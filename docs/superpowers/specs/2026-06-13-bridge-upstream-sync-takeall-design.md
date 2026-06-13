@@ -14,6 +14,7 @@ rejected_alternatives:
   - "Merged !model = keep ours unchanged, his via buttons only: zero regression but !model <x> stops switching the live session. Operator chose do-both. Rejected."
   - "Merged !model = subcommand split: more surface to remember. Rejected."
 changelog:
+  - "v4 (round-3 review): specified do-both ordering/independence for [1m] preservation (Codex-B1); named a test-driver account for smoke (Codex-B2); opusplan/default = in-session-only; bare !model no-session behavior; deploy evidence trail (Codex-M2). Converged at round 3 — findings dropped from design-blockers to mechanical clarifications."
   - "v3 (round-2 review): decided merged !model behavior (do-both + picker buttons) — corrects v2's wrong 'complementary /model vs !model' framing (both are !model; /model is only PTY text). Made PRESERVE gate exhaustive. Added executable smoke-isolation preflight, npm run ci deploy gate, node_modules snapshot rollback fallback. Renamed file (was -selective-)."
   - "v2 (round-1 review): selective-carve → take-all; npm ci in deploy/rollback; executable PRESERVE gate; dedup correction. Dropped tool-call cards (1b)."
 ---
@@ -39,8 +40,9 @@ Bring **all 39** of Dan's upstream commits into the deployed easelyte fork while
 **Decided merged behavior (operator pick — "do-both + picker buttons"):**
 1. `!model <x>` → set `<x>` as the persisted spawn-default (ours) **AND**, if an active iv-session exists, switch it to `<x>` now (his). One command = "use this model now and going forward."
 2. bare `!model` → show current model + Dan's picker buttons; tapping a chip switches the active session in-session.
-3. **Alias registry:** union the two sets into one resolver — keep our `fable-5`, version-pins (`opus-4-8`), and the separate `1m` arg; add `opusplan` and `default`. Normalize so `opus 1m` (ours) and `opus[1m]` (his) resolve to the same target.
-4. **1M preservation:** an in-session switch MUST preserve the `[1m]` context-variant suffix when the spawn-default carries it (don't silently drop to the 200k variant). This is the load-bearing coexistence invariant; its test is PRESERVE check (g) below.
+3. **Alias registry:** union the two sets into one resolver — keep our `fable-5`, version-pins (`opus-4-8`), and the separate `1m` arg; normalize so `opus 1m` (ours) and `opus[1m]` (his) resolve to the same target. `opusplan` and `default` are **in-session-only aliases** (routed to the in-session switch); the spawn-default resolver rejects them with a helpful error, since the spawn-default needs an explicit model id.
+4. **No active session:** bare `!model` with no live session shows the spawn-default only (no picker buttons — nothing to switch). `!model <x>` with no live session sets the spawn-default only (the "switch now" half is a no-op).
+5. **1M preservation + ordering (round-3 Codex-B1):** an in-session switch MUST preserve the `[1m]` suffix the **active session currently runs**, and that suffix decision is computed BEFORE the spawn-default is mutated. The two halves of do-both are independent: persisting `<x>` as the new spawn-default must NOT change the in-session switch's suffix decision. (Naive ordering — persist `sonnet` first, then read the now-suffix-less spawn-default — would silently drop the live session to 200k; the contract forbids that.) Load-bearing coexistence invariant; gated by PRESERVE check (g).
 
 Plan-stage owns the handler mechanics (single `!model` case with a unified resolver + a do-both body); this spec fixes the behavior contract above.
 
@@ -70,7 +72,9 @@ Single `git merge upstream/master` on `integrate/upstream-sync-20260613`, resolv
 Run `npm run ci` (lint + `node --check` on `index.js`/`ask-user.js`/`lib/*.js` entry files + Vitest + audit). A manual conflict resolution can leave a parse error in a file Vitest never imports; `node --check` catches it before the service crashes at restart. Gate = `npm run ci` green.
 
 ### Live-smoke isolation preflight (round-2 Codex-B1) — BLOCKS smoke start
-Before launching the worktree bridge, an executable preflight MUST assert ALL of: (i) the smoke bot MXID ≠ the production bot MXID; (ii) the target room is a dedicated scratch room the operator is NOT in; (iii) a separate session store / state dir (not the prod `anton/memory` or session DB); (iv) a separate `.env` (not the prod dotenv). If any assertion fails, the smoke harness aborts before connecting. Rationale: a worktree bridge launched with prod credentials/room would echo into live operator sessions.
+Before launching the worktree bridge, an executable preflight MUST assert ALL of: (i) the smoke bot MXID ≠ the production bot MXID; (ii) the target room is a dedicated scratch room the production operator account is NOT in; (iii) a separate session store / state dir (not the prod `anton/memory` or session DB); (iv) a separate `.env` (not the prod dotenv). If any assertion fails, the smoke harness aborts before connecting. Rationale: a worktree bridge launched with prod credentials/room would echo into live operator sessions.
+
+**Who drives the smoke (round-3 Codex-B2):** a dedicated **test-driver Matrix account** (NOT the production operator identity) joins the scratch room, sends the smoke prompts, and reads the responses. "Operator NOT in the room" means the production operator *session* is never exposed to the worktree bridge; the throwaway test-driver account is what exercises the gate. Resolves the apparent contradiction between "operator absent" and "send a prompt + verify."
 
 ### PRESERVE regression gate (exhaustive — each item an observable pass/fail; any failure blocks deploy)
 Run in the isolated smoke (above):
@@ -80,7 +84,7 @@ Run in the isolated smoke (above):
 - (d) **Ask-user** — to trigger, send the smoke session a prompt that instructs CC to call `mcp__ask-user__ask_user` with a 3-option question carrying a `(Recommended)` tag (e.g. "ask me to pick a color, recommend blue, options red/green/blue"). Verify: option line-breaks render (`#3`), `(Recommended)`/⭐ marker present (`e9477f7`), reverse-ordering preserved (`34776c1`), the question surfaces AFTER its preceding explanation (`ac59cee`), Dan's option **descriptions** (`#80`) and **explanatory prose** (`#81`) render. Then trigger a second question and let it sit past the surface/answer timeout (the bridge's configured ask-user timeout, ~30s) → verify it recovers without wedging the session (`#2`/`626729b`).
 - (e) File upload → lands in `uploads/`, not workdir root.
 - (f) **`!model` spawn-default persistence across restart** — `!model opus 1m`, restart the bridge, start a NEW session → it spawns with `--model claude-opus-4-8[1m]` (proves our `1e2a298`/`914bac0` path survived the merge). Fable 5 remains accepted by `!model`.
-- (g) **`!model` do-both + 1M preservation** — with an active session, `!model sonnet` switches it in-session AND updates the spawn-default; with a `[1m]` spawn-default active, an in-session switch preserves the `[1m]` suffix (does not drop to 200k). bare `!model` shows the picker buttons; tapping a chip switches in-session.
+- (g) **`!model` do-both + 1M-preservation ordering** — start a session running `claude-opus-4-8[1m]`, then `!model sonnet`: the live session switches to sonnet **on the 1M variant** (`sonnet[1m]`-equivalent, NOT dropped to the 200k variant) AND the spawn-default updates to `sonnet`. This is the round-3 ordering trigger — a naive "persist first, then read spawn-default" implementation fails it. Also: bare `!model` (live session) shows the picker buttons; tapping a chip switches in-session.
 - (h) `/effort` (Dan's, newly taken) works without hanging/wedging the session.
 
 ### Coexistence is the take-all risk
@@ -93,6 +97,9 @@ Checks (f)+(g) are the coexistence verification — if (g)'s 1M-preservation fai
 - **Rollback (round-2 Codex-M2): snapshot fallback so rollback never depends on the registry.** BEFORE the deploy `npm ci`, `tar czf /opt/matron/bridge.node_modules.rollback.tgz -C /opt/matron/bridge node_modules` (snapshot the currently-deployed deps). Rollback = checkout `integrate/bridge-fixes-20260605` → restore `node_modules` from the snapshot (no network) → restart. `npm ci` is the clean path; the snapshot is the incident-time fallback when the registry/network is unavailable.
 - **Topology (round-1 M5):** `integrate/upstream-sync-20260613` is off `integrate/bridge-fixes-20260605` (the *currently deployed* tip `7ea062b`), so rollback target == current deploy. Merging to easelyte `master` is a separate later step; deploy runs off the integration-branch checkout directly.
 - **Rollback trigger:** any PRESERVE/coexistence check failing post-deploy, or a startup crash.
+- **Evidence trail (round-3 Codex-M2, P34):** record a deploy log line capturing the deployed commit SHA, the `node_modules` snapshot path, and the smoke result. On rollback, also record the failed check ID, a `journalctl -u claude-matrix-bridge` excerpt, and the rollback outcome — so an incident is reconstructable (which check failed, whether rollback restored the intended code + deps).
+
+> **Reviewer note (round-3 Codex-M1):** Codex flagged the code-symbol claims (`resolveSpawnModelInput`, `MODEL_ALIASES`, `switchModelInSession`, `SWITCHABLE_ALIASES`) as unverified — that is a Codex 5-file grounding-cap limitation, not a defect: these symbols were grep/trace-confirmed against `/opt/matron/bridge/index.js` and `upstream/master` by the round-2 and round-3 Claude reviewers. No action.
 
 ## Follow-ups (not this spec)
 - Upstream our 62 to Dan (reduces future divergence).
