@@ -1,87 +1,87 @@
 ---
-title: Selective upstream sync of claude-matrix-bridge (easelyte fork ← Matronhq)
+title: Take-all upstream sync of claude-matrix-bridge (easelyte fork ← Matronhq)
 date: 2026-06-13
 status: proposal
 scope: bridge-only (Node claude-matrix-bridge); no web/native changes
 repo: easelyte/claude-matrix-bridge
 work_branch: integrate/upstream-sync-20260613 (off integrate/bridge-fixes-20260605)
-related_specs:
-  - docs/superpowers/specs/2026-06-12-matron-events-protocol.md (Phase-5 contract; consumed by follow-up 1b)
 related_principles:
-  - "Canonical source: keep one authoritative model stack (ours) rather than two switch surfaces in one pass"
-  - "Fail loud: bridge must start clean post-merge; a half-merged dispatch table is worse than deferring"
+  - "Canonical source: our model stack (!model spawn-default) stays authoritative; Dan's /model is a complementary in-session surface, not a competing source"
+  - "P51 Rollback mutation surface matches protection surface: forward mutation is branch + node_modules, so rollback must restore both"
+  - "P14 Plans are executable specs: every PRESERVE item needs a checkable gate, not a prose 'diff against deployed branch'"
 rejected_alternatives:
-  - "Full reconcile (merge Dan's /model picker WITH our !model in one pass): higher risk; deferred to a follow-up since the two surfaces are complementary, not mutually exclusive."
-  - "Cards-first (build tool_call before syncing): builds on a soon-refactored index.js (Dan's #79), creating rework."
-  - "Sync-only then stop: acceptable, but we want tool_call cards (1b) and prefer to sequence them on the synced base."
+  - "Selective carve (defer Dan's /model + /effort): round-1 review + git topology showed the carve is MORE surgery than take-all — /model+/effort dispatch is inline in index.js and f0280b4 (a picker-tap guard we want) is interwoven with effort:/model: routing. Deferring leaves dormant half-wired code. Rejected."
+  - "Maintain fork indefinitely without syncing: merge debt (39 behind) compounds. Deferred to a later upstream-and-track decision, out of scope here."
+changelog:
+  - "v2 (round-1 review): flipped selective-carve → take-all; added npm ci to deploy/rollback (sdk 0.100→0.102 bump); replaced 'diff against deployed branch' with an executable PRESERVE gate; corrected dedup (folded-paste pair DIFFERS, transcript-tail identical); added /model↔!model coexistence verification; drew branch topology. Tool-call cards (1b) removed from scope."
 ---
 
-# Selective upstream sync — claude-matrix-bridge
+# Take-all upstream sync — claude-matrix-bridge
 
 ## Goal
 
-Bring Dan's high-value bridge improvements into the deployed easelyte fork **without losing our 62 fork-local commits** and **without** reconciling the dual model-switch surfaces in this pass. The headline win: Dan's ask-user/buttons work (`#79/#80/#81`) upgrades the question UX that **matron-web already renders** (via `MButtonGroupBody`), so web improves with zero web-side code. This is Tier 1a; tool-call cards (1b) build on the result.
+Bring **all 39** of Dan's upstream commits into the deployed easelyte fork while **preserving our 62 fork-local commits**, including the dual model surfaces (his in-session `/model` picker + our `!model` spawn-default). Headline win: Dan's ask-user/buttons work (`#79/#80/#81`) upgrades the question UX that **every Matron client renders** (web `MButtonGroupBody`, native sheets), so all clients improve. Reduces merge debt to zero against canonical.
 
 ## Context
 
-- Deployed bridge: `/opt/matron/bridge` @ `integrate/bridge-fixes-20260605` (`7ea062b`), run by `claude-matrix-bridge.service` (`node index.js`). This service spawns the live Matrix↔Claude sessions.
-- Divergence vs `upstream/master` (Matronhq): **39 commits ahead (theirs), 62 ahead (ours)**, merge-base `e78efed`.
-- Read-only merge probe: **4 conflicting files** — `ask-user.js`, `index.js`, `lib/prompt-detector.js`, `test/prompt-detector.test.js`. Dan's `index.js` delta is a ~1.5k-line refactor centred on `#79 unify question handling as detector-owned buttons`.
-- The fork is collaborative: `upstream` remote is configured; Dan's master already merges easelyte PRs (#67, #75). Our changes are wanted upstream eventually (separate follow-up).
+- Deployed bridge: `/opt/matron/bridge` @ `integrate/bridge-fixes-20260605` (`7ea062b`), run by `claude-matrix-bridge.service` (`node index.js`). **This service spawns the live operator Matrix↔Claude sessions** — restarting it kills active sessions.
+- Divergence vs `upstream/master` (Matronhq): **39 ahead (theirs), 62 ahead (ours)**, merge-base `e78efed`. Read-only merge probe: **4 conflicting files** — `ask-user.js`, `index.js`, `lib/prompt-detector.js`, `test/prompt-detector.test.js`.
+- Topology verified (round-1): `#79` is the question/buttons foundation (clean — even deletes `lib/mcp-question-gate.js`); `/model` + `/effort` dispatch is inline in `index.js` (≈ lines 3456–3961) and `f0280b4` (picker-tap guard) is interwoven with `effort:/model:` routing. This is **why we take it all** rather than carve.
+- The fork is collaborative: `upstream` remote configured; Dan's master already merges our PRs (#67, #75). Upstreaming our 62 back is a separate later project.
+
+## Why take-all (not carve)
+
+Dan's `/model` (switch the *current* iv-session's model via picker buttons) and our `!model` (set the *persisted spawn-default*, plus Fable 5 allowlist + 1M-context spawn) are **complementary surfaces, not a conflict**: one mutates a live session, the other sets what new sessions spawn as. Taking both is simpler than surgically excluding one from an entangled refactor. The only real work is **verifying they coexist** (below).
 
 ## Scope
 
-### INCLUDE (take from upstream)
-- **Ask-user / buttons foundation:** `#79` (detector-owned buttons + question unification — this is the infra we want), `#80` (option descriptions), `#81` (explanatory prose), `#72` (ask-user timeout-liveness), `#67` (ask-user HTML rendering), `f0280b4` (picker taps don't eat a pending TUI prompt).
-- **Prompt-detector hardening:** `a106c76` (column-aware stripAnsi / CHA→padding).
-- **Stability:** `abe62de` (clear busy on manual `/compact` boundary).
-- **Docs:** `2026-06-12-matron-events-protocol.md` (Phase-5 contract — needed for 1b), Dan's model/prompt-buttons design docs (reference only).
+### Take (all 39)
+Everything on `upstream/master` not already in our tree: `#79/#80/#81` (ask-user/buttons), `#72` (ask-user timeout-liveness), `f0280b4` (picker-tap guard), `/effort` (`lib/effort-command.js`), `/model` picker (`lib/model-command.js`, `lib/model-aliases.js`), prompt-detector hardening (`a106c76`), `/compact` busy-clear (`abe62de`), mcp-config fixes, dep bumps, and Dan's design/spec docs.
 
-### DEFER (do NOT wire in this pass)
-- **Dan's `/model` picker command** (`56ba560`, `78a0feb`, `efc07cd`, `a91cf26`, `9fb9073`, `c602a7c` merge) and `lib/model-command.js` / `lib/model-aliases.js`. Rationale: our `!model` (persisted spawn-default), Fable 5 allowlist, and 1M-context spawn are canonical. Dan's `/model` is an **in-session** switch — *complementary*, not conflicting — so it can be added in a later pass. Keeping it out now removes the only true semantic conflict.
-- **Dan's `/effort` command** (`2f2cb13`, `26aed99`). It is a **consumer of the `#79` picker-button infra** and is coupled to `/model` handling ("handle /effort like /model"). Take the `#79` infra; leave `/effort` unwired this pass.
+### Preserve (our 62 — executable gate, not prose)
+Every fork-local behaviour must survive. The gate is the **PRESERVE checklist** in Testing — each item maps to a concrete check. Items: `!model`/Fable 5/1M-context spawn (canonical), inherit-default model, iv worktree dispatch (`!start --worktree`), `!role`/`!who`, `!label`, `!clearall`/`!flush`, `!esc` queue-jump, uploads→`uploads/` subdir, and our ask-user fixes (reverse-ordering `34776c1`, 30s surface window `626729b`, surface-after-explanation `ac59cee`, timeout-recovery `#2`, option line-breaks `#3`).
 
-### DEDUP (keep ours, drop their duplicate)
-- Transcript-tail final-line fix: theirs `b4a8695` ≈ ours `ce309b1` → keep ours.
-- Folded-paste arrow-menu detector fix: theirs `96fe359` ≈ ours `5118277` → keep ours.
+### Conflict resolution (the 4 files)
+- **`ask-user.js`** — our ask-user fixes overlap Dan's `#79/#80/#81`. Resolve by **combining**: adopt his detector-owned-buttons structure + prose/option-descriptions; keep our surfacing-window / timeout-recovery / ordering behaviour. **Decision oracle:** the PRESERVE ask-user checks (Testing) are the pass/fail — a resolution is correct iff all of `34776c1`/`626729b`/`ac59cee`/`#2`/`#3` behaviours still pass AND `#80`/`#81` prose+descriptions render. Note: `#67`/`#75` were upstreamed from us, so some hunks are already-reconciled no-ops.
+- **`index.js`** — take Dan's `#79` question refactor; re-apply our preserved features on top; keep BOTH `/model` (his) and `!model` (ours) dispatch entries.
+- **`lib/prompt-detector.js`** — combine Dan's `a106c76` column-aware stripAnsi with our folded-paste fix. **Correction:** the folded-paste pair (theirs `96fe359` / ours `5118277`) is **NOT identical** — both must be reconciled by hand, not "keep ours." (Transcript-tail pair `b4a8695`/`ce309b1` *is* identical → no-op.)
+- **`test/prompt-detector.test.js`** — union both test sets; reconcile expectations to the merged detector.
 
-### PRESERVE (our 62 — must survive untouched in behaviour)
-Model stack (`!model`, Fable 5, 1M-context, inherit-default), iv worktree dispatch (`!start --worktree`), `!role`/`!who`, `!label`, `!clearall`/`!flush`, `!esc` queue-jump, uploads-to-`uploads/` subdir, and our ask-user fixes (reverse-ordering `34776c1`, 30s surface window `626729b`, surface-after-explanation `ac59cee`, timeout-recovery `#2`, option line-breaks `#3`). Note: our ask-user fixes overlap Dan's `#79/#80/#81` — at each `ask-user.js`/`index.js` conflict, **combine intent** (keep our surfacing/timeout behaviour; adopt his detector-owned-buttons structure + prose/descriptions). This is the highest-judgment part of the merge.
+### Out of scope
+- Tool-call cards / `tool_call`/`ask_user`/`session_meta` emission (**dropped** — was 1b).
+- No web or native changes. No upstreaming our 62 (later).
 
-### OUT OF SCOPE (explicit non-goals)
-- No `chat.matron.tool_call` / `ask_user` / `session_meta` emission (that's 1b / D-later).
-- No web or native changes.
-- No upstreaming our 62 to Dan (separate follow-up).
+## Integration strategy
 
-## Integration strategy: merge-then-carve
-
-Prefer a single `git merge upstream/master` over per-commit cherry-pick, because `#79` is a foundational refactor everything else sits on — cherry-picking around it onto our diverged `index.js` would multiply conflicts. Steps (detailed sequencing belongs to the plan):
-
-1. On `integrate/upstream-sync-20260613` (already created off our HEAD), `git merge upstream/master`.
-2. Resolve the 4 conflicts by the per-file intent below.
-3. **Carve:** ensure `/model` and `/effort` slash handlers are NOT registered in the command dispatch; do not ship `lib/model-command.js` / `lib/model-aliases.js` as active (delete or leave unimported). Our model code stays canonical at every model-touching conflict site.
-4. Dedup the two duplicate fixes (keep ours).
-5. Green the test suite; live-smoke in the worktree against a scratch room before any service restart.
-
-### Per-file conflict intent
-- **`ask-user.js`** — adopt Dan's detector-owned-buttons + prose/descriptions structure; retain our surfacing-window / timeout-recovery / ordering behaviour. Combine, don't pick-a-side.
-- **`index.js`** — take Dan's `#79` question-handling refactor; re-apply our preserved features (worktree dispatch, role/label/clearall/esc, uploads, model spawn) on top; **omit** `/model` + `/effort` dispatch entries.
-- **`lib/prompt-detector.js`** — take Dan's `a106c76` column-aware stripAnsi; keep our folded-paste fix (dedup vs his `96fe359`).
-- **`test/prompt-detector.test.js`** — union of both test sets; reconcile expectations to the merged detector.
+Single `git merge upstream/master` on `integrate/upstream-sync-20260613` (already created off our HEAD), resolve the 4 conflicts per above, green the suite, live-smoke, then deploy deliberately. No carve, no dormant code.
 
 ## Testing
 
-- **Unit:** `npm test` green (existing bridge suite + Dan's new `test/*` for prompt-detector/buttons that we keep). New model-command/effort tests we defer are excluded with the commands.
-- **Live smoke (worktree, scratch room, separate port/session — never the deployed service):** start a session, exercise: a buttons/ask-user question (verify prose + option descriptions render and answer correlates), `!model`/Fable 5/1M spawn still works, `!start --worktree`, `!role`/`!label`/`!clearall`/`!esc`, a file upload lands in `uploads/`. Confirm `/model` and `/effort` are absent (not half-wired).
-- **Regression guard:** diff our preserved-feature behaviours against the deployed branch.
+### Unit
+`npm test` green — existing suite + Dan's incoming `test/effort-command.test.js`, `test/prompt-buttons.test.js`, `test/model-*.test.js`, plus the unioned `test/prompt-detector.test.js`.
+
+### Coexistence verification (the take-all risk)
+In live smoke: (a) `!model <x>` sets the spawn-default and a NEW session spawns as `<x>`; (b) Dan's `/model <y>` switches the CURRENT iv-session to `<y>` without mutating the persisted default; (c) the 1M-context variant still spawns (our `1e2a298`/`914bac0` path) and an in-session `/model` switch does not strip the `[1m]` variant unexpectedly; (d) Fable 5 remains in the `!model` allowlist. If (c) fails (e.g. `/model` re-spawns without 1M), document the interaction and gate `/model` to preserve the context-variant suffix.
+
+### PRESERVE regression gate (executable — replaces "diff against branch")
+Each item is a concrete check, run in the worktree smoke before deploy:
+- `!start --worktree --prompt` → spawns an isolated worktree session; `!sessions` lists it.
+- `!role`/`!who` → returns allowlist-scoped roles; `!label` → applies; `!clearall`/`!flush` → clears.
+- `!esc` → interrupts the current turn (queue-jump).
+- A file upload → lands in `uploads/`, not workdir root.
+- Ask-user: trigger a question → option line-breaks render (`#3`), recommendation marker present, surfaces after its preceding explanation (`ac59cee`), and a timed-out question recovers without wedging (`#2`).
+Any check failing blocks deploy.
+
+### Live smoke harness
+The bridge is a Matrix client, not a port-served app, so smoke needs a **separate bot identity + a scratch room the operator is NOT in** (or a throwaway homeserver), so it can't echo into live operator sessions. Run all of the above there against the worktree checkout — never the deployed service.
 
 ## Deploy & rollback
 
-- **Blast radius:** deploying = `git checkout` the synced branch in `/opt/matron/bridge` + `systemctl restart claude-matrix-bridge.service`, which **terminates all active Matrix↔Claude sessions** (including the operator's). Deploy deliberately, when no critical session is mid-flight; announce first.
-- **Deploy:** fast-forward `/opt/matron/bridge` working checkout to the reviewed branch (or merge to easelyte `master` and check that out), `systemctl restart claude-matrix-bridge.service`, verify health + a smoke question.
-- **Rollback:** `git checkout integrate/bridge-fixes-20260605` in `/opt/matron/bridge` + restart. The branch is unchanged by this work, so rollback is one checkout.
+- **Blast radius:** deploy = update `/opt/matron/bridge`'s checkout to the reviewed branch + `systemctl restart claude-matrix-bridge.service`, which **terminates all active Matrix↔Claude sessions** (including the operator's). Announce in the operator's Matrix channel first; deploy when no session is mid-task (check the bridge session table / a grace period after the last bot message).
+- **Dependency state (round-1 M1/Codex-M3):** upstream bumps `@anthropic-ai/sdk ^0.100.1 → ^0.102.0` (+lockfile). `git checkout` alone does NOT restore `node_modules`. Deploy = checkout → **`npm ci`** → restart. Rollback = checkout `integrate/bridge-fixes-20260605` → **`npm ci`** (restore old dep state) → restart. Pre-flight: confirm the checkout is clean (no stray state files) before switching.
+- **Branch topology (round-1 M5):** `integrate/upstream-sync-20260613` is off `integrate/bridge-fixes-20260605` (the *currently deployed* tip, confirmed `7ea062b`), so rollback target == current deploy. Merging this to easelyte `master` later is a separate step; deploy can run directly off the integration branch checkout without going through `master`.
+- **Rollback trigger:** any PRESERVE check or coexistence check failing post-deploy, or a startup crash → checkout old branch + `npm ci` + restart (one-step, branch is unchanged by this work).
 
 ## Follow-ups (not this spec)
-- **1b — tool-call cards** end-to-end against the Phase-5 `chat.matron.tool_call` contract (bridge emit + web `MToolCallBody`), contributed back so native lights up too.
-- **Model reconcile** — add Dan's in-session `/model` picker alongside our `!model` (complementary surfaces).
-- **Upstream our 62** to Dan where generally useful.
+- Upstream our 62 to Dan where generally useful (reduces future divergence; the collaborative-fork direction).
+- Decide long-term: maintain fork vs track canonical + contribute. Out of scope.
