@@ -2,7 +2,7 @@
 // hooks/matron-tee
 // Usage: matron-tee <log-path> -- <command> [args...]
 import { spawn } from 'child_process';
-import { createWriteStream, existsSync, mkdirSync } from 'fs';
+import { createWriteStream, existsSync, mkdirSync, writeSync } from 'fs';
 import path from 'path';
 
 const args = process.argv.slice(2);
@@ -34,7 +34,7 @@ let truncated = false;
 function pipe(source, sink) {
   source.on('data', chunk => {
     if (truncated) {
-      sink.write(chunk);
+      writeSink(sink, chunk);
       return;
     }
     if (bytesWritten + chunk.length > MAX_BYTES) {
@@ -43,13 +43,21 @@ function pipe(source, sink) {
       log.write(`\n[matron-tee: output truncated at ${MAX_BYTES} bytes]\n`);
       truncated = true;
       bytesWritten = MAX_BYTES;
-      sink.write(chunk);
+      writeSink(sink, chunk);
       return;
     }
     bytesWritten += chunk.length;
     log.write(chunk);
-    sink.write(chunk);
+    writeSink(sink, chunk);
   });
+}
+
+function writeSink(sink, chunk) {
+  if (typeof sink.fd === 'number') {
+    writeSync(sink.fd, chunk);
+  } else {
+    sink.write(chunk);
+  }
 }
 
 const child = spawn(cmd, rest, { stdio: ['inherit', 'pipe', 'pipe'] });

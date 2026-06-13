@@ -1,5 +1,10 @@
 import { describe, it, test, expect } from 'vitest';
-import { classifyScreen, stripAnsi, stripInputBox, isIdleReadyScreen, isGeneratingScreen, PromptDetector } from '../lib/prompt-detector.js';
+import fs from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import path from 'node:path';
+import { classifyScreen, stripAnsi, stripInputBox, isIdleReadyScreen, isGeneratingScreen, PromptDetector, looksLikeUnclassifiedMenu, extractPreamble, preambleMatchesText } from '../lib/prompt-detector.js';
+
+const __dir = path.dirname(fileURLToPath(import.meta.url));
 
 describe('stripAnsi', () => {
   it('removes color codes', () => {
@@ -160,6 +165,26 @@ describe('stripAnsi — CHA (Cursor Horizontal Absolute) word-boundary fixtures'
     expect(r.options[0].label).toContain('Yes, and bypass permissions');
     expect(r.options[1].label).toContain('Yes, manually approve edits');
     expect(r.freeTextIdx).toBe(3);
+  });
+
+  test('effort-change confirmation fixture: classifyScreen surfaces it as a prompt', () => {
+    // Changing effort mid-conversation invalidates the prompt cache, so the
+    // TUI shows this confirmation before applying. The bridge relies on the
+    // detector catching it (same shape as the bypass-permissions menu) to
+    // surface it to Matrix — see lib/effort-command.js. Guard that here.
+    const raw = [
+      'Change\x1b[8Geffort\x1b[15Glevel?',
+      'This\x1b[6Gconversation\x1b[19Gis\x1b[22Gcached.\x1b[31GSwitching\x1b[41Gto\x1b[44Gultracode\x1b[54Gre-reads\x1b[63Ghistory.',
+      '❯ 1.\x1b[6GYes,\x1b[11Gswitch\x1b[18Gto\x1b[21Gultracode',
+      '  2.\x1b[6GNo,\x1b[10Ggo\x1b[13Gback',
+    ].join('\n');
+    const r = classifyScreen(stripAnsi(raw));
+    expect(r).not.toBeNull();
+    expect(r.kind).toBe('numbered');
+    expect(r.question).toContain('Change effort level?');
+    expect(r.options).toHaveLength(2);
+    expect(r.options[0].label).toContain('Yes, switch to ultracode');
+    expect(r.options[1].label).toContain('No, go back');
   });
 
   test('AskUserQuestion menu fixture: CHA-positioned labels reconstruct with spaces', () => {
@@ -328,6 +353,33 @@ describe('classifyScreen — arrow-menu', () => {
     const r = classifyScreen(screen);
     expect(r.kind).toBe('arrow-menu');
     expect(r.options).toHaveLength(2);
+  });
+
+  it('still detects a real menu when a folded paste precedes it in the buffer', () => {
+    // The fold-widget marker must not block detection of a later real menu —
+    // the search skips paste-fold markers rather than rejecting at the first ❯.
+    const screen = [
+      '❯ [Pasted text #1 +9 lines]',
+      '  paste again to expand',
+      '',
+      'How should I proceed?',
+      '❯ Apply the change',
+      '  Cancel',
+    ].join('\n');
+    const r = classifyScreen(screen);
+    expect(r.kind).toBe('arrow-menu');
+    expect(r.options.map(o => o.label)).toEqual(['Apply the change', 'Cancel']);
+    // The fold widget + hint must not leak into the surfaced question.
+    expect(r.question).toBe('How should I proceed?');
+    expect(r.question).not.toMatch(/Pasted text|paste again/i);
+  });
+
+  it('treats the widget + hint on a single line as a folded paste', () => {
+    const screen = [
+      'Look at this:',
+      '❯ [Pasted text #2 +14 lines] paste again to expand',
+    ].join('\n');
+    expect(classifyScreen(screen)).toBeNull();
   });
 });
 
@@ -886,6 +938,154 @@ describe('PromptDetector', () => {
     await new Promise(r => setTimeout(r, 100));
     expect(events).toHaveLength(1);
     expect(events[0].kind).toBe('yes-no');
+  });
+
+  it('emits unclassified-prompt (not prompt) for a menu it cannot classify', async () => {
+    const LONG = 'this is an intentionally very long option label that exceeds the ninety character menu guard so the classifier rejects it as wrapped prose';
+    const screen = [
+      'What would you like to do?',
+      `❯ 1. ${LONG}`,
+      `  2. ${LONG} (second)`,
+    ].join('\n');
+    // Precondition: this is exactly the gap — the classifier rejects it.
+    expect(classifyScreen(screen)).toBeNull();
+    const det = new PromptDetector({ idleMs: 40 });
+    const prompts = [], unclassified = [];
+    det.on('prompt', p => prompts.push(p));
+    det.on('unclassified-prompt', u => unclassified.push(u));
+    det.feed(screen);
+    await new Promise(r => setTimeout(r, 120));
+    expect(prompts).toHaveLength(0);
+    expect(unclassified).toHaveLength(1);
+    expect(unclassified[0].screen).toContain('What would you like to do?');
+  });
+
+  it('does not emit unclassified-prompt for a normal classifiable menu', async () => {
+    const det = new PromptDetector({ idleMs: 40 });
+    const prompts = [], unclassified = [];
+    det.on('prompt', p => prompts.push(p));
+    det.on('unclassified-prompt', u => unclassified.push(u));
+    det.feed('Continue? [y/N]');
+    await new Promise(r => setTimeout(r, 120));
+    expect(prompts).toHaveLength(1);
+    expect(unclassified).toHaveLength(0);
+  });
+});
+
+describe('looksLikeUnclassifiedMenu', () => {
+  const LONG = 'a'.repeat(120);
+
+  it('flags a ❯ numbered menu the classifier rejected (overlong labels)', () => {
+    const screen = `What would you like to do?\n❯ 1. ${LONG}\n  2. ${LONG}`;
+    expect(classifyScreen(screen)).toBeNull();           // the gap
+    expect(looksLikeUnclassifiedMenu(screen)).toBe(true);
+  });
+
+  it('ignores a prose numbered list with no selection cursor', () => {
+    expect(looksLikeUnclassifiedMenu('Here are the steps:\n1. First do this\n2. Then do that')).toBe(false);
+  });
+
+  it('ignores a bare ❯ slash-command suggestion (no numbered/lettered option)', () => {
+    expect(looksLikeUnclassifiedMenu('❯ /compact\n⎿ summary line')).toBe(false);
+  });
+
+  it('ignores a folded-paste placeholder under the cursor', () => {
+    expect(looksLikeUnclassifiedMenu('❯ [Pasted text #1 +9 lines]')).toBe(false);
+  });
+
+  it('ignores plain output and empty input', () => {
+    expect(looksLikeUnclassifiedMenu('All done. Nothing to pick here.')).toBe(false);
+    expect(looksLikeUnclassifiedMenu('')).toBe(false);
+    expect(looksLikeUnclassifiedMenu(null)).toBe(false);
+  });
+});
+
+describe('classifyScreen — option descriptions (AskUserQuestion-style)', () => {
+  const screen = [
+    'What would you like me to do?',
+    '1. Everything actionable',
+    '   All of the above plus the export fix and nav redirect.',
+    '2. Just the blockers',
+    '   Only the CI fix and styles storage.',
+    '3. Type something.',
+  ].join('\n');
+
+  it('captures each option header plus its indented description', () => {
+    const r = classifyScreen(screen);
+    expect(r).not.toBeNull();
+    expect(r.kind).toBe('numbered');
+    expect(r.options).toHaveLength(3);
+    expect(r.options[0].label).toBe('Everything actionable');
+    expect(r.options[0].description).toContain('All of the above plus the export fix');
+    expect(r.options[1].label).toBe('Just the blockers');
+    expect(r.options[1].description).toContain('Only the CI fix and styles storage');
+    // Last option has no description line.
+    expect(r.options[2].label).toBe('Type something.');
+    expect(r.options[2].description).toBeUndefined();
+    // "Type something." is detected as the free-text slot.
+    expect(r.freeTextIdx).toBe(2);
+  });
+});
+
+describe('extractPreamble', () => {
+  // Real AskUserQuestion render captured from a live PTY session (stripped +
+  // blank-collapsed), saved as a fixture. The detector must recover the prose
+  // claude wrote above the menu, without the question/options/chrome.
+  const render = fs.readFileSync(path.join(__dir, 'fixtures', 'auq-preamble-render.txt'), 'utf-8');
+  const question = "Once I extract Claude's explanatory paragraph from the live screen and show it before the question, what should happen to the clean copy that still arrives from the transcript after you answer?";
+
+  it('recovers the prose above the menu from a real render', () => {
+    const { preamble, complete } = extractPreamble(render, { question });
+    expect(complete).toBe(true);
+    expect(preamble).toContain('controlled capture');
+    expect(preamble).toContain('live-demonstrates the bug');
+    // Must NOT include the question text or the option labels.
+    expect(preamble).not.toContain('what should happen to the clean copy');
+    expect(preamble).not.toContain('Suppress the duplicate');
+    expect(preamble).not.toContain('Keep it');
+  });
+
+  it('returns incomplete for input with no menu/question widget', () => {
+    expect(extractPreamble('just some plain output, nothing to pick', { question })).toEqual({ preamble: '', complete: false });
+    expect(extractPreamble('', { question })).toEqual({ preamble: '', complete: false });
+    expect(extractPreamble(render, null)).toEqual({ preamble: '', complete: false });
+  });
+
+  it('strips ANSI and collapses blank runs before extracting', () => {
+    const raw = [
+      '\x1b[2m●\x1b[0m Here is my reasoning about the choice.',
+      '', '', '', '',  // blank run (spinner artifact)
+      'What would you like?',
+      '1. Alpha',
+      '   does A',
+      '2. Beta',
+    ].join('\n');
+    const { preamble, complete } = extractPreamble(raw, { question: 'What would you like?' });
+    expect(complete).toBe(true);
+    expect(preamble).toContain('Here is my reasoning about the choice');
+    expect(preamble).not.toContain('Alpha');
+  });
+});
+
+describe('preambleMatchesText', () => {
+  it('matches the same prose despite minor glyph glitches', () => {
+    const captured = 'I reviewed the batch and found eight issues across CI and the editor navigator';
+    const transcript = 'I reviewed the batch and found eight issues across CI and the editor navigator pipeline.';
+    expect(preambleMatchesText(captured, transcript)).toBe(true);
+  });
+  it('does not match unrelated text', () => {
+    expect(preambleMatchesText('the quick brown fox jumps over lazy dogs today', 'completely different sentence about weather and rain')).toBe(false);
+  });
+  it('returns false for empty or tiny inputs', () => {
+    expect(preambleMatchesText('', 'anything here at all')).toBe(false);
+    expect(preambleMatchesText('two words', 'two words')).toBe(false);
+  });
+  it('does not match a short preamble merely contained in a much longer message', () => {
+    const shortPreamble = 'fixing the editor navigator pipeline bug today now';
+    const longUnrelated = 'fixing the editor navigator pipeline bug today now ' +
+      'but also rewriting the entire authentication subsystem and migrating the database ' +
+      'plus refactoring the deployment scripts and updating every dependency across services';
+    expect(preambleMatchesText(shortPreamble, longUnrelated)).toBe(false);
   });
 });
 

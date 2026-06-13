@@ -4,8 +4,6 @@ You are running inside a Claude Matrix bridge session. The user is interacting t
 
 ## User Interaction
 
-When you need to ask the user a question, use `mcp__ask-user__ask_user` instead of `AskUserQuestion`. `AskUserQuestion` is not available in this environment.
-
 `ExitPlanMode` is handled by the bridge. When you call it, the bridge shows the plan to the user and waits for approval before continuing.
 
 ## Critical Security Requirement: Sensitive Data

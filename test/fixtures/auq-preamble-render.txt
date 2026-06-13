@@ -1,0 +1,93 @@
+✽ F
+
+● Ha — you're completely right, I fire AskUserQuestion, not you. So I can run a controlled capture myself: I'll ask a
+  real question now (with this paragraph before it), which renders the menu in this session's PTY and surfaces it to
+you.   Once you answer, I'll read this room's live PTY dump to see exactly how the prose sits relative to the menu — and
+  build the extraction against that real render instead of guessing. This also live-demonstrates the bug: you'll likely
+  see the buttons first and this paragraph land afterward.
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt
+
+  The question doubles as a real decision I need — how to handle the post-answer duplicate once I extract the prose
+  early:
+
+✶ Skedaddling… (1m 6s · ↓ 4.2k tokens)
+  ⎿  Tip: Use /btw to ask a quick side question without interrupting Claude's current work
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+❯ 
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  ⏵⏵ bypass permissions on (shift+tab to cycle) · esc to interrupt
+
+*           g
+
+           n       7
+
+✢
+
+·         i  …
+
+         l  g               3
+
+✢       d  n
+
+*      d  i
+
+✶
+
+      a  l         8
+
+✻
+
+✽    d  d
+
+    e  d
+
+✻  k  a
+
+✶ S  d
+
+*
+
+✢   e              9
+
+                            4
+
+·  k
+
+  S
+
+✢
+
+*
+
+✶
+
+✻                  10s · ↓ 4.4k tokens)
+
+✽
+
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+ ☐ Prose fix
+
+Once I extract Claude's explanatory paragraph from the live screen and show it before the question, what should happen
+to the clean copy that still arrives from the transcript after you answer?
+
+❯ 1. Keep it (safety net)
+   Show the extracted paragraph before   the question AND s ill let the transcript copy through after. Lowest risk — you
+     never lose the full paragraph even if the screen capture is partial — but you may see it twice.
+  2. Suppress the duplicate
+     Show the extracted paragraph before, and drop the post-answer transcript copy so there's no repeat. Cleaner
+     timeline, but if the screen capture is truncated (very long prose) you'd lose the tail.
+  3. Smart: suppress only if full
+     Suppress the post-answer copy only when the pre-answer capture looks complete; otherwise let the transcript copy
+     through. Best of both, but more logic to get right.
+  4. Type something.
+────────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
+  5. Chat about this
+
+Enter to select · ↑/↓ to navigate · Esc to cancel
+(B

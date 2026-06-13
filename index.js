@@ -14,13 +14,17 @@ import { GoogleGenerativeAI } from '@google/generative-ai';
 import { createLiveOutputStore, sweepOrphanedLogs } from './lib/live-output.js';
 import { generateSignedUrl } from './lib/viewer-tokens.js';
 import { createInteractiveSession } from './lib/interactive-session.js';
-import { extractUrls, isIdleReadyScreen, isGeneratingScreen } from './lib/prompt-detector.js';
+import { extractUrls, isIdleReadyScreen, isGeneratingScreen, extractPreamble, preambleMatchesText } from './lib/prompt-detector.js';
 import { buildMcpServers, extractMcpExtraFlags, extractWorktreeFlag, extractPromptFlag, knownMcpExtras } from './lib/mcp-config.js';
+import { modelFromEvent, VALID_ALIAS_HINT } from './lib/model-aliases.js';
+import { switchModelInSession, modelButtons } from './lib/model-command.js';
+import { switchEffortInSession, effortButtons, VALID_EFFORT_HINT } from './lib/effort-command.js';
+import { promptButtons, promptResponseForButton } from './lib/prompt-buttons.js';
 import { SubagentWatcher } from './lib/subagent-watcher.js';
 import { ivUploadDir, resolveUploadMeta, ivUploadAnnotation } from './lib/iv-uploads.js';
 
 const DEFAULT_BRIDGE_CLAUDE_MD_PATH = path.join(__dirname, 'BRIDGE_CLAUDE.md');
-const FALLBACK_BRIDGE_PROMPT = 'When you need to ask the user a question, use the mcp__ask-user__ask_user tool instead of AskUserQuestion. AskUserQuestion is not available in this environment.';
+const FALLBACK_BRIDGE_PROMPT = 'You are running inside a Matrix bridge. The user interacts through Matrix, not a terminal.';
 
 // --- Config ---
 
@@ -108,6 +112,7 @@ let spawnModel = loadSpawnModel() || DEFAULT_SPAWN_MODEL;
 // backstop so a message is never lost if readiness is never detected.
 const RESUME_READY_QUIET_MS = parseInt(process.env.RESUME_READY_QUIET_MS || '800', 10);
 const RESUME_READY_HARDCAP_MS = parseInt(process.env.RESUME_READY_HARDCAP_MS || '120000', 10);
+const _resumeGeneratingScreenDetector = isGeneratingScreen;
 const MAX_MSG_LENGTH = 32768;  // Matrix supports ~65KB, use 32K as practical limit
 const DEBUG = process.env.DEBUG === '1';
 const ENCRYPT_SESSION_ROOMS = process.env.ENCRYPT_SESSION_ROOMS !== '0';
@@ -502,6 +507,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     firstMessageCaptured: false,
     // Captured from system init event
     initData: null,
+    currentModel: null,
     // Accumulated usage stats
     totalUsage: { input_tokens: 0, output_tokens: 0, cache_read: 0, cache_create: 0, cost_usd: 0 },
     turnCount: 0,
@@ -548,11 +554,6 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     if (session.subagentWatcher) {
       session.subagentWatcher.stop().catch(() => {});
       session.subagentWatcher = null;
-    }
-    // Drop any pending MCP questions tied to this room — the ask-user MCP
-    // server died with the child, so the polling loop is gone.
-    for (const [qid, entry] of pendingMcpQuestions) {
-      if (entry.roomId === session.roomId) pendingMcpQuestions.delete(qid);
     }
 
     // Flush any remaining response
@@ -759,6 +760,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     originRoomId: null,
     firstMessageCaptured: false,
     initData: null,
+    currentModel: null,
     totalUsage: { input_tokens: 0, output_tokens: 0, cache_read: 0, cache_create: 0, cost_usd: 0 },
     turnCount: 0,
     chatHistory: [],
@@ -815,10 +817,18 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     handleInteractiveScreenUpdate(session, update);
   });
 
+  iv.on('unclassified-prompt', update => {
+    debug('IV unclassified-prompt: surfacing best-effort');
+    handleUnclassifiedPrompt(session, update);
+  });
+
   iv.on('prompt', prompt => {
     debug('IV prompt:', prompt.kind, prompt.question);
     markIvReady();
     session.pendingInteractivePrompt = prompt;
+    // A real structured prompt supersedes any best-effort unclassified-prompt
+    // notice we may have surfaced for an earlier render of this screen.
+    session.pendingUnclassifiedPrompt = false;
     // A TUI prompt means claude has stopped processing and is awaiting
     // user input. The Stop hook is unreliable for these states (e.g.
     // first-run modals, /login, unauthenticated "please run /login"
@@ -846,11 +856,6 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     if (session.subagentWatcher) {
       session.subagentWatcher.stop().catch(() => {});
       session.subagentWatcher = null;
-    }
-    // Drop any pending MCP questions tied to this room — see createSession()
-    // for rationale.
-    for (const [qid, entry] of pendingMcpQuestions) {
-      if (entry.roomId === session.roomId) pendingMcpQuestions.delete(qid);
     }
     flushResponse(session);
     if (sessions.get(roomId) === session) {
@@ -927,6 +932,18 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     session.toolCalls = [];
     session.turnCount++;
     session.busy = false;
+    // The turn ended, so any best-effort unclassified-prompt notice is stale.
+    session.pendingUnclassifiedPrompt = false;
+    // A real turn-end supersedes any armed operator-compact fallback: disarm
+    // it so a later (or stale) manual compact_boundary can't stand in as a
+    // turn-end for a subsequent turn and clear busy out from under it.
+    if (session._operatorCompactPending) {
+      session._operatorCompactPending = false;
+      if (session._operatorCompactTimer) {
+        clearTimeout(session._operatorCompactTimer);
+        session._operatorCompactTimer = null;
+      }
+    }
     stripQueueNotificationLinks(session);
     if (session.typingInterval) {
       clearInterval(session.typingInterval);
@@ -993,9 +1010,78 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
 }
 
 // Surface a detected TUI prompt to Matrix as a multiple-choice question.
-function handleInteractivePrompt(session, prompt) {
+async function handleInteractivePrompt(session, prompt) {
   if (!session.sendHtml && !session.sendCallback) return;
-  const optionLines = prompt.options.map((opt, i) => `${i + 1}. ${opt.label}${opt.selected ? ' (current)' : ''}`);
+  // Surface claude's explanatory prose (rendered above the menu) BEFORE the
+  // question, so the user has the reasoning when choosing. In iv-mode that
+  // prose only reaches the transcript after the answer, but it's on the live
+  // screen now — recover it from the recent PTY output. Only when the capture
+  // is complete: then we also remember it to suppress the duplicate that flushes
+  // from the transcript post-answer (the user's "suppress only if full" choice).
+  // A partial/empty capture is skipped here and left to the transcript.
+  // Scope this to AskUserQuestion-style menus (option descriptions or a
+  // free-text slot). Other prompts (permission confirms, simple pickers) carry
+  // their own context in the question text and have no fresh prose above them —
+  // attempting a preamble there risks surfacing a stale paragraph from an
+  // earlier turn whose `●` marker sits above the menu.
+  const auqLike = prompt.freeTextIdx != null ||
+    (Array.isArray(prompt.options) && prompt.options.some(o => o && o.description));
+  if (auqLike && session.iv && typeof session.iv.recentOutput === 'function' && session.pendingInteractivePrompt === prompt) {
+    try {
+      const { preamble, complete } = extractPreamble(session.iv.recentOutput(), prompt);
+      if (complete && preamble) {
+        session._suppressPreambleText = preamble;
+        if (session.suppressPreambleTimer) clearTimeout(session.suppressPreambleTimer);
+        // Self-clear so a stale capture can't suppress an unrelated later message.
+        session.suppressPreambleTimer = setTimeout(() => { session._suppressPreambleText = null; }, 600_000);
+        if (typeof session.suppressPreambleTimer.unref === 'function') session.suppressPreambleTimer.unref();
+        if (session.sendHtml) session.sendHtml(preamble, markdownToHtml(preamble));
+        else session.sendCallback(preamble);
+      }
+    } catch (e) { debug('extractPreamble failed:', e?.message); }
+  }
+  // Prefer native buttons when the prompt is a clean selection menu and a
+  // button channel is wired. promptButtons returns null for free-text /
+  // multi-select / unlabelable prompts, which fall through to the text
+  // rendering below. pendingInteractivePrompt is set by the caller
+  // (iv.on('prompt')) regardless, so a tap routes via the prompt-opt handler.
+  if (session.sendButtonMessage) {
+    const b = promptButtons(prompt);
+    if (b) {
+      const header = prompt.question || 'Claude is asking';
+      // Include each option's description (when the detector captured one, e.g.
+      // AskUserQuestion menus) so the user has the per-option detail before
+      // choosing — the buttons themselves only carry the short label.
+      const descOf = (i) => (prompt.options && prompt.options[i] && prompt.options[i].description) || '';
+      const plain = ['Claude is asking:', prompt.question || '', '',
+        ...b.buttons.map((bt, i) => {
+          const d = descOf(i);
+          return `${i + 1}. ${bt.label}${d ? `\n    ${d}` : ''}`;
+        })].filter(Boolean).join('\n');
+      const anyDesc = b.buttons.some((_, i) => descOf(i));
+      const htmlOpts = b.buttons.map((bt, i) => {
+        const d = descOf(i);
+        return `<b>${i + 1}. ${escapeHtml(bt.label)}</b>${d ? `<br/><i>${escapeHtml(d)}</i>` : ''}`;
+      }).join(anyDesc ? '<br/>' : ' · ');
+      const html = `<b>🟡 Claude is asking:</b>` +
+        (prompt.question ? `<br/><i>${escapeHtml(prompt.question)}</i>` : '') +
+        `<br/><br/>${htmlOpts}`;
+      // If a newer prompt superseded this one while we were composing, bail —
+      // don't post buttons for a stale prompt against the current TUI menu.
+      if (session.pendingInteractivePrompt !== prompt) return;
+      // sendButtonMessage returns null if the Matrix send fails. Fall through
+      // to the text rendering below in that case so the prompt is never
+      // silently dropped while the TUI waits for an answer.
+      const sent = await session.sendButtonMessage(header, b.buttons, b.mode, plain, html);
+      if (sent != null) return;
+    }
+  }
+  // Bail if this prompt is no longer current — a newer prompt superseded it
+  // (e.g. arrived during the button send above) or it was already resolved.
+  // Don't post a stale text prompt against the current TUI menu.
+  if (session.pendingInteractivePrompt !== prompt) return;
+  const optionLines = prompt.options.map((opt, i) =>
+    `${i + 1}. ${opt.label}${opt.selected ? ' (current)' : ''}${opt.description ? `\n    ${opt.description}` : ''}`);
   // When the prompt has a detected free-text slot (e.g. "Tell Claude what
   // to change"), tell the user they can reply with text directly. We'll
   // route the reply to that option and pipe their text into the TUI.
@@ -1017,7 +1103,8 @@ function handleInteractivePrompt(session, prompt) {
   ].filter(Boolean).join('\n');
   if (session.sendHtml) {
     const htmlOptions = prompt.options.map((opt, i) =>
-      `<b>${i + 1}.</b> ${escapeHtml(opt.label)}${opt.selected ? ' <i>(current)</i>' : ''}`
+      `<b>${i + 1}.</b> ${escapeHtml(opt.label)}${opt.selected ? ' <i>(current)</i>' : ''}` +
+      (opt.description ? `<br/>&nbsp;&nbsp;&nbsp;&nbsp;<i>${escapeHtml(opt.description)}</i>` : '')
     ).join('<br/>');
     const helpHtml =
       `Reply with the option number (1–${prompt.options.length})` +
@@ -1260,6 +1347,43 @@ function handleInteractiveScreenUpdate(session, update) {
   }
 }
 
+// Safety net for iv-mode: the detector emits `unclassified-prompt` when the
+// settled screen looks like a selection menu it couldn't parse into buttons
+// (e.g. option labels too long). Without this the user would be blind while the
+// TUI waits. Surface a best-effort, cleaned screen dump so they can answer; a
+// later bare number/letter reply is sent as raw keystrokes (see the message
+// handler) to drive the open menu. Detector-side dedup prevents repeats.
+function handleUnclassifiedPrompt(session, { screen }) {
+  if (!session.sendHtml && !session.sendCallback) return;
+  // Clean the raw screen: drop blank lines, keep the tail (the menu sits at the
+  // bottom), and cap length so we don't dump the whole terminal.
+  const cleaned = String(screen || '')
+    .split('\n')
+    .map(l => l.replace(/\s+$/, ''))
+    .filter(l => l.trim().length > 0)
+    .slice(-20)
+    .join('\n')
+    .slice(0, 1500);
+  if (!cleaned) return;
+  const plain = `⚠️ Claude is waiting for input I couldn't turn into buttons. Reply with the option number shown (or send !esc to cancel):\n\n${cleaned}`;
+  const html =
+    `<b>⚠️ Claude is waiting for input I couldn't parse into buttons.</b><br/>` +
+    `Reply with the option number shown (or send <code>!esc</code> to cancel):<br/><pre>${escapeHtml(cleaned)}</pre>`;
+  if (session.sendHtml) session.sendHtml(plain, html);
+  else session.sendCallback(plain);
+  session.pendingUnclassifiedPrompt = true;
+  // Like a structured prompt, this means claude is awaiting the user — clear
+  // busy so the reply is typed into the PTY instead of dropping into the queue.
+  if (session.busy) {
+    session.busy = false;
+    if (session.typingInterval) {
+      clearInterval(session.typingInterval);
+      session.typingInterval = null;
+      client.setTyping(session.roomId, false, 1000).catch(() => {});
+    }
+  }
+}
+
 // Cues for which the bridge auto-sends Enter on the user's behalf.
 // Kept narrow on purpose — only matches phrasing where claude is
 // explicitly waiting for an acknowledgment keystroke ("press enter to
@@ -1433,9 +1557,10 @@ function submitAnswer(session, answerText) {
     sendTextToSession(session, answerText);
   } else {
     // Normal tool_result flow. This path only applies to print-mode stream-
-    // json input; in iv-mode the ask-user MCP server returns answers over
-    // its own stdio transport and this branch is unreachable. Log if it ever
-    // fires under iv-mode so we notice an unexpected code path.
+    // json input. In iv-mode, user questions are surfaced and answered via the
+    // PromptDetector → buttons/text path (handleInteractivePrompt +
+    // respondToPrompt), so this tool_result branch is unreachable there. Log if
+    // it ever fires under iv-mode so we notice an unexpected code path.
     if (session.iv) {
       debug('iv-mode: skipping legacy tool_result stdin.write (ask-user MCP should handle this).');
       return;
@@ -1598,6 +1723,12 @@ function handleSubagentEvent(session, { label, event }) {
 }
 
 function handleClaudeEvent(session, event) {
+  // Capture the current model from any event that carries message.model.
+  // This is the reliable source in iv-mode, where the system/init event (and
+  // thus session.initData.model) never arrives.
+  const capturedModel = modelFromEvent(event);
+  if (capturedModel) session.currentModel = capturedModel;
+
   // Capture session ID from any event that carries it.
   if (event.session_id && !session.claudeSessionId) {
     session.claudeSessionId = event.session_id;
@@ -1672,7 +1803,25 @@ function handleClaudeEvent(session, event) {
         // no visible progress. Print-mode keeps its existing accumulate-
         // and-flush-on-result flow.
         if (session.iv && !isPartial && session.responseBuffer.trim() && !session.waitingForAnswer) {
-          flushResponse(session);
+          // If this assistant text is the prose we already surfaced as a
+          // preamble (before an AskUserQuestion), drop the post-answer
+          // duplicate instead of flushing it again. Only fires for a complete
+          // pre-answer capture (see handleInteractivePrompt).
+          const matchesPreamble = session._suppressPreambleText &&
+            preambleMatchesText(session._suppressPreambleText, session.responseBuffer);
+          // Either way, retire the suppression flag after this first post-set
+          // assistant flush — it's either the duplicate (drop it) or proof the
+          // duplicate isn't coming (don't leave it armed into later turns).
+          if (session._suppressPreambleText) {
+            session._suppressPreambleText = null;
+            if (session.suppressPreambleTimer) { clearTimeout(session.suppressPreambleTimer); session.suppressPreambleTimer = null; }
+          }
+          if (matchesPreamble) {
+            debug('Suppressing post-answer duplicate of surfaced preamble');
+            session.responseBuffer = '';
+          } else {
+            flushResponse(session);
+          }
           // Clear the prompt detector buffer after flushing an assistant
           // response so numbered lists in the response text don't trigger
           // false-positive prompt detections during the post-response idle.
@@ -1726,6 +1875,14 @@ function handleClaudeEvent(session, event) {
 
         if (toolName === 'AskUserQuestion') {
           debug(`AskUserQuestion tool_use block.id=${block.id}, waitingForAnswer=${session.waitingForAnswer}, input keys=${Object.keys(input).join(',')}`);
+          // iv-mode: the AskUserQuestion menu renders in the TUI and is surfaced
+          // + answered via the PromptDetector path (handleInteractivePrompt +
+          // respondToPrompt keystrokes). Surfacing it again here as buttons
+          // would duplicate the prompt, and the button answer would route via
+          // sendTextToSession (a regular message), which can't drive the open
+          // menu. So this transcript→buttons path is print-mode only — matching
+          // the sibling tool_result flow (see resolveQuestionAnswer).
+          if (session.iv) { debug('iv-mode: AskUserQuestion owned by PTY detector'); continue; }
           if (session.waitingForAnswer) { debug('Skipping AskUserQuestion — already waiting'); continue; }
 
           const parsed = parseAskUserQuestion(input);
@@ -2059,7 +2216,8 @@ function handleClaudeEvent(session, event) {
         // and MUST NOT clear busy here — their real Stop hook fires when the
         // interrupted turn completes.
         const trigger = event.compactMetadata?.trigger;
-        if (session._operatorCompactPending && trigger === 'manual') {
+        if (session._operatorCompactPending && trigger === 'manual'
+            && session.turnCount === session._operatorCompactPendingTurn) {
           session._operatorCompactPending = false;
           if (session._operatorCompactTimer) {
             clearTimeout(session._operatorCompactTimer);
@@ -2853,6 +3011,7 @@ const MATRON_COMMANDS = [
   { command: 'working', description: 'Toggle tool call visibility' },
   { command: 'mcp', description: 'Show MCP server status' },
   { command: 'model', description: 'Show current model' },
+  { command: 'effort', args: '[level]', description: 'Show or set effort level' },
   { command: 'cost', description: 'Show session cost' },
   { command: 'usage', description: 'Show token usage' },
   { command: 'tools', description: 'List available tools' },
@@ -3894,6 +4053,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         `  !who — List all users and roles (admin only)\n` +
         `  !mcp — MCP server status\n` +
         `  !model — Current model\n` +
+        `  !effort [level] — Show or set effort level\n` +
         `  !cost — Session cost\n` +
         `  !usage — Token usage\n` +
         `  !tools — Available tools\n` +
@@ -3936,6 +4096,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
           ['!who', 'List all users and roles (admin only)'],
           ['!mcp', 'MCP server status'],
           ['!model', 'Current model'],
+          ['!effort [level]', 'Show or set effort level (low, medium, high, xhigh, max, auto, ultracode)'],
           ['!cost', 'Session cost'],
           ['!usage', 'Token usage'],
           ['!tools', 'Available tools'],
@@ -3976,18 +4137,30 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         const htmlMcp = `<b>MCP Servers</b><table>${htmlRows}</table>`;
         await sendHtml(`MCP Servers (live):\n\n${plainList}`, htmlMcp);
       } else {
+        // No initData.mcp_servers. In iv-mode there is no system/init event, so
+        // live server status is never exposed — fall back to the bridge's
+        // configured servers, but don't claim "no active session" when one is
+        // actually running. The live set may also include servers from the
+        // user's own Claude config that the bridge can't enumerate here.
+        const live = !!session?.alive;
         try {
           const configPath = path.join(__dirname, 'mcp-config.json');
           const config = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
           const names = Object.keys(config.mcpServers || {});
           if (names.length === 0) {
-            await sendReply('No MCP servers configured.');
+            await sendReply(live
+              ? "Live MCP status isn't available in interactive mode, and the bridge configures no servers."
+              : 'No MCP servers configured.');
           } else {
             const list = names.map(n => `⚪ ${n} — configured`).join('\n');
-            await sendReply(`MCP Servers (from config, no active session):\n\n${list}\n\nStart a session to see live status.`);
+            await sendReply(live
+              ? `Live MCP status isn't available in interactive mode.\nBridge-configured servers:\n\n${list}\n\n(Other servers from your Claude config may also be connected.)`
+              : `MCP Servers (from config, no active session):\n\n${list}\n\nStart a session to see live status.`);
           }
         } catch {
-          await sendReply('No MCP config found and no active session.');
+          await sendReply(live
+            ? "Live MCP status isn't available in interactive mode."
+            : 'No MCP config found and no active session.');
         }
       }
       break;
@@ -3995,25 +4168,110 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
 
     case '!model': {
       const session = sessions.get(roomId);
-      // With an argument: set the spawn-default model for FUTURE sessions.
-      if (parts.length > 1) {
+      const activeSession = session?.alive ? session : null;
+      const rawArg = parts.slice(1).join(' ').trim();
+      const inSessionOnlyAliases = new Set(['default', 'opusplan']);
+      const modelHas1m = (model) => /\[1m\]$/i.test(String(model || ''));
+      const liveModelForContext = activeSession
+        ? (activeSession.currentModel || activeSession.initData?.model || spawnModel)
+        : null;
+      const liveHad1m = modelHas1m(liveModelForContext);
+      const liveSwitchArgFor = (model) => {
+        if (modelHas1m(model)) return model;
+        return liveHad1m && ONE_M_CAPABLE.has(model) ? `${model}[1m]` : model;
+      };
+
+      if (rawArg) {
+        const normalizedArg = rawArg.toLowerCase().replace(/\s+/g, ' ');
         const { model, error } = resolveSpawnModelInput(parts.slice(1));
-        if (error) { await sendReply(`⚠️ ${error}`); break; }
+        if (error) {
+          if (inSessionOnlyAliases.has(normalizedArg)) {
+            if (activeSession) {
+              switchModelInSession(activeSession, normalizedArg, sendReply);
+            } else {
+              await sendReply(`⚠️ "${normalizedArg}" is an in-session-only model alias. Start a session to use it, or choose an explicit spawn model.`);
+            }
+            break;
+          }
+          await sendReply(`⚠️ ${error}`);
+          break;
+        }
+
+        const liveSwitchArg = activeSession ? liveSwitchArgFor(model) : null;
         spawnModel = model;
         try { saveSpawnModel(model); } catch (e) { debug('saveSpawnModel failed: %s', e?.message); }
-        await sendReply(`✅ Spawn model set to ${model} (persisted across restarts). Applies to new sessions, and to existing ones on their next restart/resume — not the current live turn.`);
+
+        if (activeSession) {
+          await sendReply(`✅ Spawn model set to ${model} (persisted across restarts). Switching this live session too.`);
+          switchModelInSession(activeSession, liveSwitchArg, sendReply);
+        } else {
+          await sendReply(`✅ Spawn model set to ${model} (persisted across restarts). Applies to new sessions.`);
+        }
         break;
       }
+
       // No argument: show the spawn default + this room's live model + version.
       const opts = [...new Set(Object.keys(MODEL_ALIASES))].join(', ');
-      let msg = `🔧 Spawn model (new sessions): ${spawnModel}`;
-      if (session?.initData) {
-        msg += `\nThis room's live model: ${session.initData.model || '(unknown)'}` +
-               `  ·  Claude Code v${session.initData.claude_code_version || '?'}` +
-               `  ·  Fast: ${session.initData.fast_mode_state || 'off'}`;
+      if (!activeSession) {
+        await sendReply(`🔧 Spawn model (new sessions): ${spawnModel || '(Claude default)'}\nSet default with: !model <name> [1m]\nOptions: ${opts}   (append 1m for the 1M window on opus/sonnet)`);
+        break;
       }
-      msg += `\nSet default with: !model <name> [1m]\nOptions: ${opts}   (append 1m for the 1M window on opus/sonnet)`;
-      await sendReply(msg);
+
+      const current = activeSession.currentModel || activeSession.initData?.model || null;
+      const extra = activeSession.initData
+        ? `\nClaude Code: v${activeSession.initData.claude_code_version || '(unknown)'}\nFast mode: ${activeSession.initData.fast_mode_state || 'off'}`
+        : '';
+      const currentLine = current ? `Current model: ${current}` : 'Current model: (appears after the first reply)';
+      if (activeSession.iv) {
+        // A live TUI means switching works. Prefer buttons, but fall back to a
+        // typed-command hint when no button channel is wired (e.g. some
+        // auto-started sessions) — never claim "needs interactive mode" here.
+        if (activeSession.sendButtonMessage) {
+          const buttons = modelButtons();
+          const plain = `${currentLine}${extra}\nSpawn model (new sessions): ${spawnModel || '(Claude default)'}\n\nTap a model to switch this session, or type /model <name>.`;
+          const htmlButtons = buttons.map(b => `<b>${escapeHtml(b.label)}</b>`).join(' · ');
+          const html = `<b>🧠 ${escapeHtml(currentLine)}</b>${extra ? '<br/>' + escapeHtml(extra.trim()).replace(/\n/g, '<br/>') : ''}` +
+            `<br/>Spawn model (new sessions): <code>${escapeHtml(spawnModel || '(Claude default)')}</code>` +
+            `<br/><br/>Tap a model to switch this session, or type <code>/model &lt;name&gt;</code>.<br/>${htmlButtons}`;
+          activeSession.sendButtonMessage(currentLine, buttons, 'pick_one', plain, html);
+        } else {
+          await sendReply(`${currentLine}${extra}\nSpawn model (new sessions): ${spawnModel || '(Claude default)'}\n\nType /model <name> to switch this session (e.g. /model sonnet). Options: ${VALID_ALIAS_HINT}.`);
+        }
+      } else {
+        await sendReply(`${currentLine}${extra}\nSpawn model (new sessions): ${spawnModel || '(Claude default)'}\n\nSwitching models needs interactive mode.`);
+      }
+      break;
+    }
+
+    case '!effort': {
+      const session = sessions.get(roomId);
+      if (!session || !session.alive) {
+        await sendReply('No active session. Start a session to set the effort level.');
+        break;
+      }
+      const arg = parts[1];
+      if (arg) {
+        switchEffortInSession(session, arg, sendReply);
+        break;
+      }
+      // No-arg: offer buttons. Bare /effort in the TUI opens a "Change effort
+      // level?" arrow-menu the bridge can't drive (paste+Enter just opens it
+      // and leaves it hanging), so present the levels as Matrix buttons and
+      // dispatch the pick back through switchEffortInSession (which sends
+      // `/effort <level>` inline — no picker).
+      if (session.iv) {
+        if (session.sendButtonMessage) {
+          const buttons = effortButtons();
+          const plain = `Effort level\n\nTap a level to set it, or type /effort <level>.`;
+          const htmlButtons = buttons.map(b => `<b>${escapeHtml(b.label)}</b>`).join(' · ');
+          const html = `<b>🎚️ Effort level</b><br/><br/>Tap a level to set it for this session, or type <code>/effort &lt;level&gt;</code>.<br/>${htmlButtons}`;
+          session.sendButtonMessage('Effort level', buttons, 'pick_one', plain, html);
+        } else {
+          await sendReply(`Type /effort <level> to set the effort level. Options: ${VALID_EFFORT_HINT}.`);
+        }
+      } else {
+        await sendReply(`Changing effort needs interactive mode. Options: ${VALID_EFFORT_HINT}.`);
+      }
       break;
     }
 
@@ -4066,8 +4324,15 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
 
     case '!tools': {
       const session = sessions.get(roomId);
-      if (!session?.initData?.tools) {
-        await sendReply('No session data available. Start a session first.');
+      if (!session || !session.alive) {
+        await sendReply('No active session. Start a session first.');
+        break;
+      }
+      if (!session.initData?.tools) {
+        // iv-mode has no system/init event, so the authoritative tool list is
+        // never exposed to the bridge. Be honest rather than implying there's
+        // no session (the on-disk transcript only carries partial tool deltas).
+        await sendReply("The tool list isn't available in interactive mode.");
         break;
       }
       const tools = session.initData.tools;
@@ -4166,7 +4431,7 @@ client.on('room.message', async (roomId, event) => {
     const bridgeCommandNames = new Set([
       'start', 'stop', 'restart', 'resume', 'workdir', 'status',
       'show', 'show_working', 'working', 'sessions', 'help',
-      'mcp', 'model', 'cost', 'usage', 'tools',
+      'mcp', 'model', 'effort', 'cost', 'usage', 'tools',
       'esc', 'escape', 'clearall', 'flush',
       'label', 'role', 'who',
     ]);
@@ -4215,6 +4480,12 @@ client.on('room.message', async (roomId, event) => {
       const newSession = createSession(roomId, workdir);
       newSession.sendCallback = sendReply;
       newSession.sendHtml = sendHtmlFn;
+      // Wire the button channel like every other session-creation path (the
+      // auto-resume branch above, /start, /resume) so button-based features
+      // (/model picker, AskUserQuestion, queue actions) work in auto-started
+      // sessions instead of silently degrading to text-only.
+      newSession.sendButtonMessage = (prompt, buttons, mode, plainText, html) =>
+        sendButtonMessage(roomId, prompt, buttons, mode, plainText, html);
       session = newSession;
 
       const autoNotice = notice('info',
@@ -4224,9 +4495,52 @@ client.on('room.message', async (roomId, event) => {
     }
   }
 
-  // iv-mode: route reply to a pending TUI prompt before treating it as a
-  // normal message. If we consumed it as a prompt response, return.
-  if (session.iv && maybeResolveInteractivePrompt(session, text)) {
+  // iv-mode: route a typed reply to a pending TUI prompt before treating it as
+  // a normal message. If we consumed it as a prompt response, return.
+  //
+  // Skip this for button responses. A prompt surfaced as buttons (prompt-opt:)
+  // is answered by the dedicated dispatch below, not here; and other button
+  // actions (effort:/model:/interrupt/cancel:) are never prompt answers.
+  // Without this guard, tapping an effort/model picker while a TUI prompt is
+  // pending — e.g. the "Change effort level?" confirm raised by a prior effort
+  // tap — hits maybeResolve's unmatched path, which nulls pendingInteractivePrompt
+  // WITHOUT answering the TUI and falls through, so the button value then types
+  // a stray /effort|/model into the still-open menu, desyncing the PTY.
+  const isButtonResponse = !!event.content[`${MATRIX_EVENT_NAMESPACE}.button_response`];
+  if (session.iv && !isButtonResponse && maybeResolveInteractivePrompt(session, text)) {
+    // Answering a classified prompt also retires any stale best-effort
+    // unclassified-prompt gate, so later messages aren't wrongly intercepted.
+    session.pendingUnclassifiedPrompt = false;
+    return;
+  }
+
+  // Reply to a detector-missed menu surfaced via handleUnclassifiedPrompt. A
+  // bare option number/letter is driven into the open TUI selection through
+  // respondToPrompt (sends the digits/letter then a delayed Enter, like a
+  // classified prompt — bracketed-paste sendText wouldn't select). Any OTHER
+  // reply is NOT typed into the menu (that would desync the PTY): we keep the
+  // prompt pending and tell the user how to answer or cancel.
+  // `!`-prefixed rescue commands (!esc/!enter/!stop/…) must pass through to
+  // their handlers below — the unclassified notice tells the user to send !esc
+  // to cancel, so we must not swallow it here.
+  if (session.pendingUnclassifiedPrompt && session.iv && session.iv.alive && !isButtonResponse
+      && !text.trim().startsWith('!')) {
+    const sel = text.trim();
+    if (/^\d{1,3}$/.test(sel)) {
+      session.pendingUnclassifiedPrompt = false;
+      // Don't reset the detector dedup — the just-answered screen may linger a
+      // moment, and resetting would let it re-emit unclassified-prompt.
+      session.iv.respondToPrompt({ kind: 'numbered', key: sel }, { resetDetector: false });
+      return;
+    }
+    if (/^[a-zA-Z]$/.test(sel)) {
+      session.pendingUnclassifiedPrompt = false;
+      session.iv.respondToPrompt({ kind: 'lettered', key: sel }, { resetDetector: false });
+      return;
+    }
+    const guide = "That doesn't look like one of the options. Reply with the option number shown, or send !esc to cancel the menu.";
+    if (session.sendHtml) session.sendHtml(guide, escapeHtml(guide));
+    else if (session.sendCallback) session.sendCallback(guide);
     return;
   }
 
@@ -4278,6 +4592,37 @@ client.on('room.message', async (roomId, event) => {
             ? '✕ Cancelled queued message (queue empty)'
             : `✕ Cancelled queued message (${remaining} remaining)`);
         }
+      }
+      return;
+    }
+
+    // Model picker button (no-arg /model) — value is `model:<alias>`.
+    const modelMatch = value.match(/^model:(.+)$/);
+    if (modelMatch) {
+      switchModelInSession(session, modelMatch[1], sendReply);
+      return;
+    }
+
+    // Effort picker button (no-arg /effort) — value is `effort:<level>`.
+    const effortMatch = value.match(/^effort:(.+)$/);
+    if (effortMatch) {
+      switchEffortInSession(session, effortMatch[1], sendReply);
+      return;
+    }
+
+    // Detected-prompt button — value is `prompt-opt:<index>`. Drive the open
+    // TUI menu via keystrokes (the only correct iv-mode answer channel). The
+    // fix/effort-command guard already skips maybeResolveInteractivePrompt for
+    // button responses, so this won't be mis-consumed as a typed reply.
+    const promptOptMatch = value.match(/^prompt-opt:(\d+)$/);
+    if (promptOptMatch) {
+      const p = session.pendingInteractivePrompt;
+      const resp = p ? promptResponseForButton(p, Number(promptOptMatch[1])) : null;
+      if (p && resp && session.iv && session.iv.alive) {
+        session.pendingInteractivePrompt = null;
+        // Answering also retires any stale unclassified-prompt gate.
+        session.pendingUnclassifiedPrompt = false;
+        session.iv.respondToPrompt(resp);
       }
       return;
     }
@@ -4424,6 +4769,9 @@ client.on('room.message', async (roomId, event) => {
     if (lower === '!esc' || lower === '!escape' || lower === '!stop') {
       try {
         session.iv.sendKeystroke('esc');
+        // Esc dismisses any open menu, so a best-effort unclassified-prompt is
+        // no longer pending.
+        session.pendingUnclassifiedPrompt = false;
         clearBusyAfterEsc(session);
         await sendReply('⎋ Sent Esc to claude (cancels the current turn / dismisses prompts).');
       } catch (err) {
@@ -4571,8 +4919,16 @@ client.on('room.message', async (roomId, event) => {
   // also trigger='manual' but DOES continue into a real turn + Stop hook, so
   // it must not be cleared here. Self-clears after a generous window in case
   // compaction fails and no boundary event ever arrives.
-  if (isClaudeSlashCommand && /^\/compact(\s|$)/.test(text.trim())) {
+  //
+  // Two further guards keep the fallback from clearing busy for the WRONG
+  // turn: (1) only arm when the session is idle now — a /compact typed while
+  // a turn is still running will be cleared by that turn's own Stop hook, so
+  // arming would risk a later boundary clearing busy mid-next-turn; (2) stamp
+  // the current turnCount and only honour the boundary if it hasn't advanced
+  // (a real turn-end in between both increments it and disarms the flag).
+  if (isClaudeSlashCommand && /^\/compact(\s|$)/.test(text.trim()) && !session.busy) {
     session._operatorCompactPending = true;
+    session._operatorCompactPendingTurn = session.turnCount;
     if (session._operatorCompactTimer) clearTimeout(session._operatorCompactTimer);
     session._operatorCompactTimer = setTimeout(() => {
       session._operatorCompactTimer = null;
@@ -4761,8 +5117,6 @@ client.on('room.event', async (roomId, event) => {
     console.error('[ERROR] room.event membership handler:', err);
   }
 });
-
-// --- MCP Question Store ---
 
 const pendingMcpQuestions = new Map();
 let mcpQuestionCounter = 0;
@@ -4971,7 +5325,7 @@ const apiServer = createServer(async (req, res) => {
           // (handleClaudeEvent flushes text before the tool_use loop). The
           // timeout is the safety net if that transcript event never arrives.
           const surfaceState = { surfaced: false, timer: null };
-          const surface = (source) => {
+          const surface = (_source) => {
             if (surfaceState.surfaced) return;
             surfaceState.surfaced = true;
             if (surfaceState.timer) { clearTimeout(surfaceState.timer); surfaceState.timer = null; }
@@ -5409,11 +5763,6 @@ function killSession(session, signal = 'SIGTERM') {
   if (session.subagentWatcher) {
     session.subagentWatcher.stop().catch(() => {});
     session.subagentWatcher = null;
-  }
-  // Drop any pending MCP questions for this room — the MCP server that
-  // owns them died with the session, so the entries would otherwise leak.
-  for (const [qid, entry] of pendingMcpQuestions) {
-    if (entry.roomId === session.roomId) pendingMcpQuestions.delete(qid);
   }
   if (!session.alive) return;
   try {
