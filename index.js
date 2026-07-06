@@ -253,6 +253,27 @@ function expandHome(p) {
   return p;
 }
 
+// A matron-tee'd Bash command surfaces its REWRITTEN form in
+// `task_notification.summary`:
+//   <matron-tee> /tmp/matron-cmd-<tool_use_id>.log -- bash -c '<original @sh-quoted>'
+// That wrapper is an internal disk-tail-capture detail (matron-bash-tee.sh
+// PreToolUse hook) the operator should never see. Recover the original command
+// for display; non-matron-tee summaries (Agent/Task subagents) pass through
+// unchanged.
+function unwrapMatronTee(summary) {
+  if (typeof summary !== 'string') return summary;
+  const m = summary.match(/matron-tee\s+\/tmp\/matron-cmd-\S+?\.log\s+--\s+bash\s+-c\s+([\s\S]*)$/);
+  if (!m) return summary;
+  let body = m[1].trim();
+  // jq @sh emits a POSIX single-quoted string (embedded ' -> '\''). Reverse it.
+  if (body.startsWith("'")) {
+    body = body.slice(1);
+    if (body.endsWith("'")) body = body.slice(0, -1);
+    body = body.replace(/'\\''/g, "'");
+  }
+  return body;
+}
+
 function generateFileLink(filePath) {
   if (!HMAC_SECRET || !VIEWER_BASE_URL) return null;
   const exp = Math.floor((Date.now() + LINK_EXPIRY_MS) / 1000);
@@ -2197,9 +2218,26 @@ function handleClaudeEvent(session, event) {
         }
       } else if (event.subtype === 'task_notification') {
         const isComplete = event.status === 'completed';
-        const taskPlain = `${isComplete ? '✅' : '❌'} Task: ${event.summary || 'unknown'}`;
+        const emoji = isComplete ? '✅' : '❌';
+        // Recover the original command (strip the matron-tee wrapper) and show
+        // a short one-line preview; the full command goes in a collapsible
+        // <pre><code> block so multi-line commands don't wall off the room.
+        // Mirrors the >15-line code-block rendering in markdownToHtml.
+        const full = unwrapMatronTee(event.summary || 'unknown');
+        const oneLine = full.replace(/\s+/g, ' ').trim();
+        const preview = oneLine.length > 100 ? oneLine.slice(0, 100) + '…' : oneLine;
+        const taskPlain = `${emoji} Task: ${preview}`;
         if (session.sendHtml) {
-          const n = notice(isComplete ? 'success' : 'error', taskPlain);
+          let taskHtml;
+          if (full.includes('\n') || oneLine.length > preview.length) {
+            // <pre> preserves whitespace; encode newlines as &#10; because
+            // Matrix custom HTML collapses raw "\n" (see line ~2812).
+            const codeHtml = escapeHtml(full).replace(/\n/g, '&#10;');
+            taskHtml = `${emoji} Task: <details><summary>${escapeHtml(preview)}</summary><pre><code>${codeHtml}</code></pre></details>`;
+          } else {
+            taskHtml = `${emoji} Task: <code>${escapeHtml(preview)}</code>`;
+          }
+          const n = notice(isComplete ? 'success' : 'error', taskPlain, taskHtml);
           session.sendHtml(n.plain, n.html);
         } else if (session.sendCallback) {
           session.sendCallback(taskPlain);
