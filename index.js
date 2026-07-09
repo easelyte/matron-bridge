@@ -598,6 +598,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
       } else if (exitCode !== 0 && session.restartCount < 3 && !session._resumeFailed) {
         // Don't auto-restart if the workdir or worktree was removed (e.g.
         // worktree cleaned up after merge). The session is legitimately over.
+        discardCoalesceHold(session, 'child-crash');
         const cwdGone = !fs.existsSync(cwd);
         const wtGone = session.worktree && !fs.existsSync(path.join(cwd, '.claude', 'worktrees', session.worktree));
         if (cwdGone || wtGone) {
@@ -3480,7 +3481,30 @@ async function _flushCoalesceBuffer(session, entries) {
   return runCoalesceFlush(session, entries);
 }
 
-function bufferOrDispatchIdle(session, event, { hasMedia, text, msgtype }) {
+function discardCoalesceHold(session, reason, { notify = true } = {}) {
+  const w = session._coalesceWindow;
+  if (!w) return;
+  const n = w.size();
+  w.clear();
+  if (session._coalesceNoticeTimer) {
+    clearTimeout(session._coalesceNoticeTimer);
+    session._coalesceNoticeTimer = null;
+  }
+  if (session._coalesceNoticeEventId) {
+    const plain = `✕ discarded (${n} buffered)`;
+    editMessage(session.roomId, session._coalesceNoticeEventId, plain, escapeHtml(plain));
+    session._coalesceNoticeEventId = null;
+  }
+  if (n > 0) {
+    console.log(`[COALESCE] discarded ${n} buffered on ${reason} (room ${session.roomId})`);
+    if (notify) {
+      const plain = `⚠️ Session ended before dispatch — ${n} buffered message(s) discarded; resend to continue`;
+      sendToRoom(session.roomId, plain, escapeHtml(plain));
+    }
+  }
+}
+
+function bufferOrDispatchIdle(session, event, { hasMedia, msgtype }) {
   const holdOpen = !!session._coalesceWindow && session._coalesceWindow.size() > 0;
   if (COALESCE_WINDOW_MS <= 0 || !shouldBuffer({ hasMedia, holdOpen, universal: COALESCE_UNIVERSAL })) {
     return false;
@@ -5932,6 +5956,7 @@ function killSession(session, signal = 'SIGTERM') {
     session.subagentWatcher.stop().catch(() => {});
     session.subagentWatcher = null;
   }
+  discardCoalesceHold(session, 'killSession');
   if (!session.alive) return;
   try {
     if (session.iv) session.iv.kill(signal);
@@ -5955,6 +5980,7 @@ function startIdleReaper() {
       // resumable on the next user message via the existing auto-resume path.
       const idleHours = Math.round((now - last) / 3600000);
       debug(`Reaping idle session in ${roomId} (idle ${idleHours}h)`);
+      discardCoalesceHold(session, 'idle-reaper', { notify: false });
       session._autoStopped = true;
       killSession(session, 'SIGTERM');
     }
