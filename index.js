@@ -3443,7 +3443,40 @@ const runCoalesceFlush = makeFlusher({
   onError: (err) => console.error('[COALESCE] flush failed', err),
 });
 
+function clearCoalesceNotice(session) {
+  if (session._coalesceNoticeTimer) {
+    clearTimeout(session._coalesceNoticeTimer);
+    session._coalesceNoticeTimer = null;
+  }
+  if (session._coalesceNoticeEventId) {
+    editMessage(session.roomId, session._coalesceNoticeEventId, '✓ Sending collected attachments…');
+    session._coalesceNoticeEventId = null;
+  }
+}
+
+async function postCollectingNotice(session) {
+  session._coalesceNoticeTimer = null;
+  if (!session.sendButtonMessage || session._coalesceNoticeEventId) return;
+  const plain = '📎 Collecting attachments…';
+  const buttons = [
+    { id: 'coalesce-flush', label: 'Send now', value: 'coalesce-flush' },
+  ];
+  const eventId = await session.sendButtonMessage(plain, buttons, 'pick_one', plain, escapeHtml(plain));
+  if (eventId) session._coalesceNoticeEventId = eventId;
+}
+
+function armCoalesceNotice(session) {
+  if (session._coalesceNoticeTimer || session._coalesceNoticeEventId) return;
+  session._coalesceNoticeTimer = setTimeout(() => {
+    postCollectingNotice(session).catch((err) => console.error('[COALESCE] collecting notice failed', err));
+  }, COALESCE_NOTICE_MS);
+  if (typeof session._coalesceNoticeTimer.unref === 'function') {
+    session._coalesceNoticeTimer.unref();
+  }
+}
+
 async function _flushCoalesceBuffer(session, entries) {
+  clearCoalesceNotice(session);
   return runCoalesceFlush(session, entries);
 }
 
@@ -3474,6 +3507,7 @@ function bufferOrDispatchIdle(session, event, { hasMedia, text, msgtype }) {
     name: content.body || content.filename || 'file',
   };
   session._coalesceWindow.push({ event, meta });
+  armCoalesceNotice(session);
   return true;
 }
 
@@ -4684,6 +4718,12 @@ client.on('room.message', async (roomId, event) => {
           session.sendCallback(`⚡ Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''} now:\n${summary.plain}`);
         }
         flushQueue(session, queued);
+      }
+      return;
+    }
+    if (value === 'coalesce-flush') {
+      if (session._coalesceWindow && session._coalesceWindow.size() > 0) {
+        await session._coalesceWindow.flush();
       }
       return;
     }
