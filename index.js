@@ -25,6 +25,7 @@ import { ivUploadDir, ivUploadAnnotation } from './lib/iv-uploads.js';
 import { createCoalesceWindow, mergeContentBlockGroups, shouldBuffer } from './lib/message-coalescer.js';
 import { downloadAndMerge } from './lib/download-merge.js';
 import { resolveMediaCaption } from './lib/media-caption.js';
+import { makeFlusher } from './lib/coalesce-flush-kit.js';
 
 const DEFAULT_BRIDGE_CLAUDE_MD_PATH = path.join(__dirname, 'BRIDGE_CLAUDE.md');
 const FALLBACK_BRIDGE_PROMPT = 'You are running inside a Matrix bridge. The user interacts through Matrix, not a terminal.';
@@ -3401,6 +3402,49 @@ function coalesceFlushDeps(session) {
       if (session.sendCallback) session.sendCallback(`⚠️ Couldn't download ${name || 'file'} — sending the rest without it`);
     },
   };
+}
+
+function clearCoalesceTyping(session) {
+  if (session.typingInterval) {
+    clearInterval(session.typingInterval);
+    session.typingInterval = null;
+  }
+  client.setTyping(session.roomId, false, 1000).catch(() => {});
+}
+
+const runCoalesceFlush = makeFlusher({
+  downloadAndMerge: (entries, session) => downloadAndMerge(entries, session, coalesceFlushDeps(session)),
+  sendToSession,
+  queue: (session, merged) => {
+    (session.queuedMessages ||= []).push(merged);
+  },
+  startTyping: (session) => {
+    if (session.typingInterval) clearInterval(session.typingInterval);
+    session.typingInterval = startTyping(session.roomId);
+  },
+  clearTyping: clearCoalesceTyping,
+  sendUnavailable: (session) => sendToRoom(session.roomId, 'Session is not available. Send !start to begin a new one.'),
+  sendFailureNotice: (session) => sendToRoom(session.roomId, "⚠️ Couldn't process that burst — resend to retry"),
+  onFirstMessage: (session, entries) => {
+    session.firstMessageCaptured = true;
+    const sessionShort = (session.claudeSessionId || session.roomId.slice(1)).slice(0, 2);
+    const first = entries.find((entry) => entry?.meta?.name || entry?.event?.content?.body);
+    const labelText = first?.meta?.name || first?.event?.content?.body || 'message';
+    updateRoomName(session.roomId, `${SERVER_LABEL}:${sessionShort} ${labelText.slice(0, 60)}`);
+  },
+  appendHistory: (session, text) => {
+    if (!session.chatHistory) session.chatHistory = [];
+    session.chatHistory.push({ role: 'user', text });
+    debug(`Added user message to chatHistory, length now: ${session.chatHistory.length}`);
+    if (session.claudeSessionId) {
+      persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { chatHistory: session.chatHistory });
+    }
+  },
+  onError: (err) => console.error('[COALESCE] flush failed', err),
+});
+
+async function _flushCoalesceBuffer(session, entries) {
+  return runCoalesceFlush(session, entries);
 }
 
 function bufferOrDispatchIdle(session, event, { hasMedia, text, msgtype }) {
