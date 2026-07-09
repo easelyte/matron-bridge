@@ -537,6 +537,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     _coalesceWindow: null,        // createCoalesceWindow instance, lazily created on first buffered event.
     _coalesceNoticeEventId: null,
     _coalesceNoticeTimer: null,
+    _coalesceNoticeGen: 0,        // bumped on every notice clear/discard; postCollectingNotice validates it post-await to avoid a stale notice race (final review M2)
     // Captured from system init event
     initData: null,
     currentModel: null,
@@ -3450,6 +3451,7 @@ const runCoalesceFlush = makeFlusher({
 });
 
 function clearCoalesceNotice(session) {
+  session._coalesceNoticeGen = (session._coalesceNoticeGen || 0) + 1;   // invalidate any in-flight notice send (final review M2)
   if (session._coalesceNoticeTimer) {
     clearTimeout(session._coalesceNoticeTimer);
     session._coalesceNoticeTimer = null;
@@ -3467,8 +3469,17 @@ async function postCollectingNotice(session) {
   const buttons = [
     { id: 'coalesce-flush', label: 'Send now', value: 'coalesce-flush' },
   ];
+  const gen = session._coalesceNoticeGen || 0;
   const eventId = await session.sendButtonMessage(plain, buttons, 'pick_one', plain, escapeHtml(plain));
-  if (eventId) session._coalesceNoticeEventId = eventId;
+  if (!eventId) return;
+  if ((session._coalesceNoticeGen || 0) !== gen) {
+    // The hold was flushed/discarded while this notice was in flight — it's
+    // stale. Resolve it rather than leaving a live no-op "Send now" button in
+    // the room (final review M2).
+    editMessage(session.roomId, eventId, '✓ Sending collected attachments…');
+    return;
+  }
+  session._coalesceNoticeEventId = eventId;
 }
 
 function armCoalesceNotice(session) {
@@ -3491,6 +3502,7 @@ function discardCoalesceHold(session, reason, { notify = true } = {}) {
   if (!w) return;
   const n = w.size();
   w.clear();
+  session._coalesceNoticeGen = (session._coalesceNoticeGen || 0) + 1;   // invalidate any in-flight notice send (final review M2)
   if (session._coalesceNoticeTimer) {
     clearTimeout(session._coalesceNoticeTimer);
     session._coalesceNoticeTimer = null;
