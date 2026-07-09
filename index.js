@@ -22,7 +22,7 @@ import { switchEffortInSession, effortButtons, VALID_EFFORT_HINT } from './lib/e
 import { promptButtons, promptResponseForButton } from './lib/prompt-buttons.js';
 import { SubagentWatcher } from './lib/subagent-watcher.js';
 import { ivUploadDir, ivUploadAnnotation } from './lib/iv-uploads.js';
-import { mergeContentBlockGroups } from './lib/message-coalescer.js';
+import { createCoalesceWindow, mergeContentBlockGroups, shouldBuffer } from './lib/message-coalescer.js';
 import { downloadAndMerge } from './lib/download-merge.js';
 import { resolveMediaCaption } from './lib/media-caption.js';
 
@@ -3403,6 +3403,36 @@ function coalesceFlushDeps(session) {
   };
 }
 
+function bufferOrDispatchIdle(session, event, { hasMedia, text, msgtype }) {
+  const holdOpen = !!session._coalesceWindow && session._coalesceWindow.size() > 0;
+  if (COALESCE_WINDOW_MS <= 0 || !shouldBuffer({ hasMedia, holdOpen, universal: COALESCE_UNIVERSAL })) {
+    return false;
+  }
+
+  if (!session._coalesceWindow) {
+    session._coalesceWindow = createCoalesceWindow({
+      quietMs: COALESCE_WINDOW_MS,
+      hardCapMs: COALESCE_HARDCAP_MS,
+      now: Date.now,
+      setTimer: (fn, ms) => {
+        const timer = setTimeout(fn, ms);
+        if (typeof timer.unref === 'function') timer.unref();
+        return timer;
+      },
+      clearTimer: clearTimeout,
+      onFlush: (entries) => _flushCoalesceBuffer(session, entries),
+    });
+  }
+
+  const content = event.content || {};
+  const meta = {
+    msgtype,
+    name: content.body || content.filename || 'file',
+  };
+  session._coalesceWindow.push({ event, meta });
+  return true;
+}
+
 // --- Command Handler ---
 
 async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
@@ -4975,6 +5005,10 @@ client.on('room.message', async (roomId, event) => {
       session._operatorCompactPending = false;
     }, 300_000);
     if (typeof session._operatorCompactTimer.unref === 'function') session._operatorCompactTimer.unref();
+  }
+
+  if (bufferOrDispatchIdle(session, event, { hasMedia, text, msgtype })) {
+    return;
   }
 
   if (hasMedia) {
