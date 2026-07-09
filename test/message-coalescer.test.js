@@ -150,4 +150,15 @@ describe('downloadAndMerge', () => {
       { buildMediaContentBlocks: async () => { throw new Error('404'); }, reportFailure: () => {} });
     expect(out).toEqual([{ type: 'text', text: 'review\n\n[attachment "a.png" failed to download and was omitted]' }]);
   });
+
+  it('a failed transcribe notice does not abort the batch (best-effort, Phase-1 review M1)', async () => {
+    const mkAudio = (name) => ({ event: { content: { msgtype: 'm.audio' } }, meta: { msgtype: 'm.audio', name } });
+    const out = await downloadAndMerge([mkText('here'), mkAudio('note.ogg')], {}, {
+      buildMediaContentBlocks: async () => [{ type: 'text', text: 'transcription: hi' }],
+      sendTranscribeNotice: async () => { throw new Error('matrix notice send failed'); },
+      reportFailure: () => {},
+    });
+    // notice send rejected, but the audio still transcribed and merged with the text
+    expect(out).toEqual([{ type: 'text', text: 'here\n\ntranscription: hi' }]);
+  });
 });
