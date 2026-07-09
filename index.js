@@ -21,9 +21,10 @@ import { switchModelInSession, modelButtons } from './lib/model-command.js';
 import { switchEffortInSession, effortButtons, VALID_EFFORT_HINT } from './lib/effort-command.js';
 import { promptButtons, promptResponseForButton } from './lib/prompt-buttons.js';
 import { SubagentWatcher } from './lib/subagent-watcher.js';
-import { ivUploadDir, resolveUploadMeta, ivUploadAnnotation } from './lib/iv-uploads.js';
+import { ivUploadDir, ivUploadAnnotation } from './lib/iv-uploads.js';
 import { mergeContentBlockGroups } from './lib/message-coalescer.js';
 import { downloadAndMerge } from './lib/download-merge.js';
+import { resolveMediaCaption } from './lib/media-caption.js';
 
 const DEFAULT_BRIDGE_CLAUDE_MD_PATH = path.join(__dirname, 'BRIDGE_CLAUDE.md');
 const FALLBACK_BRIDGE_PROMPT = 'You are running inside a Matrix bridge. The user interacts through Matrix, not a terminal.';
@@ -3323,7 +3324,7 @@ async function buildMediaContentBlocks(event, session) {
   if (!mxcUrl) return blocks;
 
   const buffer = await downloadMatrixFile(mxcUrl, content.file);
-  const fileName = content.body || 'file';
+  const { filename: fileName, caption } = resolveMediaCaption(content);
   const mime = content.info?.mimetype || 'application/octet-stream';
 
   if (content.msgtype === 'm.audio') {
@@ -3333,9 +3334,8 @@ async function buildMediaContentBlocks(event, session) {
     // iv-mode: the PTY is text-only. Save the file OUTSIDE the repo and type
     // only an absolute-path annotation; Claude reads it with its Read tool.
     // No base64 blocks and no inline content dump (SDK mode keeps those).
-    const { filename, caption } = resolveUploadMeta(content);
     const dir = ivUploadDir(session.roomId);
-    const savePath = deduplicateFilename(dir, filename);
+    const savePath = deduplicateFilename(dir, fileName);
     fs.writeFileSync(savePath, buffer);
     blocks.push({ type: 'text', text: ivUploadAnnotation({ msgtype: content.msgtype, savePath, caption }) });
     return blocks; // caption already folded in; skip the SDK caption append below
@@ -3373,9 +3373,8 @@ async function buildMediaContentBlocks(event, session) {
     }
   }
 
-  // Caption: for m.file events, the filename differs from body when there's a caption
-  if (content.msgtype === 'm.file' && content.filename !== content.body) {
-    blocks.push({ type: 'text', text: content.body });
+  if (caption) {
+    blocks.push({ type: 'text', text: caption });
   }
 
   return blocks;
