@@ -592,13 +592,18 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     flushResponse(session);
 
     if (sessions.get(roomId) === session) {
+      // Discard any held coalesce buffer on EVERY child-exit path — restart,
+      // terminal, and reap — so an armed quiet/hard-cap timer can't later fire
+      // against a dead session and silently lose the buffer (Phase-3 review B1).
+      // Silent for the idle-reaper path (documented silent-reap invariant); a
+      // count-bearing notice on the crash/terminal paths.
+      discardCoalesceHold(session, session._autoStopped ? 'idle-reaper' : 'child-crash', { notify: !session._autoStopped });
       if (session._autoStopped) {
         // Idle reaper already posted its own notice; just clean up.
         sessions.delete(roomId);
       } else if (exitCode !== 0 && session.restartCount < 3 && !session._resumeFailed) {
         // Don't auto-restart if the workdir or worktree was removed (e.g.
         // worktree cleaned up after merge). The session is legitimately over.
-        discardCoalesceHold(session, 'child-crash');
         const cwdGone = !fs.existsSync(cwd);
         const wtGone = session.worktree && !fs.existsSync(path.join(cwd, '.claude', 'worktrees', session.worktree));
         if (cwdGone || wtGone) {
@@ -3498,7 +3503,9 @@ function discardCoalesceHold(session, reason, { notify = true } = {}) {
   if (n > 0) {
     console.log(`[COALESCE] discarded ${n} buffered on ${reason} (room ${session.roomId})`);
     if (notify) {
-      const plain = `⚠️ Session ended before dispatch — ${n} buffered message(s) discarded; resend to continue`;
+      const plain = reason && reason.startsWith('command:')
+        ? `✕ Discarded ${n} buffered message(s) — !${reason.slice('command:'.length)}`
+        : `⚠️ Session ended before dispatch — ${n} buffered message(s) discarded; resend to continue`;
       sendToRoom(session.roomId, plain, escapeHtml(plain));
     }
   }
@@ -4605,17 +4612,11 @@ client.on('room.message', async (roomId, event) => {
     if (bridgeCommandNames.has(cmdName)) {
       const held = sessions.get(roomId);
       if (held?._coalesceWindow?.size() > 0) {
-        const heldCount = held._coalesceWindow.size();
         if (commandHoldAction(cmdName) === 'discard') {
-          held._coalesceWindow.clear();
-          if (held._coalesceNoticeTimer) {
-            clearTimeout(held._coalesceNoticeTimer);
-            held._coalesceNoticeTimer = null;
-          }
-          if (held._coalesceNoticeEventId) {
-            await editMessage(roomId, held._coalesceNoticeEventId, `✕ discarded (${heldCount} buffered)`);
-            held._coalesceNoticeEventId = null;
-          }
+          // Fail-visible even if the 1500ms collecting notice hasn't posted yet
+          // (Phase-3 review B2): discardCoalesceHold emits a count-bearing room
+          // notice unconditionally when n > 0, not only an edit of an existing notice.
+          discardCoalesceHold(held, `command:${cmdName}`);
         } else {
           await held._coalesceWindow.flush();
         }
