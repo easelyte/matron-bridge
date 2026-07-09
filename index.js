@@ -23,6 +23,7 @@ import { promptButtons, promptResponseForButton } from './lib/prompt-buttons.js'
 import { SubagentWatcher } from './lib/subagent-watcher.js';
 import { ivUploadDir, resolveUploadMeta, ivUploadAnnotation } from './lib/iv-uploads.js';
 import { mergeContentBlockGroups } from './lib/message-coalescer.js';
+import { downloadAndMerge } from './lib/download-merge.js';
 
 const DEFAULT_BRIDGE_CLAUDE_MD_PATH = path.join(__dirname, 'BRIDGE_CLAUDE.md');
 const FALLBACK_BRIDGE_PROMPT = 'You are running inside a Matrix bridge. The user interacts through Matrix, not a terminal.';
@@ -3378,6 +3379,22 @@ async function buildMediaContentBlocks(event, session) {
   }
 
   return blocks;
+}
+
+function coalesceFlushDeps(session) {
+  return {
+    buildMediaContentBlocks,
+    sendTranscribeNotice: () => sendToRoom(session.roomId, 'Transcribing voice note…', 'Transcribing voice note…'),
+    editNotice: (id, blocks) => {
+      if (!id) return;
+      const transcription = blocks.find((b) => b.type === 'text' && /transcription/i.test(b.text || ''));
+      const preview = transcription ? transcription.text.slice(0, 80) : 'Transcribed';
+      editMessage(session.roomId, id, preview, escapeHtml(preview));
+    },
+    reportFailure: (name) => {
+      if (session.sendCallback) session.sendCallback(`⚠️ Couldn't download ${name || 'file'} — sending the rest without it`);
+    },
+  };
 }
 
 // --- Command Handler ---

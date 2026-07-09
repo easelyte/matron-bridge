@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { createCoalesceWindow, mergeContentBlockGroups } from '../lib/message-coalescer.js';
+import { downloadAndMerge } from '../lib/download-merge.js';
 
 function fakeTimers() {
   let t = 0;
@@ -122,5 +123,31 @@ describe('createCoalesceWindow', () => {
     w.clear();
     clk.advance(12000);
     expect(flushed).toEqual([]);
+  });
+});
+
+describe('downloadAndMerge', () => {
+  const mkText = (body) => ({ event: { content: { msgtype: 'm.text', body } }, meta: { msgtype: 'm.text' } });
+  const mkImg = (name) => ({ event: { content: { msgtype: 'm.image' } }, meta: { msgtype: 'm.image', name } });
+
+  it('builds a text block for a text entry without calling the media builder', async () => {
+    const build = async () => { throw new Error('should not be called for text'); };
+    const out = await downloadAndMerge([mkText('hello')], {}, { buildMediaContentBlocks: build, reportFailure: () => {} });
+    expect(out).toEqual([{ type: 'text', text: 'hello' }]);
+  });
+
+  it('inserts a fail-visible marker and continues on a media download failure', async () => {
+    const build = async () => { throw new Error('404'); };
+    const failures = [];
+    const out = await downloadAndMerge([mkText('see this'), mkImg('mock.png')], {},
+      { buildMediaContentBlocks: build, reportFailure: (n) => failures.push(n) });
+    expect(failures).toEqual(['mock.png']);
+    expect(out).toEqual([{ type: 'text', text: 'see this\n\n[attachment "mock.png" failed to download and was omitted]' }]);
+  });
+
+  it('merges a text + failed-media burst into one turn', async () => {
+    const out = await downloadAndMerge([mkText('review'), mkImg('a.png')], {},
+      { buildMediaContentBlocks: async () => { throw new Error('404'); }, reportFailure: () => {} });
+    expect(out).toEqual([{ type: 'text', text: 'review\n\n[attachment "a.png" failed to download and was omitted]' }]);
   });
 });
