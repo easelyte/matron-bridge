@@ -77,6 +77,28 @@ describe('_flushCoalesceBuffer', () => {
     expect(unavailable).toEqual([session]);
   });
 
+  it('persists ONLY user-authored text to history, not media-derived blocks (Phase-2 review B2)', async () => {
+    const history = [];
+    const session = { busy: false, firstMessageCaptured: true };
+    const flush = makeFlusher({
+      // merged burst = user text + a text-file's full contents; only the user text may persist
+      downloadAndMerge: async () => [
+        { type: 'text', text: 'look at this' },
+        { type: 'text', text: 'Contents of secrets.csv:\napi_key,SECRET123' },
+      ],
+      sendToSession: () => true,
+      appendHistory: (s, t) => history.push(t),
+    });
+
+    await flush(session, [
+      { event: { content: { body: 'look at this' } }, meta: { msgtype: 'm.text' } },
+      { event: { content: { body: 'secrets.csv' } }, meta: { msgtype: 'm.file', name: 'secrets.csv' } },
+    ]);
+
+    // history carries the user message only; the file contents are NOT persisted
+    expect(history).toEqual(['look at this']);
+  });
+
   it('catches flush failures, queues a fail-visible block, and notifies the room', async () => {
     const errors = [];
     const notices = [];
