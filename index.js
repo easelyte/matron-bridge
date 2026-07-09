@@ -22,6 +22,7 @@ import { switchEffortInSession, effortButtons, VALID_EFFORT_HINT } from './lib/e
 import { promptButtons, promptResponseForButton } from './lib/prompt-buttons.js';
 import { SubagentWatcher } from './lib/subagent-watcher.js';
 import { ivUploadDir, resolveUploadMeta, ivUploadAnnotation } from './lib/iv-uploads.js';
+import { mergeContentBlockGroups } from './lib/message-coalescer.js';
 
 const DEFAULT_BRIDGE_CLAUDE_MD_PATH = path.join(__dirname, 'BRIDGE_CLAUDE.md');
 const FALLBACK_BRIDGE_PROMPT = 'You are running inside a Matrix bridge. The user interacts through Matrix, not a terminal.';
@@ -2630,29 +2631,7 @@ function formatQueueSummary(queued) {
 }
 
 function flushQueue(session, queued) {
-  const merged = [];
-  let textAccum = [];
-
-  function flushText() {
-    if (textAccum.length === 0) return;
-    const combined = textAccum.map(blocks =>
-      blocks.map(b => b.text).join('\n')
-    ).join('\n\n');
-    merged.push({ type: 'text', text: combined });
-    textAccum = [];
-  }
-
-  for (const blocks of queued) {
-    const isTextOnly = blocks.every(b => b.type === 'text');
-    if (isTextOnly) {
-      textAccum.push(blocks);
-    } else {
-      flushText();
-      merged.push(...blocks);
-    }
-  }
-  flushText();
-
+  const merged = mergeContentBlockGroups(queued);
   if (merged.length > 0) {
     if (!sendToSession(session, merged)) {
       console.log(`[QUEUE] dropped ${queued.length} queued message(s) — session dead or auto-stopped (room ${session.roomId})`);
