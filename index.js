@@ -22,7 +22,7 @@ import { switchEffortInSession, effortButtons, VALID_EFFORT_HINT } from './lib/e
 import { promptButtons, promptResponseForButton } from './lib/prompt-buttons.js';
 import { SubagentWatcher } from './lib/subagent-watcher.js';
 import { ivUploadDir, ivUploadAnnotation } from './lib/iv-uploads.js';
-import { BRIDGE_COMMAND_NAMES as bridgeCommandNames, createCoalesceWindow, isBridgeCommandEligible, mergeContentBlockGroups, shouldBuffer } from './lib/message-coalescer.js';
+import { BRIDGE_COMMAND_NAMES as bridgeCommandNames, commandHoldAction, createCoalesceWindow, isBridgeCommandEligible, mergeContentBlockGroups, shouldBuffer } from './lib/message-coalescer.js';
 import { downloadAndMerge } from './lib/download-merge.js';
 import { resolveMediaCaption } from './lib/media-caption.js';
 import { makeFlusher } from './lib/coalesce-flush-kit.js';
@@ -4579,6 +4579,23 @@ client.on('room.message', async (roomId, event) => {
     const firstWord = text.split(/\s+/)[0].toLowerCase();
     const cmdName = firstWord.slice(1); // strip ! or /
     if (bridgeCommandNames.has(cmdName)) {
+      const held = sessions.get(roomId);
+      if (held?._coalesceWindow?.size() > 0) {
+        const heldCount = held._coalesceWindow.size();
+        if (commandHoldAction(cmdName) === 'discard') {
+          held._coalesceWindow.clear();
+          if (held._coalesceNoticeTimer) {
+            clearTimeout(held._coalesceNoticeTimer);
+            held._coalesceNoticeTimer = null;
+          }
+          if (held._coalesceNoticeEventId) {
+            await editMessage(roomId, held._coalesceNoticeEventId, `✕ discarded (${heldCount} buffered)`);
+            held._coalesceNoticeEventId = null;
+          }
+        } else {
+          await held._coalesceWindow.flush();
+        }
+      }
       // Normalize to ! prefix for the handler
       const normalizedText = '!' + text.slice(1);
       await handleCommand(roomId, normalizedText, sendReply, sendHtmlFn, sender);
