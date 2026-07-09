@@ -115,6 +115,10 @@ let spawnModel = loadSpawnModel() || DEFAULT_SPAWN_MODEL;
 // backstop so a message is never lost if readiness is never detected.
 const RESUME_READY_QUIET_MS = parseInt(process.env.RESUME_READY_QUIET_MS || '800', 10);
 const RESUME_READY_HARDCAP_MS = parseInt(process.env.RESUME_READY_HARDCAP_MS || '120000', 10);
+const COALESCE_WINDOW_MS = parseInt(process.env.MATRON_COALESCE_WINDOW_MS ?? '800', 10); // 0 disables W1
+const COALESCE_HARDCAP_MS = parseInt(process.env.MATRON_COALESCE_HARDCAP_MS ?? '12000', 10);
+const COALESCE_UNIVERSAL = process.env.MATRON_COALESCE_UNIVERSAL === '1';
+const COALESCE_NOTICE_MS = 1500;
 const _resumeGeneratingScreenDetector = isGeneratingScreen;
 const MAX_MSG_LENGTH = 32768;  // Matrix supports ~65KB, use 32K as practical limit
 const DEBUG = process.env.DEBUG === '1';
@@ -529,6 +533,9 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     // Per-session room tracking
     originRoomId: null,
     firstMessageCaptured: false,
+    _coalesceWindow: null,        // createCoalesceWindow instance, lazily created on first buffered event.
+    _coalesceNoticeEventId: null,
+    _coalesceNoticeTimer: null,
     // Captured from system init event
     initData: null,
     currentModel: null,
