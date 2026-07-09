@@ -21,7 +21,11 @@ import { switchModelInSession, modelButtons } from './lib/model-command.js';
 import { switchEffortInSession, effortButtons, VALID_EFFORT_HINT } from './lib/effort-command.js';
 import { promptButtons, promptResponseForButton } from './lib/prompt-buttons.js';
 import { SubagentWatcher } from './lib/subagent-watcher.js';
-import { ivUploadDir, resolveUploadMeta, ivUploadAnnotation } from './lib/iv-uploads.js';
+import { ivUploadDir, ivUploadAnnotation } from './lib/iv-uploads.js';
+import { BRIDGE_COMMAND_NAMES as bridgeCommandNames, commandHoldAction, createCoalesceWindow, isBridgeCommandEligible, mergeContentBlockGroups, shouldBuffer } from './lib/message-coalescer.js';
+import { downloadAndMerge } from './lib/download-merge.js';
+import { resolveMediaCaption } from './lib/media-caption.js';
+import { makeFlusher } from './lib/coalesce-flush-kit.js';
 
 const DEFAULT_BRIDGE_CLAUDE_MD_PATH = path.join(__dirname, 'BRIDGE_CLAUDE.md');
 const FALLBACK_BRIDGE_PROMPT = 'You are running inside a Matrix bridge. The user interacts through Matrix, not a terminal.';
@@ -112,6 +116,10 @@ let spawnModel = loadSpawnModel() || DEFAULT_SPAWN_MODEL;
 // backstop so a message is never lost if readiness is never detected.
 const RESUME_READY_QUIET_MS = parseInt(process.env.RESUME_READY_QUIET_MS || '800', 10);
 const RESUME_READY_HARDCAP_MS = parseInt(process.env.RESUME_READY_HARDCAP_MS || '120000', 10);
+const COALESCE_WINDOW_MS = parseInt(process.env.MATRON_COALESCE_WINDOW_MS ?? '800', 10); // 0 disables W1
+const COALESCE_HARDCAP_MS = parseInt(process.env.MATRON_COALESCE_HARDCAP_MS ?? '12000', 10);
+const COALESCE_UNIVERSAL = process.env.MATRON_COALESCE_UNIVERSAL === '1';
+const COALESCE_NOTICE_MS = 1500;
 const _resumeGeneratingScreenDetector = isGeneratingScreen;
 const MAX_MSG_LENGTH = 32768;  // Matrix supports ~65KB, use 32K as practical limit
 const DEBUG = process.env.DEBUG === '1';
@@ -251,6 +259,27 @@ function expandHome(p) {
   if (p === '~') return os.homedir();
   if (p.startsWith('~/') || p.startsWith('~\\')) return path.join(os.homedir(), p.slice(2));
   return p;
+}
+
+// A matron-tee'd Bash command surfaces its REWRITTEN form in
+// `task_notification.summary`:
+//   <matron-tee> /tmp/matron-cmd-<tool_use_id>.log -- bash -c '<original @sh-quoted>'
+// That wrapper is an internal disk-tail-capture detail (matron-bash-tee.sh
+// PreToolUse hook) the operator should never see. Recover the original command
+// for display; non-matron-tee summaries (Agent/Task subagents) pass through
+// unchanged.
+function unwrapMatronTee(summary) {
+  if (typeof summary !== 'string') return summary;
+  const m = summary.match(/matron-tee\s+\/tmp\/matron-cmd-\S+?\.log\s+--\s+bash\s+-c\s+([\s\S]*)$/);
+  if (!m) return summary;
+  let body = m[1].trim();
+  // jq @sh emits a POSIX single-quoted string (embedded ' -> '\''). Reverse it.
+  if (body.startsWith("'")) {
+    body = body.slice(1);
+    if (body.endsWith("'")) body = body.slice(0, -1);
+    body = body.replace(/'\\''/g, "'");
+  }
+  return body;
 }
 
 function generateFileLink(filePath) {
@@ -505,6 +534,10 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     // Per-session room tracking
     originRoomId: null,
     firstMessageCaptured: false,
+    _coalesceWindow: null,        // createCoalesceWindow instance, lazily created on first buffered event.
+    _coalesceNoticeEventId: null,
+    _coalesceNoticeTimer: null,
+    _coalesceNoticeGen: 0,        // bumped on every notice clear/discard; postCollectingNotice validates it post-await to avoid a stale notice race (final review M2)
     // Captured from system init event
     initData: null,
     currentModel: null,
@@ -560,6 +593,12 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     flushResponse(session);
 
     if (sessions.get(roomId) === session) {
+      // Discard any held coalesce buffer on EVERY child-exit path — restart,
+      // terminal, and reap — so an armed quiet/hard-cap timer can't later fire
+      // against a dead session and silently lose the buffer (Phase-3 review B1).
+      // Silent for the idle-reaper path (documented silent-reap invariant); a
+      // count-bearing notice on the crash/terminal paths.
+      discardCoalesceHold(session, session._autoStopped ? 'idle-reaper' : 'child-crash', { notify: !session._autoStopped });
       if (session._autoStopped) {
         // Idle reaper already posted its own notice; just clean up.
         sessions.delete(roomId);
@@ -2197,9 +2236,26 @@ function handleClaudeEvent(session, event) {
         }
       } else if (event.subtype === 'task_notification') {
         const isComplete = event.status === 'completed';
-        const taskPlain = `${isComplete ? '✅' : '❌'} Task: ${event.summary || 'unknown'}`;
+        const emoji = isComplete ? '✅' : '❌';
+        // Recover the original command (strip the matron-tee wrapper) and show
+        // a short one-line preview; the full command goes in a collapsible
+        // <pre><code> block so multi-line commands don't wall off the room.
+        // Mirrors the >15-line code-block rendering in markdownToHtml.
+        const full = unwrapMatronTee(event.summary || 'unknown');
+        const oneLine = full.replace(/\s+/g, ' ').trim();
+        const preview = oneLine.length > 100 ? oneLine.slice(0, 100) + '…' : oneLine;
+        const taskPlain = `${emoji} Task: ${preview}`;
         if (session.sendHtml) {
-          const n = notice(isComplete ? 'success' : 'error', taskPlain);
+          let taskHtml;
+          if (full.includes('\n') || oneLine.length > preview.length) {
+            // <pre> preserves whitespace; encode newlines as &#10; because
+            // Matrix custom HTML collapses raw "\n" (see line ~2812).
+            const codeHtml = escapeHtml(full).replace(/\n/g, '&#10;');
+            taskHtml = `${emoji} Task: <details><summary>${escapeHtml(preview)}</summary><pre><code>${codeHtml}</code></pre></details>`;
+          } else {
+            taskHtml = `${emoji} Task: <code>${escapeHtml(preview)}</code>`;
+          }
+          const n = notice(isComplete ? 'success' : 'error', taskPlain, taskHtml);
           session.sendHtml(n.plain, n.html);
         } else if (session.sendCallback) {
           session.sendCallback(taskPlain);
@@ -2592,29 +2648,7 @@ function formatQueueSummary(queued) {
 }
 
 function flushQueue(session, queued) {
-  const merged = [];
-  let textAccum = [];
-
-  function flushText() {
-    if (textAccum.length === 0) return;
-    const combined = textAccum.map(blocks =>
-      blocks.map(b => b.text).join('\n')
-    ).join('\n\n');
-    merged.push({ type: 'text', text: combined });
-    textAccum = [];
-  }
-
-  for (const blocks of queued) {
-    const isTextOnly = blocks.every(b => b.type === 'text');
-    if (isTextOnly) {
-      textAccum.push(blocks);
-    } else {
-      flushText();
-      merged.push(...blocks);
-    }
-  }
-  flushText();
-
+  const merged = mergeContentBlockGroups(queued);
   if (merged.length > 0) {
     if (!sendToSession(session, merged)) {
       console.log(`[QUEUE] dropped ${queued.length} queued message(s) — session dead or auto-stopped (room ${session.roomId})`);
@@ -3305,7 +3339,7 @@ async function buildMediaContentBlocks(event, session) {
   if (!mxcUrl) return blocks;
 
   const buffer = await downloadMatrixFile(mxcUrl, content.file);
-  const fileName = content.body || 'file';
+  const { filename: fileName, caption } = resolveMediaCaption(content);
   const mime = content.info?.mimetype || 'application/octet-stream';
 
   if (content.msgtype === 'm.audio') {
@@ -3315,9 +3349,8 @@ async function buildMediaContentBlocks(event, session) {
     // iv-mode: the PTY is text-only. Save the file OUTSIDE the repo and type
     // only an absolute-path annotation; Claude reads it with its Read tool.
     // No base64 blocks and no inline content dump (SDK mode keeps those).
-    const { filename, caption } = resolveUploadMeta(content);
     const dir = ivUploadDir(session.roomId);
-    const savePath = deduplicateFilename(dir, filename);
+    const savePath = deduplicateFilename(dir, fileName);
     fs.writeFileSync(savePath, buffer);
     blocks.push({ type: 'text', text: ivUploadAnnotation({ msgtype: content.msgtype, savePath, caption }) });
     return blocks; // caption already folded in; skip the SDK caption append below
@@ -3355,12 +3388,170 @@ async function buildMediaContentBlocks(event, session) {
     }
   }
 
-  // Caption: for m.file events, the filename differs from body when there's a caption
-  if (content.msgtype === 'm.file' && content.filename !== content.body) {
-    blocks.push({ type: 'text', text: content.body });
+  if (caption) {
+    blocks.push({ type: 'text', text: caption });
   }
 
   return blocks;
+}
+
+function coalesceFlushDeps(session) {
+  return {
+    buildMediaContentBlocks,
+    sendTranscribeNotice: () => sendToRoom(session.roomId, 'Transcribing voice note…', 'Transcribing voice note…'),
+    editNotice: (id, blocks) => {
+      if (!id) return;
+      const transcription = blocks.find((b) => b.type === 'text' && /transcription/i.test(b.text || ''));
+      const preview = transcription ? transcription.text.slice(0, 80) : 'Transcribed';
+      editMessage(session.roomId, id, preview, escapeHtml(preview));
+    },
+    reportFailure: (name) => {
+      if (session.sendCallback) session.sendCallback(`⚠️ Couldn't download ${name || 'file'} — sending the rest without it`);
+    },
+  };
+}
+
+function clearCoalesceTyping(session) {
+  if (session.typingInterval) {
+    clearInterval(session.typingInterval);
+    session.typingInterval = null;
+  }
+  client.setTyping(session.roomId, false, 1000).catch(() => {});
+}
+
+const runCoalesceFlush = makeFlusher({
+  downloadAndMerge: (entries, session) => downloadAndMerge(entries, session, coalesceFlushDeps(session)),
+  sendToSession,
+  queue: (session, merged) => {
+    (session.queuedMessages ||= []).push(merged);
+  },
+  startTyping: (session) => {
+    if (session.typingInterval) clearInterval(session.typingInterval);
+    session.typingInterval = startTyping(session.roomId);
+  },
+  clearTyping: clearCoalesceTyping,
+  sendUnavailable: (session) => sendToRoom(session.roomId, 'Session is not available. Send !start to begin a new one.'),
+  sendFailureNotice: (session) => sendToRoom(session.roomId, "⚠️ Couldn't process that burst — resend to retry"),
+  onFirstMessage: (session, entries) => {
+    session.firstMessageCaptured = true;
+    const sessionShort = (session.claudeSessionId || session.roomId.slice(1)).slice(0, 2);
+    const first = entries.find((entry) => entry?.meta?.name || entry?.event?.content?.body);
+    const labelText = first?.meta?.name || first?.event?.content?.body || 'message';
+    updateRoomName(session.roomId, `${SERVER_LABEL}:${sessionShort} ${labelText.slice(0, 60)}`);
+  },
+  appendHistory: (session, text) => {
+    if (!session.chatHistory) session.chatHistory = [];
+    session.chatHistory.push({ role: 'user', text });
+    debug(`Added user message to chatHistory, length now: ${session.chatHistory.length}`);
+    if (session.claudeSessionId) {
+      persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { chatHistory: session.chatHistory });
+    }
+  },
+  onError: (err) => console.error('[COALESCE] flush failed', err),
+});
+
+function clearCoalesceNotice(session) {
+  session._coalesceNoticeGen = (session._coalesceNoticeGen || 0) + 1;   // invalidate any in-flight notice send (final review M2)
+  if (session._coalesceNoticeTimer) {
+    clearTimeout(session._coalesceNoticeTimer);
+    session._coalesceNoticeTimer = null;
+  }
+  if (session._coalesceNoticeEventId) {
+    editMessage(session.roomId, session._coalesceNoticeEventId, '✓ Sending collected attachments…');
+    session._coalesceNoticeEventId = null;
+  }
+}
+
+async function postCollectingNotice(session) {
+  session._coalesceNoticeTimer = null;
+  if (!session.sendButtonMessage || session._coalesceNoticeEventId) return;
+  const plain = '📎 Collecting attachments…';
+  const buttons = [
+    { id: 'coalesce-flush', label: 'Send now', value: 'coalesce-flush' },
+  ];
+  const gen = session._coalesceNoticeGen || 0;
+  const eventId = await session.sendButtonMessage(plain, buttons, 'pick_one', plain, escapeHtml(plain));
+  if (!eventId) return;
+  if ((session._coalesceNoticeGen || 0) !== gen) {
+    // The hold was flushed/discarded while this notice was in flight — it's
+    // stale. Resolve it rather than leaving a live no-op "Send now" button in
+    // the room (final review M2).
+    editMessage(session.roomId, eventId, '✓ Sending collected attachments…');
+    return;
+  }
+  session._coalesceNoticeEventId = eventId;
+}
+
+function armCoalesceNotice(session) {
+  if (session._coalesceNoticeTimer || session._coalesceNoticeEventId) return;
+  session._coalesceNoticeTimer = setTimeout(() => {
+    postCollectingNotice(session).catch((err) => console.error('[COALESCE] collecting notice failed', err));
+  }, COALESCE_NOTICE_MS);
+  if (typeof session._coalesceNoticeTimer.unref === 'function') {
+    session._coalesceNoticeTimer.unref();
+  }
+}
+
+async function _flushCoalesceBuffer(session, entries) {
+  clearCoalesceNotice(session);
+  return runCoalesceFlush(session, entries);
+}
+
+function discardCoalesceHold(session, reason, { notify = true } = {}) {
+  const w = session._coalesceWindow;
+  if (!w) return;
+  const n = w.size();
+  w.clear();
+  session._coalesceNoticeGen = (session._coalesceNoticeGen || 0) + 1;   // invalidate any in-flight notice send (final review M2)
+  if (session._coalesceNoticeTimer) {
+    clearTimeout(session._coalesceNoticeTimer);
+    session._coalesceNoticeTimer = null;
+  }
+  if (session._coalesceNoticeEventId) {
+    const plain = `✕ discarded (${n} buffered)`;
+    editMessage(session.roomId, session._coalesceNoticeEventId, plain, escapeHtml(plain));
+    session._coalesceNoticeEventId = null;
+  }
+  if (n > 0) {
+    console.log(`[COALESCE] discarded ${n} buffered on ${reason} (room ${session.roomId})`);
+    if (notify) {
+      const plain = reason && reason.startsWith('command:')
+        ? `✕ Discarded ${n} buffered message(s) — !${reason.slice('command:'.length)}`
+        : `⚠️ Session ended before dispatch — ${n} buffered message(s) discarded; resend to continue`;
+      sendToRoom(session.roomId, plain, escapeHtml(plain));
+    }
+  }
+}
+
+function bufferOrDispatchIdle(session, event, { hasMedia, msgtype }) {
+  const holdOpen = !!session._coalesceWindow && session._coalesceWindow.size() > 0;
+  if (COALESCE_WINDOW_MS <= 0 || !shouldBuffer({ hasMedia, holdOpen, universal: COALESCE_UNIVERSAL })) {
+    return false;
+  }
+
+  if (!session._coalesceWindow) {
+    session._coalesceWindow = createCoalesceWindow({
+      quietMs: COALESCE_WINDOW_MS,
+      hardCapMs: COALESCE_HARDCAP_MS,
+      now: Date.now,
+      setTimer: (fn, ms) => {
+        const timer = setTimeout(fn, ms);
+        if (typeof timer.unref === 'function') timer.unref();
+        return timer;
+      },
+      clearTimer: clearTimeout,
+      onFlush: (entries) => _flushCoalesceBuffer(session, entries),
+    });
+  }
+
+  const content = event.content || {};
+  const meta = {
+    msgtype,
+    name: content.body || content.filename || 'file',
+  };
+  session._coalesceWindow.push({ event, meta });
+  armCoalesceNotice(session);
+  return true;
 }
 
 // --- Command Handler ---
@@ -4427,17 +4618,21 @@ client.on('room.message', async (roomId, event) => {
   const sendHtmlFn = (plainText, html) => sendToRoom(roomId, plainText, html);
 
   // Bridge commands use / or ! prefix
-  if (text.startsWith('!') || text.startsWith('/')) {
-    const bridgeCommandNames = new Set([
-      'start', 'stop', 'restart', 'resume', 'workdir', 'status',
-      'show', 'show_working', 'working', 'sessions', 'help',
-      'mcp', 'model', 'effort', 'cost', 'usage', 'tools',
-      'esc', 'escape', 'clearall', 'flush',
-      'label', 'role', 'who',
-    ]);
+  if (isBridgeCommandEligible({ msgtype, text })) {
     const firstWord = text.split(/\s+/)[0].toLowerCase();
     const cmdName = firstWord.slice(1); // strip ! or /
     if (bridgeCommandNames.has(cmdName)) {
+      const held = sessions.get(roomId);
+      if (held?._coalesceWindow?.size() > 0) {
+        if (commandHoldAction(cmdName) === 'discard') {
+          // Fail-visible even if the 1500ms collecting notice hasn't posted yet
+          // (Phase-3 review B2): discardCoalesceHold emits a count-bearing room
+          // notice unconditionally when n > 0, not only an edit of an existing notice.
+          discardCoalesceHold(held, `command:${cmdName}`);
+        } else {
+          await held._coalesceWindow.flush();
+        }
+      }
       // Normalize to ! prefix for the handler
       const normalizedText = '!' + text.slice(1);
       await handleCommand(roomId, normalizedText, sendReply, sendHtmlFn, sender);
@@ -4570,6 +4765,12 @@ client.on('room.message', async (roomId, event) => {
           session.sendCallback(`⚡ Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''} now:\n${summary.plain}`);
         }
         flushQueue(session, queued);
+      }
+      return;
+    }
+    if (value === 'coalesce-flush') {
+      if (session._coalesceWindow && session._coalesceWindow.size() > 0) {
+        await session._coalesceWindow.flush();
       }
       return;
     }
@@ -4935,6 +5136,10 @@ client.on('room.message', async (roomId, event) => {
       session._operatorCompactPending = false;
     }, 300_000);
     if (typeof session._operatorCompactTimer.unref === 'function') session._operatorCompactTimer.unref();
+  }
+
+  if (bufferOrDispatchIdle(session, event, { hasMedia, text, msgtype })) {
+    return;
   }
 
   if (hasMedia) {
@@ -5764,6 +5969,7 @@ function killSession(session, signal = 'SIGTERM') {
     session.subagentWatcher.stop().catch(() => {});
     session.subagentWatcher = null;
   }
+  discardCoalesceHold(session, 'killSession');
   if (!session.alive) return;
   try {
     if (session.iv) session.iv.kill(signal);
@@ -5787,6 +5993,7 @@ function startIdleReaper() {
       // resumable on the next user message via the existing auto-resume path.
       const idleHours = Math.round((now - last) / 3600000);
       debug(`Reaping idle session in ${roomId} (idle ${idleHours}h)`);
+      discardCoalesceHold(session, 'idle-reaper', { notify: false });
       session._autoStopped = true;
       killSession(session, 'SIGTERM');
     }

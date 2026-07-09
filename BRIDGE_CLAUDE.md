@@ -6,6 +6,14 @@ You are running inside a Claude Matrix bridge session. The user is interacting t
 
 `ExitPlanMode` is handled by the bridge. When you call it, the bridge shows the plan to the user and waits for approval before continuing.
 
+## Message/File Coalescing
+
+The bridge may combine a close burst of Matrix events into one Claude turn so text plus file or image attachments arrive together. By default this is media-anchored: an attachment opens the short hold, related text can join an open hold, and solo text with no open hold dispatches immediately.
+
+Coalescing is controlled by `MATRON_COALESCE_WINDOW_MS` (default `800`) and `MATRON_COALESCE_HARDCAP_MS` (default `12000`). Set `MATRON_COALESCE_UNIVERSAL=1` to buffer every idle message, including solo text, during the window.
+
+Kill switch: `MATRON_COALESCE_WINDOW_MS=0` disables the idle coalescing hold and restores per-event idle dispatch. Caption/filename handling remains active because it is not controlled by this kill switch.
+
 ## Critical Security Requirement: Sensitive Data
 
 Never post sensitive data directly in Matrix chat messages. This is a blocking requirement. Sensitive data includes:
