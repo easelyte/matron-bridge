@@ -22,7 +22,7 @@ import { switchEffortInSession, effortButtons, VALID_EFFORT_HINT } from './lib/e
 import { promptButtons, promptResponseForButton } from './lib/prompt-buttons.js';
 import { SubagentWatcher } from './lib/subagent-watcher.js';
 import { ivUploadDir, ivUploadAnnotation } from './lib/iv-uploads.js';
-import { createCoalesceWindow, mergeContentBlockGroups, shouldBuffer } from './lib/message-coalescer.js';
+import { BRIDGE_COMMAND_NAMES as bridgeCommandNames, createCoalesceWindow, isBridgeCommandEligible, mergeContentBlockGroups, shouldBuffer } from './lib/message-coalescer.js';
 import { downloadAndMerge } from './lib/download-merge.js';
 import { resolveMediaCaption } from './lib/media-caption.js';
 import { makeFlusher } from './lib/coalesce-flush-kit.js';
@@ -4575,14 +4575,7 @@ client.on('room.message', async (roomId, event) => {
   const sendHtmlFn = (plainText, html) => sendToRoom(roomId, plainText, html);
 
   // Bridge commands use / or ! prefix
-  if (text.startsWith('!') || text.startsWith('/')) {
-    const bridgeCommandNames = new Set([
-      'start', 'stop', 'restart', 'resume', 'workdir', 'status',
-      'show', 'show_working', 'working', 'sessions', 'help',
-      'mcp', 'model', 'effort', 'cost', 'usage', 'tools',
-      'esc', 'escape', 'clearall', 'flush',
-      'label', 'role', 'who',
-    ]);
+  if (isBridgeCommandEligible({ msgtype, text })) {
     const firstWord = text.split(/\s+/)[0].toLowerCase();
     const cmdName = firstWord.slice(1); // strip ! or /
     if (bridgeCommandNames.has(cmdName)) {
