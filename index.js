@@ -4246,6 +4246,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         `  !effort [level] — Show or set effort level\n` +
         `  !cost — Session cost\n` +
         `  !usage — Token usage\n` +
+        `  !limits — Claude 5h + 7d subscription limits\n` +
         `  !tools — Available tools\n` +
         `  !help — This help message\n\n` +
         `Use ! for bridge commands. / also works for the above, but\n` +
@@ -4289,6 +4290,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
           ['!effort [level]', 'Show or set effort level (low, medium, high, xhigh, max, auto, ultracode)'],
           ['!cost', 'Session cost'],
           ['!usage', 'Token usage'],
+          ['!limits', 'Claude 5h + 7d subscription limits'],
           ['!tools', 'Available tools'],
           ['!help', 'This help message'],
         ]) +
