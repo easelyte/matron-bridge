@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect } from 'vitest';
 import { createPoller } from '../lib/limits-poller.js';
 
 function harness(overrides = {}) {
@@ -71,5 +71,44 @@ describe('createPoller.tick', () => {
     util = 90;
     await p.tick();
     expect(sent).toHaveLength(0);
+  });
+
+  it('all send failures leave tier uncommitted and retry next tick', async () => {
+    let util = 10;
+    const attempts = [];
+    const { deps } = harness({
+      recentRooms: () => ['!a:s', '!b:s'],
+      send: async (roomId, msg) => {
+        attempts.push({ roomId, msg });
+        return false;
+      },
+      fetchUsage: async () => ({ fiveHour: { utilization: util, resetsAt: null }, sevenDay: { utilization: 6, resetsAt: null } }),
+    });
+    const p = createPoller(deps);
+    await p.tick();
+    util = 90;
+    await p.tick();
+    await p.tick();
+    expect(attempts.map((a) => a.roomId)).toEqual(['!a:s', '!b:s', '!a:s', '!b:s']);
+  });
+
+  it('send throw is counted as failed send and does not abort tick', async () => {
+    let util = 10;
+    const attempts = [];
+    const { deps } = harness({
+      recentRooms: () => ['!bad:s', '!ok:s'],
+      send: async (roomId, msg) => {
+        attempts.push({ roomId, msg });
+        if (roomId === '!bad:s') throw new Error('send exploded');
+        return true;
+      },
+      fetchUsage: async () => ({ fiveHour: { utilization: util, resetsAt: null }, sevenDay: { utilization: 6, resetsAt: null } }),
+    });
+    const p = createPoller(deps);
+    await p.tick();
+    util = 90;
+    await expect(p.tick()).resolves.toBeUndefined();
+    await p.tick();
+    expect(attempts.map((a) => a.roomId)).toEqual(['!bad:s', '!ok:s']);
   });
 });
