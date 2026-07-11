@@ -62,6 +62,8 @@ describe('parseIntEnv', () => {
   });
   it('POLL_MS carve-out: non-finite -> default, but <=0 preserved as disable sentinel', () => {
     expect(parseIntEnv('abc', { name: 'POLL_MS', def: 300000, min: 1, allowDisableSentinel: true }, noLog)).toBe(300000);
+    expect(parseIntEnv('', { name: 'POLL_MS', def: 300000, min: 1, allowDisableSentinel: true }, noLog)).toBe(300000);
+    expect(parseIntEnv('   ', { name: 'POLL_MS', def: 300000, min: 1, allowDisableSentinel: true }, noLog)).toBe(300000);
     expect(parseIntEnv('0', { name: 'POLL_MS', def: 300000, min: 1, allowDisableSentinel: true }, noLog)).toBe(0);
     expect(parseIntEnv('-5', { name: 'POLL_MS', def: 300000, min: 1, allowDisableSentinel: true }, noLog)).toBe(0);
   });
@@ -258,5 +260,9 @@ describe('allMembersAllowed', () => {
   });
   it('any unauthorized member => false', () => {
     expect(allMembersAllowed(['@op:s', '@stranger:s'], ['@op:s'], bot)).toBe(false);
+  });
+  it('non-empty allow-list fails closed when no non-bot members were observed', () => {
+    expect(allMembersAllowed([], ['@op:s'], bot)).toBe(false);
+    expect(allMembersAllowed([bot], ['@op:s'], bot)).toBe(false);
   });
 });
