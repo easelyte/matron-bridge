@@ -6082,7 +6082,9 @@ function startLimitsPoller() {
     try {
       await poller.tick();
     } catch (e) {
-      debug(`[limits] poll tick error: ${e.message}`);
+      // Unexpected tick failure is a real error, not heartbeat noise — surface it
+      // regardless of DEBUG (P34 observability), sanitized (no token).
+      console.warn(`[limits] poll tick error: ${e?.name || 'Error'}: ${e?.message || e}`);
     } finally {
       polling = false;
     }
