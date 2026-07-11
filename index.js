@@ -26,6 +26,8 @@ import { BRIDGE_COMMAND_NAMES as bridgeCommandNames, commandHoldAction, createCo
 import { downloadAndMerge } from './lib/download-merge.js';
 import { resolveMediaCaption } from './lib/media-caption.js';
 import { makeFlusher } from './lib/coalesce-flush-kit.js';
+// eslint-disable-next-line no-unused-vars -- seeded for the limits config import extended by the next task.
+import { parseIntEnv, makeMembershipGate } from './lib/limits.js';
 
 const DEFAULT_BRIDGE_CLAUDE_MD_PATH = path.join(__dirname, 'BRIDGE_CLAUDE.md');
 const FALLBACK_BRIDGE_PROMPT = 'You are running inside a Matrix bridge. The user interacts through Matrix, not a terminal.';
@@ -119,6 +121,7 @@ const RESUME_READY_HARDCAP_MS = parseInt(process.env.RESUME_READY_HARDCAP_MS || 
 const COALESCE_WINDOW_MS = parseInt(process.env.MATRON_COALESCE_WINDOW_MS ?? '800', 10); // 0 disables W1
 const COALESCE_HARDCAP_MS = parseInt(process.env.MATRON_COALESCE_HARDCAP_MS ?? '12000', 10);
 const COALESCE_UNIVERSAL = process.env.MATRON_COALESCE_UNIVERSAL === '1';
+const LIMITS_ALLOW_ANY = process.env.BRIDGE_LIMITS_ALLOW_ANY === '1';
 const COALESCE_NOTICE_MS = 1500;
 const _resumeGeneratingScreenDetector = isGeneratingScreen;
 const MAX_MSG_LENGTH = 32768;  // Matrix supports ~65KB, use 32K as practical limit
@@ -2958,6 +2961,8 @@ const client = new MatrixClient(MATRIX_HOMESERVER_URL, resolvedAccessToken, stor
 AutojoinRoomsMixin.setupOnClient(client);
 
 let botUserId;
+// eslint-disable-next-line no-unused-vars -- fail-closed default consumed by the limits command/poller tasks that follow.
+let membershipGateAllows = async () => false;
 
 // --- Send to Matrix Room ---
 
@@ -6013,6 +6018,7 @@ async function main() {
   } catch {}
 
   botUserId = await client.getUserId();
+  membershipGateAllows = makeMembershipGate({ client, allowedIds: ALLOWED_USER_IDS, botUserId, allowAny: LIMITS_ALLOW_ANY, log: console });
   console.log(`Bot logged in as ${botUserId}`);
   console.log(`Homeserver: ${MATRIX_HOMESERVER_URL}`);
   console.log(`Allowed users: ${ALLOWED_USER_IDS.length ? ALLOWED_USER_IDS.join(', ') : 'any'}`);
