@@ -27,7 +27,7 @@ import { downloadAndMerge } from './lib/download-merge.js';
 import { resolveMediaCaption } from './lib/media-caption.js';
 import { makeFlusher } from './lib/coalesce-flush-kit.js';
 // eslint-disable-next-line no-unused-vars -- seeded for the limits config import extended by the next task.
-import { parseIntEnv, makeMembershipGate } from './lib/limits.js';
+import { parseIntEnv, makeMembershipGate, readOAuthToken, fetchUsage, formatLimits } from './lib/limits.js';
 
 const DEFAULT_BRIDGE_CLAUDE_MD_PATH = path.join(__dirname, 'BRIDGE_CLAUDE.md');
 const FALLBACK_BRIDGE_PROMPT = 'You are running inside a Matrix bridge. The user interacts through Matrix, not a terminal.';
@@ -122,6 +122,8 @@ const COALESCE_WINDOW_MS = parseInt(process.env.MATRON_COALESCE_WINDOW_MS ?? '80
 const COALESCE_HARDCAP_MS = parseInt(process.env.MATRON_COALESCE_HARDCAP_MS ?? '12000', 10);
 const COALESCE_UNIVERSAL = process.env.MATRON_COALESCE_UNIVERSAL === '1';
 const LIMITS_ALLOW_ANY = process.env.BRIDGE_LIMITS_ALLOW_ANY === '1';
+const LIMITS_CREDS_PATH = process.env.BRIDGE_LIMITS_CREDS_PATH || null; // null => lib default (os.homedir())
+const LIMITS_ENABLED = process.env.BRIDGE_LIMITS_ENABLED !== '0'; // master kill switch (default on)
 const COALESCE_NOTICE_MS = 1500;
 const _resumeGeneratingScreenDetector = isGeneratingScreen;
 const MAX_MSG_LENGTH = 32768;  // Matrix supports ~65KB, use 32K as practical limit
@@ -4516,6 +4518,28 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         `<tr><td>Cost</td><td>${color('$' + u.cost_usd.toFixed(4), uCostClr)}</td></tr>` +
         `</table>`;
       await sendHtml(plainUsage, htmlUsage);
+      break;
+    }
+
+    case '!limits': {
+      if (!LIMITS_ENABLED) { await sendReply('Limits feature is disabled.'); break; }
+      if (!(await membershipGateAllows(roomId))) {
+        await sendReply('⚠️ Limit usage is account-global; not posting it in a room with unauthorized members.');
+        break;
+      }
+      const token = readOAuthToken({ credsPath: LIMITS_CREDS_PATH });
+      if (!token) {
+        await sendReply("⚠️ Couldn't read Claude limits — no OAuth token found. Try again after some Claude activity.");
+        break;
+      }
+      try {
+        const usage = await fetchUsage({ token });
+        const { plain, html } = formatLimits({ fiveHour: usage.fiveHour, sevenDay: usage.sevenDay });
+        await sendHtml(plain, html);
+      } catch (e) {
+        await sendReply('⚠️ Couldn\'t read Claude limits right now. The usage endpoint is undocumented; if the token is stale, try again after any Claude activity.');
+        debug(`!limits fetch failed: ${e.name} ${e.status ?? ''}`);
+      }
       break;
     }
 
