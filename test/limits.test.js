@@ -1,4 +1,7 @@
-import { describe, it, expect, vi } from 'vitest';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { afterEach, describe, it, expect, vi } from 'vitest';
 import {
   parseThresholds,
   parseIntEnv,
@@ -12,6 +15,18 @@ import {
 } from '../lib/limits.js';
 
 const noLog = { warn: () => {} };
+const tempDirs = [];
+
+function makeTempDir() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-limits-'));
+  tempDirs.push(dir);
+  return dir;
+}
+
+afterEach(() => {
+  vi.restoreAllMocks();
+  for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
+});
 
 describe('parseThresholds', () => {
   it('parses a valid list sorted + deduped', () => {
@@ -113,6 +128,26 @@ describe('fetchUsage', () => {
     await expect(fetchUsage({ token: 't', fetchImpl: fakeFetch(401, {}) }))
       .rejects.toMatchObject({ status: 401 });
   });
+  it('2xx non-200 throws LimitsFetchError with status', async () => {
+    await expect(fetchUsage({ token: 't', fetchImpl: fakeFetch(204, {}) }))
+      .rejects.toMatchObject({ status: 204 });
+  });
+  it('calls the usage endpoint with oauth headers', async () => {
+    const fetchImpl = vi.fn(async () => ({
+      status: 200,
+      ok: true,
+      json: async () => ({ five_hour: {}, seven_day: {} }),
+    }));
+    await fetchUsage({ token: 'secret-token', fetchImpl, timeoutMs: 1234 });
+
+    expect(fetchImpl).toHaveBeenCalledTimes(1);
+    expect(fetchImpl).toHaveBeenCalledWith('https://api.anthropic.com/api/oauth/usage', expect.objectContaining({
+      headers: {
+        Authorization: 'Bearer secret-token',
+        'anthropic-beta': 'oauth-2025-04-20',
+      },
+    }));
+  });
   it('non-JSON 200 body throws malformed', async () => {
     await expect(fetchUsage({ token: 't', fetchImpl: fakeFetch(200, null, { throwJson: true }) }))
       .rejects.toBeInstanceOf(LimitsFetchError);
@@ -140,5 +175,32 @@ describe('classifyFailure', () => {
 describe('readOAuthToken', () => {
   it('missing file returns null', () => {
     expect(readOAuthToken({ credsPath: '/nonexistent/x.json' })).toBeNull();
+  });
+  it('reads a valid credentials file', () => {
+    const credsPath = path.join(makeTempDir(), 'credentials.json');
+    fs.writeFileSync(credsPath, JSON.stringify({ claudeAiOauth: { accessToken: 'tok' } }));
+
+    expect(readOAuthToken({ credsPath })).toBe('tok');
+  });
+  it('missing claudeAiOauth access token returns null', () => {
+    const credsPath = path.join(makeTempDir(), 'credentials.json');
+    fs.writeFileSync(credsPath, JSON.stringify({ claudeAiOauth: {} }));
+
+    expect(readOAuthToken({ credsPath })).toBeNull();
+  });
+  it('malformed JSON returns null', () => {
+    const credsPath = path.join(makeTempDir(), 'credentials.json');
+    fs.writeFileSync(credsPath, '{bad json');
+
+    expect(readOAuthToken({ credsPath })).toBeNull();
+  });
+  it('expands tilde in the credentials path', () => {
+    const home = makeTempDir();
+    const relPath = path.join('.claude', '.credentials.json');
+    fs.mkdirSync(path.dirname(path.join(home, relPath)), { recursive: true });
+    fs.writeFileSync(path.join(home, relPath), JSON.stringify({ claudeAiOauth: { accessToken: 'home-token' } }));
+    vi.spyOn(os, 'homedir').mockReturnValue(home);
+
+    expect(readOAuthToken({ credsPath: `~/${relPath}` })).toBe('home-token');
   });
 });
