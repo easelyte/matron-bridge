@@ -3573,10 +3573,9 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       // `parts` (shared by all commands) is untouched.
       const { prompt: autoPrompt, rest: textSansPrompt, error: promptError } = extractPromptFlag(text);
       if (promptError) { await sendReply(promptError); return; }
-      if (autoPrompt !== null && !INTERACTIVE_MODE) {
-        await sendReply('--prompt is only supported in interactive mode (MATRON_INTERACTIVE_MODE=1).');
-        return;
-      }
+      // --prompt works in both interactive (iv) and print modes. Dispatch is
+      // handled in sendPendingWelcomeIfNeeded once the operator joins the room:
+      // iv sessions gate on TUI readiness, print sessions fire immediately.
       const startTokens = textSansPrompt.split(/\s+/).slice(1); // drop the "!start" token
       const { extras: mcpExtras, rest: afterExtras } = extractMcpExtraFlags(startTokens);
       const { worktree, error: worktreeError, rest: positional } = extractWorktreeFlag(afterExtras);
@@ -5300,7 +5299,10 @@ async function sendPendingWelcomeIfNeeded(roomId, joinedUserId) {
         if (session.worktree) updateRoomName(session.roomId, `${SERVER_LABEL}:${short} ${session.worktree}`);
       }
     };
-    if (session.ivReady) await fireAutoPrompt();
+    // Print-mode sessions feed stdin JSON that Claude buffers immediately — there
+    // is no PTY-readiness handshake (ivReady/markIvReady are iv-only), so fire the
+    // prompt straight away. iv sessions still gate on the TUI being ready.
+    if (!session.iv || session.ivReady) await fireAutoPrompt();
     else session._fireAutoPromptWhenReady = fireAutoPrompt;
   }
 }
