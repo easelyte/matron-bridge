@@ -12,6 +12,10 @@ import {
   usableWindowCount,
   LimitsFetchError,
   readOAuthToken,
+  formatLimits,
+  formatAlert,
+  allMembersAllowed,
+  bandHex,
 } from '../lib/limits.js';
 
 const noLog = { warn: () => {} };
@@ -202,5 +206,57 @@ describe('readOAuthToken', () => {
     vi.spyOn(os, 'homedir').mockReturnValue(home);
 
     expect(readOAuthToken({ credsPath: `~/${relPath}` })).toBe('home-token');
+  });
+});
+
+const NOW = Date.parse('2026-07-11T20:00:00Z');
+
+describe('bandHex', () => {
+  it('bands at boundaries', () => {
+    expect(bandHex(49)).toBe('#3fb950');
+    expect(bandHex(50)).toBe('#f0883e');
+    expect(bandHex(85)).toBe('#d29922');
+    expect(bandHex(95)).toBe('#f85149');
+  });
+});
+
+describe('formatLimits', () => {
+  it('renders resets: unknown when resetsAt null but util present', () => {
+    const out = formatLimits({
+      fiveHour: { utilization: 87, resetsAt: null },
+      sevenDay: { utilization: 6, resetsAt: '2026-07-18T09:00:00Z' },
+      now: NOW,
+    });
+    expect(out.plain).toMatch(/resets: unknown/);
+    expect(out.plain).not.toMatch(/NaN/);
+  });
+  it('renders unavailable for a null-util window, not 0%', () => {
+    const out = formatLimits({
+      fiveHour: { utilization: null, resetsAt: null },
+      sevenDay: { utilization: 6, resetsAt: null },
+      now: NOW,
+    });
+    expect(out.plain).toMatch(/unavailable/);
+    expect(out.plain).not.toMatch(/0%/);
+  });
+});
+
+describe('formatAlert', () => {
+  it('null resetsAt: no reset clause, no NaN', () => {
+    const out = formatAlert({ window: '7-day', utilization: 87, tier: 85, resetsAt: null, now: NOW });
+    expect(out.plain).not.toMatch(/NaN|resets in/);
+  });
+});
+
+describe('allMembersAllowed', () => {
+  const bot = '@bot:server';
+  it('empty allow-list => true (allow-any)', () => {
+    expect(allMembersAllowed(['@x:s', '@y:s'], [], bot)).toBe(true);
+  });
+  it('all non-bot members allowed => true', () => {
+    expect(allMembersAllowed(['@op:s', bot], ['@op:s'], bot)).toBe(true);
+  });
+  it('any unauthorized member => false', () => {
+    expect(allMembersAllowed(['@op:s', '@stranger:s'], ['@op:s'], bot)).toBe(false);
   });
 });
