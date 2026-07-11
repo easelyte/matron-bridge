@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { createPoller } from '../lib/limits-poller.js';
+import { LimitsFetchError } from '../lib/limits.js';
 
 function harness(overrides = {}) {
   const sent = [];
@@ -110,5 +111,95 @@ describe('createPoller.tick', () => {
     await expect(p.tick()).resolves.toBeUndefined();
     await p.tick();
     expect(attempts.map((a) => a.roomId)).toEqual(['!bad:s', '!ok:s']);
+  });
+});
+
+describe('createPoller permanent-failure escalation', () => {
+  function failHarness(err, staleAfter = 3) {
+    const sent = [];
+    const deps = {
+      thresholds: [50, 85, 95],
+      staleAfter,
+      readToken: () => 't',
+      recentRooms: () => ['!op:s'],
+      gateAllows: async () => true,
+      send: async (r, m) => {
+        sent.push(m);
+        return true;
+      },
+      now: () => 0,
+      log: { warn() {}, info() {}, debug() {} },
+      fetchUsage: async () => {
+        throw err;
+      },
+    };
+    return { deps, sent };
+  }
+
+  // "Accumulated" not "consecutive": transient ticks are no-ops for the streak.
+  // Only a successful usage fetch resets the permanent-failure episode.
+  it('escalates once after staleAfter accumulated permanent (stale-token) failures', async () => {
+    const { deps, sent } = failHarness(new LimitsFetchError('x', { status: 401 }), 3);
+    const p = createPoller(deps);
+    await p.tick();
+    await p.tick();
+    expect(sent).toHaveLength(0);
+    await p.tick();
+    expect(sent).toHaveLength(1);
+    expect(sent[0].plain).toMatch(/stale or missing/);
+    await p.tick();
+    expect(sent).toHaveLength(1);
+  });
+
+  it('malformed uses the malformed notice text', async () => {
+    const { deps, sent } = failHarness(new LimitsFetchError('x', { status: 400 }), 1);
+    const p = createPoller(deps);
+    await p.tick();
+    expect(sent[0].plain).toMatch(/unexpected format/);
+  });
+
+  it('transient tick between permanent failures does NOT reset the streak', async () => {
+    let mode = 'perm';
+    const sent = [];
+    const deps = {
+      thresholds: [50, 85, 95],
+      staleAfter: 3,
+      readToken: () => 't',
+      recentRooms: () => ['!op:s'],
+      gateAllows: async () => true,
+      send: async (r, m) => {
+        sent.push(m);
+        return true;
+      },
+      now: () => 0,
+      log: { warn() {}, info() {}, debug() {} },
+      fetchUsage: async () => {
+        throw new LimitsFetchError('x', { status: mode === 'perm' ? 401 : 503 });
+      },
+    };
+    const p = createPoller(deps);
+    await p.tick();
+    mode = 'transient';
+    await p.tick();
+    mode = 'perm';
+    await p.tick();
+    await p.tick();
+    expect(sent).toHaveLength(1);
+  });
+
+  it('escalation with no deliverable room: not marked delivered, warns, retries', async () => {
+    const warns = [];
+    const { deps, sent } = failHarness(new LimitsFetchError('x', { status: 401 }), 3);
+    deps.recentRooms = () => [];
+    deps.log = { warn: (m) => warns.push(m), info() {}, debug() {} };
+    const p = createPoller(deps);
+    await p.tick();
+    await p.tick();
+    await p.tick();
+    expect(warns.some((m) => /NO deliverable room/.test(m))).toBe(true);
+    expect(sent).toHaveLength(0);
+    deps.recentRooms = () => ['!op:s'];
+    await p.tick();
+    expect(sent).toHaveLength(1);
   });
 });
