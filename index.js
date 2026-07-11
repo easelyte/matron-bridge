@@ -2964,7 +2964,6 @@ const client = new MatrixClient(MATRIX_HOMESERVER_URL, resolvedAccessToken, stor
 AutojoinRoomsMixin.setupOnClient(client);
 
 let botUserId;
-// eslint-disable-next-line no-unused-vars -- fail-closed default consumed by the limits command/poller tasks that follow.
 let membershipGateAllows = async () => false;
 
 // --- Send to Matrix Room ---
