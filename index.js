@@ -348,6 +348,7 @@ function loadLastEventTsMap() {
 }
 
 let lastEventTsMap = loadLastEventTsMap();
+const lastAllowedEventTsMap = {}; // roomId -> ts, only for events passing the allow-list (P15 targeting source)
 let lastEventTsDirty = false;
 const botStartupTs = Date.now();
 
@@ -4623,6 +4624,7 @@ client.on('room.message', async (roomId, event) => {
 
   const sender = event.sender;
   if (warnIfDisallowed(sender, roomId)) return;
+  lastAllowedEventTsMap[roomId] = Math.max(lastAllowedEventTsMap[roomId] || 0, eventTs);
 
   const msgtype = event.content.msgtype;
   let text = '';
