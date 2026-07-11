@@ -1,5 +1,15 @@
 import { describe, it, expect, vi } from 'vitest';
-import { parseThresholds, parseIntEnv, DEFAULT_THRESHOLDS, evaluateWindow } from '../lib/limits.js';
+import {
+  parseThresholds,
+  parseIntEnv,
+  DEFAULT_THRESHOLDS,
+  evaluateWindow,
+  fetchUsage,
+  classifyFailure,
+  usableWindowCount,
+  LimitsFetchError,
+  readOAuthToken,
+} from '../lib/limits.js';
 
 const noLog = { warn: () => {} };
 
@@ -70,5 +80,65 @@ describe('evaluateWindow', () => {
   it('custom thresholds: tier can be a non-default value', () => {
     const r = evaluateWindow({ utilization: 5, prev: { tier: 0, isFirstPoll: false }, thresholds: [1] });
     expect(r.crossedTier).toBe(1);
+  });
+});
+
+function fakeFetch(status, body, { throwJson = false } = {}) {
+  return async () => ({
+    status,
+    ok: status >= 200 && status < 300,
+    json: async () => {
+      if (throwJson) throw new SyntaxError('bad json');
+      return body;
+    },
+  });
+}
+
+describe('fetchUsage', () => {
+  it('normalizes a happy 200', async () => {
+    const body = {
+      five_hour: { utilization: 10, resets_at: '2026-07-11T23:00:00Z' },
+      seven_day: { utilization: 6, resets_at: '2026-07-18T09:00:00Z' },
+    };
+    const r = await fetchUsage({ token: 't', fetchImpl: fakeFetch(200, body) });
+    expect(r.fiveHour).toEqual({ utilization: 10, resetsAt: '2026-07-11T23:00:00Z' });
+    expect(r.sevenDay.utilization).toBe(6);
+  });
+  it('shape drift (missing windows) does NOT throw, yields null utilizations', async () => {
+    const r = await fetchUsage({ token: 't', fetchImpl: fakeFetch(200, { renamed: {} }) });
+    expect(r.fiveHour.utilization).toBeNull();
+    expect(usableWindowCount(r)).toBe(0);
+  });
+  it('non-200 throws LimitsFetchError with status', async () => {
+    await expect(fetchUsage({ token: 't', fetchImpl: fakeFetch(401, {}) }))
+      .rejects.toMatchObject({ status: 401 });
+  });
+  it('non-JSON 200 body throws malformed', async () => {
+    await expect(fetchUsage({ token: 't', fetchImpl: fakeFetch(200, null, { throwJson: true }) }))
+      .rejects.toBeInstanceOf(LimitsFetchError);
+  });
+});
+
+describe('classifyFailure', () => {
+  it('5xx and 429 are transient', () => {
+    expect(classifyFailure(new LimitsFetchError('x', { status: 503 })).class).toBe('transient');
+    expect(classifyFailure(new LimitsFetchError('x', { status: 429 })).class).toBe('transient');
+  });
+  it('401/403 permanent stale-token', () => {
+    expect(classifyFailure(new LimitsFetchError('x', { status: 401 }))).toEqual({ class: 'permanent', reason: 'stale-token' });
+    expect(classifyFailure(new LimitsFetchError('x', { status: 403 }))).toEqual({ class: 'permanent', reason: 'stale-token' });
+  });
+  it('other 4xx and non-JSON permanent malformed', () => {
+    expect(classifyFailure(new LimitsFetchError('x', { status: 400 }))).toEqual({ class: 'permanent', reason: 'malformed' });
+    expect(classifyFailure(new LimitsFetchError('x', { status: 200, malformedBody: true }))).toEqual({ class: 'permanent', reason: 'malformed' });
+  });
+  it('network error (no status) is transient', () => {
+    expect(classifyFailure(new Error('ECONNRESET')).class).toBe('transient');
+  });
+});
+
+describe('readOAuthToken', () => {
+  it('missing file returns null', () => {
+    expect(readOAuthToken({ credsPath: '/nonexistent/x.json' })).toBeNull();
   });
 });
