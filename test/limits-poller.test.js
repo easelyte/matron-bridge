@@ -202,4 +202,51 @@ describe('createPoller permanent-failure escalation', () => {
     await p.tick();
     expect(sent).toHaveLength(1);
   });
+
+  it('escalation notice send throws: not marked delivered, warns, retries', async () => {
+    const attempts = [];
+    const warns = [];
+    const { deps } = failHarness(new LimitsFetchError('x', { status: 401 }), 1);
+    deps.recentRooms = () => ['!a:s', '!b:s'];
+    deps.send = async (roomId) => {
+      attempts.push(roomId);
+      throw new Error('send exploded');
+    };
+    deps.log = { warn: (m) => warns.push(m), info() {}, debug() {} };
+    const p = createPoller(deps);
+
+    await expect(p.tick()).resolves.toBeUndefined();
+    await expect(p.tick()).resolves.toBeUndefined();
+
+    expect(attempts).toEqual(['!a:s', '!b:s', '!a:s', '!b:s']);
+    expect(warns.filter((m) => /notice send failed room=/.test(m))).toHaveLength(4);
+    expect(warns.filter((m) => /NO deliverable room/.test(m))).toHaveLength(2);
+    expect(p._state.noticeDelivered).toBe(false);
+  });
+
+  it('escalation with rooms filtered by gate: no notice, not marked delivered, retries', async () => {
+    const sent = [];
+    const gateChecks = [];
+    const warns = [];
+    const { deps } = failHarness(new LimitsFetchError('x', { status: 401 }), 1);
+    deps.recentRooms = () => ['!a:s', '!b:s'];
+    deps.gateAllows = async (roomId) => {
+      gateChecks.push(roomId);
+      return false;
+    };
+    deps.send = async (roomId, msg) => {
+      sent.push({ roomId, msg });
+      return true;
+    };
+    deps.log = { warn: (m) => warns.push(m), info() {}, debug() {} };
+    const p = createPoller(deps);
+
+    await p.tick();
+    await p.tick();
+
+    expect(gateChecks).toEqual(['!a:s', '!b:s', '!a:s', '!b:s']);
+    expect(sent).toHaveLength(0);
+    expect(warns.filter((m) => /NO deliverable room/.test(m))).toHaveLength(2);
+    expect(p._state.noticeDelivered).toBe(false);
+  });
 });
