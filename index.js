@@ -26,6 +26,8 @@ import { BRIDGE_COMMAND_NAMES as bridgeCommandNames, commandHoldAction, createCo
 import { downloadAndMerge } from './lib/download-merge.js';
 import { resolveMediaCaption } from './lib/media-caption.js';
 import { makeFlusher } from './lib/coalesce-flush-kit.js';
+import { createPoller } from './lib/limits-poller.js';
+import { parseIntEnv, parseThresholds, makeMembershipGate, readOAuthToken, fetchUsage, formatLimits } from './lib/limits.js';
 
 const DEFAULT_BRIDGE_CLAUDE_MD_PATH = path.join(__dirname, 'BRIDGE_CLAUDE.md');
 const FALLBACK_BRIDGE_PROMPT = 'You are running inside a Matrix bridge. The user interacts through Matrix, not a terminal.';
@@ -119,6 +121,14 @@ const RESUME_READY_HARDCAP_MS = parseInt(process.env.RESUME_READY_HARDCAP_MS || 
 const COALESCE_WINDOW_MS = parseInt(process.env.MATRON_COALESCE_WINDOW_MS ?? '800', 10); // 0 disables W1
 const COALESCE_HARDCAP_MS = parseInt(process.env.MATRON_COALESCE_HARDCAP_MS ?? '12000', 10);
 const COALESCE_UNIVERSAL = process.env.MATRON_COALESCE_UNIVERSAL === '1';
+const LIMITS_POLL_MS = parseIntEnv(process.env.BRIDGE_LIMITS_POLL_MS, { name: 'BRIDGE_LIMITS_POLL_MS', def: 300000, min: 1, allowDisableSentinel: true }, console);
+const LIMITS_THRESHOLDS = parseThresholds(process.env.BRIDGE_LIMITS_THRESHOLDS, console);
+const LIMITS_ACTIVE_WINDOW_MS = parseIntEnv(process.env.BRIDGE_LIMITS_ALERT_ACTIVE_WINDOW_MS, { name: 'BRIDGE_LIMITS_ALERT_ACTIVE_WINDOW_MS', def: 21600000, min: 1 }, console);
+const LIMITS_STALE_AFTER = parseIntEnv(process.env.BRIDGE_LIMITS_STALE_ALERT_AFTER, { name: 'BRIDGE_LIMITS_STALE_ALERT_AFTER', def: 3, min: 1 }, console);
+const LIMITS_DRY_RUN = process.env.BRIDGE_LIMITS_DRY_RUN === '1';
+const LIMITS_ALLOW_ANY = process.env.BRIDGE_LIMITS_ALLOW_ANY === '1';
+const LIMITS_CREDS_PATH = process.env.BRIDGE_LIMITS_CREDS_PATH || null; // null => lib default (os.homedir())
+const LIMITS_ENABLED = process.env.BRIDGE_LIMITS_ENABLED !== '0'; // master kill switch (default on)
 const COALESCE_NOTICE_MS = 1500;
 const _resumeGeneratingScreenDetector = isGeneratingScreen;
 const MAX_MSG_LENGTH = 32768;  // Matrix supports ~65KB, use 32K as practical limit
@@ -343,6 +353,7 @@ function loadLastEventTsMap() {
 }
 
 let lastEventTsMap = loadLastEventTsMap();
+const lastAllowedEventTsMap = {}; // roomId -> ts, only for events passing the allow-list (P15 targeting source)
 let lastEventTsDirty = false;
 const botStartupTs = Date.now();
 
@@ -2958,6 +2969,7 @@ const client = new MatrixClient(MATRIX_HOMESERVER_URL, resolvedAccessToken, stor
 AutojoinRoomsMixin.setupOnClient(client);
 
 let botUserId;
+let membershipGateAllows = async () => false;
 
 // --- Send to Matrix Room ---
 
@@ -4246,6 +4258,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         `  !effort [level] — Show or set effort level\n` +
         `  !cost — Session cost\n` +
         `  !usage — Token usage\n` +
+        `  !limits — Claude 5h + 7d subscription limits\n` +
         `  !tools — Available tools\n` +
         `  !help — This help message\n\n` +
         `Use ! for bridge commands. / also works for the above, but\n` +
@@ -4289,6 +4302,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
           ['!effort [level]', 'Show or set effort level (low, medium, high, xhigh, max, auto, ultracode)'],
           ['!cost', 'Session cost'],
           ['!usage', 'Token usage'],
+          ['!limits', 'Claude 5h + 7d subscription limits'],
           ['!tools', 'Available tools'],
           ['!help', 'This help message'],
         ]) +
@@ -4512,6 +4526,28 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       break;
     }
 
+    case '!limits': {
+      if (!LIMITS_ENABLED) { await sendReply('Limits feature is disabled.'); break; }
+      if (!(await membershipGateAllows(roomId))) {
+        await sendReply('⚠️ Limit usage is account-global; not posting it in a room with unauthorized members.');
+        break;
+      }
+      const token = readOAuthToken({ credsPath: LIMITS_CREDS_PATH });
+      if (!token) {
+        await sendReply("⚠️ Couldn't read Claude limits — no OAuth token found. Try again after some Claude activity.");
+        break;
+      }
+      try {
+        const usage = await fetchUsage({ token });
+        const { plain, html } = formatLimits({ fiveHour: usage.fiveHour, sevenDay: usage.sevenDay });
+        await sendHtml(plain, html);
+      } catch (e) {
+        await sendReply('⚠️ Couldn\'t read Claude limits right now. The usage endpoint is undocumented; if the token is stale, try again after any Claude activity.');
+        debug(`!limits fetch failed: ${e.name} ${e.status ?? ''}`);
+      }
+      break;
+    }
+
     case '!tools': {
       const session = sessions.get(roomId);
       if (!session || !session.alive) {
@@ -4592,6 +4628,7 @@ client.on('room.message', async (roomId, event) => {
 
   const sender = event.sender;
   if (warnIfDisallowed(sender, roomId)) return;
+  lastAllowedEventTsMap[roomId] = Math.max(lastAllowedEventTsMap[roomId] || 0, eventTs);
 
   const msgtype = event.content.msgtype;
   let text = '';
@@ -6002,6 +6039,61 @@ function startIdleReaper() {
   }, SESSION_IDLE_CHECK_MS).unref();
 }
 
+function startLimitsPoller() {
+  if (!LIMITS_ENABLED) {
+    debug('[limits] disabled (BRIDGE_LIMITS_ENABLED=0)');
+    return;
+  }
+  if (LIMITS_POLL_MS <= 0) {
+    debug('[limits] poller disabled (BRIDGE_LIMITS_POLL_MS<=0)');
+    return;
+  }
+  const poller = createPoller({
+    thresholds: LIMITS_THRESHOLDS,
+    staleAfter: LIMITS_STALE_AFTER,
+    readToken: () => readOAuthToken({ credsPath: LIMITS_CREDS_PATH }),
+    fetchUsage,
+    recentRooms: () => {
+      const cutoff = Date.now() - LIMITS_ACTIVE_WINDOW_MS;
+      const set = new Set(Object.entries(lastAllowedEventTsMap).filter(([, ts]) => ts >= cutoff).map(([r]) => r));
+      // Session rooms are also subject to the recency cutoff: a live-but-idle
+      // session that predates the active window is not recently active.
+      for (const [r, s] of sessions) {
+        if ((s.lastActivityAt || s.startedAt || 0) >= cutoff) set.add(r);
+      }
+      return [...set];
+    },
+    gateAllows: (roomId) => membershipGateAllows(roomId),
+    send: async (roomId, msg) => {
+      if (LIMITS_DRY_RUN) {
+        console.log(`[limits] DRY_RUN would alert room=${roomId}: ${msg.plain}`);
+        return true;
+      }
+      return (await sendToRoom(roomId, msg.plain, msg.html)) !== null;
+    },
+    now: Date.now,
+    log: { warn: console.warn, info: (m) => console.log(m), debug: (m) => debug(m) },
+  });
+  console.log(`[limits] poller started: interval=${LIMITS_POLL_MS}ms thresholds=${LIMITS_THRESHOLDS.join(',')} dryRun=${LIMITS_DRY_RUN}`);
+  let polling = false;
+  const runTick = async () => {
+    if (polling) return;
+    polling = true;
+    try {
+      await poller.tick();
+    } catch (e) {
+      // Unexpected tick failure is a real error, not heartbeat noise — surface it
+      // regardless of DEBUG (P34 observability), sanitized (no token).
+      console.warn(`[limits] poll tick error: ${e?.name || 'Error'}: ${e?.message || e}`);
+    } finally {
+      polling = false;
+    }
+  };
+  runTick();
+  const h = setInterval(runTick, LIMITS_POLL_MS);
+  h.unref();
+}
+
 // --- Startup ---
 
 async function main() {
@@ -6011,6 +6103,7 @@ async function main() {
   } catch {}
 
   botUserId = await client.getUserId();
+  membershipGateAllows = makeMembershipGate({ client, allowedIds: ALLOWED_USER_IDS, botUserId, allowAny: LIMITS_ALLOW_ANY, log: console });
   console.log(`Bot logged in as ${botUserId}`);
   console.log(`Homeserver: ${MATRIX_HOMESERVER_URL}`);
   console.log(`Allowed users: ${ALLOWED_USER_IDS.length ? ALLOWED_USER_IDS.join(', ') : 'any'}`);
@@ -6024,6 +6117,7 @@ async function main() {
   console.log(`Session room encryption: ${ENCRYPT_SESSION_ROOMS ? 'ON' : 'OFF'}`);
   console.log(`Bridge Claude instructions: ${BRIDGE_CLAUDE_MD_PATH}`);
   console.log(`Debug mode: ${DEBUG ? 'ON' : 'OFF'}`);
+  startLimitsPoller();
 
   await client.start();
   console.log('Matrix client started, listening for messages...');

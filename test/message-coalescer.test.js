@@ -1,6 +1,10 @@
 import { describe, it, expect } from 'vitest';
-import { createCoalesceWindow, mergeContentBlockGroups } from '../lib/message-coalescer.js';
+import { createCoalesceWindow, isBridgeCommandEligible, mergeContentBlockGroups } from '../lib/message-coalescer.js';
 import { downloadAndMerge } from '../lib/download-merge.js';
+
+it('recognizes !limits as a bridge command', () => {
+  expect(isBridgeCommandEligible({ msgtype: 'm.text', text: '!limits' })).toBe(true);
+});
 
 function fakeTimers() {
   let t = 0;
