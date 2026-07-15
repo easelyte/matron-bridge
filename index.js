@@ -85,6 +85,14 @@ const DEFAULT_BRIDGE_CODEX_MD_PATH = path.join(__dirname, 'BRIDGE_CODEX.md');
 const FALLBACK_BRIDGE_PROMPT = 'You are running through a remote Matron bridge. The user interacts through chat, not a terminal.';
 const FALLBACK_CODEX_BRIDGE_PROMPT = 'You are running through a remote chat bridge. Work autonomously within the configured sandbox; interactive approvals are unavailable.';
 
+// easelyte fork delta: the bridge runs as root on the VPS, where Claude refuses
+// --dangerously-skip-permissions. Match the live claude-matrix-bridge config —
+// a full tool allow-list via --settings — which Claude accepts under root.
+const BRIDGE_ROOT_PERMISSIONS = {
+  allow: ['Bash(*)', 'Read(*)', 'Write(*)', 'Edit(*)', 'MultiEdit(*)', 'Glob(*)', 'Grep(*)', 'WebFetch(*)', 'WebSearch(*)', 'Skill', 'Agent(*)', 'Task(*)', 'NotebookEdit(*)'],
+  deny: [],
+};
+
 // --- Config ---
 
 const ALLOWED_USER_IDS = (process.env.ALLOWED_USER_IDS || '')
@@ -964,12 +972,12 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     '--verbose',
     '--input-format', 'stream-json',
     '--output-format', 'stream-json',
-    '--dangerously-skip-permissions',
     '--disallowed-tools', 'AskUserQuestion',
     '--append-system-prompt', BRIDGE_SYSTEM_PROMPT,
     '--include-partial-messages',
     '--mcp-config', mcpConfigPathFor(mcpExtras),
     '--settings', JSON.stringify({
+      permissions: BRIDGE_ROOT_PERMISSIONS,
       hooks: {
         PreCompact: [{
           hooks: [{
@@ -1493,6 +1501,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     : resolveModel({ option: options.model, persisted: persistedForRoom?.model });
 
   const settings = {
+    permissions: BRIDGE_ROOT_PERMISSIONS,
     hooks: {
       PreCompact: [{
         hooks: [{ type: 'command', command: path.join(__dirname, 'hooks', 'compact-notify.sh'), timeout: 5 }],
@@ -1522,7 +1531,6 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     claudeArgs.push('--session-id', sessionId);
   }
   claudeArgs.push(
-    '--dangerously-skip-permissions',
     // AskUserQuestion is allowed in iv-mode: the TUI prompt detector
     // (lib/prompt-detector.js) catches it and routes the question through
     // Matrix. Print-mode kept it disallowed because there was no way to
