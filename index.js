@@ -4442,7 +4442,11 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
           await sendReply(`${currentLine}${extra}\nSpawn model (new sessions): ${spawnModel || '(Claude default)'}\n\nType /model <name> to switch this session (e.g. /model sonnet). Options: ${VALID_ALIAS_HINT}.`);
         }
       } else {
-        await sendReply(`${currentLine}${extra}\nSpawn model (new sessions): ${spawnModel || '(Claude default)'}\n\nSwitching models needs interactive mode.`);
+        // Headless sessions can't hot-switch the live process, but `!model
+        // <name>` still sets + persists the spawn model and `!restart` applies
+        // it to this session — say so instead of a dead-end "needs interactive
+        // mode" (operator flagged the old copy as misleading, 2026-07-17).
+        await sendReply(`${currentLine}${extra}\nSpawn model (new sessions): ${spawnModel || '(Claude default)'}\n\nLive hot-switch needs interactive mode, but: !model <name> [1m] sets the spawn model, then !restart respawns this session on it. Options: ${opts}.`);
       }
       break;
     }
