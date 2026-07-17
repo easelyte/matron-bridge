@@ -4349,6 +4349,16 @@ function safeMediaFilename(name) {
   return base === '' || base === '.' || base === '..' ? 'file' : base;
 }
 
+// Session-scoped uploads directory for SDK-mode media saves: <workdir>/uploads.
+// Keeps user-sent files out of the workdir root, where they otherwise sit as
+// untracked noise in the operator's git checkout (workspace root or worktree —
+// uploads/ is gitignored there). Mirrors the Matrix bridge's uploadsDir helper.
+function sessionUploadsDir(session) {
+  const dir = path.join(session.workdir, 'uploads');
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
 // Build the claude content blocks for an already-materialized (fetched from
 // the journal blob store) NON-audio media buffer: saves the bytes to the right
 // place (iv upload dir vs. session workdir) and produces the same save-path
@@ -4383,8 +4393,10 @@ function buildSavedMediaBlocks(session, { buffer, mime, dims, isImage, ivFilenam
     return { blocks, ivHandled: true };
   }
   if (isImage) {
-    // Save image to workdir
-    const imgPath = deduplicateFilename(session.workdir, workdirName);
+    // Save image to the session uploads dir
+    let imgPath;
+    try { imgPath = deduplicateFilename(sessionUploadsDir(session), workdirName); }
+    catch (err) { blocks.push({ type: 'text', text: `[Upload failed: ${err.message}]` }); return { blocks, ivHandled: false }; }
     fs.writeFileSync(imgPath, buffer);
     blocks.push({ type: 'text', text: `Image saved to ${imgPath}` });
     blocks.push({
@@ -4393,8 +4405,10 @@ function buildSavedMediaBlocks(session, { buffer, mime, dims, isImage, ivFilenam
     });
     attachPendingMediaMirror(blocks, { buffer, mime, name: workdirName, dims });
   } else {
-    // Save file to workdir
-    const savePath = deduplicateFilename(session.workdir, workdirName);
+    // Save file to the session uploads dir
+    let savePath;
+    try { savePath = deduplicateFilename(sessionUploadsDir(session), workdirName); }
+    catch (err) { blocks.push({ type: 'text', text: `[Upload failed: ${err.message}]` }); return { blocks, ivHandled: false }; }
     fs.writeFileSync(savePath, buffer);
     blocks.push({ type: 'text', text: `File saved to ${savePath}` });
     attachPendingMediaMirror(blocks, { buffer, mime, name: workdirName, dims });
