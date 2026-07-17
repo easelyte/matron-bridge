@@ -716,6 +716,31 @@ describe('createJournalInputConsumer — media (file/image) routing', () => {
     ...overrides,
   });
 
+  it('extracts, trims, and clamps payload.caption into the media object', () => {
+    const deps = makeDeps();
+    const consumer = createJournalInputConsumer(deps);
+    const framed = (payload) => fileFrame({ payload: { ...fileFrame().payload, ...payload } });
+
+    consumer(framed({ caption: '  look at this  ' }));
+    expect(deps.routeMediaToSession).toHaveBeenCalledWith(
+      expect.anything(),
+      expect.objectContaining({ caption: 'look at this' }),
+      expect.anything(),
+    );
+
+    deps.routeMediaToSession.mockClear();
+    consumer(framed({ caption: 'x'.repeat(5000) }));
+    expect(deps.routeMediaToSession.mock.calls[0][1].caption).toHaveLength(4096);
+
+    deps.routeMediaToSession.mockClear();
+    consumer(framed({}));
+    expect(deps.routeMediaToSession.mock.calls[0][1].caption).toBeNull();
+
+    deps.routeMediaToSession.mockClear();
+    consumer(framed({ caption: '   ' }));
+    expect(deps.routeMediaToSession.mock.calls[0][1].caption).toBeNull();
+  });
+
   it('routes a user file event to routeMediaToSession with the resolved media shape', () => {
     const deps = makeDeps();
     const consumer = createJournalInputConsumer(deps);
@@ -725,7 +750,7 @@ describe('createJournalInputConsumer — media (file/image) routing', () => {
     expect(session).toEqual({ claudeSessionId: 'convo-1' });
     expect(media).toEqual({
       type: 'file', blobRef: 'blob-1', contentType: 'application/pdf',
-      name: 'report.pdf', size: 1234, dims: null,
+      name: 'report.pdf', size: 1234, dims: null, caption: null,
     });
     expect(ctx).toEqual({ username: 'dan' });
     expect(deps.routeTextToSession).not.toHaveBeenCalled();
@@ -742,7 +767,7 @@ describe('createJournalInputConsumer — media (file/image) routing', () => {
     const [, media] = deps.routeMediaToSession.mock.calls[0];
     expect(media).toEqual({
       type: 'image', blobRef: 'img-9', contentType: 'image/png',
-      name: 'shot.png', size: 55, dims: { w: 800, h: 600 },
+      name: 'shot.png', size: 55, dims: { w: 800, h: 600 }, caption: null,
     });
   });
 

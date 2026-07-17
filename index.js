@@ -5897,26 +5897,29 @@ function journalOnText(session, body, { username }) {
 
 // media (file/image/voice-note) -> session. Thin wiring around the injectable
 // lib/journal-media.js orchestrator: the router hands us a resolved
-// {type, blobRef, contentType, name, size, dims}; the orchestrator fetches the
-// blob back out of the journal blob store and feeds it to the session exactly
-// the way the Matrix media path does — audio transcribed and injected as if
-// the user typed it, images/files saved to the same per-session location and
-// attached to the next prompt. Fire-and-forget: the orchestrator's returned
-// function never throws/rejects (it swallows internally), matching the
-// router's contract for routeMediaToSession. Nothing here re-mirrors the blob
-// into the journal — the client's own file/image event is already there — so
-// file/image injection passes skipJournalMirror; a voice note's transcript IS
-// published (as the user's message, via sendTextToSession) so it's visible in
-// the journal too, mirroring what the Matrix m.audio path records.
+// {type, blobRef, contentType, name, size, dims, caption}; the orchestrator
+// fetches the blob back out of the journal blob store and feeds it to the
+// session exactly the way the Matrix media path does — audio transcribed and
+// injected as if the user typed it, images/files saved to the same per-session
+// location and attached to the next prompt. buildSavedMediaBlocks folds the
+// caption into the iv annotation and reports ivHandled; SDK mode leaves it for
+// the orchestrator to tail-append as a text block. Fire-and-forget: the
+// orchestrator's returned function never throws/rejects (it swallows
+// internally), matching the router's contract for routeMediaToSession.
+// Nothing here re-mirrors the blob into the journal — the client's own
+// file/image event is already there — so file/image injection passes
+// skipJournalMirror; a voice note's transcript IS published (as the user's
+// message, via sendTextToSession) so it's visible in the journal too,
+// mirroring what the Matrix m.audio path records.
 const journalMediaRouter = createJournalMediaRouter({
   fetchMedia: (blobRef) => journalPublisher.fetchMedia(blobRef),
   transcribe: (buffer, mime) => transcribeAudio(buffer, mime, { modelPath: WHISPER_MODEL_PATH, language: WHISPER_LANGUAGE }),
-  buildSavedBlocks: (session, { buffer, mime, isImage, name, dims }) => {
+  buildSavedBlocks: (session, { buffer, mime, isImage, name, dims, caption }) => {
     const safeName = safeMediaFilename(name);
     return buildSavedMediaBlocks(session, {
       buffer, mime, dims: dims || undefined, isImage,
-      ivFilename: safeName, ivCaption: null, workdirName: safeName,
-    }).blocks;
+      ivFilename: safeName, ivCaption: caption ?? null, workdirName: safeName,
+    });
   },
   injectText: (session, text) => sendTextToSession(session, text),
   injectBlocks: (session, blocks) => sendToSession(session, blocks, { skipJournalMirror: true }),

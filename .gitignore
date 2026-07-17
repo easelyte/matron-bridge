@@ -3,3 +3,4 @@ node_modules/
 *.log
 .mcp-config-generated*.json
 journal-cursor.json
+.codex-session-tmp/
