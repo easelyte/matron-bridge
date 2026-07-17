@@ -162,9 +162,23 @@ app.get('/view', async (req, res) => {
   try {
     // Resolve and prevent path traversal
     const filePath = path.resolve(data.path);
-    const content = await fs.readFile(filePath, 'utf-8');
     const filename = path.basename(filePath);
+    const ext = path.extname(filePath).slice(1).toLowerCase();
 
+    // Binary types are served raw with correct headers; the text path below
+    // reads utf-8 and would corrupt them (e.g. PDFs render as garbage).
+    const BINARY_TYPES = {
+      pdf: 'application/pdf', png: 'image/png', jpg: 'image/jpeg',
+      jpeg: 'image/jpeg', gif: 'image/gif', webp: 'image/webp', zip: 'application/zip',
+    };
+    if (BINARY_TYPES[ext]) {
+      const buf = await fs.readFile(filePath);
+      res.type(BINARY_TYPES[ext]);
+      res.setHeader('Content-Disposition', `inline; filename="${filename}"`);
+      return res.send(buf);
+    }
+
+    const content = await fs.readFile(filePath, 'utf-8');
     res.type('html').send(renderHtml(filename, content));
   } catch (err) {
     if (err.code === 'ENOENT') return res.status(404).send('File not found');
