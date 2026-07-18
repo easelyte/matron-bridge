@@ -1,4 +1,6 @@
 import { describe, it, expect } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import {
   resolveInteractive,
   resolveModel,
@@ -7,6 +9,7 @@ import {
   modeButtons,
   planModeSwitch,
 } from '../lib/session-mode.js';
+import * as sessionMode from '../lib/session-mode.js';
 
 describe('resolveInteractive', () => {
   it('prefers an explicit boolean option over everything', () => {
@@ -98,5 +101,38 @@ describe('planModeSwitch', () => {
     const d = planModeSwitch({ iv: null, busy: false, claudeSessionId: 'abc' }, true);
     expect(d.ok).toBe(true);
     expect(d.message).toMatch(/interactive/i);
+  });
+});
+
+describe('planSessionIdentity', () => {
+  it('mints an id and plans --session-id for a fresh session', () => {
+    const plan = sessionMode.planSessionIdentity({ resumeSessionId: undefined, mintId: () => 'uuid-1' });
+    expect(plan.sessionId).toBe('uuid-1');
+    expect(plan.cliArgs).toEqual(['--session-id', 'uuid-1']);
+  });
+  it('reuses the resume id and plans --resume without minting', () => {
+    let minted = 0;
+    const plan = sessionMode.planSessionIdentity({ resumeSessionId: 'old-id', mintId: () => { minted++; return 'never'; } });
+    expect(plan.sessionId).toBe('old-id');
+    expect(plan.cliArgs).toEqual(['--resume', 'old-id']);
+    expect(minted).toBe(0);
+  });
+});
+
+// Wiring guard: index.js can't be imported in-process (it starts the bridge),
+// so assert by source inspection — the same pattern command-dispatch.test.js
+// uses. Both spawn paths must route their id args through planSessionIdentity
+// so a fresh PRINT session knows its claudeSessionId synchronously (RPC start
+// needs it to answer convo_id) and the --session-id/--resume exclusivity rule
+// lives in exactly one place.
+describe('createSession id pre-assignment (source inspection)', () => {
+  const src = readFileSync(fileURLToPath(new URL('../index.js', import.meta.url)), 'utf-8');
+  it('both spawn paths use planSessionIdentity', () => {
+    const calls = src.match(/planSessionIdentity\(/g) || [];
+    expect(calls.length).toBeGreaterThanOrEqual(2);
+  });
+  it('no hand-rolled --session-id/--resume args outside the helper', () => {
+    expect(src).not.toMatch(/push\('--session-id'/);
+    expect(src).not.toMatch(/push\('--resume'/);
   });
 });

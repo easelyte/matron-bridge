@@ -2,6 +2,7 @@ import dotenv from 'dotenv';
 dotenv.config({ override: true });
 import { spawn } from 'child_process';
 import { transcribeAudio } from './lib/transcribe.js';
+import { prepareInlineImage, appendInlineImageBlocks } from './lib/inline-image.js';
 import { createServer } from 'http';
 import { createHmac, randomUUID } from 'crypto';
 import fs from 'fs';
@@ -25,6 +26,7 @@ import {
   modeLabel,
   modeButtons,
   planModeSwitch,
+  planSessionIdentity,
 } from './lib/session-mode.js';
 import { switchEffortInSession, effortButtons, VALID_EFFORT_HINT } from './lib/effort-command.js';
 import { promptButtons, promptResponseForButton } from './lib/prompt-buttons.js';
@@ -32,6 +34,7 @@ import { parseOptionReply } from './lib/prompt-reply.js';
 import { sendDelayedPromptAnswer, writePromptAnswer } from './lib/prompt-answer-delivery.js';
 import { SubagentWatcher } from './lib/subagent-watcher.js';
 import { createSubagentConvoTracker } from './lib/subagent-convos.js';
+import { formatSubagentToolBody } from './lib/subagent-tool-format.js';
 import { ivUploadDir, ivUploadAnnotation } from './lib/iv-uploads.js';
 import { parseUsageLimits, formatLimits } from './lib/usage-limits.js';
 import { readSessionSummary, listSessionSummaries, listSessionIdsByMtime, pathExists } from './lib/session-summary.js';
@@ -48,12 +51,13 @@ import { sendPrintInterrupt } from './lib/print-interrupt.js';
 import { checkFileLink } from './lib/file-link-guard.js';
 import { createJournalPublisher } from './lib/journal-publisher.js';
 import { createRpcRequestHandler } from './lib/journal-rpc.js';
+import { createRecentFolders } from './lib/recent-folders.js';
 import { dispatchBusyQueueMagicWord, notifyQueuedMessage, isQueueActionValue, handleQueueActionValue } from './lib/busy-queue.js';
 import { createJournalInputConsumer, resolvePromptChoice } from './lib/journal-input-router.js';
 import { createJournalMediaRouter } from './lib/journal-media.js';
 import { markJournalOrigin, planQueueFlush } from './lib/queue-flush.js';
 import { attachPendingMediaMirror, pendingMediaMirror } from './lib/media-mirror.js';
-import { seedJournalTitle } from './lib/journal-title-seed.js';
+import { seedJournalTitle, applyFallbackTitle } from './lib/journal-title-seed.js';
 import { activityStateChanged, truncateActivityDetail, shouldResumeThinkingAfterTool } from './lib/journal-activity.js';
 import { streamRefFor } from './lib/journal-stream.js';
 import { contextFullToNative, briefContextReport } from './lib/context-command.js';
@@ -133,6 +137,9 @@ const MAX_MSG_LENGTH = 32768;  // Matrix supports ~65KB, use 32K as practical li
 const DEBUG = process.env.DEBUG === '1';
 const INTERACTIVE_MODE = process.env.MATRON_INTERACTIVE_MODE === '1';
 const SESSIONS_FILE = path.join(os.homedir(), '.claude-matrix-sessions.json');
+// Durable folder history for the picker (`recent_folders` RPC) — outlives
+// the session records above, which stale-resume cleanup deletes.
+const RECENT_FOLDERS_FILE = path.join(os.homedir(), '.matron-bridge-folders.json');
 
 // Generate MCP config with resolved paths (--mcp-config requires a file, not inline JSON).
 // The on-disk baseline assumes Linux (xvfb-run wraps the browser MCP); on macOS we
@@ -381,7 +388,17 @@ function savePersistedSessions(data) {
   }
 }
 
+// Folder history store, seeded once per boot from whatever the session
+// store still knows — after that, folders survive on their own even when
+// their session records are deleted.
+const recentFolders = createRecentFolders({ file: RECENT_FOLDERS_FILE });
+recentFolders.seedFrom(Object.values(loadPersistedSessions()).map((rec) => ({
+  path: rec?.workdir,
+  lastUsed: rec?.lastUsed,
+})));
+
 function persistSession(roomId, sessionId, workdir, originRoomId, extra) {
+  recentFolders.touch(workdir, Date.now());
   const data = loadPersistedSessions();
   const existing = data[String(roomId)] || {};
   // Auto-carry session-scoped fields (mcpExtras) from the live session if the
@@ -513,9 +530,9 @@ function journalStartSessionForRpc({ workdir, mcpExtras }) {
   session.sendCallback = sessionSendReply;
   session.sendHtml = sessionSendHtml;
   session.sendButtonMessage = sessionSendButtons;
-  // Same iv-mode persistence rule as !start: claudeSessionId is known
-  // immediately, so persist extras now rather than losing them to a bridge
-  // restart before the first transcript-driven persist.
+  // Same persistence rule as !start: claudeSessionId is known immediately
+  // (pre-assigned at spawn), so persist extras now rather than losing them
+  // to a bridge restart before the first transcript-driven persist.
   if (mcpExtras.length > 0 && session.claudeSessionId) {
     persistSession(sessionRoomId, session.claudeSessionId, session.workdir, null);
   }
@@ -535,6 +552,7 @@ const journalRpcHandler = createRpcRequestHandler({
     journalEvictConvoInput(session);
   },
   listPersistedSessions: () => Object.values(loadPersistedSessions()),
+  listRememberedFolders: () => recentFolders.list(),
   defaultWorkdir: DEFAULT_WORKDIR,
   expandHome,
   log: console,
@@ -592,10 +610,11 @@ function journalPublish(session, method, payload) {
   if (convoId) {
     // Protocol requirement: a convo_upsert must reach the server before (or
     // with) the first publish to a convo — the server hard-rejects publishes
-    // to conversations that don't exist yet. Print-mode sessions get this via
-    // journalFlushForSession, but iv-mode sessions know their id at spawn and
-    // never buffer, so an assistant notice posted before the first
-    // state-transition upsert would otherwise be dropped server-side.
+    // to conversations that don't exist yet. Sessions whose id arrives late
+    // (codex thread_ids) get this via journalFlushForSession, but claude
+    // sessions know their id at spawn and never buffer, so an assistant
+    // notice posted before the first state-transition upsert would otherwise
+    // be dropped server-side.
     if (!session._journalConvoEstablished) {
       session._journalConvoEstablished = true;
       if (method !== 'upsertConvo') {
@@ -613,9 +632,16 @@ function journalUpsertConvo(session, opts) {
   journalPublish(session, 'upsertConvo', opts);
 }
 
-function journalSeedTitle(session) {
+// opts.incomingHint: the title carried across a restart/resume (see
+// seedJournalTitle) so a respawn adopts the prior good title instead of
+// re-seeding the repo basename over it. opts.reattaching: this convo already
+// exists server-side (a journalConvoId was supplied), so suppress the workdir
+// seed entirely — it could only clobber the earned title.
+function journalSeedTitle(session, { incomingHint, reattaching = false } = {}) {
   return seedJournalTitle(session, {
     workdir: session.workdir,
+    incomingHint,
+    reattaching,
     upsertConvo: journalUpsertConvo,
     warn: (m) => DEBUG && console.warn(m),
   });
@@ -940,7 +966,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   const agent = resolveAgent({ option: options.agent, persisted: persistedMode?.agent, fallback: DEFAULT_AGENT });
   if (agent === AGENT_CODEX) {
     const codexSession = createCodexSessionForRoom(roomId, workdir, resumeSessionId, options);
-    journalSeedTitle(codexSession);
+    journalSeedTitle(codexSession, { incomingHint: options.journalTitleHint, reattaching: options.journalConvoId != null });
     return codexSession;
   }
   const interactive = resolveInteractive({
@@ -950,7 +976,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   });
   if (interactive) {
     const ivSession = createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, options);
-    journalSeedTitle(ivSession);
+    journalSeedTitle(ivSession, { incomingHint: options.journalTitleHint, reattaching: options.journalConvoId != null });
     return ivSession;
   }
   const cwd = expandHome(workdir || DEFAULT_WORKDIR);
@@ -967,6 +993,11 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   const mcpExtras = Array.isArray(options.mcpExtras)
     ? options.mcpExtras
     : (Array.isArray(persistedForRoom?.mcpExtras) ? persistedForRoom.mcpExtras : []);
+  // Pre-assign the session id for fresh spawns (same trick as iv-mode below):
+  // claudeSessionId is then known synchronously, so RPC start can answer with
+  // a convo_id immediately and journal publishes never buffer for the init
+  // event. Resumes keep --resume semantics (see planSessionIdentity).
+  const identity = planSessionIdentity({ resumeSessionId, mintId: randomUUID });
   const args = [
     '--print',
     '--verbose',
@@ -1002,9 +1033,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   if (printModel) {
     args.push('--model', printModel);
   }
-  if (resumeSessionId) {
-    args.push('--resume', resumeSessionId);
-  }
+  args.push(...identity.cliArgs);
 
   debug(`Spawning claude with args: ${args.join(' ')}`);
   debug(`Working directory: ${cwd}`);
@@ -1052,8 +1081,8 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     startedAt: Date.now(),
     lastActivityAt: Date.now(),
     restartCount: 0,
-    claudeSessionId: resumeSessionId || null,
-    journalConvoId: options.journalConvoId || persistedMode?.journalConvoId || resumeSessionId || null,
+    claudeSessionId: identity.sessionId,
+    journalConvoId: options.journalConvoId || persistedMode?.journalConvoId || identity.sessionId,
     _agentSessions: mergeAgentStates({}, options.agentSessions || persistedMode?.agentSessions),
     _agentHistoryCursor: 0,
     busy: false,
@@ -1151,6 +1180,9 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
           model: session.currentModel || undefined,
           mcpExtras: session.mcpExtras,
           journalConvoId: session.journalConvoId,
+          // Carry the prior title so the re-seed adopts the good Gemini title
+          // instead of publishing the repo basename over it (title-revert bug).
+          journalTitleHint: session._journalTitleHint,
         });
         restarted.restartCount = session.restartCount + 1;
         restarted.sendCallback = session.sendCallback;
@@ -1217,7 +1249,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   }
 
   sessions.set(roomId, session);
-  journalSeedTitle(session);
+  journalSeedTitle(session, { incomingHint: options.journalTitleHint, reattaching: options.journalConvoId != null });
   return session;
 }
 
@@ -1495,7 +1527,8 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
   const mcpExtras = Array.isArray(options.mcpExtras)
     ? options.mcpExtras
     : (Array.isArray(persistedForRoom?.mcpExtras) ? persistedForRoom.mcpExtras : []);
-  const sessionId = resumeSessionId || randomUUID();
+  const identity = planSessionIdentity({ resumeSessionId, mintId: randomUUID });
+  const sessionId = identity.sessionId;
   const model = options.model === null
     ? undefined
     : resolveModel({ option: options.model, persisted: persistedForRoom?.model });
@@ -1520,16 +1553,10 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     },
   };
 
-  // The CLI rejects --session-id + --resume together unless --fork-session
-  // is also passed. For fresh sessions we pre-assign --session-id so we know
-  // the transcript path before spawn; for resumes we pass --resume only and
-  // rely on the already-known sessionId for the transcript path.
-  const claudeArgs = [];
-  if (resumeSessionId) {
-    claudeArgs.push('--resume', resumeSessionId);
-  } else {
-    claudeArgs.push('--session-id', sessionId);
-  }
+  // Fresh sessions pre-assign --session-id so the transcript path is known
+  // before spawn; resumes pass --resume only. The exclusivity rule lives in
+  // planSessionIdentity.
+  const claudeArgs = [...identity.cliArgs];
   claudeArgs.push(
     // AskUserQuestion is allowed in iv-mode: the TUI prompt detector
     // (lib/prompt-detector.js) catches it and routes the question through
@@ -1684,6 +1711,9 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
           model: session.currentModel || undefined,
           mcpExtras: session.mcpExtras,
           journalConvoId: session.journalConvoId,
+          // Carry the prior title so the re-seed adopts the good Gemini title
+          // instead of publishing the repo basename over it (title-revert bug).
+          journalTitleHint: session._journalTitleHint,
         });
         restarted.restartCount = session.restartCount + 1;
         restarted.sendCallback = session.sendCallback;
@@ -2450,28 +2480,6 @@ function resolveQuestionAnswer(session, text) {
 
 // --- Claude Event Handler ---
 
-// Format a subagent tool_use block as a plain journal-text body for the child
-// convo. Returns null for tools we don't surface (Read/Glob/Grep/Bash/etc.) to
-// keep the child convo readable — mirrors the parent's "key event" gating. No
-// 🔀[label] prefix: the child conversation IS the subagent, so its label lives
-// in the convo title, not on every line.
-function formatSubagentToolBody(toolName, input) {
-  if (toolName === 'WebSearch' && input.query) return `🌐 ${input.query}`;
-  if (toolName === 'WebFetch' && input.url) return `🌐 ${input.url}`;
-  if (toolName === 'Task' || toolName === 'Agent') {
-    const desc = (input.description || input.prompt || '').slice(0, 80);
-    return `🔀 Nested subtask: ${desc}`;
-  }
-  if (toolName === 'TodoWrite' && Array.isArray(input.todos)) {
-    const lines = input.todos.map(t => {
-      const icon = t.status === 'completed' ? '✅' : t.status === 'in_progress' ? '🔄' : '⬚';
-      return `${icon} ${t.content || t.text || ''}`;
-    });
-    return `📋 Todos:\n${lines.join('\n')}`;
-  }
-  return null;
-}
-
 // Construct + wire a session's subagent watcher and its child-convo tracker.
 // The tracker publishes each discovered subagent as its own child conversation
 // (parent_convo_id = this session's convo) and routes the subagent's output
@@ -2591,7 +2599,10 @@ function handleClaudeEvent(session, event) {
   const capturedModel = modelFromEvent(event);
   if (capturedModel) session.currentModel = capturedModel;
 
-  // Capture session ID from any event that carries it.
+  // Capture session ID from any event that carries it. Claude sessions
+  // pre-assign their id at spawn (planSessionIdentity), so for them this is
+  // a defensive fallback; it still does real work for sessions whose id is
+  // only learned from the stream.
   if (event.session_id && !session.claudeSessionId) {
     session.claudeSessionId = event.session_id;
     if (!session.journalConvoId) session.journalConvoId = event.session_id;
@@ -2600,13 +2611,11 @@ function handleClaudeEvent(session, event) {
     journalFlushForSession(session);
   }
 
-  // Lazy-construct subagent watcher once we know the session id. Print-mode
-  // resumed sessions get the watcher built eagerly in createSession() (since
-  // claudeSessionId is already populated at spawn); fresh print-mode
-  // sessions only learn their id when the first event with `session_id`
-  // arrives, so the watcher is constructed here. iv-mode constructs its
-  // watcher up front. Decoupled from the id-capture block above so future
-  // refactors can't silently lose the watcher on either spawn path.
+  // Lazy-construct subagent watcher once we know the session id. All claude
+  // spawn paths pre-assign the id and build the watcher eagerly now, so this
+  // is a safety net for any session whose id arrived late. Decoupled from
+  // the id-capture block above so future refactors can't silently lose the
+  // watcher on either spawn path.
   if (session.claudeSessionId && !session.subagentWatcher) {
     setupSubagentWatcher(session, session.workdir, session.claudeSessionId);
   }
@@ -4214,7 +4223,10 @@ async function updateRoomName(roomId, name) {
 
 async function maybeUpdatePinnedSummary(session) {
   if (!genAI) {
-    debug('Skipping summary: genAI not configured');
+    // No Gemini key: no pinned summary, but still name the convo Claude's
+    // own way — its first user message, the same summary `claude --resume`
+    // and /sessions display — instead of leaving the workdir-basename seed.
+    applyFallbackTitle(session, { serverLabel: SERVER_LABEL, updateRoomName, workdir: session.workdir });
     return;
   }
 
@@ -4368,11 +4380,22 @@ function sessionUploadsDir(session) {
 // claude. Audio is NOT handled here — the caller surfaces transcription
 // progress itself, so it runs transcribeAudio directly. `isImage` selects the
 // image branch by msgtype rather than mime — an image-mime file still falls
-// through the file branch's inline-image sub-case. `ivFilename`/`ivCaption`
-// feed the iv upload annotation; `workdirName` names the SDK-mode save.
-// Returns { blocks, ivHandled } — ivHandled true means the iv branch already
-// folded any caption in, so the caller must not append it again.
-function buildSavedMediaBlocks(session, { buffer, mime, dims, isImage, ivFilename, ivCaption, workdirName }) {
+// through the file branch's inline-image sub-case. `ivFilename` names the iv
+// upload; `workdirName` names the SDK-mode save.
+//
+// `caption` is what the user typed alongside the attachment in the composer.
+// BOTH modes fold it in, each in its own idiom: iv mode passes it to the
+// upload annotation (caption above the path), SDK mode leads with it as its
+// own text block. It used to be `ivCaption`, hardcoded `null` by the only
+// caller — so a caption reached this function from nowhere and left for
+// nowhere, and claude never saw one. `ivHandled` went the same way: it was
+// returned to tell a caller not to double-append the caption, but no caller
+// ever read it.
+//
+// `inline` is an optional prepareInlineImage decision governing the base64
+// image block only (downscaled copy / skip); the buffer written to disk and
+// the pending-media mirror always carry the full-resolution original.
+function buildSavedMediaBlocks(session, { buffer, mime, dims, isImage, ivFilename, caption, workdirName, inline }) {
   const blocks = [];
   if (session.iv) {
     // iv-mode: the PTY is text-only. Save the file OUTSIDE the repo and type
@@ -4381,7 +4404,7 @@ function buildSavedMediaBlocks(session, { buffer, mime, dims, isImage, ivFilenam
     const dir = ivUploadDir(session.roomId);
     const savePath = deduplicateFilename(dir, ivFilename);
     fs.writeFileSync(savePath, buffer);
-    blocks.push({ type: 'text', text: ivUploadAnnotation({ msgtype: isImage ? 'm.image' : 'm.file', savePath, caption: ivCaption }) });
+    blocks.push({ type: 'text', text: ivUploadAnnotation({ msgtype: isImage ? 'm.image' : 'm.file', savePath, caption }) });
     // Journal mirror (upload + publish + markRead) is deferred to actual
     // dispatch time — see lib/media-mirror.js. Attaching it here (rather
     // than calling journalMirrorUserMedia now) is what stops a queued
@@ -4392,6 +4415,11 @@ function buildSavedMediaBlocks(session, { buffer, mime, dims, isImage, ivFilenam
     attachPendingMediaMirror(blocks, { buffer, mime, name: ivFilename, dims });
     return { blocks, ivHandled: true };
   }
+  // SDK mode: lead with the caption so claude reads the user's words before
+  // the "Image saved to …" bookkeeping and the image itself — the order a
+  // person would say it in. Everything below appends to the same `blocks`
+  // array, i.e. the same single user turn.
+  if (caption) blocks.push({ type: 'text', text: caption });
   if (isImage) {
     // Save image to the session uploads dir
     let imgPath;
@@ -4399,10 +4427,7 @@ function buildSavedMediaBlocks(session, { buffer, mime, dims, isImage, ivFilenam
     catch (err) { blocks.push({ type: 'text', text: `[Upload failed: ${err.message}]` }); return { blocks, ivHandled: false }; }
     fs.writeFileSync(imgPath, buffer);
     blocks.push({ type: 'text', text: `Image saved to ${imgPath}` });
-    blocks.push({
-      type: 'image',
-      source: { type: 'base64', media_type: mime, data: buffer.toString('base64') }
-    });
+    appendInlineImageBlocks(blocks, { buffer, mime, inline, savePath: imgPath });
     attachPendingMediaMirror(blocks, { buffer, mime, name: workdirName, dims });
   } else {
     // Save file to the session uploads dir
@@ -4419,10 +4444,7 @@ function buildSavedMediaBlocks(session, { buffer, mime, dims, isImage, ivFilenam
         source: { type: 'base64', media_type: 'application/pdf', data: buffer.toString('base64') }
       });
     } else if (mime.startsWith('image/')) {
-      blocks.push({
-        type: 'image',
-        source: { type: 'base64', media_type: mime, data: buffer.toString('base64') }
-      });
+      appendInlineImageBlocks(blocks, { buffer, mime, inline, savePath });
     } else if (mime.startsWith('text/') || ['application/json', 'application/xml', 'application/javascript', 'application/csv'].includes(mime)) {
       blocks.push({ type: 'text', text: `Contents of ${workdirName}:\n${buffer.toString('utf-8')}` });
     } else {
@@ -4524,10 +4546,9 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       session.sendCallback = sessionSendReply;
       session.sendHtml = sessionSendHtml;
       session.sendButtonMessage = sessionSendButtons;
-      // In iv-mode claudeSessionId is known immediately, so persist mcpExtras
-      // now — otherwise a bridge restart before the first transcript-driven
-      // persist would lose the user's opt-in. Print-mode sessions get their
-      // claudeSessionId asynchronously and pick this up on the first persist.
+      // claudeSessionId is known immediately (pre-assigned in both modes),
+      // so persist mcpExtras now — otherwise a bridge restart before the
+      // first transcript-driven persist would lose the user's opt-in.
       if (mcpExtras.length > 0 && session.claudeSessionId) {
         persistSession(sessionRoomId, session.claudeSessionId, session.workdir, roomId);
       }
@@ -5928,12 +5949,23 @@ function journalOnText(session, body, { username }) {
 const journalMediaRouter = createJournalMediaRouter({
   fetchMedia: (blobRef) => journalPublisher.fetchMedia(blobRef),
   transcribe: (buffer, mime) => transcribeAudio(buffer, mime, { modelPath: WHISPER_MODEL_PATH, language: WHISPER_LANGUAGE }),
-  buildSavedBlocks: (session, { buffer, mime, isImage, name, dims, caption }) => {
+  buildSavedBlocks: async (session, { buffer, mime, isImage, name, dims, caption }) => {
     const safeName = safeMediaFilename(name);
+    // Downscale/skip decision for the INLINE copy only (iv mode never inlines,
+    // so don't burn a decode there). The original buffer still goes to disk.
+    let inline = null;
+    if (!session.iv && (isImage || (typeof mime === 'string' && mime.startsWith('image/')))) {
+      inline = await prepareInlineImage(buffer, mime);
+      if (inline.action === 'replace') {
+        console.log(`[journal-media] inline image downscaled: ${buffer.length}B ${mime} -> ${inline.buffer.length}B ${inline.mediaType} ${inline.width}x${inline.height}`);
+      } else if (inline.action === 'skip') {
+        console.warn(`[journal-media] inline image skipped (${inline.reason}); full file still saved for Read`);
+      }
+    }
     return buildSavedMediaBlocks(session, {
       buffer, mime, dims: dims || undefined, isImage,
-      ivFilename: safeName, ivCaption: caption ?? null, workdirName: safeName,
-    });
+      ivFilename: safeName, caption, workdirName: safeName, inline,
+    }).blocks;
   },
   injectText: (session, text) => sendTextToSession(session, text),
   injectBlocks: (session, blocks) => sendToSession(session, blocks, { skipJournalMirror: true }),
@@ -6095,9 +6127,10 @@ async function journalHandleControlCommand(body) {
 // claude session id, so scan persisted sessions for it and respawn through
 // the SAME helper the Matrix path uses (resumePersistedSession — hoisted,
 // defined next to the Matrix handler below). Returns the new session for the
-// router to route the triggering text into (delivery is safe: sendToSession
-// holds input in _resumeOutbox until the resumed TUI is ready), or null to
-// fall back to the unknown-convo notice.
+// router to route the triggering text or media into (delivery is safe:
+// sendToSession holds input in _resumeOutbox until the resumed TUI is ready,
+// and print mode's stdin buffers), or null to fall back to the unknown-convo
+// notice.
 function journalResumeConvo(convoId) {
   const data = loadPersistedSessions();
   for (const [roomId, prev] of Object.entries(data)) {
@@ -6976,6 +7009,9 @@ function recreateSession(roomId, overrides, { sendReply, sendHtml }) {
     agent: existing.agent,
     mcpExtras: existing.mcpExtras,
     journalConvoId: existing.journalConvoId,
+    // Carry the good title across the swap so the re-seed adopts it instead of
+    // clobbering it with the repo basename (title-revert bug).
+    journalTitleHint: existing._journalTitleHint,
     // Preserve the currently-active model across the swap. An in-TUI /model
     // pick updates currentModel but isn't persisted (by design), so without
     // this a /mode toggle or /restart would resume on the stale persisted/

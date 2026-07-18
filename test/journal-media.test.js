@@ -41,6 +41,34 @@ describe('createJournalMediaRouter — file/image', () => {
     expect(deps.transcribe).not.toHaveBeenCalled();
   });
 
+  it('passes the caption through to the block builder', async () => {
+    // The caption is the whole point of staging attachments in the composer:
+    // it has to survive the router hop or claude gets the picture with no
+    // idea what was asked about it.
+    const { route, deps } = makeRouter({
+      fetchMedia: vi.fn(async () => ({ buffer: Buffer.from('img'), contentType: 'image/png' })),
+    });
+
+    await route(session, {
+      type: 'image', blobRef: 'img-1', contentType: 'image/png',
+      name: 'x.png', caption: 'what breed is this?',
+    }, ctx);
+
+    const [, buildArgs] = deps.buildSavedBlocks.mock.calls[0];
+    expect(buildArgs.caption).toBe('what breed is this?');
+  });
+
+  it('passes a null caption through for an attachment sent with no message', async () => {
+    const { route, deps } = makeRouter();
+
+    await route(session, {
+      type: 'file', blobRef: 'blob-1', contentType: 'application/pdf', name: 'report.pdf',
+    }, ctx);
+
+    const [, buildArgs] = deps.buildSavedBlocks.mock.calls[0];
+    expect(buildArgs.caption).toBeUndefined();
+  });
+
   it('classifies type:image as an image for the block builder', async () => {
     const { route, deps } = makeRouter({
       fetchMedia: vi.fn(async () => ({ buffer: Buffer.from('img'), contentType: 'image/png' })),
@@ -52,12 +80,13 @@ describe('createJournalMediaRouter — file/image', () => {
     expect(deps.injectBlocks).toHaveBeenCalledTimes(1);
   });
 
-  it('threads caption to buildSavedBlocks and tail-appends it when the iv branch did not fold it (non-iv/SDK mode)', async () => {
+  it('threads the caption to buildSavedBlocks and does NOT re-append it (buildSavedMediaBlocks folds it — LEAD ordering)', async () => {
+    // Post-upstream-sync: the caption is folded INSIDE buildSavedMediaBlocks
+    // (SDK mode leads with it), so routeOne must inject exactly what the
+    // builder returns — appending here again would double the caption.
+    const built = [{ type: 'text', text: 'look at this' }, { type: 'text', text: 'Image saved to /w/s.png' }];
     const injected = [];
-    const buildSavedBlocks = vi.fn().mockReturnValue({
-      blocks: [{ type: 'text', text: 'File saved to /tmp/x' }],
-      ivHandled: false,
-    });
+    const buildSavedBlocks = vi.fn(async () => built);
     const { route } = makeRouter({
       fetchMedia: vi.fn().mockResolvedValue({ buffer: Buffer.from('x'), contentType: 'image/png' }),
       buildSavedBlocks,
@@ -66,35 +95,18 @@ describe('createJournalMediaRouter — file/image', () => {
     await route(session, { type: 'image', blobRef: 'b1', contentType: 'image/png', name: 's.png', caption: 'look at this' }, ctx);
 
     expect(buildSavedBlocks).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ caption: 'look at this' }));
-    expect(injected[0][injected[0].length - 1]).toEqual({ type: 'text', text: 'look at this' });
+    expect(injected[0]).toEqual(built);
+    expect(injected[0]).toHaveLength(2);
   });
 
-  it('does NOT tail-append when the iv branch already folded the caption (ivHandled: true)', async () => {
-    const injected = [];
-    const { route } = makeRouter({
-      fetchMedia: vi.fn().mockResolvedValue({ buffer: Buffer.from('x'), contentType: 'image/png' }),
-      buildSavedBlocks: vi.fn().mockReturnValue({
-        blocks: [{ type: 'text', text: 'look at this\n\n[annotation]' }],
-        ivHandled: true,
-      }),
-      injectBlocks: vi.fn((sess, blocks) => { injected.push(blocks); return true; }),
+  it('awaits an ASYNC buildSavedBlocks (the inline-image downscale path returns a promise)', async () => {
+    const blocks = [{ type: 'text', text: 'Image saved to /w/big.jpg' }, { type: 'image', source: {} }];
+    const { route, deps } = makeRouter({
+      fetchMedia: vi.fn(async () => ({ buffer: Buffer.from('img'), contentType: 'image/jpeg' })),
+      buildSavedBlocks: vi.fn(async () => blocks),
     });
-    await route(session, { type: 'image', blobRef: 'b1', contentType: 'image/png', name: 's.png', caption: 'look at this' }, ctx);
-
-    expect(injected[0]).toHaveLength(1);
-    expect(injected[0][0].text).toContain('look at this');
-  });
-
-  it('keeps the legacy bare-array seam working with no caption change', async () => {
-    const injected = [];
-    const { route } = makeRouter({
-      fetchMedia: vi.fn().mockResolvedValue({ buffer: Buffer.from('x'), contentType: 'image/png' }),
-      buildSavedBlocks: vi.fn().mockReturnValue([{ type: 'text', text: 'File saved to /tmp/x' }]),
-      injectBlocks: vi.fn((sess, blocks) => { injected.push(blocks); return true; }),
-    });
-    await route(session, { type: 'image', blobRef: 'b1', contentType: 'image/png', name: 's.png', caption: null }, ctx);
-
-    expect(injected[0]).toHaveLength(1);
+    await route(session, { type: 'image', blobRef: 'img-2', contentType: 'image/jpeg', name: 'big.jpg' }, ctx);
+    expect(deps.injectBlocks).toHaveBeenCalledWith(session, blocks);
   });
 
   it('uses the fetched content-type when the frame declared none', async () => {
@@ -139,7 +151,7 @@ describe('createJournalMediaRouter — file/image', () => {
 
   it('captioned media with an empty builder result is dropped and noticed, not injected as caption-only', async () => {
     const { route, deps } = makeRouter({
-      buildSavedBlocks: vi.fn(() => ({ blocks: [], ivHandled: false })),
+      buildSavedBlocks: vi.fn(async () => []),
     });
     await route(session, { type: 'file', blobRef: 'b', contentType: 'application/pdf', name: 'x.pdf', caption: 'read this' }, ctx);
 

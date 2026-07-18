@@ -54,6 +54,62 @@ describe('recent_folders', () => {
     expect(responses[0].result.folders.map((f) => f.path)).toEqual(['/b', '/a', '/home/dan']);
     expect(responses[0].result.folders[1].last_used).toBe(null);
   });
+
+  it('merges remembered folders with session records, newest timestamp winning', () => {
+    const { handler, responses } = harness({
+      listPersistedSessions: () => [{ workdir: '/w/both', lastUsed: 50 }, { workdir: '/w/sess', lastUsed: 10 }],
+      listRememberedFolders: () => [{ path: '/w/both', lastUsed: 200 }, { path: '/w/gone-session', lastUsed: 100 }],
+    });
+    handler(REQ('recent_folders', {}));
+    expect(responses[0].result.folders).toEqual([
+      { path: '/w/both', last_used: 200 },
+      { path: '/w/gone-session', last_used: 100 },
+      { path: '/w/sess', last_used: 10 },
+      { path: '/home/dan', last_used: null },
+    ]);
+  });
+
+  it('remembered folders alone survive an emptied session store', () => {
+    const { handler, responses } = harness({
+      listPersistedSessions: () => [],
+      listRememberedFolders: () => [{ path: '/w/kept', lastUsed: 7 }],
+    });
+    handler(REQ('recent_folders', {}));
+    expect(responses[0].result.folders).toEqual([
+      { path: '/w/kept', last_used: 7 },
+      { path: '/home/dan', last_used: null },
+    ]);
+  });
+
+  it('drops folders that no longer exist on disk, but never the default workdir', () => {
+    const { handler, responses } = harness({
+      listPersistedSessions: () => [{ workdir: '/w/alive', lastUsed: 3 }, { workdir: '/w/deleted', lastUsed: 5 }],
+      listRememberedFolders: () => [{ path: '/w/deleted', lastUsed: 9 }, { path: '/w/now-a-file', lastUsed: 8 }],
+      statSync: (p) => {
+        if (p === '/w/deleted') { throw new Error('ENOENT'); }
+        return { isDirectory: () => p !== '/w/now-a-file' };
+      },
+    });
+    handler(REQ('recent_folders', {}));
+    expect(responses[0].result.folders).toEqual([
+      { path: '/w/alive', last_used: 3 },
+      { path: '/home/dan', last_used: null },
+    ]);
+  });
+
+  it('dead folders do not consume cap slots', () => {
+    const records = [];
+    for (let i = 0; i < 25; i++) records.push({ workdir: `/dead/${i}`, lastUsed: 9000 + i });
+    for (let i = 0; i < 5; i++) records.push({ workdir: `/live/${i}`, lastUsed: 100 + i });
+    const { handler, responses } = harness({
+      listPersistedSessions: () => records,
+      statSync: (p) => { if (p.startsWith('/dead/')) throw new Error('ENOENT'); return { isDirectory: () => true }; },
+    });
+    handler(REQ('recent_folders', {}));
+    expect(responses[0].result.folders.map((f) => f.path)).toEqual(
+      ['/live/4', '/live/3', '/live/2', '/live/1', '/live/0', '/home/dan'],
+    );
+  });
 });
 
 describe('start', () => {
