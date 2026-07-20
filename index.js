@@ -5961,9 +5961,11 @@ function journalOnText(session, body, { username }) {
 // fetches the blob back out of the journal blob store and feeds it to the
 // session exactly the way the Matrix media path does — audio transcribed and
 // injected as if the user typed it, images/files saved to the same per-session
-// location and attached to the next prompt. buildSavedMediaBlocks folds the
-// caption into the iv annotation and reports ivHandled; SDK mode leaves it for
-// the orchestrator to tail-append as a text block. Fire-and-forget: the
+// location and attached to the next prompt. buildSavedMediaBlocks handles the
+// caption in both modes — iv folds it into the upload annotation (ivHandled),
+// SDK leads with it as a text block — so the orchestrator must NOT append it
+// again (an earlier easelyte design tail-appended in SDK mode; that was
+// superseded on the 2026-07-20 upstream sync). Fire-and-forget: the
 // orchestrator's returned function never throws/rejects (it swallows
 // internally), matching the router's contract for routeMediaToSession.
 // Nothing here re-mirrors the blob into the journal — the client's own
