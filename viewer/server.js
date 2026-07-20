@@ -1,9 +1,10 @@
 import express from 'express';
+import { rateLimit } from 'express-rate-limit';
 import { watch as fsWatch, existsSync, readFileSync, statSync, openSync, readSync, closeSync } from 'fs';
 import path from 'path';
 import { WebSocketServer } from 'ws';
 import { generateSignedUrl, verifyToken } from '../lib/viewer-tokens.js';
-import { validateAndOpen, FileLinkDenied } from '../lib/file-link-guard.js';
+import { validateAndOpen, FileLinkDenied, MAX_DOWNLOAD_BYTES } from '../lib/file-link-guard.js';
 export { generateSignedUrl, verifyToken };
 
 const PORT = process.env.MATRON_VIEWER_PORT || 9803;
@@ -177,6 +178,45 @@ app.get('/view', async (req, res) => {
     // response leaks nothing about why.
     const { content, realPath } = await validateAndOpen(data.path, { workdir: data.workdir });
     res.type('html').send(renderHtml(path.basename(realPath), content.toString('utf-8')));
+  } catch (err) {
+    if (!(err instanceof FileLinkDenied)) console.error('Error reading file:', err);
+    res.status(404).send('File not found');
+  }
+});
+
+// Bounds the disk reads a token holder — or a token guesser — can trigger.
+// In-memory store is fine here: one viewer process, restart resets are
+// harmless. Behind the Cloudflare tunnel every request shares the loopback
+// IP, so this is effectively a global budget — right shape for a single-
+// user deployment.
+const downloadLimiter = rateLimit({
+  windowMs: 60_000,
+  limit: parseInt(process.env.DOWNLOAD_RATE_LIMIT || '30', 10),
+  standardHeaders: false,
+  legacyHeaders: false,
+  validate: { xForwardedForHeader: false },
+});
+
+app.get('/download', downloadLimiter, async (req, res) => {
+  const { token } = req.query;
+  if (!token) return res.status(400).send('Missing token');
+
+  const data = verifyToken(token);
+  // dl is the route discriminator — a /view token must not turn into a raw
+  // download with the larger size budget just by switching the path.
+  if (!data || data.dl !== true) return res.status(403).send('Invalid or expired token');
+
+  try {
+    const { content, realPath } = await validateAndOpen(data.path, {
+      workdir: data.workdir,
+      maxBytes: MAX_DOWNLOAD_BYTES,
+    });
+    // Keep the header a plain quoted ASCII token: strip anything that could
+    // splice the header or escape the quotes.
+    const name = path.basename(realPath).replace(/[^A-Za-z0-9._ -]/g, '_');
+    res.set('Content-Type', 'application/octet-stream');
+    res.set('Content-Disposition', `attachment; filename="${name}"`);
+    res.send(content);
   } catch (err) {
     if (!(err instanceof FileLinkDenied)) console.error('Error reading file:', err);
     res.status(404).send('File not found');
