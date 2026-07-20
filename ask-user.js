@@ -94,9 +94,9 @@ server.tool(
 
 server.tool(
   'redact_message',
-  'Redact (delete) a message that was sent by the bridge to the user in the Matrix chat. Use this to remove sensitive information that was accidentally posted. Note: Only messages sent by the bridge bot can be redacted.',
+  'Redact (delete) a message that was sent by the bridge to the user in the Matron chat. Use this to remove sensitive information that was accidentally posted. Note: Only messages sent by the bridge bot can be redacted.',
   {
-    eventId: z.string().describe('The Matrix event ID of the message to redact'),
+    eventId: z.string().describe('The event ID of the message to redact'),
     reason: z.string().optional().describe('Optional reason for redacting the message'),
   },
   async ({ eventId, reason }) => {

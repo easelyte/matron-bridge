@@ -37,6 +37,7 @@ import { createSubagentConvoTracker } from './lib/subagent-convos.js';
 import { formatSubagentToolBody } from './lib/subagent-tool-format.js';
 import { ivUploadDir, ivUploadAnnotation } from './lib/iv-uploads.js';
 import { parseUsageLimits, formatLimits } from './lib/usage-limits.js';
+import { resolveSpawnCwd, attachSpawnErrorHandler } from './lib/spawn-guard.js';
 import { readSessionSummary, listSessionSummaries, listSessionIdsByMtime, pathExists } from './lib/session-summary.js';
 import {
   isIvSlashPassthrough,
@@ -962,6 +963,18 @@ function journalFlushForSession(session) {
 }
 
 function createSession(roomId, workdir, resumeSessionId, options = {}) {
+  // A persisted workdir can stop existing between spawns (repo renamed,
+  // worktree pruned). Node reports a missing spawn cwd as `spawn claude
+  // ENOENT`, so degrade to a fallback dir here — before any agent branch —
+  // instead of letting every spawn path discover it the hard way.
+  const guarded = resolveSpawnCwd(expandHome(workdir || DEFAULT_WORKDIR), [DEFAULT_WORKDIR, os.homedir()]);
+  if (guarded.fellBack) {
+    console.warn(`[spawn-guard] workdir ${guarded.missing} no longer exists for ${roomId}; using ${guarded.cwd}`);
+    const wg = notice('warning', `Workdir ${guarded.missing} no longer exists — using ${guarded.cwd} instead. Use !workdir to move the session.`,
+      `Workdir <code>${escapeHtml(String(guarded.missing))}</code> no longer exists — using <code>${escapeHtml(guarded.cwd)}</code> instead. Use <code>!workdir</code> to move the session.`);
+    Promise.resolve(sendToRoom(roomId, wg.plain, wg.html)).catch(() => {});
+  }
+  workdir = guarded.cwd;
   const persistedMode = getPersistedSession(roomId);
   const agent = resolveAgent({ option: options.agent, persisted: persistedMode?.agent, fallback: DEFAULT_AGENT });
   if (agent === AGENT_CODEX) {
@@ -1103,6 +1116,14 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     pinnedSummaryEventId: null, // event ID of pinned summary message
     pinnedSummaryText: '',       // accumulated summary text (source of truth, not Matrix)
   };
+
+  // A spawn 'error' with no listener is fatal to the whole bridge (crash-loop
+  // of 2026-07-16). Cleanup and the 3-restart cap stay in proc.on('close'),
+  // which still fires after a spawn error; this only reports.
+  attachSpawnErrorHandler(proc, {
+    notify: (msg) => { if (session.sendCallback) session.sendCallback(msg); },
+    log: (msg) => console.error(`[spawn-guard] ${msg} (room ${roomId})`),
+  });
 
   // Parse newline-delimited JSON from stdout
   proc.stdout.on('data', (chunk) => {
@@ -1837,9 +1858,9 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     } else if (session.sendCallback) {
       session.sendCallback(plainPlan);
     } else {
-      // No Matrix output channel yet — auto-deny so the hook unblocks.
+      // No output channel yet — auto-deny so the hook unblocks.
       const pending = pendingPlanDecisions.get(toolUseId);
-      if (pending) pending.resolve({ decision: 'deny', reason: 'no Matrix output channel for session' });
+      if (pending) pending.resolve({ decision: 'deny', reason: 'no output channel for session' });
     }
   };
 
@@ -4857,7 +4878,11 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       await updateRoomName(sessionRoomId, roomName);
 
       // Persist immediately — we already know the agent session ID.
-      persistSession(sessionRoomId, resumeSessionId, actualWorkdir, roomId, {
+      // session.workdir, not actualWorkdir: createSession may have degraded a
+      // missing workdir to a fallback, and persisting the missing path would
+      // re-trigger the fallback warning on the next spawn (every other
+      // persistSession site already passes session.workdir).
+      persistSession(sessionRoomId, resumeSessionId, session.workdir, roomId, {
         agent: selectedAgent,
         agentSessions: inheritedAgentSessions,
         journalConvoId: session.journalConvoId,
@@ -4872,10 +4897,10 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       });
 
       await sendReply(`Resuming ${agentLabel(selectedAgent)} session ${shortId}… in a new conversation.`);
-      const resumePlain = `Resuming ${agentLabel(selectedAgent)} session ${shortId}…\nWorkdir: ${actualWorkdir}\n\nSend any message to continue.`;
+      const resumePlain = `Resuming ${agentLabel(selectedAgent)} session ${shortId}…\nWorkdir: ${session.workdir}\n\nSend any message to continue.`;
       const resumeHtml =
         `<b>Resuming ${escapeHtml(agentLabel(selectedAgent))} session <code>${shortId}</code>…</b><br/>` +
-        `Workdir: <code>${escapeHtml(actualWorkdir)}</code><br/><br/>` +
+        `Workdir: <code>${escapeHtml(session.workdir)}</code><br/><br/>` +
         `<i>Send any message to continue.</i>`;
       await sessionSendHtml(resumePlain, resumeHtml);
       break;
@@ -5674,7 +5699,7 @@ async function journalRouteTextToSession(session, body) {
     // never silently fall through to Claude as text, never crash.
     notAvailable: (cmdName) => {
       const ctx = journalSessionCommandCtx(session);
-      return ctx.sendReply(`/${cmdName} isn't available from Matron — use this session's Matrix room for that one.`);
+      return ctx.sendReply(`/${cmdName} isn't available from Matron.`);
     },
   });
   if (dispatchedCommand) return;
@@ -5699,7 +5724,7 @@ async function journalRouteTextToSession(session, body) {
     // PTY-desync risk the Matrix path guards against). Notice instead of
     // silently dropping it.
     journalPublishNotice(journalConvoIdFor(session),
-      "That doesn't look like one of the options. Reply with the option number shown, or use the session's Matrix room to send !esc and cancel the menu.");
+      "That doesn't look like one of the options. Reply with the option number shown, or send !esc to cancel the menu.");
     return;
   }
 

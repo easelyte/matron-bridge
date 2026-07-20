@@ -271,6 +271,49 @@ describe('createJournalPublisher', () => {
     }
   });
 
+  it('keepalive: terminates and reconnects when pings go unanswered (half-open socket)', async () => {
+    const fake = await startFakeServer();
+    const pub = createJournalPublisher({
+      url: fake.url, token: 'tok', log: silentLog, ...FAST_BACKOFF,
+      keepaliveIntervalMs: 50,
+    });
+    await waitFor(() => fake.connections.length === 1);
+
+    // Simulate a half-open connection: the server stops reading its socket,
+    // so the client's protocol-level pings are never answered — exactly the
+    // NAT/proxy silent-drop failure mode. The TCP connection itself stays
+    // "ESTABLISHED" from the client's point of view.
+    fake.connections[0].ws._socket.pause();
+
+    // The keepalive must notice the missing pong and tear the socket down,
+    // and the normal reconnect path must then produce a second connection.
+    await waitFor(() => fake.connections.length >= 2, 4000);
+
+    pub.close();
+    await fake.close();
+  });
+
+  it('keepalive: a healthy idle connection is left alone and stays usable', async () => {
+    const fake = await startFakeServer();
+    const pub = createJournalPublisher({
+      url: fake.url, token: 'tok', log: silentLog, ...FAST_BACKOFF,
+      keepaliveIntervalMs: 40,
+    });
+    await waitFor(() => fake.connections.length === 1);
+
+    // Sit idle across many keepalive intervals — the ws server answers pings
+    // with pongs automatically, so no reconnect may happen.
+    await delay(300);
+    expect(fake.connections.length).toBe(1);
+
+    // And the connection is still genuinely usable afterwards.
+    pub.publishText('c1', { body: 'still here', from: 'user' });
+    await waitFor(() => fake.received.some(f => f.op === 'publish' && f.payload?.body === 'still here'));
+
+    pub.close();
+    await fake.close();
+  });
+
   it('bounds the queue: drops the oldest frame on overflow and warns once per episode', async () => {
     const port = await getFreePort(); // stays disconnected for the whole enqueue burst
     const url = `ws://127.0.0.1:${port}/ws`;

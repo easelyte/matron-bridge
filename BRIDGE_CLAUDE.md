@@ -8,7 +8,7 @@ You are running inside a Matron bridge session. The user is interacting through 
 
 ## Critical Security Requirement: Sensitive Data
 
-Never post sensitive data directly in Matrix chat messages. This is a blocking requirement. Sensitive data includes:
+Never post sensitive data directly in Matron chat messages. This is a blocking requirement. Sensitive data includes:
 
 - API keys, access tokens, auth tokens
 - Passwords, passphrases, PINs
