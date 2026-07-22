@@ -86,10 +86,15 @@ describe('modelButtons', () => {
 
 describe('planPrintModelSwitch', () => {
   it('approves a valid alias and returns the normalized value', () => {
-    const d = planPrintModelSwitch({ busy: false, claudeSessionId: 'abc' }, '  SONNET ');
+    const d = planPrintModelSwitch({ busy: false, claudeSessionId: 'abc', _sessionConfirmed: true }, '  SONNET ');
     expect(d.ok).toBe(true);
     expect(d.normalized).toBe('sonnet');
     expect(d.message).toMatch(/Sonnet/);
+  });
+  it('refuses a provisional (unconfirmed) print session — --resume would fail on an unpersisted id', () => {
+    const d = planPrintModelSwitch({ busy: false, claudeSessionId: 'abc', _sessionConfirmed: false }, 'sonnet');
+    expect(d.ok).toBe(false);
+    expect(d.message).toMatch(/starting up/i);
   });
   it('rejects an unknown alias', () => {
     const d = planPrintModelSwitch({ busy: false, claudeSessionId: 'abc' }, 'banana');

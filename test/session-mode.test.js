@@ -98,9 +98,20 @@ describe('planModeSwitch', () => {
     expect(d.message).toMatch(/starting up/i);
   });
   it('approves a clean switch', () => {
-    const d = planModeSwitch({ iv: null, busy: false, claudeSessionId: 'abc' }, true);
+    const d = planModeSwitch({ iv: null, busy: false, claudeSessionId: 'abc', _sessionConfirmed: true }, true);
     expect(d.ok).toBe(true);
     expect(d.message).toMatch(/interactive/i);
+  });
+  it('refuses switching a provisional (unconfirmed) print session to interactive', () => {
+    const d = planModeSwitch({ iv: null, busy: false, claudeSessionId: 'abc', _sessionConfirmed: false }, true);
+    expect(d.ok).toBe(false);
+    expect(d.message).toMatch(/starting up/i);
+  });
+  it('does NOT gate an iv session on _sessionConfirmed (iv confirms via a different path)', () => {
+    // iv->print: current is interactive, so the print-provisional gate is skipped
+    // even though iv never sets _sessionConfirmed.
+    const d = planModeSwitch({ iv: { alive: true }, busy: false, claudeSessionId: 'abc' }, false);
+    expect(d.ok).toBe(true);
   });
 });
 
@@ -157,20 +168,25 @@ describe('createSession id pre-assignment (source inspection)', () => {
   });
 
   // #136 / loop #459: the auto-restart must not --resume a session that
-  // crashed before Claude persisted it. Assert the confirmation flag is set
-  // from the stream, both spawn helpers thread presetSessionId, and the
-  // restart branches gate the resume id on _sessionConfirmed.
+  // crashed before Claude persisted it. Scoped to PRINT mode only — iv-mode
+  // confirms from camel-case `sessionId` transcript records that the snake-case
+  // capture never sees, so gating iv would break its resume-after-persist
+  // (PR review round 2 Blocker 2). Print-mode assertions are therefore singular.
   it('marks _sessionConfirmed the first time a session_id event arrives', () => {
     expect(src).toMatch(/if \(event\.session_id\) session\._sessionConfirmed = true;/);
   });
-  it('both spawn helpers thread presetSessionId into planSessionIdentity', () => {
+  it('the print spawn helper threads presetSessionId into planSessionIdentity (once, print-only)', () => {
     const calls = src.match(/planSessionIdentity\(\{ resumeSessionId, presetId: options\.presetSessionId/g) || [];
-    expect(calls.length).toBe(2);
+    expect(calls.length).toBe(1);
   });
-  it('auto-restart uses claudeSessionId only when confirmed, presetSessionId otherwise (both branches)', () => {
+  it('the print auto-restart uses claudeSessionId only when confirmed, presetSessionId otherwise', () => {
     const resumeGates = src.match(/session\._sessionConfirmed \? session\.claudeSessionId : null/g) || [];
-    expect(resumeGates.length).toBe(2);
+    expect(resumeGates.length).toBe(1);
     const presetGates = src.match(/presetSessionId: session\._sessionConfirmed \? undefined : session\.claudeSessionId/g) || [];
-    expect(presetGates.length).toBe(2);
+    expect(presetGates.length).toBe(1);
+  });
+  it('the print constructor inits _sessionConfirmed from resumeSessionId (iv is unconditional --resume)', () => {
+    const inits = src.match(/_sessionConfirmed: !!resumeSessionId/g) || [];
+    expect(inits.length).toBe(1);
   });
 });

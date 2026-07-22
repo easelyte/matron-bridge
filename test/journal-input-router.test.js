@@ -1001,32 +1001,136 @@ describe('createJournalInputConsumer — picker replies bypass the staleness gua
     },
   });
 
+  // A published picker frame (option ids model-* / effort-* / mode-*).
+  const pickerFrame = (seq, opts) => baseFrame({
+    seq, sender: 'agent:dev-2', type: 'prompt',
+    payload: { question: 'pick', mode: 'pick_one', options: opts },
+  });
+
   const pickerReply = (targetSeq, choice) => baseFrame({
     seq: 100, type: 'prompt_reply',
     payload: { target_seq: targetSeq, choice, text: null },
   });
 
-  it.each([['model:sonnet'], ['effort:high'], ['mode:print']])(
-    'a %s tap routes even when its target_seq mismatches the latest answerable prompt',
-    (choice) => {
+  it.each([
+    ['model:sonnet', [{ id: 'model-sonnet', value: 'model:sonnet' }]],
+    ['effort:high', [{ id: 'effort-high', value: 'effort:high' }]],
+    ['mode:print', [{ id: 'mode-print', value: 'mode:print' }]],
+  ])(
+    'a %s tap whose target_seq identifies its picker frame routes (flagged picker) even past a later answerable prompt',
+    (choice, opts) => {
       const deps = makeDeps();
       const consumer = createJournalInputConsumer(deps);
-      consumer(answerableFrame(10));         // guard now expects target_seq 10
-      consumer(pickerReply(12, choice));     // picker at seq 12 — mismatch, but a picker value
+      consumer(pickerFrame(12, opts));       // bridge published this picker at seq 12
+      consumer(answerableFrame(10));          // a later answerable prompt sets the guard
+      consumer(pickerReply(12, choice));      // reply targets the picker frame → dispatched
       expect(deps.noticeStalePromptReply).not.toHaveBeenCalled();
       expect(deps.routePromptReply).toHaveBeenCalledTimes(1);
+      // Explicit provenance flag — the receiver dispatches on this, not value shape.
       expect(deps.routePromptReply.mock.calls[0][1]).toEqual({
-        target_seq: 12, choice, text: null,
+        target_seq: 12, choice, text: null, picker: true,
       });
     },
   );
 
-  it('a NON-picker choice with a mismatched target_seq is still refused as stale', () => {
+  // PR review round 3 Major 2: a picker frame must not authorize a value it
+  // never offered. A reply targeting a mode-picker frame but carrying a model
+  // value (globally a valid picker value) is NOT dispatched.
+  it('a picker frame does not authorize a value from a different picker (cross-namespace)', () => {
+    const deps = makeDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(pickerFrame(12, [{ id: 'mode-print', value: 'mode:print' }])); // a MODE picker
+    consumer(answerableFrame(10));
+    consumer(pickerReply(12, 'model:opus')); // a MODEL value the mode frame never offered
+    expect(deps.routePromptReply).not.toHaveBeenCalled();
+    expect(deps.noticeStalePromptReply).toHaveBeenCalledTimes(1);
+  });
+
+  // PR review round 2 Blocker 1: a genuine answer whose label equals a valid
+  // picker value must NOT be dispatched as a command. It targets an
+  // answerable-prompt seq (not a picker frame), so it stays subject to the
+  // staleness guard — a superseded one is refused, not turned into a switch.
+  it('a picker-VALUED reply targeting an answerable prompt (not a picker frame) is NOT dispatched as a command', () => {
+    const deps = makeDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(answerableFrame(10));           // an AskUserQuestion whose option is labeled model:sonnet
+    consumer(answerableFrame(15));           // superseded by a newer answerable prompt
+    consumer(pickerReply(10, 'model:sonnet')); // delayed answer to the superseded prompt
+    expect(deps.routePromptReply).not.toHaveBeenCalled();
+    expect(deps.noticeStalePromptReply).toHaveBeenCalledTimes(1); // refused as stale, not switched
+  });
+
+  it('a picker value whose target_seq matches no published picker frame is not bypassed', () => {
     const deps = makeDeps();
     const consumer = createJournalInputConsumer(deps);
     consumer(answerableFrame(10));
-    consumer(pickerReply(12, 'opt_a'));
+    consumer(pickerReply(12, 'model:sonnet')); // seq 12 was never a picker frame
     expect(deps.routePromptReply).not.toHaveBeenCalled();
+    expect(deps.noticeStalePromptReply).toHaveBeenCalledTimes(1);
+  });
+
+  it('a NON-picker choice targeting a picker frame is still refused (not a picker value)', () => {
+    const deps = makeDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(pickerFrame(12, [{ id: 'model-sonnet', value: 'model:sonnet' }]));
+    consumer(answerableFrame(10));
+    consumer(pickerReply(12, 'opt_a')); // targets the picker frame but isn't a picker value
+    expect(deps.routePromptReply).not.toHaveBeenCalled();
+    expect(deps.noticeStalePromptReply).toHaveBeenCalledTimes(1);
+  });
+
+  it('a namespaced-but-INVALID value (mode:bogus) targeting a picker frame is not dispatched', () => {
+    const deps = makeDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(pickerFrame(12, [{ id: 'mode-print', value: 'mode:print' }]));
+    consumer(answerableFrame(10));
+    consumer(pickerReply(12, 'mode:bogus')); // not a real picker value → not bypassed
+    expect(deps.routePromptReply).not.toHaveBeenCalled();
+    expect(deps.noticeStalePromptReply).toHaveBeenCalledTimes(1);
+  });
+
+  it('evictConvo clears the picker-frame record for that convo', () => {
+    const deps = makeDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(pickerFrame(12, [{ id: 'model-sonnet', value: 'model:sonnet' }]));
+    consumer.evictConvo('convo-1');
+    consumer(answerableFrame(10));
+    consumer(pickerReply(12, 'model:sonnet')); // picker record gone → no longer bypassed
+    expect(deps.routePromptReply).not.toHaveBeenCalled();
+    expect(deps.noticeStalePromptReply).toHaveBeenCalledTimes(1);
+  });
+
+  // PR review round 3 Major 3: the per-convo picker record is bounded — a very
+  // old picker beyond the retention window is dropped, so the map can't grow
+  // without limit in a long-lived conversation.
+  it('drops the oldest picker frames past the retention window (bounded record)', () => {
+    const deps = makeDeps();
+    const consumer = createJournalInputConsumer(deps);
+    // Publish more picker frames than the retention window (16); seq 1 is oldest.
+    for (let seq = 1; seq <= 20; seq++) {
+      consumer(pickerFrame(seq, [{ id: 'model-sonnet', value: 'model:sonnet' }]));
+    }
+    consumer(answerableFrame(50)); // sets the staleness guard so a non-picker reply is refused
+    consumer(pickerReply(1, 'model:sonnet'));  // oldest picker — evicted → not a picker → stale
+    expect(deps.routePromptReply).not.toHaveBeenCalled();
+    expect(deps.noticeStalePromptReply).toHaveBeenCalledTimes(1);
+    consumer(pickerReply(20, 'model:sonnet')); // most recent — still dispatchable as a picker
+    expect(deps.routePromptReply).toHaveBeenCalledTimes(1);
+    expect(deps.routePromptReply.mock.calls[0][1]).toMatchObject({ target_seq: 20, picker: true });
+  });
+
+  // PR review round 4 Major: a pick_one picker is single-use. A double-tap or
+  // client retry (a second prompt_reply for the same frame) must not fire the
+  // switch twice (which would restart a print session twice / double-write PTY).
+  it('a picker frame is single-use — a duplicate reply is not dispatched as a picker again', () => {
+    const deps = makeDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(pickerFrame(12, [{ id: 'model-sonnet', value: 'model:sonnet' }]));
+    consumer(answerableFrame(50)); // staleness guard, so the consumed duplicate is refused
+    consumer(pickerReply(12, 'model:sonnet')); // first tap → picker dispatch, frame consumed
+    consumer(pickerReply(12, 'model:sonnet')); // duplicate → no longer a picker → stale, refused
+    expect(deps.routePromptReply).toHaveBeenCalledTimes(1);
+    expect(deps.routePromptReply.mock.calls[0][1]).toMatchObject({ target_seq: 12, picker: true });
     expect(deps.noticeStalePromptReply).toHaveBeenCalledTimes(1);
   });
 });

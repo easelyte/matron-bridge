@@ -1,31 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { isPickerValue, handlePickerValue } from '../lib/picker-dispatch.js';
-
-describe('isPickerValue', () => {
-  it('recognizes the three namespaced picker values', () => {
-    expect(isPickerValue('model:sonnet')).toBe(true);
-    expect(isPickerValue('effort:high')).toBe(true);
-    expect(isPickerValue('mode:interactive')).toBe(true);
-    expect(isPickerValue('mode:print')).toBe(true);
-    expect(isPickerValue('model:claude-opus-4-8')).toBe(true);
-  });
-
-  it('rejects queue-action, pending-prompt, and free-text values', () => {
-    expect(isPickerValue('interrupt')).toBe(false);
-    expect(isPickerValue('cancel:2')).toBe(false);
-    expect(isPickerValue('prompt-opt:1')).toBe(false);
-    expect(isPickerValue('yes do it')).toBe(false);
-    expect(isPickerValue('model')).toBe(false); // no colon+arg
-    expect(isPickerValue('model:')).toBe(false); // empty arg
-  });
-
-  it('never throws on non-strings', () => {
-    expect(isPickerValue(null)).toBe(false);
-    expect(isPickerValue(undefined)).toBe(false);
-    expect(isPickerValue(42)).toBe(false);
-    expect(isPickerValue({})).toBe(false);
-  });
-});
+import { handlePickerValue } from '../lib/picker-dispatch.js';
 
 describe('handlePickerValue', () => {
   function seams() {
@@ -78,5 +52,16 @@ describe('handlePickerValue', () => {
     expect(s.applyModelSwitch).not.toHaveBeenCalled();
     expect(s.switchEffortInSession).not.toHaveBeenCalled();
     expect(s.applyModeSwitch).not.toHaveBeenCalled();
+  });
+
+  it('returns false and dispatches nothing for a namespaced-but-invalid value', () => {
+    const s = seams();
+    // Major 1: mode:bogus must NOT fall through to a print-mode switch.
+    expect(handlePickerValue('mode:bogus', 'room-1', {}, s)).toBe(false);
+    expect(handlePickerValue('model:bogus', 'room-1', {}, s)).toBe(false);
+    expect(handlePickerValue('effort:bogus', 'room-1', {}, s)).toBe(false);
+    expect(s.applyModeSwitch).not.toHaveBeenCalled();
+    expect(s.applyModelSwitch).not.toHaveBeenCalled();
+    expect(s.switchEffortInSession).not.toHaveBeenCalled();
   });
 });
