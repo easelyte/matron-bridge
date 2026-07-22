@@ -2,7 +2,9 @@ import { describe, it, expect, vi } from 'vitest';
 import { createRecentFolders } from '../lib/recent-folders.js';
 
 // In-memory fs fake shared across store instances so persistence round-trips
-// can be asserted without touching the real disk.
+// can be asserted without touching the real disk. Models POSIX atomic-rename
+// semantics: writeFileSync lands the temp file, renameSync atomically replaces
+// the target with it (and removes the temp).
 function fakeFs(initial = {}) {
   const files = { ...initial };
   return {
@@ -12,6 +14,12 @@ function fakeFs(initial = {}) {
       return files[p];
     },
     writeFileSync: vi.fn((p, data) => { files[p] = data; }),
+    renameSync: vi.fn((from, to) => {
+      if (!(from in files)) { const e = new Error('ENOENT'); e.code = 'ENOENT'; throw e; }
+      files[to] = files[from];
+      delete files[from];
+    }),
+    unlinkSync: vi.fn((p) => { delete files[p]; }),
   };
 }
 
@@ -95,5 +103,38 @@ describe('createRecentFolders', () => {
     const store = createRecentFolders({ file: FILE, fs, log: { warn: () => {} } });
     expect(store.touch('/w/a', 1000)).toBe(true);
     expect(store.list()).toEqual([{ path: '/w/a', lastUsed: 1000 }]);
+  });
+
+  // #460: the sole durable file must never be truncated in place. A save
+  // writes a temp file first, then atomically renames it onto the target —
+  // the target is only ever replaced by a complete file.
+  it('save is atomic: writes a temp file, then renames it onto the target (never truncates target directly)', () => {
+    const fs = fakeFs();
+    const store = createRecentFolders({ file: FILE, fs });
+    expect(store.touch('/w/a', 1000)).toBe(true);
+    // The write went to a temp path, not the durable file.
+    const writtenPaths = fs.writeFileSync.mock.calls.map(c => c[0]);
+    expect(writtenPaths.every(p => p !== FILE)).toBe(true);
+    expect(writtenPaths.every(p => p.startsWith(FILE))).toBe(true); // temp is a sibling of the target
+    // Then a rename landed the complete file onto the target, temp gone.
+    expect(fs.renameSync).toHaveBeenCalledWith(expect.stringMatching(/^\/home\/dan\/\.matron-bridge-folders\.json/), FILE);
+    expect(Object.keys(fs.files)).toEqual([FILE]);
+    expect(JSON.parse(fs.files[FILE])).toEqual({ '/w/a': 1000 });
+  });
+
+  it('a write that fails mid-save retains the prior durable file (no truncation)', () => {
+    // Prior durable history on disk.
+    const prior = JSON.stringify({ '/w/old': 500 }, null, 2);
+    const fs = fakeFs({ [FILE]: prior });
+    // The temp-file write fails (ENOSPC / short write / kill during write).
+    fs.writeFileSync.mockImplementation(() => { const e = new Error('ENOSPC'); e.code = 'ENOSPC'; throw e; });
+    const store = createRecentFolders({ file: FILE, fs, log: { warn: () => {} } });
+    expect(store.touch('/w/new', 1000)).toBe(true); // in-memory change accepted
+    // The durable file is UNCHANGED — the old history survived the failed write.
+    expect(fs.files[FILE]).toBe(prior);
+    expect(fs.renameSync).not.toHaveBeenCalled();
+    // A fresh store over the same fs still sees the old folder (not empty).
+    const reloaded = createRecentFolders({ file: FILE, fs, log: { warn: () => {} } });
+    expect(reloaded.list()).toEqual([{ path: '/w/old', lastUsed: 500 }]);
   });
 });

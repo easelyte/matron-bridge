@@ -969,3 +969,64 @@ describe('createJournalInputConsumer — queue-action replies bypass the stalene
     expect(deps.noticeStalePromptReply).toHaveBeenCalledTimes(1);
   });
 });
+
+// Picker taps (/model, /effort, /mode) arrive as prompt_reply frames whose
+// `choice` carries the button VALUE (`model:<alias>` / `effort:<level>` /
+// `mode:<target>`). Like queue-tile taps, their picker frame never advances
+// the staleness guard (non-answerable, issue #98), so the guard's target_seq
+// comparison would wrongly refuse the tap whenever ANY answerable prompt has
+// been recorded for the convo. The consumer must classify them by value shape
+// (lib/picker-dispatch.js isPickerValue) and route them around the guard —
+// exactly like the queue-action block (loop #461).
+describe('createJournalInputConsumer — picker replies bypass the staleness guard', () => {
+  function makeDeps(overrides = {}) {
+    return {
+      isControlConvo: () => false,
+      handleControlCommand: vi.fn(),
+      findSessionByConvoId: vi.fn((id) => ({ claudeSessionId: id })),
+      routeTextToSession: vi.fn(),
+      routePromptReply: vi.fn(),
+      noticeUnknownConvo: vi.fn(),
+      noticeStalePromptReply: vi.fn(),
+      log: silentLog,
+      ...overrides,
+    };
+  }
+
+  const answerableFrame = (seq) => baseFrame({
+    seq, sender: 'agent:dev-2', type: 'prompt',
+    payload: {
+      question: 'Which approach?', mode: 'pick_one',
+      options: [{ id: 'opt_a', label: 'A' }, { id: 'opt_b', label: 'B' }],
+    },
+  });
+
+  const pickerReply = (targetSeq, choice) => baseFrame({
+    seq: 100, type: 'prompt_reply',
+    payload: { target_seq: targetSeq, choice, text: null },
+  });
+
+  it.each([['model:sonnet'], ['effort:high'], ['mode:print']])(
+    'a %s tap routes even when its target_seq mismatches the latest answerable prompt',
+    (choice) => {
+      const deps = makeDeps();
+      const consumer = createJournalInputConsumer(deps);
+      consumer(answerableFrame(10));         // guard now expects target_seq 10
+      consumer(pickerReply(12, choice));     // picker at seq 12 — mismatch, but a picker value
+      expect(deps.noticeStalePromptReply).not.toHaveBeenCalled();
+      expect(deps.routePromptReply).toHaveBeenCalledTimes(1);
+      expect(deps.routePromptReply.mock.calls[0][1]).toEqual({
+        target_seq: 12, choice, text: null,
+      });
+    },
+  );
+
+  it('a NON-picker choice with a mismatched target_seq is still refused as stale', () => {
+    const deps = makeDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(answerableFrame(10));
+    consumer(pickerReply(12, 'opt_a'));
+    expect(deps.routePromptReply).not.toHaveBeenCalled();
+    expect(deps.noticeStalePromptReply).toHaveBeenCalledTimes(1);
+  });
+});
