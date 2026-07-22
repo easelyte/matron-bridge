@@ -117,6 +117,26 @@ describe('planSessionIdentity', () => {
     expect(plan.cliArgs).toEqual(['--resume', 'old-id']);
     expect(minted).toBe(0);
   });
+  // #136 / loop #459: a fresh print session that crashes BEFORE Claude
+  // persisted a resumable session must respawn with the SAME id via
+  // --session-id (not --resume, which would fail on a never-written session).
+  // presetId reuses the given id without minting and keeps --session-id.
+  it('reuses a presetId via --session-id (no --resume) without minting, when not resuming', () => {
+    let minted = 0;
+    const plan = sessionMode.planSessionIdentity({
+      resumeSessionId: undefined, presetId: 'provisional-id', mintId: () => { minted++; return 'never'; },
+    });
+    expect(plan.sessionId).toBe('provisional-id');
+    expect(plan.cliArgs).toEqual(['--session-id', 'provisional-id']);
+    expect(minted).toBe(0);
+  });
+  it('resumeSessionId wins over presetId (a confirmed session resumes)', () => {
+    const plan = sessionMode.planSessionIdentity({
+      resumeSessionId: 'confirmed-id', presetId: 'provisional-id', mintId: () => 'never',
+    });
+    expect(plan.sessionId).toBe('confirmed-id');
+    expect(plan.cliArgs).toEqual(['--resume', 'confirmed-id']);
+  });
 });
 
 // Wiring guard: index.js can't be imported in-process (it starts the bridge),
@@ -134,5 +154,23 @@ describe('createSession id pre-assignment (source inspection)', () => {
   it('no hand-rolled --session-id/--resume args outside the helper', () => {
     expect(src).not.toMatch(/push\('--session-id'/);
     expect(src).not.toMatch(/push\('--resume'/);
+  });
+
+  // #136 / loop #459: the auto-restart must not --resume a session that
+  // crashed before Claude persisted it. Assert the confirmation flag is set
+  // from the stream, both spawn helpers thread presetSessionId, and the
+  // restart branches gate the resume id on _sessionConfirmed.
+  it('marks _sessionConfirmed the first time a session_id event arrives', () => {
+    expect(src).toMatch(/if \(event\.session_id\) session\._sessionConfirmed = true;/);
+  });
+  it('both spawn helpers thread presetSessionId into planSessionIdentity', () => {
+    const calls = src.match(/planSessionIdentity\(\{ resumeSessionId, presetId: options\.presetSessionId/g) || [];
+    expect(calls.length).toBe(2);
+  });
+  it('auto-restart uses claudeSessionId only when confirmed, presetSessionId otherwise (both branches)', () => {
+    const resumeGates = src.match(/session\._sessionConfirmed \? session\.claudeSessionId : null/g) || [];
+    expect(resumeGates.length).toBe(2);
+    const presetGates = src.match(/presetSessionId: session\._sessionConfirmed \? undefined : session\.claudeSessionId/g) || [];
+    expect(presetGates.length).toBe(2);
   });
 });
