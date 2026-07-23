@@ -63,7 +63,7 @@ import { seedJournalTitle, applyFallbackTitle } from './lib/journal-title-seed.j
 import { activityStateChanged, truncateActivityDetail, shouldResumeThinkingAfterTool } from './lib/journal-activity.js';
 import { streamRefFor } from './lib/journal-stream.js';
 import { contextFullToNative, briefContextReport } from './lib/context-command.js';
-import { buildSessionStatus, contextTokensFromAssistantEvent, postCompactContextTokens, compactTriggerFrom, contextGaugeText, emailFromClaudeConfig, isSidechainEvent } from './lib/session-status.js';
+import { buildSessionStatus, contextTokensFromAssistantEvent, postCompactContextTokens, compactTriggerFrom, contextGaugeText, emailFromClaudeConfig, isSidechainEvent, reconcileModelForWindow } from './lib/session-status.js';
 import {
   AGENT_CLAUDE,
   AGENT_CODEX,
@@ -2643,9 +2643,11 @@ function handleClaudeEvent(session, event) {
 
   // Capture the current model from any event that carries message.model.
   // This is the reliable source in iv-mode, where the system/init event (and
-  // thus session.initData.model) never arrives.
+  // thus session.initData.model) never arrives. Reconcile widen-only: the bare
+  // API id (`claude-opus-4-8`) must not overwrite a launch model whose `[1m]`
+  // marker set a 1m window, or the context gauge silently narrows to /200k.
   const capturedModel = modelFromEvent(event);
-  if (capturedModel) session.currentModel = capturedModel;
+  if (capturedModel) session.currentModel = reconcileModelForWindow(session.currentModel, capturedModel);
 
   // Capture session ID from any event that carries it. Claude sessions
   // pre-assign their id at spawn (planSessionIdentity), so for them this is

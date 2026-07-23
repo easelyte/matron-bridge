@@ -3,6 +3,7 @@ import { readFileSync } from 'fs';
 import { fileURLToPath } from 'url';
 import {
   contextWindowFor,
+  reconcileModelForWindow,
   contextTokensFromUsage,
   contextTokensFromAssistantEvent,
   postCompactContextTokens,
@@ -28,6 +29,28 @@ describe('contextWindowFor', () => {
   it('handles a missing model', () => {
     expect(contextWindowFor(null)).toBe(200_000);
     expect(contextWindowFor(undefined)).toBe(200_000);
+  });
+});
+
+describe('reconcileModelForWindow', () => {
+  it('keeps the [1m] launch model when the bare stream id would narrow it', () => {
+    // The live bug: session launched as opus[1m], first assistant event
+    // reports the bare API id → must NOT drop to a 200k window.
+    expect(reconcileModelForWindow('opus[1m]', 'claude-opus-4-8')).toBe('opus[1m]');
+    expect(reconcileModelForWindow('claude-sonnet-4-5[1m]', 'claude-sonnet-4-5')).toBe('claude-sonnet-4-5[1m]');
+  });
+
+  it('adopts the new model when it widens or matches the window', () => {
+    expect(reconcileModelForWindow('claude-opus-4-8', 'claude-opus-4-8[1m]')).toBe('claude-opus-4-8[1m]');
+    expect(reconcileModelForWindow('claude-opus-4-8', 'claude-haiku-4-5')).toBe('claude-haiku-4-5');
+    expect(reconcileModelForWindow('claude-fable-5', 'claude-mythos-5')).toBe('claude-mythos-5');
+  });
+
+  it('handles missing sides without narrowing', () => {
+    expect(reconcileModelForWindow(null, 'claude-opus-4-8')).toBe('claude-opus-4-8');
+    expect(reconcileModelForWindow('opus[1m]', null)).toBe('opus[1m]');
+    expect(reconcileModelForWindow(null, null)).toBe(null);
+    expect(reconcileModelForWindow(undefined, undefined)).toBe(null);
   });
 });
 
