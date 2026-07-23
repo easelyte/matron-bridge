@@ -14,15 +14,22 @@ import {
 } from '../lib/session-status.js';
 
 describe('contextWindowFor', () => {
-  it('gives 1m-class models their full window', () => {
+  it('gives 1m-default session models their full window', () => {
     expect(contextWindowFor('claude-fable-5')).toBe(1_000_000);
     expect(contextWindowFor('claude-mythos-5')).toBe(1_000_000);
     expect(contextWindowFor('claude-sonnet-4-5[1m]')).toBe(1_000_000);
+    // Current Opus + Sonnet 5 default their SESSIONS to 1m (measured via
+    // `claude -p /context`), even with no [1m] marker on the bare API id.
+    expect(contextWindowFor('claude-opus-4-8')).toBe(1_000_000);
+    expect(contextWindowFor('claude-opus-4-7')).toBe(1_000_000);
+    expect(contextWindowFor('claude-sonnet-5')).toBe(1_000_000);
   });
 
-  it('defaults everything else to 200k', () => {
-    expect(contextWindowFor('claude-opus-4-8')).toBe(200_000);
+  it('defaults older / smaller models to 200k unless [1m] is appended', () => {
+    expect(contextWindowFor('claude-opus-4-6')).toBe(200_000);
+    expect(contextWindowFor('claude-sonnet-4-6')).toBe(200_000);
     expect(contextWindowFor('claude-haiku-4-5-20251001')).toBe(200_000);
+    expect(contextWindowFor('claude-opus-4-6[1m]')).toBe(1_000_000);
     expect(contextWindowFor('<synthetic>')).toBe(200_000);
   });
 
@@ -34,15 +41,18 @@ describe('contextWindowFor', () => {
 
 describe('reconcileModelForWindow', () => {
   it('keeps the [1m] launch model when the bare stream id would narrow it', () => {
-    // The live bug: session launched as opus[1m], first assistant event
-    // reports the bare API id → must NOT drop to a 200k window.
-    expect(reconcileModelForWindow('opus[1m]', 'claude-opus-4-8')).toBe('opus[1m]');
+    // A session launched as e.g. opus-4-6[1m], whose first assistant event
+    // reports the bare 200k-default id, must NOT drop to a 200k window.
+    expect(reconcileModelForWindow('claude-opus-4-6[1m]', 'claude-opus-4-6')).toBe('claude-opus-4-6[1m]');
     expect(reconcileModelForWindow('claude-sonnet-4-5[1m]', 'claude-sonnet-4-5')).toBe('claude-sonnet-4-5[1m]');
+    // Widen-only also refuses a genuine downgrade in the event path (a real
+    // /model switch flows through its own path, not this reconcile).
+    expect(reconcileModelForWindow('claude-opus-4-8', 'claude-haiku-4-5')).toBe('claude-opus-4-8');
   });
 
   it('adopts the new model when it widens or matches the window', () => {
     expect(reconcileModelForWindow('claude-opus-4-8', 'claude-opus-4-8[1m]')).toBe('claude-opus-4-8[1m]');
-    expect(reconcileModelForWindow('claude-opus-4-8', 'claude-haiku-4-5')).toBe('claude-haiku-4-5');
+    expect(reconcileModelForWindow('claude-opus-4-6', 'claude-opus-4-8')).toBe('claude-opus-4-8');
     expect(reconcileModelForWindow('claude-fable-5', 'claude-mythos-5')).toBe('claude-mythos-5');
   });
 
@@ -140,7 +150,8 @@ describe('compactTriggerFrom', () => {
 
 describe('contextGaugeText', () => {
   it('formats tokens over the model window ("24k/200k")', () => {
-    expect(contextGaugeText(24_313, 'claude-opus-4-8')).toBe('24k/200k');
+    expect(contextGaugeText(24_313, 'claude-opus-4-6')).toBe('24k/200k');
+    expect(contextGaugeText(24_313, 'claude-opus-4-8')).toBe('24k/1m');
   });
 
   it('keeps one decimal under 10k and formats 1m-class windows', () => {
@@ -148,7 +159,7 @@ describe('contextGaugeText', () => {
   });
 
   it('passes sub-1k counts through raw', () => {
-    expect(contextGaugeText(950, 'claude-opus-4-8')).toBe('950/200k');
+    expect(contextGaugeText(950, 'claude-opus-4-8')).toBe('950/1m');
   });
 
   it('returns null without a usable token count so callers fall back to non-numeric wording', () => {
@@ -183,8 +194,9 @@ describe('buildSessionStatus', () => {
   });
 
   it('rounds pct and clamps it to 100', () => {
-    expect(buildSessionStatus({ model: 'claude-opus-4-8', contextTokens: 1_000 }).context.pct).toBe(1);
-    expect(buildSessionStatus({ model: 'claude-opus-4-8', contextTokens: 300_000 }).context.pct).toBe(100);
+    // 200k-window model so the clamp path is exercised at realistic token counts.
+    expect(buildSessionStatus({ model: 'claude-opus-4-6', contextTokens: 1_000 }).context.pct).toBe(1);
+    expect(buildSessionStatus({ model: 'claude-opus-4-6', contextTokens: 300_000 }).context.pct).toBe(100);
   });
 
   it('includes the logged-in account email when known, omits it otherwise', () => {
