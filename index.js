@@ -6269,6 +6269,21 @@ const journalInputConsumer = createJournalInputConsumer({
     journalPublishNotice(convoId,
       "That prompt has been superseded by a newer one — your answer wasn't delivered. Check the latest prompt and answer that instead.");
   },
+  // #492 durable picker provenance: resolve the canonical `prompt` event at
+  // target_seq from the journal store, so a picker card published before a
+  // bridge restart is still dispatchable afterwards (its in-memory frame record
+  // died with the process). Returns just the event's payload — the router owns
+  // the isPickerFrame / offered-values validation. Fail-open: any miss (not a
+  // prompt event at that seq, or a null read) yields null and the reply falls
+  // back to ordinary prompt-answer routing.
+  resolveTargetPromptPayload: async (convoId, targetSeq) => {
+    // limit:1 with before_seq = target_seq+1 returns exactly the single event
+    // AT target_seq (highest seq < target_seq+1), oldest-first.
+    const events = await journalPublisher.fetchConvoMessages(convoId, { beforeSeq: targetSeq + 1, limit: 1 });
+    if (!Array.isArray(events)) return null;
+    const ev = events.find((e) => e && e.seq === targetSeq && e.type === 'prompt');
+    return ev ? ev.payload : null;
+  },
   log: console,
 });
 
