@@ -6106,25 +6106,31 @@ function journalOnPromptReply(session, answer, { username }) {
   // cursor's ~1s debounce window must not replay it on restart. The frame's
   // seq was recorded before onEvent fired; force it to disk now.
   journalPublisher.flushCursor();
-  // Queue-tile buttons (✕ Cancel / ⚡ Send now): a Matron card tap arrives
-  // here as a prompt_reply whose `choice` carries the option VALUE
-  // (`interrupt` / `cancel:<n>` — the app's .buttonResponse channel sends
-  // values), the same wire constants a Matrix button tap posts. Run the
-  // SAME extracted implementation the Matrix button_response handler uses.
-  // A queue action is never a pending-prompt answer, so the "answered:" echo
-  // below must not fire and journalRoutePromptReply must not see it (its
-  // unmatched path could otherwise disturb real pending-prompt state).
-  if (isQueueReleaseTap(answer?.choice)) {
+  // The router proves queue-card provenance from target_seq membership before
+  // calling us. Re-resolve the live registry entry here, where the session
+  // arrays and queue mutation seams are available. An ordinary prompt choice
+  // named "send" or "cancel" remains an ordinary answer because its seq is
+  // unknown to this registry.
+  const convoId = journalConvoIdFor(session);
+  const queuedRelease = journalInputConsumer.queueRelease.classifyBySeq(
+    convoId,
+    answer?.target_seq,
+  );
+  if (queuedRelease.state === 'live') {
     resolveQueueReleaseTap(answer.choice, session, {
       flushQueue,
-      // 'interrupt' needs this to clear session.queueNotifications on a full
-      // flush (see clearQueueNotifications above); 'cancel:<n>' doesn't use
-      // it — its notif splice is unconditional. No editMessage: Matrix tile
-      // edits are gone with outbound Matrix sends (Task 3).
       stripQueueNotificationLinks: clearQueueNotifications,
+      entry: queuedRelease.entry,
+      convoId,
+      queueRelease: journalInputConsumer.queueRelease,
+      emitRelease,
     });
     return;
   }
+  // Stale pre-deploy clients can still submit the retired positional values.
+  // They have no stable-id provenance and must not reach either queue mutation
+  // or the ordinary answer path.
+  if (isQueueReleaseTap(answer?.choice)) return;
   // Picker taps (/model, /effort, /mode): the router is the single source of
   // truth for picker-vs-answer. It sets `answer.picker` ONLY when the reply's
   // target_seq named a picker frame the bridge published AND the choice was one
