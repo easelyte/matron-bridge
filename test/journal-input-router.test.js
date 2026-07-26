@@ -905,8 +905,12 @@ describe('createJournalInputConsumer — media (file/image) routing', () => {
 // carries the tile's option VALUE (`interrupt` / `cancel:<n>`). Their tile
 // never advances the staleness guard (non-answerable, issue #98), so the
 // guard's target_seq comparison would wrongly refuse them whenever ANY
-// answerable prompt has been recorded — the consumer must classify them by
-// value shape and route them around the guard.
+// answerable prompt has been recorded — the consumer routes them around the
+// guard, but ONLY when the reply targets a queue-action FRAME the bridge
+// published (explicit provenance, #493). Value shape is a fallback
+// confirmation, never the sole classifier — this is what stops an ordinary
+// AskUserQuestion whose option value happens to be `interrupt`/`cancel:<n>`
+// from being swallowed as a queue control.
 describe('createJournalInputConsumer — queue-action replies bypass the staleness guard', () => {
   function makeDeps(overrides = {}) {
     return {
@@ -930,41 +934,195 @@ describe('createJournalInputConsumer — queue-action replies bypass the stalene
     },
   });
 
-  const queueReply = (targetSeq, choice) => baseFrame({
+  // A published "📨 Queued" tile: every option stamped reply_kind:queue_action,
+  // exactly as notifyQueuedMessage journals it (lib/busy-queue.js).
+  const queueActionFrame = (seq) => baseFrame({
+    seq, sender: 'agent:dev-2', type: 'prompt',
+    payload: {
+      question: '📨 Queued (1): hello', mode: 'pick_one',
+      options: [
+        { id: 'cancel', label: '✕ Cancel', value: 'cancel:0', reply_kind: 'queue_action' },
+        { id: 'interrupt', label: '⚡ Send now', value: 'interrupt', reply_kind: 'queue_action' },
+      ],
+    },
+  });
+
+  // An ORDINARY AskUserQuestion whose option values happen to collide with the
+  // queue-control wire shape (#493). Answerable — creates pending-answer state.
+  const collidingQuestionFrame = (seq) => baseFrame({
+    seq, sender: 'agent:dev-2', type: 'prompt',
+    payload: {
+      question: 'What should the run do?', mode: 'pick_one',
+      options: [
+        { id: 'opt_a', label: 'Interrupt the process', value: 'interrupt' },
+        { id: 'opt_b', label: 'Cancel task 3', value: 'cancel:3' },
+      ],
+    },
+  });
+
+  const reply = (targetSeq, choice) => baseFrame({
     seq: 100, type: 'prompt_reply',
     payload: { target_seq: targetSeq, choice, text: null },
   });
 
-  it('an interrupt tap routes even when its target_seq mismatches the latest answerable prompt', () => {
+  it('an interrupt tap that targets its published queue-action frame routes (flagged queue_action) past a later answerable prompt', () => {
     const deps = makeDeps();
     const consumer = createJournalInputConsumer(deps);
-    consumer(answerableFrame(10));           // guard now expects target_seq 10
-    consumer(queueReply(12, 'interrupt'));   // tile at seq 12 — mismatch, but a queue action
+    consumer(queueActionFrame(12));          // bridge published this tile at seq 12
+    consumer(answerableFrame(10));           // a later answerable prompt sets the guard
+    consumer(reply(12, 'interrupt'));        // reply targets the tile → queue control
     expect(deps.noticeStalePromptReply).not.toHaveBeenCalled();
     expect(deps.routePromptReply).toHaveBeenCalledTimes(1);
+    // Explicit provenance flag — the receiver dispatches on this, not value shape.
     expect(deps.routePromptReply.mock.calls[0][1]).toEqual({
-      target_seq: 12, choice: 'interrupt', text: null,
+      target_seq: 12, choice: 'interrupt', text: null, queue_action: true,
     });
   });
 
-  it('an indexed cancel tap routes the same way', () => {
+  it('an indexed cancel tap targeting its tile routes the same way', () => {
     const deps = makeDeps();
     const consumer = createJournalInputConsumer(deps);
+    consumer(queueActionFrame(12));
     consumer(answerableFrame(10));
-    consumer(queueReply(12, 'cancel:0'));
+    consumer(reply(12, 'cancel:0'));
     expect(deps.noticeStalePromptReply).not.toHaveBeenCalled();
     expect(deps.routePromptReply).toHaveBeenCalledWith(
       expect.anything(),
-      { target_seq: 12, choice: 'cancel:0', text: null },
+      { target_seq: 12, choice: 'cancel:0', text: null, queue_action: true },
       { username: 'dan' },
     );
   });
 
-  it('a NON-queue choice with a mismatched target_seq is still refused as stale', () => {
+  // #493 regression: an ordinary AskUserQuestion whose chosen option value is
+  // literally `interrupt` (or `cancel:3`) must be DELIVERED as an answer, not
+  // swallowed as a queue control. It targets an answerable frame (not a
+  // queue-action frame), so no provenance flag is set and it routes as an
+  // ordinary answer.
+  it('an ordinary answer whose value is `interrupt` is delivered, NOT swallowed as a queue control', () => {
+    const deps = makeDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(collidingQuestionFrame(20));    // answerable prompt, guard expects seq 20
+    consumer(reply(20, 'interrupt'));        // the user picked the "Interrupt the process" option
+    expect(deps.noticeStalePromptReply).not.toHaveBeenCalled();
+    expect(deps.routePromptReply).toHaveBeenCalledTimes(1);
+    const answer = deps.routePromptReply.mock.calls[0][1];
+    expect(answer).toEqual({ target_seq: 20, choice: 'interrupt', text: null }); // no queue_action flag
+    expect(answer.queue_action).toBeUndefined();
+  });
+
+  it('an ordinary answer whose value is `cancel:3` is likewise delivered as an answer', () => {
+    const deps = makeDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(collidingQuestionFrame(20));
+    consumer(reply(20, 'cancel:3'));
+    expect(deps.noticeStalePromptReply).not.toHaveBeenCalled();
+    expect(deps.routePromptReply).toHaveBeenCalledTimes(1);
+    const answer = deps.routePromptReply.mock.calls[0][1];
+    expect(answer.queue_action).toBeUndefined();
+    expect(answer.choice).toBe('cancel:3');
+  });
+
+  it('a queue value whose target_seq matches NO published queue-action frame fails safe toward delivery (ordinary answer, not swallowed)', () => {
+    // Legacy tile / post-restart: no frame recorded. The reply is NOT routed as
+    // a queue control; it falls through as an ordinary answer. Here it targets
+    // the latest answerable prompt, so it is delivered (never silently
+    // queue-routed).
     const deps = makeDeps();
     const consumer = createJournalInputConsumer(deps);
     consumer(answerableFrame(10));
-    consumer(queueReply(12, 'opt_a'));
+    consumer(reply(10, 'interrupt'));
+    expect(deps.noticeStalePromptReply).not.toHaveBeenCalled();
+    expect(deps.routePromptReply).toHaveBeenCalledTimes(1);
+    expect(deps.routePromptReply.mock.calls[0][1].queue_action).toBeUndefined();
+  });
+
+  it('a NON-queue choice targeting the queue-action frame is not routed as a queue control (value-shape fallback fails)', () => {
+    const deps = makeDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(queueActionFrame(12));
+    consumer(answerableFrame(10));
+    consumer(reply(12, 'opt_a')); // targets the tile but isn't a queue value
+    expect(deps.routePromptReply).not.toHaveBeenCalled();
+    expect(deps.noticeStalePromptReply).toHaveBeenCalledTimes(1);
+  });
+
+  // Blocker 1 (idempotency): a double-tapped / retried queue-action reply must
+  // dispatch AT MOST ONCE. Without this, a repeated `cancel:<n>` splices the
+  // queue twice — the second splice removes the now index-shifted SIBLING
+  // message (silent data loss). The tile is consumed on first dispatch; a
+  // repeat is a handled no-op (not routed again, and never mis-delivered as an
+  // ordinary answer).
+  it('a double-tapped cancel is idempotent — dispatched once, the repeat is a no-op', () => {
+    const deps = makeDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(queueActionFrame(12));
+    consumer(answerableFrame(10));
+    consumer(reply(12, 'cancel:0'));
+    consumer(reply(12, 'cancel:0')); // retry / double-tap of the SAME tile
+    expect(deps.routePromptReply).toHaveBeenCalledTimes(1);
+    expect(deps.routePromptReply.mock.calls[0][1]).toMatchObject({ target_seq: 12, choice: 'cancel:0', queue_action: true });
+    // The repeat is swallowed as a no-op — never routed, never a stale notice.
+    expect(deps.noticeStalePromptReply).not.toHaveBeenCalled();
+  });
+
+  it('a double-tapped interrupt is likewise dispatched once', () => {
+    const deps = makeDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(queueActionFrame(12));
+    consumer(answerableFrame(10));
+    consumer(reply(12, 'interrupt'));
+    consumer(reply(12, 'interrupt'));
+    expect(deps.routePromptReply).toHaveBeenCalledTimes(1);
+    expect(deps.routePromptReply.mock.calls[0][1].queue_action).toBe(true);
+    expect(deps.noticeStalePromptReply).not.toHaveBeenCalled();
+  });
+
+  // Blocker 2 (no live-tile eviction): a still-actionable tile far beyond any
+  // recency window must still route as a queue control. Publish many queue-tile
+  // frames (more than the old 16-frame cap), then tap the OLDEST — it must
+  // still be recognized.
+  it('a still-live tile beyond the old retention window still routes as a queue control', () => {
+    const deps = makeDeps();
+    const consumer = createJournalInputConsumer(deps);
+    // 20 outstanding queue tiles at seqs 1..20 (queue never flushed).
+    for (let seq = 1; seq <= 20; seq++) consumer(queueActionFrame(seq));
+    consumer(answerableFrame(50)); // sets the staleness guard
+    consumer(reply(1, 'interrupt')); // the OLDEST tile — still actionable
+    expect(deps.noticeStalePromptReply).not.toHaveBeenCalled();
+    expect(deps.routePromptReply).toHaveBeenCalledTimes(1);
+    expect(deps.routePromptReply.mock.calls[0][1]).toMatchObject({ target_seq: 1, queue_action: true });
+  });
+
+  // The lifecycle hook (#493 blocker 2): a full flush resolves every tile, so a
+  // subsequent tap on any of them is an idempotent no-op — not re-dispatched,
+  // not mis-delivered.
+  it('resolveQueueActionFrames marks every live tile resolved (post-flush taps are no-ops)', () => {
+    const deps = makeDeps();
+    const consumer = createJournalInputConsumer(deps);
+    expect(typeof consumer.resolveQueueActionFrames).toBe('function');
+    consumer(queueActionFrame(12));
+    consumer(queueActionFrame(13));
+    consumer(answerableFrame(10));
+    consumer.resolveQueueActionFrames('convo-1'); // the queue flushed
+    consumer(reply(12, 'interrupt')); // late tap on a flushed tile
+    consumer(reply(13, 'cancel:0'));
+    expect(deps.routePromptReply).not.toHaveBeenCalled();       // never re-dispatched
+    expect(deps.noticeStalePromptReply).not.toHaveBeenCalled(); // swallowed, not mis-delivered
+  });
+
+  it('resolveQueueActionFrames tolerates unknown convo ids and never throws', () => {
+    const consumer = createJournalInputConsumer(makeDeps());
+    expect(() => consumer.resolveQueueActionFrames('never-seen')).not.toThrow();
+    expect(() => consumer.resolveQueueActionFrames(null)).not.toThrow();
+  });
+
+  it('evictConvo clears the queue-action frame record for that convo', () => {
+    const deps = makeDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(queueActionFrame(12));
+    consumer.evictConvo('convo-1');
+    consumer(answerableFrame(10));
+    consumer(reply(12, 'interrupt')); // record gone → not a queue control → stale vs seq 10
     expect(deps.routePromptReply).not.toHaveBeenCalled();
     expect(deps.noticeStalePromptReply).toHaveBeenCalledTimes(1);
   });

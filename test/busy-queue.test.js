@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'fs';
-import { dispatchBusyQueueMagicWord, handleBusyQueueMagicWord, notifyQueuedMessage, isQueueActionValue, handleQueueActionValue } from '../lib/busy-queue.js';
+import { dispatchBusyQueueMagicWord, handleBusyQueueMagicWord, notifyQueuedMessage, isQueueActionValue, isQueueActionFrame, handleQueueActionValue, QUEUE_ACTION_REPLY_KIND } from '../lib/busy-queue.js';
 
 // Busy-queue magic-word parity (PR #101 follow-up). The Matrix busy branch's
 // send/interrupt/!interrupt (flush now) and cancel (pop last) handling is
@@ -373,8 +373,8 @@ describe('notifyQueuedMessage', () => {
     expect(sendButtonMessage).toHaveBeenCalledWith(
       '📨 Queued (2): second',
       [
-        { id: 'cancel', label: '✕ Cancel', value: 'cancel:1' },
-        { id: 'interrupt', label: '⚡ Send now', value: 'interrupt' },
+        { id: 'cancel', label: '✕ Cancel', value: 'cancel:1', reply_kind: 'queue_action' },
+        { id: 'interrupt', label: '⚡ Send now', value: 'interrupt', reply_kind: 'queue_action' },
       ],
       'pick_one', '📨 Queued (2): second', '📨 Queued (2): second',
     );
@@ -438,6 +438,41 @@ describe('isQueueActionValue', () => {
     expect(isQueueActionValue('opt_a')).toBe(false);
     expect(isQueueActionValue(null)).toBe(false);
     expect(isQueueActionValue(undefined)).toBe(false);
+  });
+});
+
+describe('isQueueActionFrame', () => {
+  it('is true for a published queue-action tile (every option stamped reply_kind:queue_action)', () => {
+    expect(isQueueActionFrame({
+      options: [
+        { id: 'cancel', label: '✕ Cancel', value: 'cancel:0', reply_kind: QUEUE_ACTION_REPLY_KIND },
+        { id: 'interrupt', label: '⚡ Send now', value: 'interrupt', reply_kind: QUEUE_ACTION_REPLY_KIND },
+      ],
+    })).toBe(true);
+  });
+
+  it('is false for an ordinary AskUserQuestion, even one whose option value looks like a queue value (#493)', () => {
+    // The exact mis-route #493 guards against: an ordinary prompt offering an
+    // option literally valued `interrupt` / `cancel:3` carries NO provenance
+    // stamp, so it is not a queue-action frame.
+    expect(isQueueActionFrame({
+      options: [
+        { id: 'opt_a', label: 'Interrupt the run', value: 'interrupt' },
+        { id: 'opt_b', label: 'Cancel item 3', value: 'cancel:3' },
+      ],
+    })).toBe(false);
+  });
+
+  it('is false when only some options are stamped, or for empty/missing option sets', () => {
+    expect(isQueueActionFrame({
+      options: [
+        { id: 'cancel', value: 'cancel:0', reply_kind: QUEUE_ACTION_REPLY_KIND },
+        { id: 'interrupt', value: 'interrupt' },
+      ],
+    })).toBe(false);
+    expect(isQueueActionFrame({ options: [] })).toBe(false);
+    expect(isQueueActionFrame({})).toBe(false);
+    expect(isQueueActionFrame(null)).toBe(false);
   });
 });
 
@@ -525,5 +560,47 @@ describe('index.js journal busy caller — queued-tile notification wiring (sour
     const window = src.slice(start, start + 800);
     expect(window).toMatch(/notifyQueuedMessage\(session, preview, \{/);
     expect(window).toMatch(/sendReply: ctx\.sendReply/);
+  });
+});
+
+// #493: the journal prompt_reply router must dispatch a queue control on the
+// router's explicit `queue_action` provenance flag — set only when the reply
+// targeted a published queue-action FRAME — and NOT re-guess by the reply's
+// value shape (which mis-routed ordinary answers whose value happened to be
+// `interrupt`/`cancel:<n>`). index.js can't be imported in-process, so pin by
+// source inspection.
+describe('index.js journalOnPromptReply — queue-action routing prefers explicit provenance (#493)', () => {
+  const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
+
+  it('gates queue-action dispatch on answer.queue_action, not on a value-shape predicate', () => {
+    const start = src.indexOf('function journalOnPromptReply(');
+    expect(start).toBeGreaterThan(-1);
+    const end = src.indexOf('\nfunction ', start + 1);
+    const body = src.slice(start, end);
+    expect(body).toContain('if (answer?.queue_action)');
+    expect(body).toContain('handleQueueActionValue(answer.choice, session,');
+    // The old value-shape classifier must no longer gate the queue branch.
+    expect(body).not.toContain('isQueueActionValue(answer');
+  });
+
+  it('no longer imports isQueueActionValue (unused after the provenance switch)', () => {
+    const importLine = src.match(/import \{[^}]*\} from '\.\/lib\/busy-queue\.js'/);
+    expect(importLine).not.toBeNull();
+    expect(importLine[0]).not.toContain('isQueueActionValue');
+    expect(importLine[0]).toContain('handleQueueActionValue');
+  });
+
+  it('flushQueue ties frame lifecycle to the queue: it resolves the convo\'s queue-action frames after an actual flush (#493 blocker 2)', () => {
+    const start = src.indexOf('function flushQueue(');
+    expect(start).toBeGreaterThan(-1);
+    const end = src.indexOf('\nfunction ', start + 1);
+    const body = src.slice(start, end);
+    expect(body).toContain('journalInputConsumer.resolveQueueActionFrames(');
+    // The resolve call must live AFTER the Codex-busy early-return (which
+    // re-queues and keeps the tiles live), i.e. below dispatchMergedFlush.
+    const codexReturn = body.indexOf('session.codex?.interrupt');
+    const resolveCall = body.indexOf('resolveQueueActionFrames(');
+    expect(codexReturn).toBeGreaterThan(-1);
+    expect(resolveCall).toBeGreaterThan(codexReturn);
   });
 });
