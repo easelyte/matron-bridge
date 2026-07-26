@@ -5892,6 +5892,8 @@ async function journalRouteTextToSession(session, body) {
     await notifyQueuedMessage(session, preview, {
       sendReply: ctx.sendReply,
       htmlEscape: escapeHtml,
+      queueRelease: journalInputConsumer.queueRelease,
+      convoId: journalConvoIdFor(session),
     });
     return;
   }
@@ -6072,6 +6074,8 @@ async function journalQueueMedia(session, { blocks, mirrorToJournal, preview }) 
     await notifyQueuedMessage(session, preview, {
       sendReply: ctx.sendReply,
       htmlEscape: escapeHtml,
+      queueRelease: journalInputConsumer.queueRelease,
+      convoId: journalConvoIdFor(session),
     });
   } catch (e) {
     console.warn(`[journal-media] queued-tile notify failed (media is queued): ${e.message}`);
