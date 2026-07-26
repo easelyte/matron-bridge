@@ -1510,6 +1510,16 @@ function handleCodexEvent(session, event) {
 function flushPendingSessionQueue(session) {
   if (!session.alive || !session.queuedMessages?.length) return false;
   const queued = session.queuedMessages;
+  const convoId = journalConvoIdFor(session);
+  const releaseSnapshot = journalInputConsumer.queueRelease.listLive(convoId);
+  for (const { promptId, itemId } of releaseSnapshot) {
+    emitRelease(convoId, {
+      promptId,
+      action: 'send',
+      releasedIds: [itemId],
+    });
+    journalInputConsumer.queueRelease.dropItem(convoId, itemId);
+  }
   session.queuedMessages = null;
   const summary = formatQueueSummary(queued);
   if (session.sendHtml) {
