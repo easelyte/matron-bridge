@@ -525,8 +525,8 @@ function journalStartSessionForRpc({ workdir, mcpExtras }) {
   const sessionRoomId = newSessionConvoId();
   const sessionSendReply = (reply) => sendToRoom(sessionRoomId, plainTextFormat(reply), markdownToHtml(reply));
   const sessionSendHtml = (plainText, html) => sendToRoom(sessionRoomId, plainText, html);
-  const sessionSendButtons = (prompt, buttons, mode, plainText, html) =>
-    sendButtonMessage(sessionRoomId, prompt, buttons, mode, plainText, html);
+  const sessionSendButtons = (prompt, buttons, mode, plainText, html, payload) =>
+    sendButtonMessage(sessionRoomId, prompt, buttons, mode, plainText, html, payload);
   const session = createSession(sessionRoomId, workdir, undefined, { mcpExtras });
   session.originRoomId = null;
   session.sendCallback = sessionSendReply;
@@ -4253,11 +4253,11 @@ function sweepToolStreams(session) {
 // session.sendButtonMessage closures; the journal publishes structured
 // prompts and ignores them. Retiring the whole fallback-text plumbing is a
 // tracked follow-up.
-async function sendButtonMessage(roomId, prompt, buttons, mode, _fallbackBody, _fallbackHtml) {
+async function sendButtonMessage(roomId, prompt, buttons, mode, _fallbackBody, _fallbackHtml, payload = null) {
   console.log(`[BUTTONS] Sending button message: mode=${mode}, buttons=${buttons.length}, prompt=${prompt.substring(0, 50)}`);
   const journalSession = sessions.get(roomId);
   if (journalSession) {
-    journalPublish(journalSession, 'publishPrompt', { question: prompt, options: buttons, mode });
+    journalPublish(journalSession, 'publishPrompt', payload || { question: prompt, options: buttons, mode });
     return true;
   }
   return null;
@@ -4597,8 +4597,8 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
 
       const sessionSendReply = (reply) => sendToRoom(sessionRoomId, plainTextFormat(reply), markdownToHtml(reply));
       const sessionSendHtml = (plainText, html) => sendToRoom(sessionRoomId, plainText, html);
-      const sessionSendButtons = (prompt, buttons, mode, plainText, html) =>
-        sendButtonMessage(sessionRoomId, prompt, buttons, mode, plainText, html);
+      const sessionSendButtons = (prompt, buttons, mode, plainText, html, payload) =>
+        sendButtonMessage(sessionRoomId, prompt, buttons, mode, plainText, html, payload);
 
       const session = createSession(sessionRoomId, workdir, undefined, { agent: selectedAgent, mcpExtras });
       session.originRoomId = roomId;
@@ -4864,8 +4864,8 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
 
       const sessionSendReply = (reply) => sendToRoom(sessionRoomId, plainTextFormat(reply), markdownToHtml(reply));
       const sessionSendHtml = (plainText, html) => sendToRoom(sessionRoomId, plainText, html);
-      const sessionSendButtons = (prompt, buttons, mode, plainText, html) =>
-        sendButtonMessage(sessionRoomId, prompt, buttons, mode, plainText, html);
+      const sessionSendButtons = (prompt, buttons, mode, plainText, html, payload) =>
+        sendButtonMessage(sessionRoomId, prompt, buttons, mode, plainText, html, payload);
 
       // Inherit the resumed session's previously persisted extras unless the
       // user is explicitly overriding via the command line; this lets a
@@ -4987,8 +4987,8 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
 
       const sessionSendReply = (reply) => sendToRoom(sessionRoomId, plainTextFormat(reply), markdownToHtml(reply));
       const sessionSendHtml = (plainText, html) => sendToRoom(sessionRoomId, plainText, html);
-      const sessionSendButtons = (prompt, buttons, mode, plainText, html) =>
-        sendButtonMessage(sessionRoomId, prompt, buttons, mode, plainText, html);
+      const sessionSendButtons = (prompt, buttons, mode, plainText, html, payload) =>
+        sendButtonMessage(sessionRoomId, prompt, buttons, mode, plainText, html, payload);
 
       const session = createSession(sessionRoomId, resolved, undefined, { agent: selectedAgent, mcpExtras: workdirExtras });
       session.originRoomId = roomId;
@@ -5894,6 +5894,7 @@ async function journalRouteTextToSession(session, body) {
       htmlEscape: escapeHtml,
       queueRelease: journalInputConsumer.queueRelease,
       convoId: journalConvoIdFor(session),
+      fullText: trimmed,
     });
     return;
   }
@@ -6060,7 +6061,7 @@ const journalMediaRouter = createJournalMediaRouter({
 // immediate sendTextToSession); a saved file/image is marked journal-origin so
 // it never re-mirrors. Async: notifyQueuedMessage awaits the tile send, exactly
 // like the text path.
-async function journalQueueMedia(session, { blocks, mirrorToJournal, preview }) {
+async function journalQueueMedia(session, { blocks, mirrorToJournal, preview, fullText }) {
   if (!session.queuedMessages) session.queuedMessages = [];
   const entry = [...blocks];
   if (!mirrorToJournal) markJournalOrigin(entry);
@@ -6076,6 +6077,7 @@ async function journalQueueMedia(session, { blocks, mirrorToJournal, preview }) 
       htmlEscape: escapeHtml,
       queueRelease: journalInputConsumer.queueRelease,
       convoId: journalConvoIdFor(session),
+      fullText,
     });
   } catch (e) {
     console.warn(`[journal-media] queued-tile notify failed (media is queued): ${e.message}`);
@@ -6422,8 +6424,8 @@ function resumePersistedSession(roomId, prev, { skipJournalMirror = false } = {}
   newSession.pinnedSummaryEventId = prev.pinnedSummaryEventId || null;
   newSession.sendCallback = sendReply;
   newSession.sendHtml = sendHtmlFn;
-  newSession.sendButtonMessage = (prompt, buttons, mode, plainText, html) =>
-    sendButtonMessage(roomId, prompt, buttons, mode, plainText, html);
+  newSession.sendButtonMessage = (prompt, buttons, mode, plainText, html, payload) =>
+    sendButtonMessage(roomId, prompt, buttons, mode, plainText, html, payload);
   hydrateAgentState(newSession, prev);
 
   const shortId = resumeSessionId ? resumeSessionId.slice(0, 8) : 'new';
@@ -7123,8 +7125,8 @@ function recreateSession(roomId, overrides, { sendReply, sendHtml }) {
   });
   next.sendCallback = sendReply;
   next.sendHtml = sendHtml;
-  next.sendButtonMessage = (prompt, buttons, mode, plainText, html) =>
-    sendButtonMessage(roomId, prompt, buttons, mode, plainText, html);
+  next.sendButtonMessage = (prompt, buttons, mode, plainText, html, payload) =>
+    sendButtonMessage(roomId, prompt, buttons, mode, plainText, html, payload);
   next.originRoomId = originRoomId;
   next.firstMessageCaptured = existing.firstMessageCaptured;
   next.queuedMessages = existing.queuedMessages;
