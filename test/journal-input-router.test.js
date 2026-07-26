@@ -486,6 +486,46 @@ describe('createJournalInputConsumer — non-answerable prompts must not superse
     expect(() => consumer.evictConvo(null)).not.toThrow();
     expect(() => consumer.evictConvo(undefined)).not.toThrow();
   });
+
+  it('evictConvo cancels live queue cards before clearing the queue and registry', () => {
+    const order = [];
+    const emitRelease = vi.fn((convoId, release) => {
+      order.push(`release:${release.releasedIds[0]}`);
+      expect(convoId).toBe('convo-1');
+    });
+    const consumer = createJournalInputConsumer(makeDeps({ emitRelease }));
+    consumer.queueRelease.noteQueued('convo-1', {
+      promptId: 'pr_1',
+      itemId: 'pr_1::0',
+    });
+    consumer.queueRelease.noteQueued('convo-1', {
+      promptId: 'pr_2',
+      itemId: 'pr_2::0',
+    });
+
+    consumer.evictConvo('convo-1', {
+      clearQueue: () => order.push('clear'),
+    });
+
+    expect(order).toEqual(['release:pr_1::0', 'release:pr_2::0', 'clear']);
+    expect(emitRelease).toHaveBeenNthCalledWith(1, 'convo-1', {
+      promptId: 'pr_1',
+      action: 'cancel',
+      releasedIds: ['pr_1::0'],
+    });
+    expect(emitRelease).toHaveBeenNthCalledWith(2, 'convo-1', {
+      promptId: 'pr_2',
+      action: 'cancel',
+      releasedIds: ['pr_2::0'],
+    });
+    expect(consumer.queueRelease.listLive('convo-1')).toEqual([]);
+
+    consumer.evictConvo('convo-1', {
+      clearQueue: () => order.push('clear-again'),
+    });
+    expect(emitRelease).toHaveBeenCalledTimes(2);
+    expect(order.at(-1)).toBe('clear-again');
+  });
 });
 
 // Auto-resume seam: the idle reaper silently kills sessions assuming "the
@@ -889,6 +929,29 @@ describe('createJournalInputConsumer — media (file/image) routing', () => {
     consumer(fileFrame({ convo_id: 'control-1' }));
     expect(deps.routeMediaToSession).not.toHaveBeenCalled();
     expect(deps.handleControlCommand).not.toHaveBeenCalled();
+  });
+
+  it('retains live queued-card seqs while bounding only resolved tombstones', () => {
+    const consumer = createJournalInputConsumer(makeDeps());
+    const registry = consumer.queueRelease;
+
+    registry.noteQueued('convo-1', { promptId: 'live', itemId: 'live::0' });
+    registry.annotateSeq('convo-1', 1, 'live');
+
+    for (let seq = 2; seq <= 514; seq++) {
+      const promptId = `resolved-${seq}`;
+      const itemId = `${promptId}::0`;
+      registry.noteQueued('convo-1', { promptId, itemId });
+      registry.annotateSeq('convo-1', seq, promptId);
+      registry.dropItem('convo-1', itemId);
+    }
+
+    expect(registry.classifyBySeq('convo-1', 1)).toMatchObject({
+      state: 'live',
+      entry: { prompt_id: 'live', itemIds: ['live::0'], seq: 1 },
+    });
+    expect(registry.classifyBySeq('convo-1', 2)).toEqual({ state: 'unknown' });
+    expect(registry.classifyBySeq('convo-1', 3)).toEqual({ state: 'tombstoned' });
   });
 
   it('without a routeMediaToSession seam, file/image frames stay pass-through (never looked up or routed)', () => {
