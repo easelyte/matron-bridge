@@ -199,6 +199,16 @@ describe('buildSessionStatus', () => {
     expect(buildSessionStatus({ model: 'claude-opus-4-6', contextTokens: 300_000 }).context.pct).toBe(100);
   });
 
+  it('includes the session workdir when known, omits it otherwise (#521)', () => {
+    expect(buildSessionStatus({ model: 'claude-fable-5', workdir: '/opt/matron/web-journal' })).toEqual({
+      model: 'claude-fable-5',
+      workdir: '/opt/matron/web-journal',
+    });
+    expect(buildSessionStatus({ model: 'claude-fable-5', workdir: null })).toEqual({ model: 'claude-fable-5' });
+    expect(buildSessionStatus({ model: 'claude-fable-5', workdir: '' })).toEqual({ model: 'claude-fable-5' });
+    expect(buildSessionStatus({ model: 'claude-fable-5' })).toEqual({ model: 'claude-fable-5' });
+  });
+
   it('includes the logged-in account email when known, omits it otherwise', () => {
     expect(buildSessionStatus({ model: 'claude-fable-5', email: 'gene@yearbook.com' })).toEqual({
       model: 'claude-fable-5',
@@ -243,6 +253,13 @@ describe('index.js wiring', () => {
     const body = src.slice(start, end);
     expect(body).toContain('buildSessionStatus(');
     expect(body).toContain('publishStatus(');
+  });
+
+  it('journalStatus threads the session workdir into the frame (#521)', () => {
+    const start = src.indexOf('function journalStatus(');
+    const end = src.indexOf('\nfunction ', start + 1);
+    const body = src.slice(start, end);
+    expect(body).toContain('workdir: session.workdir');
   });
 
   it("the print-mode result handler publishes status WITHOUT deriving context from result usage (it's cumulative across the turn's API calls, not a context footprint)", () => {

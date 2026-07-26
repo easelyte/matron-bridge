@@ -53,7 +53,7 @@ import { checkFileLink } from './lib/file-link-guard.js';
 import { createJournalPublisher } from './lib/journal-publisher.js';
 import { createRpcRequestHandler } from './lib/journal-rpc.js';
 import { createRecentFolders } from './lib/recent-folders.js';
-import { dispatchBusyQueueMagicWord, notifyQueuedMessage, isQueueActionValue, handleQueueActionValue } from './lib/busy-queue.js';
+import { dispatchBusyQueueMagicWord, notifyQueuedMessage, handleQueueActionValue } from './lib/busy-queue.js';
 import { handlePickerValue } from './lib/picker-dispatch.js';
 import { createJournalInputConsumer, resolvePromptChoice } from './lib/journal-input-router.js';
 import { createJournalMediaRouter } from './lib/journal-media.js';
@@ -822,6 +822,7 @@ function journalStatus(session) {
     contextTokens: session._lastContextTokens,
     limits: usageLimitsCache.lines,
     email: getAccountEmail(),
+    workdir: session.workdir,
   });
   // The shared account cache is Claude-specific. Preserve the established
   // status-builder wiring above, then strip those fields from Codex frames.
@@ -6090,16 +6091,20 @@ function journalOnPromptReply(session, answer, { username }) {
   // seq was recorded before onEvent fired; force it to disk now.
   journalPublisher.flushCursor();
   // Queue-tile buttons (✕ Cancel / ⚡ Send now): a Matron card tap arrives
-  // here as a prompt_reply whose `choice` carries the option VALUE
-  // (`interrupt` / `cancel:<n>` — the app's .buttonResponse channel sends
-  // values), the same wire constants a Matrix button tap posts. Run the
-  // SAME extracted implementation the Matrix button_response handler uses.
-  // Feedback ("⚡ Sending …" / "✕ Cancelled …") comes from the handler via
-  // the journal-mirroring ctx.sendReply, so the "answered:" echo below must
-  // not also fire — and a queue action is never a pending-prompt answer, so
+  // here as a prompt_reply. We trust the router's explicit `queue_action`
+  // provenance flag — set ONLY when the reply targeted a queue-action FRAME the
+  // bridge published (lib/journal-input-router.js) — and never re-guess by the
+  // reply's value shape (#493). An ordinary AskUserQuestion whose option value
+  // happens to be `interrupt`/`cancel:<n>` arrives here WITHOUT the flag and so
+  // falls through to ordinary answer resolution below (delivered, visible)
+  // rather than being swallowed as a queue control. Run the SAME extracted
+  // implementation the Matrix button_response handler uses. Feedback
+  // ("⚡ Sending …" / "✕ Cancelled …") comes from the handler via the
+  // journal-mirroring ctx.sendReply, so the "answered:" echo below must not
+  // also fire — and a queue action is never a pending-prompt answer, so
   // journalRoutePromptReply must not see it (its unmatched path could
   // otherwise disturb real pending-prompt state).
-  if (isQueueActionValue(answer?.choice)) {
+  if (answer?.queue_action) {
     const ctx = journalSessionCommandCtx(session);
     handleQueueActionValue(answer.choice, session, {
       sendReply: ctx.sendReply,
