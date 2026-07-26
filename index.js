@@ -1514,11 +1514,7 @@ function handleCodexEvent(session, event) {
 function flushPendingSessionQueue(session) {
   if (!session.alive || !session.queuedMessages?.length) return false;
   const queued = session.queuedMessages;
-  const convoId = journalConvoIdFor(session);
-  const releaseSnapshot = {
-    convoId,
-    entries: journalInputConsumer.queueRelease.listLive(convoId),
-  };
+  const releaseSnapshot = snapshotQueuedReleaseBatch(session, queued);
   session.queuedMessages = null;
   const summary = formatQueueSummary(queued);
   if (session.sendHtml) {
@@ -3828,14 +3824,57 @@ function dispatchMergedFlush(session, queued) {
   return true;
 }
 
+function queuedReleaseItemIds(session, queued) {
+  const batchSize = Array.isArray(queued) ? queued.length : 0;
+  return new Set(
+    (session.queueNotifications || [])
+      .slice(0, batchSize)
+      .map(notification => notification?.id)
+      .filter(Boolean),
+  );
+}
+
+function liveQueuedReleaseEntries(convoId, itemIds) {
+  return journalInputConsumer.queueRelease.listLive(convoId)
+    .filter(entry => itemIds.has(entry.itemId));
+}
+
+function snapshotQueuedReleaseBatch(session, queued) {
+  const convoId = journalConvoIdFor(session);
+  return {
+    convoId,
+    entries: liveQueuedReleaseEntries(
+      convoId,
+      queuedReleaseItemIds(session, queued),
+    ),
+  };
+}
+
+function queueReleaseForBatch(session, queued) {
+  const itemIds = queuedReleaseItemIds(session, queued);
+  return {
+    listLive: (convoId) => liveQueuedReleaseEntries(convoId, itemIds),
+    dropItem: (convoId, itemId) => {
+      journalInputConsumer.queueRelease.dropItem(convoId, itemId);
+    },
+  };
+}
+
 function finalizeSentQueue(convoId, flushedSnapshot) {
-  for (const { promptId, itemId } of flushedSnapshot || []) {
+  const liveByItemId = new Map(
+    journalInputConsumer.queueRelease.listLive(convoId)
+      .map(entry => [entry.itemId, entry]),
+  );
+  for (const { itemId } of flushedSnapshot || []) {
+    const liveEntry = liveByItemId.get(itemId);
+    if (!liveEntry) continue;
     emitRelease(convoId, {
-      promptId,
+      promptId: liveEntry.promptId,
       action: 'send',
       releasedIds: [itemId],
     });
     journalInputConsumer.queueRelease.dropItem(convoId, itemId);
+    liveByItemId.delete(itemId);
   }
 }
 
@@ -3846,13 +3885,7 @@ function restoreQueuedBatch(session, queued) {
 }
 
 function flushQueue(session, queued, releaseSnapshot = null) {
-  const snapshot = releaseSnapshot || (() => {
-    const convoId = journalConvoIdFor(session);
-    return {
-      convoId,
-      entries: journalInputConsumer.queueRelease.listLive(convoId),
-    };
-  })();
+  const snapshot = releaseSnapshot || snapshotQueuedReleaseBatch(session, queued);
   if (session.agent === AGENT_CODEX && session.busy) {
     // Claude's stream-json stdin can accept a forced follow-up while the
     // current process is alive; codex exec cannot. Preserve the detached
@@ -5901,7 +5934,10 @@ async function journalRouteTextToSession(session, body) {
       flushQueue,
       stripQueueNotificationLinks: clearQueueNotifications,
       editMessage: null,
-      queueRelease: journalInputConsumer.queueRelease,
+      queueRelease: queueReleaseForBatch(
+        session,
+        session.queuedMessages || [],
+      ),
       convoId: journalConvoIdFor(session),
       emitRelease,
     });
@@ -6143,7 +6179,10 @@ function journalOnPromptReply(session, answer, { username }) {
       stripQueueNotificationLinks: clearQueueNotifications,
       entry: queuedRelease.entry,
       convoId,
-      queueRelease: journalInputConsumer.queueRelease,
+      queueRelease: queueReleaseForBatch(
+        session,
+        session.queuedMessages || [],
+      ),
       emitRelease,
     });
     return;
@@ -6725,12 +6764,9 @@ const apiServer = createServer(async (req, res) => {
           return;
         }
         const queued = session.queuedMessages || [];
-        const convoId = journalConvoIdFor(session);
-        const releaseSnapshot = {
-          convoId,
-          entries: journalInputConsumer.queueRelease.listLive(convoId),
-        };
+        const releaseSnapshot = snapshotQueuedReleaseBatch(session, queued);
         session.queuedMessages = null;
+        let sent = true;
         if (queued.length > 0) {
           const summary = formatQueueSummary(queued);
           if (session.sendHtml) {
@@ -6740,11 +6776,19 @@ const apiServer = createServer(async (req, res) => {
           } else if (session.sendCallback) {
             session.sendCallback(`⚡ Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''} now:\n${summary.plain}`);
           }
-          const sent = flushQueue(session, queued, releaseSnapshot);
+          sent = flushQueue(session, queued, releaseSnapshot);
           if (sent === true) clearQueueNotifications(session);
         }
-        res.writeHead(200);
-        res.end(JSON.stringify({ ok: true, flushed: queued.length }));
+        if (sent === true) {
+          res.writeHead(200);
+          res.end(JSON.stringify({ ok: true, flushed: queued.length }));
+        } else {
+          const retained = Array.isArray(session.queuedMessages)
+            ? session.queuedMessages.length
+            : queued.length;
+          res.writeHead(409);
+          res.end(JSON.stringify({ ok: false, flushed: 0, retained }));
+        }
 
 
       } else if (url.pathname === '/cancel-queued') {

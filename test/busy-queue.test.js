@@ -694,7 +694,7 @@ describe('queued-release publisher wiring', () => {
 describe('index.js queued-send finalizer', () => {
   function loadFlushHarness({ dispatchResult = true } = {}) {
     const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
-    const start = src.indexOf('function finalizeSentQueue(');
+    const start = src.indexOf('function queuedReleaseItemIds(');
     const end = src.indexOf('\nfunction splitMessage(', start);
     expect(start).toBeGreaterThan(-1);
     expect(end).toBeGreaterThan(start);
@@ -704,6 +704,7 @@ describe('index.js queued-send finalizer', () => {
     const listLive = vi.fn(() => [
       { promptId: 'pr_1', itemId: 'pr_1::0' },
       { promptId: 'pr_2', itemId: 'pr_2::0' },
+      { promptId: 'pr_drifted', itemId: 'pr_drifted::0' },
     ]);
     const dispatchMergedFlush = vi.fn(() => dispatchResult);
     const flushQueue = runInNewContext(
@@ -725,14 +726,51 @@ describe('index.js queued-send finalizer', () => {
   it('commits every release exactly once, only after merged dispatch accepts the batch', () => {
     const harness = loadFlushHarness();
     const queued = [[{ type: 'text', text: 'first' }], [{ type: 'text', text: 'second' }]];
-    const session = { agent: 'claude', busy: false, queuedMessages: null, roomId: '!room' };
+    const session = {
+      agent: 'claude',
+      busy: false,
+      queuedMessages: null,
+      queueNotifications: [
+        { id: 'pr_1::0' },
+        { id: 'pr_2::0' },
+      ],
+      roomId: '!room',
+    };
 
     expect(harness.flushQueue(session, queued)).toBe(true);
     expect(harness.dispatchMergedFlush).toHaveBeenCalledWith(session, queued);
     expect(harness.emitRelease).toHaveBeenCalledTimes(2);
     expect(harness.dropItem).toHaveBeenCalledTimes(2);
+    expect(harness.emitRelease).not.toHaveBeenCalledWith(
+      'convo-1',
+      expect.objectContaining({ releasedIds: ['pr_drifted::0'] }),
+    );
     expect(harness.dispatchMergedFlush.mock.invocationCallOrder[0])
       .toBeLessThan(harness.emitRelease.mock.invocationCallOrder[0]);
+  });
+
+  it('skips a batch notification whose registry entry is no longer live', () => {
+    const harness = loadFlushHarness();
+    const queued = [[{ type: 'text', text: 'live' }], [{ type: 'text', text: 'stale' }]];
+    const session = {
+      agent: 'claude',
+      busy: false,
+      queuedMessages: null,
+      queueNotifications: [
+        { id: 'pr_1::0' },
+        { id: 'pr_missing::0' },
+      ],
+      roomId: '!room',
+    };
+
+    expect(harness.flushQueue(session, queued)).toBe(true);
+    expect(harness.emitRelease).toHaveBeenCalledTimes(1);
+    expect(harness.emitRelease).toHaveBeenCalledWith('convo-1', {
+      promptId: 'pr_1',
+      action: 'send',
+      releasedIds: ['pr_1::0'],
+    });
+    expect(harness.dropItem).toHaveBeenCalledTimes(1);
   });
 
   it('rolls the batch back without emitting or dropping releases when dispatch rejects it', () => {
@@ -772,6 +810,22 @@ describe('index.js queued-send finalizer', () => {
     expect(harness.flushQueue(session, queued, snapshot)).toBe(true);
     expect(harness.emitRelease).toHaveBeenCalledTimes(1);
     expect(harness.dropItem).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('index.js /interrupt endpoint — flush status (source inspection)', () => {
+  it('reports rejected or deferred dispatch as retained instead of flushed', () => {
+    const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
+    const start = src.indexOf("} else if (url.pathname === '/interrupt') {");
+    const end = src.indexOf("} else if (url.pathname === '/cancel-queued') {", start);
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const body = src.slice(start, end);
+
+    expect(body).toMatch(/sent = flushQueue\(session, queued, releaseSnapshot\)/);
+    expect(body).toMatch(/if \(sent === true\)[\s\S]*res\.writeHead\(200\)/);
+    expect(body).toMatch(/else \{[\s\S]*res\.writeHead\(409\)/);
+    expect(body).toMatch(/JSON\.stringify\(\{ ok: false, flushed: 0, retained \}\)/);
   });
 });
 
