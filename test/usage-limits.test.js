@@ -106,6 +106,42 @@ describe('parseUsageLimits', () => {
     const { lines } = parseUsageLimits(SUBSCRIPTION_SAMPLE, new Date('2026-07-08T00:00:00Z'));
     expect(lines.map((l) => l.id)).toEqual(['session_5h', 'week_all', 'week_fable']);
   });
+
+  // Real output when the Fable weekly bucket is at 0% — Claude prints that line
+  // with NO "· resets …" tail. The parser must still keep it (id/label/percent)
+  // and omit resets/resets_at/resets_at_ms, while the with-resets session and
+  // week-all lines in the SAME parse are unchanged.
+  it('parses a Fable 0%-used line that has no resets clause', () => {
+    const ZERO_FABLE_SAMPLE = `Current session: 25% used · resets Jul 26, 8:59pm (America/New_York)
+Current week (all models): 24% used · resets Aug 1, 4:59am (America/New_York)
+Current week (Fable): 0% used
+`;
+    const { ok, lines } = parseUsageLimits(ZERO_FABLE_SAMPLE, new Date('2026-07-26T12:00:00Z'));
+    expect(ok).toBe(true);
+    expect(lines.map((l) => l.id)).toEqual(['session_5h', 'week_all', 'week_fable']);
+
+    // week_fable: kept, percent 0, no resets fields at all.
+    const fable = lines[2];
+    expect(fable).toEqual({ id: 'week_fable', label: 'Week (Fable)', percent: 0 });
+    expect('resets' in fable).toBe(false);
+    expect('resets_at' in fable).toBe(false);
+    expect('resets_at_ms' in fable).toBe(false);
+
+    // Regression guard: the two with-resets lines parse identically to before —
+    // same percent and same resets_at the optional group must not disturb.
+    expect(lines[0]).toEqual({
+      id: 'session_5h', label: 'Session', percent: 25,
+      resets: 'Jul 26, 8:59pm (America/New_York)',
+      resets_at: '2026-07-27T00:59:00.000Z',
+      resets_at_ms: Date.parse('2026-07-27T00:59:00.000Z'),
+    });
+    expect(lines[1]).toEqual({
+      id: 'week_all', label: 'Week (all models)', percent: 24,
+      resets: 'Aug 1, 4:59am (America/New_York)',
+      resets_at: '2026-08-01T08:59:00.000Z',
+      resets_at_ms: Date.parse('2026-08-01T08:59:00.000Z'),
+    });
+  });
 });
 
 describe('resetsAtMs', () => {
