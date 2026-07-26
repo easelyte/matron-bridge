@@ -822,6 +822,7 @@ function journalStatus(session) {
     contextTokens: session._lastContextTokens,
     limits: usageLimitsCache.lines,
     email: getAccountEmail(),
+    workdir: session.workdir,
   });
   // The shared account cache is Claude-specific. Preserve the established
   // status-builder wiring above, then strip those fields from Codex frames.
