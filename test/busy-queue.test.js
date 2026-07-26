@@ -48,7 +48,7 @@ function matrixDeps(overrides = {}) {
     sendReply: vi.fn(async () => {}),
     sendHtml: vi.fn(async () => {}),
     formatQueueSummary: vi.fn(fakeSummary),
-    flushQueue: vi.fn(),
+    flushQueue: vi.fn(() => true),
     stripQueueNotificationLinks: vi.fn(),
     editMessage: vi.fn(async () => {}),
     ...overrides,
@@ -80,7 +80,7 @@ function journalDeps(overrides = {}) {
   const deps = {
     sendReply: vi.fn(async () => {}),
     formatQueueSummary: vi.fn(fakeSummary),
-    flushQueue: vi.fn(),
+    flushQueue: vi.fn(() => true),
     editMessage: vi.fn(async () => {}),
   };
   deps.stripQueueNotificationLinks = realisticStrip(deps);
@@ -122,7 +122,10 @@ describe('handleBusyQueueMagicWord — send/interrupt (Matrix pin, full seams)',
     const order = [];
     const deps = matrixDeps({
       sendHtml: vi.fn(async () => order.push('summary')),
-      flushQueue: vi.fn(() => order.push('flush')),
+      flushQueue: vi.fn(() => {
+        order.push('flush');
+        return true;
+      }),
     });
 
     await handleBusyQueueMagicWord(session, 'send', deps);
@@ -226,6 +229,56 @@ describe('handleBusyQueueMagicWord — send/interrupt (journal seams)', () => {
     session.queueNotifications.push({ eventId: '$evC', plain: '📨 Queued (1): C' });
     expect(session.queueNotifications[0].eventId).toBe('$evC');
     expect(session.queuedMessages).toHaveLength(session.queueNotifications.length);
+  });
+
+  it('captures live release identities before detaching and passes them to the shared flush finalizer', async () => {
+    const session = makeSession();
+    const entries = [
+      { promptId: 'pr_first', itemId: 'pr_first::0' },
+      { promptId: 'pr_second', itemId: 'pr_second::0' },
+    ];
+    const queueRelease = { listLive: vi.fn(() => entries) };
+    const deps = journalDeps({
+      queueRelease,
+      convoId: 'convo-1',
+    });
+
+    await handleBusyQueueMagicWord(session, 'send', deps);
+
+    expect(queueRelease.listLive).toHaveBeenCalledWith('convo-1');
+    expect(deps.flushQueue).toHaveBeenCalledWith(session, expect.any(Array), {
+      convoId: 'convo-1',
+      entries,
+    });
+  });
+
+  it('keeps notification identities actionable when dispatch is rejected', async () => {
+    const session = makeSession();
+    const deps = journalDeps({ flushQueue: vi.fn(() => false) });
+
+    await handleBusyQueueMagicWord(session, 'send', deps);
+
+    expect(deps.stripQueueNotificationLinks).not.toHaveBeenCalled();
+    expect(session.queueNotifications).toHaveLength(2);
+  });
+
+  it('does not clear a notification queued while the detached batch awaits its summary', async () => {
+    const session = makeSession();
+    const deps = journalDeps({
+      sendReply: vi.fn(async () => {
+        session.queueNotifications.push({
+          eventId: '$ev3',
+          plain: '📨 Queued (1): third',
+        });
+      }),
+    });
+
+    await handleBusyQueueMagicWord(session, 'send', deps);
+
+    expect(session.queueNotifications).toEqual([{
+      eventId: '$ev3',
+      plain: '📨 Queued (1): third',
+    }]);
   });
 });
 
@@ -569,6 +622,90 @@ describe('queued-release publisher wiring', () => {
     expect(src).toMatch(
       /if \(typeof sender !== ['"]string['"] \|\| !sender\.startsWith\(['"]user:['"]\)\) return;/,
     );
+  });
+});
+
+describe('index.js queued-send finalizer', () => {
+  function loadFlushHarness({ dispatchResult = true } = {}) {
+    const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
+    const start = src.indexOf('function finalizeSentQueue(');
+    const end = src.indexOf('\nfunction splitMessage(', start);
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+
+    const emitRelease = vi.fn();
+    const dropItem = vi.fn();
+    const listLive = vi.fn(() => [
+      { promptId: 'pr_1', itemId: 'pr_1::0' },
+      { promptId: 'pr_2', itemId: 'pr_2::0' },
+    ]);
+    const dispatchMergedFlush = vi.fn(() => dispatchResult);
+    const flushQueue = runInNewContext(
+      `(() => { ${src.slice(start, end)}; return flushQueue; })()`,
+      {
+        AGENT_CODEX: 'codex',
+        console: { log: vi.fn() },
+        dispatchMergedFlush,
+        emitRelease,
+        journalConvoIdFor: () => 'convo-1',
+        journalInputConsumer: {
+          queueRelease: { listLive, dropItem },
+        },
+      },
+    );
+    return { flushQueue, emitRelease, dropItem, listLive, dispatchMergedFlush };
+  }
+
+  it('commits every release exactly once, only after merged dispatch accepts the batch', () => {
+    const harness = loadFlushHarness();
+    const queued = [[{ type: 'text', text: 'first' }], [{ type: 'text', text: 'second' }]];
+    const session = { agent: 'claude', busy: false, queuedMessages: null, roomId: '!room' };
+
+    expect(harness.flushQueue(session, queued)).toBe(true);
+    expect(harness.dispatchMergedFlush).toHaveBeenCalledWith(session, queued);
+    expect(harness.emitRelease).toHaveBeenCalledTimes(2);
+    expect(harness.dropItem).toHaveBeenCalledTimes(2);
+    expect(harness.dispatchMergedFlush.mock.invocationCallOrder[0])
+      .toBeLessThan(harness.emitRelease.mock.invocationCallOrder[0]);
+  });
+
+  it('rolls the batch back without emitting or dropping releases when dispatch rejects it', () => {
+    const harness = loadFlushHarness({ dispatchResult: false });
+    const queued = [[{ type: 'text', text: 'retry me' }]];
+    const later = [[{ type: 'text', text: 'arrived later' }]];
+    const session = { agent: 'claude', busy: false, queuedMessages: later, roomId: '!room' };
+
+    expect(harness.flushQueue(session, queued)).toBe(false);
+    expect(session.queuedMessages).toEqual([...queued, ...later]);
+    expect(harness.emitRelease).not.toHaveBeenCalled();
+    expect(harness.dropItem).not.toHaveBeenCalled();
+  });
+
+  it('defers Codex release commitment until the interrupted turn has exited and dispatch succeeds', () => {
+    const harness = loadFlushHarness();
+    const queued = [[{ type: 'text', text: 'send after exit' }]];
+    const snapshot = {
+      convoId: 'convo-1',
+      entries: [{ promptId: 'pr_1', itemId: 'pr_1::0' }],
+    };
+    const session = {
+      agent: 'codex',
+      busy: true,
+      queuedMessages: null,
+      roomId: '!room',
+      codex: { interrupt: vi.fn(() => true) },
+    };
+
+    expect(harness.flushQueue(session, queued, snapshot)).toBe('deferred');
+    expect(session.queuedMessages).toEqual(queued);
+    expect(harness.dispatchMergedFlush).not.toHaveBeenCalled();
+    expect(harness.emitRelease).not.toHaveBeenCalled();
+
+    session.busy = false;
+    session.queuedMessages = null;
+    expect(harness.flushQueue(session, queued, snapshot)).toBe(true);
+    expect(harness.emitRelease).toHaveBeenCalledTimes(1);
+    expect(harness.dropItem).toHaveBeenCalledTimes(1);
   });
 });
 

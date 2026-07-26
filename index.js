@@ -1515,15 +1515,10 @@ function flushPendingSessionQueue(session) {
   if (!session.alive || !session.queuedMessages?.length) return false;
   const queued = session.queuedMessages;
   const convoId = journalConvoIdFor(session);
-  const releaseSnapshot = journalInputConsumer.queueRelease.listLive(convoId);
-  for (const { promptId, itemId } of releaseSnapshot) {
-    emitRelease(convoId, {
-      promptId,
-      action: 'send',
-      releasedIds: [itemId],
-    });
-    journalInputConsumer.queueRelease.dropItem(convoId, itemId);
-  }
+  const releaseSnapshot = {
+    convoId,
+    entries: journalInputConsumer.queueRelease.listLive(convoId),
+  };
   session.queuedMessages = null;
   const summary = formatQueueSummary(queued);
   if (session.sendHtml) {
@@ -1534,8 +1529,9 @@ function flushPendingSessionQueue(session) {
   } else if (session.sendCallback) {
     session.sendCallback(`📬 Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''}:\n${summary.plain}`);
   }
-  flushQueue(session, queued);
-  return true;
+  const sent = flushQueue(session, queued, releaseSnapshot);
+  if (sent === true) clearQueueNotifications(session);
+  return sent;
 }
 
 function finishCodexTurn(session, {
@@ -1568,8 +1564,6 @@ function finishCodexTurn(session, {
   journalSessionState(session, 'waiting');
   journalActivity(session, 'idle');
   journalStatus(session);
-  if (!preserveQueue) clearQueueNotifications(session);
-
   if (!discardOutput && error && session.alive) {
     const message = `⚠️ ${error}`;
     if (session.sendHtml) session.sendHtml(message, escapeHtml(message));
@@ -1880,7 +1874,6 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     }
     // Flush any queued messages now that claude is free.
     if (session.queuedMessages && session.queuedMessages.length > 0 && !session.waitingForAnswer) {
-      clearQueueNotifications(session);
       flushPendingSessionQueue(session);
     }
   };
@@ -3138,7 +3131,6 @@ function handleClaudeEvent(session, event) {
 
       // Send any queued messages now that Claude is free
       if (session.queuedMessages && session.queuedMessages.length > 0 && !session.waitingForAnswer) {
-        clearQueueNotifications(session);
         flushPendingSessionQueue(session);
       }
 
@@ -3836,22 +3828,50 @@ function dispatchMergedFlush(session, queued) {
   return true;
 }
 
-function flushQueue(session, queued) {
+function finalizeSentQueue(convoId, flushedSnapshot) {
+  for (const { promptId, itemId } of flushedSnapshot || []) {
+    emitRelease(convoId, {
+      promptId,
+      action: 'send',
+      releasedIds: [itemId],
+    });
+    journalInputConsumer.queueRelease.dropItem(convoId, itemId);
+  }
+}
+
+function restoreQueuedBatch(session, queued) {
+  const pending = session.queuedMessages || [];
+  if (pending === queued) return;
+  session.queuedMessages = [...queued, ...pending];
+}
+
+function flushQueue(session, queued, releaseSnapshot = null) {
+  const snapshot = releaseSnapshot || (() => {
+    const convoId = journalConvoIdFor(session);
+    return {
+      convoId,
+      entries: journalInputConsumer.queueRelease.listLive(convoId),
+    };
+  })();
   if (session.agent === AGENT_CODEX && session.busy) {
     // Claude's stream-json stdin can accept a forced follow-up while the
     // current process is alive; codex exec cannot. Preserve the detached
     // batch, interrupt the active child, and let finishCodexTurn dispatch it
     // after that child has exited and released the adapter's process slot.
-    session.queuedMessages = [...(session.queuedMessages || []), ...queued];
+    restoreQueuedBatch(session, queued);
     session._codexInterrupted = true;
-    if (session.codex?.interrupt('SIGINT')) return;
+    if (session.codex?.interrupt('SIGINT')) return 'deferred';
     session._codexInterrupted = false;
     console.log(`[QUEUE] could not interrupt active Codex turn; kept ${queued.length} queued message(s)`);
-    return;
+    return false;
   }
   if (!dispatchMergedFlush(session, queued)) {
-    console.log(`[QUEUE] dropped queued message(s) — session dead or auto-stopped (room ${session.roomId})`);
+    restoreQueuedBatch(session, queued);
+    console.log(`[QUEUE] could not send queued message(s); kept ${queued.length} queued message(s) for retry (room ${session.roomId})`);
+    return false;
   }
+  finalizeSentQueue(snapshot.convoId, snapshot.entries);
+  return true;
 }
 
 function splitMessage(text) {
@@ -6697,8 +6717,12 @@ const apiServer = createServer(async (req, res) => {
           return;
         }
         const queued = session.queuedMessages || [];
+        const convoId = journalConvoIdFor(session);
+        const releaseSnapshot = {
+          convoId,
+          entries: journalInputConsumer.queueRelease.listLive(convoId),
+        };
         session.queuedMessages = null;
-        clearQueueNotifications(session);
         if (queued.length > 0) {
           const summary = formatQueueSummary(queued);
           if (session.sendHtml) {
@@ -6708,7 +6732,8 @@ const apiServer = createServer(async (req, res) => {
           } else if (session.sendCallback) {
             session.sendCallback(`⚡ Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''} now:\n${summary.plain}`);
           }
-          flushQueue(session, queued);
+          const sent = flushQueue(session, queued, releaseSnapshot);
+          if (sent === true) clearQueueNotifications(session);
         }
         res.writeHead(200);
         res.end(JSON.stringify({ ok: true, flushed: queued.length }));
@@ -7177,7 +7202,6 @@ function recreateSession(roomId, overrides, { sendReply, sendHtml }) {
   // already queued behind it. They belong to the logical conversation, not
   // the killed child, so dispatch them through the idle replacement now.
   if (next.agent === AGENT_CODEX && next.queuedMessages?.length) {
-    clearQueueNotifications(next);
     flushPendingSessionQueue(next);
   }
   return next;

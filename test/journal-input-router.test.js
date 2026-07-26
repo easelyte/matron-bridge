@@ -891,6 +891,29 @@ describe('createJournalInputConsumer — media (file/image) routing', () => {
     expect(deps.handleControlCommand).not.toHaveBeenCalled();
   });
 
+  it('retains live queued-card seqs while bounding only resolved tombstones', () => {
+    const consumer = createJournalInputConsumer(makeDeps());
+    const registry = consumer.queueRelease;
+
+    registry.noteQueued('convo-1', { promptId: 'live', itemId: 'live::0' });
+    registry.annotateSeq('convo-1', 1, 'live');
+
+    for (let seq = 2; seq <= 514; seq++) {
+      const promptId = `resolved-${seq}`;
+      const itemId = `${promptId}::0`;
+      registry.noteQueued('convo-1', { promptId, itemId });
+      registry.annotateSeq('convo-1', seq, promptId);
+      registry.dropItem('convo-1', itemId);
+    }
+
+    expect(registry.classifyBySeq('convo-1', 1)).toMatchObject({
+      state: 'live',
+      entry: { prompt_id: 'live', itemIds: ['live::0'], seq: 1 },
+    });
+    expect(registry.classifyBySeq('convo-1', 2)).toEqual({ state: 'unknown' });
+    expect(registry.classifyBySeq('convo-1', 3)).toEqual({ state: 'tombstoned' });
+  });
+
   it('without a routeMediaToSession seam, file/image frames stay pass-through (never looked up or routed)', () => {
     const deps = makeDeps({ routeMediaToSession: undefined });
     const consumer = createJournalInputConsumer(deps);
