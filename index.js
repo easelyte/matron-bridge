@@ -53,7 +53,7 @@ import { checkFileLink } from './lib/file-link-guard.js';
 import { createJournalPublisher } from './lib/journal-publisher.js';
 import { createRpcRequestHandler } from './lib/journal-rpc.js';
 import { createRecentFolders } from './lib/recent-folders.js';
-import { dispatchBusyQueueMagicWord, notifyQueuedMessage, isQueueReleaseTap, resolveQueueReleaseTap } from './lib/busy-queue.js';
+import { cancelQueuedItem, dispatchBusyQueueMagicWord, notifyQueuedMessage, isQueueReleaseTap, resolveQueueReleaseTap } from './lib/busy-queue.js';
 import { handlePickerValue } from './lib/picker-dispatch.js';
 import { createJournalInputConsumer, resolvePromptChoice } from './lib/journal-input-router.js';
 import { createJournalMediaRouter } from './lib/journal-media.js';
@@ -6310,6 +6310,7 @@ const journalInputConsumer = createJournalInputConsumer({
     journalPublishNotice(convoId,
       "That prompt has been superseded by a newer one — your answer wasn't delivered. Check the latest prompt and answer that instead.");
   },
+  emitRelease,
   log: console,
 });
 
@@ -6333,7 +6334,14 @@ function journalHandleInboundEvent(frame) {
 // this file but only ever fire long after journalInputConsumer is assigned.
 function journalEvictConvoInput(session) {
   const convoId = journalConvoIdFor(session);
-  if (convoId) journalInputConsumer.evictConvo(convoId);
+  if (convoId) {
+    journalInputConsumer.evictConvo(convoId, {
+      clearQueue: () => {
+        session.queuedMessages = null;
+        session.queueNotifications = [];
+      },
+    });
+  }
 }
 
 // Plan approval for the `build` keyword — the Matrix handler's original
@@ -6758,12 +6766,32 @@ const apiServer = createServer(async (req, res) => {
           res.end(JSON.stringify({ error: 'No queued message at that index' }));
           return;
         }
-        queue.splice(index, 1);
-        // Keep queueNotifications in lockstep with queuedMessages at this
-        // index — no Matrix tile to edit anymore (Task 3), but the arrays
-        // must still shrink together or a later cancel misaligns.
+        // Preserve Array#splice's historical coercion for numeric indexes
+        // while resolving the exact slot it will remove to a stable id.
+        const queueIndex = Math.trunc(index);
         const notifs = session.queueNotifications || [];
-        if (index < notifs.length) notifs.splice(index, 1);
+        const itemId = notifs[queueIndex]?.id;
+        const convoId = journalConvoIdFor(session);
+        const releaseEntry = itemId
+          ? journalInputConsumer.queueRelease.listLive(convoId)
+            .find(entry => entry.itemId === itemId)
+          : null;
+        const cancelled = releaseEntry
+          ? cancelQueuedItem(session, {
+              itemId,
+              promptId: releaseEntry.promptId,
+              convoId,
+              queueRelease: journalInputConsumer.queueRelease,
+              emitRelease,
+            })
+          : false;
+        if (!cancelled) {
+          // Legacy queue entries have no durable item id. Preserve their
+          // positional cancellation behavior while keeping both arrays in
+          // lockstep.
+          queue.splice(queueIndex, 1);
+          if (queueIndex < notifs.length) notifs.splice(queueIndex, 1);
+        }
         const remaining = queue.length;
         if (remaining === 0) session.queuedMessages = null;
         if (session.sendCallback) {

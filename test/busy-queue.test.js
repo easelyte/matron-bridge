@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'fs';
 import { runInNewContext } from 'vm';
 import {
+  cancelQueuedItem,
   dispatchBusyQueueMagicWord,
   handleBusyQueueMagicWord,
   notifyQueuedMessage,
@@ -501,6 +502,71 @@ describe('isQueueReleaseTap', () => {
   });
 });
 
+describe('cancelQueuedItem', () => {
+  it('removes by stable id, drops the registry entry, and emits one cancel release', () => {
+    const session = makeSession({
+      queueNotifications: [
+        { eventId: '$ev1', plain: 'first', id: 'pr_1::0' },
+        { eventId: '$ev2', plain: 'second', id: 'pr_2::0' },
+      ],
+    });
+    const live = [
+      { promptId: 'pr_1', itemId: 'pr_1::0' },
+      { promptId: 'pr_2', itemId: 'pr_2::0' },
+    ];
+    const queueRelease = {
+      dropItem: vi.fn((_convoId, itemId) => {
+        live.splice(live.findIndex(entry => entry.itemId === itemId), 1);
+      }),
+    };
+    const emitRelease = vi.fn();
+
+    expect(cancelQueuedItem(session, {
+      itemId: 'pr_2::0',
+      promptId: 'pr_2',
+      convoId: 'convo-1',
+      queueRelease,
+      emitRelease,
+    })).toBe(true);
+
+    expect(session.queuedMessages).toEqual([[{ type: 'text', text: 'first' }]]);
+    expect(session.queueNotifications).toEqual([
+      { eventId: '$ev1', plain: 'first', id: 'pr_1::0' },
+    ]);
+    expect(live).toEqual([{ promptId: 'pr_1', itemId: 'pr_1::0' }]);
+    expect(queueRelease.dropItem).toHaveBeenCalledWith('convo-1', 'pr_2::0');
+    expect(emitRelease).toHaveBeenCalledWith('convo-1', {
+      promptId: 'pr_2',
+      action: 'cancel',
+      releasedIds: ['pr_2::0'],
+    });
+  });
+
+  it('does nothing when the stable id no longer maps to the queue', () => {
+    const session = makeSession({
+      queueNotifications: [
+        { eventId: '$ev1', plain: 'first', id: 'pr_1::0' },
+        { eventId: '$ev2', plain: 'second', id: 'pr_2::0' },
+      ],
+    });
+    const queueRelease = { dropItem: vi.fn() };
+    const emitRelease = vi.fn();
+
+    expect(cancelQueuedItem(session, {
+      itemId: 'pr_missing::0',
+      promptId: 'pr_missing',
+      convoId: 'convo-1',
+      queueRelease,
+      emitRelease,
+    })).toBe(false);
+
+    expect(session.queuedMessages).toHaveLength(2);
+    expect(session.queueNotifications).toHaveLength(2);
+    expect(queueRelease.dropItem).not.toHaveBeenCalled();
+    expect(emitRelease).not.toHaveBeenCalled();
+  });
+});
+
 describe('resolveQueueReleaseTap', () => {
   it('interrupt: detaches + strips + flushes without a post-action text line, returns true', () => {
     const session = makeSession();
@@ -717,5 +783,22 @@ describe('index.js journal busy caller — queued-tile notification wiring (sour
     const window = src.slice(start, start + 800);
     expect(window).toMatch(/notifyQueuedMessage\(session, preview, \{/);
     expect(window).toMatch(/sendReply: ctx\.sendReply/);
+  });
+});
+
+describe('index.js /cancel-queued endpoint — release registry wiring (source inspection)', () => {
+  it('resolves the positional entry to its stable id and uses cancelQueuedItem', () => {
+    const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
+    const start = src.indexOf("} else if (url.pathname === '/cancel-queued') {");
+    const end = src.indexOf("} else if (url.pathname === '/message') {", start);
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const body = src.slice(start, end);
+
+    expect(body).toMatch(/const queueIndex = Math\.trunc\(index\)/);
+    expect(body).toMatch(/const itemId = notifs\[queueIndex\]\?\.id/);
+    expect(body).toMatch(/queueRelease\.listLive\(convoId\)/);
+    expect(body).toMatch(/cancelQueuedItem\(session, \{/);
+    expect(body).toMatch(/\bemitRelease\b/);
   });
 });
