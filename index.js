@@ -1246,6 +1246,10 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
         // silently lose queued messages or per-room toggles.
         restarted.queuedMessages = session.queuedMessages;
         restarted.queueNotifications = session.queueNotifications;
+        journalInputConsumer.queueRelease.carryForward(
+          journalConvoIdFor(session),
+          journalConvoIdFor(restarted),
+        );
         restarted.showWorking = session.showWorking;
         restarted.showBashOutput = session.showBashOutput;
         restarted.chatHistory = session.chatHistory;
@@ -1794,6 +1798,10 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
         // silently lose queued messages or per-room toggles.
         restarted.queuedMessages = session.queuedMessages;
         restarted.queueNotifications = session.queueNotifications;
+        journalInputConsumer.queueRelease.carryForward(
+          journalConvoIdFor(session),
+          journalConvoIdFor(restarted),
+        );
         restarted.showWorking = session.showWorking;
         restarted.showBashOutput = session.showBashOutput;
         restarted.chatHistory = session.chatHistory;
@@ -1872,18 +1880,8 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     }
     // Flush any queued messages now that claude is free.
     if (session.queuedMessages && session.queuedMessages.length > 0 && !session.waitingForAnswer) {
-      const queued = session.queuedMessages;
-      session.queuedMessages = null;
-      const summary = formatQueueSummary(queued);
-      if (session.sendHtml) {
-        session.sendHtml(
-          `📬 Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''}:\n${summary.plain}`,
-          `<b>📬 Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''}:</b>${summary.html}`,
-        );
-      } else if (session.sendCallback) {
-        session.sendCallback(`📬 Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''}:\n${summary.plain}`);
-      }
-      flushQueue(session, queued);
+      clearQueueNotifications(session);
+      flushPendingSessionQueue(session);
     }
   };
 
@@ -3140,18 +3138,8 @@ function handleClaudeEvent(session, event) {
 
       // Send any queued messages now that Claude is free
       if (session.queuedMessages && session.queuedMessages.length > 0 && !session.waitingForAnswer) {
-        const queued = session.queuedMessages;
-        session.queuedMessages = null;
-        if (session.sendHtml) {
-          const summary = formatQueueSummary(queued);
-          const plainMsg = `📬 Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''}:\n${summary.plain}`;
-          const htmlMsg = `<b>📬 Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''}:</b>${summary.html}`;
-          session.sendHtml(plainMsg, htmlMsg);
-        } else if (session.sendCallback) {
-          const summary = formatQueueSummary(queued);
-          session.sendCallback(`📬 Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''}:\n${summary.plain}`);
-        }
-        flushQueue(session, queued);
+        clearQueueNotifications(session);
+        flushPendingSessionQueue(session);
       }
 
       break;
@@ -5893,6 +5881,9 @@ async function journalRouteTextToSession(session, body) {
       flushQueue,
       stripQueueNotificationLinks: clearQueueNotifications,
       editMessage: null,
+      queueRelease: journalInputConsumer.queueRelease,
+      convoId: journalConvoIdFor(session),
+      emitRelease,
     });
     if (handledMagicWord) return;
     // Queue like a Matrix message would, but marked journal-origin so the
@@ -7152,6 +7143,10 @@ function recreateSession(roomId, overrides, { sendReply, sendHtml }) {
   next.firstMessageCaptured = existing.firstMessageCaptured;
   next.queuedMessages = existing.queuedMessages;
   next.queueNotifications = existing.queueNotifications;
+  journalInputConsumer.queueRelease.carryForward(
+    journalConvoIdFor(existing),
+    journalConvoIdFor(next),
+  );
   next.showWorking = existing.showWorking;
   next.showBashOutput = existing.showBashOutput;
   next.chatHistory = existing.chatHistory;
