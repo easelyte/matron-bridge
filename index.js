@@ -63,7 +63,7 @@ import { seedJournalTitle, applyFallbackTitle } from './lib/journal-title-seed.j
 import { activityStateChanged, truncateActivityDetail, shouldResumeThinkingAfterTool } from './lib/journal-activity.js';
 import { streamRefFor } from './lib/journal-stream.js';
 import { contextFullToNative, briefContextReport } from './lib/context-command.js';
-import { buildSessionStatus, contextTokensFromAssistantEvent, postCompactContextTokens, compactTriggerFrom, contextGaugeText, emailFromClaudeConfig, isSidechainEvent, reconcileModelForWindow } from './lib/session-status.js';
+import { buildSessionStatus, contextTokensFromAssistantEvent, postCompactContextTokens, compactTriggerFrom, contextGaugeText, emailFromClaudeConfig, isSidechainEvent, reconcileModelForWindow, hostVitalLimits } from './lib/session-status.js';
 import {
   AGENT_CLAUDE,
   AGENT_CODEX,
@@ -827,17 +827,25 @@ function journalStatus(session) {
   if (!JOURNAL_ENABLED) return;
   const convoId = journalConvoIdFor(session);
   if (!convoId) return;
+  // Host CPU/RAM vitals (#526) are host-global, not account- or agent-specific,
+  // so they ride on every frame (Claude and Codex). Sampled once per turn end
+  // here so consecutive CPU samples bracket real wall-clock time (no blocking
+  // sleep). The account rate limits, by contrast, are Claude-account-specific.
+  const hostVitals = hostVitalLimits();
+  const isCodex = session.agent === AGENT_CODEX;
   const status = buildSessionStatus({
     model: session.currentModel || session.initData?.model,
     contextTokens: session._lastContextTokens,
-    limits: usageLimitsCache.lines,
+    // Codex frames carry only host vitals; Claude frames carry the account
+    // rate limits followed by host vitals.
+    limits: isCodex ? hostVitals : [...(usageLimitsCache.lines || []), ...hostVitals],
     email: getAccountEmail(),
     workdir: session.workdir,
   });
-  // The shared account cache is Claude-specific. Preserve the established
-  // status-builder wiring above, then strip those fields from Codex frames.
-  if (session.agent === AGENT_CODEX) {
-    delete status.limits;
+  // The shared account email cache is Claude-specific — strip it from Codex
+  // frames. (Rate limits are already excluded from the Codex limits array
+  // above; host vitals intentionally remain.)
+  if (isCodex) {
     delete status.email;
   }
   if (Object.keys(status).length === 0) return;

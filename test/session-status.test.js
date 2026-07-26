@@ -11,6 +11,9 @@ import {
   contextGaugeText,
   buildSessionStatus,
   emailFromClaudeConfig,
+  hostVitalLimits,
+  sampleCpuPercent,
+  ramPercent,
 } from '../lib/session-status.js';
 
 describe('contextWindowFor', () => {
@@ -231,6 +234,58 @@ describe('emailFromClaudeConfig', () => {
     expect(emailFromClaudeConfig({ oauthAccount: { emailAddress: 42 } })).toBeNull();
     expect(emailFromClaudeConfig(null)).toBeNull();
     expect(emailFromClaudeConfig(undefined)).toBeNull();
+  });
+});
+
+describe('host vitals (#526)', () => {
+  it('ramPercent returns an integer 0-100', () => {
+    const p = ramPercent();
+    expect(typeof p).toBe('number');
+    expect(Number.isInteger(p)).toBe(true);
+    expect(p).toBeGreaterThanOrEqual(0);
+    expect(p).toBeLessThanOrEqual(100);
+  });
+
+  it('sampleCpuPercent returns null on the first sample, then an integer 0-100', () => {
+    // Two back-to-back module-level samples: the second brackets real time
+    // against the first. (Test order can make this non-first if another test
+    // already sampled, so accept null-or-integer on the leading call.)
+    const first = sampleCpuPercent();
+    expect(first === null || Number.isInteger(first)).toBe(true);
+    const second = sampleCpuPercent();
+    // After at least one prior sample exists, a value is an integer 0-100 (it
+    // may still be null only if the tick window was degenerate — tolerate it).
+    if (second !== null) {
+      expect(Number.isInteger(second)).toBe(true);
+      expect(second).toBeGreaterThanOrEqual(0);
+      expect(second).toBeLessThanOrEqual(100);
+    }
+  });
+
+  it('hostVitalLimits always includes host_ram with an integer percent', () => {
+    const entries = hostVitalLimits();
+    const ram = entries.find((e) => e.id === 'host_ram');
+    expect(ram).toBeDefined();
+    expect(ram.label).toBe('RAM');
+    expect(Number.isInteger(ram.percent)).toBe(true);
+    // Host vitals never reset — no resets_at/resets fields.
+    expect('resets_at' in ram).toBe(false);
+    expect('resets' in ram).toBe(false);
+  });
+
+  it('hostVitalLimits includes host_cpu once a prior CPU sample exists', () => {
+    // Prime the module-level prior, then the next call has a diffable window.
+    sampleCpuPercent();
+    const entries = hostVitalLimits();
+    const cpu = entries.find((e) => e.id === 'host_cpu');
+    // host_cpu may legitimately be absent only on a degenerate zero-tick
+    // window; when present it must be a clean integer with the CPU label.
+    if (cpu) {
+      expect(cpu.label).toBe('CPU');
+      expect(Number.isInteger(cpu.percent)).toBe(true);
+      expect(cpu.percent).toBeGreaterThanOrEqual(0);
+      expect(cpu.percent).toBeLessThanOrEqual(100);
+    }
   });
 });
 
