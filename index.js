@@ -53,7 +53,7 @@ import { checkFileLink } from './lib/file-link-guard.js';
 import { createJournalPublisher } from './lib/journal-publisher.js';
 import { createRpcRequestHandler } from './lib/journal-rpc.js';
 import { createRecentFolders } from './lib/recent-folders.js';
-import { dispatchBusyQueueMagicWord, notifyQueuedMessage, isQueueActionValue, handleQueueActionValue } from './lib/busy-queue.js';
+import { dispatchBusyQueueMagicWord, notifyQueuedMessage, isQueueReleaseTap, resolveQueueReleaseTap } from './lib/busy-queue.js';
 import { handlePickerValue } from './lib/picker-dispatch.js';
 import { createJournalInputConsumer, resolvePromptChoice } from './lib/journal-input-router.js';
 import { createJournalMediaRouter } from './lib/journal-media.js';
@@ -627,6 +627,16 @@ function journalPublish(session, method, payload) {
   } else {
     journalBufferPush(session, method, payload);
   }
+}
+
+function emitRelease(convoId, { promptId, action, releasedIds }) {
+  journalPublisher.publishPromptReply(convoId, {
+    kind: 'queued_release',
+    prompt_id: promptId,
+    action,
+    released: releasedIds,
+    at: Date.now(),
+  });
 }
 
 function journalUpsertConvo(session, opts) {
@@ -6101,16 +6111,11 @@ function journalOnPromptReply(session, answer, { username }) {
   // (`interrupt` / `cancel:<n>` — the app's .buttonResponse channel sends
   // values), the same wire constants a Matrix button tap posts. Run the
   // SAME extracted implementation the Matrix button_response handler uses.
-  // Feedback ("⚡ Sending …" / "✕ Cancelled …") comes from the handler via
-  // the journal-mirroring ctx.sendReply, so the "answered:" echo below must
-  // not also fire — and a queue action is never a pending-prompt answer, so
-  // journalRoutePromptReply must not see it (its unmatched path could
-  // otherwise disturb real pending-prompt state).
-  if (isQueueActionValue(answer?.choice)) {
-    const ctx = journalSessionCommandCtx(session);
-    handleQueueActionValue(answer.choice, session, {
-      sendReply: ctx.sendReply,
-      formatQueueSummary,
+  // A queue action is never a pending-prompt answer, so the "answered:" echo
+  // below must not fire and journalRoutePromptReply must not see it (its
+  // unmatched path could otherwise disturb real pending-prompt state).
+  if (isQueueReleaseTap(answer?.choice)) {
+    resolveQueueReleaseTap(answer.choice, session, {
       flushQueue,
       // 'interrupt' needs this to clear session.queueNotifications on a full
       // flush (see clearQueueNotifications above); 'cancel:<n>' doesn't use
