@@ -12,8 +12,11 @@ import {
   buildSessionStatus,
   emailFromClaudeConfig,
   hostVitalLimits,
-  sampleCpuPercent,
+  sampleCpuOnce,
+  cpuPercent,
   ramPercent,
+  startCpuSampler,
+  stopCpuSampler,
 } from '../lib/session-status.js';
 
 describe('contextWindowFor', () => {
@@ -238,6 +241,14 @@ describe('emailFromClaudeConfig', () => {
 });
 
 describe('host vitals (#526)', () => {
+  // Burn real CPU so two sampleCpuOnce() calls bracket a non-zero tick window
+  // (jiffy resolution is ~10ms, so ~40ms guarantees accumulated ticks).
+  const busyWait = (ms) => {
+    const end = Date.now() + ms;
+    // eslint-disable-next-line no-empty
+    while (Date.now() < end) {}
+  };
+
   it('ramPercent returns an integer 0-100', () => {
     const p = ramPercent();
     expect(typeof p).toBe('number');
@@ -246,20 +257,17 @@ describe('host vitals (#526)', () => {
     expect(p).toBeLessThanOrEqual(100);
   });
 
-  it('sampleCpuPercent returns null on the first sample, then an integer 0-100', () => {
-    // Two back-to-back module-level samples: the second brackets real time
-    // against the first. (Test order can make this non-first if another test
-    // already sampled, so accept null-or-integer on the leading call.)
-    const first = sampleCpuPercent();
-    expect(first === null || Number.isInteger(first)).toBe(true);
-    const second = sampleCpuPercent();
-    // After at least one prior sample exists, a value is an integer 0-100 (it
-    // may still be null only if the tick window was degenerate — tolerate it).
-    if (second !== null) {
-      expect(Number.isInteger(second)).toBe(true);
-      expect(second).toBeGreaterThanOrEqual(0);
-      expect(second).toBeLessThanOrEqual(100);
-    }
+  it('cpuPercent stays null until a scheduled sample produces a valid diff', () => {
+    stopCpuSampler(); // reset module state (clears baseline + cache)
+    expect(cpuPercent()).toBeNull();
+    sampleCpuOnce(); // establishes the baseline only — no cached value yet
+    expect(cpuPercent()).toBeNull();
+    busyWait(40);
+    sampleCpuOnce(); // now a real diff populates the cache
+    const v = cpuPercent();
+    expect(Number.isInteger(v)).toBe(true);
+    expect(v).toBeGreaterThanOrEqual(0);
+    expect(v).toBeLessThanOrEqual(100);
   });
 
   it('hostVitalLimits always includes host_ram with an integer percent', () => {
@@ -273,19 +281,48 @@ describe('host vitals (#526)', () => {
     expect('resets' in ram).toBe(false);
   });
 
-  it('hostVitalLimits includes host_cpu once a prior CPU sample exists', () => {
-    // Prime the module-level prior, then the next call has a diffable window.
-    sampleCpuPercent();
-    const entries = hostVitalLimits();
-    const cpu = entries.find((e) => e.id === 'host_cpu');
-    // host_cpu may legitimately be absent only on a degenerate zero-tick
-    // window; when present it must be a clean integer with the CPU label.
-    if (cpu) {
-      expect(cpu.label).toBe('CPU');
-      expect(Number.isInteger(cpu.percent)).toBe(true);
-      expect(cpu.percent).toBeGreaterThanOrEqual(0);
-      expect(cpu.percent).toBeLessThanOrEqual(100);
-    }
+  it('host_cpu is STABLE across two reads in the same tick (no 0/100 collapse)', () => {
+    // Reproduces the re-entrancy blocker: journalStatus fires >1x per tick.
+    // The reader must not mutate the baseline, so a 2nd read in the same tick
+    // returns the same cached value rather than collapsing to a 0-interval
+    // reading of 0 or 100.
+    stopCpuSampler();
+    sampleCpuOnce();        // baseline
+    busyWait(40);
+    sampleCpuOnce();        // cache a real value
+    const cached = cpuPercent();
+    expect(Number.isInteger(cached)).toBe(true);
+
+    // Two reads with NO intervening scheduled sample — the many-per-tick case.
+    const a = hostVitalLimits().find((e) => e.id === 'host_cpu');
+    const b = hostVitalLimits().find((e) => e.id === 'host_cpu');
+    expect(a).toBeDefined();
+    expect(b).toBeDefined();
+    expect(a.label).toBe('CPU');
+    expect(a.percent).toBe(cached);
+    expect(b.percent).toBe(cached); // stable, not recomputed to 0/100
+  });
+
+  it('a degenerate (zero-tick) sample preserves the prior cached value', () => {
+    stopCpuSampler();
+    sampleCpuOnce();
+    busyWait(40);
+    sampleCpuOnce();
+    const good = cpuPercent();
+    expect(Number.isInteger(good)).toBe(true);
+    // Back-to-back call in the same tick: ~0 elapsed ticks → must NOT overwrite.
+    sampleCpuOnce();
+    expect(cpuPercent()).toBe(good);
+  });
+
+  it('startCpuSampler is idempotent and .unref()s its interval', () => {
+    stopCpuSampler();
+    startCpuSampler(60000);
+    startCpuSampler(60000); // second call is a no-op (no duplicate interval)
+    // The interval is unref'd, so it does not keep the test process alive; the
+    // suite exiting cleanly is the observable proof. Just confirm teardown.
+    stopCpuSampler();
+    expect(cpuPercent()).toBeNull();
   });
 });
 
@@ -299,6 +336,17 @@ describe('index.js wiring', () => {
     expect(src).toMatch(/import \{[^}]*buildSessionStatus[^}]*\} from '\.\/lib\/session-status\.js'/);
     expect(src).toMatch(/import \{[^}]*contextTokensFromAssistantEvent[^}]*\} from '\.\/lib\/session-status\.js'/);
     expect(src).toMatch(/import \{[^}]*postCompactContextTokens[^}]*\} from '\.\/lib\/session-status\.js'/);
+  });
+
+  it('starts the CPU sampler at boot and stops it on shutdown (#526)', () => {
+    // main() owns the fixed-cadence sampler so journalStatus only ever reads it.
+    const main = src.slice(src.indexOf('async function main('));
+    expect(main).toContain('startCpuSampler(');
+    // Both signal handlers tear it down so the interval doesn't leak.
+    const sigint = src.slice(src.indexOf("process.on('SIGINT'"));
+    expect(sigint).toContain('stopCpuSampler()');
+    const sigterm = src.slice(src.indexOf("process.on('SIGTERM'"));
+    expect(sigterm).toContain('stopCpuSampler()');
   });
 
   it('defines a journalStatus helper that publishes via publishStatus', () => {

@@ -63,7 +63,7 @@ import { seedJournalTitle, applyFallbackTitle } from './lib/journal-title-seed.j
 import { activityStateChanged, truncateActivityDetail, shouldResumeThinkingAfterTool } from './lib/journal-activity.js';
 import { streamRefFor } from './lib/journal-stream.js';
 import { contextFullToNative, briefContextReport } from './lib/context-command.js';
-import { buildSessionStatus, contextTokensFromAssistantEvent, postCompactContextTokens, compactTriggerFrom, contextGaugeText, emailFromClaudeConfig, isSidechainEvent, reconcileModelForWindow, hostVitalLimits } from './lib/session-status.js';
+import { buildSessionStatus, contextTokensFromAssistantEvent, postCompactContextTokens, compactTriggerFrom, contextGaugeText, emailFromClaudeConfig, isSidechainEvent, reconcileModelForWindow, hostVitalLimits, startCpuSampler, stopCpuSampler } from './lib/session-status.js';
 import {
   AGENT_CLAUDE,
   AGENT_CODEX,
@@ -7443,6 +7443,10 @@ async function main() {
   console.log(`Bridge Claude instructions: ${BRIDGE_CLAUDE_MD_PATH}`);
   console.log(`Debug mode: ${DEBUG ? 'ON' : 'OFF'}`);
   console.log(`Journal: connecting to ${JOURNAL_WS_URL}`);
+  // Fixed-cadence host-CPU sampler (#526). Owns the baseline so journalStatus's
+  // many-per-tick reads never corrupt it; .unref()'d so it doesn't hold the
+  // process open. host_cpu appears once the first interval has a valid diff.
+  startCpuSampler();
 }
 
 main().catch(err => {
@@ -7452,6 +7456,7 @@ main().catch(err => {
 
 process.on('SIGINT', () => {
   console.log('\nShutting down...');
+  stopCpuSampler();
   for (const [, session] of sessions) {
     killSession(session);
   }
@@ -7459,6 +7464,7 @@ process.on('SIGINT', () => {
 });
 
 process.on('SIGTERM', () => {
+  stopCpuSampler();
   for (const [, session] of sessions) {
     killSession(session);
   }
