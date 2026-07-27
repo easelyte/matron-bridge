@@ -63,7 +63,7 @@ import { seedJournalTitle, applyFallbackTitle } from './lib/journal-title-seed.j
 import { activityStateChanged, truncateActivityDetail, shouldResumeThinkingAfterTool } from './lib/journal-activity.js';
 import { streamRefFor } from './lib/journal-stream.js';
 import { contextFullToNative, briefContextReport } from './lib/context-command.js';
-import { buildSessionStatus, contextTokensFromAssistantEvent, postCompactContextTokens, compactTriggerFrom, contextGaugeText, emailFromClaudeConfig, isSidechainEvent, reconcileModelForWindow, hostVitalLimits, startCpuSampler, stopCpuSampler } from './lib/session-status.js';
+import { buildSessionStatus, contextTokensFromAssistantEvent, postCompactContextTokens, compactTriggerFrom, contextGaugeText, emailFromClaudeConfig, isSidechainEvent, reconcileModelForWindow, hostVitalLimits, startCpuSampler, stopCpuSampler, cpuPercent, ramPercent, cpuSampledAtMs } from './lib/session-status.js';
 import {
   AGENT_CLAUDE,
   AGENT_CODEX,
@@ -124,6 +124,11 @@ const CODEX_SANDBOX_MODE = normalizeCodexSandbox(process.env.CODEX_SANDBOX_MODE 
 // behaviour, or 0 to disable the reaper entirely).
 const SESSION_IDLE_TIMEOUT_MS = parseInt(process.env.SESSION_IDLE_TIMEOUT_MS || '3600000', 10);
 const SESSION_IDLE_CHECK_MS = parseInt(process.env.SESSION_IDLE_CHECK_MS || '300000', 10);
+// Cadence of the host-wide vitals push (CPU/RAM) — a single convo-less gauge
+// emitted on a timer decoupled from turns. Matches the CPU sampler window so
+// the pushed CPU value is fresh (RAM is read instantly). Env-overridable.
+const HOST_VITALS_PUSH_MS = parseInt(process.env.HOST_VITALS_PUSH_MS || '5000', 10);
+let _hostVitalsPushHandle = null;
 
 // Resume-readiness gate (iv-mode). A freshly-spawned `claude --resume` takes
 // several seconds to load the transcript — and longer if it auto-compacts —
@@ -7446,7 +7451,26 @@ async function main() {
   // Fixed-cadence host-CPU sampler (#526). Owns the baseline so journalStatus's
   // many-per-tick reads never corrupt it; .unref()'d so it doesn't hold the
   // process open. host_cpu appears once the first interval has a valid diff.
-  startCpuSampler();
+  // Sample at the vitals-push cadence so the pushed CPU value is always fresh.
+  startCpuSampler(HOST_VITALS_PUSH_MS);
+  // Periodic host-vitals push — a single convo-less gauge decoupled from turns
+  // (#544). Pure read of the cached CPU + instant RAM (never samples here) →
+  // publishHostVitals. Ephemeral/fail-open like status. .unref()'d so it never
+  // holds the process open; cleared in the shutdown handlers.
+  _hostVitalsPushHandle = setInterval(pushHostVitals, HOST_VITALS_PUSH_MS);
+  if (typeof _hostVitalsPushHandle.unref === 'function') _hostVitalsPushHandle.unref();
+}
+
+// Read cached CPU + instant RAM and emit one host_vitals frame (no convo_id).
+// cpu is omitted until the sampler has a first valid reading (matches the
+// hostVitalLimits shape); ram is always present when the OS reports memory.
+function pushHostVitals() {
+  const cpu = cpuPercent();
+  const ram = ramPercent();
+  const vitals = { sampled_at_ms: cpu !== null ? cpuSampledAtMs() : Date.now() };
+  if (cpu !== null) vitals.cpu = cpu;
+  if (ram !== null) vitals.ram = ram;
+  journalPublisher.publishHostVitals(vitals);
 }
 
 main().catch(err => {
@@ -7456,6 +7480,7 @@ main().catch(err => {
 
 process.on('SIGINT', () => {
   console.log('\nShutting down...');
+  if (_hostVitalsPushHandle) { clearInterval(_hostVitalsPushHandle); _hostVitalsPushHandle = null; }
   stopCpuSampler();
   for (const [, session] of sessions) {
     killSession(session);
@@ -7464,6 +7489,7 @@ process.on('SIGINT', () => {
 });
 
 process.on('SIGTERM', () => {
+  if (_hostVitalsPushHandle) { clearInterval(_hostVitalsPushHandle); _hostVitalsPushHandle = null; }
   stopCpuSampler();
   for (const [, session] of sessions) {
     killSession(session);
