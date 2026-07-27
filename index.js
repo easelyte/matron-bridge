@@ -125,10 +125,15 @@ const CODEX_SANDBOX_MODE = normalizeCodexSandbox(process.env.CODEX_SANDBOX_MODE 
 const SESSION_IDLE_TIMEOUT_MS = parseInt(process.env.SESSION_IDLE_TIMEOUT_MS || '3600000', 10);
 const SESSION_IDLE_CHECK_MS = parseInt(process.env.SESSION_IDLE_CHECK_MS || '300000', 10);
 // Cadence of the host-wide vitals push (CPU/RAM) — a single convo-less gauge
-// emitted on a timer decoupled from turns. Matches the CPU sampler window so
-// the pushed CPU value is fresh (RAM is read instantly). Env-overridable.
-const HOST_VITALS_PUSH_MS = parseInt(process.env.HOST_VITALS_PUSH_MS || '5000', 10);
+// evaluated on a fast timer but published ON CHANGE: emit a frame only when CPU
+// or RAM moves past a threshold (idle jitter is filtered), plus a slow heartbeat
+// so the gauge stays fresh under steady load. Idle bridge -> ~no traffic; active
+// work shows the full rise and fall. All env-overridable.
+const HOST_VITALS_SAMPLE_MS = parseInt(process.env.HOST_VITALS_SAMPLE_MS || '2000', 10);
+const HOST_VITALS_DELTA_PCT = parseInt(process.env.HOST_VITALS_DELTA_PCT || '4', 10);
+const HOST_VITALS_HEARTBEAT_MS = parseInt(process.env.HOST_VITALS_HEARTBEAT_MS || '30000', 10);
 let _hostVitalsPushHandle = null;
+let _lastVitalsPublished = null; // { cpu, ram, at } of the last emitted frame
 
 // Resume-readiness gate (iv-mode). A freshly-spawned `claude --resume` takes
 // several seconds to load the transcript — and longer if it auto-compacts —
@@ -7448,16 +7453,16 @@ async function main() {
   console.log(`Bridge Claude instructions: ${BRIDGE_CLAUDE_MD_PATH}`);
   console.log(`Debug mode: ${DEBUG ? 'ON' : 'OFF'}`);
   console.log(`Journal: connecting to ${JOURNAL_WS_URL}`);
-  // Fixed-cadence host-CPU sampler (#526). Owns the baseline so journalStatus's
+  // Fixed-cadence host-CPU sampler. Owns the baseline so journalStatus's
   // many-per-tick reads never corrupt it; .unref()'d so it doesn't hold the
   // process open. host_cpu appears once the first interval has a valid diff.
-  // Sample at the vitals-push cadence so the pushed CPU value is always fresh.
-  startCpuSampler(HOST_VITALS_PUSH_MS);
-  // Periodic host-vitals push — a single convo-less gauge decoupled from turns
-  // (#544). Pure read of the cached CPU + instant RAM (never samples here) →
-  // publishHostVitals. Ephemeral/fail-open like status. .unref()'d so it never
-  // holds the process open; cleared in the shutdown handlers.
-  _hostVitalsPushHandle = setInterval(pushHostVitals, HOST_VITALS_PUSH_MS);
+  // Sample at the fast vitals cadence so a published CPU value is always fresh.
+  startCpuSampler(HOST_VITALS_SAMPLE_MS);
+  // Host-vitals gauge: a single convo-less frame, published ON CHANGE. The timer
+  // only EVALUATES every HOST_VITALS_SAMPLE_MS; pushHostVitals emits a frame only
+  // on a meaningful CPU/RAM delta or the heartbeat interval, so an idle bridge
+  // stays quiet. Ephemeral/fail-open. .unref()'d; cleared in shutdown handlers.
+  _hostVitalsPushHandle = setInterval(pushHostVitals, HOST_VITALS_SAMPLE_MS);
   if (typeof _hostVitalsPushHandle.unref === 'function') _hostVitalsPushHandle.unref();
 }
 
@@ -7467,10 +7472,21 @@ async function main() {
 function pushHostVitals() {
   const cpu = cpuPercent();
   const ram = ramPercent();
-  const vitals = { sampled_at_ms: cpu !== null ? cpuSampledAtMs() : Date.now() };
+  // Nothing to report until the sampler has at least one real reading.
+  if (cpu === null && ram === null) return;
+  const now = Date.now();
+  const last = _lastVitalsPublished;
+  const moved = !last
+    || (cpu !== null && (last.cpu === null || Math.abs(cpu - last.cpu) >= HOST_VITALS_DELTA_PCT))
+    || (ram !== null && (last.ram === null || Math.abs(ram - last.ram) >= HOST_VITALS_DELTA_PCT));
+  const heartbeatDue = !last || (now - last.at) >= HOST_VITALS_HEARTBEAT_MS;
+  // Steady load within the heartbeat window: stay quiet, cut idle traffic.
+  if (!moved && !heartbeatDue) return;
+  const vitals = { sampled_at_ms: cpu !== null ? cpuSampledAtMs() : now };
   if (cpu !== null) vitals.cpu = cpu;
   if (ram !== null) vitals.ram = ram;
   journalPublisher.publishHostVitals(vitals);
+  _lastVitalsPublished = { cpu, ram, at: now };
 }
 
 main().catch(err => {
