@@ -14,6 +14,7 @@ import {
   hostVitalLimits,
   sampleCpuOnce,
   cpuPercent,
+  cpuSampledAtMs,
   ramPercent,
   startCpuSampler,
   stopCpuSampler,
@@ -276,9 +277,36 @@ describe('host vitals (#526)', () => {
     expect(ram).toBeDefined();
     expect(ram.label).toBe('RAM');
     expect(Number.isInteger(ram.percent)).toBe(true);
+    // Age metadata: host_ram stamps sampled_at_ms inline at read time.
+    expect(typeof ram.sampled_at_ms).toBe('number');
+    expect(ram.sampled_at_ms).toBeGreaterThan(0);
     // Host vitals never reset — no resets_at/resets fields.
     expect('resets_at' in ram).toBe(false);
     expect('resets' in ram).toBe(false);
+  });
+
+  it('host_cpu + host_ram carry a numeric sampled_at_ms age stamp', () => {
+    stopCpuSampler();
+    expect(cpuSampledAtMs()).toBeNull(); // reset clears the stamp
+    sampleCpuOnce();        // baseline only — no valid sample, no stamp
+    expect(cpuSampledAtMs()).toBeNull();
+    busyWait(40);
+    const before = Date.now();
+    sampleCpuOnce();        // valid diff → stamps sampled_at_ms
+    const after = Date.now();
+    const stamp = cpuSampledAtMs();
+    expect(typeof stamp).toBe('number');
+    expect(stamp).toBeGreaterThanOrEqual(before);
+    expect(stamp).toBeLessThanOrEqual(after);
+
+    const entries = hostVitalLimits();
+    const cpu = entries.find((e) => e.id === 'host_cpu');
+    const ram = entries.find((e) => e.id === 'host_ram');
+    expect(cpu).toBeDefined();
+    expect(cpu.sampled_at_ms).toBe(stamp); // host_cpu uses the sampler's stamp
+    expect(ram).toBeDefined();
+    expect(typeof ram.sampled_at_ms).toBe('number');
+    expect(ram.sampled_at_ms).toBeGreaterThan(0);
   });
 
   it('host_cpu is STABLE across two reads in the same tick (no 0/100 collapse)', () => {
