@@ -6,7 +6,13 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
 
-const BRIDGE_API = process.env.BRIDGE_API_URL || 'http://127.0.0.1:9802';
+// Route to whichever bridge spawned us: explicit BRIDGE_API_URL wins, else the
+// per-session MATRON_BRIDGE_API_PORT exported by the bridge at spawn (journal=9812,
+// old Matrix bridge=9802), else the legacy default. Prevents the inbound-secret
+// flow from posting to the wrong bridge process after the journal cutover (loop #504/#549).
+const BRIDGE_API = process.env.BRIDGE_API_URL
+  || (process.env.MATRON_BRIDGE_API_PORT && `http://127.0.0.1:${process.env.MATRON_BRIDGE_API_PORT}`)
+  || 'http://127.0.0.1:9802';
 const ROOM_ID = process.env.BRIDGE_ROOM_ID || null;
 const POLL_INTERVAL_MS = 500;
 const SECRET_TIMEOUT_MS = 300000;    // 5 min max wait for secret submission
