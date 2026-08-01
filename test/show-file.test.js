@@ -134,6 +134,25 @@ describe('shareAgentMedia', () => {
     await expect(share(deps)).resolves.toEqual({ denied: 'upload-failed' });
     expect(deps.publish).not.toHaveBeenCalled();
   });
+
+  it('falls back to the requested MIME and local byte length when upload metadata is partial', async () => {
+    const content = Buffer.from('image data');
+    const deps = makeDeps({ content });
+    deps.uploadMedia.mockResolvedValue({ media_id: 'media-partial' });
+
+    const result = await share(deps);
+
+    expect(deps.publish).toHaveBeenCalledWith('publishImage', expect.objectContaining({
+      blob_ref: 'media-partial',
+      content_type: 'image/png',
+      size: content.length,
+    }));
+    expect(result).toEqual(expect.objectContaining({
+      ok: true,
+      media_id: 'media-partial',
+      size: content.length,
+    }));
+  });
 });
 
 describe('denialToStatus', () => {

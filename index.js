@@ -53,7 +53,7 @@ import {
   checkFileLink,
   validateAndOpen,
   FileLinkDenied,
-  pinAllowedRoots,
+  pinAllowedRootsSync,
 } from './lib/file-link-guard.js';
 import {
   denialToStatus,
@@ -219,6 +219,10 @@ const HMAC_SECRET = process.env.HMAC_SECRET || '';
 const VIEWER_BASE_URL = process.env.VIEWER_BASE_URL || '';
 const LINK_EXPIRY_MS = parseInt(process.env.LINK_EXPIRY_MS || String(15 * 60 * 1000), 10);
 const SHOW_FILE_MAX_BYTES = 50 * 1024 * 1024;
+const SHOW_FILE_MAX_IN_FLIGHT = 2;
+const SHOW_FILE_GLOBAL_BYTE_BUDGET = SHOW_FILE_MAX_IN_FLIGHT * SHOW_FILE_MAX_BYTES;
+let showFileInFlight = 0;
+let showFileReservedBytes = 0;
 const SHOW_FILE_UPLOAD_TIMEOUT_MS = parseShowFileUploadTimeoutMs(
   process.env.SHOW_FILE_UPLOAD_TIMEOUT_MS,
 );
@@ -1051,7 +1055,6 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   // Unset (undefined) means "never toggled" → use the default (on).
   const persistedForRoom = getPersistedSession(roomId);
   const showBashOutputAtSpawn = persistedForRoom?.showBashOutput !== false;
-  const showFileToken = randomUUID();
   // mcpExtras: explicit caller-supplied value wins (used by /start, /resume,
   // /workdir handlers that parsed user flags); otherwise fall back to whatever
   // was persisted for this room so /restart and bridge restarts honour the
@@ -1059,6 +1062,11 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   const mcpExtras = Array.isArray(options.mcpExtras)
     ? options.mcpExtras
     : (Array.isArray(persistedForRoom?.mcpExtras) ? persistedForRoom.mcpExtras : []);
+  const shareEnabled = mcpExtras.includes('share');
+  const showFileToken = shareEnabled ? randomUUID() : undefined;
+  const showFilePinnedRoots = shareEnabled
+    ? pinAllowedRootsSync([cwd, ...SHOW_FILE_ARTIFACT_ROOTS])
+    : undefined;
   // Pre-assign the session id for fresh spawns (same trick as iv-mode below):
   // claudeSessionId is then known synchronously, so RPC start can answer with
   // a convo_id immediately and journal publishes never buffer for the init
@@ -1116,20 +1124,23 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     ? existingPath
     : `${nodeBinDir}:${existingPath}`;
 
+  const spawnEnv = {
+    ...process.env,
+    PATH: pathWithNode,
+    CLAUDECODE: '',
+    CLAUDE_CODE_MAX_OUTPUT_TOKENS: '128000',
+    BRIDGE_ROOM_ID: roomId,
+    MATRON_BRIDGE_API_PORT: String(API_PORT),
+    // Env is fixed at spawn time; toggling the flag later requires
+    // !restart to take effect.
+    MATRON_BASH_TEE_ENABLED: showBashOutputAtSpawn ? '1' : '0',
+  };
+  delete spawnEnv.SHOW_FILE_TOKEN;
+  if (shareEnabled) spawnEnv.SHOW_FILE_TOKEN = showFileToken;
+
   const proc = spawn('claude', args, {
     cwd,
-    env: {
-      ...process.env,
-      PATH: pathWithNode,
-      CLAUDECODE: '',
-      CLAUDE_CODE_MAX_OUTPUT_TOKENS: '128000',
-      BRIDGE_ROOM_ID: roomId,
-      SHOW_FILE_TOKEN: showFileToken,
-      MATRON_BRIDGE_API_PORT: String(API_PORT),
-      // Env is fixed at spawn time; toggling the flag later requires
-      // !restart to take effect.
-      MATRON_BASH_TEE_ENABLED: showBashOutputAtSpawn ? '1' : '0',
-    },
+    env: spawnEnv,
     stdio: ['pipe', 'pipe', 'pipe'],
   });
 
@@ -1138,7 +1149,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     proc,
     roomId,
     workdir: cwd,
-    showFileToken,
+    ...(shareEnabled ? { showFileToken, showFilePinnedRoots } : {}),
     mcpExtras,
     responseBuffer: '',
     sendCallback: null,
@@ -1623,10 +1634,14 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
   const cwd = expandHome(workdir || DEFAULT_WORKDIR);
   const persistedForRoom = getPersistedSession(roomId);
   const showBashOutputAtSpawn = persistedForRoom?.showBashOutput !== false;
-  const showFileToken = randomUUID();
   const mcpExtras = Array.isArray(options.mcpExtras)
     ? options.mcpExtras
     : (Array.isArray(persistedForRoom?.mcpExtras) ? persistedForRoom.mcpExtras : []);
+  const shareEnabled = mcpExtras.includes('share');
+  const showFileToken = shareEnabled ? randomUUID() : undefined;
+  const showFilePinnedRoots = shareEnabled
+    ? pinAllowedRootsSync([cwd, ...SHOW_FILE_ARTIFACT_ROOTS])
+    : undefined;
   const identity = planSessionIdentity({ resumeSessionId, mintId: randomUUID });
   const sessionId = identity.sessionId;
   const model = options.model === null
@@ -1674,6 +1689,18 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
   const existingPath = process.env.PATH || '';
   const pathWithNode = existingPath.split(':').includes(nodeBinDir) ? existingPath : `${nodeBinDir}:${existingPath}`;
 
+  const interactiveEnv = {
+    ...process.env,
+    PATH: pathWithNode,
+    CLAUDECODE: '',
+    CLAUDE_CODE_MAX_OUTPUT_TOKENS: '128000',
+    BRIDGE_ROOM_ID: roomId,
+    MATRON_BRIDGE_API_PORT: String(API_PORT),
+    MATRON_BASH_TEE_ENABLED: showBashOutputAtSpawn ? '1' : '0',
+  };
+  delete interactiveEnv.SHOW_FILE_TOKEN;
+  if (shareEnabled) interactiveEnv.SHOW_FILE_TOKEN = showFileToken;
+
   debug(`Spawning interactive claude session ${sessionId} in ${cwd}`);
 
   const iv = createInteractiveSession({
@@ -1681,16 +1708,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     workdir: cwd,
     sessionId,
     claudeArgs,
-    env: {
-      ...process.env,
-      PATH: pathWithNode,
-      CLAUDECODE: '',
-      CLAUDE_CODE_MAX_OUTPUT_TOKENS: '128000',
-      BRIDGE_ROOM_ID: roomId,
-      SHOW_FILE_TOKEN: showFileToken,
-      MATRON_BRIDGE_API_PORT: String(API_PORT),
-      MATRON_BASH_TEE_ENABLED: showBashOutputAtSpawn ? '1' : '0',
-    },
+    env: interactiveEnv,
   });
 
   // Same shape as the --print session object. `proc` is null in iv mode;
@@ -1702,7 +1720,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     iv,
     roomId,
     workdir: cwd,
-    showFileToken,
+    ...(shareEnabled ? { showFileToken, showFilePinnedRoots } : {}),
     mcpExtras,
     responseBuffer: '',
     sendCallback: null,
@@ -6604,6 +6622,41 @@ const pendingPlanDecisions = new Map();
 
 const API_PORT = parseInt(process.env.MATRON_BRIDGE_API_PORT || '9802', 10);
 
+function auditShowFile({ result, roomId, filePath, error, ...details }) {
+  const record = {
+    event: 'show_file',
+    ...(roomId ? { roomId } : {}),
+    ...(filePath ? { path: filePath } : {}),
+    result,
+    ...details,
+  };
+  if (error) {
+    record.error = {
+      name: typeof error.name === 'string' ? error.name : 'Error',
+      ...(typeof error.code === 'string' ? { code: error.code } : {}),
+    };
+  }
+  (result === 'ok' ? console.log : console.warn)(JSON.stringify(record));
+}
+
+function validateShowFileBody(data) {
+  if (data === null || typeof data !== 'object' || Array.isArray(data)
+      || (Object.getPrototypeOf(data) !== Object.prototype && Object.getPrototypeOf(data) !== null)) {
+    return { error: 'request body must be an object', reason: 'invalid-body' };
+  }
+  if (typeof data.path !== 'string' || data.path.trim() === '') {
+    return { error: 'path must be a non-empty string', reason: 'invalid-path' };
+  }
+  if (typeof data.token !== 'string' || data.token.trim() === '') {
+    return { error: 'token must be a non-empty string', reason: 'missing-token' };
+  }
+  if (data.caption !== undefined
+      && (typeof data.caption !== 'string' || data.caption.length > 4096)) {
+    return { error: 'caption must be a string of at most 4096 characters', reason: 'invalid-caption' };
+  }
+  return null;
+}
+
 const apiServer = createServer(async (req, res) => {
   const url = new URL(req.url, `http://localhost:${API_PORT}`);
 
@@ -6659,6 +6712,7 @@ const apiServer = createServer(async (req, res) => {
   }
 
   if (req.method !== 'POST') {
+    if (url.pathname === '/show-file') auditShowFile({ result: 'method-not-allowed' });
     res.writeHead(405);
     res.end('Method not allowed');
     return;
@@ -6673,6 +6727,7 @@ const apiServer = createServer(async (req, res) => {
     if (url.pathname === '/show-file' && bodyBytes > 64 * 1024) {
       showFileBodyTooLarge = true;
       body = '';
+      auditShowFile({ result: 'request-too-large' });
       res.writeHead(413, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'request body too large' }));
       return;
@@ -6683,40 +6738,54 @@ const apiServer = createServer(async (req, res) => {
     if (showFileBodyTooLarge) return;
 
     if (url.pathname === '/show-file') {
+      let filePath;
+      let session;
+      let budgetHeld = false;
       try {
-        const data = JSON.parse(body);
-        const { path: filePath, caption, token } = data;
-        if (!filePath || !token) {
+        let data;
+        try {
+          data = JSON.parse(body);
+        } catch (error) {
+          auditShowFile({ result: 'invalid-json', error });
           res.writeHead(400, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: 'path and token are required' }));
+          res.end(JSON.stringify({ error: 'invalid JSON' }));
           return;
         }
+        const validationError = validateShowFileBody(data);
+        filePath = typeof data?.path === 'string' ? data.path : undefined;
+        if (validationError) {
+          auditShowFile({ result: validationError.reason, filePath });
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: validationError.error }));
+          return;
+        }
+        const { caption, token } = data;
 
-        let session;
         for (const candidate of sessions.values()) {
-          if (candidate.showFileToken === token) {
+          if (candidate.showFileToken && candidate.showFileToken === token) {
             session = candidate;
             break;
           }
         }
         if (!session) {
+          auditShowFile({ result: 'invalid-token', filePath });
           res.writeHead(403, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ error: 'invalid token' }));
           return;
         }
 
-        let result;
-        try {
-          session.showFilePinnedRoots ??= await pinAllowedRoots([
-            session.workdir,
-            ...SHOW_FILE_ARTIFACT_ROOTS,
-          ]);
-        } catch (error) {
-          if (error instanceof FileLinkDenied) result = { denied: error.reason };
-          else throw error;
+        if (showFileInFlight >= SHOW_FILE_MAX_IN_FLIGHT
+            || showFileReservedBytes + SHOW_FILE_MAX_BYTES > SHOW_FILE_GLOBAL_BYTE_BUDGET) {
+          auditShowFile({ result: 'saturated', roomId: session.roomId, filePath });
+          res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': '1' });
+          res.end(JSON.stringify({ error: 'show-file capacity saturated' }));
+          return;
         }
+        showFileInFlight += 1;
+        showFileReservedBytes += SHOW_FILE_MAX_BYTES;
+        budgetHeld = true;
 
-        result ??= await shareAgentMedia({
+        const result = await shareAgentMedia({
           filePath,
           caption,
           pinnedRoots: session.showFilePinnedRoots,
@@ -6731,16 +6800,15 @@ const apiServer = createServer(async (req, res) => {
         });
 
         if (result.ok) {
-          console.log(JSON.stringify({
-            event: 'show_file',
+          auditShowFile({
+            result: 'ok',
             roomId: session.roomId,
             realPath: result.realPath,
             kind: result.kind,
             size: result.size,
             media_id: result.media_id,
             sha256: result.sha256,
-            result: 'ok',
-          }));
+          });
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({
             ok: true,
@@ -6750,17 +6818,22 @@ const apiServer = createServer(async (req, res) => {
           return;
         }
 
-        console.warn(JSON.stringify({
-          event: 'show_file',
-          roomId: session.roomId,
-          path: filePath,
+        auditShowFile({
           result: result.denied,
-        }));
+          roomId: session.roomId,
+          filePath,
+        });
         res.writeHead(denialToStatus(result.denied), { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: result.denied }));
-      } catch (_error) {
+      } catch (error) {
+        auditShowFile({ result: 'internal-error', roomId: session?.roomId, filePath, error });
         res.writeHead(502, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ error: 'internal error' }));
+      } finally {
+        if (budgetHeld) {
+          showFileInFlight -= 1;
+          showFileReservedBytes -= SHOW_FILE_MAX_BYTES;
+        }
       }
       return;
     }

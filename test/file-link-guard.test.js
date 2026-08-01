@@ -5,7 +5,8 @@ import fsp from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import {
-  isSensitivePath, checkFileLink, validateAndOpen, pinAllowedRoots, FileLinkDenied, MAX_VIEW_BYTES,
+  isSensitivePath, checkFileLink, validateAndOpen, pinAllowedRoots, pinAllowedRootsSync,
+  FileLinkDenied, MAX_VIEW_BYTES,
 } from '../lib/file-link-guard.js';
 
 describe('isSensitivePath', () => {
@@ -202,6 +203,21 @@ describe('validateAndOpen', () => {
   it('rejects an allowed root that does not resolve', async () => {
     await expect(pinAllowedRoots([path.join(dir, 'missing-root')]))
       .rejects.toMatchObject({ reason: 'bad-workdir' });
+  });
+
+  it('synchronously pins root identity for pre-spawn authorization', async () => {
+    const parent = mkdtempSync(path.join(tmpdir(), 'flg-sync-root-swap-'));
+    const approved = path.join(parent, 'approved');
+    const moved = path.join(parent, 'moved');
+    mkdirSync(approved);
+    const allowedRoots = pinAllowedRootsSync([approved]);
+    renameSync(approved, moved);
+    symlinkSync(outside, approved);
+    try {
+      expect(await denied(path.join(approved, 'target.txt'), { allowedRoots })).toBe('bad-workdir');
+    } finally {
+      rmSync(parent, { recursive: true, force: true });
+    }
   });
 
   it('rejects a pinned root that is replaced before validation', async () => {
