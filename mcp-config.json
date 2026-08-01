@@ -9,6 +9,12 @@
     }
   },
   "mcpExtras": {
+    "share": {
+      "show-file": {
+        "command": "node",
+        "args": ["./show-file-mcp.js"]
+      }
+    },
     "browser": {
       "chrome-devtools": {
         "command": "./hooks/xvfb-wrap.sh",
