@@ -1,5 +1,6 @@
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
 import { mkdtempSync, writeFileSync, symlinkSync, rmSync, mkdirSync } from 'node:fs';
+import fsp from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import {
@@ -128,7 +129,7 @@ describe('validateAndOpen', () => {
   });
 
   it('skips containment for legacy calls without a workdir', async () => {
-    const { content } = await validateAndOpen(path.join(outside, 'target.txt'), {});
+    const { content } = await validateAndOpen(path.join(outside, 'target.txt'));
     expect(content.toString('utf-8')).toBe('outside content\n');
   });
 
@@ -146,6 +147,57 @@ describe('validateAndOpen', () => {
     symlinkSync(dir, wdLink);
     const { content } = await validateAndOpen(path.join(dir, 'ok.txt'), { workdir: wdLink });
     expect(content.toString('utf-8')).toBe('hello guard\n');
+  });
+
+  it('allows a realPath under one of several allowed roots', async () => {
+    const { content, realPath } = await validateAndOpen(path.join(outside, 'target.txt'), {
+      allowedRoots: [dir, outside],
+    });
+    expect(content.toString('utf-8')).toBe('outside content\n');
+    expect(realPath).toBe(path.join(outside, 'target.txt'));
+  });
+
+  it('rejects a realPath outside every allowed root before reading it', async () => {
+    const actualOpen = fsp.open.bind(fsp);
+    const readSpies = [];
+    const openSpy = vi.spyOn(fsp, 'open').mockImplementation(async (...args) => {
+      const fd = await actualOpen(...args);
+      readSpies.push(vi.spyOn(fd, 'read'));
+      return fd;
+    });
+
+    try {
+      expect(await denied(path.join(outside, 'target.txt'), { allowedRoots: [dir] }))
+        .toBe('outside-scope');
+      expect(readSpies).toHaveLength(1);
+      expect(readSpies[0]).not.toHaveBeenCalled();
+    } finally {
+      readSpies.forEach((spy) => spy.mockRestore());
+      openSpy.mockRestore();
+    }
+  });
+
+  it('gives outside-scope precedence over sensitive and oversized denials', async () => {
+    expect(await denied(path.join(outside, 'config.json'), { allowedRoots: [dir] }))
+      .toBe('outside-scope');
+    expect(await denied(path.join(outside, 'target.txt'), { allowedRoots: [dir], maxBytes: 1 }))
+      .toBe('outside-scope');
+  });
+
+  it('canonicalizes symlinked allowed roots', async () => {
+    const rootLink = path.join(outside, 'root-link');
+    symlinkSync(dir, rootLink);
+    const { content, realPath } = await validateAndOpen(path.join(dir, 'ok.txt'), {
+      allowedRoots: [rootLink],
+    });
+    expect(content.toString('utf-8')).toBe('hello guard\n');
+    expect(realPath).toBe(path.join(dir, 'ok.txt'));
+  });
+
+  it('rejects an allowed root that does not resolve', async () => {
+    expect(await denied(path.join(dir, 'ok.txt'), {
+      allowedRoots: [path.join(dir, 'missing-root')],
+    })).toBe('bad-workdir');
   });
 
   it('exports a 5MB default cap', () => {
