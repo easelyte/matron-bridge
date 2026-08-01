@@ -23,6 +23,11 @@ Phase 1 blocks Phase 2 (the helper calls the extended guard). Phase 2 blocks Pha
 tool file (T-3.1) can be written any time, but its wiring (T-3.2/3.3) and the run-it gate need
 Phase 2 live. Execute phases in order 1 → 2 → 3 → 4.
 
+**Intra-Phase-2 ordering:** T-2.5 (add `timeoutMs` to `uploadMedia`) lands before or with T-2.2
+step 4, which passes `timeoutMs`. If T-2.2 is implemented first, its `uploadMedia` call simply
+passes an ignored param until T-2.5 wires the AbortController — harmless, but implement T-2.5
+alongside T-2.2 for a working deadline.
+
 ## Spec-coverage map
 
 | Spec part | Task(s) |
@@ -276,3 +281,10 @@ outside-scope both denied with nothing posted. Record the outcome in the ship no
 > - **Heavy plan** (R100, `risk: high`, auth/RLS/payments/data-loss): `/execute-heavy-codex` — per-task implementer + spec-compliance + quality + fix-mode chain via Codex, Sonnet only at every 5th phase + end-of-plan.
 >
 > Steps use checkbox (`- [ ]`) syntax for tracking.
+
+## Appendix: Verified Claims (research pass 2026-08-01)
+
+✓ Claim: Node `fetch` honors an `AbortController` signal to abort an in-flight/stalled request; `controller.abort()` rejects the fetch. Verified (MDN AbortSignal / javascript.info/fetch-abort) — the T-2.5 `setTimeout`→`abort()` upload-deadline pattern is sound.
+✓ Claim: `@modelcontextprotocol/sdk` `McpServer` + `server.tool(name, desc, zodSchema, handler)` + `StdioServerTransport` is a valid registration shape. Verified (modelcontextprotocol/typescript-sdk) — live in this repo's `ask-user.js`. Caveat: newer SDK examples favor object-based `registerTool()`; `.tool()` is not documented as removed — spot-check against the installed SDK version before merge.
+✓ Claim: zod `.refine()` attaches a custom predicate; `.string().max(n)` bounds length. Verified (zod.dev).
+✓ Claim: Node `path.isAbsolute()` checks absoluteness; `fs.promises.realpath()` resolves `.`/`..`/symlinks to a canonical path. Verified (nodejs.org/api/fs).
