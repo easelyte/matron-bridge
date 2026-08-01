@@ -6,7 +6,7 @@ const src = readFileSync(fileURLToPath(new URL('../index.js', import.meta.url)),
 
 describe('show-file bridge wiring', () => {
   it('pins roots and mints tokens only at the share-enabled pre-spawn seam', () => {
-    expect(src.match(/const shareEnabled = mcpExtras\.includes\('share'\);/g)).toHaveLength(2);
+    expect(src.match(/const shareEnabled = effectiveMcpExtras\.includes\('share'\);/g)).toHaveLength(2);
     expect(src.match(/showFileToken = shareEnabled \? randomUUID\(\) : undefined/g)).toHaveLength(2);
     expect(src.match(/pinAllowedRootsSync\(\[cwd, \.\.\.SHOW_FILE_ARTIFACT_ROOTS\]\)/g)).toHaveLength(2);
     expect(src).not.toMatch(/showFilePinnedRoots \?\?=/);
