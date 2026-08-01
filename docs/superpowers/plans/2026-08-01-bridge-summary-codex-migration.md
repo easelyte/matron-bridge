@@ -164,6 +164,55 @@ Implements `docs/superpowers/specs/2026-08-01-bridge-summary-codex-migration-des
 
 ---
 
+## Deploy
+
+Deployment is operator-gated. Do not execute these steps until the branch-contention precondition is resolved and the operator has chosen a restart window; restarting the bridge kills live sessions.
+
+0. **Confirm the live checkout is ready.** Coordinate with the owner of the `agent-inline-media` work before changing branches. `/opt/matron/bridge-journal` must be on `journal-deploy`, clean, and at the merged SHA before restart. Confirm with:
+
+   ```sh
+   git -C /opt/matron/bridge-journal status
+   git -C /opt/matron/bridge-journal rev-parse HEAD
+   ```
+
+1. **Run the service-user Codex preflight before removing the Gemini dependency.** Substitute the unit's actual service user and home. Run the probe with the service identity and a minimal environment so it proves that `codex` resolves and subscription authentication works in production:
+
+   ```sh
+   sudo -u <svc-user> env -i PATH=$PATH HOME=<svc-home> bash -c 'echo "reply TITLE: ok" | codex exec --json --skip-git-repo-check -s read-only -c approval_policy=\"never\" --ignore-user-config --ephemeral -'
+   ```
+
+   Using `systemd-run` with the unit's exact `User=` and `Environment=` is also acceptable. Expect JSONL containing an `item.completed` whose item type is `agent_message`; the probe contains no conversation data. If it fails because of `PATH`, `HOME`, `CODEX_HOME`, or authentication, fix the service environment before continuing. Otherwise every production summary would silently use the deterministic fallback.
+
+2. **Update the live environment.** In `/opt/matron/bridge-journal/.env`, set `SERVER_LABEL=VPS` and remove `GEMINI_API_KEY`, then verify the removed key has no entry:
+
+   ```sh
+   cd /opt/matron/bridge-journal
+   grep -n GEMINI_API_KEY .env
+   ```
+
+   The grep must return no matches. The summary controls are documented in `.env.example`: `SUMMARY_CODEX_ENABLED=1` enables Codex summaries, an empty `SUMMARY_CODEX_MODEL` uses the Codex default, `SUMMARY_CODEX_TIMEOUT_MS=60000` sets the call timeout, and `SUMMARY_CODEX_MAX_CONCURRENT=2` sets the global concurrency cap.
+
+3. **Install the merged dependencies.** From `/opt/matron/bridge-journal`, run `npm ci`.
+
+4. **Restart the bridge.** Run `systemctl restart matron-bridge-journal.service` only in the coordinated restart window.
+
+5. **Verify the deployed behavior.** Start a session with `!start`, send five messages, and confirm its title becomes `VPS · <repo> · <topic>`, where the topic is meaningful rather than the deterministic first-message fallback. Confirm the title renders legibly in the journal sidebar and that the session has no `[summary]` warn entries in the service log. Then `/resume` the session and confirm the resumed room title is also `VPS · <repo> · <text>`. For an optional deeper check, temporarily enable `DEBUG=1`, restart in a coordinated window, and confirm a `[summary] ok` debug entry is present; restore the prior debug setting afterward.
+
+### Rollback
+
+In a coordinated restart window, restore the previous revision and environment, reinstall its locked dependencies, and restart:
+
+```sh
+git -C /opt/matron/bridge-journal checkout <prev>
+cd /opt/matron/bridge-journal
+npm ci
+systemctl restart matron-bridge-journal.service
+```
+
+Revert the `.env` changes as part of rollback, restoring the prior `SERVER_LABEL` and any dependency-specific setting required by `<prev>`.
+
+---
+
 ## Out of scope (file as loops at ship)
 
 - **matron-web pinned-summary UI** — reintroduce the lost pinned-summary surface (later claude-design round). Separate repo `easelyte/matron-web`, non-urgent.
