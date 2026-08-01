@@ -371,6 +371,18 @@ outside-scope both denied with nothing posted. Record the outcome in the ship no
   (P32) is a deferred follow-up if orphan rate ever matters.
 - **`show_file` default-on** is a v1 policy; #458's curated (Nastia) session type overrides it by not
   selecting `share`. Operator-veto-able to explicit opt-in (`--share` flag, `DEFAULT_MCP_EXTRAS=[]`).
+- **Default-on egress consent (Phase-3 review blocker, operator-accepted OVERRIDE).** Codex flagged
+  default-on `share` as egress-without-explicit-consent (P15) and noted the union is *unconditional* —
+  a session started with an explicit extras list omitting `share` still gets it, so there is no
+  per-session opt-out. Overridden: default-on was the operator's explicit, veto-able decision. The
+  per-session opt-out (a tri-state where an explicit session-level deny skips the union) is a **#458
+  prerequisite**, deliberately NOT built here — no curated session exists yet, so there is no consumer
+  that needs to opt out today (building the guard before its consumer exists is the anti-pattern). #458
+  MUST add the per-session `share` deny before it ships curated (Nastia) sessions, or those sessions
+  will inherit default-on egress. Filed as a #458 dependency.
+- **Idempotency (Phase-3 review major, spec-deferred).** A lost HTTP success response after a
+  successful upload+publish would duplicate the media on retry (P32). Already documented out-of-scope
+  in the spec; a request-UUID dedup cache is the follow-up if it ever matters.
 - **Latent mirror-path bug** (`journalMirrorUserMedia` `name`/`from` fields) is pre-existing and out
   of scope — file as a separate bridge loop.
 
