@@ -93,20 +93,34 @@ Cases:
 
 **File:** `index.js`
 
-- At session creation (`createSession`), set `session.showFileToken = randomUUID()`.
-- Inject `SHOW_FILE_TOKEN` (value = `session.showFileToken`) and `BRIDGE_API_URL` (or rely on the
-  existing `MATRON_BRIDGE_API_PORT`) into the claude child process env at **both** spawn sites,
-  alongside the existing `BRIDGE_ROOM_ID` (`index.js:1098-1104`, `:1658-1664`).
+- **Two spawn/construct functions** build sessions and MUST both be wired: `createSession`
+  (print mode; spawn env `:1098-1104`, session object `:1111+`) and
+  `createInteractiveSessionForRoom` (interactive mode; a SEPARATE top-level function at `:1597`,
+  spawn env `:1658-1664`, session object `:1672+`). Mirror how `showBashOutputAtSpawn` is
+  independently computed in each. Wiring only `createSession` silently 403s every interactive-mode
+  session.
+- In each function mint the token **before** the `spawn()` call — `spawn()` precedes the
+  session-object declaration, so referencing `session` at spawn is a temporal-dead-zone
+  `ReferenceError`. Use a pre-spawn local: `const showFileToken = randomUUID();`
+- Inject `SHOW_FILE_TOKEN = showFileToken` and `BRIDGE_API_URL` (or rely on the existing
+  `MATRON_BRIDGE_API_PORT`) into the claude child env alongside `BRIDGE_ROOM_ID`
+  (`:1098-1104`, `:1658-1664`), then store `session.showFileToken = showFileToken` on the
+  constructed session object.
 - No separate token map: the token lives on the session object and dies with it (no teardown-seam
-  cleanup needed — the ~9 `sessions.delete` sites drop the object and the token with it).
+  cleanup — the ~9 `sessions.delete` sites drop the object and the token with it).
 
-**Acceptance:** every spawned claude child has `SHOW_FILE_TOKEN` in env == its session's
-`showFileToken`; two concurrent sessions have distinct tokens.
+**Acceptance:** every spawned claude child (print AND interactive mode) has `SHOW_FILE_TOKEN` in env
+== its session's `showFileToken`; two concurrent sessions have distinct tokens; both spawn seams
+tested.
 
 ### T-2.2: Emit helper `journalShareAgentMedia` + config constants
 
 **File:** `index.js`
 
+- **Imports (blocker if skipped):** `index.js:52` imports only `checkFileLink` from
+  `lib/file-link-guard.js`, and `path` is a namespace import at `:9`. Extend the guard import to add
+  `validateAndOpen` and `FileLinkDenied`, and use `path.basename(...)` — a bare
+  `validateAndOpen`/`FileLinkDenied`/`basename` is unbound → `ReferenceError` (502 on every call).
 - Constants: `SHOW_FILE_MAX_BYTES = 50 * 1024 * 1024`; `SHOW_FILE_UPLOAD_TIMEOUT_MS =
   Number(process.env.SHOW_FILE_UPLOAD_TIMEOUT_MS) || 30000`; `SHOW_FILE_ARTIFACT_ROOTS` parsed at
   startup from `process.env.SHOW_FILE_ARTIFACT_ROOTS` (colon-separated). Parse rule: split on `:`,
@@ -134,7 +148,12 @@ with a bad entry aborts startup.
 
 **File:** `index.js` (in `apiServer`, `:6579`, beside `/secret`/`/share-sensitive`)
 
-- Cap the request body at 64 KB during accumulation → `413` if exceeded (do not buffer past the cap).
+- Cap the request body at 64 KB **for the `/show-file` route specifically** → `413` if exceeded.
+  The `apiServer` `req.on('data', ...)` accumulator (`index.js:6639-6640`) is shared across all POST
+  routes and caps nothing today; gate the cap on `url.pathname === '/show-file'` and enforce it
+  DURING accumulation (abort + 413 once the running length exceeds 64 KB) — do NOT apply it globally
+  (would regress `/share-sensitive`'s `content` field) and do NOT defer to the `end` handler (the
+  whole body would already be buffered, violating "do not buffer past the cap").
 - Wrap the entire handler body in try/catch → on any unexpected throw, `res.writeHead(502)` +
   `{"error":"internal error"}` (never fall through to the shared `Invalid JSON` catch, `:7037`).
 - Parse `{ path, caption, token }`; missing `path` or `token` → `400`.
@@ -143,7 +162,9 @@ with a bad entry aborts startup.
 - Status map: `r.ok` → `200 {ok:true, media_id:r.media_id, kind:r.kind}`; else by `r.denied`:
   `sensitive`/`outside-scope` → 403; `too-large` → 413; `not-a-file`/`unreadable`/`symlink`/
   `relative-path`/`bad-workdir` → 404; `upload-failed` → 502.
-- **Audit log** (one structured line): on ok `{event:'show_file', roomId: session.roomId, realPath:
+- **Audit log** (one structured line, via **unconditional `console.log`/`console.warn`** — NOT the
+  `DEBUG=1`-gated `debug()` helper at `index.js:378`, so this security-relevant egress trail (P34)
+  isn't silently killed by a future debug-quieting): on ok `{event:'show_file', roomId: session.roomId, realPath:
   r.realPath, kind:r.kind, size:r.size, media_id:r.media_id, sha256:r.sha256, result:'ok'}`; on denial
   `{event:'show_file', roomId: session.roomId, path, result:r.denied}` (input path — realPath not
   available on a guard throw).
@@ -187,10 +208,15 @@ with a bad entry aborts startup.
 **File:** `show-file-mcp.js` (repo root, beside `ask-user.js`)
 
 - Mirror `ask-user.js` structure (`McpServer`, `StdioServerTransport`, `BRIDGE_API` resolution from
-  `BRIDGE_API_URL` || `MATRON_BRIDGE_API_PORT`, `ask-user.js:13-15`).
+  `BRIDGE_API_URL` || `MATRON_BRIDGE_API_PORT`, `ask-user.js:13-15`). The repo is `"type":"module"`
+  (pure ESM — no `require` anywhere), so `import path from 'node:path'` at module scope.
 - Register one tool `show_file` with the spec's description; zod schema `{ path: z.string().refine(p
-  => require('node:path').isAbsolute(p), 'path must be absolute'), caption: z.string().max(4096).
-  optional() }`; handler POSTs `${BRIDGE_API}/show-file` with `{ path, caption, token:
+  => path.isAbsolute(p), 'path must be absolute'), caption: z.string().max(4096).optional() }` —
+  **use the module-scope `path.isAbsolute`, NOT `require('node:path')`** (undefined in ESM →
+  `ReferenceError` inside the refine on every call, before the handler runs). `.tool()` positional
+  form matches `ask-user.js` (live in prod); if the installed SDK version has deprecated it for
+  `registerTool()`, switch to the object form. Handler POSTs `${BRIDGE_API}/show-file` with `{ path,
+  caption, token:
   process.env.SHOW_FILE_TOKEN }` and returns `{content:[{type:'text', text}]}` — success/denial
   strings per spec; a relative path is rejected client-side by the refine before the POST.
 
@@ -209,8 +235,11 @@ the mapped denial string; a relative path is refused by the schema.
   'show-file-mcp.js')` (mirroring the `ask-user` special-case at `:89`), or (b) generalize the
   resolver to absolutize a relative script `args` for any Node extra. Prefer (a) for a minimal,
   targeted change; note (b) as the cleaner generalization if the reviewer prefers it.
-- Ensure `knownMcpExtras()` includes `share` (the startup sanity check at `index.js:193` will warn
-  otherwise).
+- Register `share` in `knownMcpExtras()` / `EXTRA_FLAG_TO_NAME` **only** to support the opt-in
+  `--share` veto flag (below). Note: the `index.js:193` startup check warns only when a *known flag*
+  lacks a matching config block — it does NOT warn about a config block that isn't a known flag — so
+  omitting `share` from `knownMcpExtras()` triggers no warning either way (the earlier "will warn
+  otherwise" rationale was incorrect). Registration is for the veto path, not to silence a warning.
 
 **Acceptance:** a `share`-enabled session spawned in a non-bridge workdir starts the `show_file`
 server successfully (no ENOENT); the generated `.mcp-config-generated.share.json` points at the
@@ -220,7 +249,12 @@ absolute `show-file-mcp.js`.
 
 **File:** `index.js` (+ `lib/mcp-config.js` if the union helper lives there)
 
-- Define `DEFAULT_MCP_EXTRAS = ['share']`.
+- Define `DEFAULT_MCP_EXTRAS` behind an **env kill-switch** so default-on can be disabled without a
+  code edit + redeploy + restart on the live bridge (matches the spec's "operator-veto-able" language
+  and the repo's kill-switch convention for new capabilities):
+  `const DEFAULT_MCP_EXTRAS = process.env.SHOW_FILE_DEFAULT_ON === '0' ? [] : ['share'];`. Setting
+  `SHOW_FILE_DEFAULT_ON=0` in the bridge env + restart turns default-on off (the `--share` flag still
+  opts a session in). This is the cheap circuit-breaker for a default-on file-egress primitive.
 - Union the default into the **effective** extras **only** at the `mcpConfigPathFor(extras)` boundary
   (`index.js:171` and its call sites) — i.e. compute `effective = Array.from(new Set([...resolvedExtras,
   ...DEFAULT_MCP_EXTRAS]))` and pass `effective` to `mcpConfigPathFor`. **Do NOT** add the default to
@@ -240,6 +274,8 @@ session → `browser` still present (regression guard); the parsed-extras overri
 - effective-extras union: `resolvedExtras=[]` → effective `['share']`; `['browser']` → `['browser',
   'share']`; `['share','browser']` → `['share','browser']` (idempotent); and the parsed override
   array is NOT mutated by the union (restart-inheritance regression guard).
+- kill-switch: with `SHOW_FILE_DEFAULT_ON=0`, `DEFAULT_MCP_EXTRAS=[]` so `resolvedExtras=[]` →
+  effective `[]` (no `share` injected); a `--share`-flagged session still resolves to `['share']`.
 
 **Acceptance:** all green; the inheritance-preservation case is explicit.
 
@@ -259,6 +295,11 @@ session → `browser` still present (regression guard); the parsed-extras overri
   `outside-scope`, nothing posted.
 - A second concurrent session cannot post to the first's conversation (token isolation) — optional
   spot-check if two sessions are convenient.
+- **Interactive-mode session** (a room with `MATRON_INTERACTIVE_MODE=1`) also gets a working
+  `show_file` — verifies the token was wired into `createInteractiveSessionForRoom`, not just
+  `createSession` (the two-spawn-function gap). At minimum one iv-mode PNG show.
+- **Kill-switch:** with `SHOW_FILE_DEFAULT_ON=0` set, a fresh no-flag session does NOT have
+  `show_file`, and a `--share` session does — confirms the veto path.
 
 **Acceptance:** PNG + SVG render inline (both themes); PDF shows real filename + size; sensitive and
 outside-scope both denied with nothing posted. Record the outcome in the ship notes.
