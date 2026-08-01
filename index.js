@@ -1029,6 +1029,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   // Unset (undefined) means "never toggled" → use the default (on).
   const persistedForRoom = getPersistedSession(roomId);
   const showBashOutputAtSpawn = persistedForRoom?.showBashOutput !== false;
+  const showFileToken = randomUUID();
   // mcpExtras: explicit caller-supplied value wins (used by /start, /resume,
   // /workdir handlers that parsed user flags); otherwise fall back to whatever
   // was persisted for this room so /restart and bridge restarts honour the
@@ -1101,6 +1102,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
       CLAUDECODE: '',
       CLAUDE_CODE_MAX_OUTPUT_TOKENS: '128000',
       BRIDGE_ROOM_ID: roomId,
+      SHOW_FILE_TOKEN: showFileToken,
       MATRON_BRIDGE_API_PORT: String(API_PORT),
       // Env is fixed at spawn time; toggling the flag later requires
       // !restart to take effect.
@@ -1114,6 +1116,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     proc,
     roomId,
     workdir: cwd,
+    showFileToken,
     mcpExtras,
     responseBuffer: '',
     sendCallback: null,
@@ -1598,6 +1601,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
   const cwd = expandHome(workdir || DEFAULT_WORKDIR);
   const persistedForRoom = getPersistedSession(roomId);
   const showBashOutputAtSpawn = persistedForRoom?.showBashOutput !== false;
+  const showFileToken = randomUUID();
   const mcpExtras = Array.isArray(options.mcpExtras)
     ? options.mcpExtras
     : (Array.isArray(persistedForRoom?.mcpExtras) ? persistedForRoom.mcpExtras : []);
@@ -1661,6 +1665,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
       CLAUDECODE: '',
       CLAUDE_CODE_MAX_OUTPUT_TOKENS: '128000',
       BRIDGE_ROOM_ID: roomId,
+      SHOW_FILE_TOKEN: showFileToken,
       MATRON_BRIDGE_API_PORT: String(API_PORT),
       MATRON_BASH_TEE_ENABLED: showBashOutputAtSpawn ? '1' : '0',
     },
@@ -1675,6 +1680,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     iv,
     roomId,
     workdir: cwd,
+    showFileToken,
     mcpExtras,
     responseBuffer: '',
     sendCallback: null,
