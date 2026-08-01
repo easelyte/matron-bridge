@@ -149,7 +149,7 @@ describe('updatePinnedSummary compaction', () => {
 
   it('caps and persists compaction before requesting or applying the title', async () => {
     const order = [];
-    const compacted = `  ${'x'.repeat(450)}  `;
+    const compacted = `  • ${'x'.repeat(450)}  `;
     const codexOneShot = vi.fn()
       .mockImplementationOnce(async () => {
         order.push('compact');
@@ -174,6 +174,42 @@ describe('updatePinnedSummary compaction', () => {
     expect(order.slice(0, 3)).toEqual(['compact', 'persist', 'title']);
     expect(order).toContain('rename');
     expect(d.warn).not.toHaveBeenCalled();
+  });
+
+  it('rejects a prose-only compaction response and retains the prior summary', async () => {
+    const d = deps({
+      codexOneShot: vi.fn()
+        .mockResolvedValueOnce(success('x'.repeat(450)))
+        .mockResolvedValueOnce(success('TITLE: Still useful')),
+    });
+    const s = session({ pinnedSummaryText: longSummary });
+
+    await updatePinnedSummary(s, d);
+
+    expect(s.pinnedSummaryText).toBe(longSummary);
+    expect(s._compactionFailures).toBe(1);
+    expect(d.persistSession).toHaveBeenCalledTimes(1);
+    expect(d.persistSession.mock.calls[0][4].pinnedSummaryText).toBe(longSummary);
+    expect(d.warn).toHaveBeenCalledWith('[summary] compaction failed',
+      expect.objectContaining({ reason: 'invalid-output' }));
+  });
+
+  it('rejects a whitespace-only compaction response and retains the prior summary', async () => {
+    const d = deps({
+      codexOneShot: vi.fn()
+        .mockResolvedValueOnce(success('   '))
+        .mockResolvedValueOnce(success('TITLE: Still useful')),
+    });
+    const s = session({ pinnedSummaryText: longSummary, _compactionFailures: 1 });
+
+    await updatePinnedSummary(s, d);
+
+    expect(s.pinnedSummaryText).toBe(longSummary);
+    expect(s._compactionFailures).toBe(2);
+    expect(d.persistSession).toHaveBeenCalledTimes(1);
+    expect(d.persistSession.mock.calls[0][4].pinnedSummaryText).toBe(longSummary);
+    expect(d.warn).toHaveBeenCalledWith('[summary] compaction failed',
+      expect.objectContaining({ reason: 'invalid-output' }));
   });
 
   it('warns for compaction failure and only once when crossing the retry threshold', async () => {
@@ -218,6 +254,30 @@ describe('updatePinnedSummary compaction', () => {
     expect(d.warn).toHaveBeenCalledTimes(1);
     expect(d.warn).toHaveBeenCalledWith('[summary] compaction failed', expect.any(Object));
     expect(d.debug).toHaveBeenCalledWith('[summary] ok', { durationMs: 12 });
+  });
+
+  it('keeps only the most recent bullets after appending past the hard ceiling', async () => {
+    const existingSummary = Array.from(
+      { length: 20 },
+      (_, index) => `• item ${index + 1}`,
+    ).join('\n');
+    const d = deps({
+      codexOneShot: vi.fn().mockResolvedValue(
+        success('TITLE: Bounded summary\nNEW: newest item'),
+      ),
+    });
+    const s = session({
+      pinnedSummaryText: existingSummary,
+      _compactionFailures: 2,
+    });
+
+    await updatePinnedSummary(s, d);
+
+    const bullets = s.pinnedSummaryText.split('\n');
+    expect(bullets).toHaveLength(15);
+    expect(bullets[0]).toBe('• item 7');
+    expect(bullets.at(-1)).toBe('• newest item');
+    expect(d.codexOneShot).toHaveBeenCalledTimes(1);
   });
 });
 
