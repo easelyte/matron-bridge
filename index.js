@@ -49,9 +49,17 @@ import {
   JOURNAL_CONTROL_HELP_NOTE,
 } from './lib/command-dispatch.js';
 import { sendPrintInterrupt } from './lib/print-interrupt.js';
-// eslint-disable-next-line no-unused-vars -- validateAndOpen/FileLinkDenied are injected by the T-2.3 endpoint.
-import { checkFileLink, validateAndOpen, FileLinkDenied } from './lib/file-link-guard.js';
-import { parseShowFileUploadTimeoutMs } from './lib/show-file.js';
+import {
+  checkFileLink,
+  validateAndOpen,
+  FileLinkDenied,
+  pinAllowedRoots,
+} from './lib/file-link-guard.js';
+import {
+  denialToStatus,
+  parseShowFileUploadTimeoutMs,
+  shareAgentMedia,
+} from './lib/show-file.js';
 import { createJournalPublisher } from './lib/journal-publisher.js';
 import { createRpcRequestHandler } from './lib/journal-rpc.js';
 import { createRecentFolders } from './lib/recent-folders.js';
@@ -210,9 +218,7 @@ const SERVER_LABEL = process.env.SERVER_LABEL || (() => {
 const HMAC_SECRET = process.env.HMAC_SECRET || '';
 const VIEWER_BASE_URL = process.env.VIEWER_BASE_URL || '';
 const LINK_EXPIRY_MS = parseInt(process.env.LINK_EXPIRY_MS || String(15 * 60 * 1000), 10);
-// eslint-disable-next-line no-unused-vars -- consumed by the T-2.3 endpoint.
 const SHOW_FILE_MAX_BYTES = 50 * 1024 * 1024;
-// eslint-disable-next-line no-unused-vars -- consumed by the T-2.3 endpoint.
 const SHOW_FILE_UPLOAD_TIMEOUT_MS = parseShowFileUploadTimeoutMs(
   process.env.SHOW_FILE_UPLOAD_TIMEOUT_MS,
 );
@@ -6659,8 +6665,106 @@ const apiServer = createServer(async (req, res) => {
   }
 
   let body = '';
-  req.on('data', chunk => body += chunk);
+  let bodyBytes = 0;
+  let showFileBodyTooLarge = false;
+  req.on('data', chunk => {
+    if (showFileBodyTooLarge) return;
+    bodyBytes += chunk.length;
+    if (url.pathname === '/show-file' && bodyBytes > 64 * 1024) {
+      showFileBodyTooLarge = true;
+      body = '';
+      res.writeHead(413, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'request body too large' }));
+      return;
+    }
+    body += chunk;
+  });
   req.on('end', async () => {
+    if (showFileBodyTooLarge) return;
+
+    if (url.pathname === '/show-file') {
+      try {
+        const data = JSON.parse(body);
+        const { path: filePath, caption, token } = data;
+        if (!filePath || !token) {
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'path and token are required' }));
+          return;
+        }
+
+        let session;
+        for (const candidate of sessions.values()) {
+          if (candidate.showFileToken === token) {
+            session = candidate;
+            break;
+          }
+        }
+        if (!session) {
+          res.writeHead(403, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'invalid token' }));
+          return;
+        }
+
+        let result;
+        try {
+          session.showFilePinnedRoots ??= await pinAllowedRoots([
+            session.workdir,
+            ...SHOW_FILE_ARTIFACT_ROOTS,
+          ]);
+        } catch (error) {
+          if (error instanceof FileLinkDenied) result = { denied: error.reason };
+          else throw error;
+        }
+
+        result ??= await shareAgentMedia({
+          filePath,
+          caption,
+          pinnedRoots: session.showFilePinnedRoots,
+          maxBytes: SHOW_FILE_MAX_BYTES,
+          uploadTimeoutMs: SHOW_FILE_UPLOAD_TIMEOUT_MS,
+          deps: {
+            validateAndOpen,
+            FileLinkDenied,
+            uploadMedia: journalPublisher.uploadMedia,
+            publish: (method, payload) => journalPublish(session, method, payload),
+          },
+        });
+
+        if (result.ok) {
+          console.log(JSON.stringify({
+            event: 'show_file',
+            roomId: session.roomId,
+            realPath: result.realPath,
+            kind: result.kind,
+            size: result.size,
+            media_id: result.media_id,
+            sha256: result.sha256,
+            result: 'ok',
+          }));
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            ok: true,
+            media_id: result.media_id,
+            kind: result.kind,
+          }));
+          return;
+        }
+
+        console.warn(JSON.stringify({
+          event: 'show_file',
+          roomId: session.roomId,
+          path: filePath,
+          result: result.denied,
+        }));
+        res.writeHead(denialToStatus(result.denied), { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: result.denied }));
+      } catch (_error) {
+        res.writeHead(502, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'internal error' }));
+      }
+      return;
+    }
+
     try {
       const data = JSON.parse(body);
 
