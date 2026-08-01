@@ -112,7 +112,7 @@ const FALLBACK_CODEX_BRIDGE_PROMPT = 'You are running through a remote chat brid
 // --dangerously-skip-permissions. Match the live claude-matrix-bridge config —
 // a full tool allow-list via --settings — which Claude accepts under root.
 const BRIDGE_ROOT_PERMISSIONS = {
-  allow: ['Bash(*)', 'Read(*)', 'Write(*)', 'Edit(*)', 'MultiEdit(*)', 'Glob(*)', 'Grep(*)', 'WebFetch(*)', 'WebSearch(*)', 'Skill', 'Agent(*)', 'Task(*)', 'NotebookEdit(*)'],
+  allow: ['Bash(*)', 'Read(*)', 'Write(*)', 'Edit(*)', 'MultiEdit(*)', 'Glob(*)', 'Grep(*)', 'WebFetch(*)', 'WebSearch(*)', 'Skill', 'Agent(*)', 'Task(*)', 'NotebookEdit(*)', 'mcp__show-file__show_file'],
   deny: [],
 };
 
