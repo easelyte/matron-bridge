@@ -1,9 +1,12 @@
-import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { mkdtempSync, writeFileSync, symlinkSync, rmSync, mkdirSync } from 'node:fs';
+import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
+import { mkdtempSync, writeFileSync, symlinkSync, rmSync, mkdirSync, renameSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import fsp from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import {
-  isSensitivePath, checkFileLink, validateAndOpen, FileLinkDenied, MAX_VIEW_BYTES,
+  isSensitivePath, checkFileLink, validateAndOpen, pinAllowedRoots, pinAllowedRootsSync,
+  FileLinkDenied, MAX_VIEW_BYTES,
 } from '../lib/file-link-guard.js';
 
 describe('isSensitivePath', () => {
@@ -103,6 +106,54 @@ describe('validateAndOpen', () => {
     expect(path.basename(realPath)).toBe('ok.txt');
   });
 
+  it('continues reading until the approved snapshot buffer is full', async () => {
+    const filePath = path.join(dir, 'short-reads.txt');
+    writeFileSync(filePath, 'abcdef');
+    const actualOpen = fsp.open.bind(fsp);
+    let readSpy;
+    const openSpy = vi.spyOn(fsp, 'open').mockImplementation(async (...args) => {
+      const fd = await actualOpen(...args);
+      const actualRead = fd.read.bind(fd);
+      readSpy = vi.spyOn(fd, 'read').mockImplementation(
+        (buffer, offset, length, position) => actualRead(buffer, offset, Math.min(length, 2), position),
+      );
+      return fd;
+    });
+
+    try {
+      const { content } = await validateAndOpen(filePath, { workdir: dir });
+      expect(content.toString()).toBe('abcdef');
+      expect(readSpy).toHaveBeenCalledTimes(3);
+    } finally {
+      readSpy?.mockRestore();
+      openSpy.mockRestore();
+    }
+  });
+
+  it('rejects a file whose descriptor size changes after reading', async () => {
+    const filePath = path.join(dir, 'mutated.txt');
+    writeFileSync(filePath, 'abcdef');
+    const actualOpen = fsp.open.bind(fsp);
+    let readSpy;
+    const openSpy = vi.spyOn(fsp, 'open').mockImplementation(async (...args) => {
+      const fd = await actualOpen(...args);
+      const actualRead = fd.read.bind(fd);
+      readSpy = vi.spyOn(fd, 'read').mockImplementation(async (...readArgs) => {
+        const result = await actualRead(...readArgs);
+        await fsp.truncate(filePath, 1);
+        return result;
+      });
+      return fd;
+    });
+
+    try {
+      expect(await denied(filePath, { workdir: dir })).toBe('unreadable');
+    } finally {
+      readSpy?.mockRestore();
+      openSpy.mockRestore();
+    }
+  });
+
   it('rejects a symlink at the final component', async () => {
     expect(await denied(path.join(dir, 'sneaky.txt'), { workdir: dir })).toBe('symlink');
   });
@@ -128,7 +179,7 @@ describe('validateAndOpen', () => {
   });
 
   it('skips containment for legacy calls without a workdir', async () => {
-    const { content } = await validateAndOpen(path.join(outside, 'target.txt'), {});
+    const { content } = await validateAndOpen(path.join(outside, 'target.txt'));
     expect(content.toString('utf-8')).toBe('outside content\n');
   });
 
@@ -146,6 +197,101 @@ describe('validateAndOpen', () => {
     symlinkSync(dir, wdLink);
     const { content } = await validateAndOpen(path.join(dir, 'ok.txt'), { workdir: wdLink });
     expect(content.toString('utf-8')).toBe('hello guard\n');
+  });
+
+  it('allows a realPath under one of several allowed roots', async () => {
+    const allowedRoots = await pinAllowedRoots([dir, outside]);
+    const { content, realPath } = await validateAndOpen(path.join(outside, 'target.txt'), {
+      allowedRoots,
+    });
+    expect(content.toString('utf-8')).toBe('outside content\n');
+    expect(realPath).toBe(path.join(outside, 'target.txt'));
+  });
+
+  it('rejects a realPath outside every allowed root before reading it', async () => {
+    const allowedRoots = await pinAllowedRoots([dir]);
+    const actualOpen = fsp.open.bind(fsp);
+    const readSpies = [];
+    const openSpy = vi.spyOn(fsp, 'open').mockImplementation(async (...args) => {
+      const fd = await actualOpen(...args);
+      readSpies.push(vi.spyOn(fd, 'read'));
+      return fd;
+    });
+
+    try {
+      expect(await denied(path.join(outside, 'target.txt'), { allowedRoots }))
+        .toBe('outside-scope');
+      expect(readSpies).toHaveLength(1);
+      expect(readSpies[0]).not.toHaveBeenCalled();
+    } finally {
+      readSpies.forEach((spy) => spy.mockRestore());
+      openSpy.mockRestore();
+    }
+  });
+
+  it('gives outside-scope precedence over sensitive and oversized denials', async () => {
+    const allowedRoots = await pinAllowedRoots([dir]);
+    expect(await denied(path.join(outside, 'config.json'), { allowedRoots }))
+      .toBe('outside-scope');
+    expect(await denied(path.join(outside, 'target.txt'), { allowedRoots, maxBytes: 1 }))
+      .toBe('outside-scope');
+  });
+
+  it('canonicalizes symlinked allowed roots', async () => {
+    const rootLink = path.join(outside, 'root-link');
+    symlinkSync(dir, rootLink);
+    const allowedRoots = await pinAllowedRoots([rootLink]);
+    const { content, realPath } = await validateAndOpen(path.join(dir, 'ok.txt'), {
+      allowedRoots,
+    });
+    expect(content.toString('utf-8')).toBe('hello guard\n');
+    expect(realPath).toBe(path.join(dir, 'ok.txt'));
+  });
+
+  it('rejects an allowed root that does not resolve', async () => {
+    await expect(pinAllowedRoots([path.join(dir, 'missing-root')]))
+      .rejects.toMatchObject({ reason: 'bad-workdir' });
+  });
+
+  it('synchronously pins root identity for pre-spawn authorization', async () => {
+    const parent = mkdtempSync(path.join(tmpdir(), 'flg-sync-root-swap-'));
+    const approved = path.join(parent, 'approved');
+    const moved = path.join(parent, 'moved');
+    mkdirSync(approved);
+    const allowedRoots = pinAllowedRootsSync([approved]);
+    renameSync(approved, moved);
+    symlinkSync(outside, approved);
+    try {
+      expect(await denied(path.join(approved, 'target.txt'), { allowedRoots })).toBe('bad-workdir');
+    } finally {
+      rmSync(parent, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects a pinned root that is replaced before validation', async () => {
+    const parent = mkdtempSync(path.join(tmpdir(), 'flg-root-swap-'));
+    const approved = path.join(parent, 'approved');
+    const moved = path.join(parent, 'moved');
+    mkdirSync(approved);
+    writeFileSync(path.join(outside, 'neutral.txt'), 'must not escape\n');
+    const allowedRoots = await pinAllowedRoots([approved]);
+    renameSync(approved, moved);
+    symlinkSync(outside, approved);
+    try {
+      expect(await denied(path.join(approved, 'neutral.txt'), { allowedRoots })).toBe('bad-workdir');
+    } finally {
+      rmSync(parent, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects a FIFO without blocking in open or attempting a read', async () => {
+    const fifo = path.join(dir, 'agent.fifo');
+    expect(spawnSync('mkfifo', [fifo]).status).toBe(0);
+    const result = await Promise.race([
+      denied(fifo, { workdir: dir }),
+      new Promise((resolve) => setTimeout(() => resolve('timed-out'), 500)),
+    ]);
+    expect(result).toBe('not-a-file');
   });
 
   it('exports a 5MB default cap', () => {

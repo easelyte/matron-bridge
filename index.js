@@ -16,7 +16,14 @@ import { createToolStreamPump, toolOutputSnippet, decodeByteExact } from './lib/
 import { computeEditDiff } from './lib/edit-diff.js';
 import { createInteractiveSession } from './lib/interactive-session.js';
 import { extractUrls, isIdleReadyScreen, extractPreamble, preambleMatchesText } from './lib/prompt-detector.js';
-import { buildMcpServers, extractMcpExtraFlags, extractPromptFlag, knownMcpExtras } from './lib/mcp-config.js';
+import {
+  buildMcpServers,
+  effectiveExtras,
+  extractMcpExtraFlags,
+  extractPromptFlag,
+  knownMcpExtras,
+  resolveDefaultExtras,
+} from './lib/mcp-config.js';
 import { modelFromEvent, VALID_ALIAS_HINT } from './lib/model-aliases.js';
 import { switchModelInSession, modelButtons, planPrintModelSwitch } from './lib/model-command.js';
 import {
@@ -49,7 +56,17 @@ import {
   JOURNAL_CONTROL_HELP_NOTE,
 } from './lib/command-dispatch.js';
 import { sendPrintInterrupt } from './lib/print-interrupt.js';
-import { checkFileLink } from './lib/file-link-guard.js';
+import {
+  checkFileLink,
+  validateAndOpen,
+  FileLinkDenied,
+  pinAllowedRootsSync,
+} from './lib/file-link-guard.js';
+import {
+  denialToStatus,
+  parseShowFileUploadTimeoutMs,
+  shareAgentMedia,
+} from './lib/show-file.js';
 import { createJournalPublisher } from './lib/journal-publisher.js';
 import { createRpcRequestHandler } from './lib/journal-rpc.js';
 import { createRecentFolders } from './lib/recent-folders.js';
@@ -95,7 +112,7 @@ const FALLBACK_CODEX_BRIDGE_PROMPT = 'You are running through a remote chat brid
 // --dangerously-skip-permissions. Match the live claude-matrix-bridge config —
 // a full tool allow-list via --settings — which Claude accepts under root.
 const BRIDGE_ROOT_PERMISSIONS = {
-  allow: ['Bash(*)', 'Read(*)', 'Write(*)', 'Edit(*)', 'MultiEdit(*)', 'Glob(*)', 'Grep(*)', 'WebFetch(*)', 'WebSearch(*)', 'Skill', 'Agent(*)', 'Task(*)', 'NotebookEdit(*)'],
+  allow: ['Bash(*)', 'Read(*)', 'Write(*)', 'Edit(*)', 'MultiEdit(*)', 'Glob(*)', 'Grep(*)', 'WebFetch(*)', 'WebSearch(*)', 'Skill', 'Agent(*)', 'Task(*)', 'NotebookEdit(*)', 'mcp__show-file__show_file'],
   deny: [],
 };
 
@@ -166,6 +183,7 @@ const RECENT_FOLDERS_FILE = path.join(os.homedir(), '.matron-bridge-folders.json
 // generated[.<extras>].json`) and pass its path to claude. Each browser stack
 // is ~400M resident, so defaulting to none keeps lightweight sessions lean.
 const RAW_MCP_CONFIG = JSON.parse(fs.readFileSync(path.join(__dirname, 'mcp-config.json'), 'utf-8'));
+const DEFAULT_MCP_EXTRAS = resolveDefaultExtras(process.env.SHOW_FILE_DEFAULT_ON);
 const mcpConfigPathCache = new Map(); // sorted-extras-key -> generated file path
 
 function mcpConfigPathFor(extras = []) {
@@ -208,6 +226,23 @@ const SERVER_LABEL = process.env.SERVER_LABEL || (() => {
 const HMAC_SECRET = process.env.HMAC_SECRET || '';
 const VIEWER_BASE_URL = process.env.VIEWER_BASE_URL || '';
 const LINK_EXPIRY_MS = parseInt(process.env.LINK_EXPIRY_MS || String(15 * 60 * 1000), 10);
+const SHOW_FILE_MAX_BYTES = 50 * 1024 * 1024;
+const SHOW_FILE_MAX_IN_FLIGHT = 2;
+const SHOW_FILE_MAX_IN_FLIGHT_PER_SESSION = 1;
+const SHOW_FILE_GLOBAL_BYTE_BUDGET = SHOW_FILE_MAX_IN_FLIGHT * SHOW_FILE_MAX_BYTES;
+let showFileInFlight = 0;
+let showFileReservedBytes = 0;
+const SHOW_FILE_UPLOAD_TIMEOUT_MS = parseShowFileUploadTimeoutMs(
+  process.env.SHOW_FILE_UPLOAD_TIMEOUT_MS,
+);
+const SHOW_FILE_ARTIFACT_ROOTS = (process.env.SHOW_FILE_ARTIFACT_ROOTS || '')
+  .split(':')
+  .filter(Boolean);
+for (const artifactRoot of SHOW_FILE_ARTIFACT_ROOTS) {
+  if (!path.isAbsolute(artifactRoot) || !fs.existsSync(artifactRoot)) {
+    throw new Error(`Invalid SHOW_FILE_ARTIFACT_ROOTS entry: ${JSON.stringify(artifactRoot)}`);
+  }
+}
 const SECRETS_DIR = path.join(os.homedir(), '.secrets');
 const SECRET_TTL_MS = 3600000; // 1 hour
 const BRIDGE_CLAUDE_MD_PATH = process.env.BRIDGE_CLAUDE_MD_PATH || DEFAULT_BRIDGE_CLAUDE_MD_PATH;
@@ -1036,6 +1071,18 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   const mcpExtras = Array.isArray(options.mcpExtras)
     ? options.mcpExtras
     : (Array.isArray(persistedForRoom?.mcpExtras) ? persistedForRoom.mcpExtras : []);
+  const effectiveMcpExtras = effectiveExtras(mcpExtras, DEFAULT_MCP_EXTRAS);
+  const shareEnabled = effectiveMcpExtras.includes('share');
+  let showFileToken;
+  let showFilePinnedRoots = null;
+  if (shareEnabled) {
+    try {
+      showFilePinnedRoots = pinAllowedRootsSync([cwd, ...SHOW_FILE_ARTIFACT_ROOTS]);
+      showFileToken = randomUUID();
+    } catch (error) {
+      console.warn(`[show-file] disabled for ${roomId}: failed to pin allowed roots (${error.message})`);
+    }
+  }
   // Pre-assign the session id for fresh spawns (same trick as iv-mode below):
   // claudeSessionId is then known synchronously, so RPC start can answer with
   // a convo_id immediately and journal publishes never buffer for the init
@@ -1051,7 +1098,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     '--disallowed-tools', 'AskUserQuestion',
     '--append-system-prompt', BRIDGE_SYSTEM_PROMPT,
     '--include-partial-messages',
-    '--mcp-config', mcpConfigPathFor(mcpExtras),
+    '--mcp-config', mcpConfigPathFor(effectiveMcpExtras),
     '--settings', JSON.stringify({
       permissions: BRIDGE_ROOT_PERMISSIONS,
       hooks: {
@@ -1093,19 +1140,23 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     ? existingPath
     : `${nodeBinDir}:${existingPath}`;
 
+  const spawnEnv = {
+    ...process.env,
+    PATH: pathWithNode,
+    CLAUDECODE: '',
+    CLAUDE_CODE_MAX_OUTPUT_TOKENS: '128000',
+    BRIDGE_ROOM_ID: roomId,
+    MATRON_BRIDGE_API_PORT: String(API_PORT),
+    // Env is fixed at spawn time; toggling the flag later requires
+    // !restart to take effect.
+    MATRON_BASH_TEE_ENABLED: showBashOutputAtSpawn ? '1' : '0',
+  };
+  delete spawnEnv.SHOW_FILE_TOKEN;
+  if (showFileToken) spawnEnv.SHOW_FILE_TOKEN = showFileToken;
+
   const proc = spawn('claude', args, {
     cwd,
-    env: {
-      ...process.env,
-      PATH: pathWithNode,
-      CLAUDECODE: '',
-      CLAUDE_CODE_MAX_OUTPUT_TOKENS: '128000',
-      BRIDGE_ROOM_ID: roomId,
-      MATRON_BRIDGE_API_PORT: String(API_PORT),
-      // Env is fixed at spawn time; toggling the flag later requires
-      // !restart to take effect.
-      MATRON_BASH_TEE_ENABLED: showBashOutputAtSpawn ? '1' : '0',
-    },
+    env: spawnEnv,
     stdio: ['pipe', 'pipe', 'pipe'],
   });
 
@@ -1114,6 +1165,9 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     proc,
     roomId,
     workdir: cwd,
+    ...(showFileToken ? { showFileToken } : {}),
+    showFilePinnedRoots,
+    _showFileInFlight: 0,
     mcpExtras,
     responseBuffer: '',
     sendCallback: null,
@@ -1601,6 +1655,18 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
   const mcpExtras = Array.isArray(options.mcpExtras)
     ? options.mcpExtras
     : (Array.isArray(persistedForRoom?.mcpExtras) ? persistedForRoom.mcpExtras : []);
+  const effectiveMcpExtras = effectiveExtras(mcpExtras, DEFAULT_MCP_EXTRAS);
+  const shareEnabled = effectiveMcpExtras.includes('share');
+  let showFileToken;
+  let showFilePinnedRoots = null;
+  if (shareEnabled) {
+    try {
+      showFilePinnedRoots = pinAllowedRootsSync([cwd, ...SHOW_FILE_ARTIFACT_ROOTS]);
+      showFileToken = randomUUID();
+    } catch (error) {
+      console.warn(`[show-file] disabled for ${roomId}: failed to pin allowed roots (${error.message})`);
+    }
+  }
   const identity = planSessionIdentity({ resumeSessionId, mintId: randomUUID });
   const sessionId = identity.sessionId;
   const model = options.model === null
@@ -1637,7 +1703,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     // Matrix. Print-mode kept it disallowed because there was no way to
     // surface the TUI prompt; that constraint no longer applies.
     '--append-system-prompt', BRIDGE_SYSTEM_PROMPT,
-    '--mcp-config', mcpConfigPathFor(mcpExtras),
+    '--mcp-config', mcpConfigPathFor(effectiveMcpExtras),
     '--settings', JSON.stringify(settings),
   );
   if (model) {
@@ -1648,6 +1714,18 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
   const existingPath = process.env.PATH || '';
   const pathWithNode = existingPath.split(':').includes(nodeBinDir) ? existingPath : `${nodeBinDir}:${existingPath}`;
 
+  const interactiveEnv = {
+    ...process.env,
+    PATH: pathWithNode,
+    CLAUDECODE: '',
+    CLAUDE_CODE_MAX_OUTPUT_TOKENS: '128000',
+    BRIDGE_ROOM_ID: roomId,
+    MATRON_BRIDGE_API_PORT: String(API_PORT),
+    MATRON_BASH_TEE_ENABLED: showBashOutputAtSpawn ? '1' : '0',
+  };
+  delete interactiveEnv.SHOW_FILE_TOKEN;
+  if (showFileToken) interactiveEnv.SHOW_FILE_TOKEN = showFileToken;
+
   debug(`Spawning interactive claude session ${sessionId} in ${cwd}`);
 
   const iv = createInteractiveSession({
@@ -1655,15 +1733,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     workdir: cwd,
     sessionId,
     claudeArgs,
-    env: {
-      ...process.env,
-      PATH: pathWithNode,
-      CLAUDECODE: '',
-      CLAUDE_CODE_MAX_OUTPUT_TOKENS: '128000',
-      BRIDGE_ROOM_ID: roomId,
-      MATRON_BRIDGE_API_PORT: String(API_PORT),
-      MATRON_BASH_TEE_ENABLED: showBashOutputAtSpawn ? '1' : '0',
-    },
+    env: interactiveEnv,
   });
 
   // Same shape as the --print session object. `proc` is null in iv mode;
@@ -1675,6 +1745,9 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     iv,
     roomId,
     workdir: cwd,
+    ...(showFileToken ? { showFileToken } : {}),
+    showFilePinnedRoots,
+    _showFileInFlight: 0,
     mcpExtras,
     responseBuffer: '',
     sendCallback: null,
@@ -6576,6 +6649,41 @@ const pendingPlanDecisions = new Map();
 
 const API_PORT = parseInt(process.env.MATRON_BRIDGE_API_PORT || '9802', 10);
 
+function auditShowFile({ result, roomId, filePath, error, ...details }) {
+  const record = {
+    event: 'show_file',
+    ...(roomId ? { roomId } : {}),
+    ...(filePath ? { path: filePath } : {}),
+    result,
+    ...details,
+  };
+  if (error) {
+    record.error = {
+      name: typeof error.name === 'string' ? error.name : 'Error',
+      ...(typeof error.code === 'string' ? { code: error.code } : {}),
+    };
+  }
+  (result === 'ok' ? console.log : console.warn)(JSON.stringify(record));
+}
+
+function validateShowFileBody(data) {
+  if (data === null || typeof data !== 'object' || Array.isArray(data)
+      || (Object.getPrototypeOf(data) !== Object.prototype && Object.getPrototypeOf(data) !== null)) {
+    return { error: 'request body must be an object', reason: 'invalid-body' };
+  }
+  if (typeof data.path !== 'string' || data.path.trim() === '') {
+    return { error: 'path must be a non-empty string', reason: 'invalid-path' };
+  }
+  if (typeof data.token !== 'string' || data.token.trim() === '') {
+    return { error: 'token must be a non-empty string', reason: 'missing-token' };
+  }
+  if (data.caption !== undefined
+      && (typeof data.caption !== 'string' || data.caption.length > 4096)) {
+    return { error: 'caption must be a string of at most 4096 characters', reason: 'invalid-caption' };
+  }
+  return null;
+}
+
 const apiServer = createServer(async (req, res) => {
   const url = new URL(req.url, `http://localhost:${API_PORT}`);
 
@@ -6631,14 +6739,135 @@ const apiServer = createServer(async (req, res) => {
   }
 
   if (req.method !== 'POST') {
+    if (url.pathname === '/show-file') auditShowFile({ result: 'method-not-allowed' });
     res.writeHead(405);
     res.end('Method not allowed');
     return;
   }
 
   let body = '';
-  req.on('data', chunk => body += chunk);
+  let bodyBytes = 0;
+  let showFileBodyTooLarge = false;
+  req.on('data', chunk => {
+    if (showFileBodyTooLarge) return;
+    bodyBytes += chunk.length;
+    if (url.pathname === '/show-file' && bodyBytes > 64 * 1024) {
+      showFileBodyTooLarge = true;
+      body = '';
+      auditShowFile({ result: 'request-too-large' });
+      res.writeHead(413, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'request body too large' }));
+      return;
+    }
+    body += chunk;
+  });
   req.on('end', async () => {
+    if (showFileBodyTooLarge) return;
+
+    if (url.pathname === '/show-file') {
+      let filePath;
+      let session;
+      let budgetHeld = false;
+      try {
+        let data;
+        try {
+          data = JSON.parse(body);
+        } catch (error) {
+          auditShowFile({ result: 'invalid-json', error });
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'invalid JSON' }));
+          return;
+        }
+        const validationError = validateShowFileBody(data);
+        filePath = typeof data?.path === 'string' ? data.path : undefined;
+        if (validationError) {
+          auditShowFile({ result: validationError.reason, filePath });
+          res.writeHead(400, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: validationError.error }));
+          return;
+        }
+        const { caption, token } = data;
+
+        for (const candidate of sessions.values()) {
+          if (candidate.showFileToken && candidate.showFileToken === token) {
+            session = candidate;
+            break;
+          }
+        }
+        if (!session) {
+          auditShowFile({ result: 'invalid-token', filePath });
+          res.writeHead(403, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: 'invalid token' }));
+          return;
+        }
+
+        if ((session._showFileInFlight || 0) >= SHOW_FILE_MAX_IN_FLIGHT_PER_SESSION
+            || showFileInFlight >= SHOW_FILE_MAX_IN_FLIGHT
+            || showFileReservedBytes + SHOW_FILE_MAX_BYTES > SHOW_FILE_GLOBAL_BYTE_BUDGET) {
+          auditShowFile({ result: 'saturated', roomId: session.roomId, filePath });
+          res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': '1' });
+          res.end(JSON.stringify({ error: 'saturated' }));
+          return;
+        }
+        session._showFileInFlight = (session._showFileInFlight || 0) + 1;
+        showFileInFlight += 1;
+        showFileReservedBytes += SHOW_FILE_MAX_BYTES;
+        budgetHeld = true;
+
+        const result = await shareAgentMedia({
+          filePath,
+          caption,
+          pinnedRoots: session.showFilePinnedRoots,
+          maxBytes: SHOW_FILE_MAX_BYTES,
+          uploadTimeoutMs: SHOW_FILE_UPLOAD_TIMEOUT_MS,
+          deps: {
+            validateAndOpen,
+            FileLinkDenied,
+            uploadMedia: journalPublisher.uploadMedia,
+            publish: (method, payload) => journalPublish(session, method, payload),
+          },
+        });
+
+        if (result.ok) {
+          auditShowFile({
+            result: 'ok',
+            roomId: session.roomId,
+            realPath: result.realPath,
+            kind: result.kind,
+            size: result.size,
+            media_id: result.media_id,
+            sha256: result.sha256,
+          });
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({
+            ok: true,
+            media_id: result.media_id,
+            kind: result.kind,
+          }));
+          return;
+        }
+
+        auditShowFile({
+          result: result.denied,
+          roomId: session.roomId,
+          filePath,
+        });
+        res.writeHead(denialToStatus(result.denied), { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: result.denied }));
+      } catch (error) {
+        auditShowFile({ result: 'internal-error', roomId: session?.roomId, filePath, error });
+        res.writeHead(502, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ error: 'internal error' }));
+      } finally {
+        if (budgetHeld) {
+          session._showFileInFlight -= 1;
+          showFileInFlight -= 1;
+          showFileReservedBytes -= SHOW_FILE_MAX_BYTES;
+        }
+      }
+      return;
+    }
+
     try {
       const data = JSON.parse(body);
 
