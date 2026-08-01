@@ -10,7 +10,6 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 import os from 'os';
-import { GoogleGenerativeAI } from '@google/generative-ai';
 import { createLiveOutputStore, sweepOrphanedLogs } from './lib/live-output.js';
 import { createToolStreamPump, toolOutputSnippet, decodeByteExact } from './lib/tool-stream-pump.js';
 import { computeEditDiff } from './lib/edit-diff.js';
@@ -76,7 +75,9 @@ import { createJournalInputConsumer, resolvePromptChoice } from './lib/journal-i
 import { createJournalMediaRouter } from './lib/journal-media.js';
 import { markJournalOrigin, planQueueFlush } from './lib/queue-flush.js';
 import { attachPendingMediaMirror, pendingMediaMirror } from './lib/media-mirror.js';
-import { seedJournalTitle, applyFallbackTitle } from './lib/journal-title-seed.js';
+import { seedJournalTitle, applyFallbackTitle, formatRoomTitle } from './lib/journal-title-seed.js';
+import { codexOneShot } from './lib/codex-oneshot.js';
+import { updatePinnedSummary } from './lib/pinned-summary.js';
 import { activityStateChanged, truncateActivityDetail, shouldResumeThinkingAfterTool } from './lib/journal-activity.js';
 import { streamRefFor } from './lib/journal-stream.js';
 import { contextFullToNative, briefContextReport } from './lib/context-command.js';
@@ -247,10 +248,6 @@ const SECRETS_DIR = path.join(os.homedir(), '.secrets');
 const SECRET_TTL_MS = 3600000; // 1 hour
 const BRIDGE_CLAUDE_MD_PATH = process.env.BRIDGE_CLAUDE_MD_PATH || DEFAULT_BRIDGE_CLAUDE_MD_PATH;
 const BRIDGE_CODEX_MD_PATH = process.env.BRIDGE_CODEX_MD_PATH || DEFAULT_BRIDGE_CODEX_MD_PATH;
-
-// Gemini client for room topic summarization
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY || '';
-const genAI = GEMINI_API_KEY ? new GoogleGenerativeAI(GEMINI_API_KEY) : null;
 
 function loadBridgeSystemPrompt() {
   try {
@@ -4433,85 +4430,20 @@ async function updateRoomName(roomId, name) {
 }
 
 async function maybeUpdatePinnedSummary(session) {
-  if (!genAI) {
-    // No Gemini key: no pinned summary, but still name the convo Claude's
-    // own way — its first user message, the same summary `claude --resume`
-    // and /sessions display — instead of leaving the workdir-basename seed.
-    applyFallbackTitle(session, { serverLabel: SERVER_LABEL, updateRoomName, workdir: session.workdir });
-    return;
-  }
-
-  if (!session.chatHistory) session.chatHistory = [];
-  debug(`maybeUpdatePinnedSummary: chatHistory.length=${session.chatHistory.length}`);
-
-  // Trigger every 5 messages
-  if (session.chatHistory.length < 5 || session.chatHistory.length % 5 !== 0) return;
-
-  try {
-    // Use in-memory summary as source of truth (not Matrix, since getEvent returns original, not edits)
-    let currentSummary = session.pinnedSummaryText || '';
-    const bulletCount = (currentSummary.match(/^•/gm) || []).length;
-
-    const model = genAI.getGenerativeModel({ model: 'gemini-3-flash-preview' });
-
-    // Check if we need to compact (>15 bullets)
-    if (bulletCount > 15 && currentSummary) {
-      const compactPrompt = `Condense this session summary into exactly 3 bullet points (using • prefix) capturing the key accomplishments. Keep it concise and focused on major milestones:\n\n${currentSummary}`;
-      const compactResult = await model.generateContent(compactPrompt);
-      currentSummary = compactResult.response.text().trim();
-      // Persist compacted result immediately so it isn't lost if the next LLM call fails to match
-      session.pinnedSummaryText = currentSummary;
-    }
-
-    // Get last 50 messages for summarization (broad context for better titles)
-    const recentMessages = session.chatHistory.slice(-50).map(m =>
-      `${m.role}: ${m.text}`
-    ).join('\n\n');
-
-    const prompt = currentSummary
-      ? `Based on these recent messages, provide:\n1. A 3-5 word title (max 34 chars) describing the overall topic/feature being worked on, e.g. "infrastructure documentation refinement" or "plan mode fix"\n2. A brief 1-sentence summary of what was accomplished\n\nFormat:\nTITLE: <title>\nNEW: <1 sentence>\n\nNo quotes. Be specific and concise.\n\nMessages:\n${recentMessages}`
-      : `Based on these messages, provide:\n1. A 3-5 word title (max 34 chars) describing the overall topic/feature, e.g. "bridge room name truncation" or "voice note support"\n2. A 1-2 sentence summary (what's been done, current status)\n\nFormat:\nTITLE: <title>\nSUMMARY: <summary>\n\nNo quotes. Be specific.\n\nMessages:\n${recentMessages}`;
-
-    const result = await model.generateContent(prompt);
-    const text = result.response.text().trim();
-    const titleMatch = text.match(/TITLE:\s*(.+)/i);
-    const summaryMatch = text.match(/SUMMARY:\s*(.+)/i);
-    const newMatch = text.match(/NEW:\s*(.+)/i);
-
-    const sessionShort = (session.claudeSessionId || session.roomId.slice(1)).slice(0, 2);
-
-    // Update room name (Element sidebar truncates visually, full name visible on hover)
-    if (titleMatch) {
-      const name = `${SERVER_LABEL}:${sessionShort} ${titleMatch[1].trim().slice(0, 60)}`;
-      updateRoomName(session.roomId, name);
-    }
-
-    // Build cumulative summary for pinned message
-    let updatedSummary = '';
-    if (newMatch && currentSummary) {
-      updatedSummary = `${currentSummary}\n• ${newMatch[1].trim()}`;
-    } else if (summaryMatch && !currentSummary) {
-      // Only use SUMMARY: for the initial summary, not after compaction
-      updatedSummary = `• ${summaryMatch[1].trim()}`;
-    } else if (currentSummary) {
-      // LLM didn't produce a match — keep the existing summary (e.g. after compaction)
-      updatedSummary = currentSummary;
-    }
-
-    if (updatedSummary) {
-      // Store accumulated summary in session (source of truth). The Matrix
-      // pinned-message mechanics (create/verify/edit the pinned event,
-      // m.room.pinned_events bookkeeping) are gone along with outbound
-      // Matrix sends — only the summary text itself has ongoing meaning, so
-      // that's all that gets persisted now.
-      session.pinnedSummaryText = updatedSummary;
-      if (session.claudeSessionId) {
-        persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { chatHistory: session.chatHistory, pinnedSummaryText: updatedSummary });
-      }
-    }
-  } catch (e) {
-    debug(`Failed to update pinned summary: ${e.message}`);
-  }
+  await updatePinnedSummary(session, {
+    codexOneShot,
+    formatRoomTitle,
+    applyFallbackTitle,
+    persistSession,
+    updateRoomName,
+    debug,
+    warn: (...args) => console.warn(...args),
+    serverLabel: SERVER_LABEL,
+    defaultWorkdir: DEFAULT_WORKDIR,
+  }).catch(e => console.warn('[summary] wrapper error', {
+    error: String(e?.message || e),
+    roomId: session.roomId,
+  }));
 }
 
 // Path of a session's on-disk transcript. Extraction + bounded reading live
@@ -5036,9 +4968,6 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const summary = selectedAgent === AGENT_CODEX
         ? (resumePersisted?.summary || '')
         : await getSessionSummary(resumeSessionId, actualWorkdir);
-      const roomName = summary
-        ? `${SERVER_LABEL}: ${summary.slice(0, 50)}${summary.length > 50 ? '…' : ''}`
-        : `${SERVER_LABEL}: Resumed ${shortId}`;
 
       const sessionSendReply = (reply) => sendToRoom(sessionRoomId, plainTextFormat(reply), markdownToHtml(reply));
       const sessionSendHtml = (plainText, html) => sendToRoom(sessionRoomId, plainText, html);
@@ -5074,6 +5003,12 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         ...(selectedAgent === AGENT_CLAUDE
           ? { interactive: resumeState.interactiveMode }
           : {}),
+      });
+      const roomName = formatRoomTitle({
+        serverLabel: SERVER_LABEL,
+        workdir: session.workdir,
+        text: summary || (`Resumed ${shortId}`),
+        defaultWorkdir: DEFAULT_WORKDIR,
       });
       session.originRoomId = roomId;
       session.firstMessageCaptured = true; // don't re-rename on first message
@@ -5352,7 +5287,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         `/tools — List available tools\n` +
         `/help — Show this help message\n\n` +
         `Each /start, /resume, and /workdir creates a new session.\n` +
-        `Room names show the server (${SERVER_LABEL}) and first message summary.\n\n` +
+        `Room names show ${SERVER_LABEL} · <repo> · <topic>.\n\n` +
         `While the agent is working:\n` +
         `  Messages are queued automatically\n` +
         `  Send "interrupt" to force interrupt\n` +
@@ -5395,7 +5330,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         ]) +
         `<b>Tips</b><ul>` +
         `<li>Each <code>/start</code>, <code>/resume</code>, and <code>/workdir</code> creates a new session</li>` +
-        `<li>Room names show the server (<code>${SERVER_LABEL}</code>) and first message summary</li>` +
+        `<li>Room names show <code>${SERVER_LABEL} · &lt;repo&gt; · &lt;topic&gt;</code></li>` +
         `<li>Messages are queued automatically while the agent is working</li>` +
         `<li>Send <code>interrupt</code> to force interrupt</li>` +
         `<li><code>!esc</code> — cancel the current turn without killing the session</li>` +

@@ -1,5 +1,10 @@
 import { describe, it, expect, vi } from 'vitest';
-import { seedJournalTitle, applyFallbackTitle } from '../lib/journal-title-seed.js';
+import {
+  seedJournalTitle,
+  applyFallbackTitle,
+  formatRoomTitle,
+  repoLabel,
+} from '../lib/journal-title-seed.js';
 
 describe('seedJournalTitle (workdir-sourced)', () => {
   it('titles the convo from the workdir basename when no hint is set', async () => {
@@ -84,8 +89,61 @@ describe('seedJournalTitle (workdir-sourced)', () => {
   });
 });
 
-describe('applyFallbackTitle (no-Gemini first-user-message naming)', () => {
-  const deps = () => ({ serverLabel: '2', updateRoomName: vi.fn() });
+describe('repoLabel', () => {
+  const defaultWorkdir = '/home/dan/son-of-anton';
+
+  it('uses son-of-anton for the default workdir', () => {
+    expect(repoLabel(defaultWorkdir, { defaultWorkdir })).toBe('son-of-anton');
+  });
+
+  it('uses the workdir basename for another repo', () => {
+    expect(repoLabel('/home/dan/yearbook-app', { defaultWorkdir })).toBe('yearbook-app');
+  });
+
+  it('truncates an overflowing repo label with an ellipsis', () => {
+    expect(repoLabel(`/home/dan/${'r'.repeat(25)}`, { defaultWorkdir })).toBe(`${'r'.repeat(24)}…`);
+  });
+});
+
+describe('formatRoomTitle', () => {
+  const options = {
+    serverLabel: 'VPS',
+    workdir: '/home/dan/yearbook-app',
+    defaultWorkdir: '/home/dan/son-of-anton',
+  };
+
+  it('formats the server and repo without text or a session id', () => {
+    const title = formatRoomTitle(options);
+    expect(title).toBe('VPS · yearbook-app');
+    expect(title).not.toMatch(/:\w{2}/);
+  });
+
+  it('formats the server, repo, and text without a session id', () => {
+    const title = formatRoomTitle({ ...options, text: 'Fix the photo upload race' });
+    expect(title).toBe('VPS · yearbook-app · Fix the photo upload race');
+    expect(title).not.toMatch(/:\w{2}/);
+  });
+
+  it('truncates overflowing text at 60 characters with an ellipsis', () => {
+    expect(formatRoomTitle({ ...options, text: 'x'.repeat(61) })).toBe(
+      `VPS · yearbook-app · ${'x'.repeat(60)}…`,
+    );
+  });
+
+  it('truncates an overflowing repo label at 24 characters with an ellipsis', () => {
+    expect(formatRoomTitle({ ...options, workdir: `/home/dan/${'r'.repeat(25)}` })).toBe(
+      `VPS · ${'r'.repeat(24)}…`,
+    );
+  });
+});
+
+describe('applyFallbackTitle (repo-aware first-user-message naming)', () => {
+  const deps = () => ({
+    serverLabel: 'VPS',
+    workdir: '/home/dan/proj',
+    defaultWorkdir: '/home/dan/son-of-anton',
+    updateRoomName: vi.fn(),
+  });
 
   it('titles the convo from the first user message, same format as the LLM rename', () => {
     const session = {
@@ -98,7 +156,7 @@ describe('applyFallbackTitle (no-Gemini first-user-message naming)', () => {
     };
     const d = deps();
     expect(applyFallbackTitle(session, d)).toBe(true);
-    expect(d.updateRoomName).toHaveBeenCalledWith('!abc', '2:f0 fix the folder picker');
+    expect(d.updateRoomName).toHaveBeenCalledWith('!abc', 'VPS · proj · fix the folder picker');
   });
 
   it('does nothing until a user message exists, then still applies later', () => {
@@ -108,7 +166,7 @@ describe('applyFallbackTitle (no-Gemini first-user-message naming)', () => {
     expect(d.updateRoomName).not.toHaveBeenCalled();
     session.chatHistory.push({ role: 'user', text: 'now do the thing' });
     expect(applyFallbackTitle(session, d)).toBe(true);
-    expect(d.updateRoomName).toHaveBeenCalledWith('!abc', '2:f0 now do the thing');
+    expect(d.updateRoomName).toHaveBeenCalledWith('!abc', 'VPS · proj · now do the thing');
   });
 
   it('applies only once per session', () => {
@@ -125,9 +183,9 @@ describe('applyFallbackTitle (no-Gemini first-user-message naming)', () => {
     const d = deps();
     expect(applyFallbackTitle(session, d)).toBe(true);
     const title = d.updateRoomName.mock.calls[0][1];
-    expect(title.startsWith('2:f0 refactor the whole session store')).toBe(true);
+    expect(title.startsWith('VPS · proj · refactor the whole session store')).toBe(true);
     expect(title.endsWith('…')).toBe(true);
-    expect(title.length).toBe('2:f0 '.length + 61);
+    expect(title.length).toBe('VPS · proj · '.length + 61);
   });
 
   it('falls back to the room id for the short prefix and survives a missing history', () => {
@@ -136,7 +194,7 @@ describe('applyFallbackTitle (no-Gemini first-user-message naming)', () => {
     expect(applyFallbackTitle(session, d)).toBe(false);
     session.chatHistory = [{ role: 'user', text: 'hi' }];
     expect(applyFallbackTitle(session, d)).toBe(true);
-    expect(d.updateRoomName).toHaveBeenCalledWith('!room', '2:ro hi');
+    expect(d.updateRoomName).toHaveBeenCalledWith('!room', 'VPS · proj · hi');
   });
 
   it('never lets angle brackets or reassembled script fragments into the title', () => {
@@ -171,7 +229,7 @@ describe('applyFallbackTitle (no-Gemini first-user-message naming)', () => {
     };
     const d = { ...deps(), workdir: '/home/dan/proj' };
     expect(applyFallbackTitle(session, d)).toBe(true);
-    expect(d.updateRoomName).toHaveBeenCalledWith('!abc', '2:f0 carry on');
+    expect(d.updateRoomName).toHaveBeenCalledWith('!abc', 'VPS · proj · carry on');
   });
 
   it('skips a tag-only first user message and titles from the next real one', () => {
@@ -185,6 +243,6 @@ describe('applyFallbackTitle (no-Gemini first-user-message naming)', () => {
     };
     const d = deps();
     expect(applyFallbackTitle(session, d)).toBe(true);
-    expect(d.updateRoomName).toHaveBeenCalledWith('!abc', '2:f0 the real prompt');
+    expect(d.updateRoomName).toHaveBeenCalledWith('!abc', 'VPS · proj · the real prompt');
   });
 });
