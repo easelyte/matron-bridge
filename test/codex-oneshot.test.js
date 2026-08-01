@@ -109,13 +109,16 @@ describe('codexOneShot', () => {
     expect(resolved).toHaveBeenCalledTimes(1);
   });
 
-  it('reports an stdin error', async () => {
+  it('reports an stdin error and terminates the child (no leak)', async () => {
     const child = fakeChild();
     const resultPromise = codexOneShot('prompt', { spawnImpl: () => child });
 
     child.stdin.emit('error', Object.assign(new Error('broken pipe'), { code: 'EPIPE' }));
 
     await expect(resultPromise).resolves.toMatchObject({ text: null, reason: 'stdin-error' });
+    // A stdin EPIPE can leave the child alive; it must be SIGTERM'd rather than
+    // resolved-and-leaked (Phase-1/2 review Major 1).
+    expect(child.kill).toHaveBeenCalledWith('SIGTERM');
   });
 
   it('handles an asynchronous child ENOENT error without throwing', async () => {
