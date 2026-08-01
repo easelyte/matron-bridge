@@ -51,7 +51,7 @@ alongside T-2.2 for a working deadline.
 
 Add an optional `allowedRoots: string[]` to `validateAndOpen(filePath, { workdir, allowedRoots, maxBytes })`.
 After the fd `realPath` is resolved (via `/proc/self/fd`, `:108`) and **before** the sensitivity
-check (`:111`) and before the file is read (`:127`):
+check (`:111`) and before the file is read (`fd.read` at `:128`):
 
 - If `allowedRoots` is provided and non-empty: `fsp.realpath()`-resolve each root (a root that
   fails to resolve throws `FileLinkDenied('bad-workdir')`), then throw
@@ -131,10 +131,13 @@ tested.
   2. `try { var { content, realPath } = await validateAndOpen(filePath, { allowedRoots: roots, maxBytes: SHOW_FILE_MAX_BYTES }); } catch (e) { if (e instanceof FileLinkDenied) return { denied: e.reason }; throw e; }`
   3. Derive `mime` from `realPath` extension (case-insensitive map: png/jpg/jpeg/gif/webp/svg → image
      types; else `application/octet-stream`); `kind = mime.startsWith('image/') ? 'image' : 'file'`.
-  4. `const media = await journalPublisher.uploadMedia({ bytes: content, contentType: mime, name: basename(realPath), timeoutMs: SHOW_FILE_UPLOAD_TIMEOUT_MS });` (timeout param added in T-2.5).
-     `if (!media) return { denied: 'upload-failed' };`
-  5. Build payload `{ blob_ref: media.media_id, content_type: media.content_type, name: basename,
-     filename: basename, size: media.size, ...(caption ? { caption } : {}) }` and
+  4. `const filename = path.basename(realPath);` (qualified — `path` is the namespace import at
+     `index.js:9`; there is no bare `basename`), then `const media = await
+     journalPublisher.uploadMedia({ bytes: content, contentType: mime, name: filename, timeoutMs:
+     SHOW_FILE_UPLOAD_TIMEOUT_MS });` (timeout param added in T-2.5). `if (!media) return { denied:
+     'upload-failed' };`
+  5. Build payload `{ blob_ref: media.media_id, content_type: media.content_type, name: filename,
+     filename, size: media.size, ...(caption ? { caption } : {}) }` and
      `journalPublish(session, kind === 'image' ? 'publishImage' : 'publishFile', payload);` (NOT
      `journalPublishUserItem` — no `markRead`). Do not set `from`.
   6. `return { ok: true, media_id: media.media_id, kind, realPath, size: content.length, sha256: media.sha256 };`
@@ -230,11 +233,14 @@ the mapped denial string; a relative path is refused by the schema.
 - Add `mcpExtras.share.show-file` server block to `mcp-config.json` (shape like the `browser` extra).
 - **Entrypoint must resolve to an absolute path** — a relative `args` (`./show-file-mcp.js`) would
   ENOENT because claude runs with the session workdir as `cwd` (`index.js:1025`) and the generic
-  resolver canonicalizes `command`, not `args` (`lib/mcp-config.js:105`). Either (a) extend
-  `buildMcpServers` to rewrite the `share` server's script `args` to `path.join(askUserBaseDir,
-  'show-file-mcp.js')` (mirroring the `ask-user` special-case at `:89`), or (b) generalize the
-  resolver to absolutize a relative script `args` for any Node extra. Prefer (a) for a minimal,
-  targeted change; note (b) as the cleaner generalization if the reviewer prefers it.
+  resolver canonicalizes `command`, not `args` (`lib/mcp-config.js:105`). Extend `buildMcpServers`
+  to rewrite the `share` server's script `args` to the absolute `` `${askUserBaseDir}/show-file-mcp.js` ``
+  (string construction — `askUserBaseDir` is already a param of `buildMcpServers`), mirroring the
+  `ask-user` special-case at `:89`. **Use string construction, NOT `path.join`** — `lib/mcp-config.js`
+  imports only `macifyMcpServers` (`:14`) and has no `path` binding, and with default-on the eager
+  `mcpConfigPathFor([])` at `index.js:190` builds the `share` server at module init, so a bare
+  `path.join` there would `ReferenceError` and prevent the bridge from starting. (If `path.join` is
+  preferred, add `import path from 'node:path'` to `lib/mcp-config.js` first.)
 - Register `share` in `knownMcpExtras()` / `EXTRA_FLAG_TO_NAME` **only** to support the opt-in
   `--share` veto flag (below). Note: the `index.js:193` startup check warns only when a *known flag*
   lacks a matching config block — it does NOT warn about a config block that isn't a known flag — so
@@ -247,35 +253,45 @@ absolute `show-file-mcp.js`.
 
 ### T-3.3: Default-on via effective-extras union (inheritance-safe)
 
-**File:** `index.js` (+ `lib/mcp-config.js` if the union helper lives there)
+**Files:** `lib/mcp-config.js` (pure logic — currently has zero `process.env` reads, so it is the
+clean testable home) + `index.js` (call sites only).
 
-- Define `DEFAULT_MCP_EXTRAS` behind an **env kill-switch** so default-on can be disabled without a
-  code edit + redeploy + restart on the live bridge (matches the spec's "operator-veto-able" language
-  and the repo's kill-switch convention for new capabilities):
-  `const DEFAULT_MCP_EXTRAS = process.env.SHOW_FILE_DEFAULT_ON === '0' ? [] : ['share'];`. Setting
-  `SHOW_FILE_DEFAULT_ON=0` in the bridge env + restart turns default-on off (the `--share` flag still
-  opts a session in). This is the cheap circuit-breaker for a default-on file-egress primitive.
-- Union the default into the **effective** extras **only** at the `mcpConfigPathFor(extras)` boundary
-  (`index.js:171` and its call sites) — i.e. compute `effective = Array.from(new Set([...resolvedExtras,
-  ...DEFAULT_MCP_EXTRAS]))` and pass `effective` to `mcpConfigPathFor`. **Do NOT** add the default to
-  the parsed/explicit extras array used for override-vs-inherit detection (`extractMcpExtraFlags`
-  result; the `extras.length > 0` checks at `index.js:4754`, `:4768`, `:4992`). This preserves: fresh
-  no-flag → `['share']`; no-flag restart/resume of a persisted `['share','browser']` → inherits both,
-  union idempotent, `browser` preserved; explicit `--browser` → `['browser','share']`.
+- Add two **pure, argument-taking** functions to `lib/mcp-config.js` (exported, so T-3.4 can unit-test
+  them by direct import like the existing `mcp-config.test.js` — index.js binds a TCP port at module
+  scope `:7044` and is never unit-imported, so this logic must NOT live there):
+  - `resolveDefaultExtras(envVal)` → `envVal === '0' ? [] : ['share']` (the env kill-switch, evaluated
+    from a passed-in value, not by reading `process.env` inside the function).
+  - `effectiveExtras(resolvedExtras, defaultExtras)` → `Array.from(new Set([...resolvedExtras,
+    ...defaultExtras]))` (dedup union).
+- In `index.js`: `const DEFAULT_MCP_EXTRAS = resolveDefaultExtras(process.env.SHOW_FILE_DEFAULT_ON);`
+  (the single `process.env` read stays at the call boundary). Setting `SHOW_FILE_DEFAULT_ON=0` in the
+  bridge env + restart turns default-on off (the `--share` flag still opts a session in) — the cheap
+  circuit-breaker for a default-on file-egress primitive.
+- Apply the union into the **effective** extras **only** at the `mcpConfigPathFor(extras)` boundary
+  (`index.js:171` and its call sites) — pass `effectiveExtras(resolvedExtras, DEFAULT_MCP_EXTRAS)` to
+  `mcpConfigPathFor`. **Do NOT** add the default to the parsed/explicit extras array used for
+  override-vs-inherit detection (`extractMcpExtraFlags` result; the `extras.length > 0` checks around
+  `index.js:4754`, `:4769`, `:4992`). This preserves: fresh no-flag → `['share']`; no-flag
+  restart/resume of a persisted `['share','browser']` → inherits both, union idempotent, `browser`
+  preserved; explicit `--browser` → `['browser','share']`.
 
 **Acceptance:** fresh no-flag session → `show_file` present; no-flag restart of a `['share','browser']`
 session → `browser` still present (regression guard); the parsed-extras override signal is unchanged.
 
 ### T-3.4: Tests — extra wiring + default selection
 
-**File:** `test/`
+**File:** `test/` (extend the existing `mcp-config.test.js`; all three below are direct-import unit
+tests of the pure `lib/mcp-config.js` functions — no monolith import, no port binding).
 
-- `share` extra resolves to an absolute entrypoint path (unit on the builder / resolver).
-- effective-extras union: `resolvedExtras=[]` → effective `['share']`; `['browser']` → `['browser',
-  'share']`; `['share','browser']` → `['share','browser']` (idempotent); and the parsed override
-  array is NOT mutated by the union (restart-inheritance regression guard).
-- kill-switch: with `SHOW_FILE_DEFAULT_ON=0`, `DEFAULT_MCP_EXTRAS=[]` so `resolvedExtras=[]` →
-  effective `[]` (no `share` injected); a `--share`-flagged session still resolves to `['share']`.
+- `buildMcpServers` resolves the `share` extra to an absolute entrypoint path.
+- `effectiveExtras`: `([],['share'])` → `['share']`; `(['browser'],['share'])` → `['browser','share']`;
+  `(['share','browser'],['share'])` → `['share','browser']` (idempotent); the input `resolvedExtras`
+  array is NOT mutated (restart-inheritance regression guard — assert the caller's parsed array is
+  untouched).
+- `resolveDefaultExtras`: `resolveDefaultExtras('0')` → `[]` (kill-switch); `resolveDefaultExtras(undefined)`
+  → `['share']`; and `effectiveExtras([], resolveDefaultExtras('0'))` → `[]` (no `share`), while a
+  `--share`-flagged session (`resolvedExtras=['share']`) still yields `['share']` even with the
+  kill-switch on.
 
 **Acceptance:** all green; the inheritance-preservation case is explicit.
 
