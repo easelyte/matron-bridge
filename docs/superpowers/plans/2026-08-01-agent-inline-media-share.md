@@ -383,6 +383,19 @@ outside-scope both denied with nothing posted. Record the outcome in the ship no
 - **Idempotency (Phase-3 review major, spec-deferred).** A lost HTTP success response after a
   successful upload+publish would duplicate the media on retry (P32). Already documented out-of-scope
   in the spec; a request-UUID dedup cache is the follow-up if it ever matters.
+- **Cross-session OS-isolation (final-review blockers B1/B2, accepted residuals — #458).** The final
+  full-branch review flagged that the per-session capability token is a same-UID environment bearer:
+  a `Bash`-capable session can read another session's `SHOW_FILE_TOKEN` via `/proc/<pid>/environ` and
+  post into its conversation (B1). This is only exploitable between two same-UID `Bash` sessions —
+  i.e. the operator's own sessions (self-principal); #458's curated (Nastia) toolset has NO `Bash`, so
+  it cannot read `/proc` or steal a token. True multi-principal isolation (distinct OS uids/namespaces
+  or peer-credential IPC) is #458's explicit domain (the operator's "toolset boundary contains blast
+  radius" + later separate-server option). **B2** (macOS parent-symlink race between `open()` and
+  `realpath()`) is macOS-only and pre-existing — the Linux production bridge resolves via fd-pinned
+  `/proc/self/fd` (immune); the guard already documents the macOS limitation as single-user-dev
+  acceptable. Both accepted for the current single-principal deployment; #458 MUST close B1 before
+  shipping a second principal. Fixed in the same review: session-kill-on-pin-failure (fail-closed),
+  short-read/truncation (read-loop + re-stat), saturated denial mapping, per-session in-flight cap.
 - **Latent mirror-path bug** (`journalMirrorUserMedia` `name`/`from` fields) is pre-existing and out
   of scope — file as a separate bridge loop.
 
