@@ -122,10 +122,14 @@ unit-imported, so the logic must NOT live there — same testability rule that p
 `lib/mcp-config.js`, and keeps the ~7.5k-line `index.js` monolith from growing, P18) + `index.js`
 (config parsing at the boundary + a thin endpoint wrapper in T-2.3).
 
-- **`lib/show-file.js`** exports `async function shareAgentMedia({ filePath, caption, workdir,
-  artifactRoots, maxBytes, uploadTimeoutMs, deps })` where `deps = { validateAndOpen, FileLinkDenied,
-  uploadMedia, publish }` are injected (real ones in index.js; mocks in the test). It imports `path`
-  itself (`import path from 'node:path'`) for `path.basename` and the ext→mime map. Returns
+- **`lib/show-file.js`** exports `async function shareAgentMedia({ filePath, caption, pinnedRoots,
+  maxBytes, uploadTimeoutMs, deps })` where `deps = { validateAndOpen, FileLinkDenied, uploadMedia,
+  publish }` are injected (real ones in index.js; mocks in the test), and `pinnedRoots` is the
+  **pre-pinned** roots object from `pinAllowedRoots([workdir, ...artifactRoots])` (Phase-1 hardening:
+  `validateAndOpen` now REJECTS raw string roots with `bad-workdir` and only accepts the pinned
+  `{[PINNED_ROOTS]:true, roots:[{realPath,dev,ino}]}` object, so the workdir+artifact roots are pinned
+  ONCE at the boundary in T-2.3, not rebuilt per request). It imports `path` itself
+  (`import path from 'node:path'`) for `path.basename` and the ext→mime map. Returns
   `{ok, media_id, kind, realPath, size, sha256}` or `{denied: reason}`.
 - **`index.js` config constants** (parsed once at the boundary, passed into `shareAgentMedia`):
   - `SHOW_FILE_MAX_BYTES = 50 * 1024 * 1024`.
@@ -145,8 +149,8 @@ unit-imported, so the logic must NOT live there — same testability rule that p
   - Extend the `lib/file-link-guard.js` import in index.js (`:52` imports only `checkFileLink`) to
     also export `validateAndOpen` + `FileLinkDenied` for injection into `shareAgentMedia`'s `deps`.
 - **`shareAgentMedia` body** (in `lib/show-file.js`):
-  1. `const roots = [workdir, ...artifactRoots];`
-  2. `try { var { content, realPath } = await deps.validateAndOpen(filePath, { allowedRoots: roots, maxBytes }); } catch (e) { if (e instanceof deps.FileLinkDenied) return { denied: e.reason }; throw e; }`
+  1. (Roots are pre-pinned by the caller — `pinnedRoots` param, see T-2.3.)
+  2. `try { var { content, realPath } = await deps.validateAndOpen(filePath, { allowedRoots: pinnedRoots, maxBytes }); } catch (e) { if (e instanceof deps.FileLinkDenied) return { denied: e.reason }; throw e; }`
   3. Derive `mime` from `realPath` extension (case-insensitive map: png/jpg/jpeg/gif/webp/svg → image
      types; else `application/octet-stream`); `kind = mime.startsWith('image/') ? 'image' : 'file'`.
   4. `const filename = path.basename(realPath);` (from the module-scope `import path from 'node:path'`),
@@ -181,10 +185,15 @@ invalid `SHOW_FILE_UPLOAD_TIMEOUT_MS` (`-1`, `Infinity`, non-numeric, `>300000`)
   `{"error":"internal error"}` (never fall through to the shared `Invalid JSON` catch, `:7037`).
 - Parse `{ path, caption, token }`; missing `path` or `token` → `400`.
 - Resolve session: `let session; for (const s of sessions.values()) if (s.showFileToken === token) { session = s; break; }` → no match → `403 {"error":"invalid token"}`. Ignore any body `roomId`.
-- `const r = await shareAgentMedia({ filePath: path, caption, workdir: session.workdir, artifactRoots:
-  SHOW_FILE_ARTIFACT_ROOTS, maxBytes: SHOW_FILE_MAX_BYTES, uploadTimeoutMs: SHOW_FILE_UPLOAD_TIMEOUT_MS,
-  deps: { validateAndOpen, FileLinkDenied, uploadMedia: journalPublisher.uploadMedia, publish: (m, p) =>
-  journalPublish(session, m, p) } });` (imported from `lib/show-file.js`).
+- **Pin the roots once per session (cached on the session), then call the helper.** `pinAllowedRoots`
+  is async and captures each root's `{realPath,dev,ino}`, so pin lazily on first use and cache:
+  `try { session.showFilePinnedRoots ??= await pinAllowedRoots([session.workdir, ...SHOW_FILE_ARTIFACT_ROOTS]); } catch (e) { /* FileLinkDenied('bad-workdir') → 404, don't 500 */ }`
+  (import `pinAllowedRoots` from `lib/file-link-guard.js` alongside `validateAndOpen`/`FileLinkDenied`).
+  Then: `const r = await shareAgentMedia({ filePath: path, caption, pinnedRoots:
+  session.showFilePinnedRoots, maxBytes: SHOW_FILE_MAX_BYTES, uploadTimeoutMs:
+  SHOW_FILE_UPLOAD_TIMEOUT_MS, deps: { validateAndOpen, FileLinkDenied, uploadMedia:
+  journalPublisher.uploadMedia, publish: (m, p) => journalPublish(session, m, p) } });` (imported from
+  `lib/show-file.js`).
 - Status map via a **pure `denialToStatus(reason)` function also exported from `lib/show-file.js`** (so
   it's unit-testable): `r.ok` → `200 {ok:true, media_id:r.media_id, kind:r.kind}`; else
   `denialToStatus(r.denied)`: `sensitive`/`outside-scope` → 403; `too-large` → 413;
