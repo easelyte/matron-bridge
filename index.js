@@ -49,7 +49,9 @@ import {
   JOURNAL_CONTROL_HELP_NOTE,
 } from './lib/command-dispatch.js';
 import { sendPrintInterrupt } from './lib/print-interrupt.js';
-import { checkFileLink } from './lib/file-link-guard.js';
+// eslint-disable-next-line no-unused-vars -- validateAndOpen/FileLinkDenied are injected by the T-2.3 endpoint.
+import { checkFileLink, validateAndOpen, FileLinkDenied } from './lib/file-link-guard.js';
+import { parseShowFileUploadTimeoutMs } from './lib/show-file.js';
 import { createJournalPublisher } from './lib/journal-publisher.js';
 import { createRpcRequestHandler } from './lib/journal-rpc.js';
 import { createRecentFolders } from './lib/recent-folders.js';
@@ -208,6 +210,20 @@ const SERVER_LABEL = process.env.SERVER_LABEL || (() => {
 const HMAC_SECRET = process.env.HMAC_SECRET || '';
 const VIEWER_BASE_URL = process.env.VIEWER_BASE_URL || '';
 const LINK_EXPIRY_MS = parseInt(process.env.LINK_EXPIRY_MS || String(15 * 60 * 1000), 10);
+// eslint-disable-next-line no-unused-vars -- consumed by the T-2.3 endpoint.
+const SHOW_FILE_MAX_BYTES = 50 * 1024 * 1024;
+// eslint-disable-next-line no-unused-vars -- consumed by the T-2.3 endpoint.
+const SHOW_FILE_UPLOAD_TIMEOUT_MS = parseShowFileUploadTimeoutMs(
+  process.env.SHOW_FILE_UPLOAD_TIMEOUT_MS,
+);
+const SHOW_FILE_ARTIFACT_ROOTS = (process.env.SHOW_FILE_ARTIFACT_ROOTS || '')
+  .split(':')
+  .filter(Boolean);
+for (const artifactRoot of SHOW_FILE_ARTIFACT_ROOTS) {
+  if (!path.isAbsolute(artifactRoot) || !fs.existsSync(artifactRoot)) {
+    throw new Error(`Invalid SHOW_FILE_ARTIFACT_ROOTS entry: ${JSON.stringify(artifactRoot)}`);
+  }
+}
 const SECRETS_DIR = path.join(os.homedir(), '.secrets');
 const SECRET_TTL_MS = 3600000; // 1 hour
 const BRIDGE_CLAUDE_MD_PATH = process.env.BRIDGE_CLAUDE_MD_PATH || DEFAULT_BRIDGE_CLAUDE_MD_PATH;
