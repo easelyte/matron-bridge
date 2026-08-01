@@ -110,42 +110,62 @@ Cases:
   cleanup — the ~9 `sessions.delete` sites drop the object and the token with it).
 
 **Acceptance:** every spawned claude child (print AND interactive mode) has `SHOW_FILE_TOKEN` in env
-== its session's `showFileToken`; two concurrent sessions have distinct tokens; both spawn seams
-tested.
+== its session's `showFileToken`; two concurrent sessions have distinct tokens. Spawn-env injection is
+verified via the T-4.1 run-it gate in BOTH modes — not a unit test (this repo does not unit-test
+`index.js` spawn wiring; `BRIDGE_ROOM_ID` injection has no unit test either).
 
-### T-2.2: Emit helper `journalShareAgentMedia` + config constants
+### T-2.2: Emit logic as a dependency-injected module + config constants
 
-**File:** `index.js`
+**Files:** `lib/show-file.js` (new — the emit logic, dependency-injected so T-2.4 can unit-test it;
+`index.js` binds a TCP port + runs `main()` at module scope, `:7044`/`:7518`, and is never
+unit-imported, so the logic must NOT live there — same testability rule that put T-3.3's functions in
+`lib/mcp-config.js`, and keeps the ~7.5k-line `index.js` monolith from growing, P18) + `index.js`
+(config parsing at the boundary + a thin endpoint wrapper in T-2.3).
 
-- **Imports (blocker if skipped):** `index.js:52` imports only `checkFileLink` from
-  `lib/file-link-guard.js`, and `path` is a namespace import at `:9`. Extend the guard import to add
-  `validateAndOpen` and `FileLinkDenied`, and use `path.basename(...)` — a bare
-  `validateAndOpen`/`FileLinkDenied`/`basename` is unbound → `ReferenceError` (502 on every call).
-- Constants: `SHOW_FILE_MAX_BYTES = 50 * 1024 * 1024`; `SHOW_FILE_UPLOAD_TIMEOUT_MS =
-  Number(process.env.SHOW_FILE_UPLOAD_TIMEOUT_MS) || 30000`; `SHOW_FILE_ARTIFACT_ROOTS` parsed at
-  startup from `process.env.SHOW_FILE_ARTIFACT_ROOTS` (colon-separated). Parse rule: split on `:`,
-  drop empty segments; each remaining entry must be absolute AND exist (`fs.existsSync`) — otherwise
-  **throw at startup** (fail loud, V4/P3) with the offending entry named. Default: `[]`.
-- `async function journalShareAgentMedia(session, { path: filePath, caption })`:
-  1. `const roots = [session.workdir, ...SHOW_FILE_ARTIFACT_ROOTS];`
-  2. `try { var { content, realPath } = await validateAndOpen(filePath, { allowedRoots: roots, maxBytes: SHOW_FILE_MAX_BYTES }); } catch (e) { if (e instanceof FileLinkDenied) return { denied: e.reason }; throw e; }`
+- **`lib/show-file.js`** exports `async function shareAgentMedia({ filePath, caption, workdir,
+  artifactRoots, maxBytes, uploadTimeoutMs, deps })` where `deps = { validateAndOpen, FileLinkDenied,
+  uploadMedia, publish }` are injected (real ones in index.js; mocks in the test). It imports `path`
+  itself (`import path from 'node:path'`) for `path.basename` and the ext→mime map. Returns
+  `{ok, media_id, kind, realPath, size, sha256}` or `{denied: reason}`.
+- **`index.js` config constants** (parsed once at the boundary, passed into `shareAgentMedia`):
+  - `SHOW_FILE_MAX_BYTES = 50 * 1024 * 1024`.
+  - `SHOW_FILE_UPLOAD_TIMEOUT_MS`: parse + **validate** as a finite positive integer within a sane
+    upper bound (≤ 300000). `const t = Number(process.env.SHOW_FILE_UPLOAD_TIMEOUT_MS); const
+    SHOW_FILE_UPLOAD_TIMEOUT_MS = Number.isInteger(t) && t > 0 && t <= 300000 ? t : 30000;` — an
+    out-of-range/`-1`/`Infinity`/non-numeric value falls back to 30000 with an **unconditional
+    `console.warn`** naming the bad value (a `Number(env) || 30000` alone would let `-1`/`Infinity`
+    clamp Node's timer to ~1 ms and fail every upload). Fail-loud-at-startup is an acceptable
+    alternative; pick the warn-and-default form for a config typo, matching the deliberate
+    non-fatal-vs-fatal split (ARTIFACT_ROOTS below is fatal because a bad root is a security-scope
+    error, not a perf knob).
+  - `SHOW_FILE_ARTIFACT_ROOTS`: parse at startup from `process.env.SHOW_FILE_ARTIFACT_ROOTS`
+    (colon-separated). Split on `:`, drop empty segments; each remaining entry must be absolute AND
+    exist (`fs.existsSync`, already bound in index.js) — otherwise **throw at startup** (fail loud,
+    V4/P3) naming the offending entry. Default: `[]`.
+  - Extend the `lib/file-link-guard.js` import in index.js (`:52` imports only `checkFileLink`) to
+    also export `validateAndOpen` + `FileLinkDenied` for injection into `shareAgentMedia`'s `deps`.
+- **`shareAgentMedia` body** (in `lib/show-file.js`):
+  1. `const roots = [workdir, ...artifactRoots];`
+  2. `try { var { content, realPath } = await deps.validateAndOpen(filePath, { allowedRoots: roots, maxBytes }); } catch (e) { if (e instanceof deps.FileLinkDenied) return { denied: e.reason }; throw e; }`
   3. Derive `mime` from `realPath` extension (case-insensitive map: png/jpg/jpeg/gif/webp/svg → image
      types; else `application/octet-stream`); `kind = mime.startsWith('image/') ? 'image' : 'file'`.
-  4. `const filename = path.basename(realPath);` (qualified — `path` is the namespace import at
-     `index.js:9`; there is no bare `basename`), then `const media = await
-     journalPublisher.uploadMedia({ bytes: content, contentType: mime, name: filename, timeoutMs:
-     SHOW_FILE_UPLOAD_TIMEOUT_MS });` (timeout param added in T-2.5). `if (!media) return { denied:
+  4. `const filename = path.basename(realPath);` (from the module-scope `import path from 'node:path'`),
+     then `const media = await deps.uploadMedia({ bytes: content, contentType: mime, name: filename,
+     timeoutMs: uploadTimeoutMs });` (timeout param added in T-2.5). `if (!media) return { denied:
      'upload-failed' };`
   5. Build payload `{ blob_ref: media.media_id, content_type: media.content_type, name: filename,
      filename, size: media.size, ...(caption ? { caption } : {}) }` and
-     `journalPublish(session, kind === 'image' ? 'publishImage' : 'publishFile', payload);` (NOT
-     `journalPublishUserItem` — no `markRead`). Do not set `from`.
+     `deps.publish(kind === 'image' ? 'publishImage' : 'publishFile', payload);`. index.js injects
+     `publish: (method, payload) => journalPublish(session, method, payload)` — the buffering wrapper,
+     NOT `journalPublishUserItem` (which also fires `markRead`). Do not set `from`.
   6. `return { ok: true, media_id: media.media_id, kind, realPath, size: content.length, sha256: media.sha256 };`
 
-**Acceptance:** helper returns `{ok, media_id, kind, realPath, size, sha256}` on success; a
-`FileLinkDenied` reason surfaces as `{denied: reason}` with no upload; `uploadMedia` → null yields
-`{denied:'upload-failed'}`; payload carries both `filename` and `name`; `SHOW_FILE_ARTIFACT_ROOTS`
-with a bad entry aborts startup.
+**Acceptance:** `shareAgentMedia` (in `lib/show-file.js`, injected mocks) returns
+`{ok, media_id, kind, realPath, size, sha256}` on success; a `deps.FileLinkDenied` reason surfaces as
+`{denied: reason}` with no upload; `deps.uploadMedia` → null yields `{denied:'upload-failed'}`; payload
+carries both `filename` and `name`; `SHOW_FILE_ARTIFACT_ROOTS` with a bad entry aborts startup; an
+invalid `SHOW_FILE_UPLOAD_TIMEOUT_MS` (`-1`, `Infinity`, non-numeric, `>300000`) warns + falls back to
+30000 (asserted via the parse helper).
 
 ### T-2.3: `POST /show-file` endpoint
 
@@ -161,10 +181,14 @@ with a bad entry aborts startup.
   `{"error":"internal error"}` (never fall through to the shared `Invalid JSON` catch, `:7037`).
 - Parse `{ path, caption, token }`; missing `path` or `token` → `400`.
 - Resolve session: `let session; for (const s of sessions.values()) if (s.showFileToken === token) { session = s; break; }` → no match → `403 {"error":"invalid token"}`. Ignore any body `roomId`.
-- `const r = await journalShareAgentMedia(session, { path, caption });`
-- Status map: `r.ok` → `200 {ok:true, media_id:r.media_id, kind:r.kind}`; else by `r.denied`:
-  `sensitive`/`outside-scope` → 403; `too-large` → 413; `not-a-file`/`unreadable`/`symlink`/
-  `relative-path`/`bad-workdir` → 404; `upload-failed` → 502.
+- `const r = await shareAgentMedia({ filePath: path, caption, workdir: session.workdir, artifactRoots:
+  SHOW_FILE_ARTIFACT_ROOTS, maxBytes: SHOW_FILE_MAX_BYTES, uploadTimeoutMs: SHOW_FILE_UPLOAD_TIMEOUT_MS,
+  deps: { validateAndOpen, FileLinkDenied, uploadMedia: journalPublisher.uploadMedia, publish: (m, p) =>
+  journalPublish(session, m, p) } });` (imported from `lib/show-file.js`).
+- Status map via a **pure `denialToStatus(reason)` function also exported from `lib/show-file.js`** (so
+  it's unit-testable): `r.ok` → `200 {ok:true, media_id:r.media_id, kind:r.kind}`; else
+  `denialToStatus(r.denied)`: `sensitive`/`outside-scope` → 403; `too-large` → 413;
+  `not-a-file`/`unreadable`/`symlink`/`relative-path`/`bad-workdir` → 404; `upload-failed` → 502.
 - **Audit log** (one structured line, via **unconditional `console.log`/`console.warn`** — NOT the
   `DEBUG=1`-gated `debug()` helper at `index.js:378`, so this security-relevant egress trail (P34)
   isn't silently killed by a future debug-quieting): on ok `{event:'show_file', roomId: session.roomId, realPath:
@@ -175,20 +199,21 @@ with a bad entry aborts startup.
 **Acceptance:** AC #3/#4/#5/#6 status codes exact; body >64 KB → 413; unexpected throw → 502 (not
 `Invalid JSON`); audit line emitted with the documented fields.
 
-### T-2.4: Unit tests — helper + endpoint
+### T-2.4: Unit tests — `lib/show-file.js`
 
-**File:** `test/`
+**File:** `test/` (new `show-file.test.js`, direct import of `lib/show-file.js` — no `index.js` import,
+no port binding; endpoint wiring is verified live in T-4.1, consistent with the repo not unit-testing
+`index.js` HTTP handlers — `/secret`, `/share-sensitive` have no unit tests either).
 
-- Helper (mock `validateAndOpen`, `journalPublisher.uploadMedia`, `journalPublish`): image ext →
-  `publishImage`; non-image → `publishFile`; payload has BOTH `filename` and `name`; caption
-  present/absent; each `FileLinkDenied` reason → `{denied:reason}` no upload; `uploadMedia`→null →
-  `upload-failed`; success return includes realPath/size/sha256.
-- Endpoint: missing token → 400; unknown token → 403; valid token resolves the right session; body
-  `roomId` ignored; each denial reason → its status; unexpected throw → 502 `internal error`; body
-  >64 KB → 413; fixture PNG under workdir + valid token → 200 + `journalPublish` called with a
-  `filename`.
+- `shareAgentMedia` (injected mock `deps`): image ext → `deps.publish('publishImage', ...)`; non-image
+  → `deps.publish('publishFile', ...)`; payload has BOTH `filename` and `name`; caption present/absent;
+  each `deps.FileLinkDenied` reason → `{denied:reason}` with no `deps.uploadMedia` call;
+  `deps.uploadMedia`→null → `{denied:'upload-failed'}`; success return includes realPath/size/sha256.
+- `denialToStatus`: each reason → its documented HTTP status; an unknown reason → 502 (safe default).
+- timeout-parse helper: `-1`/`Infinity`/non-numeric/`>300000` → 30000 (+warn); a valid int → itself.
 
-**Acceptance:** all green.
+**Acceptance:** all green. Endpoint-level cases (token 400/403, body-cap 413, `roomId` ignored) are
+covered by the T-4.1 run-it gate.
 
 ### T-2.5: Upload deadline in `uploadMedia`
 
