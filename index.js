@@ -16,7 +16,14 @@ import { createToolStreamPump, toolOutputSnippet, decodeByteExact } from './lib/
 import { computeEditDiff } from './lib/edit-diff.js';
 import { createInteractiveSession } from './lib/interactive-session.js';
 import { extractUrls, isIdleReadyScreen, extractPreamble, preambleMatchesText } from './lib/prompt-detector.js';
-import { buildMcpServers, extractMcpExtraFlags, extractPromptFlag, knownMcpExtras } from './lib/mcp-config.js';
+import {
+  buildMcpServers,
+  effectiveExtras,
+  extractMcpExtraFlags,
+  extractPromptFlag,
+  knownMcpExtras,
+  resolveDefaultExtras,
+} from './lib/mcp-config.js';
 import { modelFromEvent, VALID_ALIAS_HINT } from './lib/model-aliases.js';
 import { switchModelInSession, modelButtons, planPrintModelSwitch } from './lib/model-command.js';
 import {
@@ -176,6 +183,7 @@ const RECENT_FOLDERS_FILE = path.join(os.homedir(), '.matron-bridge-folders.json
 // generated[.<extras>].json`) and pass its path to claude. Each browser stack
 // is ~400M resident, so defaulting to none keeps lightweight sessions lean.
 const RAW_MCP_CONFIG = JSON.parse(fs.readFileSync(path.join(__dirname, 'mcp-config.json'), 'utf-8'));
+const DEFAULT_MCP_EXTRAS = resolveDefaultExtras(process.env.SHOW_FILE_DEFAULT_ON);
 const mcpConfigPathCache = new Map(); // sorted-extras-key -> generated file path
 
 function mcpConfigPathFor(extras = []) {
@@ -1062,7 +1070,8 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   const mcpExtras = Array.isArray(options.mcpExtras)
     ? options.mcpExtras
     : (Array.isArray(persistedForRoom?.mcpExtras) ? persistedForRoom.mcpExtras : []);
-  const shareEnabled = mcpExtras.includes('share');
+  const effectiveMcpExtras = effectiveExtras(mcpExtras, DEFAULT_MCP_EXTRAS);
+  const shareEnabled = effectiveMcpExtras.includes('share');
   const showFileToken = shareEnabled ? randomUUID() : undefined;
   const showFilePinnedRoots = shareEnabled
     ? pinAllowedRootsSync([cwd, ...SHOW_FILE_ARTIFACT_ROOTS])
@@ -1082,7 +1091,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     '--disallowed-tools', 'AskUserQuestion',
     '--append-system-prompt', BRIDGE_SYSTEM_PROMPT,
     '--include-partial-messages',
-    '--mcp-config', mcpConfigPathFor(mcpExtras),
+    '--mcp-config', mcpConfigPathFor(effectiveMcpExtras),
     '--settings', JSON.stringify({
       permissions: BRIDGE_ROOT_PERMISSIONS,
       hooks: {
@@ -1637,7 +1646,8 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
   const mcpExtras = Array.isArray(options.mcpExtras)
     ? options.mcpExtras
     : (Array.isArray(persistedForRoom?.mcpExtras) ? persistedForRoom.mcpExtras : []);
-  const shareEnabled = mcpExtras.includes('share');
+  const effectiveMcpExtras = effectiveExtras(mcpExtras, DEFAULT_MCP_EXTRAS);
+  const shareEnabled = effectiveMcpExtras.includes('share');
   const showFileToken = shareEnabled ? randomUUID() : undefined;
   const showFilePinnedRoots = shareEnabled
     ? pinAllowedRootsSync([cwd, ...SHOW_FILE_ARTIFACT_ROOTS])
@@ -1678,7 +1688,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     // Matrix. Print-mode kept it disallowed because there was no way to
     // surface the TUI prompt; that constraint no longer applies.
     '--append-system-prompt', BRIDGE_SYSTEM_PROMPT,
-    '--mcp-config', mcpConfigPathFor(mcpExtras),
+    '--mcp-config', mcpConfigPathFor(effectiveMcpExtras),
     '--settings', JSON.stringify(settings),
   );
   if (model) {
