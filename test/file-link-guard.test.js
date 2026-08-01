@@ -1,10 +1,11 @@
 import { describe, it, expect, beforeAll, afterAll, vi } from 'vitest';
-import { mkdtempSync, writeFileSync, symlinkSync, rmSync, mkdirSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, symlinkSync, rmSync, mkdirSync, renameSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import fsp from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import {
-  isSensitivePath, checkFileLink, validateAndOpen, FileLinkDenied, MAX_VIEW_BYTES,
+  isSensitivePath, checkFileLink, validateAndOpen, pinAllowedRoots, FileLinkDenied, MAX_VIEW_BYTES,
 } from '../lib/file-link-guard.js';
 
 describe('isSensitivePath', () => {
@@ -150,14 +151,16 @@ describe('validateAndOpen', () => {
   });
 
   it('allows a realPath under one of several allowed roots', async () => {
+    const allowedRoots = await pinAllowedRoots([dir, outside]);
     const { content, realPath } = await validateAndOpen(path.join(outside, 'target.txt'), {
-      allowedRoots: [dir, outside],
+      allowedRoots,
     });
     expect(content.toString('utf-8')).toBe('outside content\n');
     expect(realPath).toBe(path.join(outside, 'target.txt'));
   });
 
   it('rejects a realPath outside every allowed root before reading it', async () => {
+    const allowedRoots = await pinAllowedRoots([dir]);
     const actualOpen = fsp.open.bind(fsp);
     const readSpies = [];
     const openSpy = vi.spyOn(fsp, 'open').mockImplementation(async (...args) => {
@@ -167,7 +170,7 @@ describe('validateAndOpen', () => {
     });
 
     try {
-      expect(await denied(path.join(outside, 'target.txt'), { allowedRoots: [dir] }))
+      expect(await denied(path.join(outside, 'target.txt'), { allowedRoots }))
         .toBe('outside-scope');
       expect(readSpies).toHaveLength(1);
       expect(readSpies[0]).not.toHaveBeenCalled();
@@ -178,26 +181,53 @@ describe('validateAndOpen', () => {
   });
 
   it('gives outside-scope precedence over sensitive and oversized denials', async () => {
-    expect(await denied(path.join(outside, 'config.json'), { allowedRoots: [dir] }))
+    const allowedRoots = await pinAllowedRoots([dir]);
+    expect(await denied(path.join(outside, 'config.json'), { allowedRoots }))
       .toBe('outside-scope');
-    expect(await denied(path.join(outside, 'target.txt'), { allowedRoots: [dir], maxBytes: 1 }))
+    expect(await denied(path.join(outside, 'target.txt'), { allowedRoots, maxBytes: 1 }))
       .toBe('outside-scope');
   });
 
   it('canonicalizes symlinked allowed roots', async () => {
     const rootLink = path.join(outside, 'root-link');
     symlinkSync(dir, rootLink);
+    const allowedRoots = await pinAllowedRoots([rootLink]);
     const { content, realPath } = await validateAndOpen(path.join(dir, 'ok.txt'), {
-      allowedRoots: [rootLink],
+      allowedRoots,
     });
     expect(content.toString('utf-8')).toBe('hello guard\n');
     expect(realPath).toBe(path.join(dir, 'ok.txt'));
   });
 
   it('rejects an allowed root that does not resolve', async () => {
-    expect(await denied(path.join(dir, 'ok.txt'), {
-      allowedRoots: [path.join(dir, 'missing-root')],
-    })).toBe('bad-workdir');
+    await expect(pinAllowedRoots([path.join(dir, 'missing-root')]))
+      .rejects.toMatchObject({ reason: 'bad-workdir' });
+  });
+
+  it('rejects a pinned root that is replaced before validation', async () => {
+    const parent = mkdtempSync(path.join(tmpdir(), 'flg-root-swap-'));
+    const approved = path.join(parent, 'approved');
+    const moved = path.join(parent, 'moved');
+    mkdirSync(approved);
+    writeFileSync(path.join(outside, 'neutral.txt'), 'must not escape\n');
+    const allowedRoots = await pinAllowedRoots([approved]);
+    renameSync(approved, moved);
+    symlinkSync(outside, approved);
+    try {
+      expect(await denied(path.join(approved, 'neutral.txt'), { allowedRoots })).toBe('bad-workdir');
+    } finally {
+      rmSync(parent, { recursive: true, force: true });
+    }
+  });
+
+  it('rejects a FIFO without blocking in open or attempting a read', async () => {
+    const fifo = path.join(dir, 'agent.fifo');
+    expect(spawnSync('mkfifo', [fifo]).status).toBe(0);
+    const result = await Promise.race([
+      denied(fifo, { workdir: dir }),
+      new Promise((resolve) => setTimeout(() => resolve('timed-out'), 500)),
+    ]);
+    expect(result).toBe('not-a-file');
   });
 
   it('exports a 5MB default cap', () => {
