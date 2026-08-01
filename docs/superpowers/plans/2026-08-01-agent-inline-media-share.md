@@ -301,13 +301,20 @@ clean testable home) + `index.js` (call sites only).
   (the single `process.env` read stays at the call boundary). Setting `SHOW_FILE_DEFAULT_ON=0` in the
   bridge env + restart turns default-on off (the `--share` flag still opts a session in) — the cheap
   circuit-breaker for a default-on file-egress primitive.
-- Apply the union into the **effective** extras **only** at the `mcpConfigPathFor(extras)` boundary
-  (`index.js:171` and its call sites) — pass `effectiveExtras(resolvedExtras, DEFAULT_MCP_EXTRAS)` to
-  `mcpConfigPathFor`. **Do NOT** add the default to the parsed/explicit extras array used for
-  override-vs-inherit detection (`extractMcpExtraFlags` result; the `extras.length > 0` checks around
-  `index.js:4754`, `:4769`, `:4992`). This preserves: fresh no-flag → `['share']`; no-flag
-  restart/resume of a persisted `['share','browser']` → inherits both, union idempotent, `browser`
-  preserved; explicit `--browser` → `['browser','share']`.
+- Compute `const effectiveMcpExtras = effectiveExtras(mcpExtras, DEFAULT_MCP_EXTRAS)` ONCE per spawn
+  in both `createSession` and `createInteractiveSessionForRoom`, right after the parsed `mcpExtras` is
+  resolved (`index.js:1036-1038` and the interactive equivalent) and **before** the Phase-2
+  `shareEnabled` gate. Use `effectiveMcpExtras` for BOTH: (a) `mcpConfigPathFor(effectiveMcpExtras)`
+  (so the `share` MCP server is spawned), AND (b) **the `shareEnabled = ...includes('share')` gate the
+  Phase-2 fix added at `index.js:1065`/`:1640`** — that gate currently reads the parsed `mcpExtras`, so
+  without this it would compute `shareEnabled=false` for a default-on no-flag session and mint no token
+  (breaking AC#1). Change those two gate lines to read `effectiveMcpExtras.includes('share')`.
+- **Do NOT** add the default to the parsed/explicit `mcpExtras` array used for override-vs-inherit
+  detection (`extractMcpExtraFlags` result; the `extras.length > 0` checks around `index.js:4754`,
+  `:4769`, `:4992`) or to what gets persisted — only the derived `effectiveMcpExtras` carries the
+  default. This preserves: fresh no-flag → effective `['share']`; no-flag restart/resume of a persisted
+  `['share','browser']` → inherits both, union idempotent, `browser` preserved; explicit `--browser` →
+  effective `['browser','share']`.
 
 **Acceptance:** fresh no-flag session → `show_file` present; no-flag restart of a `['share','browser']`
 session → `browser` still present (regression guard); the parsed-extras override signal is unchanged.
