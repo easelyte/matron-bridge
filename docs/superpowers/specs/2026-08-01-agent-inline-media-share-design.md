@@ -2,7 +2,7 @@
 title: Agent-initiated inline media share (`show_file`)
 date: 2026-08-01
 status: draft
-revision: 2
+revision: 3
 repo: easelyte/claude-matrix-bridge (branch agent-inline-media)
 risk: medium
 execution_tier: slim
@@ -13,13 +13,17 @@ related_principles:
   - P8 Guard Boundary Inputs
   - P3 Fail Visible
   - P34 Observability Before Automation
+open_decisions:
+  - "share default-on vs explicit opt-in (Component 1 / Security): spec commits to default-on, workdir-scoped; operator can flip to opt-in. Reviewers split on requires_operator_judgement — surfaced."
 rejected_alternatives:
-  - "B (image-only show_image): drops file/attachment + PDF support; PDFs/reports are a real artifact class, trim not worth it."
-  - "A (unscoped MVP, scope later): the path guard IS the security-load-bearing part (P67/P15); shipping unscoped first cuts the wrong corner."
-  - "Output-marker trigger ([[show:/path]] in model text): fragile parse, pollutes reply stream, no structured error path. MCP tool is the established pattern."
-  - "Data-URI inline embed (no upload): a second render path for marginal gain on tiny SVGs; violates P59 (parallel path). The media store already renders images inline."
-  - "Denylist-only path scope (revision 1): rejected in review — a neutrally-named sensitive file (/var/lib/app/prod.db) sails through the finite pattern list, so denylist-only is not an egress boundary (P15). Replaced with workdir + artifact-roots allowlist."
-  - "roomId in the request body as routing identity (revision 1): rejected in review — any shell-capable agent can enumerate /sessions and post to another room (P67). Replaced with a per-session capability token."
+  - "B (image-only show_image): drops PDF/file support; real artifact class, trim not worth it."
+  - "A (unscoped MVP, scope later): the path guard IS the security-load-bearing part (P67/P15)."
+  - "Output-marker trigger: fragile parse, pollutes reply stream, no structured error path."
+  - "Data-URI inline embed: a second render path for marginal gain; violates P59."
+  - "Denylist-only scope (rev1): a neutrally-named secret sails through; not an egress boundary (P15)."
+  - "roomId in request body as routing identity (rev1): agent can enumerate /sessions and spoof (P67). Replaced with per-session capability token."
+  - "/tmp as a default allowed root (rev2): globally shared, so it relocates the neutral-name leak under a shared root (Codex rev2 B1). Replaced with workdir-only default + opt-in roots."
+  - "Separate token→roomId map (rev2): cleanup misses ~9 teardown seams / survives session replacement (P67). Replaced with token stored on the session object."
 ---
 
 # Agent-initiated inline media share (`show_file`)
@@ -30,67 +34,73 @@ When a bridge (Claude Code) session generates a file on the VPS — a rendered P
 diagram, a PDF report, a screenshot — there is no way for the session to put it in front of
 the operator. The operator must SSH into the VPS and open the file by hand. The prior
 workaround (an HMAC viewer link) fails for binary/image content: the viewer's `/view` route
-renders every file as escaped UTF-8 text in a `<pre>` block (`viewer/server.js:180`), so an
-image comes out as garbage; the binary-safe `/download` route forces an attachment download
-and has no bridge caller. The result is the friction the operator hit: "give me a link to the
-SVG" → "I can't."
+renders every file as escaped UTF-8 text in a `<pre>` block, so an image comes out as garbage;
+the binary-safe `/download` route forces an attachment download and has no bridge caller. The
+result is the friction the operator hit: "give me a link to the SVG" → "I can't."
 
 ## What already exists (do NOT rebuild)
 
 Agent→operator inline media is already built on two of the three layers. This spec adds only
 the missing trigger on the third. See the **Downstream contract verification** appendix for the
-file:line evidence that each downstream claim below already holds.
+file:line evidence that each downstream claim already holds.
 
 - **Journal server** (`easelyte/matron-journal`) accepts agent-published `image`/`file`
-  events with a top-level `blob_ref` and stores/fans them out. `POST /media` (Bearer agent
-  token) stores a blob and returns `{media_id, size, content_type, sha256}`; `GET /media/:id`
-  serves it with its stored content-type verbatim. `AGENT_PUBLISH_TYPES` already includes
-  `image` and `file`. Media cap `DEFAULT_MEDIA_MAX_BYTES = 50 MB`. **Nothing to build.**
-- **Web client** (`easelyte/matron-web`) already renders these inline:
-  `components.tsx:3019` `case "image"` → `AuthenticatedMedia` (auth-fetches `/media/:id`,
-  inline `<img>`); `case "file"` (`:3034`) → inline attachment link reading `payload.filename`
-  (`:3042`) with size + icon. Bubble side is decided by `event.sender` (`:3086`), which the
-  journal server sets from the WebSocket connection identity — **not** from any payload field.
-  **Nothing to build.**
-- **Bridge** (`easelyte/claude-matrix-bridge`) already owns the plumbing:
+  events with a top-level `blob_ref`. `POST /media` (Bearer agent token) stores a blob and
+  returns `{media_id, size, content_type, sha256}`; `GET /media/:id` serves it with the stored
+  content-type verbatim. `AGENT_PUBLISH_TYPES` includes `image` and `file`. Media cap
+  `DEFAULT_MEDIA_MAX_BYTES = 50 MB`. **Nothing to build.**
+- **Web client** (`easelyte/matron-web`) renders these inline: `components.tsx:3018`
+  `case "image"` → `AuthenticatedMedia` (auth-fetches `/media/:id`, inline `<img>`);
+  `case "file"` (`:3033`) → inline attachment reading `payload.filename` (`:3042`) with size +
+  icon. Bubble side is decided by `event.sender` (`:3086`), set server-side from the WebSocket
+  connection identity — **not** from any payload field. **Nothing to build.**
+- **Bridge** (`easelyte/claude-matrix-bridge`) owns the plumbing:
   `journalPublisher.uploadMedia({bytes, contentType, name})` (`lib/journal-publisher.js:507`)
-  and `publishImage` / `publishFile` (`:643` / `:640`). The fd-pinned, sensitivity-checked,
-  size-capped file reader `validateAndOpen(path, {workdir, maxBytes})`
-  (`lib/file-link-guard.js:93`) already exists. **The only caller of `publishImage`/`publishFile`
-  is `journalMirrorUserMedia` (`index.js:957-977`), which mirrors the operator's OWN uploads.**
-  There is no agent-initiated caller.
+  and `publishImage` / `publishFile` (`:643` / `:640`); the fd-pinned, sensitivity-checked,
+  size-capped reader `validateAndOpen(path, {workdir, maxBytes})` (`lib/file-link-guard.js:93`);
+  and per-session env injection into the claude child at spawn (`BRIDGE_ROOM_ID` /
+  `MATRON_BRIDGE_API_PORT` set at both spawn sites, `index.js:1098-1104` and `:1658-1664`). The
+  only caller of `publishImage`/`publishFile` today is `journalMirrorUserMedia`
+  (`index.js:957-977`), which mirrors the operator's OWN uploads. There is no agent-initiated
+  caller.
 
-**Archaeology (2026-08-01):** upstream `Matronhq/{matron-bridge,matron-web,matron-journal}`
-has no branch, PR, or commit building an agent-initiated outbound media trigger. Dan's media
-work is all inbound (operator→Claude) plus file-edit diffs. This work is greenfield on our fork
-and does not conflict upstream.
+**Archaeology (2026-08-01):** upstream `Matronhq/{matron-bridge,matron-web,matron-journal}` has
+no branch, PR, or commit building an agent-initiated outbound media trigger. Greenfield on our
+fork; no upstream conflict.
 
 ## The gap
 
-One thing is missing: a trigger the Claude session can invoke that says "show this file to the
-operator." Everything downstream of an agent-authored `image`/`file` publish already works.
+A trigger the Claude session can invoke to say "show this file to the operator." Everything
+downstream of an agent-authored `image`/`file` publish already works.
 
 ## Design
 
-Three small pieces, in the bridge repo only. The MCP tool cannot call `uploadMedia` directly
-(it runs as a separate stdio process without the agent token or WS connection), so — exactly
-like the existing `request_secret` / `share_sensitive_data` tools — it POSTs to a new bridge
-HTTP endpoint, and the bridge process does the guarded read, upload, and publish.
+Three small pieces, bridge repo only. The MCP tool runs as a separate stdio process (no agent
+token, no WS), so — like `request_secret` / `share_sensitive_data` — it POSTs a bridge HTTP
+endpoint, and the bridge process does the guarded read, upload, and publish.
 
-### Component 1 — MCP tool `show_file` on its own opt-in extra server (`show-file-mcp.js`)
+### Component 1 — MCP tool `show_file` on its own opt-in `share` extra server (`show-file-mcp.js`)
 
-Registered as a **new `mcpExtras` group** (`share`), NOT on the always-on `ask-user` base
-server. The bridge's `mcpExtras` groups are selected per session at spawn (`index.js:163`,
-`mcpConfigPathFor(extras)`, `journalStartSessionForRpc({mcpExtras})`); operator/full-tools
-sessions include `share` by default (it is a lightweight stdio server, not a ~400 MB browser
-stack, so the "default to no extras" lean-session rule does not apply to it), and #458's curated
-sessions omit it by not selecting the group. This is why Acceptance #7 holds with **existing**
-additive infra — no tool-subtraction mechanism is invented. (Revision-1 registered on `ask-user`;
-review flagged that as an always-on leak to every session, contradicting Acceptance #7.)
+Registered as a **new `mcpExtras` group** `share`, NOT on the always-on `ask-user` base server.
+`mcpExtras` groups are selected per session at spawn (`index.js:171` `mcpConfigPathFor(extras)`,
+`:534` `journalStartSessionForRpc({mcpExtras})`; extras merged by `lib/mcp-config.js`
+`buildMcpServers`). This is the isolation seam: a session that does not select `share` never
+gets the tool (Acceptance #8), which is how #458's curated session type will exclude it — using
+the existing additive selection, no tool-subtraction infra invented.
 
-The tool mirrors the `share_sensitive_data` shape (`ask-user.js:67-98`: a single synchronous
-`server.tool(name, description, zodSchema, handler)` that `fetch`es a bridge endpoint and returns
-`{content:[{type:'text', text}]}` — NOT the polling shape of `request_secret`).
+**`share` is included in the DEFAULT extras (open decision — see frontmatter).** The two claude
+spawn sites currently default `mcpExtras` to `[]` (`index.js:1036-1038`, `:1601-1603`); this spec
+adds `share` to that default so every ordinary session gets `show_file` with no flag (the
+frictionless goal). `share` is a lightweight stdio server (not a ~400 MB browser stack), so the
+"default to no extras for lean sessions" rationale does not apply. **Scope of default-on is
+bounded by the workdir-only path scope (Security), so a default-on session can only show files
+from its own workdir.** #458 introduces the operator-vs-curated session discriminator and sets
+curated extras explicitly without `share`. *Operator may flip this to explicit opt-in (a named
+`--share` flag, default off); that trades the no-flag UX for a stricter default.*
+
+The tool mirrors the `share_sensitive_data` shape (single synchronous `server.tool(...)` that
+`fetch`es a bridge endpoint and returns `{content:[{type:'text',text}]}` — NOT the polling shape
+of `request_secret`):
 
 ```
 server.tool(
@@ -98,245 +108,239 @@ server.tool(
   'Display a file to the operator inline in the chat: a rendered image (PNG/JPG/SVG/GIF/WebP)
    renders as an inline picture; any other file (PDF, report, archive) appears as a
    downloadable attachment. Use this instead of describing a filepath the operator cannot
-   open. The file must already exist on disk.',
+   open. The file must exist and be under the session workdir.',
   {
-    path: z.string()
-      .refine((p) => require('node:path').isAbsolute(p), 'path must be absolute'),
-    caption: z.string().optional().describe('Optional caption shown with the file'),
+    path: z.string().refine((p) => require('node:path').isAbsolute(p), 'path must be absolute'),
+    caption: z.string().max(4096).optional(),   // journal caption clamp
   },
   handler → POST ${BRIDGE_API}/show-file { path, caption, token: SHOW_FILE_TOKEN }
 )
 ```
 
-The handler sends the per-session capability token (see Component 2), NOT a `roomId`. Env:
-`BRIDGE_API_URL` (or `MATRON_BRIDGE_API_PORT`, matching `ask-user.js:13-15`) and
-`SHOW_FILE_TOKEN`, both injected into the claude child env at session spawn.
+Env injected into the claude child at spawn (alongside the existing `BRIDGE_ROOM_ID`):
+`BRIDGE_API_URL` (or `MATRON_BRIDGE_API_PORT`) and `SHOW_FILE_TOKEN`.
 
-Return contract (so the model knows the outcome and does NOT then narrate a filepath):
-- success → `Shown to operator: <basename> (image|file).` — note "shown" here means uploaded and
-  queued for delivery; see Component 3 on the delivery guarantee.
-- denial → `Could not show <basename>: <reason>` for any of the eight `FileLinkDenied` reasons
-  (`relative-path`, `symlink`, `sensitive`, `outside-scope`, `bad-workdir`, `not-a-file`,
-  `unreadable`, `too-large`) or `upload-failed` / `queue-failed`. Any other/unexpected error →
-  `Could not show <basename>: internal error`. The model can then fall back to a text reply.
+Return contract: success → `Shown to operator: <basename> (image|file).` ("shown" = uploaded and
+queued; see Component 3 on the delivery guarantee). Denial → `Could not show <basename>: <reason>`
+where reason ∈ {`relative-path`, `symlink`, `sensitive`, `not-a-file`, `unreadable`, `too-large`
+(from `validateAndOpen`), `outside-scope`, `upload-failed`, `queue-failed` (helper-level)}. Any
+other error → `Could not show <basename>: internal error`.
 
 ### Component 2 — bridge HTTP endpoint `POST /show-file` (`index.js`)
 
-Added to `apiServer` (`index.js:6579`) alongside `/secret` (`:6645`) and `/share-sensitive`
-(`:6719`).
+Added to `apiServer` (`index.js:6579`) beside `/secret` (`:6645`) and `/share-sensitive`
+(`:6719`). The entire handler body is wrapped in try/catch so an uncaught error returns
+`502 {"error":"internal error"}`, NOT the shared API catch's misleading `400 {"error":"Invalid
+JSON"}` (`index.js:7037`).
 
-1. Parse `{ path, caption, token }`; `400 {"error":"path and token are required"}` if either is
-   missing.
-2. **Resolve session by token, not by a client-supplied room id.** At session spawn the bridge
-   mints a random `SHOW_FILE_TOKEN` (`randomUUID`), stores `token → {roomId}` in an in-memory
-   map, and injects it into the claude child env. The endpoint looks up the session from the
-   token; unknown/expired token → `403 {"error":"invalid token"}`. This closes the revision-1
-   forgery hole where `roomId` was a trusted body field an agent could enumerate via `/sessions`
-   and spoof (P67). The token is cleared when the session ends.
-3. Delegate to the emit helper (Component 3). Map its result:
-   - `sensitive` / `outside-scope` / `bad-workdir` → 403
-   - `too-large` → 413
-   - `not-a-file` / `unreadable` / `symlink` / `relative-path` → 404
-   - `upload-failed` / `queue-failed` → 502
-   - unexpected throw → **502 `{"error":"internal error"}`** — the handler MUST wrap its body in
-     try/catch so an uncaught error does not fall through to the shared API catch, which
-     mislabels everything as `400 {"error":"Invalid JSON"}` (`index.js:7037`).
-   - ok → `200 {ok:true, media_id, kind:'image'|'file'}`.
+1. **Reject oversized requests before buffering:** cap the request body at 64 KB (path + caption
+   + token are small); over-cap → `413`. Parse `{path, caption, token}`; missing `path` or `token`
+   → `400`.
+2. **Resolve session by token, never by a client-supplied room id.** At session spawn the bridge
+   mints `SHOW_FILE_TOKEN = randomUUID()` and stores it **on the session object**
+   (`session.showFileToken`), then injects it into the claude child env. The endpoint resolves the
+   session by scanning `sessions.values()` for `s.showFileToken === token` (N is small — linear
+   scan, P18); no match → `403 {"error":"invalid token"}`. Storing the token on the session object
+   (not a separate `token→roomId` map) means it is created and destroyed with the session in one
+   place — it cannot outlive the session, cannot be missed at any of the ~9 `sessions.delete`
+   teardown seams, and can never resolve to a replacement session in the same room (the token is
+   bound to the object, not the reusable roomId). This closes the rev-1 forgery hole and the rev-2
+   cleanup-seam gap (P67).
+3. Delegate to the emit helper (Component 3). Status map: `sensitive` → 403; `outside-scope` → 403;
+   `too-large` → 413; `not-a-file`/`unreadable`/`symlink`/`relative-path` → 404;
+   `upload-failed`/`queue-failed` → 502; unexpected throw → 502 `internal error`; ok →
+   `200 {ok:true, media_id, kind}`.
 
 ### Component 3 — emit helper `journalShareAgentMedia(session, {path, caption})` (`index.js`)
 
-The one piece of genuinely new logic. Almost entirely reuse (P59):
+The one piece of new logic. Almost entirely reuse (P59):
 
-1. **Read + guard (reuse `validateAndOpen`).**
-   `const { content, realPath } = await validateAndOpen(path, { workdir: <allowed root>, maxBytes: SHOW_FILE_MAX_BYTES })`.
-   `validateAndOpen` (`file-link-guard.js:93`) opens with `O_NOFOLLOW`, resolves the real path
-   via `/proc/self/fd`, re-checks the sensitivity denylist, asserts `isFile`, enforces workdir
-   containment, and caps size — throwing `FileLinkDenied(reason)` for any of the eight reasons.
-   Catch it and surface `err.reason` as the denial. `SHOW_FILE_MAX_BYTES = 50 MB` (aligned to the
-   journal server's `DEFAULT_MEDIA_MAX_BYTES`; new exported constant). See **Security** for how
-   the allowed root(s) are chosen — the tool tries each configured root and denies with
-   `outside-scope` if the path is contained by none.
-2. **Derive content-type + kind** from `realPath`'s extension via a small extension→mime map
-   (`.png→image/png`, `.jpg/.jpeg→image/jpeg`, `.gif→image/gif`, `.webp→image/webp`,
-   `.svg→image/svg+xml`, else `application/octet-stream`), case-insensitive. `kind =
-   mime.startsWith('image/') ? 'image' : 'file'`. Deriving from extension (not sniffing) matches
-   how `journalMirrorUserMedia` chooses image-vs-file.
+1. **Read + guard (reuse `validateAndOpen` with NO workdir).**
+   `const { content, realPath } = await validateAndOpen(path, { maxBytes: SHOW_FILE_MAX_BYTES })`
+   (no `workdir` arg). `validateAndOpen` (`file-link-guard.js:93`) opens with `O_NOFOLLOW`,
+   resolves the real path via `/proc/self/fd`, checks the sensitivity denylist, asserts `isFile`,
+   caps size — throwing `FileLinkDenied(reason)` for `relative-path`/`symlink`/`sensitive`/
+   `not-a-file`/`unreadable`/`too-large`. Catch it and surface `err.reason`. `SHOW_FILE_MAX_BYTES
+   = 50 MB` (aligned to the journal `DEFAULT_MEDIA_MAX_BYTES`; new exported constant).
+2. **Scope check (helper-level, on the fd-pinned `realPath`).** Assert `realPath` is contained by
+   at least one allowed root — `[session.workdir, ...SHOW_FILE_ARTIFACT_ROOTS]` — using the guard's
+   boundary-safe `contains()` (export it from `file-link-guard.js`). None contain → return
+   `{denied: 'outside-scope'}`, no upload. Checking the **already-resolved `realPath`** (not the
+   input `path`) keeps this TOCTOU-safe and reuses the guard's own containment logic rather than a
+   parallel multi-`workdir` loop inside `validateAndOpen` (the single-root helper stays unchanged,
+   P59). `SHOW_FILE_ARTIFACT_ROOTS` grammar: colon-separated absolute paths (like `$PATH`); each
+   must be absolute + existing at bridge startup; a malformed/nonexistent/relative entry fails loud
+   at startup (V4 fail-visible), never silently broadens or narrows. Default: **empty** (workdir
+   only). `/tmp` is deliberately NOT a default — it is globally shared, so making it an allowed root
+   would let one session show another session's neutrally-named file (rev-2 finding).
 3. **Upload (reuse `uploadMedia`).**
    `const media = await journalPublisher.uploadMedia({ bytes: content, contentType: mime, name: basename })`.
-   Fails open → `null`; on `null` return `{ denied: 'upload-failed' }` and skip the publish (a
-   media event without a blob is useless — same contract as the mirror path).
-4. **Publish (reuse `publishImage`/`publishFile` via the buffering wrapper).**
-   Build the payload:
+   Fails open → `null` ⇒ return `{denied:'upload-failed'}`, skip publish.
+4. **Publish (reuse `publishImage`/`publishFile` via the buffering wrapper).** Payload:
    ```
    { blob_ref: media.media_id, content_type: media.content_type,
      name: basename, filename: basename,          // filename is the key the web renderer reads
      size: media.size, caption }                   // caption omitted when absent
    ```
-   **`filename` is required, not `name`.** The web file-render path reads `payload.filename`
-   (`components.tsx:3042`) and the sidebar snippet reads `payload.filename` (`types.ts:536`);
-   without it every non-image attachment renders as the generic label "attachment" and downloads
-   as `attachment` (revision 1 copied the mirror's `name`-only shape and would have shipped
-   broken). The client's own outbound path sends both (`client.ts:904-906`), so we send both.
-   Publish through `journalPublish(session, kind === 'image' ? 'publishImage' : 'publishFile',
-   payload)` — the buffering wrapper that upserts the convo before the first publish and buffers
-   if the convo id is not yet established. **Do NOT use `journalPublishUserItem` (`index.js:682`)**
-   — it additionally fires `markRead`, correct for the operator's own upload (they've seen it) but
-   for an agent-sent item it would suppress the unread badge on a message the operator has not yet
-   seen.
+   **`filename` is required** — the web file-render path reads `payload.filename`
+   (`components.tsx:3042`) and the sidebar snippet reads it (`types.ts:536`); without it every
+   attachment renders as the generic label and downloads as `attachment`. The client's own outbound
+   path sends both (`client.ts:905-906`), so we send both. Publish through
+   `journalPublish(session, kind === 'image' ? 'publishImage' : 'publishFile', payload)` — the
+   buffering wrapper that upserts the convo before the first publish. **Do NOT use
+   `journalPublishUserItem` (`index.js:682`)** — it also fires `markRead`, which for an agent-sent
+   item would suppress the unread badge on a message the operator has not yet seen. If the
+   synchronous enqueue throws → return `{denied:'queue-failed'}`.
    The event lands on the **agent** bubble because the journal server stamps `sender:
    agent:${conn.name}` on every publish from the bridge's agent-kind connection (`ws.js:645`) —
-   this is connection-identity routing, independent of any payload field. (Revision 1 wrongly
-   attributed routing to a `from:'assistant'` payload field; `payload.from` has no consumer in the
-   journal server or web client. The field is dropped from the payload.)
-5. Return `{ ok: true, media_id: media.media_id, kind }`. **Delivery is best-effort:** `ok` means
-   the blob uploaded and the event was enqueued, matching how every journal event (text, diff,
-   tool_output) already works — the in-memory publish queue delivers on the live socket and
-   replays on reconnect, but a crash before reconnect or a queue overflow can drop it. The endpoint
-   returns 502 only for the synchronously-known failures (upload returned null, enqueue threw); it
-   does NOT and cannot promise the operator saw it (P3 — the contract is honest about this rather
-   than reporting a delivery it can't verify).
+   connection-identity routing, independent of payload. (`payload.from` has no consumer anywhere;
+   the field is not sent.)
+5. Return `{ ok: true, media_id, kind, realPath, size: content.length, sha256: media.sha256 }` —
+   fields the endpoint needs for the audit log (Observability). **Delivery is best-effort:** `ok`
+   means the blob uploaded and the event enqueued, matching every journal event (text/diff/
+   tool_output) — the in-memory queue delivers live and replays on reconnect, but a crash before
+   reconnect or a queue overflow can drop it. The endpoint returns 502 only for synchronously-known
+   failures (`upload-failed`, `queue-failed`); it does not claim the operator saw it (P3).
+   **Orphan on `queue-failed`:** the rare synchronous enqueue failure leaves an uploaded-but-
+   unreferenced blob. There is no media DELETE in the journal API, so no synchronous rollback;
+   unreferenced blobs age out via the journal's existing blob retention/TTL (PR #12 tool-output
+   purge established TTL-based media purge). Retrying re-uploads (idempotency deferred, below). This
+   bound is acceptable given the rarity; documented rather than papered over.
 
 ### Data flow
 
 ```
 Claude session
-  └─ MCP tool show_file(path, caption)                       [show-file-mcp.js, stdio, `share` extra]
-       └─ POST http://127.0.0.1:9812/show-file {path,caption,token:SHOW_FILE_TOKEN}
-            └─ apiServer /show-file                            [index.js:6579+, try/catch-wrapped]
-                 └─ session = lookupByToken(token)             [403 if unknown]
+  └─ MCP tool show_file(path, caption)                       [show-file-mcp.js, `share` extra]
+       └─ POST /show-file {path,caption,token:SHOW_FILE_TOKEN}   (body ≤64KB)
+            └─ apiServer /show-file (try/catch-wrapped)        [index.js:6579+]
+                 └─ session = scan sessions.values() for s.showFileToken===token   [403 if none]
                  └─ journalShareAgentMedia(session, {path,caption})
-                      ├─ validateAndOpen(path,{workdir:allowedRoot,maxBytes:50MB}) → bytes  [file-link-guard.js:93]
+                      ├─ validateAndOpen(path,{maxBytes:50MB}) → {content, realPath}  [file-link-guard.js:93]
+                      ├─ contains(realPath, [workdir, ...ARTIFACT_ROOTS])? else outside-scope
                       ├─ ext→mime, kind = image|file
-                      ├─ journalPublisher.uploadMedia(bytes,mime)  → POST /media (journal server)
+                      ├─ uploadMedia(content,mime) → POST /media (journal)
                       └─ journalPublish(session, publishImage|publishFile, {blob_ref, filename, name, size, caption})
-                           └─ journal server stamps sender:agent:*, stores + fans out
-                                └─ web client case "image"|"file" → inline <img> / attachment (reads payload.filename)  [components.tsx:3019/3034/3042]
+                           └─ journal stamps sender:agent:*, stores + fans out
+                                └─ web case "image"|"file" → inline <img> / attachment(payload.filename)  [components.tsx:3018/3033/3042]
 ```
 
 ## Security model (P67, P15, P8)
 
-The tool reads a local file and egresses its bytes to the operator's journal — a
-**read-arbitrary-file primitive**. Two boundaries, both real:
+The tool reads a local file and egresses its bytes — a **read-file + egress primitive**. Three
+boundaries, all real:
 
-- **Path scope = allowlist of roots (workdir + configured artifact roots), NOT a denylist.**
-  `validateAndOpen` is called with a `workdir` (allowed root); a path contained by none of the
-  configured roots is denied `outside-scope`. Default allowed roots: the **session's workdir**
-  plus a small bridge-configured `SHOW_FILE_ARTIFACT_ROOTS` list (default `['/tmp']`, extendable
-  via env). Rationale: agents routinely write generated artifacts to `/tmp` or a scratch dir, so
-  a workdir-only scope would reproduce the friction (the motivating `/root/spider-box-guide/*.svg`
-  case) — but an open denylist is not an egress boundary at all: a neutrally-named secret
-  (`/var/lib/app/prod.db`, a customer CSV) matches no pattern and would leak (P15). The allowlist
-  is the boundary; the sensitivity denylist inside `validateAndOpen` is defense-in-depth on top of
-  it. "The agent has Bash anyway" is explicitly NOT the justification — outbound egress is a
-  separate permission from local read (P15).
-- **Routing identity = per-session capability token, never a client-supplied room id.** See
-  Component 2. The token binds each `/show-file` call to the session that spawned its MCP process,
-  so an agent cannot target another conversation. This is the P67 boundary: actor/routing identity
-  is not a model-reachable request field.
-- **Curated-toolset (Nastia) interaction — deferred to #458, provisioned here.** Because
-  `show_file` is its own `mcpExtras` group (not on the always-on base), #458's curated session
-  type keeps the capability out simply by not selecting the `share` extra — the existing additive
-  selection is the mechanism, no new subtraction infra required. If #458 instead wants Nastia to
-  have a *scoped* `show_file`, it narrows `SHOW_FILE_ARTIFACT_ROOTS`/workdir for that session type
-  at the same call site. **This spec does not put `show_file` in any curated toolset.**
-- **Size cap** `SHOW_FILE_MAX_BYTES = 50 MB`, enforced by `validateAndOpen` before the whole file
-  is read into a Buffer; oversize → `too-large`, no upload.
+- **Path scope = allowlist of roots, default the session workdir only.** `journalShareAgentMedia`
+  denies (`outside-scope`) any `realPath` not contained by `[session.workdir,
+  ...SHOW_FILE_ARTIFACT_ROOTS]`. Default roots = **just the session's own workdir** —
+  `SHOW_FILE_ARTIFACT_ROOTS` defaults empty. Workdir-only means a default-on session can only
+  egress files from its own working tree (its own work), which is why default-on is acceptable
+  pre-#458. An operator who wants a shared scratch root adds it explicitly to
+  `SHOW_FILE_ARTIFACT_ROOTS` (colon-separated absolute paths, validated at startup) accepting that
+  a shared root is shared across that box's sessions. `/tmp` is NOT a default (globally shared →
+  cross-session read). The sensitivity denylist inside `validateAndOpen` remains as
+  defense-in-depth on top of the allowlist. "The agent has Bash anyway" is explicitly NOT the
+  justification — egress is a separate permission from local read (P15).
+- **Routing identity = per-session capability token stored on the session object**, never a
+  client-supplied room id (Component 2). An agent cannot target another conversation, and the token
+  cannot outlive or be misrouted across session replacement.
+- **Curated-toolset (Nastia) — deferred to #458, provisioned here.** `show_file` is the `share`
+  mcpExtras group; #458's curated session type omits `share` (existing additive selection) or, to
+  give Nastia a scoped `show_file`, narrows her session's `SHOW_FILE_ARTIFACT_ROOTS`/workdir at the
+  same call site. This spec puts `show_file` in the *default* extras but that default is a v1 policy
+  #458 overrides per session type; it is NOT on the always-on base.
+- **Size cap** `SHOW_FILE_MAX_BYTES = 50 MB` (file) enforced by `validateAndOpen`; request body
+  capped at 64 KB; caption clamped to 4096.
 
 ## SVG handling (verified inline-renderable)
 
-`.svg` is published as an `image` event with `content_type: image/svg+xml`. The web client renders
-it via `AuthenticatedMedia`: `client.ts:1145` `mediaUrl()` → `URL.createObjectURL(blob)` →
-`<img src={objectURL}>`. The journal server serves the stored content-type verbatim with no
-allowlist (`http.js:432-460`), and there is no CSP or sanitization step restricting a `blob:` SVG
-`<img>` (traced during review). Scripts do not execute in `<img>`-loaded SVG, so this is XSS-safe
-even for agent-generated markup. No SVG→PNG pre-render and no new dependency is required.
-(Revision 1 deferred this to a plan-time POC with a headless-chromium fallback; the render path was
-traced and confirmed in review, so the deferral and the fallback overhang are removed.)
+`.svg` publishes as an `image` event with `content_type: image/svg+xml`. The web client renders via
+`AuthenticatedMedia`: `client.ts:1145` `mediaUrl()` → `URL.createObjectURL(blob)` → `<img>`. The
+journal serves the stored content-type verbatim with no allowlist and no CSP restricting a `blob:`
+SVG `<img>` (`http.js:432-460`, traced in review). Scripts do not execute in `<img>`-loaded SVG →
+XSS-safe. No SVG→PNG pre-render, no new dependency.
 
 ## Observability (P34)
 
-The `/show-file` handler emits one structured log line per call sufficient to reconstruct an
-egress incident: `{event:'show_file', roomId, realPath, kind, size, media_id, sha256,
-result:'ok'|denyReason}`. `realPath` (not just basename) identifies exactly which file left the
-host; `media_id`+`sha256` correlate the stored blob to the source; `result` records the outcome.
-`uploadMedia` already warns on every failure mode. No new automation loop; this is an
-operator-invoked path, so a per-call line is sufficient.
+The `/show-file` handler emits one structured log line per call. On **success**, from the helper's
+return: `{event:'show_file', roomId, realPath, kind, size, media_id, sha256, result:'ok'}` —
+`realPath` identifies exactly which file left the host, `media_id`+`sha256` correlate the stored
+blob. On **denial**, `validateAndOpen` throws before exposing `realPath`, so the line logs the
+input `path` + `reason`: `{event:'show_file', roomId, path, result:<reason>}` (the input path is
+sufficient to identify the attempt; the guard is deliberately not modified to leak its internal
+realpath on throw). `uploadMedia` already warns on failure.
 
 ## Testing
 
-- **Unit — extension→mime + kind routing:** `.png/.jpg/.svg/.gif/.webp → image`; `.pdf/.zip/
-  unknown → file`; case-insensitive extension.
-- **Unit — emit helper** (mock `validateAndOpen`, `uploadMedia`, `journalPublish`):
-  image ext → `publishImage`; non-image ext → `publishFile`; payload carries BOTH `filename` and
-  `name` = basename; `blob_ref` threaded; caption passed when present, omitted when absent;
-  `uploadMedia`→null ⇒ no publish + `upload-failed`; each of the eight `FileLinkDenied` reasons ⇒
-  the matching denial, no upload.
-- **Unit — denial mapping:** every `FileLinkDenied` reason maps to its documented HTTP status; an
-  unexpected (non-`FileLinkDenied`) throw maps to 502 `internal error`, NOT the shared
-  `Invalid JSON` fallthrough.
-- **Unit — path scope:** a path under the session workdir → allowed; under a `SHOW_FILE_ARTIFACT_
-  ROOTS` entry (`/tmp/x.png`) → allowed; outside all roots (`/var/lib/app/prod.db`) → `outside-scope`;
-  a `secrets.json` inside an allowed root → `sensitive` (denylist still fires within scope).
-- **Unit — token routing:** missing token → 400; unknown token → 403; valid token resolves to the
-  correct session; a body `roomId` is ignored.
-- **Endpoint — `POST /show-file`:** fixture PNG under an allowed root + valid token → 200 + publish
-  invoked with `filename`; oversize fixture → 413 + no publish.
-- **Run-it gate (2026-08-01 principle candidate — empirical validation catches what static review
-  cannot).** Before ship, on a live session: `show_file` a real PNG and a real SVG and confirm both
-  render inline on the web client (both themes), and a PDF renders as an attachment showing its real
-  filename and size. This gate must pass.
+- **Unit — ext→mime + kind:** png/jpg/svg/gif/webp→image; pdf/zip/unknown→file; case-insensitive.
+- **Unit — emit helper** (mock `validateAndOpen`, `uploadMedia`, `journalPublish`): image→
+  `publishImage`, non-image→`publishFile`; payload carries BOTH `filename` and `name`; `blob_ref`
+  threaded; caption present/absent; each `validateAndOpen` reason surfaced with no upload;
+  `uploadMedia`→null ⇒ `upload-failed`; enqueue-throw ⇒ `queue-failed`; helper return includes
+  realPath/size/sha256 for the audit line.
+- **Unit — scope check:** realPath under workdir → allowed; under a configured `ARTIFACT_ROOTS`
+  entry → allowed; outside all roots (`/var/lib/app/prod.db`) → `outside-scope`, no upload; a
+  `secrets.json` under an allowed root → `sensitive` (denylist fires within scope).
+- **Unit — roots parsing:** valid colon-list → parsed; a relative/nonexistent entry → startup fails
+  loud.
+- **Unit — token routing:** missing token → 400; unknown token → 403; valid token resolves the
+  right session; a body `roomId` is ignored; token absent from `sessions` after the session object
+  is dropped.
+- **Unit — denial mapping:** every reason → its status; an unexpected throw → 502 `internal error`,
+  never `Invalid JSON`; body >64KB → 413.
+- **Endpoint:** fixture PNG under workdir + valid token → 200 + publish with `filename`; oversize
+  file → 413.
+- **Run-it gate (empirical validation — catches what static review cannot).** On a live session:
+  `show_file` a real PNG and SVG → both render inline (both themes); a PDF → attachment showing real
+  filename + size.
 
 ## Out of scope / deferred follow-ups
 
-- **>50 MB or genuinely non-previewable-huge files → signed viewer `/download` link.** Rare for
-  generated diagrams; v1 returns `too-large`. Upstream already has `feat/viewer-download` (#149)
-  to build on when wanted.
-- **Curated-toolset scoping / inclusion for Nastia** — belongs to #458; provisioned via the
-  `share` mcpExtras group + the `SHOW_FILE_ARTIFACT_ROOTS`/workdir knob.
-- **Latent mirror-path bug (found in review):** `journalMirrorUserMedia` (`index.js:962-970`) sets
-  `name` but not `filename`, and sets a `from:'user'` field that no consumer reads while
-  `sender:agent:*` is stamped regardless — so the operator's own mirrored uploads may render with a
-  generic attachment label and/or on the wrong bubble side. Pre-existing, out of scope here; file
-  as a separate bridge loop.
-- **Idempotency (P32):** an agent double-calling `show_file` double-posts. Low harm; `uploadMedia`
-  returns `sha256` if a dedup guard is wanted later. Not built in v1.
-- **Retiring the dead `redact_message` tool** (already noted stale at `index.js:6773`) — separate.
+- **>50 MB / huge non-previewable files → signed viewer `/download` link.** v1 returns `too-large`;
+  upstream `feat/viewer-download` (#149) to build on later.
+- **Curated-toolset scoping for Nastia** — #458; provisioned via the `share` extra + roots/workdir
+  knob.
+- **Latent mirror-path bug:** `journalMirrorUserMedia` sets `name` not `filename` and a dead
+  `from:'user'` field — operator's own mirrored uploads may render with a generic label / wrong
+  bubble side. Pre-existing; file as a separate bridge loop.
+- **Idempotency (P32):** double-call double-posts; `uploadMedia` returns `sha256` for a future dedup
+  guard. Combined with the `queue-failed` orphan bound, an explicit upload/publish two-phase
+  reconciliation is a follow-up if orphan rate ever matters.
+- **Retiring dead `redact_message`** (`index.js:6773`) — separate.
 
 ## Acceptance criteria
 
-1. A bridge session can call `show_file('/abs/path/to/diagram.svg')` (path under the session
-   workdir or a configured artifact root) and the operator sees the diagram rendered inline in the
-   chat, on the agent side, on the web client.
-2. A non-image file (PDF) shows as an inline downloadable attachment with its **real filename**
-   (via `payload.filename`) and size.
-3. A path outside all allowed roots is refused `outside-scope`; a sensitive path within an allowed
-   root (`secrets.json`, `.env`, `*.pem`, `~/.ssh/*`) is refused `sensitive`; nothing is uploaded or
-   published in either case.
-4. An oversize (>50 MB) file is refused `too-large`; nothing uploaded.
-5. A `/show-file` call carrying another session's identity cannot inject media into that
-   conversation: routing is by the per-session capability token, and a client-supplied `roomId` is
-   ignored.
-6. The tool returns a short success/denial string to the model; every `FileLinkDenied` reason and
-   any unexpected error maps to a defined status + denial string (never the `Invalid JSON`
-   fallthrough); on denial the model can fall back to a text reply.
-7. No change to the journal server or web client is required for items 1–2 (existing render path);
-   the diff is confined to `easelyte/claude-matrix-bridge`.
-8. `show_file` is registered as the opt-in `share` mcpExtras group, NOT on the always-on `ask-user`
-   base server; a session that does not select `share` does not get the tool.
+1. A bridge session calls `show_file('<workdir>/diagram.svg')` and the operator sees the diagram
+   rendered inline, on the agent side, on the web client.
+2. A non-image file (PDF) shows as an inline attachment with its **real filename** (`payload.filename`)
+   and size.
+3. A path whose `realPath` is outside all allowed roots → `outside-scope` (403); a sensitive path
+   within an allowed root → `sensitive` (403); nothing uploaded/published in either case.
+4. An oversize (>50 MB) file → `too-large` (413); a request body >64 KB → 413; nothing uploaded.
+5. A `/show-file` call cannot inject media into another session's conversation: routing is by the
+   per-session token on the session object; a client-supplied `roomId` is ignored; the token does
+   not resolve after its session object is dropped.
+6. Every `FileLinkDenied` reason and any unexpected error maps to a defined status + denial string
+   (never the `Invalid JSON` fallthrough); on denial the model can fall back to a text reply.
+7. No journal-server or web-client change is required for items 1–2; the diff is confined to
+   `easelyte/claude-matrix-bridge`.
+8. `show_file` is the opt-in `share` mcpExtras group, NOT on the always-on `ask-user` base; a
+   session that does not select `share` does not get the tool. (Default extras include `share` per
+   the open decision; #458's curated session type omits it.)
 
 ## Appendix — Downstream contract verification
 
-Evidence that "What already exists" holds, so acceptance items 1–2 rest on grounded contracts, not
-assertions (verified in review across all three repos):
-
+Verified in review across all three repos:
 - Journal accepts agent `image`/`file` publishes — `AGENT_PUBLISH_TYPES` includes both (`ws.js`);
   publish op requires `conn.kind==='agent'`.
-- Server media cap `DEFAULT_MEDIA_MAX_BYTES = 50 MB` (journal `server.js`).
-- `POST /media` returns `{media_id, size, content_type, sha256}`; `GET /media/:id` streams the
-  stored `content_type` verbatim (journal `http.js:401-465`).
-- Web renders `image` inline (`components.tsx:3019` → `AuthenticatedMedia` `<img>`) and `file` as an
-  attachment reading `payload.filename` (`:3034/:3042`).
-- Bubble routing keys on `event.sender` (`components.tsx:3086`), set server-side to
-  `agent:${conn.name}` for the bridge connection (`ws.js:645`) — independent of payload.
+- Media cap `DEFAULT_MEDIA_MAX_BYTES = 50 MB` (journal `server.js`).
+- `POST /media` → `{media_id, size, content_type, sha256}`; `GET /media/:id` streams stored
+  `content_type` verbatim (journal `http.js:401-465`).
+- Web renders `image` inline (`components.tsx:3018` → `AuthenticatedMedia` `<img>`) and `file` as an
+  attachment reading `payload.filename` (`:3033/:3042`); dual `filename`+`name` matches the client's
+  own outbound path (`client.ts:905-906`).
+- Bubble routing keys on `event.sender` = `agent:${conn.name}` (`ws.js:645`), independent of payload.
+- Per-session child-env injection exists (`BRIDGE_ROOM_ID` at `index.js:1098-1104`, `:1658-1664`) —
+  the token delivery mechanism.
 - SVG: no content-type allowlist or CSP blocks a `blob:` `image/svg+xml` `<img>` (journal
-  `http.js:432-460`; web `client.ts:1145` → `createObjectURL`).
+  `http.js:432-460`; web `client.ts:1145`).
