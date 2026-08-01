@@ -4965,9 +4965,6 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const summary = selectedAgent === AGENT_CODEX
         ? (resumePersisted?.summary || '')
         : await getSessionSummary(resumeSessionId, actualWorkdir);
-      const roomName = summary
-        ? `${SERVER_LABEL}: ${summary.slice(0, 50)}${summary.length > 50 ? '…' : ''}`
-        : `${SERVER_LABEL}: Resumed ${shortId}`;
 
       const sessionSendReply = (reply) => sendToRoom(sessionRoomId, plainTextFormat(reply), markdownToHtml(reply));
       const sessionSendHtml = (plainText, html) => sendToRoom(sessionRoomId, plainText, html);
@@ -5003,6 +5000,12 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         ...(selectedAgent === AGENT_CLAUDE
           ? { interactive: resumeState.interactiveMode }
           : {}),
+      });
+      const roomName = formatRoomTitle({
+        serverLabel: SERVER_LABEL,
+        workdir: session.workdir,
+        text: summary || (`Resumed ${shortId}`),
+        defaultWorkdir: DEFAULT_WORKDIR,
       });
       session.originRoomId = roomId;
       session.firstMessageCaptured = true; // don't re-rename on first message
@@ -5281,7 +5284,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         `/tools — List available tools\n` +
         `/help — Show this help message\n\n` +
         `Each /start, /resume, and /workdir creates a new session.\n` +
-        `Room names show the server (${SERVER_LABEL}) and first message summary.\n\n` +
+        `Room names show ${SERVER_LABEL} · <repo> · <topic>.\n\n` +
         `While the agent is working:\n` +
         `  Messages are queued automatically\n` +
         `  Send "interrupt" to force interrupt\n` +
@@ -5324,7 +5327,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         ]) +
         `<b>Tips</b><ul>` +
         `<li>Each <code>/start</code>, <code>/resume</code>, and <code>/workdir</code> creates a new session</li>` +
-        `<li>Room names show the server (<code>${SERVER_LABEL}</code>) and first message summary</li>` +
+        `<li>Room names show <code>${SERVER_LABEL} · &lt;repo&gt; · &lt;topic&gt;</code></li>` +
         `<li>Messages are queued automatically while the agent is working</li>` +
         `<li>Send <code>interrupt</code> to force interrupt</li>` +
         `<li><code>!esc</code> — cancel the current turn without killing the session</li>` +
