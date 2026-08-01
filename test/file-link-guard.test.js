@@ -106,6 +106,54 @@ describe('validateAndOpen', () => {
     expect(path.basename(realPath)).toBe('ok.txt');
   });
 
+  it('continues reading until the approved snapshot buffer is full', async () => {
+    const filePath = path.join(dir, 'short-reads.txt');
+    writeFileSync(filePath, 'abcdef');
+    const actualOpen = fsp.open.bind(fsp);
+    let readSpy;
+    const openSpy = vi.spyOn(fsp, 'open').mockImplementation(async (...args) => {
+      const fd = await actualOpen(...args);
+      const actualRead = fd.read.bind(fd);
+      readSpy = vi.spyOn(fd, 'read').mockImplementation(
+        (buffer, offset, length, position) => actualRead(buffer, offset, Math.min(length, 2), position),
+      );
+      return fd;
+    });
+
+    try {
+      const { content } = await validateAndOpen(filePath, { workdir: dir });
+      expect(content.toString()).toBe('abcdef');
+      expect(readSpy).toHaveBeenCalledTimes(3);
+    } finally {
+      readSpy?.mockRestore();
+      openSpy.mockRestore();
+    }
+  });
+
+  it('rejects a file whose descriptor size changes after reading', async () => {
+    const filePath = path.join(dir, 'mutated.txt');
+    writeFileSync(filePath, 'abcdef');
+    const actualOpen = fsp.open.bind(fsp);
+    let readSpy;
+    const openSpy = vi.spyOn(fsp, 'open').mockImplementation(async (...args) => {
+      const fd = await actualOpen(...args);
+      const actualRead = fd.read.bind(fd);
+      readSpy = vi.spyOn(fd, 'read').mockImplementation(async (...readArgs) => {
+        const result = await actualRead(...readArgs);
+        await fsp.truncate(filePath, 1);
+        return result;
+      });
+      return fd;
+    });
+
+    try {
+      expect(await denied(filePath, { workdir: dir })).toBe('unreadable');
+    } finally {
+      readSpy?.mockRestore();
+      openSpy.mockRestore();
+    }
+  });
+
   it('rejects a symlink at the final component', async () => {
     expect(await denied(path.join(dir, 'sneaky.txt'), { workdir: dir })).toBe('symlink');
   });

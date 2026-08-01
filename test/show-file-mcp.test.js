@@ -11,6 +11,7 @@ const DENIAL_REASONS = [
   'relative-path',
   'bad-workdir',
   'upload-failed',
+  'saturated',
 ];
 
 describe('show-file MCP adapter', () => {
@@ -37,5 +38,24 @@ describe('show-file MCP adapter', () => {
     expect(fetchImpl).toHaveBeenCalledWith('http://bridge.test/show-file', expect.objectContaining({
       method: 'POST',
     }));
+  });
+
+  it('surfaces Retry-After for a saturated endpoint', async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(new Response(
+      JSON.stringify({ error: 'saturated' }),
+      {
+        status: 429,
+        headers: { 'Content-Type': 'application/json', 'Retry-After': '1' },
+      },
+    ));
+    const handleShowFile = createShowFileHandler({
+      bridgeApi: 'http://bridge.test',
+      token: 'test-token',
+      fetchImpl,
+    });
+
+    const result = await handleShowFile({ path: '/work/chart.png' });
+
+    expect(result.content[0].text).toBe('Could not show chart.png: saturated (Retry-After: 1)');
   });
 });

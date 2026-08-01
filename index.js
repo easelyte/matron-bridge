@@ -228,6 +228,7 @@ const VIEWER_BASE_URL = process.env.VIEWER_BASE_URL || '';
 const LINK_EXPIRY_MS = parseInt(process.env.LINK_EXPIRY_MS || String(15 * 60 * 1000), 10);
 const SHOW_FILE_MAX_BYTES = 50 * 1024 * 1024;
 const SHOW_FILE_MAX_IN_FLIGHT = 2;
+const SHOW_FILE_MAX_IN_FLIGHT_PER_SESSION = 1;
 const SHOW_FILE_GLOBAL_BYTE_BUDGET = SHOW_FILE_MAX_IN_FLIGHT * SHOW_FILE_MAX_BYTES;
 let showFileInFlight = 0;
 let showFileReservedBytes = 0;
@@ -1072,10 +1073,16 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     : (Array.isArray(persistedForRoom?.mcpExtras) ? persistedForRoom.mcpExtras : []);
   const effectiveMcpExtras = effectiveExtras(mcpExtras, DEFAULT_MCP_EXTRAS);
   const shareEnabled = effectiveMcpExtras.includes('share');
-  const showFileToken = shareEnabled ? randomUUID() : undefined;
-  const showFilePinnedRoots = shareEnabled
-    ? pinAllowedRootsSync([cwd, ...SHOW_FILE_ARTIFACT_ROOTS])
-    : undefined;
+  let showFileToken;
+  let showFilePinnedRoots = null;
+  if (shareEnabled) {
+    try {
+      showFilePinnedRoots = pinAllowedRootsSync([cwd, ...SHOW_FILE_ARTIFACT_ROOTS]);
+      showFileToken = randomUUID();
+    } catch (error) {
+      console.warn(`[show-file] disabled for ${roomId}: failed to pin allowed roots (${error.message})`);
+    }
+  }
   // Pre-assign the session id for fresh spawns (same trick as iv-mode below):
   // claudeSessionId is then known synchronously, so RPC start can answer with
   // a convo_id immediately and journal publishes never buffer for the init
@@ -1145,7 +1152,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     MATRON_BASH_TEE_ENABLED: showBashOutputAtSpawn ? '1' : '0',
   };
   delete spawnEnv.SHOW_FILE_TOKEN;
-  if (shareEnabled) spawnEnv.SHOW_FILE_TOKEN = showFileToken;
+  if (showFileToken) spawnEnv.SHOW_FILE_TOKEN = showFileToken;
 
   const proc = spawn('claude', args, {
     cwd,
@@ -1158,7 +1165,9 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     proc,
     roomId,
     workdir: cwd,
-    ...(shareEnabled ? { showFileToken, showFilePinnedRoots } : {}),
+    ...(showFileToken ? { showFileToken } : {}),
+    showFilePinnedRoots,
+    _showFileInFlight: 0,
     mcpExtras,
     responseBuffer: '',
     sendCallback: null,
@@ -1648,10 +1657,16 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     : (Array.isArray(persistedForRoom?.mcpExtras) ? persistedForRoom.mcpExtras : []);
   const effectiveMcpExtras = effectiveExtras(mcpExtras, DEFAULT_MCP_EXTRAS);
   const shareEnabled = effectiveMcpExtras.includes('share');
-  const showFileToken = shareEnabled ? randomUUID() : undefined;
-  const showFilePinnedRoots = shareEnabled
-    ? pinAllowedRootsSync([cwd, ...SHOW_FILE_ARTIFACT_ROOTS])
-    : undefined;
+  let showFileToken;
+  let showFilePinnedRoots = null;
+  if (shareEnabled) {
+    try {
+      showFilePinnedRoots = pinAllowedRootsSync([cwd, ...SHOW_FILE_ARTIFACT_ROOTS]);
+      showFileToken = randomUUID();
+    } catch (error) {
+      console.warn(`[show-file] disabled for ${roomId}: failed to pin allowed roots (${error.message})`);
+    }
+  }
   const identity = planSessionIdentity({ resumeSessionId, mintId: randomUUID });
   const sessionId = identity.sessionId;
   const model = options.model === null
@@ -1709,7 +1724,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     MATRON_BASH_TEE_ENABLED: showBashOutputAtSpawn ? '1' : '0',
   };
   delete interactiveEnv.SHOW_FILE_TOKEN;
-  if (shareEnabled) interactiveEnv.SHOW_FILE_TOKEN = showFileToken;
+  if (showFileToken) interactiveEnv.SHOW_FILE_TOKEN = showFileToken;
 
   debug(`Spawning interactive claude session ${sessionId} in ${cwd}`);
 
@@ -1730,7 +1745,9 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     iv,
     roomId,
     workdir: cwd,
-    ...(shareEnabled ? { showFileToken, showFilePinnedRoots } : {}),
+    ...(showFileToken ? { showFileToken } : {}),
+    showFilePinnedRoots,
+    _showFileInFlight: 0,
     mcpExtras,
     responseBuffer: '',
     sendCallback: null,
@@ -6784,13 +6801,15 @@ const apiServer = createServer(async (req, res) => {
           return;
         }
 
-        if (showFileInFlight >= SHOW_FILE_MAX_IN_FLIGHT
+        if ((session._showFileInFlight || 0) >= SHOW_FILE_MAX_IN_FLIGHT_PER_SESSION
+            || showFileInFlight >= SHOW_FILE_MAX_IN_FLIGHT
             || showFileReservedBytes + SHOW_FILE_MAX_BYTES > SHOW_FILE_GLOBAL_BYTE_BUDGET) {
           auditShowFile({ result: 'saturated', roomId: session.roomId, filePath });
           res.writeHead(429, { 'Content-Type': 'application/json', 'Retry-After': '1' });
-          res.end(JSON.stringify({ error: 'show-file capacity saturated' }));
+          res.end(JSON.stringify({ error: 'saturated' }));
           return;
         }
+        session._showFileInFlight = (session._showFileInFlight || 0) + 1;
         showFileInFlight += 1;
         showFileReservedBytes += SHOW_FILE_MAX_BYTES;
         budgetHeld = true;
@@ -6841,6 +6860,7 @@ const apiServer = createServer(async (req, res) => {
         res.end(JSON.stringify({ error: 'internal error' }));
       } finally {
         if (budgetHeld) {
+          session._showFileInFlight -= 1;
           showFileInFlight -= 1;
           showFileReservedBytes -= SHOW_FILE_MAX_BYTES;
         }
