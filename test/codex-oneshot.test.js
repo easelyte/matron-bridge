@@ -1,4 +1,6 @@
 import { EventEmitter } from 'node:events';
+import fs from 'node:fs';
+import os from 'node:os';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { codexOneShot, parseTimeout } from '../lib/codex-oneshot.js';
 
@@ -26,6 +28,7 @@ function agentMessage(text) {
 afterEach(() => {
   vi.useRealTimers();
   vi.unstubAllEnvs();
+  vi.restoreAllMocks();
 });
 
 describe('codexOneShot', () => {
@@ -61,13 +64,17 @@ describe('codexOneShot', () => {
     const child = fakeChild();
     const resultPromise = codexOneShot('prompt', { spawnImpl: () => child });
 
+    child.stderr.emit('data', `${'discarded-'.repeat(60)}useful diagnostic`);
     child.emit('close', 1, null);
 
     await expect(resultPromise).resolves.toMatchObject({
       text: null,
       reason: 'nonzero-exit',
       exitCode: 1,
+      stderrTail: expect.stringMatching(/useful diagnostic$/),
     });
+    const result = await resultPromise;
+    expect(result.stderrTail).toHaveLength(500);
   });
 
   it('reports no output when no agent message completed', async () => {
@@ -87,6 +94,8 @@ describe('codexOneShot', () => {
   it('escalates a timeout from SIGTERM to SIGKILL and resolves once', async () => {
     vi.useFakeTimers();
     const child = fakeChild();
+    child.pid = 12_345;
+    const processKill = vi.spyOn(process, 'kill').mockImplementation(() => true);
     const resultPromise = codexOneShot('prompt', {
       spawnImpl: () => child,
       timeoutMs: 1_000,
@@ -95,12 +104,12 @@ describe('codexOneShot', () => {
     void resultPromise.then(resolved);
 
     await vi.advanceTimersByTimeAsync(1_000);
-    expect(child.kill).toHaveBeenCalledTimes(1);
-    expect(child.kill).toHaveBeenNthCalledWith(1, 'SIGTERM');
+    expect(processKill).toHaveBeenNthCalledWith(1, -12_345, 'SIGTERM');
+    expect(child.kill).not.toHaveBeenCalled();
     expect(resolved).not.toHaveBeenCalled();
 
     await vi.advanceTimersByTimeAsync(KILL_GRACE_MS);
-    expect(child.kill).toHaveBeenNthCalledWith(2, 'SIGKILL');
+    expect(processKill).toHaveBeenNthCalledWith(2, -12_345, 'SIGKILL');
     await expect(resultPromise).resolves.toMatchObject({ text: null, reason: 'timeout' });
     expect(resolved).toHaveBeenCalledTimes(1);
 
@@ -119,6 +128,7 @@ describe('codexOneShot', () => {
     // A stdin EPIPE can leave the child alive; it must be SIGTERM'd rather than
     // resolved-and-leaked (Phase-1/2 review Major 1).
     expect(child.kill).toHaveBeenCalledWith('SIGTERM');
+    child.emit('close', null, 'SIGTERM');
   });
 
   it('handles an asynchronous child ENOENT error without throwing', async () => {
@@ -130,6 +140,7 @@ describe('codexOneShot', () => {
       Object.assign(new Error('spawn codex ENOENT'), { code: 'ENOENT' }),
     )).not.toThrow();
     await expect(resultPromise).resolves.toMatchObject({ text: null, reason: 'spawn-error' });
+    child.emit('close', null, null);
   });
 
   it('handles a synchronous spawn failure', async () => {
@@ -160,6 +171,7 @@ describe('codexOneShot', () => {
 
     await vi.advanceTimersByTimeAsync(KILL_GRACE_MS);
     expect(child.kill).toHaveBeenCalledWith('SIGKILL');
+    child.emit('close', null, 'SIGKILL');
   });
 
   it('passes the security argv and includes a model only when configured', async () => {
@@ -227,6 +239,33 @@ describe('codexOneShot', () => {
     });
     expect(options.env).not.toHaveProperty('HMAC_SECRET');
     expect(options.stdio).toEqual(['pipe', 'pipe', 'pipe']);
+    expect(options.detached).toBe(true);
+  });
+
+  it('uses and cleans up a fresh private cwd by default', async () => {
+    const child = fakeChild();
+    const spawnImpl = vi.fn(() => child);
+    const resultPromise = codexOneShot('prompt', { spawnImpl });
+    const spawnedCwd = spawnImpl.mock.calls[0][2].cwd;
+
+    expect(spawnedCwd).not.toBe(os.tmpdir());
+    expect(spawnedCwd.startsWith(`${os.tmpdir()}/codex-oneshot-`)).toBe(true);
+    expect(fs.statSync(spawnedCwd).mode & 0o777).toBe(0o700);
+
+    child.emit('close', 0, null);
+    await resultPromise;
+    await vi.waitFor(() => expect(fs.existsSync(spawnedCwd)).toBe(false));
+  });
+
+  it('honors a caller-supplied cwd without removing it', async () => {
+    const child = fakeChild();
+    const spawnImpl = vi.fn(() => child);
+    const resultPromise = codexOneShot('prompt', { cwd: os.tmpdir(), spawnImpl });
+
+    expect(spawnImpl.mock.calls[0][2].cwd).toBe(os.tmpdir());
+    child.emit('close', 0, null);
+    await resultPromise;
+    expect(fs.existsSync(os.tmpdir())).toBe(true);
   });
 });
 

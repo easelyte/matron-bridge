@@ -4440,7 +4440,10 @@ async function maybeUpdatePinnedSummary(session) {
     warn: (...args) => console.warn(...args),
     serverLabel: SERVER_LABEL,
     defaultWorkdir: DEFAULT_WORKDIR,
-  }).catch(e => debug('[summary] wrapper error', e));
+  }).catch(e => console.warn('[summary] wrapper error', {
+    error: String(e?.message || e),
+    roomId: session.roomId,
+  }));
 }
 
 // Path of a session's on-disk transcript. Extraction + bounded reading live

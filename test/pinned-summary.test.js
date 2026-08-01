@@ -28,7 +28,14 @@ function success(text = 'TITLE: Useful work\nSUMMARY: Work is complete.') {
 }
 
 function failure(reason = 'timeout') {
-  return { text: null, reason, exitCode: null, signal: 'SIGKILL', durationMs: 60_000 };
+  return {
+    text: null,
+    reason,
+    exitCode: null,
+    signal: 'SIGKILL',
+    durationMs: 60_000,
+    stderrTail: 'codex diagnostic',
+  };
 }
 
 function deps(overrides = {}) {
@@ -351,6 +358,7 @@ describe('updatePinnedSummary title flow and log levels', () => {
       exitCode: null,
       signal: 'SIGKILL',
       durationMs: 60_000,
+      stderrTail: 'codex diagnostic',
       model: 'summary-model',
     });
   });
