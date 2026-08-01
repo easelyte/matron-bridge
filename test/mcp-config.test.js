@@ -1,9 +1,11 @@
 import { describe, it, expect } from 'vitest';
 import {
   buildMcpServers,
+  effectiveExtras,
   extractMcpExtraFlags,
   extractPromptFlag,
   knownMcpExtras,
+  resolveDefaultExtras,
 } from '../lib/mcp-config.js';
 
 const BASE = Object.freeze({
@@ -15,6 +17,12 @@ const BASE = Object.freeze({
     },
   },
   mcpExtras: {
+    share: {
+      'show-file': {
+        command: 'node',
+        args: ['./show-file-mcp.js'],
+      },
+    },
     browser: {
       'chrome-devtools': {
         command: 'xvfb-run',
@@ -233,6 +241,17 @@ describe('buildMcpServers', () => {
     expect(extras).toEqual(['browser']);
   });
 
+  it('resolves the share extra entrypoint against the bridge install dir', () => {
+    const { config, extras } = buildMcpServers({
+      baseConfig: BASE,
+      extras: ['share'],
+      platform: 'linux',
+      askUserBaseDir: '/opt/bridge',
+    });
+    expect(config.mcpServers['show-file'].args[0]).toBe('/opt/bridge/show-file-mcp.js');
+    expect(extras).toEqual(['share']);
+  });
+
   it('silently drops unknown extras names rather than letting a typo enable nothing-then-everything', () => {
     const { config, extras } = buildMcpServers({
       baseConfig: BASE,
@@ -274,5 +293,31 @@ describe('buildMcpServers', () => {
   it('leaves args alone when no ask-user base dir is given', () => {
     const { config } = buildMcpServers({ baseConfig: BASE, platform: 'linux' });
     expect(config.mcpServers['ask-user'].args[0]).toBe('./ask-user.js');
+  });
+});
+
+describe('effectiveExtras', () => {
+  it('adds defaults to fresh and explicitly configured sessions without duplicates', () => {
+    expect(effectiveExtras([], ['share'])).toEqual(['share']);
+    expect(effectiveExtras(['browser'], ['share'])).toEqual(['browser', 'share']);
+    expect(effectiveExtras(['share', 'browser'], ['share'])).toEqual(['share', 'browser']);
+  });
+
+  it('does not mutate the resolved extras used for restart inheritance', () => {
+    const resolvedExtras = ['browser'];
+    effectiveExtras(resolvedExtras, ['share']);
+    expect(resolvedExtras).toEqual(['browser']);
+  });
+});
+
+describe('resolveDefaultExtras', () => {
+  it('enables share by default and disables it with the kill-switch', () => {
+    expect(resolveDefaultExtras(undefined)).toEqual(['share']);
+    expect(resolveDefaultExtras('0')).toEqual([]);
+    expect(effectiveExtras([], resolveDefaultExtras('0'))).toEqual([]);
+  });
+
+  it('keeps an explicitly requested share extra when the kill-switch is on', () => {
+    expect(effectiveExtras(['share'], resolveDefaultExtras('0'))).toEqual(['share']);
   });
 });
