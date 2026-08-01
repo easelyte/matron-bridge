@@ -1,8 +1,8 @@
 ---
 title: Agent-initiated inline media share (`show_file`)
 date: 2026-08-01
-status: draft
-revision: 4
+status: converged
+revision: 5
 repo: easelyte/claude-matrix-bridge (branch agent-inline-media)
 risk: medium
 execution_tier: slim
@@ -88,17 +88,23 @@ for `show-file-mcp.js` (resolved from `__dirname` when the generated config is w
 the builder's resolver to canonicalize its `args` the same way. A relative `args` would ENOENT in
 any non-bridge-workdir session.
 
-**Default selection (P14; open decision):** `share` is added to the default extras so ordinary
-sessions get `show_file` with no flag. The seam is **flag-merge, not the `createSession` fallback**:
-`extractMcpExtraFlags` returns an explicit `[]` (`lib/mcp-config.js:38`) which is passed to
-`createSession` at the `/start`, `/workdir`, `/resume` call sites (`index.js:4658`, `:4696`,
-`:5098`) and via RPC (`journalStartSessionForRpc`, `:534`); the `[]`-fallback at `:1036`/`:1601`
-is only used when `mcpExtras` is not an array. So default-on requires the default set to be applied
-where the flags are resolved (a `DEFAULT_MCP_EXTRAS = ['share']` merged into the extracted flags),
-not by editing the fallback. `share` is lightweight (not a ~400 MB browser stack), so the
-"lean-session default none" rationale does not apply. Bounded by workdir-only scope (Security).
-*Operator may flip to explicit opt-in — register `--share` in `EXTRA_FLAG_TO_NAME` like `--browser`
-and drop it from the default set; trades no-flag UX for a stricter default.*
+**Default selection (P14; open decision):** `share` is default-on so ordinary sessions get
+`show_file` with no flag. **Critically, the default is unioned into the EFFECTIVE extras only at
+config-generation time — it must NOT be merged into the explicit/parsed extras array**, because
+restart and resume use array-emptiness of the *parsed* extras to distinguish an explicit override
+from inheriting the persisted set (`index.js:4754`, `:4768`, `:4992`; `extractMcpExtraFlags` returns
+`[]` on no flags, `lib/mcp-config.js:38`). If `['share']` were merged into the parsed array, a
+no-flag restart of a `['share','browser']` session would look like an explicit override and silently
+drop `browser` (rev-4 regression caught in review). Correct seam: keep the parsed set untouched for
+override/inherit detection, and at each `mcpConfigPathFor(extras)` call (`index.js:171` and its call
+sites, plus `journalStartSessionForRpc`, `:534`) pass `effective = union(resolvedExtras,
+DEFAULT_MCP_EXTRAS)` where `DEFAULT_MCP_EXTRAS = ['share']`. Then: fresh no-flag → `['share']`;
+no-flag restart of `['share','browser']` → inherit `['share','browser']`, union is idempotent, browser
+preserved; explicit `--browser` → `['browser','share']`. `share` is lightweight (not a ~400 MB browser
+stack), so the "lean-session default none" rationale does not apply. Bounded by workdir-only scope
+(Security). *Operator may flip to explicit opt-in — register `--share` in `EXTRA_FLAG_TO_NAME` like
+`--browser` and set `DEFAULT_MCP_EXTRAS = []`; trades the no-flag UX for a stricter default and is
+the zero-plumbing option (the union step above is then unnecessary).*
 
 Tool (mirrors the synchronous `share_sensitive_data` shape, not the polling `request_secret`):
 
