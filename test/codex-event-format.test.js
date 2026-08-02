@@ -85,45 +85,70 @@ async function waitFor(predicate, timeoutMs = 3000) {
 describe('formatAndRoute', () => {
   it('replays the golden sample through the pinned item-to-post mapping', () => {
     const { calls, ctx } = makeContext();
+    const events = fixtureEvents();
+    const openingMessage = 'I’ll execute the three operations strictly in the requested order, using a patch for the file edit.';
+    const finalMessage = 'Completed in order:\n\n1. Printed `sentinel.env`.\n2. Appended `second line` to `mutate_me.txt`.\n3. Ran the sleep command; output: `done`.';
+    const expectedByFixtureItem = [
+      [{ method: 'publishActivity', args: [ctx.convoId, 'thinking'] }],
+      [{ method: 'publishActivity', args: [ctx.convoId, 'thinking'] }],
+      [],
+      [
+        { method: 'publishActivity', args: [ctx.convoId, 'thinking', openingMessage] },
+        { method: 'publishActivity', args: [ctx.convoId, 'tool', "/bin/bash -lc 'cat sentinel.env'"] },
+      ],
+      [{
+        method: 'publishToolOutput',
+        args: [ctx.convoId, {
+          tool_use_id: 'item_1', command: "/bin/bash -lc 'cat sentinel.env'",
+          output: 'SECRET_TOKEN=sk-REDACTED-FIXTURE-TOKEN\n', exit_code: 0, status: 'completed',
+        }],
+      }],
+      [{ method: 'publishActivity', args: [ctx.convoId, 'tool', 'Applying file changes'] }],
+      [{
+        method: 'publishToolOutput',
+        args: [ctx.convoId, {
+          tool_use_id: 'item_2', command: 'file_change',
+          output: 'update /tmp/codex-fixture-wt/mutate_me.txt', status: 'completed',
+        }],
+      }],
+      [{ method: 'publishActivity', args: [ctx.convoId, 'tool', "/bin/bash -lc 'sleep 3 && echo done'"] }],
+      [{
+        method: 'publishToolOutput',
+        args: [ctx.convoId, {
+          tool_use_id: 'item_3', command: "/bin/bash -lc 'sleep 3 && echo done'",
+          output: 'done\n', exit_code: 0, status: 'completed',
+        }],
+      }],
+      [{ method: 'publishActivity', args: [ctx.convoId, 'tool', "/bin/bash -lc 'tail -n 3 mutate_me.txt'"] }],
+      [{
+        method: 'publishToolOutput',
+        args: [ctx.convoId, {
+          tool_use_id: 'item_4', command: "/bin/bash -lc 'tail -n 3 mutate_me.txt'",
+          output: 'first line\nsecond line\n', exit_code: 0, status: 'completed',
+        }],
+      }],
+      [],
+      [
+        {
+          method: 'publishText',
+          args: [ctx.convoId, { body: finalMessage, from: 'assistant' }, { idemKey: 'run-1:final' }],
+        },
+        { method: 'publishActivity', args: [ctx.convoId, 'idle'] },
+      ],
+    ];
 
-    for (const event of fixtureEvents()) formatAndRoute(event, ctx);
+    for (const [index, event] of events.entries()) {
+      const start = calls.length;
+      formatAndRoute(event, ctx);
+      const itemCalls = calls.slice(start).filter(call => call.method !== 'publishStatus');
+      expect(itemCalls, `fixture line ${index + 1}`).toEqual(expectedByFixtureItem[index]);
+    }
 
-    expect(calls.filter(call => call.method === 'publishToolOutput')).toHaveLength(4);
-    expect(calls.filter(call => call.method === 'publishDiff')).toHaveLength(0);
-    expect(calls.filter(call => call.method === 'publishActivity').length).toBeGreaterThan(0);
+    expect(expectedByFixtureItem).toHaveLength(events.length);
     expect(calls.filter(call => call.method === 'publishStatus')).toEqual([
       { method: 'publishStatus', args: [ctx.convoId, { model: 'gpt-5.6-sol' }] },
     ]);
-
-    const toolPosts = calls.filter(call => call.method === 'publishToolOutput');
-    expect(toolPosts[0].args).toEqual([
-      ctx.convoId,
-      expect.objectContaining({
-        command: "/bin/bash -lc 'cat sentinel.env'",
-        output: 'SECRET_TOKEN=sk-REDACTED-FIXTURE-TOKEN\n',
-        exit_code: 0,
-      }),
-    ]);
-
-    expect(toolPosts[1].args).toEqual([
-      ctx.convoId,
-      {
-        tool_use_id: 'item_2',
-        command: 'file_change',
-        output: 'update /tmp/codex-fixture-wt/mutate_me.txt',
-        status: 'completed',
-      },
-    ]);
-    expect(toolPosts[1].args[1]).not.toHaveProperty('changes');
-    expect(toolPosts[1].args[1]).not.toHaveProperty('diff');
-
-    const finalPosts = calls.filter(call => call.method === 'publishText');
-    expect(finalPosts).toHaveLength(1);
-    expect(finalPosts[0].args).toEqual([
-      ctx.convoId,
-      expect.objectContaining({ body: expect.stringContaining('Completed in order'), from: 'assistant' }),
-      { idemKey: 'run-1:final' },
-    ]);
+    expect(calls.filter(call => call.method === 'publishDiff')).toHaveLength(0);
     expect(ctx.state.terminalSeen).toBe(true);
     expect(ctx.state.durableEvents).toBe(5);
   });
@@ -327,6 +352,55 @@ describe('formatAndRoute', () => {
       args: [ctx.convoId, { body: JSON.stringify(event), from: 'assistant' }],
     })));
     expect(ctx.state.unparsed).toBe(2);
+  });
+
+  it('requires an exact complete schema version identifier', () => {
+    const { calls, ctx } = makeContext({
+      meta: { schemaVersion: `${PINNED_SCHEMA_VERSION} schema-v2` },
+    });
+    const event = fixtureEvents()[4];
+
+    formatAndRoute(event, ctx);
+
+    expect(ctx.log.warn).toHaveBeenCalledTimes(1);
+    expect(calls.filter(call => call.method !== 'publishStatus')).toEqual([{
+      method: 'publishText',
+      args: [ctx.convoId, { body: JSON.stringify(event), from: 'assistant' }],
+    }]);
+  });
+
+  it('skips the durable final and warns once when runId is missing', () => {
+    const { calls, ctx } = makeContext({ runId: undefined });
+    const finalMessage = {
+      type: 'item.completed',
+      item: { id: 'answer-1', type: 'agent_message', text: 'Finished' },
+    };
+
+    formatAndRoute(finalMessage, ctx);
+    formatAndRoute({ type: 'turn.completed' }, ctx);
+    formatAndRoute(finalMessage, ctx);
+    formatAndRoute({ type: 'turn.completed' }, ctx);
+
+    expect(calls.filter(call => call.method === 'publishText')).toHaveLength(0);
+    expect(ctx.log.warn).toHaveBeenCalledTimes(1);
+    expect(ctx.state.durableEvents).toBe(0);
+    expect(ctx.state.terminalSeen).toBe(true);
+  });
+
+  it('rejects a partially numeric durable-event environment value', () => {
+    vi.stubEnv('CODEX_MAX_DURABLE_EVENTS', '2junk');
+    try {
+      const { calls, ctx } = makeContext();
+      for (let i = 0; i < 3; i += 1) {
+        formatAndRoute({ type: 'mystery', sequence: i }, ctx);
+      }
+
+      expect(calls.filter(call => call.method === 'publishText')).toHaveLength(3);
+      expect(ctx.state.durableEvents).toBe(3);
+      expect(ctx.state.droppedEvents).toBe(0);
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 
   it('omits model data when meta has no model', () => {

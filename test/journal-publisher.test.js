@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest';
+import { EventEmitter } from 'node:events';
 import WebSocket, { WebSocketServer } from 'ws';
 import net from 'net';
 import http from 'node:http';
@@ -658,6 +659,24 @@ describe('createJournalPublisher', () => {
       pub.publishText('c1', { body: 'hi', from: 'user' });
       pub.close();
     }).not.toThrow();
+  });
+
+  it('publishText fails open when options is null', () => {
+    class DormantTransport extends EventEmitter {
+      constructor() {
+        super();
+        this.readyState = 0;
+      }
+      terminate() { this.readyState = 3; }
+    }
+    const pub = createJournalPublisher({
+      url: 'ws://journal.test/ws',
+      token: 'tok',
+      log: silentLog,
+      WebSocketImpl: DormantTransport,
+    });
+    expect(() => pub.publishText('c1', { body: 'hi', from: 'user' }, null)).not.toThrow();
+    pub.close();
   });
 
   it('never assigns an idem_key with the fin: prefix reserved by finalize', async () => {
