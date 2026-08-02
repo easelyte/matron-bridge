@@ -19,19 +19,21 @@ test files. No dependency, env, or migration changes.
 
 **T-1.1 — `extractRepoOverride(text)` (new exported fn)**
 - Signature: `extractRepoOverride(text) → string | null`.
-- Match `/^REPO:\s*(.+)$/im` (line-anchored, multiline, case-insensitive)
-  against `text`; `String.match` (no `/g`) returns the first line-anchored
-  match, so a mid-line `REPO:` echo inside TITLE/prose cannot hijack it. No
-  match → `null`.
-- Trim the captured group. Lowercase-compare against the sentinel set
-  `{unknown, none, n/a, na, -}` (compare the trimmed raw, pre-sanitize) →
-  `null`.
-- Sanitize (mirror `applyFallbackTitle` cleaning — strips tag *delimiters*,
-  preserves content, neutralizes stray `<`/`>`): `.replace(/<[^>]*>/g,' ')`
-  → `.replace(/[<>]/g,' ')` → `.replace(/·/g,' ')` → `.replace(/\s+/g,' ')`
+- Collect all line-anchored `REPO:` lines with
+  `/^REPO:[^\S\r\n]*[^\r\n]*$/gim` (horizontal-ws-only + line-bounded so a
+  blank `REPO:` cannot cross a newline and swallow the next field). Require
+  **exactly one**: `!lines || lines.length !== 1` → `null` (zero = no override;
+  ≥2 = ambiguous/spoofable stray `REPO:` echo → reject to workdir fallback). A
+  mid-line `REPO:` in TITLE/prose is not line-anchored → ignored.
+- Strip the `REPO:` prefix from the single line and trim →`raw`. Lowercase-
+  compare against the sentinel set `{unknown, none, n/a, na, -}` → `null`.
+- Sanitize for a display sink (mirror `applyFallbackTitle`, plus control-char
+  policy): `.replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu,' ')` (C0/C1 controls,
+  bidi/format, separators) → `.replace(/<[^>]*>/g,' ')` →
+  `.replace(/[<>]/g,' ')` → `.replace(/·/g,' ')` → `.replace(/\s+/g,' ')`
   → `.trim()`. Empty after clean → `null`.
-- Cap with `truncateWithEllipsis(clean, REPO_LABEL_MAX)` (≤24 unchanged; >24 →
-  first 24 + `…`); return it.
+- Cap with `truncateWithEllipsis(clean, REPO_LABEL_MAX)` (code-point-aware; ≤24
+  unchanged; >24 → first 24 + `…`); return it.
 - Keep the fn pure/synchronous; export it.
 
 **T-1.2 — `formatRoomTitle` gains optional `repo`**
@@ -54,7 +56,7 @@ test files. No dependency, env, or migration changes.
   (23 ASCII + emoji over the cap → no unpaired surrogate / `�`); middot
   injection
   (`REPO: a · b` → `a b`, no `·`); line-anchored spoof
-  (`TITLE: probe REPO: spoof\nREPO: real-repo` → `real-repo`).
+  (`TITLE: probe REPO: spoof\nREPO: real-repo` -> `real-repo`); duplicate REPO: lines -> `null` (reject); control/bidi chars (`REPO: safe\u202Eabc` -> `safe abc`).
 - `formatRoomTitle`: with `repo:'snafu-studio'` → segment is `snafu-studio`
   (not workdir basename); with `repo` omitted → identical to pre-change output
   (assert against a workdir case); with `repo:'   '` → falls back to

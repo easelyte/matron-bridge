@@ -224,6 +224,24 @@ describe('extractRepoOverride', () => {
   it('is line-anchored — a mid-line REPO: echo cannot hijack the canonical line', () => {
     expect(extractRepoOverride('TITLE: probe REPO: spoof\nREPO: real-repo\nSUMMARY: x')).toBe('real-repo');
   });
+
+  it('rejects duplicate REPO: lines (ambiguous / spoofable) to the workdir fallback', () => {
+    // A stray REPO: echoed from transcript content before the canonical one
+    // must not be able to select the title — two REPO: lines → no override.
+    expect(extractRepoOverride('REPO: attacker\nTITLE: legit\nREPO: real-repo\nSUMMARY: y')).toBeNull();
+    expect(extractRepoOverride('REPO: a\nREPO: b')).toBeNull();
+  });
+
+  it('strips control, format, and bidi characters before they reach the title', () => {
+    // Bidi override (U+202E) can visually reorder a title; C0 controls (BEL)
+    // are non-printing. Both must be neutralized (-> space, collapsed). The
+    // .toBe assertions prove the chars are gone; the bidi range check is
+    // belt-and-braces.
+    const bidi = extractRepoOverride('REPO: safe\u202Eabc');
+    expect(bidi).toBe('safe abc');
+    expect(bidi).not.toMatch(/[\u202A-\u202E\u2066-\u2069]/);
+    expect(extractRepoOverride('REPO: a\u0007b')).toBe('a b');
+  });
 });
 
 describe('applyFallbackTitle (repo-aware first-user-message naming)', () => {

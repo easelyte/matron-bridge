@@ -56,19 +56,27 @@ adding one output field:
    `unknown` when unclear.
 
 2. **Extraction (`lib/journal-title-seed.js`, new exported
-   `extractRepoOverride(text)`)** — parse with a **line-anchored, multiline,
-   case-insensitive** regex `/^REPO:\s*(.+)$/im` (the `REPO:` line codex is
-   instructed to emit at the start of a line). `String.match` without `/g`
-   returns the **first line-anchored match**, so an incidental `REPO:` echoed
-   mid-line inside TITLE/prose cannot hijack the value (blocker fix). Then:
+   `extractRepoOverride(text)`)** — collect all **line-anchored,
+   case-insensitive** `REPO:` lines with `/^REPO:[^\S\r\n]*[^\r\n]*$/gim`
+   (horizontal-whitespace-only + line-bounded capture so a blank `REPO:` cannot
+   cross the newline and swallow the next field). Require **exactly one** such
+   line: zero → no override; **two or more → reject to the workdir fallback**
+   (a stray `REPO:` echoed from untrusted transcript content — this feature
+   runs on the bridge whose own sessions discuss `REPO:` lines — is ambiguous
+   and spoofable, so parse-don't-validate rejects rather than guessing which is
+   canonical). A mid-line `REPO:` inside TITLE/prose is not line-anchored and is
+   ignored. Then, on the single line:
    - Treat missing, empty-after-clean, or a sentinel (`unknown`, `none`,
      `n/a`, `na`, `-`, compared case-insensitively against the trimmed raw
      capture) as **no override** → returns `null`.
    - Otherwise sanitize the model-generated string (it is derived from
-     untrusted transcript content). The sanitizer's contract is to neutralize
-     angle brackets so no `<`/`>` reaches the room name — it strips tag
-     *delimiters* but **preserves their text content** (parity with the
-     existing `applyFallbackTitle` cleaning; CodeQL
+     untrusted transcript content and lands in a display sink). First strip
+     Unicode control/format/separator chars —
+     `.replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu,' ')` — which removes C0/C1
+     controls, bidi overrides (`‮` etc. that could visually reorder the
+     title), and line/paragraph separators. Then neutralize angle brackets so
+     no `<`/`>` reaches the room name — strip tag *delimiters* but **preserve
+     their text content** (parity with `applyFallbackTitle`; CodeQL
      js/incomplete-multi-character-sanitization): `.replace(/<[^>]*>/g,' ')`
      → `.replace(/[<>]/g,' ')` → `.replace(/·/g,' ')` (drop the `·` separator
      so an injected middot cannot forge extra title segments) →
@@ -101,6 +109,8 @@ adding one output field:
 | `REPO: unknown` / omitted / whitespace | `repoLabel(workdir)` (today's behavior) |
 | `REPO: <b>foo</b>bar` | `foo bar` (tag delimiters → space, content preserved, no `<`/`>`) |
 | `TITLE: probe REPO: spoof`\n`REPO: real-repo` | `real-repo` (line-anchored regex ignores the mid-line echo) |
+| `REPO: attacker`\n`REPO: real-repo` (two lines) | `repoLabel(workdir)` (duplicate → rejected, no override) |
+| `REPO: safe‮abc` (bidi/control chars) | `safe abc` (control/format/bidi stripped) |
 | codex call fails (`text === null`) | fallback-title path → `repoLabel(workdir)` (unchanged) |
 | kill-switch off | fallback-title path → `repoLabel(workdir)` (unchanged) |
 | resume path | `repoLabel(workdir)` (unchanged — no transcript LLM pass) |
