@@ -2674,6 +2674,7 @@ function setupSubagentWatcher(session, workdir, sessionId) {
       onDiscover: session.codexOnDiscover,
       isolation,
     }, {
+      beforeStart: watcher => watcher.reconcile(session),
       onFailure: (_error, failedWatcher) => {
         if (session.codexWatcher === failedWatcher) session.codexWatcher = null;
         Promise.resolve(failedWatcher?.stop?.()).catch(() => {});
