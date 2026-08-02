@@ -2668,7 +2668,7 @@ function setupSubagentWatcher(session, workdir, sessionId) {
       isAdmittedRun: runId => session.codexConvos.hasChild(runId),
       log: console,
     });
-    session.codexWatcher = registerCodexWatcherForSession(session, {
+    registerCodexWatcherForSession(session, {
       workdir,
       sessionId,
       onDiscover: session.codexOnDiscover,
