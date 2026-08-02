@@ -375,7 +375,7 @@ describe('Codex completion state machine', () => {
     }));
   });
 
-  it('reports a final post as landed only after publisher delivery confirmation', async () => {
+  it('does not treat publisher socket delivery as a durable final-post acknowledgement', async () => {
     vi.useFakeTimers();
     const harness = makeHarness({ alive: true });
     await attach(harness);
@@ -399,7 +399,7 @@ describe('Codex completion state machine', () => {
     await harness.watcher.watchdogTick();
     await vi.advanceTimersByTimeAsync(50);
 
-    expect(harness.audits).toContainEqual(expect.objectContaining({ finalPostLanded: true }));
+    expect(harness.audits).toContainEqual(expect.objectContaining({ finalPostLanded: null }));
   });
 
   it('threads formatter durability and redaction-drop counters into terminal audit', async () => {

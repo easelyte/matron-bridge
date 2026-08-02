@@ -37,7 +37,8 @@ describe('Codex event backpressure', () => {
     expect(calls.filter(call => (
       call.method === 'publishText' || call.method === 'publishToolOutput'
     ))).toHaveLength(0);
-    expect(calls.filter(call => call.method === 'publishActivity')).toHaveLength(500);
+    expect(calls.filter(call => call.method === 'publishActivity')).toHaveLength(1);
+    expect(ctx.state.droppedActivityEvents).toBe(499);
     expect(ctx.state.durableEvents).toBe(0);
 
     for (let index = 0; index < 250; index += 1) {
@@ -75,9 +76,8 @@ describe('Codex event backpressure', () => {
 
     expect(calls).toEqual([
       { method: 'publishActivity', args: [ctx.convoId, 'thinking', 'thinking'] },
-      { method: 'publishActivity', args: [ctx.convoId, 'thinking', 'starting'] },
-      { method: 'publishActivity', args: [ctx.convoId, 'thinking', 'update'] },
     ]);
+    expect(ctx.state.droppedActivityEvents).toBe(2);
     expect(ctx.state.unparsed).toBe(0);
     expect(ctx.state.durableEvents).toBe(0);
   });

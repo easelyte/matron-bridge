@@ -357,6 +357,72 @@ describe('CodexWatcher', () => {
     await watcher.scan();
     expect(watcher.pending.has(RUN_PENDING)).toBe(false);
   });
+
+  it('clamps forged deadlines and detaches a continuous sub-cap transcript at its cumulative cap', async () => {
+    const dir = makeDir();
+    let now = Date.now();
+    writeMeta(dir, RUN_LIVE, { deadlineTs: now + 10_000_000 });
+    const transcript = path.join(dir, `codex-${RUN_LIVE}.jsonl`);
+    fs.writeFileSync(transcript, '{"type":"a","n":1}\n');
+    const watcher = new CodexWatcher({
+      dir,
+      now: () => now,
+      maxRunMs: 1_000,
+      maxTranscriptBytes: 80,
+      pollIntervalMs: 60_000,
+      isWrapperAliveFn: () => true,
+    });
+    watchers.push(watcher);
+    const caps = [];
+    watcher.on('resourceCap', payload => caps.push(payload));
+
+    await watcher.start();
+    const acceptedDeadline = watcher.attachedMeta.get(RUN_LIVE).deadlineTs;
+    expect(acceptedDeadline).toBe(now + 1_000);
+    now += 100;
+    expect(watcher._readMeta(RUN_LIVE).deadlineTs).toBe(acceptedDeadline);
+
+    const append = `${JSON.stringify({ type: 'item', body: 'x'.repeat(18) })}\n`;
+    fs.appendFileSync(transcript, append);
+    await watcher.tails.get(RUN_LIVE).drain({ windowMs: 0 });
+    expect(watcher.seen.has(RUN_LIVE)).toBe(false);
+    fs.appendFileSync(transcript, append);
+    await watcher.tails.get(RUN_LIVE).drain({ windowMs: 0 });
+
+    expect(caps).toEqual([expect.objectContaining({ runId: RUN_LIVE, resource: 'bytes' })]);
+    expect(watcher.seen.has(RUN_LIVE)).toBe(true);
+    expect(watcher.attached.has(RUN_LIVE)).toBe(false);
+    expect(watcher.tails.has(RUN_LIVE)).toBe(false);
+  });
+
+  it('terminalizes a run after its cumulative event budget including ephemerals', async () => {
+    const dir = makeDir();
+    writeMeta(dir, RUN_LIVE);
+    const transcript = path.join(dir, `codex-${RUN_LIVE}.jsonl`);
+    fs.writeFileSync(transcript, [1, 2, 3].map(n => JSON.stringify({
+      type: 'item.completed',
+      item: { type: 'reasoning', text: `thought ${n}` },
+    })).join('\n') + '\n');
+    const watcher = new CodexWatcher({
+      dir,
+      maxTranscriptEvents: 2,
+      pollIntervalMs: 60_000,
+      isWrapperAliveFn: () => true,
+    });
+    watchers.push(watcher);
+    const events = [];
+    const caps = [];
+    watcher.on('codex-event', payload => events.push(payload));
+    watcher.on('resourceCap', payload => caps.push(payload));
+
+    await watcher.start();
+
+    expect(events).toHaveLength(2);
+    expect(caps).toEqual([expect.objectContaining({ runId: RUN_LIVE, resource: 'events' })]);
+    expect(watcher.streamStates.get(RUN_LIVE).processedEvents).toBe(2);
+    expect(watcher.seen.has(RUN_LIVE)).toBe(true);
+    expect(watcher.attached.has(RUN_LIVE)).toBe(false);
+  });
 });
 
 describe('bridge watcher wiring', () => {

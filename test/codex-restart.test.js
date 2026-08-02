@@ -56,7 +56,13 @@ class FakeTail extends EventEmitter {
   stop() {}
 }
 
-function makeWatcher(dir, { onDiscover, onReconcile, breakerThreshold, maxChildren } = {}) {
+function makeWatcher(dir, {
+  onDiscover,
+  onReconcile,
+  breakerThreshold,
+  maxChildren,
+  isWrapperAliveFn = () => false,
+} = {}) {
   const calls = [];
   const publisher = {
     upsertConvo(convoId, options) {
@@ -88,7 +94,7 @@ function makeWatcher(dir, { onDiscover, onReconcile, breakerThreshold, maxChildr
     onDiscover: discover,
     onReconcile: onReconcile ?? ((runId, outcome) => tracker.terminalizeByRunId(runId, outcome)),
     isolation,
-    isWrapperAliveFn: () => true,
+    isWrapperAliveFn,
     pollIntervalMs: 60_000,
     TailClass: FakeTail,
   });
@@ -97,41 +103,44 @@ function makeWatcher(dir, { onDiscover, onReconcile, breakerThreshold, maxChildr
 }
 
 describe('Codex restart reconciliation', () => {
-  it('interrupts a running child before snapshot can re-tail it', async () => {
+  it('attaches a live run and reconciles terminal metadata with honest outcomes', async () => {
     const dir = makeDir();
     writeRun(dir, RUN_INTERRUPTED);
     writeRun(dir, RUN_FINISHED, { exitCode: 0 });
     writeRun(dir, RUN_FAILED, { exitCode: 1 });
-    const { calls, tracker, watcher } = makeWatcher(dir);
+    const { calls, tracker, watcher } = makeWatcher(dir, {
+      isWrapperAliveFn: meta => meta.runId === RUN_INTERRUPTED,
+    });
     const session = { claudeSessionId: 'session-1' };
 
     await expect(watcher.reconcile(session)).resolves.toBe(true);
     await watcher.start();
 
-    expect(tracker.childFor(RUN_INTERRUPTED)).toBeNull();
+    expect(tracker.childFor(RUN_INTERRUPTED)).toMatchObject({ terminal: false });
     expect(tracker.childFor(RUN_FINISHED)).toBeNull();
     expect(tracker.childFor(RUN_FAILED)).toBeNull();
     expect(Object.fromEntries(calls.map(call => [call.convoId, call.options]))).toEqual({
       [`parent-1:codex:${RUN_INTERRUPTED}`]: expect.objectContaining({
-        sessionState: 'done', sessionOutcome: 'interrupted',
+        sessionState: 'running',
       }),
       [`parent-1:codex:${RUN_FINISHED}`]: expect.objectContaining({
-        sessionState: 'done', sessionOutcome: 'interrupted',
+        sessionState: 'done', sessionOutcome: 'completed',
       }),
       [`parent-1:codex:${RUN_FAILED}`]: expect.objectContaining({
-        sessionState: 'done', sessionOutcome: 'interrupted',
+        sessionState: 'done', sessionOutcome: 'failed',
       }),
     });
-    expect(watcher.seen.has(RUN_INTERRUPTED)).toBe(true);
+    expect(watcher.seen.has(RUN_INTERRUPTED)).toBe(false);
+    expect(watcher.attached.has(RUN_INTERRUPTED)).toBe(true);
     expect(watcher.seen.has(RUN_FINISHED)).toBe(true);
     expect(watcher.seen.has(RUN_FAILED)).toBe(true);
-    expect(FakeTail.starts).toEqual([]);
+    expect(FakeTail.starts).toEqual([path.join(dir, `codex-${RUN_INTERRUPTED}.jsonl`)]);
   });
 
   it('runs the production registration hook for a session added after boot and before watcher startup', async () => {
     const dir = makeDir();
     writeRun(dir, RUN_INTERRUPTED);
-    const { tracker, watcher } = makeWatcher(dir);
+    const { tracker, watcher } = makeWatcher(dir, { isWrapperAliveFn: () => true });
     watcher.sessionId = 'late-session';
     const session = { roomId: 'late-room', claudeSessionId: 'late-session' };
     const liveSessions = new Map([['late-room', session]]);
@@ -158,9 +167,32 @@ describe('Codex restart reconciliation', () => {
     expect(session.codexWatcher).toBe(watcher);
     expect(reconcile).toHaveBeenCalledWith(session);
     expect(order.slice(0, 2)).toEqual(['reconcile', 'start']);
-    expect(tracker.childFor(RUN_INTERRUPTED)).toBeNull();
-    expect(watcher.seen.has(RUN_INTERRUPTED)).toBe(true);
+    expect(tracker.childFor(RUN_INTERRUPTED)).toMatchObject({ terminal: false });
+    expect(watcher.seen.has(RUN_INTERRUPTED)).toBe(false);
+    expect(watcher.attached.has(RUN_INTERRUPTED)).toBe(true);
 
+  });
+
+  it('interrupts dead, reused-pid, and past-deadline runs during reconciliation', async () => {
+    const dir = makeDir();
+    writeRun(dir, RUN_INTERRUPTED);
+    writeRun(dir, RUN_MALFORMED, { wrapperStartTicks: 'reused' });
+    writeRun(dir, RUN_FINISHED, { deadlineTs: Date.now() - 1 });
+    const alive = new Set([RUN_FINISHED]);
+    const harness = makeWatcher(dir, {
+      isWrapperAliveFn: meta => alive.has(meta.runId),
+    });
+
+    await expect(harness.watcher.reconcile({ claudeSessionId: 'session-1' })).resolves.toBe(true);
+
+    for (const runId of [RUN_INTERRUPTED, RUN_MALFORMED, RUN_FINISHED]) {
+      expect(harness.watcher.seen.has(runId)).toBe(true);
+      expect(harness.calls).toContainEqual(expect.objectContaining({
+        convoId: `parent-1:codex:${runId}`,
+        options: expect.objectContaining({ sessionOutcome: 'interrupted' }),
+      }));
+    }
+    expect(FakeTail.starts).toEqual([]);
   });
 
   it('leaves a transient terminalization failure pending so reconciliation retries it', async () => {

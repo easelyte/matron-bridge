@@ -270,6 +270,11 @@ describe('publish-side Codex redaction', () => {
     ["/usr/bin/bash -lc 'env'", `API_TOKEN=${SENTINEL}`],
     ['bash -c env | grep DATABASE_PASSWORD', 'DATABASE_PASSWORD=hunter2'],
     ["sh -lc 'printenv | grep API_TOKEN'", `API_TOKEN=${SENTINEL}`],
+    ['printenv DATABASE_PASSWORD', 'hunter2'],
+    ['echo $AWS_SECRET_ACCESS_KEY', 'AKIA-secret-value'],
+    ['echo "${AUTH_TOKEN}"', 'opaque-value'],
+    ["node -p 'process.env[\"API_KEY\"]'", 'opaque-value'],
+    ["python -c 'import os; print(os.getenv(\"AUTH_TOKEN\"))'", 'opaque-value'],
     ['unknown-diagnostic', `API_TOKEN=${SENTINEL}\nDATABASE_PASSWORD=hunter2\nHOME=/root\nPATH=/bin`],
   ])('drops raw env-dump output for bypass %s', (command, output) => {
     const publisher = makePublisher();
