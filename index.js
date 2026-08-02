@@ -2649,6 +2649,7 @@ function setupSubagentWatcher(session, workdir, sessionId) {
   // resolving through the live session preserves that stable parent across
   // agent switches. T-4.1's watcher calls handleCodexDiscover below.
   session.codexConvos = createCodexConvoTracker({
+    sessionId,
     publisher: journalPublisher,
     getParentConvoId: () => journalConvoIdFor(session),
     log: console,

@@ -20,9 +20,12 @@ function makeHarness(sessionId = 'session-1', options = {}) {
   const calls = { upsertConvo: [], publishText: [] };
   const publisher = {
     upsertConvo(convoId, opts) { calls.upsertConvo.push({ convoId, opts }); },
-    publishText(convoId, payload) { calls.publishText.push({ convoId, payload }); },
+    publishText(convoId, payload, publishOptions) {
+      calls.publishText.push({ convoId, payload, options: publishOptions });
+    },
   };
   const tracker = createCodexConvoTracker({
+    sessionId,
     publisher,
     getParentConvoId: () => `parent-${sessionId}`,
     log: { warn() {} },
@@ -39,6 +42,7 @@ function makeHarness(sessionId = 'session-1', options = {}) {
     getParentConvoId: () => `parent-${sessionId}`,
     terminalize: (id, outcome) => tracker.terminalize(id, outcome),
     terminalizeAll: () => tracker.interruptAll(),
+    isAdmittedRun: id => tracker.hasChild(id),
     log,
   });
   return { calls, tracker, isolation, audits };
@@ -103,6 +107,7 @@ describe('codex watcher isolation', () => {
         body: '⚙ codex live-view disabled after repeated errors — reviews unaffected',
         from: 'assistant',
       },
+      options: { idemKey: 'first:breaker' },
     }]);
     expect(first.isolation.guardSession('poll', () => 'not run')).toBeUndefined();
     expect(first.calls.publishText).toHaveLength(1);
@@ -113,11 +118,13 @@ describe('codex watcher isolation', () => {
   it('retries the breaker note independently after its first publication fails', () => {
     let publishAttempts = 0;
     const successfulNotes = [];
+    const attemptedOptions = [];
     const publisher = {
-      publishText(convoId, payload) {
+      publishText(convoId, payload, options) {
         publishAttempts += 1;
+        attemptedOptions.push(options);
         if (publishAttempts === 1) throw new Error('journal unavailable');
-        successfulNotes.push({ convoId, payload });
+        successfulNotes.push({ convoId, payload, options });
       },
     };
     const isolation = createCodexWatcherIsolation({
@@ -125,6 +132,7 @@ describe('codex watcher isolation', () => {
       publisher,
       getParentConvoId: () => 'parent-breaker-retry',
       terminalize: () => false,
+      isAdmittedRun: () => false,
       breakerThreshold: 1,
       log: { info() {}, warn() {} },
     });
@@ -137,7 +145,35 @@ describe('codex watcher isolation', () => {
     isolation.retryPending();
 
     expect(publishAttempts).toBe(2);
+    expect(attemptedOptions).toEqual([
+      { idemKey: 'breaker-retry:breaker' },
+      { idemKey: 'breaker-retry:breaker' },
+    ]);
     expect(successfulNotes).toHaveLength(1);
+    expect(successfulNotes[0].payload).toMatchObject({
+      body: '⚙ codex live-view disabled after repeated errors — reviews unaffected',
+    });
+  });
+
+  it('disables, terminalizes every child, then posts the breaker note', () => {
+    const order = [];
+    let isolation;
+    isolation = createCodexWatcherIsolation({
+      sessionId: 'ordered-breaker',
+      publisher: { publishText() { order.push('note'); } },
+      getParentConvoId: () => 'parent-ordered-breaker',
+      terminalizeAll() {
+        order.push(`terminalize-all-disabled-${isolation.isDisabled()}`);
+        return [];
+      },
+      isAdmittedRun: () => false,
+      breakerThreshold: 1,
+      log: { info() {}, warn() {} },
+    });
+
+    isolation.guardSession('poll', () => { throw new Error('scan failed'); });
+
+    expect(order).toEqual(['terminalize-all-disabled-true', 'note']);
   });
 
   it('interrupts other in-flight runs only when the breaker trips', () => {
@@ -182,6 +218,7 @@ describe('codex watcher isolation', () => {
         breakerTerminalizations = tracker.interruptAll();
         return breakerTerminalizations;
       },
+      isAdmittedRun: id => tracker.hasChild(id),
       breakerThreshold: 1,
       log: { info(_message, record) { audits.push(record); }, warn() {} },
     });
@@ -204,7 +241,8 @@ describe('codex watcher isolation', () => {
   });
 
   it('emits at most one structured start and terminal audit record per run', () => {
-    const { isolation, audits } = makeHarness();
+    const { tracker, isolation, audits } = makeHarness();
+    tracker.ensureChild({ runId: RUN_1 });
     isolation.auditStart({
       runId: RUN_1,
       label: 'Review',
@@ -266,6 +304,7 @@ describe('codex watcher isolation', () => {
         },
         warn() {},
       },
+      isAdmittedRun: runId => runId === RUN_1,
     });
     const meta = { runId: RUN_1, deadlineTs: 1722600100000 };
 
@@ -284,7 +323,7 @@ describe('codex watcher isolation', () => {
     ]);
   });
 
-  it('rejects forged audit run IDs and non-finite or non-numeric deadlines', () => {
+  it('rejects unadmitted audit run IDs and non-finite or non-numeric deadlines', () => {
     const auditRecords = [];
     const isolation = createCodexWatcherIsolation({
       sessionId: 'audit-validation',
@@ -292,6 +331,7 @@ describe('codex watcher isolation', () => {
         info(_message, record) { auditRecords.push(record); },
         warn() {},
       },
+      isAdmittedRun: runId => runId === RUN_1,
     });
 
     isolation.auditStart({ runId: 'forged-secret-run-id', deadlineTs: 1 });
@@ -310,12 +350,37 @@ describe('codex watcher isolation', () => {
     expect(JSON.stringify(auditRecords)).not.toContain('secret');
   });
 
+  it('ignores regex-valid run IDs that child creation never admitted', () => {
+    const operation = vi.fn(() => { throw new Error('must not run'); });
+    const terminalize = vi.fn();
+    const auditRecords = [];
+    const isolation = createCodexWatcherIsolation({
+      sessionId: 'admission-gate',
+      terminalize,
+      isAdmittedRun: runId => runId === RUN_1,
+      log: {
+        info(_message, record) { auditRecords.push(record); },
+        warn() {},
+      },
+    });
+
+    isolation.auditStart({ runId: RUN_2, deadlineTs: 1722600100000 });
+    isolation.auditTerminal(RUN_2);
+    expect(isolation.guardRun(RUN_2, 'decoder', operation)).toBeUndefined();
+
+    expect(operation).not.toHaveBeenCalled();
+    expect(terminalize).not.toHaveBeenCalled();
+    expect(auditRecords).toHaveLength(0);
+    expect(isolation.breakerState()).toEqual({ disabled: false, errorCount: 0 });
+  });
+
   it('does not copy descendant-controlled labels or error messages into logs', () => {
     const warnings = [];
     const auditRecords = [];
     const isolation = createCodexWatcherIsolation({
       sessionId: 'session-secret-test',
       terminalize() {},
+      isAdmittedRun: runId => runId === RUN_1,
       log: {
         info(_message, record) { auditRecords.push(record); },
         warn(message) { warnings.push(message); },
@@ -367,6 +432,7 @@ describe('codex watcher isolation', () => {
       getParentConvoId: () => 'parent-terminal-retry',
       terminalize: (id, outcome) => tracker.terminalize(id, outcome),
       terminalizeAll: () => tracker.interruptAll(),
+      isAdmittedRun: id => tracker.hasChild(id),
       log: { info(_message, record) { audits.push(record); }, warn() {} },
     });
     tracker.ensureChild({ runId: RUN_1 });
@@ -409,6 +475,7 @@ describe('per-session codex child creation cap', () => {
         body: '⚙ codex live-view child limit reached — additional reviews are not shown',
         from: 'assistant',
       },
+      options: { idemKey: 'first:childcap' },
     }]);
     expect(second.calls.upsertConvo).toHaveLength(1);
     expect(second.calls.publishText).toHaveLength(0);
@@ -434,8 +501,10 @@ describe('per-session codex child creation cap', () => {
 
   it('retries the child-limit note after publication fails', () => {
     let publishAttempts = 0;
-    const publishText = vi.fn(() => {
+    const attemptedOptions = [];
+    const publishText = vi.fn((_convoId, _payload, options) => {
       publishAttempts += 1;
+      attemptedOptions.push(options);
       if (publishAttempts === 1) throw new Error('journal unavailable');
     });
     const tracker = createCodexConvoTracker({
@@ -450,6 +519,10 @@ describe('per-session codex child creation cap', () => {
     expect(tracker.ensureChild({ runId: runId(3) })).toBeNull();
 
     expect(publishText).toHaveBeenCalledTimes(2);
+    expect(attemptedOptions).toEqual([
+      { idemKey: 'parent:childcap' },
+      { idemKey: 'parent:childcap' },
+    ]);
   });
 
   it('returns a snapshot when inspecting a child', () => {
