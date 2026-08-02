@@ -1,0 +1,9 @@
+patterns:
+  - name: slack-token
+    regex: 'xox[baprs]-[A-Za-z0-9-]{10,}'
+  - name: google-oauth-token
+    regex: 'ya29\.[A-Za-z0-9_-]+'
+  - name: aws-access-key
+    regex: 'AKIA[0-9A-Z]{16}'
+  - name: generic-provider-key
+    regex: '(?:sk|rk)-[A-Za-z0-9_-]{20,}'

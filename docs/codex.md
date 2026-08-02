@@ -23,6 +23,14 @@ The bridge:
 
 The installed Codex CLI remains responsible for model access, authentication, user/project configuration, `AGENTS.md`, skills, rules, MCP servers, and tool execution.
 
+Before Codex events are durably published, the bridge applies the canonical
+value-pattern policy and also redacts assignment values whose keys look secret
+(for example, `DATABASE_PASSWORD=...` or `"API_TOKEN": "..."`). Recognizable
+raw environment dumps are dropped as an additional safeguard. Pattern-based
+redaction cannot decide that an arbitrary value is secret: a secret under a
+non-secret-looking key whose value matches no configured pattern may pass and
+must not be printed into agent output.
+
 ## Install and authenticate
 
 Install Codex globally, then authenticate it as the same OS user that launches matron-bridge:

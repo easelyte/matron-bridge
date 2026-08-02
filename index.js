@@ -340,7 +340,9 @@ function toolStreamKey(convoId, messageRef) {
 // whole module, including `sessions` and the routing functions below, has
 // finished evaluating).
 const journalPublisher = createJournalPublisher({
-  url: JOURNAL_WS_URL, token: _journalToken, log: console,
+  url: process.env.NODE_ENV === 'test' ? '' : JOURNAL_WS_URL,
+  token: process.env.NODE_ENV === 'test' ? '' : _journalToken,
+  log: console,
   cursorFile: JOURNAL_CURSOR_FILE,
   onEvent: journalHandleInboundEvent,
   onStreamResync: (convoId, messageRef, have) => {
@@ -360,7 +362,7 @@ const journalPublisher = createJournalPublisher({
 // Used to skip the per-session buffering/bookkeeping entirely when the
 // publisher is a disabled no-op (its methods are already safe no-ops; this
 // just avoids pointless buffers and spurious overflow warnings).
-const JOURNAL_ENABLED = !!(JOURNAL_WS_URL && _journalToken);
+const JOURNAL_ENABLED = process.env.NODE_ENV !== 'test' && !!(JOURNAL_WS_URL && _journalToken);
 
 if (JOURNAL_ENABLED) {
   // Boot the control convo eagerly — safe even before the WS is connected
@@ -2652,18 +2654,26 @@ function resolveQuestionAnswer(session, text) {
 // there; getParentConvoId resolves lazily so agent-switching (which changes
 // journalConvoId) is followed. Called from every spawn path (print eager,
 // iv-mode, and the lazy print-mode construction in handleClaudeEvent).
-function setupSubagentWatcher(session, workdir, sessionId) {
+export function setupCodexWatcherForSession(session, workdir, sessionId, {
+  publisher = journalPublisher,
+  liveSessions = sessions,
+  workspaceRoot = DEFAULT_WORKDIR,
+  watcherOptions = {},
+  watcherDependencies = {},
+  log = console,
+} = {}) {
   // persistSession carries journalConvoId alongside the native session id;
   // resolving through the live session preserves that stable parent across
   // agent switches. T-4.1's watcher calls handleCodexDiscover below.
   const codexPublishRedact = createPublishRedactor({
-    workspaceRoot: DEFAULT_WORKDIR,
+    workspaceRoot,
+    log,
   });
   session.codexConvos = createCodexConvoTracker({
     sessionId,
-    publisher: journalPublisher,
+    publisher,
     getParentConvoId: () => journalConvoIdFor(session),
-    log: console,
+    log,
     redact: codexPublishRedact,
   });
   session.codexOnDiscover = meta => handleCodexDiscover(session, meta);
@@ -2671,23 +2681,25 @@ function setupSubagentWatcher(session, workdir, sessionId) {
   try {
     const isolation = createCodexWatcherIsolation({
       sessionId,
-      publisher: journalPublisher,
+      publisher,
       getParentConvoId: () => journalConvoIdFor(session),
       terminalize: (runId, outcome) => session.codexConvos.terminalize(runId, outcome),
       terminalizeAll: () => session.codexConvos.interruptAll(),
       hasPendingCapNote: () => session.codexConvos.hasPendingCapNote(),
       retryCapNote: () => session.codexConvos.retryPendingCapNote(),
       isAdmittedRun: runId => session.codexConvos.hasChild(runId),
-      log: console,
+      log,
     });
     session.codexWatcherIsolation = isolation;
-    const codexWatcher = registerCodexWatcherForLiveSession(sessions, session.roomId, {
+    const codexWatcher = registerCodexWatcherForLiveSession(liveSessions, session.roomId, {
       workdir,
       sessionId,
+      ...watcherOptions,
       onDiscover: session.codexOnDiscover,
       onReconcile: (runId, outcome) => session.codexConvos.terminalizeByRunId(runId, outcome),
       isolation,
     }, {
+      ...watcherDependencies,
       onFailure: (_error, failedWatcher) => {
         if (session.codexWatcher === failedWatcher) session.codexWatcher = null;
         Promise.resolve(failedWatcher?.stop?.()).catch(() => {});
@@ -2695,17 +2707,23 @@ function setupSubagentWatcher(session, workdir, sessionId) {
     });
     if (codexWatcher) {
       connectCodexWatcherPublisher(codexWatcher, {
-        publisher: journalPublisher,
+        publisher,
         convoIdFor: runId => session.codexConvos.convoIdFor(runId),
         redact: codexPublishRedact,
-        log: console,
+        log,
       });
     }
+    return codexWatcher;
   } catch (error) {
     session.codexWatcher = null;
-    try { console.warn(`[codex-watcher] session setup failed (${error instanceof Error ? error.name : typeof error})`); }
+    try { log.warn(`[codex-watcher] session setup failed (${error instanceof Error ? error.name : typeof error})`); }
     catch { /* visualization setup must never block session initialization */ }
+    return null;
   }
+}
+
+function setupSubagentWatcher(session, workdir, sessionId) {
+  setupCodexWatcherForSession(session, workdir, sessionId);
   session.subagentConvos = createSubagentConvoTracker({
     publisher: journalPublisher,
     getParentConvoId: () => journalConvoIdFor(session),
@@ -7291,9 +7309,11 @@ const apiServer = createServer(async (req, res) => {
   });
 });
 
-apiServer.listen(API_PORT, '127.0.0.1', () => {
-  console.log(`Local API listening on 127.0.0.1:${API_PORT}`);
-});
+if (process.env.NODE_ENV !== 'test') {
+  apiServer.listen(API_PORT, '127.0.0.1', () => {
+    console.log(`Local API listening on 127.0.0.1:${API_PORT}`);
+  });
+}
 
 function hydrateAgentState(session, persisted, fromAgent = otherAgent(session.agent)) {
   const history = Array.isArray(session.chatHistory) ? session.chatHistory : [];
@@ -7765,26 +7785,28 @@ function pushHostVitals() {
   _lastVitalsPublished = { cpu, ram, at: now };
 }
 
-main().catch(err => {
-  console.error('Fatal error:', err);
-  process.exit(1);
-});
+if (process.env.NODE_ENV !== 'test') {
+  main().catch(err => {
+    console.error('Fatal error:', err);
+    process.exit(1);
+  });
 
-process.on('SIGINT', () => {
-  console.log('\nShutting down...');
-  if (_hostVitalsPushHandle) { clearInterval(_hostVitalsPushHandle); _hostVitalsPushHandle = null; }
-  stopCpuSampler();
-  for (const [, session] of sessions) {
-    killSession(session);
-  }
-  process.exit(0);
-});
+  process.on('SIGINT', () => {
+    console.log('\nShutting down...');
+    if (_hostVitalsPushHandle) { clearInterval(_hostVitalsPushHandle); _hostVitalsPushHandle = null; }
+    stopCpuSampler();
+    for (const [, session] of sessions) {
+      killSession(session);
+    }
+    process.exit(0);
+  });
 
-process.on('SIGTERM', () => {
-  if (_hostVitalsPushHandle) { clearInterval(_hostVitalsPushHandle); _hostVitalsPushHandle = null; }
-  stopCpuSampler();
-  for (const [, session] of sessions) {
-    killSession(session);
-  }
-  process.exit(0);
-});
+  process.on('SIGTERM', () => {
+    if (_hostVitalsPushHandle) { clearInterval(_hostVitalsPushHandle); _hostVitalsPushHandle = null; }
+    stopCpuSampler();
+    for (const [, session] of sessions) {
+      killSession(session);
+    }
+    process.exit(0);
+  });
+}
