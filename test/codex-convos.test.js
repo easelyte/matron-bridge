@@ -94,11 +94,76 @@ describe('createCodexConvoTracker', () => {
     expect(() => tracker.ensureChild(null)).not.toThrow();
 
     const throwing = createCodexConvoTracker({
-      publisher: { upsertConvo() { throw new Error('journal unavailable'); } },
+      publisher: { upsertConvo() { throw null; } },
       getParentConvoId: () => 'parent-uuid',
       log: { warn() {} },
     });
     expect(() => throwing.ensureChild({ runId: 'run-2', label: 'Review' })).not.toThrow();
-    expect(() => throwing.terminalize('run-2', 'failed')).not.toThrow();
+
+    let throwOnPublish = false;
+    const terminalThrowing = createCodexConvoTracker({
+      publisher: {
+        upsertConvo() {
+          if (throwOnPublish) throw 'journal unavailable';
+        },
+      },
+      getParentConvoId: () => 'parent-uuid',
+      log: { warn() {} },
+    });
+    terminalThrowing.ensureChild({ runId: 'run-3', label: 'Review' });
+    throwOnPublish = true;
+    expect(() => terminalThrowing.terminalize('run-3', 'failed')).not.toThrow();
+  });
+
+  it('retries child creation after a publication failure', () => {
+    let attempts = 0;
+    const recoveringPublisher = makePublisher();
+    const upsertConvo = recoveringPublisher.upsertConvo;
+    recoveringPublisher.upsertConvo = (...args) => {
+      attempts += 1;
+      if (attempts === 1) throw new Error('journal unavailable');
+      upsertConvo(...args);
+    };
+    const recovering = createCodexConvoTracker({
+      publisher: recoveringPublisher,
+      getParentConvoId: () => 'parent-uuid',
+      log: { warn() {} },
+    });
+
+    expect(recovering.ensureChild({ runId: 'run-2', label: 'Review' })).toBeNull();
+    expect(recovering.convoIdFor('run-2')).toBeNull();
+
+    const child = recovering.ensureChild({ runId: 'run-2', label: 'Review' });
+    expect(child?.convoId).toBe('parent-uuid:codex:run-2');
+    expect(attempts).toBe(2);
+    expect(recoveringPublisher.calls.upsertConvo).toHaveLength(1);
+  });
+
+  it('retries terminalization after a publication failure', () => {
+    let terminalAttempts = 0;
+    const recoveringPublisher = makePublisher();
+    const upsertConvo = recoveringPublisher.upsertConvo;
+    const recovering = createCodexConvoTracker({
+      publisher: recoveringPublisher,
+      getParentConvoId: () => 'parent-uuid',
+      log: { warn() {} },
+    });
+    recovering.ensureChild({ runId: 'run-2', label: 'Review' });
+    recoveringPublisher.calls.upsertConvo.length = 0;
+    recoveringPublisher.upsertConvo = (...args) => {
+      terminalAttempts += 1;
+      if (terminalAttempts === 1) throw new Error('journal unavailable');
+      upsertConvo(...args);
+    };
+
+    recovering.terminalize('run-2', 'failed');
+    recovering.terminalize('run-2', 'failed');
+    recovering.terminalize('run-2', 'completed');
+
+    expect(terminalAttempts).toBe(2);
+    expect(recoveringPublisher.calls.upsertConvo).toEqual([{
+      convoId: 'parent-uuid:codex:run-2',
+      opts: { sessionState: CHILD_STATE_FINISHED, sessionOutcome: 'failed' },
+    }]);
   });
 });
