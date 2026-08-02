@@ -82,7 +82,7 @@ describe('Codex event backpressure', () => {
     expect(ctx.state.durableEvents).toBe(0);
   });
 
-  it('passes through an unknown reasoning envelope and counts it as unparsed', () => {
+  it('keeps an unknown reasoning envelope ephemeral and counts it as unparsed', () => {
     const { calls, ctx } = makeContext();
     const event = {
       type: 'item.delta',
@@ -92,10 +92,27 @@ describe('Codex event backpressure', () => {
     formatAndRoute(event, ctx);
 
     expect(calls).toEqual([{
-      method: 'publishText',
-      args: [ctx.convoId, { body: JSON.stringify(event), from: 'assistant' }],
+      method: 'publishActivity',
+      args: [ctx.convoId, 'thinking', 'partial thought'],
     }]);
     expect(ctx.state.unparsed).toBe(1);
-    expect(ctx.state.durableEvents).toBe(1);
+    expect(ctx.state.durableEvents).toBe(0);
+  });
+
+  it('keeps reasoning ephemeral before unpinned-schema fallback', () => {
+    const { calls, ctx } = makeContext();
+    ctx.meta.schemaVersion = 'codex-cli 0.147.0';
+
+    formatAndRoute({
+      type: 'item.completed',
+      item: { id: 'reasoning-future-schema', type: 'reasoning', text: 'private thought' },
+    }, ctx);
+
+    expect(calls).toEqual([{
+      method: 'publishActivity',
+      args: [ctx.convoId, 'thinking', 'private thought'],
+    }]);
+    expect(ctx.state.unparsed).toBe(0);
+    expect(ctx.state.durableEvents).toBe(0);
   });
 });
