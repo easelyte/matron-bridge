@@ -39,7 +39,7 @@ import { promptButtons, promptResponseForButton } from './lib/prompt-buttons.js'
 import { parseOptionReply } from './lib/prompt-reply.js';
 import { sendDelayedPromptAnswer, writePromptAnswer } from './lib/prompt-answer-delivery.js';
 import { SubagentWatcher } from './lib/subagent-watcher.js';
-import { createCodexWatcherIfEnabled, createCodexWatcherIsolation } from './lib/codex-watcher.js';
+import { createCodexWatcherIsolation, startCodexWatcherIfEnabled } from './lib/codex-watcher.js';
 import { launchWithCodexSinkEnv } from './lib/codex-paths.js';
 import { createSubagentConvoTracker } from './lib/subagent-convos.js';
 import { createCodexConvoTracker } from './lib/codex-convos.js';
@@ -2656,7 +2656,7 @@ function setupSubagentWatcher(session, workdir, sessionId) {
     log: console,
   });
   session.codexOnDiscover = meta => handleCodexDiscover(session, meta);
-  if (process.env.MATRON_CODEX_VIZ !== '0') {
+  try {
     const isolation = createCodexWatcherIsolation({
       sessionId,
       publisher: journalPublisher,
@@ -2666,13 +2666,21 @@ function setupSubagentWatcher(session, workdir, sessionId) {
       isAdmittedRun: runId => session.codexConvos.hasChild(runId),
       log: console,
     });
-    session.codexWatcher = createCodexWatcherIfEnabled({
+    session.codexWatcher = startCodexWatcherIfEnabled({
       workdir,
       sessionId,
       onDiscover: session.codexOnDiscover,
       isolation,
+    }, {
+      onFailure: (_error, failedWatcher) => {
+        if (session.codexWatcher === failedWatcher) session.codexWatcher = null;
+        Promise.resolve(failedWatcher?.stop?.()).catch(() => {});
+      },
     });
-    session.codexWatcher.start().catch(() => {});
+  } catch (error) {
+    session.codexWatcher = null;
+    try { console.warn(`[codex-watcher] session setup failed (${error instanceof Error ? error.name : typeof error})`); }
+    catch { /* visualization setup must never block session initialization */ }
   }
   session.subagentConvos = createSubagentConvoTracker({
     publisher: journalPublisher,

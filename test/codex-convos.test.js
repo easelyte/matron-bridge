@@ -185,7 +185,7 @@ describe('createCodexConvoTracker', () => {
       { runId: `1722600000000-${'1'.repeat(20)}-abcd`, label: 'Review' },
     ];
 
-    for (const meta of invalidMeta) expect(tracker.ensureChild(meta)).toBeNull();
+    for (const meta of invalidMeta) expect(tracker.ensureChild(meta)).toBe(false);
     expect(publisher.calls.upsertConvo).toHaveLength(0);
   });
 

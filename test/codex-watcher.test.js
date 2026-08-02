@@ -7,6 +7,7 @@ import {
   CodexWatcher,
   DEFAULT_CODEX_TRANSCRIPT_MAX_BYTES,
   createCodexWatcherIfEnabled,
+  startCodexWatcherIfEnabled,
 } from '../lib/codex-watcher.js';
 
 const RUN_LATE = '1722600000000-1234-abcd';
@@ -45,13 +46,17 @@ class FakeTail extends EventEmitter {
 }
 
 const watchers = [];
+const tempDirs = [];
 
 afterEach(async () => {
   await Promise.all(watchers.splice(0).map(watcher => watcher.stop()));
+  for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
 });
 
 function makeDir() {
-  return fs.mkdtempSync(path.join(os.tmpdir(), 'codex-watcher-'));
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-watcher-'));
+  tempDirs.push(dir);
+  return dir;
 }
 
 describe('CodexWatcher', () => {
@@ -75,7 +80,7 @@ describe('CodexWatcher', () => {
     expect(watcher.pollTimer).not.toBeNull();
   });
 
-  it('holds a discovered meta pending until JSONL exists and marks seen only after attach', async () => {
+  it('holds a discovered meta pending until JSONL exists and tracks live attachment separately', async () => {
     const dir = makeDir();
     const onDiscover = vi.fn();
     const watcher = new CodexWatcher({
@@ -98,7 +103,8 @@ describe('CodexWatcher', () => {
     await watcher.scan();
 
     expect(watcher.pending.has(RUN_PENDING)).toBe(false);
-    expect(watcher.seen.has(RUN_PENDING)).toBe(true);
+    expect(watcher.attached.has(RUN_PENDING)).toBe(true);
+    expect(watcher.seen.has(RUN_PENDING)).toBe(false);
     expect(watcher.tails.get(RUN_PENDING)?.started).toBe(true);
   });
 
@@ -153,7 +159,8 @@ describe('CodexWatcher', () => {
     expect(watcher.tails.has(RUN_TERMINAL)).toBe(false);
     expect(watcher.seen.has(RUN_DEAD)).toBe(true);
     expect(watcher.tails.has(RUN_DEAD)).toBe(false);
-    expect(watcher.seen.has(RUN_LIVE)).toBe(true);
+    expect(watcher.attached.has(RUN_LIVE)).toBe(true);
+    expect(watcher.seen.has(RUN_LIVE)).toBe(false);
     expect(replayed).toEqual([{ runId: RUN_LIVE, meta: liveMeta, event: { type: 'live' } }]);
     expect(onDiscover).toHaveBeenCalledTimes(1);
     expect(onDiscover).toHaveBeenCalledWith(liveMeta);
@@ -189,7 +196,8 @@ describe('CodexWatcher', () => {
     await watcher.scan();
     expect(attempts).toBe(3);
     expect(watcher.pending.has(RUN_PENDING)).toBe(false);
-    expect(watcher.seen.has(RUN_PENDING)).toBe(true);
+    expect(watcher.attached.has(RUN_PENDING)).toBe(true);
+    expect(watcher.seen.has(RUN_PENDING)).toBe(false);
   });
 
   it('does not commit an attachment that finishes after stop', async () => {
@@ -227,7 +235,7 @@ describe('CodexWatcher', () => {
     expect(await watcher.scan()).toBeUndefined();
   });
 
-  it('rejects symlinked, non-regular, and oversized transcript sinks', async () => {
+  it('rejects symlinked and non-regular sinks but attaches an oversized regular transcript', async () => {
     const dir = makeDir();
     const symlinkRun = RUN_PENDING;
     const fifoRun = RUN_LATE;
@@ -250,8 +258,46 @@ describe('CodexWatcher', () => {
 
     await watcher.start();
 
-    expect(watcher.tails.size).toBe(0);
-    expect([...watcher.pending.keys()].sort()).toEqual([largeRun, fifoRun, symlinkRun].sort());
+    expect(watcher.tails.has(largeRun)).toBe(true);
+    expect(watcher.attached.has(largeRun)).toBe(true);
+    expect([...watcher.pending.keys()].sort()).toEqual([fifoRun, symlinkRun].sort());
+  });
+
+  it('bounds each metadata scan and permanently skips rejected discoveries', async () => {
+    const dir = makeDir();
+    for (const runId of [RUN_LATE, RUN_PENDING, RUN_LIVE]) writeMeta(dir, runId);
+    const onDiscover = vi.fn(() => false);
+    const watcher = new CodexWatcher({
+      dir,
+      onDiscover,
+      maxMetaScanCount: 2,
+      pollIntervalMs: 60_000,
+      TailClass: FakeTail,
+    });
+    watchers.push(watcher);
+
+    await watcher.start();
+    expect(onDiscover).toHaveBeenCalledTimes(2);
+    await watcher.scan();
+    await watcher.scan();
+    expect(onDiscover).toHaveBeenCalledTimes(3);
+  });
+
+  it('permanently skips oversized metadata without reading it again', async () => {
+    const dir = makeDir();
+    const metaPath = path.join(dir, `codex-${RUN_PENDING}.meta.json`);
+    const malformedName = 'codex-.meta.json';
+    fs.writeFileSync(metaPath, 'x'.repeat(65));
+    fs.writeFileSync(path.join(dir, malformedName), '{}');
+    const watcher = new CodexWatcher({ dir, maxMetaBytes: 64, pollIntervalMs: 60_000 });
+    watchers.push(watcher);
+
+    await watcher.start();
+    expect(watcher.permanentlySkipped.has(path.basename(metaPath))).toBe(true);
+    expect(watcher.permanentlySkipped.has(malformedName)).toBe(true);
+    fs.writeFileSync(metaPath, JSON.stringify({ runId: RUN_PENDING }));
+    await watcher.scan();
+    expect(watcher.pending.has(RUN_PENDING)).toBe(false);
   });
 });
 
@@ -266,5 +312,18 @@ describe('bridge watcher wiring', () => {
 
     expect(watcher).toBeNull();
     expect(WatcherClass).not.toHaveBeenCalled();
+  });
+
+  it.each(['construction', 'startup'])('fails open when watcher %s throws', async failure => {
+    const onFailure = vi.fn();
+    const log = { warn: vi.fn() };
+    const WatcherClass = failure === 'construction'
+      ? class { constructor() { throw new Error('construct'); } }
+      : class { start() { throw new Error('start'); } };
+
+    expect(() => startCodexWatcherIfEnabled({}, { WatcherClass, log, onFailure })).not.toThrow();
+    await Promise.resolve();
+    expect(onFailure).toHaveBeenCalledOnce();
+    expect(log.warn).toHaveBeenCalledOnce();
   });
 });

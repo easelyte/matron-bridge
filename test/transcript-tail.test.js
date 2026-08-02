@@ -123,19 +123,48 @@ describe('TranscriptTail', () => {
     expect(events.map(e => e.n)).toEqual([1, 2]);
   });
 
-  it('rejects an oversized regular file before replaying it', async () => {
-    fs.writeFileSync(file, '{"type":"a"}\n');
+  it('bounds an oversized replay, marks truncation, and preserves terminal events', async () => {
+    fs.writeFileSync(file, 'discarded\n{"type":"result","final":true}\n');
     const tail = new TranscriptTail(file, {
       readFromStart: true,
       requireRegularFile: true,
-      maxFileSizeBytes: 4,
+      maxFileSizeBytes: 32,
     });
     const events = [];
+    const errors = [];
     tail.on('event', event => events.push(event));
+    tail.on('parseError', error => errors.push(error));
 
-    await expect(tail.start()).rejects.toThrow('size limit');
+    await tail.start();
     await tail.stop();
-    expect(events).toEqual([]);
+    expect(errors.some(item => item.error?.code === 'TRANSCRIPT_TRUNCATED')).toBe(true);
+    expect(events).toContainEqual({ type: 'result', final: true });
+  });
+
+  it('keeps tailing terminal events after an attached file grows past the cap', async () => {
+    fs.writeFileSync(file, '');
+    const tail = new TranscriptTail(file, { maxFileSizeBytes: 32 });
+    const events = [];
+    const errors = [];
+    tail.on('event', event => events.push(event));
+    tail.on('parseError', error => errors.push(error));
+    await tail.start();
+
+    fs.appendFileSync(file, `${'x'.repeat(64)}\n{"type":"result","final":true}\n`);
+    await waitFor(() => events.length === 1);
+    await tail.stop();
+
+    expect(errors.some(item => item.error?.code === 'TRANSCRIPT_TRUNCATED')).toBe(true);
+    expect(events).toEqual([{ type: 'result', final: true }]);
+  });
+
+  it('rolls back started state when the initial read fails', async () => {
+    fs.mkdirSync(file);
+    const tail = new TranscriptTail(file, { readFromStart: true, requireRegularFile: true });
+
+    await expect(tail.start()).rejects.toThrow('regular file');
+    expect(tail.started).toBe(false);
+    expect(tail.timer).toBeNull();
   });
 
   it('rejects a symlink when regular-file enforcement is enabled', async () => {

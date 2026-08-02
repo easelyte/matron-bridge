@@ -515,8 +515,8 @@ describe('per-session codex child creation cap', () => {
     });
 
     expect(tracker.ensureChild({ runId: RUN_1 })).toBeNull();
-    expect(tracker.ensureChild({ runId: RUN_2 })).toBeNull();
-    expect(tracker.ensureChild({ runId: runId(3) })).toBeNull();
+    expect(tracker.ensureChild({ runId: RUN_2 })).toBe(false);
+    expect(tracker.ensureChild({ runId: runId(3) })).toBe(false);
 
     expect(publishText).toHaveBeenCalledTimes(2);
     expect(attemptedOptions).toEqual([
