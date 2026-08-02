@@ -4,7 +4,12 @@ import {
   CHILD_STATE_RUNNING,
   childConvoId,
   createCodexConvoTracker,
+  CODEX_LABEL_MAX_LENGTH,
 } from '../lib/codex-convos.js';
+
+const RUN_1 = '1722600000000-1234-abcd';
+const RUN_2 = '1722600000001-1234-1234';
+const RUN_3 = '1722600000002-1234-beef';
 
 function makePublisher() {
   const calls = { upsertConvo: [] };
@@ -36,17 +41,17 @@ describe('createCodexConvoTracker', () => {
   });
 
   it('creates a running child linked to the parent using the meta label', () => {
-    const child = tracker.ensureChild({ runId: 'run-1', label: 'Plan review' });
+    const child = tracker.ensureChild({ runId: RUN_1, label: 'Plan review' });
 
     expect(child).toMatchObject({
-      runId: 'run-1',
+      runId: RUN_1,
       parentConvoId: 'parent-uuid',
-      convoId: 'parent-uuid:codex:run-1',
+      convoId: `parent-uuid:codex:${RUN_1}`,
       title: 'Plan review',
       state: CHILD_STATE_RUNNING,
     });
     expect(publisher.calls.upsertConvo).toEqual([{
-      convoId: 'parent-uuid:codex:run-1',
+      convoId: `parent-uuid:codex:${RUN_1}`,
       opts: {
         parentConvoId: 'parent-uuid',
         title: 'Plan review',
@@ -56,25 +61,30 @@ describe('createCodexConvoTracker', () => {
   });
 
   it('re-ensuring the same run is idempotent', () => {
-    const first = tracker.ensureChild({ runId: 'run-1', label: 'Plan review' });
-    const second = tracker.ensureChild({ runId: 'run-1', label: 'Plan review' });
+    const first = tracker.ensureChild({ runId: RUN_1, label: 'Plan review' });
+    const second = tracker.ensureChild({ runId: RUN_1, label: 'Plan review' });
 
     expect(second).toBe(first);
     expect(publisher.calls.upsertConvo).toHaveLength(1);
   });
 
   it('terminalizes a known run with a durable outcome', () => {
-    tracker.ensureChild({ runId: 'run-1', label: 'Plan review' });
+    tracker.ensureChild({ runId: RUN_1, label: 'Plan review' });
     publisher.calls.upsertConvo.length = 0;
 
-    tracker.terminalize('run-1', 'interrupted');
+    tracker.terminalize(RUN_1, 'interrupted');
 
     expect(publisher.calls.upsertConvo).toEqual([{
-      convoId: 'parent-uuid:codex:run-1',
-      opts: { sessionState: CHILD_STATE_FINISHED, sessionOutcome: 'interrupted' },
+      convoId: `parent-uuid:codex:${RUN_1}`,
+      opts: {
+        parentConvoId: 'parent-uuid',
+        title: 'Plan review',
+        sessionState: CHILD_STATE_FINISHED,
+        sessionOutcome: 'interrupted',
+      },
     }]);
 
-    tracker.terminalize('run-1', 'completed');
+    tracker.terminalize(RUN_1, 'completed');
     expect(publisher.calls.upsertConvo).toHaveLength(1);
   });
 
@@ -85,8 +95,8 @@ describe('createCodexConvoTracker', () => {
       log: { warn() {} },
     });
 
-    expect(() => unavailable.ensureChild({ runId: 'run-1', label: 'Plan review' })).not.toThrow();
-    expect(unavailable.ensureChild({ runId: 'run-1' })).toBeNull();
+    expect(() => unavailable.ensureChild({ runId: RUN_1, label: 'Plan review' })).not.toThrow();
+    expect(unavailable.ensureChild({ runId: RUN_1 })).toBeNull();
     expect(publisher.calls.upsertConvo).toHaveLength(0);
   });
 
@@ -98,7 +108,7 @@ describe('createCodexConvoTracker', () => {
       getParentConvoId: () => 'parent-uuid',
       log: { warn() {} },
     });
-    expect(() => throwing.ensureChild({ runId: 'run-2', label: 'Review' })).not.toThrow();
+    expect(() => throwing.ensureChild({ runId: RUN_2, label: 'Review' })).not.toThrow();
 
     let throwOnPublish = false;
     const terminalThrowing = createCodexConvoTracker({
@@ -110,9 +120,9 @@ describe('createCodexConvoTracker', () => {
       getParentConvoId: () => 'parent-uuid',
       log: { warn() {} },
     });
-    terminalThrowing.ensureChild({ runId: 'run-3', label: 'Review' });
+    terminalThrowing.ensureChild({ runId: RUN_3, label: 'Review' });
     throwOnPublish = true;
-    expect(() => terminalThrowing.terminalize('run-3', 'failed')).not.toThrow();
+    expect(() => terminalThrowing.terminalize(RUN_3, 'failed')).not.toThrow();
   });
 
   it('retries child creation after a publication failure', () => {
@@ -130,11 +140,11 @@ describe('createCodexConvoTracker', () => {
       log: { warn() {} },
     });
 
-    expect(recovering.ensureChild({ runId: 'run-2', label: 'Review' })).toBeNull();
-    expect(recovering.convoIdFor('run-2')).toBeNull();
+    expect(recovering.ensureChild({ runId: RUN_2, label: 'Review' })).toBeNull();
+    expect(recovering.convoIdFor(RUN_2)).toBeNull();
 
-    const child = recovering.ensureChild({ runId: 'run-2', label: 'Review' });
-    expect(child?.convoId).toBe('parent-uuid:codex:run-2');
+    const child = recovering.ensureChild({ runId: RUN_2, label: 'Review' });
+    expect(child?.convoId).toBe(`parent-uuid:codex:${RUN_2}`);
     expect(attempts).toBe(2);
     expect(recoveringPublisher.calls.upsertConvo).toHaveLength(1);
   });
@@ -148,7 +158,7 @@ describe('createCodexConvoTracker', () => {
       getParentConvoId: () => 'parent-uuid',
       log: { warn() {} },
     });
-    recovering.ensureChild({ runId: 'run-2', label: 'Review' });
+    recovering.ensureChild({ runId: RUN_2, label: 'Review' });
     recoveringPublisher.calls.upsertConvo.length = 0;
     recoveringPublisher.upsertConvo = (...args) => {
       terminalAttempts += 1;
@@ -156,14 +166,50 @@ describe('createCodexConvoTracker', () => {
       upsertConvo(...args);
     };
 
-    recovering.terminalize('run-2', 'failed');
-    recovering.terminalize('run-2', 'failed');
-    recovering.terminalize('run-2', 'completed');
+    recovering.terminalize(RUN_2, 'failed');
+    recovering.terminalize(RUN_2, 'failed');
+    recovering.terminalize(RUN_2, 'completed');
 
     expect(terminalAttempts).toBe(2);
     expect(recoveringPublisher.calls.upsertConvo).toEqual([{
-      convoId: 'parent-uuid:codex:run-2',
-      opts: { sessionState: CHILD_STATE_FINISHED, sessionOutcome: 'failed' },
+      convoId: `parent-uuid:codex:${RUN_2}`,
+      opts: {
+        parentConvoId: 'parent-uuid',
+        title: 'Review',
+        sessionState: CHILD_STATE_FINISHED,
+        sessionOutcome: 'failed',
+      },
+    }]);
+  });
+
+  it('rejects forged or oversized sidecar identity metadata', () => {
+    const invalidMeta = [
+      { runId: 'run-1', label: 'Review' },
+      { runId: '1722600000000-1234-zzzz', label: 'Review' },
+      { runId: `1722600000000-${'1'.repeat(20)}-abcd`, label: 'Review' },
+      { runId: RUN_1, label: 'x'.repeat(CODEX_LABEL_MAX_LENGTH + 1) },
+      { runId: RUN_1, label: 'authorization=Bearer forged-secret' },
+      { runId: RUN_1, label: '<script>forged</script>' },
+    ];
+
+    for (const meta of invalidMeta) expect(tracker.ensureChild(meta)).toBeNull();
+    expect(publisher.calls.upsertConvo).toHaveLength(0);
+  });
+
+  it('terminal frame is self-sufficient when the creation frame was dropped', () => {
+    tracker.ensureChild({ runId: RUN_1, label: 'Quality review' });
+    publisher.calls.upsertConvo.length = 0; // model queue eviction of creation
+
+    tracker.terminalize(RUN_1, 'completed');
+
+    expect(publisher.calls.upsertConvo).toEqual([{
+      convoId: `parent-uuid:codex:${RUN_1}`,
+      opts: {
+        parentConvoId: 'parent-uuid',
+        title: 'Quality review',
+        sessionState: CHILD_STATE_FINISHED,
+        sessionOutcome: 'completed',
+      },
     }]);
   });
 });
