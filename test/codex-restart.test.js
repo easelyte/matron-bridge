@@ -259,6 +259,38 @@ describe('Codex restart reconciliation', () => {
     expect(watcher.seen.has(RUN_INTERRUPTED)).toBe(false);
   });
 
+  it('resolves a vanished reconcile meta and still discovers later live runs', async () => {
+    const dir = makeDir();
+    writeRun(dir, RUN_INTERRUPTED);
+    const harness = makeWatcher(dir);
+    const vanishedPath = path.join(dir, `codex-${RUN_INTERRUPTED}.meta.json`);
+    const originalOpen = fs.openSync;
+    let vanished = false;
+    const openSpy = vi.spyOn(fs, 'openSync').mockImplementation((file, ...args) => {
+      if (!vanished && file === vanishedPath) {
+        vanished = true;
+        const error = new Error('vanished');
+        error.code = 'ENOENT';
+        throw error;
+      }
+      return originalOpen(file, ...args);
+    });
+
+    try {
+      await expect(harness.watcher.reconcile({ claudeSessionId: 'session-1' })).resolves.toBe(true);
+    } finally {
+      openSpy.mockRestore();
+    }
+    await harness.watcher.start();
+    writeRun(dir, RUN_FINISHED);
+    await harness.watcher.scan();
+
+    expect(harness.watcher.reconciliationRequired).toBe(false);
+    expect(harness.watcher.permanentlySkipped.has(path.basename(vanishedPath))).toBe(true);
+    expect(harness.tracker.hasChild(RUN_FINISHED)).toBe(true);
+    expect(FakeTail.starts).toContain(path.join(dir, `codex-${RUN_FINISHED}.jsonl`));
+  });
+
   it('isolates an operational reconciliation throw without quarantining the run', async () => {
     const dir = makeDir();
     writeRun(dir, RUN_MALFORMED);

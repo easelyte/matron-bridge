@@ -3,6 +3,7 @@ import { describe, expect, it } from 'vitest';
 import WebSocket from 'ws';
 import { createCodexConvoTracker, journalReemitCodexOutcomes } from '../lib/codex-convos.js';
 import { createCodexWatcherIsolation } from '../lib/codex-watcher.js';
+import { formatAndRoute } from '../lib/codex-event-format.js';
 import { createJournalPublisher } from '../lib/journal-publisher.js';
 
 const RUN_ID = '1722600000000-1234-abcd';
@@ -71,6 +72,79 @@ async function waitFor(predicate, timeoutMs = 1000) {
 }
 
 describe('Codex outcome deploy-skew repair', () => {
+  it('caps deferred reconnect repairs while the outage queue is full', async () => {
+    DeploySkewWebSocket.instances.length = 0;
+    DeploySkewWebSocket.frames.length = 0;
+    DeploySkewWebSocket.delayCallbacks = false;
+    const warnings = [];
+    let publisher;
+    publisher = createJournalPublisher({
+      url: 'ws://journal.test/ws', token: 'test-token', queueLimit: 1, pendingRepairLimit: 1,
+      keepaliveIntervalMs: 0, log: { warn: message => warnings.push(message) },
+      WebSocketImpl: DeploySkewWebSocket,
+      onReconnect: () => {
+        publisher.upsertConvoBestEffort('repair-1', { sessionState: 'done' });
+        publisher.upsertConvoBestEffort('repair-2', { sessionState: 'done' });
+      },
+    });
+    publisher.publishText('backlog', { body: 'queued' });
+
+    await waitFor(() => DeploySkewWebSocket.frames.some(frame => frame.convo_id === 'repair-1'));
+    expect(DeploySkewWebSocket.frames.some(frame => frame.convo_id === 'repair-2')).toBe(false);
+    expect(warnings).toContainEqual(expect.stringContaining('pending repair overflow'));
+    publisher.close();
+  });
+
+  it('re-emits an evicted final answer on reconnect until delivery is confirmed', async () => {
+    DeploySkewWebSocket.instances.length = 0;
+    DeploySkewWebSocket.conversations.clear();
+    DeploySkewWebSocket.pendingCallbacks.length = 0;
+    DeploySkewWebSocket.frames.length = 0;
+    DeploySkewWebSocket.delayCallbacks = false;
+    let publisher;
+    let tracker;
+    const isolation = { guardSession(_label, operation) { return operation(); } };
+    publisher = createJournalPublisher({
+      url: 'ws://journal.test/ws', token: 'test-token', queueLimit: 2,
+      backoffBaseMs: 1, backoffCapMs: 1, keepaliveIntervalMs: 0,
+      log: { warn() {} }, WebSocketImpl: DeploySkewWebSocket,
+      onReconnect: () => journalReemitCodexOutcomes({
+        sessions: new Map([['session', { codexConvos: tracker, codexWatcherIsolation: isolation }]]),
+        publisher,
+      }),
+    });
+    tracker = createCodexConvoTracker({
+      publisher, getParentConvoId: () => PARENT_ID, log: { warn() {} },
+    });
+    await waitFor(() => DeploySkewWebSocket.instances.length === 1);
+    tracker.ensureChild({ runId: RUN_ID });
+    await waitFor(() => DeploySkewWebSocket.frames.some(frame => frame.convo_id === CHILD_ID));
+    DeploySkewWebSocket.instances[0].close();
+
+    const state = {};
+    const ctx = {
+      publisher, convoId: CHILD_ID, runId: RUN_ID,
+      meta: { schemaVersion: 'codex-cli 0.146.0' }, state,
+      retainFinalAnswer: (runId, payload) => tracker.retainFinalAnswer(runId, payload),
+      markFinalAnswerDelivered: runId => tracker.markFinalAnswerDelivered(runId),
+    };
+    formatAndRoute({ type: 'item.completed', item: { type: 'agent_message', text: 'survives' } }, ctx);
+    formatAndRoute({ type: 'turn.completed' }, ctx);
+    tracker.terminalize(RUN_ID, 'completed');
+    publisher.publishText('overflow-1', { body: 'one' });
+    publisher.publishText('overflow-2', { body: 'two' });
+    expect(tracker.pendingFinalAnswer(RUN_ID)).toEqual({ body: 'survives', from: 'assistant' });
+    expect(state.finalPostLanded).not.toBe(true);
+
+    await waitFor(() => DeploySkewWebSocket.instances.length === 2);
+    await waitFor(() => DeploySkewWebSocket.frames.some(frame =>
+      frame.op === 'publish' && frame.idem_key === `${RUN_ID}:final` && frame.payload.body === 'survives'
+    ));
+    await waitFor(() => tracker.pendingFinalAnswer(RUN_ID) === null);
+    expect(state.finalPostLanded).not.toBe(true);
+    publisher.close();
+  });
+
   it('re-emits an in-memory terminal child after reconnect so an upgraded server persists its outcome', async () => {
     DeploySkewWebSocket.instances.length = 0;
     DeploySkewWebSocket.upgraded = false;

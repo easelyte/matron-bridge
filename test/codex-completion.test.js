@@ -4,7 +4,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createCodexConvoTracker } from '../lib/codex-convos.js';
-import { formatAndRoute } from '../lib/codex-event-format.js';
+import { formatAndRoute, redactAndRoute } from '../lib/codex-event-format.js';
 import { CodexWatcher, createCodexWatcherIsolation } from '../lib/codex-watcher.js';
 import { TranscriptTail } from '../lib/transcript-tail.js';
 
@@ -67,6 +67,7 @@ function makeHarness({
   exitCode,
   realLiveness = false,
   TailClass = FakeTail,
+  maxTranscriptBytes,
 } = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-completion-'));
   tempDirs.push(dir);
@@ -119,6 +120,7 @@ function makeHarness({
     pollIntervalMs: 60_000,
     drainWindowMs: 100,
     TailClass,
+    ...(maxTranscriptBytes === undefined ? {} : { maxTranscriptBytes }),
     isolation,
   });
   watchers.push(watcher);
@@ -371,6 +373,92 @@ describe('Codex completion state machine', () => {
       outcome: 'completed',
       finalPostLanded: false,
     }));
+  });
+
+  it('reports a final post as landed only after publisher delivery confirmation', async () => {
+    vi.useFakeTimers();
+    const harness = makeHarness({ alive: true });
+    await attach(harness);
+    harness.publisher.publishText = (convoId, payload, options) => {
+      harness.calls.publishText.push({ convoId, payload, options });
+      options?.onDelivered?.();
+      return true;
+    };
+    const tail = harness.watcher.tails.get(RUN_ID);
+    harness.watcher.on('codex-event', ({ event }, streamState) => formatAndRoute(event, {
+      publisher: harness.publisher,
+      convoId: `parent:codex:${RUN_ID}`,
+      runId: RUN_ID,
+      meta: harness.meta,
+      state: streamState,
+    }));
+    tail.emit('event', { type: 'item.completed', item: { type: 'agent_message', text: 'answer' } });
+    tail.emit('event', { type: 'turn.completed' });
+    fs.writeFileSync(harness.metaPath, JSON.stringify({ ...harness.meta, exitCode: 0 }));
+
+    await harness.watcher.watchdogTick();
+    await vi.advanceTimersByTimeAsync(50);
+
+    expect(harness.audits).toContainEqual(expect.objectContaining({ finalPostLanded: true }));
+  });
+
+  it('threads formatter durability and redaction-drop counters into terminal audit', async () => {
+    const harness = makeHarness({ alive: false });
+    await attach(harness);
+    harness.watcher.on('codex-event', ({ event }, streamState) => redactAndRoute(event, {
+      publisher: harness.publisher,
+      convoId: `parent:codex:${RUN_ID}`,
+      runId: RUN_ID,
+      meta: harness.meta,
+      state: streamState,
+      maxDurableEvents: 0,
+      redact: value => value,
+    }));
+    const tail = harness.watcher.tails.get(RUN_ID);
+    tail.emit('event', {
+      type: 'item.completed',
+      item: { type: 'command_execution', command: 'true', aggregated_output: 'ok' },
+    });
+    tail.emit('event', {
+      type: 'item.completed',
+      item: { type: 'command_execution', command: 'env', aggregated_output: 'A=1\nB=2\nC=3' },
+    });
+
+    await harness.watcher.watchdogTick();
+
+    expect(harness.audits).toContainEqual(expect.objectContaining({
+      durableEventCount: 0,
+      droppedEventCount: 1,
+      redactionDropCount: 1,
+    }));
+  });
+
+  it('keeps a capped production transcript nonfatal and routes its terminal suffix', async () => {
+    vi.useFakeTimers();
+    const harness = makeHarness({ alive: true, TailClass: TranscriptTail, maxTranscriptBytes: 180 });
+    await attach(harness);
+    harness.watcher.on('codex-event', ({ event }, streamState) => formatAndRoute(event, {
+      publisher: harness.publisher,
+      convoId: `parent:codex:${RUN_ID}`,
+      runId: RUN_ID,
+      meta: harness.meta,
+      state: streamState,
+    }));
+    const transcript = path.join(harness.dir, `codex-${RUN_ID}.jsonl`);
+    fs.appendFileSync(transcript, `${'x'.repeat(400)}\n${JSON.stringify({
+      type: 'item.completed', item: { type: 'agent_message', text: 'bounded answer' },
+    })}\n${JSON.stringify({ type: 'turn.completed' })}\n`);
+    await harness.watcher.tails.get(RUN_ID).drain({ windowMs: 0 });
+    fs.writeFileSync(harness.metaPath, JSON.stringify({ ...harness.meta, exitCode: 0 }));
+
+    await harness.watcher.watchdogTick();
+    await vi.advanceTimersByTimeAsync(100);
+
+    expect(harness.calls.publishText).toContainEqual(expect.objectContaining({
+      payload: { body: 'bounded answer', from: 'assistant' },
+    }));
+    expect(harness.tracker.childFor(RUN_ID)).toMatchObject({ terminal: true, outcome: 'completed' });
+    expect(harness.isolation.breakerState().errorCount).toBe(0);
   });
 
   it('keeps a drain failure interruption authoritative over clean exit', async () => {

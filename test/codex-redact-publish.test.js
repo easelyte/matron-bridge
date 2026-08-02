@@ -74,6 +74,18 @@ describe('publish-side Codex redaction', () => {
     expect(redact(SENTINEL)).toMatch(/^\[REDACTED:test-token:[0-9a-f]{8}\]$/);
   });
 
+  it('does not classify ordinary identifier collisions as secret keys', () => {
+    const redact = createPublishRedactor({
+      configPath: '/test/lesson_redactor.yaml',
+      readFileSyncFn: () => POLICY,
+    });
+
+    expect(redact('author=Alice\nsession_count=4\ncookiecutter=yes')).toBe(
+      'author=Alice\nsession_count=4\ncookiecutter=yes',
+    );
+    expect(redact('AUTH=hidden\nGOOGLE_TOKEN=hidden')).not.toContain('=hidden');
+  });
+
   it('loads the real canonical policy and redacts its representative secret families', () => {
     const policyPath = resolveRedactorConfigPath({ env: {} });
     expect(policyPath).toBe(path.join(CANONICAL_WORKSPACE, 'memory/config/lesson_redactor.yaml'));
@@ -208,6 +220,35 @@ describe('publish-side Codex redaction', () => {
     expect(JSON.stringify(publisher.calls)).not.toContain(SENTINEL);
     expect(JSON.stringify(publisher.calls)).not.toContain('SHOULD_NOT');
     expect(state.redactionDropCount).toBe(0);
+  });
+
+  it('preserves the real unpinned schema and safely publishes new textual diagnostics', () => {
+    const publisher = makePublisher();
+    const log = { warn: vi.fn() };
+
+    redactAndRoute({
+      type: 'item.completed',
+      item: {
+        type: 'future_answer',
+        answer: `result ${SENTINEL}`,
+        newBinaryShape: { raw: SENTINEL },
+      },
+    }, {
+      publisher,
+      convoId: `parent:codex:${RUN_ID}`,
+      runId: RUN_ID,
+      meta: { schemaVersion: 'codex-cli 0.999.0' },
+      state: {},
+      redact: replaceSentinel,
+      log,
+    });
+
+    expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('codex-cli 0.999.0'));
+    const body = publisher.calls.find(call => call.method === 'publishText')?.payload.body;
+    expect(body).toContain(REDACTED);
+    expect(body).toContain('future_answer');
+    expect(body).not.toContain(SENTINEL);
+    expect(body).not.toContain('newBinaryShape');
   });
 
   it.each([
