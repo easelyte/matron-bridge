@@ -1,0 +1,128 @@
+import { EventEmitter } from 'node:events';
+import { describe, expect, it } from 'vitest';
+import WebSocket from 'ws';
+import { createCodexConvoTracker } from '../lib/codex-convos.js';
+import { createCodexWatcherIsolation } from '../lib/codex-watcher.js';
+import { createJournalPublisher } from '../lib/journal-publisher.js';
+
+const RUN_ID = '1722600000000-1234-abcd';
+const RUNNING_ID = '1722600000001-1234-beef';
+const PARENT_ID = 'parent-convo';
+const CHILD_ID = `${PARENT_ID}:codex:${RUN_ID}`;
+const RUNNING_CHILD_ID = `${PARENT_ID}:codex:${RUNNING_ID}`;
+
+class DeploySkewWebSocket extends EventEmitter {
+  static instances = [];
+  static upgraded = false;
+  static conversations = new Map();
+
+  constructor() {
+    super();
+    this.readyState = WebSocket.OPEN;
+    DeploySkewWebSocket.instances.push(this);
+    queueMicrotask(() => this.emit('open'));
+  }
+
+  send(data, callback) {
+    const frame = JSON.parse(data);
+    if (frame.op === 'hello') {
+      queueMicrotask(() => this.emit('message', JSON.stringify({ op: 'hello_ok' })));
+    } else if (frame.op === 'convo_upsert') {
+      const previous = DeploySkewWebSocket.conversations.get(frame.convo_id) || {};
+      DeploySkewWebSocket.conversations.set(frame.convo_id, {
+        sessionState: frame.session_state ?? previous.sessionState ?? null,
+        sessionOutcome: DeploySkewWebSocket.upgraded
+          ? (frame.session_outcome ?? previous.sessionOutcome ?? null)
+          : null,
+      });
+    }
+    callback?.();
+  }
+
+  close() {
+    if (this.readyState === WebSocket.CLOSED) return;
+    this.readyState = WebSocket.CLOSED;
+    this.emit('close');
+  }
+
+  terminate() {
+    this.close();
+  }
+}
+
+async function waitFor(predicate, timeoutMs = 1000) {
+  const started = Date.now();
+  while (!predicate()) {
+    if (Date.now() - started > timeoutMs) throw new Error('waitFor timed out');
+    await new Promise(resolve => setTimeout(resolve, 1));
+  }
+}
+
+describe('Codex outcome deploy-skew repair', () => {
+  it('re-emits an in-memory terminal child after reconnect so an upgraded server persists its outcome', async () => {
+    DeploySkewWebSocket.instances.length = 0;
+    DeploySkewWebSocket.upgraded = false;
+    DeploySkewWebSocket.conversations.clear();
+
+    let publisher;
+    let tracker;
+    let isolation;
+    publisher = createJournalPublisher({
+      url: 'ws://journal.test/ws',
+      token: 'test-token',
+      log: { warn() {}, info() {} },
+      backoffBaseMs: 1,
+      backoffCapMs: 1,
+      keepaliveIntervalMs: 0,
+      WebSocketImpl: DeploySkewWebSocket,
+      onReconnect: () => isolation.guardSession('reconnect', () => {
+        for (const [runId, sessionOutcome] of tracker.terminalChildren()) {
+          publisher.upsertConvo(tracker.convoIdFor(runId), {
+            sessionState: 'done',
+            sessionOutcome,
+          });
+        }
+      }),
+    });
+    tracker = createCodexConvoTracker({
+      sessionId: 'session-1',
+      publisher,
+      getParentConvoId: () => PARENT_ID,
+      log: { warn() {} },
+    });
+    isolation = createCodexWatcherIsolation({
+      sessionId: 'session-1',
+      publisher,
+      getParentConvoId: () => PARENT_ID,
+      terminalize: (runId, outcome) => tracker.terminalize(runId, outcome),
+      terminalizeAll: () => tracker.interruptAll(),
+      isAdmittedRun: runId => tracker.hasChild(runId),
+      log: { warn() {}, info() {} },
+    });
+
+    await waitFor(() => DeploySkewWebSocket.instances.length === 1);
+    tracker.ensureChild({ runId: RUN_ID });
+    tracker.ensureChild({ runId: RUNNING_ID });
+    tracker.terminalize(RUN_ID, 'completed');
+    await waitFor(() => DeploySkewWebSocket.conversations.get(CHILD_ID)?.sessionState === 'done');
+    expect(DeploySkewWebSocket.conversations.get(CHILD_ID)).toEqual({
+      sessionState: 'done',
+      sessionOutcome: null,
+    });
+
+    DeploySkewWebSocket.upgraded = true;
+    DeploySkewWebSocket.instances[0].close();
+
+    await waitFor(() => DeploySkewWebSocket.conversations.get(CHILD_ID)?.sessionOutcome === 'completed');
+    expect(DeploySkewWebSocket.conversations.get(CHILD_ID)).toEqual({
+      sessionState: 'done',
+      sessionOutcome: 'completed',
+    });
+    expect(DeploySkewWebSocket.conversations.get(RUNNING_CHILD_ID)).toEqual({
+      sessionState: 'running',
+      sessionOutcome: null,
+    });
+
+    publisher.close();
+  });
+});
