@@ -24,17 +24,14 @@ function makeContext() {
 }
 
 describe('Codex event backpressure', () => {
-  it('keeps reasoning ephemeral and caps durable tool output per run', () => {
+  it('keeps 500 completed reasoning items ephemeral and caps durable tool output per run', () => {
     const { calls, ctx } = makeContext();
 
-    const reasoningEvents = [
-      { type: 'item.started', item: { id: 'reasoning-started', type: 'reasoning' } },
-      { type: 'item.completed', item: { id: 'reasoning-completed', type: 'reasoning', text: 'thought' } },
-      { type: 'item.started', item: { id: 'interstitial-started', type: 'interstitial' } },
-      { type: 'item.completed', item: { id: 'interstitial-completed', type: 'interstitial', text: 'update' } },
-    ];
     for (let index = 0; index < 500; index += 1) {
-      formatAndRoute(reasoningEvents[index % reasoningEvents.length], ctx);
+      formatAndRoute({
+        type: 'item.completed',
+        item: { id: `reasoning-${index}`, type: 'reasoning', text: `thought ${index}` },
+      }, ctx);
     }
 
     expect(calls.filter(call => (
@@ -64,5 +61,41 @@ describe('Codex event backpressure', () => {
     }]);
     expect(ctx.state.durableEvents).toBe(200);
     expect(ctx.state.droppedEvents).toBe(50);
+  });
+
+  it('keeps started reasoning and recognized interstitial items ephemeral', () => {
+    const { calls, ctx } = makeContext();
+    const events = [
+      { type: 'item.started', item: { id: 'reasoning-started', type: 'reasoning', text: 'thinking' } },
+      { type: 'item.started', item: { id: 'interstitial-started', type: 'interstitial', text: 'starting' } },
+      { type: 'item.completed', item: { id: 'interstitial-completed', type: 'interstitial', text: 'update' } },
+    ];
+
+    for (const event of events) formatAndRoute(event, ctx);
+
+    expect(calls).toEqual([
+      { method: 'publishActivity', args: [ctx.convoId, 'thinking', 'thinking'] },
+      { method: 'publishActivity', args: [ctx.convoId, 'thinking', 'starting'] },
+      { method: 'publishActivity', args: [ctx.convoId, 'thinking', 'update'] },
+    ]);
+    expect(ctx.state.unparsed).toBe(0);
+    expect(ctx.state.durableEvents).toBe(0);
+  });
+
+  it('passes through an unknown reasoning envelope and counts it as unparsed', () => {
+    const { calls, ctx } = makeContext();
+    const event = {
+      type: 'item.delta',
+      item: { id: 'reasoning-delta', type: 'reasoning', text: 'partial thought' },
+    };
+
+    formatAndRoute(event, ctx);
+
+    expect(calls).toEqual([{
+      method: 'publishText',
+      args: [ctx.convoId, { body: JSON.stringify(event), from: 'assistant' }],
+    }]);
+    expect(ctx.state.unparsed).toBe(1);
+    expect(ctx.state.durableEvents).toBe(1);
   });
 });
