@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
+  CHILD_STATE_TERMINAL_PENDING,
   DEFAULT_MAX_CODEX_CHILDREN_PER_SESSION,
   createCodexConvoTracker,
 } from '../lib/codex-convos.js';
@@ -66,6 +67,25 @@ describe('codex watcher isolation', () => {
     expect(isolation.isDisabled()).toBe(false);
   });
 
+  it('disables a failed run without counting later callbacks or affecting a sibling', () => {
+    const { tracker, isolation } = makeHarness();
+    tracker.ensureChild({ runId: RUN_1 });
+    tracker.ensureChild({ runId: RUN_2 });
+    const repeatedOperation = vi.fn(() => { throw new Error('still malformed'); });
+    const siblingOperation = vi.fn(() => 'healthy');
+
+    isolation.guardRun(RUN_1, 'decoder', () => { throw new Error('bad event'); });
+    for (let index = 0; index < DEFAULT_CODEX_BREAKER_THRESHOLD + 1; index += 1) {
+      isolation.guardRun(RUN_1, 'decoder', repeatedOperation);
+    }
+
+    expect(isolation.guardRun(RUN_2, 'decoder', siblingOperation)).toBe('healthy');
+    expect(repeatedOperation).not.toHaveBeenCalled();
+    expect(siblingOperation).toHaveBeenCalledOnce();
+    expect(isolation.breakerState()).toEqual({ disabled: false, errorCount: 1 });
+    expect(tracker.childFor(RUN_2)?.terminal).toBe(false);
+  });
+
   it('trips at five throws, posts one durable note, and is per session', () => {
     const first = makeHarness('first');
     const second = makeHarness('second');
@@ -88,6 +108,36 @@ describe('codex watcher isolation', () => {
     expect(first.calls.publishText).toHaveLength(1);
     expect(second.isolation.guardSession('poll', () => 'still running')).toBe('still running');
     expect(second.isolation.isDisabled()).toBe(false);
+  });
+
+  it('retries the breaker note after its first publication fails', () => {
+    let publishAttempts = 0;
+    const successfulNotes = [];
+    const publisher = {
+      publishText(convoId, payload) {
+        publishAttempts += 1;
+        if (publishAttempts === 1) throw new Error('journal unavailable');
+        successfulNotes.push({ convoId, payload });
+      },
+    };
+    const isolation = createCodexWatcherIsolation({
+      sessionId: 'breaker-retry',
+      publisher,
+      getParentConvoId: () => 'parent-breaker-retry',
+      terminalize: () => false,
+      breakerThreshold: 1,
+      log: { info() {}, warn() {} },
+    });
+
+    isolation.guardSession('poll', () => { throw new Error('scan failed'); });
+    expect(isolation.isDisabled()).toBe(true);
+    expect(successfulNotes).toHaveLength(0);
+
+    isolation.guardSession('poll', () => 'must not run');
+    isolation.guardSession('poll', () => 'must not run');
+
+    expect(publishAttempts).toBe(2);
+    expect(successfulNotes).toHaveLength(1);
   });
 
   it('interrupts other in-flight runs only when the breaker trips', () => {
@@ -150,6 +200,68 @@ describe('codex watcher isolation', () => {
     ]);
   });
 
+  it('latches audit records only after the logger accepts them', () => {
+    const audits = [];
+    let startAttempts = 0;
+    let terminalAttempts = 0;
+    const isolation = createCodexWatcherIsolation({
+      sessionId: 'audit-retry',
+      log: {
+        info(_message, record) {
+          if (record.event === 'codex_run_start' && startAttempts++ === 0) {
+            throw new Error('logger unavailable');
+          }
+          if (record.event === 'codex_run_terminal' && terminalAttempts++ === 0) {
+            throw new Error('logger unavailable');
+          }
+          audits.push(record);
+        },
+        warn() {},
+      },
+    });
+    const meta = { runId: RUN_1, deadlineTs: 1722600100000 };
+
+    isolation.auditStart(meta);
+    isolation.auditStart(meta);
+    isolation.auditStart(meta);
+    isolation.auditTerminal(RUN_1);
+    isolation.auditTerminal(RUN_1);
+    isolation.auditTerminal(RUN_1);
+
+    expect(startAttempts).toBe(2);
+    expect(terminalAttempts).toBe(2);
+    expect(audits.map(record => record.event)).toEqual([
+      'codex_run_start',
+      'codex_run_terminal',
+    ]);
+  });
+
+  it('rejects forged audit run IDs and non-finite or non-numeric deadlines', () => {
+    const auditRecords = [];
+    const isolation = createCodexWatcherIsolation({
+      sessionId: 'audit-validation',
+      log: {
+        info(_message, record) { auditRecords.push(record); },
+        warn() {},
+      },
+    });
+
+    isolation.auditStart({ runId: 'forged-secret-run-id', deadlineTs: 1 });
+    isolation.auditTerminal('forged-secret-run-id');
+    isolation.auditStart({ runId: RUN_1, deadlineTs: 'secret-deadline' });
+    isolation.auditStart({ runId: RUN_1, deadlineTs: { secret: true } });
+    isolation.auditStart({ runId: RUN_1, deadlineTs: Number.POSITIVE_INFINITY });
+    isolation.auditStart({ runId: RUN_1, deadlineTs: 1722600100000 });
+
+    expect(auditRecords).toHaveLength(1);
+    expect(auditRecords[0]).toMatchObject({
+      event: 'codex_run_start',
+      runId: RUN_1,
+      deadlineTs: 1722600100000,
+    });
+    expect(JSON.stringify(auditRecords)).not.toContain('secret');
+  });
+
   it('does not copy descendant-controlled labels or error messages into logs', () => {
     const warnings = [];
     const auditRecords = [];
@@ -180,6 +292,57 @@ describe('codex watcher isolation', () => {
       async () => { throw new Error('journal failed'); },
     )).resolves.toBeUndefined();
     expect(tracker.childFor(RUN_1)).toMatchObject({ terminal: true, outcome: 'interrupted' });
+  });
+
+  it('keeps a failed terminal upsert pending and retries it before another callback', () => {
+    let failTerminalUpsert = true;
+    const calls = [];
+    const publisher = {
+      upsertConvo(convoId, opts) {
+        calls.push({ convoId, opts });
+        if (opts.sessionOutcome && failTerminalUpsert) {
+          failTerminalUpsert = false;
+          throw new Error('journal unavailable');
+        }
+      },
+      publishText() {},
+    };
+    const tracker = createCodexConvoTracker({
+      publisher,
+      getParentConvoId: () => 'parent-terminal-retry',
+      log: { warn() {} },
+    });
+    const audits = [];
+    const isolation = createCodexWatcherIsolation({
+      sessionId: 'terminal-retry',
+      publisher,
+      getParentConvoId: () => 'parent-terminal-retry',
+      terminalize: (id, outcome) => tracker.terminalize(id, outcome),
+      terminalizeAll: () => tracker.interruptAll(),
+      log: { info(_message, record) { audits.push(record); }, warn() {} },
+    });
+    tracker.ensureChild({ runId: RUN_1 });
+    const laterOperation = vi.fn();
+
+    isolation.guardRun(RUN_1, 'publish', () => { throw new Error('event failed'); });
+
+    expect(tracker.childFor(RUN_1)).toMatchObject({
+      state: CHILD_STATE_TERMINAL_PENDING,
+      terminal: false,
+      pendingOutcome: 'interrupted',
+    });
+    expect(audits).toHaveLength(0);
+
+    isolation.guardRun(RUN_1, 'publish', laterOperation);
+
+    expect(laterOperation).not.toHaveBeenCalled();
+    expect(tracker.childFor(RUN_1)).toMatchObject({
+      state: 'done',
+      terminal: true,
+      outcome: 'interrupted',
+    });
+    expect(audits).toHaveLength(1);
+    expect(calls.filter(call => call.opts.sessionOutcome)).toHaveLength(2);
   });
 });
 
@@ -222,5 +385,39 @@ describe('per-session codex child creation cap', () => {
 
     expect(tracker.ensureChild({ runId: RUN_1 })).toBeNull();
     expect(tracker.ensureChild({ runId: RUN_2 })).not.toBeNull();
+  });
+
+  it('retries the child-limit note after publication fails', () => {
+    let publishAttempts = 0;
+    const publishText = vi.fn(() => {
+      publishAttempts += 1;
+      if (publishAttempts === 1) throw new Error('journal unavailable');
+    });
+    const tracker = createCodexConvoTracker({
+      publisher: { upsertConvo() {}, publishText },
+      getParentConvoId: () => 'parent',
+      maxChildren: 0,
+      log: { warn() {} },
+    });
+
+    expect(tracker.ensureChild({ runId: RUN_1 })).toBeNull();
+    expect(tracker.ensureChild({ runId: RUN_2 })).toBeNull();
+    expect(tracker.ensureChild({ runId: runId(3) })).toBeNull();
+
+    expect(publishText).toHaveBeenCalledTimes(2);
+  });
+
+  it('returns a snapshot when inspecting a child', () => {
+    const { tracker } = makeHarness();
+    tracker.ensureChild({ runId: RUN_1 });
+
+    const inspected = tracker.childFor(RUN_1);
+    inspected.terminal = true;
+    inspected.state = 'tampered';
+
+    expect(tracker.childFor(RUN_1)).toMatchObject({
+      terminal: false,
+      state: 'running',
+    });
   });
 });
