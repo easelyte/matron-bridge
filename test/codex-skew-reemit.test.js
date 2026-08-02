@@ -6,9 +6,11 @@ import { createCodexWatcherIsolation } from '../lib/codex-watcher.js';
 import { createJournalPublisher } from '../lib/journal-publisher.js';
 
 const RUN_ID = '1722600000000-1234-abcd';
+const SECOND_RUN_ID = '1722600000002-1234-cafe';
 const RUNNING_ID = '1722600000001-1234-beef';
 const PARENT_ID = 'parent-convo';
 const CHILD_ID = `${PARENT_ID}:codex:${RUN_ID}`;
+const SECOND_CHILD_ID = `${PARENT_ID}:codex:${SECOND_RUN_ID}`;
 const RUNNING_CHILD_ID = `${PARENT_ID}:codex:${RUNNING_ID}`;
 
 class DeploySkewWebSocket extends EventEmitter {
@@ -138,7 +140,7 @@ describe('Codex outcome deploy-skew repair', () => {
     publisher.close();
   });
 
-  it('defers reconnect repairs behind a full queue without evicting backlog frames', async () => {
+  it('drains deferred reconnect repairs in FIFO order on the same connection', async () => {
     DeploySkewWebSocket.instances.length = 0;
     DeploySkewWebSocket.upgraded = false;
     DeploySkewWebSocket.conversations.clear();
@@ -177,8 +179,11 @@ describe('Codex outcome deploy-skew repair', () => {
 
     await waitFor(() => DeploySkewWebSocket.instances.length === 1);
     tracker.ensureChild({ runId: RUN_ID });
+    tracker.ensureChild({ runId: SECOND_RUN_ID });
     tracker.terminalize(RUN_ID, 'completed');
+    tracker.terminalize(SECOND_RUN_ID, 'failed');
     await waitFor(() => DeploySkewWebSocket.conversations.get(CHILD_ID)?.sessionState === 'done');
+    await waitFor(() => DeploySkewWebSocket.conversations.get(SECOND_CHILD_ID)?.sessionState === 'done');
 
     DeploySkewWebSocket.upgraded = true;
     DeploySkewWebSocket.instances[0].close();
@@ -198,18 +203,72 @@ describe('Codex outcome deploy-skew repair', () => {
       'backlog-3',
     ]);
     expect(DeploySkewWebSocket.conversations.get(CHILD_ID)?.sessionOutcome).toBeNull();
+    expect(DeploySkewWebSocket.conversations.get(SECOND_CHILD_ID)?.sessionOutcome).toBeNull();
+
+    DeploySkewWebSocket.pendingCallbacks.shift()();
+    await waitFor(() => DeploySkewWebSocket.conversations.get(CHILD_ID)?.sessionOutcome === 'completed');
+    expect(DeploySkewWebSocket.conversations.get(SECOND_CHILD_ID)?.sessionOutcome).toBeNull();
+
+    DeploySkewWebSocket.pendingCallbacks.shift()();
+    await waitFor(() => DeploySkewWebSocket.conversations.get(SECOND_CHILD_ID)?.sessionOutcome === 'failed');
+    expect(DeploySkewWebSocket.frames.filter(frame =>
+      frame.op === 'convo_upsert' && [CHILD_ID, SECOND_CHILD_ID].includes(frame.convo_id)
+    ).slice(-2).map(frame => frame.convo_id)).toEqual([CHILD_ID, SECOND_CHILD_ID]);
 
     for (const callback of DeploySkewWebSocket.pendingCallbacks.splice(0)) callback();
     DeploySkewWebSocket.delayCallbacks = false;
-    DeploySkewWebSocket.instances[1].close();
-
-    await waitFor(() => DeploySkewWebSocket.instances.length === 3);
-    await waitFor(() => DeploySkewWebSocket.conversations.get(CHILD_ID)?.sessionOutcome === 'completed');
     expect(DeploySkewWebSocket.conversations.get(CHILD_ID)).toEqual({
       sessionState: 'done',
       sessionOutcome: 'completed',
     });
+    expect(DeploySkewWebSocket.conversations.get(SECOND_CHILD_ID)).toEqual({
+      sessionState: 'done',
+      sessionOutcome: 'failed',
+    });
+    expect(DeploySkewWebSocket.instances).toHaveLength(2);
 
     publisher.close();
+  });
+
+  it('contains a malformed tracker during reconnect repair and repairs its sibling session', () => {
+    const repaired = [];
+    const publisher = {
+      upsertConvoBestEffort(convoId, opts) {
+        repaired.push({ convoId, opts });
+        return true;
+      },
+      publishText() { return true; },
+    };
+    const malformedIsolation = createCodexWatcherIsolation({
+      sessionId: 'malformed',
+      publisher,
+      log: { warn() {}, info() {} },
+    });
+    const siblingIsolation = createCodexWatcherIsolation({
+      sessionId: 'sibling',
+      publisher,
+      log: { warn() {}, info() {} },
+    });
+    const sessions = new Map([
+      ['malformed', {
+        codexConvos: {
+          terminalChildren() { throw new Error('malformed tracker'); },
+        },
+        codexWatcherIsolation: malformedIsolation,
+      }],
+      ['sibling', {
+        codexConvos: {
+          terminalChildren: () => new Map([[RUN_ID, 'completed']]),
+          convoIdFor: () => CHILD_ID,
+        },
+        codexWatcherIsolation: siblingIsolation,
+      }],
+    ]);
+
+    expect(() => journalReemitCodexOutcomes({ sessions, publisher })).not.toThrow();
+    expect(repaired).toEqual([{
+      convoId: CHILD_ID,
+      opts: { sessionState: 'done', sessionOutcome: 'completed' },
+    }]);
   });
 });
