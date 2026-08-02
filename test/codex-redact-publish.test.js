@@ -1,6 +1,9 @@
 import { EventEmitter } from 'node:events';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
-import { connectCodexWatcherPublisher } from '../lib/codex-watcher.js';
+import { CodexWatcher, connectCodexWatcherPublisher } from '../lib/codex-watcher.js';
 import { redactAndRoute } from '../lib/codex-event-format.js';
 import { createPublishRedactor } from '../lib/redact.js';
 
@@ -150,25 +153,45 @@ describe('publish-side Codex redaction', () => {
     })).toThrow('injected publisher failure');
   });
 
-  it('connects watcher replay events to redacted journal publication inside isolation', () => {
-    const watcher = new EventEmitter();
+  it('connects a tail replay to redacted journal publication inside isolation', async () => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'codex-redact-publish-'));
     const publisher = makePublisher();
-    const isolation = { guardRun: vi.fn((_runId, _entryPoint, operation) => operation()) };
-    watcher.isolation = isolation;
-
-    connectCodexWatcherPublisher(watcher, {
-      publisher,
-      convoIdFor: runId => `parent:codex:${runId}`,
-      redact: replaceSentinel,
-      log: { warn: vi.fn() },
+    const isolation = {
+      guardRun: vi.fn((_runId, _entryPoint, operation) => operation()),
+      auditStart: vi.fn(),
+      requestTerminalization: vi.fn(),
+      retryPending: vi.fn(),
+    };
+    class ReplayTail extends EventEmitter {
+      async start() {
+        this.emit('event', commandEvent('printf replay', `replayed=${SENTINEL}`));
+      }
+      async stop() {}
+    }
+    const watcher = new CodexWatcher({
+      dir,
+      sessionId: 'session-1',
+      TailClass: ReplayTail,
+      isolation,
+      onDiscover: () => true,
     });
-    watcher.emit('codex-event', {
-      runId: RUN_ID,
-      meta: { schemaVersion: SCHEMA_VERSION },
-      event: commandEvent('printf replay', `replayed=${SENTINEL}`),
-    }, {});
+    writeFileSync(path.join(dir, `codex-${RUN_ID}.jsonl`), '');
 
-    expect(isolation.guardRun).toHaveBeenCalledWith(RUN_ID, 'publish', expect.any(Function));
-    expect(publisher.calls[0].payload.output).toBe(`replayed=${REDACTED}`);
+    try {
+      connectCodexWatcherPublisher(watcher, {
+        publisher,
+        convoIdFor: runId => `parent:codex:${runId}`,
+        redact: replaceSentinel,
+        log: { warn: vi.fn() },
+      });
+      watcher._discover({ runId: RUN_ID, schemaVersion: SCHEMA_VERSION });
+      await watcher.attach(RUN_ID);
+
+      expect(isolation.guardRun).toHaveBeenCalledWith(RUN_ID, 'publish', expect.any(Function));
+      expect(publisher.calls[0].payload.output).toBe(`replayed=${REDACTED}`);
+    } finally {
+      await watcher.stop();
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
