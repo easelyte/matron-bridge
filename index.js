@@ -2657,7 +2657,7 @@ function setupSubagentWatcher(session, workdir, sessionId) {
   // resolving through the live session preserves that stable parent across
   // agent switches. T-4.1's watcher calls handleCodexDiscover below.
   const codexPublishRedact = createPublishRedactor({
-    workspaceRoot: process.env.DEFAULT_WORKDIR || workdir,
+    workspaceRoot: DEFAULT_WORKDIR,
   });
   session.codexConvos = createCodexConvoTracker({
     sessionId,
