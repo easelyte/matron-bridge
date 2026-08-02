@@ -2663,6 +2663,8 @@ function setupSubagentWatcher(session, workdir, sessionId) {
       getParentConvoId: () => journalConvoIdFor(session),
       terminalize: (runId, outcome) => session.codexConvos.terminalize(runId, outcome),
       terminalizeAll: () => session.codexConvos.interruptAll(),
+      hasPendingCapNote: () => session.codexConvos.hasPendingCapNote(),
+      retryCapNote: () => session.codexConvos.retryPendingCapNote(),
       isAdmittedRun: runId => session.codexConvos.hasChild(runId),
       log: console,
     });

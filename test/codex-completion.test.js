@@ -9,17 +9,45 @@ import { CodexWatcher, createCodexWatcherIsolation } from '../lib/codex-watcher.
 
 const RUN_ID = '1722600000000-1234-abcd';
 
+function currentStartTicks() {
+  const stat = fs.readFileSync(`/proc/${process.pid}/stat`, 'utf8');
+  return stat.slice(stat.lastIndexOf(')') + 1).trim().split(/\s+/)[19];
+}
+
 class FakeTail extends EventEmitter {
   constructor(filePath) {
     super();
     this.filePath = filePath;
     this.started = false;
     this.drainCount = 0;
+    this.offset = 0;
   }
 
   start() { this.started = true; }
-  drain() { this.drainCount += 1; }
+  async drain() {
+    this.drainCount += 1;
+    await new Promise(resolve => setTimeout(resolve, 50));
+    const content = fs.readFileSync(this.filePath, 'utf8').slice(this.offset);
+    this.offset += Buffer.byteLength(content);
+    for (const line of content.split('\n')) {
+      if (line.trim()) this.emit('event', JSON.parse(line));
+    }
+  }
   async stop() { this.started = false; }
+}
+
+class HangingTail extends FakeTail {
+  drain() {
+    this.drainCount += 1;
+    return new Promise(() => {});
+  }
+}
+
+class RejectingTail extends FakeTail {
+  drain() {
+    this.drainCount += 1;
+    return Promise.reject(new Error('drain failed'));
+  }
 }
 
 const watchers = [];
@@ -31,13 +59,19 @@ afterEach(async () => {
   for (const dir of tempDirs.splice(0)) fs.rmSync(dir, { recursive: true, force: true });
 });
 
-function makeHarness({ alive = true, deadlineTs = Date.now() + 60_000, exitCode } = {}) {
+function makeHarness({
+  alive = true,
+  deadlineTs = Date.now() + 60_000,
+  exitCode,
+  realLiveness = false,
+  TailClass = FakeTail,
+} = {}) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-completion-'));
   tempDirs.push(dir);
   const meta = {
     runId: RUN_ID,
     wrapperPid: process.pid,
-    wrapperStartTicks: '1',
+    wrapperStartTicks: realLiveness ? currentStartTicks() : '1',
     deadlineTs,
     schemaVersion: 'codex-cli 0.146.0',
   };
@@ -64,6 +98,8 @@ function makeHarness({ alive = true, deadlineTs = Date.now() + 60_000, exitCode 
     getParentConvoId: () => 'parent',
     terminalize: (runId, outcome) => tracker.terminalize(runId, outcome),
     terminalizeAll: () => tracker.interruptAll(),
+    hasPendingCapNote: () => tracker.hasPendingCapNote(),
+    retryCapNote: () => tracker.retryPendingCapNote(),
     isAdmittedRun: runId => tracker.hasChild(runId),
     log: { info(_message, record) { audits.push(record); }, warn() {} },
   });
@@ -71,10 +107,10 @@ function makeHarness({ alive = true, deadlineTs = Date.now() + 60_000, exitCode 
   const watcher = new CodexWatcher({
     dir,
     onDiscover: discovered => tracker.ensureChild(discovered),
-    isWrapperAliveFn: () => wrapperAlive,
+    ...(!realLiveness ? { isWrapperAliveFn: () => wrapperAlive } : {}),
     pollIntervalMs: 60_000,
     drainWindowMs: 100,
-    TailClass: FakeTail,
+    TailClass,
     isolation,
   });
   watchers.push(watcher);
@@ -111,12 +147,20 @@ describe('Codex completion state machine', () => {
     expect(harness.calls.upsertConvo).toHaveLength(0);
   });
 
-  it.each([
-    ['dead wrapper', false],
-    ['reused pid', false],
-  ])('interrupts on %s without an exit code', async (_reason, alive) => {
-    const harness = makeHarness({ alive });
+  it('interrupts a dead wrapper without an exit code', async () => {
+    const harness = makeHarness({ alive: false });
     await attach(harness);
+
+    await harness.watcher.watchdogTick();
+
+    expect(harness.tracker.childFor(RUN_ID)).toMatchObject({ terminal: true, outcome: 'interrupted' });
+  });
+
+  it('interrupts a reused pid whose process start ticks do not match', async () => {
+    const harness = makeHarness({ realLiveness: true });
+    await attach(harness);
+    harness.meta.wrapperStartTicks = '0';
+    fs.writeFileSync(harness.metaPath, JSON.stringify(harness.meta));
 
     await harness.watcher.watchdogTick();
 
@@ -138,7 +182,9 @@ describe('Codex completion state machine', () => {
     await harness.watcher.watchdogTick();
     fs.writeFileSync(harness.metaPath, JSON.stringify({ ...harness.meta, exitCode: 0 }));
 
-    await harness.watcher.watchdogTick();
+    expect(harness.isolation.requestTerminalization(RUN_ID, 'completed', {
+      winningSignal: 'clean-exit',
+    })).toBe(false);
 
     expect(harness.calls.upsertConvo).toHaveLength(1);
     expect(harness.calls.upsertConvo[0].opts.sessionOutcome).toBe('interrupted');
@@ -178,13 +224,24 @@ describe('Codex completion state machine', () => {
       meta: harness.meta,
       state: {},
     };
-    harness.watcher.on('codex-event', ({ event }) => formatAndRoute(event, routed));
+    harness.watcher.on('codex-event', ({ event }, streamState) => {
+      routed.state = streamState;
+      formatAndRoute(event, routed);
+    });
     fs.writeFileSync(harness.metaPath, JSON.stringify({ ...harness.meta, exitCode: 0 }));
 
     await harness.watcher.watchdogTick();
     expect(harness.tracker.childFor(RUN_ID)?.terminal).toBe(false);
-    tail.emit('event', { type: 'item.completed', item: { type: 'agent_message', text: 'late answer' } });
-    tail.emit('event', { type: 'turn.completed' });
+    setTimeout(() => {
+      fs.appendFileSync(path.join(harness.dir, `codex-${RUN_ID}.jsonl`), [
+        JSON.stringify({
+          type: 'item.completed',
+          item: { type: 'agent_message', text: 'late answer' },
+        }),
+        JSON.stringify({ type: 'turn.completed' }),
+        '',
+      ].join('\n'));
+    }, 25);
     expect(harness.tracker.childFor(RUN_ID)?.terminal).toBe(false);
     await vi.advanceTimersByTimeAsync(100);
 
@@ -198,7 +255,7 @@ describe('Codex completion state machine', () => {
 
   it('bounds a final-less drain and maps a nonzero exit to failed', async () => {
     vi.useFakeTimers();
-    const harness = makeHarness({ alive: true });
+    const harness = makeHarness({ alive: true, TailClass: HangingTail });
     await attach(harness);
     fs.writeFileSync(harness.metaPath, JSON.stringify({ ...harness.meta, exitCode: 2 }));
 
@@ -212,6 +269,59 @@ describe('Codex completion state machine', () => {
       winningSignal: 'clean-exit',
       finalPostLanded: false,
     }));
+  });
+
+  it('does not report an intermediate agent message as a landed final post', async () => {
+    vi.useFakeTimers();
+    const harness = makeHarness({ alive: true });
+    await attach(harness);
+    const routed = {
+      publisher: harness.publisher,
+      convoId: `parent:codex:${RUN_ID}`,
+      runId: RUN_ID,
+      meta: harness.meta,
+      state: {},
+    };
+    harness.watcher.on('codex-event', ({ event }, streamState) => {
+      routed.state = streamState;
+      formatAndRoute(event, routed);
+    });
+    const tail = harness.watcher.tails.get(RUN_ID);
+    tail.emit('event', {
+      type: 'item.completed',
+      item: { type: 'agent_message', text: 'intermediate' },
+    });
+    tail.emit('event', {
+      type: 'item.started',
+      item: { type: 'command_execution', command: 'true' },
+    });
+    tail.emit('event', { type: 'turn.completed' });
+    fs.writeFileSync(harness.metaPath, JSON.stringify({ ...harness.meta, exitCode: 0 }));
+
+    await harness.watcher.watchdogTick();
+    await vi.advanceTimersByTimeAsync(50);
+
+    expect(harness.audits).toContainEqual(expect.objectContaining({
+      outcome: 'completed',
+      finalPostLanded: false,
+    }));
+  });
+
+  it('keeps a drain failure interruption authoritative over clean exit', async () => {
+    const harness = makeHarness({ alive: true, TailClass: RejectingTail });
+    await attach(harness);
+    fs.writeFileSync(harness.metaPath, JSON.stringify({ ...harness.meta, exitCode: 0 }));
+
+    await harness.watcher.watchdogTick();
+    await new Promise(resolve => setImmediate(resolve));
+
+    expect(harness.tracker.childFor(RUN_ID)).toMatchObject({
+      terminal: true,
+      outcome: 'interrupted',
+    });
+    expect(harness.audits.filter(record => record.event === 'codex_run_terminal')).toEqual([
+      expect.objectContaining({ outcome: 'interrupted', winningSignal: 'drain-error' }),
+    ]);
   });
 
   it('retries a failed terminal upsert on a later watchdog tick without a stream callback', async () => {

@@ -42,6 +42,8 @@ function makeHarness(sessionId = 'session-1', options = {}) {
     getParentConvoId: () => `parent-${sessionId}`,
     terminalize: (id, outcome) => tracker.terminalize(id, outcome),
     terminalizeAll: () => tracker.interruptAll(),
+    hasPendingCapNote: () => tracker.hasPendingCapNote(),
+    retryCapNote: () => tracker.retryPendingCapNote(),
     isAdmittedRun: id => tracker.hasChild(id),
     log,
   });
@@ -190,6 +192,12 @@ describe('codex watcher isolation', () => {
     isolation.guardSession('poll', () => { throw new Error('scan failed'); });
     expect(tracker.childFor(RUN_1)?.outcome).toBe('interrupted');
     expect(tracker.childFor(RUN_2)?.outcome).toBe('interrupted');
+
+    expect(isolation.requestTerminalization(RUN_1, 'completed', {
+      winningSignal: 'clean-exit',
+    })).toBe(false);
+    isolation.retryPending();
+    expect(tracker.childFor(RUN_1)?.outcome).toBe('interrupted');
   });
 
   it('preserves and audits a pending terminal outcome when the breaker retries it', () => {
@@ -455,6 +463,46 @@ describe('codex watcher isolation', () => {
     expect(audits).toHaveLength(1);
     expect(calls.filter(call => call.opts.sessionOutcome)).toHaveLength(2);
   });
+
+  it('retries terminal audit independently after terminalization succeeds', () => {
+    const publisher = { upsertConvo() {}, publishText() {} };
+    const tracker = createCodexConvoTracker({
+      publisher,
+      getParentConvoId: () => 'parent-audit-retry',
+      log: { warn() {} },
+    });
+    let auditAttempts = 0;
+    const audits = [];
+    const isolation = createCodexWatcherIsolation({
+      sessionId: 'terminal-audit-retry',
+      terminalize: (id, outcome) => tracker.terminalize(id, outcome),
+      isAdmittedRun: id => tracker.hasChild(id),
+      log: {
+        info(_message, record) {
+          auditAttempts += 1;
+          if (auditAttempts === 1) throw new Error('audit sink unavailable');
+          audits.push(record);
+        },
+        warn() {},
+      },
+    });
+    tracker.ensureChild({ runId: RUN_1 });
+
+    expect(isolation.requestTerminalization(RUN_1, 'completed', {
+      winningSignal: 'clean-exit',
+      finalPostLanded: true,
+    })).toBe(false);
+    expect(tracker.childFor(RUN_1)?.terminal).toBe(true);
+    expect(audits).toHaveLength(0);
+
+    isolation.retryPending();
+
+    expect(auditAttempts).toBe(2);
+    expect(audits).toEqual([expect.objectContaining({
+      outcome: 'completed',
+      winningSignal: 'clean-exit',
+    })]);
+  });
 });
 
 describe('per-session codex child creation cap', () => {
@@ -499,7 +547,7 @@ describe('per-session codex child creation cap', () => {
     expect(tracker.ensureChild({ runId: RUN_2 })).not.toBeNull();
   });
 
-  it('retries the child-limit note after publication fails', () => {
+  it('retries the child-limit note from the watchdog pending seam', () => {
     let publishAttempts = 0;
     const attemptedOptions = [];
     const publishText = vi.fn((_convoId, _payload, options) => {
@@ -513,16 +561,25 @@ describe('per-session codex child creation cap', () => {
       maxChildren: 0,
       log: { warn() {} },
     });
+    const isolation = createCodexWatcherIsolation({
+      hasPendingCapNote: () => tracker.hasPendingCapNote(),
+      retryCapNote: () => tracker.retryPendingCapNote(),
+      isAdmittedRun: () => false,
+      log: { info() {}, warn() {} },
+    });
 
     expect(tracker.ensureChild({ runId: RUN_1 })).toBeNull();
-    expect(tracker.ensureChild({ runId: RUN_2 })).toBe(false);
-    expect(tracker.ensureChild({ runId: runId(3) })).toBe(false);
+    expect(tracker.hasPendingCapNote()).toBe(true);
+
+    isolation.retryPending();
+    isolation.retryPending();
 
     expect(publishText).toHaveBeenCalledTimes(2);
     expect(attemptedOptions).toEqual([
       { idemKey: 'parent:childcap' },
       { idemKey: 'parent:childcap' },
     ]);
+    expect(tracker.hasPendingCapNote()).toBe(false);
   });
 
   it('returns a snapshot when inspecting a child', () => {
