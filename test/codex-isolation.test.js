@@ -110,7 +110,7 @@ describe('codex watcher isolation', () => {
     expect(second.isolation.isDisabled()).toBe(false);
   });
 
-  it('retries the breaker note after its first publication fails', () => {
+  it('retries the breaker note independently after its first publication fails', () => {
     let publishAttempts = 0;
     const successfulNotes = [];
     const publisher = {
@@ -133,8 +133,8 @@ describe('codex watcher isolation', () => {
     expect(isolation.isDisabled()).toBe(true);
     expect(successfulNotes).toHaveLength(0);
 
-    isolation.guardSession('poll', () => 'must not run');
-    isolation.guardSession('poll', () => 'must not run');
+    isolation.retryPending();
+    isolation.retryPending();
 
     expect(publishAttempts).toBe(2);
     expect(successfulNotes).toHaveLength(1);
@@ -154,6 +154,53 @@ describe('codex watcher isolation', () => {
     isolation.guardSession('poll', () => { throw new Error('scan failed'); });
     expect(tracker.childFor(RUN_1)?.outcome).toBe('interrupted');
     expect(tracker.childFor(RUN_2)?.outcome).toBe('interrupted');
+  });
+
+  it('preserves and audits a pending terminal outcome when the breaker retries it', () => {
+    let failCompletedUpsert = true;
+    const publisher = {
+      upsertConvo(_convoId, opts) {
+        if (opts.sessionOutcome === 'completed' && failCompletedUpsert) {
+          failCompletedUpsert = false;
+          throw new Error('journal unavailable');
+        }
+      },
+      publishText() {},
+    };
+    const tracker = createCodexConvoTracker({
+      publisher,
+      getParentConvoId: () => 'parent-outcome-fidelity',
+      log: { warn() {} },
+    });
+    const audits = [];
+    let breakerTerminalizations;
+    const isolation = createCodexWatcherIsolation({
+      sessionId: 'outcome-fidelity',
+      publisher,
+      getParentConvoId: () => 'parent-outcome-fidelity',
+      terminalizeAll: () => {
+        breakerTerminalizations = tracker.interruptAll();
+        return breakerTerminalizations;
+      },
+      breakerThreshold: 1,
+      log: { info(_message, record) { audits.push(record); }, warn() {} },
+    });
+    tracker.ensureChild({ runId: RUN_1 });
+
+    expect(tracker.terminalize(RUN_1, 'completed')).toBe(false);
+    isolation.guardSession('poll', () => { throw new Error('scan failed'); });
+
+    expect(tracker.childFor(RUN_1)).toMatchObject({
+      terminal: true,
+      outcome: 'completed',
+    });
+    expect(breakerTerminalizations).toEqual([{ runId: RUN_1, outcome: 'completed' }]);
+    expect(audits).toContainEqual(expect.objectContaining({
+      runId: RUN_1,
+      outcome: 'completed',
+      winningSignal: 'completed',
+      finalPostLanded: null,
+    }));
   });
 
   it('emits at most one structured start and terminal audit record per run', () => {
@@ -189,6 +236,7 @@ describe('codex watcher isolation', () => {
         event: 'codex_run_terminal',
         runId: RUN_1,
         sessionId: 'session-1',
+        outcome: null,
         winningSignal: 'clean-exit',
         livenessEvidence: { pidAlive: false },
         durableEventCount: 7,
@@ -294,7 +342,7 @@ describe('codex watcher isolation', () => {
     expect(tracker.childFor(RUN_1)).toMatchObject({ terminal: true, outcome: 'interrupted' });
   });
 
-  it('keeps a failed terminal upsert pending and retries it before another callback', () => {
+  it('retries a failed terminal upsert without another stream callback', () => {
     let failTerminalUpsert = true;
     const calls = [];
     const publisher = {
@@ -322,8 +370,6 @@ describe('codex watcher isolation', () => {
       log: { info(_message, record) { audits.push(record); }, warn() {} },
     });
     tracker.ensureChild({ runId: RUN_1 });
-    const laterOperation = vi.fn();
-
     isolation.guardRun(RUN_1, 'publish', () => { throw new Error('event failed'); });
 
     expect(tracker.childFor(RUN_1)).toMatchObject({
@@ -333,9 +379,8 @@ describe('codex watcher isolation', () => {
     });
     expect(audits).toHaveLength(0);
 
-    isolation.guardRun(RUN_1, 'publish', laterOperation);
+    isolation.retryPending();
 
-    expect(laterOperation).not.toHaveBeenCalled();
     expect(tracker.childFor(RUN_1)).toMatchObject({
       state: 'done',
       terminal: true,
