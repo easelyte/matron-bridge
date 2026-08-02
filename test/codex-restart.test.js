@@ -64,9 +64,14 @@ function makeWatcher(dir, {
   isWrapperAliveFn = () => false,
 } = {}) {
   const calls = [];
+  const notices = [];
   const publisher = {
     upsertConvo(convoId, options) {
       calls.push({ convoId, options });
+      return true;
+    },
+    publishText(convoId, payload, options) {
+      notices.push({ convoId, payload, options });
       return true;
     },
   };
@@ -99,7 +104,7 @@ function makeWatcher(dir, {
     TailClass: FakeTail,
   });
   watchers.push(watcher);
-  return { calls, tracker, watcher };
+  return { calls, notices, tracker, watcher };
 }
 
 describe('Codex restart reconciliation', () => {
@@ -222,7 +227,7 @@ describe('Codex restart reconciliation', () => {
     expect(FakeTail.starts).toEqual([]);
   });
 
-  it('reconciles more than the live-child cap without consuming admission capacity', async () => {
+  it('caps historical reconciliation without consuming live admission capacity', async () => {
     const dir = makeDir();
     const historicalRuns = Array.from({ length: 66 }, (_, index) =>
       `${1722600100000 + index}-1234-${index.toString(16).padStart(4, '0')}`);
@@ -234,7 +239,11 @@ describe('Codex restart reconciliation', () => {
     await harness.watcher.start();
 
     expect(historicalRuns.every(runId => harness.watcher.seen.has(runId))).toBe(true);
-    expect(harness.calls.filter(call => call.options.sessionState === 'done')).toHaveLength(66);
+    expect(harness.calls.filter(call => call.options.sessionState === 'done')).toHaveLength(64);
+    expect(harness.notices).toEqual([expect.objectContaining({
+      convoId: 'parent-1',
+      payload: expect.objectContaining({ body: expect.stringContaining('child limit reached') }),
+    })]);
     expect(harness.calls.filter(call => call.options.sessionState === 'running')).toHaveLength(0);
 
     writeRun(dir, liveRun);

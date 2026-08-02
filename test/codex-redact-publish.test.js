@@ -276,6 +276,8 @@ describe('publish-side Codex redaction', () => {
     ["node -p 'process.env[\"API_KEY\"]'", 'opaque-value'],
     ["python -c 'import os; print(os.getenv(\"AUTH_TOKEN\"))'", 'opaque-value'],
     ['unknown-diagnostic', `API_TOKEN=${SENTINEL}\nDATABASE_PASSWORD=hunter2\nHOME=/root\nPATH=/bin`],
+    ['unknown-diagnostic', `HOME=/root\0PATH=/bin\0API_TOKEN=${SENTINEL}`],
+    ['cat /proc/self/environ', `HOME=/root\0API_TOKEN=${SENTINEL}\0PATH=/bin`],
   ])('drops raw env-dump output for bypass %s', (command, output) => {
     const publisher = makePublisher();
     const state = {};
@@ -289,6 +291,18 @@ describe('publish-side Codex redaction', () => {
     });
     expect(publisher.calls).toEqual([]);
     expect(state.redactionDropCount).toBe(1);
+  });
+
+  it('redacts a secret-key assignment after a harmless NUL-delimited segment', () => {
+    const redact = createPublishRedactor({
+      configPath: '/test/lesson_redactor.yaml',
+      readFileSyncFn: () => POLICY,
+    });
+    const output = redact('HOME=/root\0API_TOKEN=unstructured-secret\0PATH=/bin');
+
+    expect(output).not.toContain('unstructured-secret');
+    expect(output).toContain('HOME=/root\0API_TOKEN=[REDACTED:secret-key:');
+    expect(output).toContain('\0PATH=/bin');
   });
 
   it.each([

@@ -36,8 +36,10 @@ must not be printed into agent output.
 The live-view sidecar directory is writable by the Codex wrapper and therefore
 by a shell-capable descendant. Such a descendant can forge a matching metadata
 file and JSONL transcript that the journal presents as a Codex run. Shape and
-PID-liveness validation, together with the 64-child limit, bound malformed data
-and volume but do not establish provenance.
+PID-liveness validation, together with separate 64-child limits for live and
+historical restart reconciliation, bound malformed data and volume but do not
+establish provenance. Runs beyond either budget are omitted after one durable
+notice on the parent conversation.
 
 This is accepted only for the current single-principal deployment, where the
 operator's own trusted sessions share the principal. It follows the P67 trust
@@ -46,6 +48,18 @@ within the operator's own journal is not a new cross-principal capability.
 Out-of-band, bridge-stamped run registration through a mediator that descendants
 cannot forge is a hard prerequisite before any multi-principal or curated-toolset
 (Nastia) deployment. The current bridge does not claim that provenance.
+
+### Activation-gating residual
+
+The common disconnected-journal case is repaired by reconnect outcome re-emit
+and terminal-field coalescing. A narrower edge remains if a parent session is
+replaced during the outage after its terminal frame has been evicted from the
+bounded publisher queue: the old tracker is no longer attached to a session,
+so its child outcome cannot be re-emitted and the journal may continue to show
+that child as running. Before `EPIPE_TOLERANT_VERSIONS` is changed to activate
+the visualization, this must be closed with a session-independent terminal
+ledger that re-emits outcomes until the publisher receives authoritative
+acknowledgement.
 
 ## Install and authenticate
 
