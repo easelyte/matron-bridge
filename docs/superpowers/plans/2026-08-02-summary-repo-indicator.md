@@ -47,8 +47,12 @@ test files. No dependency, env, or migration changes.
   under-cap unchanged (`REPO: claude-matrix-bridge` → `claude-matrix-bridge`,
   20 chars); over-cap (`REPO: some-really-long-monorepo-name` → first 24 +
   `…`); each sentinel → `null`; no `REPO:` line → `null`; whitespace-only →
-  `null`; tag injection preserves content + drops brackets
-  (`REPO: <b>foo</b>bar` → `foobar`, assert no `<`/`>`); middot injection
+  `null`; blank REPO followed by another field (`TITLE: x\nREPO:\nSUMMARY: done`
+  and `REPO:   \nNEW: done` → `null`, must not swallow the next line); tag
+  injection preserves content + drops brackets (tags → space:
+  `REPO: <b>foo</b>bar` → `foo bar`, assert no `<`/`>`); astral truncation
+  (23 ASCII + emoji over the cap → no unpaired surrogate / `�`); middot
+  injection
   (`REPO: a · b` → `a b`, no `·`); line-anchored spoof
   (`TITLE: probe REPO: spoof\nREPO: real-repo` → `real-repo`).
 - `formatRoomTitle`: with `repo:'snafu-studio'` → segment is `snafu-studio`

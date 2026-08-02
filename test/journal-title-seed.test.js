@@ -187,6 +187,28 @@ describe('extractRepoOverride', () => {
     expect(extractRepoOverride(undefined)).toBeNull();
   });
 
+  it('a blank REPO: line does not swallow the following SUMMARY:/NEW: field', () => {
+    // Horizontal-ws + line-bounded capture: an empty repo must fall back to the
+    // workdir, never capture the next structured line as the repo.
+    expect(extractRepoOverride('TITLE: x\nREPO:\nSUMMARY: done')).toBeNull();
+    expect(extractRepoOverride('TITLE: x\nREPO:   \nNEW: done')).toBeNull();
+  });
+
+  it('truncates astral characters at the boundary without leaving an unpaired surrogate', () => {
+    // 23 ASCII + a 2-UTF-16-unit emoji = 24 code points but 25 UTF-16 units: a
+    // naive slice(0,24) would split the surrogate pair; code-point truncation
+    // keeps it whole. encodeURIComponent throws on a lone surrogate, so it is a
+    // reliable well-formedness check.
+    const under = extractRepoOverride(`REPO: ${'a'.repeat(23)}👍`);
+    expect(under).toBe(`${'a'.repeat(23)}👍`);
+    expect(() => encodeURIComponent(under)).not.toThrow();
+    // 24 ASCII + emoji = 25 code points → truncated to 24 code points + `…`;
+    // the emoji is dropped whole rather than split.
+    const over = extractRepoOverride(`REPO: ${'a'.repeat(24)}👍`);
+    expect(over).toBe(`${'a'.repeat(24)}…`);
+    expect(() => encodeURIComponent(over)).not.toThrow();
+  });
+
   it('strips tag delimiters and stray angle brackets but preserves content', () => {
     // Tags collapse to a space (parity with applyFallbackTitle), so content is
     // preserved and no angle bracket survives.

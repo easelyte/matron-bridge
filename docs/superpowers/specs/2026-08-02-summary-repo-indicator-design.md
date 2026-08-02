@@ -74,8 +74,10 @@ adding one output field:
      so an injected middot cannot forge extra title segments) →
      `.replace(/\s+/g,' ')` → `.trim()`. Empty after clean → `null`.
    - Cap with `truncateWithEllipsis(clean, REPO_LABEL_MAX)` — parity with
-     `repoLabel`: strings ≤ 24 chars are returned unchanged; strings > 24
-     chars become the first 24 chars **plus** a `…` (i.e. 25 display chars).
+     `repoLabel`: strings ≤ 24 **code points** are returned unchanged; longer
+     strings become the first 24 code points **plus** a `…` (25 code points).
+     Truncation is code-point-aware (`Array.from`) so an astral character
+     (emoji) at the boundary cannot be split into an unpaired surrogate.
      Returns the capped string.
 
 3. **Formatting (`formatRoomTitle`)** — gain an optional `repo` param. When a
@@ -95,7 +97,7 @@ adding one output field:
 |---|---|
 | `REPO: snafu-studio` | `snafu-studio` |
 | `REPO: claude-matrix-bridge` (20 chars ≤ 24) | `claude-matrix-bridge` (unchanged — under cap) |
-| `REPO: some-really-long-monorepo-name` (>24) | first 24 chars + `…` (25 display chars, `truncateWithEllipsis` parity) |
+| `REPO: some-really-long-monorepo-name` (>24) | first 24 code points + `…` (`truncateWithEllipsis` parity, astral-safe) |
 | `REPO: unknown` / omitted / whitespace | `repoLabel(workdir)` (today's behavior) |
 | `REPO: <b>foo</b>bar` | `foo bar` (tag delimiters → space, content preserved, no `<`/`>`) |
 | `TITLE: probe REPO: spoof`\n`REPO: real-repo` | `real-repo` (line-anchored regex ignores the mid-line echo) |
