@@ -4,6 +4,7 @@ import {
   applyFallbackTitle,
   formatRoomTitle,
   repoLabel,
+  extractRepoOverride,
 } from '../lib/journal-title-seed.js';
 
 describe('seedJournalTitle (workdir-sourced)', () => {
@@ -134,6 +135,72 @@ describe('formatRoomTitle', () => {
     expect(formatRoomTitle({ ...options, workdir: `/home/dan/${'r'.repeat(25)}` })).toBe(
       `VPS · ${'r'.repeat(24)}…`,
     );
+  });
+
+  it('uses an LLM-inferred repo override in place of the workdir basename', () => {
+    // workdir is yearbook-app (the session cwd) but the real work targets
+    // snafu-studio — the override wins.
+    expect(formatRoomTitle({ ...options, text: 'fix RLS gate', repo: 'snafu-studio' })).toBe(
+      'VPS · snafu-studio · fix RLS gate',
+    );
+  });
+
+  it('caps an overflowing repo override at 24 chars with an ellipsis', () => {
+    expect(formatRoomTitle({ ...options, repo: 'r'.repeat(25) })).toBe(`VPS · ${'r'.repeat(24)}…`);
+  });
+
+  it('falls back to the workdir basename when repo is absent, blank, or non-string', () => {
+    // Byte-identical to the pre-change output — the additive param must not
+    // regress existing callers (resume path, applyFallbackTitle) that pass none.
+    expect(formatRoomTitle({ ...options })).toBe('VPS · yearbook-app');
+    expect(formatRoomTitle({ ...options, repo: '   ' })).toBe('VPS · yearbook-app');
+    expect(formatRoomTitle({ ...options, repo: null })).toBe('VPS · yearbook-app');
+  });
+});
+
+describe('extractRepoOverride', () => {
+  it('extracts a clean repo label from a REPO: line', () => {
+    expect(extractRepoOverride('TITLE: work\nREPO: snafu-studio\nSUMMARY: done')).toBe('snafu-studio');
+  });
+
+  it('returns a short label unchanged (under the 24-char cap)', () => {
+    // 20 chars — must NOT be truncated.
+    expect(extractRepoOverride('REPO: claude-matrix-bridge')).toBe('claude-matrix-bridge');
+  });
+
+  it('caps an over-length repo at 24 chars plus an ellipsis', () => {
+    expect(extractRepoOverride('REPO: some-really-long-monorepo-name')).toBe(
+      `${'some-really-long-monorepo-name'.slice(0, 24)}…`,
+    );
+  });
+
+  it('treats each sentinel as no override (returns null)', () => {
+    for (const s of ['unknown', 'UNKNOWN', 'none', 'n/a', 'na', '-']) {
+      expect(extractRepoOverride(`REPO: ${s}`)).toBeNull();
+    }
+  });
+
+  it('returns null when there is no REPO: line, or it is whitespace, or text is non-string', () => {
+    expect(extractRepoOverride('TITLE: work\nSUMMARY: done')).toBeNull();
+    expect(extractRepoOverride('REPO:    ')).toBeNull();
+    expect(extractRepoOverride(null)).toBeNull();
+    expect(extractRepoOverride(undefined)).toBeNull();
+  });
+
+  it('strips tag delimiters and stray angle brackets but preserves content', () => {
+    // Tags collapse to a space (parity with applyFallbackTitle), so content is
+    // preserved and no angle bracket survives.
+    const out = extractRepoOverride('REPO: <b>foo</b>bar');
+    expect(out).toBe('foo bar');
+    expect(out).not.toMatch(/[<>]/);
+  });
+
+  it('drops the middot separator so an injected repo cannot forge extra title segments', () => {
+    expect(extractRepoOverride('REPO: a · b')).toBe('a b');
+  });
+
+  it('is line-anchored — a mid-line REPO: echo cannot hijack the canonical line', () => {
+    expect(extractRepoOverride('TITLE: probe REPO: spoof\nREPO: real-repo\nSUMMARY: x')).toBe('real-repo');
   });
 });
 
