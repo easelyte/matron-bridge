@@ -39,6 +39,7 @@ import { promptButtons, promptResponseForButton } from './lib/prompt-buttons.js'
 import { parseOptionReply } from './lib/prompt-reply.js';
 import { sendDelayedPromptAnswer, writePromptAnswer } from './lib/prompt-answer-delivery.js';
 import { SubagentWatcher } from './lib/subagent-watcher.js';
+import { configureCodexSinkEnv } from './lib/codex-paths.js';
 import { createSubagentConvoTracker } from './lib/subagent-convos.js';
 import { formatSubagentToolBody } from './lib/subagent-tool-format.js';
 import { ivUploadDir, ivUploadAnnotation } from './lib/iv-uploads.js';
@@ -1150,6 +1151,13 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   };
   delete spawnEnv.SHOW_FILE_TOKEN;
   if (showFileToken) spawnEnv.SHOW_FILE_TOKEN = showFileToken;
+
+  configureCodexSinkEnv({
+    spawnEnv,
+    workdir: cwd,
+    sessionId: identity.sessionId,
+    warn: message => console.warn(message),
+  });
 
   const proc = spawn('claude', args, {
     cwd,
