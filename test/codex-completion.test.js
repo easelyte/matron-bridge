@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createCodexConvoTracker } from '../lib/codex-convos.js';
 import { formatAndRoute } from '../lib/codex-event-format.js';
 import { CodexWatcher, createCodexWatcherIsolation } from '../lib/codex-watcher.js';
+import { TranscriptTail } from '../lib/transcript-tail.js';
 
 const RUN_ID = '1722600000000-1234-abcd';
 
@@ -32,6 +33,7 @@ class FakeTail extends EventEmitter {
     for (const line of content.split('\n')) {
       if (line.trim()) this.emit('event', JSON.parse(line));
     }
+    return true;
   }
   async stop() { this.started = false; }
 }
@@ -253,7 +255,7 @@ describe('Codex completion state machine', () => {
     expect(tail.drainCount).toBeGreaterThan(0);
   });
 
-  it('bounds a final-less drain and maps a nonzero exit to failed', async () => {
+  it('interrupts when an attached tail does not finish its bounded drain', async () => {
     vi.useFakeTimers();
     const harness = makeHarness({ alive: true, TailClass: HangingTail });
     await attach(harness);
@@ -262,11 +264,11 @@ describe('Codex completion state machine', () => {
     await harness.watcher.watchdogTick();
     await vi.advanceTimersByTimeAsync(100);
 
-    expect(harness.tracker.childFor(RUN_ID)).toMatchObject({ terminal: true, outcome: 'failed' });
+    expect(harness.tracker.childFor(RUN_ID)).toMatchObject({ terminal: true, outcome: 'interrupted' });
     expect(harness.audits).toContainEqual(expect.objectContaining({
       runId: RUN_ID,
-      outcome: 'failed',
-      winningSignal: 'clean-exit',
+      outcome: 'interrupted',
+      winningSignal: 'drain-timeout',
       finalPostLanded: false,
     }));
   });
@@ -348,5 +350,101 @@ describe('Codex completion state machine', () => {
     await harness.watcher.stop();
 
     expect(harness.tracker.childFor(RUN_ID)).toMatchObject({ terminal: true, outcome: 'interrupted' });
+  });
+
+  it('waits for a pending JSONL and drains it with the production tail', async () => {
+    vi.useFakeTimers();
+    const harness = makeHarness({ alive: true, TailClass: TranscriptTail });
+    fs.rmSync(path.join(harness.dir, `codex-${RUN_ID}.jsonl`));
+    await harness.watcher.start();
+    expect(harness.watcher.pending.has(RUN_ID)).toBe(true);
+    const routed = {
+      publisher: harness.publisher,
+      convoId: `parent:codex:${RUN_ID}`,
+      runId: RUN_ID,
+      meta: harness.meta,
+      state: {},
+    };
+    harness.watcher.on('codex-event', ({ event }, streamState) => {
+      routed.state = streamState;
+      formatAndRoute(event, routed);
+    });
+    fs.writeFileSync(harness.metaPath, JSON.stringify({ ...harness.meta, exitCode: 0 }));
+    await harness.watcher.watchdogTick();
+    expect(harness.tracker.childFor(RUN_ID)?.terminal).toBe(false);
+
+    fs.writeFileSync(path.join(harness.dir, `codex-${RUN_ID}.jsonl`), [
+      JSON.stringify({ type: 'item.completed', item: { type: 'agent_message', text: 'late file' } }),
+      JSON.stringify({ type: 'turn.completed' }),
+      '',
+    ].join('\n'));
+    await harness.watcher.scan();
+    await vi.advanceTimersByTimeAsync(100);
+
+    expect(harness.calls.publishText).toContainEqual(expect.objectContaining({
+      payload: { body: 'late file', from: 'assistant' },
+    }));
+    expect(harness.tracker.childFor(RUN_ID)).toMatchObject({ terminal: true, outcome: 'completed' });
+  });
+
+  it('interrupts when a clean-exit JSONL never attaches within the drain window', async () => {
+    vi.useFakeTimers();
+    const harness = makeHarness({ alive: true, TailClass: TranscriptTail });
+    fs.rmSync(path.join(harness.dir, `codex-${RUN_ID}.jsonl`));
+    await harness.watcher.start();
+    fs.writeFileSync(harness.metaPath, JSON.stringify({ ...harness.meta, exitCode: 0 }));
+
+    await harness.watcher.watchdogTick();
+    await vi.advanceTimersByTimeAsync(100);
+
+    expect(harness.tracker.childFor(RUN_ID)).toMatchObject({ terminal: true, outcome: 'interrupted' });
+    expect(harness.audits).toContainEqual(expect.objectContaining({ winningSignal: 'drain-unattached' }));
+  });
+
+  it('lets teardown win as interrupted during a production-tail drain', async () => {
+    vi.useFakeTimers();
+    const harness = makeHarness({ alive: true, TailClass: TranscriptTail });
+    await attach(harness);
+    fs.writeFileSync(harness.metaPath, JSON.stringify({ ...harness.meta, exitCode: 0 }));
+    await harness.watcher.watchdogTick();
+
+    await harness.watcher.stop();
+    await vi.advanceTimersByTimeAsync(100);
+
+    expect(harness.tracker.childFor(RUN_ID)).toMatchObject({ terminal: true, outcome: 'interrupted' });
+    expect(harness.audits).toContainEqual(expect.objectContaining({ winningSignal: 'teardown' }));
+  });
+
+  it('consumes an append late in the production tail drain window', async () => {
+    vi.useFakeTimers();
+    const harness = makeHarness({ alive: true, TailClass: TranscriptTail });
+    await attach(harness);
+    fs.writeFileSync(harness.metaPath, JSON.stringify({ ...harness.meta, exitCode: 0 }));
+    await harness.watcher.watchdogTick();
+    setTimeout(() => {
+      fs.appendFileSync(path.join(harness.dir, `codex-${RUN_ID}.jsonl`),
+        `${JSON.stringify({ type: 'turn.completed', late: true })}\n`);
+    }, 75);
+    const events = [];
+    harness.watcher.on('codex-event', ({ event }) => events.push(event));
+
+    await vi.advanceTimersByTimeAsync(100);
+
+    expect(events).toContainEqual({ type: 'turn.completed', late: true });
+    expect(harness.tracker.childFor(RUN_ID)).toMatchObject({ terminal: true, outcome: 'completed' });
+  });
+
+  it('does not complete cleanly when the attached transcript disappears', async () => {
+    vi.useFakeTimers();
+    const harness = makeHarness({ alive: true, TailClass: TranscriptTail });
+    await attach(harness);
+    fs.rmSync(path.join(harness.dir, `codex-${RUN_ID}.jsonl`));
+    fs.writeFileSync(harness.metaPath, JSON.stringify({ ...harness.meta, exitCode: 0 }));
+
+    await harness.watcher.watchdogTick();
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(harness.tracker.childFor(RUN_ID)).toMatchObject({ terminal: true, outcome: 'interrupted' });
+    expect(harness.audits).toContainEqual(expect.objectContaining({ winningSignal: 'drain-error' }));
   });
 });
