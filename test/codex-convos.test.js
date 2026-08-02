@@ -21,6 +21,10 @@ function makePublisher() {
   };
 }
 
+function redact(value) {
+  return value.replaceAll('SENTINEL_CREDENTIAL', '[REDACTED:test]');
+}
+
 describe('childConvoId', () => {
   it('is deterministic for a parent conversation and Codex run', () => {
     expect(childConvoId('parent-uuid', 'run-1')).toBe('parent-uuid:codex:run-1');
@@ -39,24 +43,26 @@ describe('createCodexConvoTracker', () => {
       publisher,
       getParentConvoId: () => 'parent-uuid',
       log: { warn() {} },
+      redact,
     });
   });
 
-  it('creates a running child linked to the parent without publishing the unredacted label', () => {
-    const child = tracker.ensureChild({ runId: RUN_1, label: 'Plan review' });
+  it('creates a running child linked to the parent with a redacted title', () => {
+    const child = tracker.ensureChild({ runId: RUN_1, label: 'Plan SENTINEL_CREDENTIAL review' });
 
     expect(child).toMatchObject({
       runId: RUN_1,
       parentConvoId: 'parent-uuid',
       convoId: `parent-uuid:codex:${RUN_1}`,
       state: CHILD_STATE_RUNNING,
+      title: 'Plan [REDACTED:test] review',
     });
-    expect(child).not.toHaveProperty('title');
     expect(publisher.calls.upsertConvo).toEqual([{
       convoId: `parent-uuid:codex:${RUN_1}`,
       opts: {
         parentConvoId: 'parent-uuid',
         sessionState: CHILD_STATE_RUNNING,
+        title: 'Plan [REDACTED:test] review',
       },
     }]);
   });
@@ -193,14 +199,14 @@ describe('createCodexConvoTracker', () => {
     expect(publisher.calls.upsertConvo).toHaveLength(0);
   });
 
-  it.each([
-    'xoxb-LABELEXAMPLENOTAREALTOKEN',
-    'ya29.a0AfH6SMB-secret-bearing-google-token',
-  ])('creates the child but omits forgeable or secret-bearing label %s', label => {
-    const child = tracker.ensureChild({
-      runId: RUN_1,
-      label,
+  it('omits the title on redactor error while still creating the child', () => {
+    const redactorFailure = createCodexConvoTracker({
+      publisher,
+      getParentConvoId: () => 'parent-uuid',
+      log: { warn() {} },
+      redact() { throw new Error('injected redactor failure'); },
     });
+    const child = redactorFailure.ensureChild({ runId: RUN_1, label: 'SENTINEL_CREDENTIAL' });
 
     expect(child?.convoId).toBe(`parent-uuid:codex:${RUN_1}`);
     expect(child).not.toHaveProperty('title');
@@ -215,7 +221,7 @@ describe('createCodexConvoTracker', () => {
 
     expect(child?.convoId).toBe(`parent-uuid:codex:${RUN_1}`);
     expect(publisher.calls.upsertConvo).toHaveLength(1);
-    expect(publisher.calls.upsertConvo[0].opts).not.toHaveProperty('title');
+    expect(publisher.calls.upsertConvo[0].opts.title).toBe(label);
   });
 
   it.each([undefined, null, 'done', 'complete', 'FAILED'])(

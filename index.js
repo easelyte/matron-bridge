@@ -39,10 +39,15 @@ import { promptButtons, promptResponseForButton } from './lib/prompt-buttons.js'
 import { parseOptionReply } from './lib/prompt-reply.js';
 import { sendDelayedPromptAnswer, writePromptAnswer } from './lib/prompt-answer-delivery.js';
 import { SubagentWatcher } from './lib/subagent-watcher.js';
-import { createCodexWatcherIsolation, registerCodexWatcherForLiveSession } from './lib/codex-watcher.js';
+import {
+  connectCodexWatcherPublisher,
+  createCodexWatcherIsolation,
+  registerCodexWatcherForLiveSession,
+} from './lib/codex-watcher.js';
 import { launchWithCodexSinkEnv } from './lib/codex-paths.js';
 import { createSubagentConvoTracker } from './lib/subagent-convos.js';
 import { createCodexConvoTracker, journalReemitCodexOutcomes } from './lib/codex-convos.js';
+import { createPublishRedactor } from './lib/redact.js';
 import { formatSubagentToolBody } from './lib/subagent-tool-format.js';
 import { ivUploadDir, ivUploadAnnotation } from './lib/iv-uploads.js';
 import { parseUsageLimits, formatLimits } from './lib/usage-limits.js';
@@ -2651,11 +2656,15 @@ function setupSubagentWatcher(session, workdir, sessionId) {
   // persistSession carries journalConvoId alongside the native session id;
   // resolving through the live session preserves that stable parent across
   // agent switches. T-4.1's watcher calls handleCodexDiscover below.
+  const codexPublishRedact = createPublishRedactor({
+    workspaceRoot: process.env.DEFAULT_WORKDIR || workdir,
+  });
   session.codexConvos = createCodexConvoTracker({
     sessionId,
     publisher: journalPublisher,
     getParentConvoId: () => journalConvoIdFor(session),
     log: console,
+    redact: codexPublishRedact,
   });
   session.codexOnDiscover = meta => handleCodexDiscover(session, meta);
   session.codexWatcherIsolation = null;
@@ -2672,7 +2681,7 @@ function setupSubagentWatcher(session, workdir, sessionId) {
       log: console,
     });
     session.codexWatcherIsolation = isolation;
-    registerCodexWatcherForLiveSession(sessions, session.roomId, {
+    const codexWatcher = registerCodexWatcherForLiveSession(sessions, session.roomId, {
       workdir,
       sessionId,
       onDiscover: session.codexOnDiscover,
@@ -2684,6 +2693,14 @@ function setupSubagentWatcher(session, workdir, sessionId) {
         Promise.resolve(failedWatcher?.stop?.()).catch(() => {});
       },
     });
+    if (codexWatcher) {
+      connectCodexWatcherPublisher(codexWatcher, {
+        publisher: journalPublisher,
+        convoIdFor: runId => session.codexConvos.convoIdFor(runId),
+        redact: codexPublishRedact,
+        log: console,
+      });
+    }
   } catch (error) {
     session.codexWatcher = null;
     try { console.warn(`[codex-watcher] session setup failed (${error instanceof Error ? error.name : typeof error})`); }
