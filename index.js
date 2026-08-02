@@ -39,6 +39,7 @@ import { promptButtons, promptResponseForButton } from './lib/prompt-buttons.js'
 import { parseOptionReply } from './lib/prompt-reply.js';
 import { sendDelayedPromptAnswer, writePromptAnswer } from './lib/prompt-answer-delivery.js';
 import { SubagentWatcher } from './lib/subagent-watcher.js';
+import { CodexWatcher, createCodexWatcherIsolation } from './lib/codex-watcher.js';
 import { launchWithCodexSinkEnv } from './lib/codex-paths.js';
 import { createSubagentConvoTracker } from './lib/subagent-convos.js';
 import { createCodexConvoTracker } from './lib/codex-convos.js';
@@ -2655,6 +2656,23 @@ function setupSubagentWatcher(session, workdir, sessionId) {
     log: console,
   });
   session.codexOnDiscover = meta => handleCodexDiscover(session, meta);
+  if (process.env.MATRON_CODEX_VIZ !== '0') {
+    const isolation = createCodexWatcherIsolation({
+      sessionId,
+      publisher: journalPublisher,
+      getParentConvoId: () => journalConvoIdFor(session),
+      terminalize: (runId, outcome) => session.codexConvos.terminalize(runId, outcome),
+      terminalizeAll: () => session.codexConvos.interruptAll(),
+      isAdmittedRun: runId => session.codexConvos.hasChild(runId),
+      log: console,
+    });
+    session.codexWatcher = new CodexWatcher({
+      workdir,
+      sessionId,
+      onDiscover: session.codexOnDiscover,
+      isolation,
+    });
+  }
   session.subagentConvos = createSubagentConvoTracker({
     publisher: journalPublisher,
     getParentConvoId: () => journalConvoIdFor(session),
@@ -2678,6 +2696,10 @@ function handleCodexDiscover(session, meta) {
 // the catch-all for a subagent whose Task tool_result was never paired) before
 // the tracker is dropped.
 function teardownSubagentTracking(session) {
+  if (session.codexWatcher) {
+    session.codexWatcher.stop().catch(() => {});
+    session.codexWatcher = null;
+  }
   if (session.subagentConvos) {
     session.subagentConvos.finishAll();
     session.subagentConvos = null;
