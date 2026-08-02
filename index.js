@@ -40,14 +40,11 @@ import { parseOptionReply } from './lib/prompt-reply.js';
 import { sendDelayedPromptAnswer, writePromptAnswer } from './lib/prompt-answer-delivery.js';
 import { SubagentWatcher } from './lib/subagent-watcher.js';
 import {
-  connectCodexWatcherPublisher,
-  createCodexWatcherIsolation,
-  registerCodexWatcherForLiveSession,
-} from './lib/codex-watcher.js';
+  setupCodexWatcherForSession,
+} from './lib/codex-watcher-setup.js';
 import { launchWithCodexSinkEnv } from './lib/codex-paths.js';
 import { createSubagentConvoTracker } from './lib/subagent-convos.js';
-import { createCodexConvoTracker, journalReemitCodexOutcomes } from './lib/codex-convos.js';
-import { createPublishRedactor } from './lib/redact.js';
+import { journalReemitCodexOutcomes } from './lib/codex-convos.js';
 import { formatSubagentToolBody } from './lib/subagent-tool-format.js';
 import { ivUploadDir, ivUploadAnnotation } from './lib/iv-uploads.js';
 import { parseUsageLimits, formatLimits } from './lib/usage-limits.js';
@@ -340,8 +337,8 @@ function toolStreamKey(convoId, messageRef) {
 // whole module, including `sessions` and the routing functions below, has
 // finished evaluating).
 const journalPublisher = createJournalPublisher({
-  url: process.env.NODE_ENV === 'test' ? '' : JOURNAL_WS_URL,
-  token: process.env.NODE_ENV === 'test' ? '' : _journalToken,
+  url: JOURNAL_WS_URL,
+  token: _journalToken,
   log: console,
   cursorFile: JOURNAL_CURSOR_FILE,
   onEvent: journalHandleInboundEvent,
@@ -362,7 +359,7 @@ const journalPublisher = createJournalPublisher({
 // Used to skip the per-session buffering/bookkeeping entirely when the
 // publisher is a disabled no-op (its methods are already safe no-ops; this
 // just avoids pointless buffers and spurious overflow warnings).
-const JOURNAL_ENABLED = process.env.NODE_ENV !== 'test' && !!(JOURNAL_WS_URL && _journalToken);
+const JOURNAL_ENABLED = !!(JOURNAL_WS_URL && _journalToken);
 
 if (JOURNAL_ENABLED) {
   // Boot the control convo eagerly — safe even before the WS is connected
@@ -2654,76 +2651,11 @@ function resolveQuestionAnswer(session, text) {
 // there; getParentConvoId resolves lazily so agent-switching (which changes
 // journalConvoId) is followed. Called from every spawn path (print eager,
 // iv-mode, and the lazy print-mode construction in handleClaudeEvent).
-export function setupCodexWatcherForSession(session, workdir, sessionId, {
-  publisher = journalPublisher,
-  liveSessions = sessions,
-  workspaceRoot = DEFAULT_WORKDIR,
-  watcherOptions = {},
-  watcherDependencies = {},
-  log = console,
-} = {}) {
-  // persistSession carries journalConvoId alongside the native session id;
-  // resolving through the live session preserves that stable parent across
-  // agent switches. T-4.1's watcher calls handleCodexDiscover below.
-  const codexPublishRedact = createPublishRedactor({
-    workspaceRoot,
-    log,
-  });
-  session.codexConvos = createCodexConvoTracker({
-    sessionId,
-    publisher,
-    getParentConvoId: () => journalConvoIdFor(session),
-    log,
-    redact: codexPublishRedact,
-  });
-  session.codexOnDiscover = meta => handleCodexDiscover(session, meta);
-  session.codexWatcherIsolation = null;
-  try {
-    const isolation = createCodexWatcherIsolation({
-      sessionId,
-      publisher,
-      getParentConvoId: () => journalConvoIdFor(session),
-      terminalize: (runId, outcome) => session.codexConvos.terminalize(runId, outcome),
-      terminalizeAll: () => session.codexConvos.interruptAll(),
-      hasPendingCapNote: () => session.codexConvos.hasPendingCapNote(),
-      retryCapNote: () => session.codexConvos.retryPendingCapNote(),
-      isAdmittedRun: runId => session.codexConvos.hasChild(runId),
-      log,
-    });
-    session.codexWatcherIsolation = isolation;
-    const codexWatcher = registerCodexWatcherForLiveSession(liveSessions, session.roomId, {
-      workdir,
-      sessionId,
-      ...watcherOptions,
-      onDiscover: session.codexOnDiscover,
-      onReconcile: (runId, outcome) => session.codexConvos.terminalizeByRunId(runId, outcome),
-      isolation,
-    }, {
-      ...watcherDependencies,
-      onFailure: (_error, failedWatcher) => {
-        if (session.codexWatcher === failedWatcher) session.codexWatcher = null;
-        Promise.resolve(failedWatcher?.stop?.()).catch(() => {});
-      },
-    });
-    if (codexWatcher) {
-      connectCodexWatcherPublisher(codexWatcher, {
-        publisher,
-        convoIdFor: runId => session.codexConvos.convoIdFor(runId),
-        redact: codexPublishRedact,
-        log,
-      });
-    }
-    return codexWatcher;
-  } catch (error) {
-    session.codexWatcher = null;
-    try { log.warn(`[codex-watcher] session setup failed (${error instanceof Error ? error.name : typeof error})`); }
-    catch { /* visualization setup must never block session initialization */ }
-    return null;
-  }
-}
-
 function setupSubagentWatcher(session, workdir, sessionId) {
-  setupCodexWatcherForSession(session, workdir, sessionId);
+  setupCodexWatcherForSession(session, workdir, sessionId, {
+    publisher: journalPublisher,
+    liveSessions: sessions,
+  });
   session.subagentConvos = createSubagentConvoTracker({
     publisher: journalPublisher,
     getParentConvoId: () => journalConvoIdFor(session),
@@ -2733,13 +2665,6 @@ function setupSubagentWatcher(session, workdir, sessionId) {
   session.subagentWatcher.on('subagent-start', payload => handleSubagentStart(session, payload));
   session.subagentWatcher.on('subagent-event', payload => handleSubagentEvent(session, payload));
   session.subagentWatcher.snapshot();
-}
-
-// Adapter for CodexWatcher's onDiscover(meta) callback. Keeping journal
-// concerns here lets the watcher remain a filesystem/liveness component.
-function handleCodexDiscover(session, meta) {
-  if (!session || !session.codexConvos) return null;
-  return session.codexConvos.ensureChild(meta);
 }
 
 // Stop a session's subagent watcher and settle its children. finishAll marks
@@ -7309,11 +7234,9 @@ const apiServer = createServer(async (req, res) => {
   });
 });
 
-if (process.env.NODE_ENV !== 'test') {
-  apiServer.listen(API_PORT, '127.0.0.1', () => {
-    console.log(`Local API listening on 127.0.0.1:${API_PORT}`);
-  });
-}
+apiServer.listen(API_PORT, '127.0.0.1', () => {
+  console.log(`Local API listening on 127.0.0.1:${API_PORT}`);
+});
 
 function hydrateAgentState(session, persisted, fromAgent = otherAgent(session.agent)) {
   const history = Array.isArray(session.chatHistory) ? session.chatHistory : [];
@@ -7785,28 +7708,26 @@ function pushHostVitals() {
   _lastVitalsPublished = { cpu, ram, at: now };
 }
 
-if (process.env.NODE_ENV !== 'test') {
-  main().catch(err => {
-    console.error('Fatal error:', err);
-    process.exit(1);
-  });
+main().catch(err => {
+  console.error('Fatal error:', err);
+  process.exit(1);
+});
 
-  process.on('SIGINT', () => {
-    console.log('\nShutting down...');
-    if (_hostVitalsPushHandle) { clearInterval(_hostVitalsPushHandle); _hostVitalsPushHandle = null; }
-    stopCpuSampler();
-    for (const [, session] of sessions) {
-      killSession(session);
-    }
-    process.exit(0);
-  });
+process.on('SIGINT', () => {
+  console.log('\nShutting down...');
+  if (_hostVitalsPushHandle) { clearInterval(_hostVitalsPushHandle); _hostVitalsPushHandle = null; }
+  stopCpuSampler();
+  for (const [, session] of sessions) {
+    killSession(session);
+  }
+  process.exit(0);
+});
 
-  process.on('SIGTERM', () => {
-    if (_hostVitalsPushHandle) { clearInterval(_hostVitalsPushHandle); _hostVitalsPushHandle = null; }
-    stopCpuSampler();
-    for (const [, session] of sessions) {
-      killSession(session);
-    }
-    process.exit(0);
-  });
-}
+process.on('SIGTERM', () => {
+  if (_hostVitalsPushHandle) { clearInterval(_hostVitalsPushHandle); _hostVitalsPushHandle = null; }
+  stopCpuSampler();
+  for (const [, session] of sessions) {
+    killSession(session);
+  }
+  process.exit(0);
+});

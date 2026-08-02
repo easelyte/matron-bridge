@@ -1,17 +1,17 @@
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import path from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
-import { setupCodexWatcherForSession } from '../index.js';
 import { createCodexConvoTracker } from '../lib/codex-convos.js';
 import { redactAndRoute } from '../lib/codex-event-format.js';
+import { setupCodexWatcherForSession } from '../lib/codex-watcher-setup.js';
 import { createPublishRedactor, resolveRedactorConfigPath } from '../lib/redact.js';
 
 const RUN_ID = '1722600000000-1234-abcd';
 const SCHEMA_VERSION = 'codex-cli 0.146.0';
 const SENTINEL = 'SENTINEL_CREDENTIAL';
 const REDACTED = '[REDACTED:test]';
-const CANONICAL_WORKSPACE = path.resolve('.');
+const CANONICAL_WORKSPACE = path.join(homedir(), '.openclaw', 'workspace');
 
 function replaceSentinel(value) {
   return value.replaceAll(SENTINEL, REDACTED);
@@ -75,20 +75,30 @@ describe('publish-side Codex redaction', () => {
   });
 
   it('loads the real canonical policy and redacts its representative secret families', () => {
-    const policyPath = resolveRedactorConfigPath({ workspaceRoot: CANONICAL_WORKSPACE, env: {} });
+    const policyPath = resolveRedactorConfigPath({ env: {} });
     expect(policyPath).toBe(path.join(CANONICAL_WORKSPACE, 'memory/config/lesson_redactor.yaml'));
-    const redact = createPublishRedactor({ workspaceRoot: CANONICAL_WORKSPACE, env: {} });
+    const redact = createPublishRedactor({ env: {} });
     const samples = [
-      'xoxb-EXAMPLEONLYNOTAREALTOKEN',
-      'ya29.a0AfH6SMB-example_token',
-      'AKIAIOSFODNN7EXAMPLE',
+      ['aws-access-key-id', 'AKIAIOSFODNN7EXAMPLE'],
+      ['aws-secret-access-key', `aws secret access key: ${'a'.repeat(40)}`],
+      ['anthropic-api-key', `sk-ant-${'a'.repeat(24)}`],
+      ['openai-api-key', `sk-${'b'.repeat(24)}`],
+      ['github-token', `ghp_${'c'.repeat(36)}`],
+      ['slack-token', 'xoxb-EXAMPLEONLYNOTAREALTOKEN'],
+      ['bearer-token', `Bearer ${'d'.repeat(24)}`],
+      ['telegram-bot-token', `123456789:${'e'.repeat(30)}`],
+      ['private-key-pem', '-----BEGIN PRIVATE KEY-----'],
+      ['tavily-api-key', `tvly-${'f'.repeat(24)}`],
     ];
     const canonicalPolicy = readFileSync(policyPath, 'utf8');
-    expect(canonicalPolicy).toContain('slack-token');
-    for (const sample of samples) {
-      expect(redact(sample), sample).not.toContain(sample);
-      expect(redact(sample), sample).toContain('[REDACTED:');
+    for (const [name, sample] of samples) {
+      expect(canonicalPolicy).toContain(`name: ${name}`);
+      expect(redact(sample), name).not.toContain(sample);
+      expect(redact(sample), name).toContain(`[REDACTED:${name}:`);
     }
+    // Google OAuth is not currently a named canonical rule, but the shared
+    // secret-key belt still protects it when emitted as environment output.
+    expect(redact('GOOGLE_TOKEN=ya29.a0AfH6SMB-example_token')).not.toContain('ya29.');
     expect(redact('API_KEY=unstructured-value')).not.toContain('unstructured-value');
   });
 
@@ -100,14 +110,13 @@ describe('publish-side Codex redaction', () => {
       env: {},
     })).toBe('/home/tester/policy/redactor.yaml');
     expect(resolveRedactorConfigPath({
-      workspaceRoot: '/canonical/workspace',
       homedir: '/home/tester',
       env: {},
-    })).toBe('/canonical/workspace/memory/config/lesson_redactor.yaml');
+    })).toBe('/home/tester/.openclaw/workspace/memory/config/lesson_redactor.yaml');
 
     const reads = [];
     const redact = createPublishRedactor({
-      workspaceRoot: '/canonical/workspace',
+      homedir: '/home/tester',
       env: {},
       readFileSyncFn: file => {
         reads.push(file);
@@ -115,7 +124,7 @@ describe('publish-side Codex redaction', () => {
       },
     });
     redact('safe');
-    expect(reads).toEqual(['/canonical/workspace/memory/config/lesson_redactor.yaml']);
+    expect(reads).toEqual(['/home/tester/.openclaw/workspace/memory/config/lesson_redactor.yaml']);
     expect(reads[0]).not.toContain('/arbitrary/session-workdir');
   });
 
@@ -146,10 +155,6 @@ describe('publish-side Codex redaction', () => {
         "    regex: '(?P<token>safe)'",
       ].join('\n'),
     ],
-    ...['\\w+', '\\d+', '\\s+', '\\btoken\\b', '(?i)token', '.', '[^A-Z]+'].map(regex => [
-      `non-parity regex ${regex}`,
-      ['patterns:', '  - name: non-parity', `    regex: '${regex}'`].join('\n'),
-    ]),
   ])('fails closed for %s instead of applying a partial policy', (_label, policy) => {
     const log = { error: vi.fn() };
     const redact = createPublishRedactor({
@@ -160,6 +165,20 @@ describe('publish-side Codex redaction', () => {
     expect(() => redact(SENTINEL)).toThrow('publish redactor config failed');
     expect(() => redact('safe')).toThrow('publish redactor is unavailable');
     expect(log.error).toHaveBeenCalledOnce();
+  });
+
+  it.each([
+    ['whitespace', '\\s+', ' \t'],
+    ['word boundary', '\\btoken\\b', 'token'],
+    ['digit and word classes', '\\d+\\w+', '12abc'],
+    ['negative lookahead', 'sk-(?!ant-)[A-Za-z0-9]{4}', 'sk-abcd'],
+    ['inline case flag', 'prefix(?i)token', 'PREFIXTOKEN'],
+  ])('translates canonical Python regex feature %s', (_label, regex, sample) => {
+    const redact = createPublishRedactor({
+      configPath: '/test/lesson_redactor.yaml',
+      readFileSyncFn: () => ['patterns:', '  - name: translated', `    regex: '${regex}'`].join('\n'),
+    });
+    expect(redact(sample)).toMatch(/^\[REDACTED:translated:[0-9a-f]{8}\]$/);
   });
 
   it('redacts every allowlisted string and excludes unknown fields before publishing', () => {
@@ -195,10 +214,18 @@ describe('publish-side Codex redaction', () => {
     ['env | sort', `API_TOKEN=${SENTINEL}`],
     ['env -0', `API_TOKEN=${SENTINEL}`],
     ['printenv | cat', `API_TOKEN=${SENTINEL}`],
+    ['printenv --null', `API_TOKEN=${SENTINEL}`],
     ['command env', `API_TOKEN=${SENTINEL}`],
     ['/usr/bin/env', `API_TOKEN=${SENTINEL}`],
     ['set', `API_TOKEN=${SENTINEL}`],
+    ['export', `API_TOKEN=${SENTINEL}`],
     ['export -p', `API_TOKEN=${SENTINEL}`],
+    ['declare -x', 'declare -x PRIVATE_KEY="pem-material"'],
+    ['declare -x | grep PRIVATE_KEY', 'declare -x PRIVATE_KEY="pem-material"'],
+    ["python -c 'import os; print(os.environ)'", "{'HARMLESS_NAME': 'one-line-secret'}"],
+    ["python3 -c 'import os; print(os.environ)'", "{'HARMLESS_NAME': 'one-line-secret'}"],
+    ["node -e 'console.log(process.env)'", 'HARMLESS_NAME=one-line-secret'],
+    ["node -p 'process.env'", 'HARMLESS_NAME=one-line-secret'],
     ["/usr/bin/bash -lc 'env'", `API_TOKEN=${SENTINEL}`],
     ['bash -c env | grep DATABASE_PASSWORD', 'DATABASE_PASSWORD=hunter2'],
     ["sh -lc 'printenv | grep API_TOKEN'", `API_TOKEN=${SENTINEL}`],
@@ -219,29 +246,10 @@ describe('publish-side Codex redaction', () => {
   });
 
   it.each([
-    ["node -e 'console.log(process.env)'", 'DATABASE_PASSWORD=hunter2'],
-    ["python -c 'import os; print(os.environ)'", "{'API_TOKEN': 'one-line-secret'}"],
-    ['declare -x | grep PRIVATE_KEY', 'declare -x PRIVATE_KEY="pem-material"'],
-  ])('redacts secret-key values even when env-dump command classification is undecidable: %s', (command, output) => {
-    const publisher = makePublisher();
-    const redact = createPublishRedactor({ workspaceRoot: CANONICAL_WORKSPACE, env: {} });
-    redactAndRoute(commandEvent(command, output), {
-      publisher,
-      convoId: `parent:codex:${RUN_ID}`,
-      runId: RUN_ID,
-      meta: { schemaVersion: SCHEMA_VERSION },
-      state: {},
-      redact,
-    });
-    expect(publisher.calls).toHaveLength(1);
-    expect(JSON.stringify(publisher.calls)).not.toContain('hunter2');
-    expect(JSON.stringify(publisher.calls)).not.toContain('one-line-secret');
-    expect(JSON.stringify(publisher.calls)).not.toContain('pem-material');
-    expect(JSON.stringify(publisher.calls)).toContain('[REDACTED:secret-key:');
-  });
-
-  it.each([
     ['env NODE_ENV=test npm test', 'test suite passed'],
+    ['printenv HOME', '/home/tester'],
+    ['export NAME=value', ''],
+    ['declare -x NAME=value', ''],
     ["echo 'env'", 'env'],
   ])('does not drop non-dump command %s', (command, output) => {
     const publisher = makePublisher();
@@ -301,7 +309,7 @@ describe('publish-side Codex redaction', () => {
     })).toThrow('injected publisher failure');
   });
 
-  it('uses the real index.js setup with tracker, canonical redactor, and isolation for replay and live tail', async () => {
+  it('uses the side-effect-free production setup with tracker, canonical redactor, and isolation for replay and live tail', async () => {
     const dir = mkdtempSync(path.join(tmpdir(), 'codex-redact-publish-'));
     const publisher = makePublisher();
     const liveSession = {
@@ -312,7 +320,6 @@ describe('publish-side Codex redaction', () => {
     const watcher = setupCodexWatcherForSession(liveSession, dir, 'session-1', {
       publisher,
       liveSessions: new Map([['room-1', liveSession]]),
-      workspaceRoot: CANONICAL_WORKSPACE,
       watcherOptions: {
         dir,
         pollIntervalMs: 60_000,
