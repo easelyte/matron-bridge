@@ -41,6 +41,7 @@ import { sendDelayedPromptAnswer, writePromptAnswer } from './lib/prompt-answer-
 import { SubagentWatcher } from './lib/subagent-watcher.js';
 import { launchWithCodexSinkEnv } from './lib/codex-paths.js';
 import { createSubagentConvoTracker } from './lib/subagent-convos.js';
+import { createCodexConvoTracker } from './lib/codex-convos.js';
 import { formatSubagentToolBody } from './lib/subagent-tool-format.js';
 import { ivUploadDir, ivUploadAnnotation } from './lib/iv-uploads.js';
 import { parseUsageLimits, formatLimits } from './lib/usage-limits.js';
@@ -2644,6 +2645,15 @@ function resolveQuestionAnswer(session, text) {
 // journalConvoId) is followed. Called from every spawn path (print eager,
 // iv-mode, and the lazy print-mode construction in handleClaudeEvent).
 function setupSubagentWatcher(session, workdir, sessionId) {
+  // persistSession carries journalConvoId alongside the native session id;
+  // resolving through the live session preserves that stable parent across
+  // agent switches. T-4.1's watcher calls handleCodexDiscover below.
+  session.codexConvos = createCodexConvoTracker({
+    publisher: journalPublisher,
+    getParentConvoId: () => journalConvoIdFor(session),
+    log: console,
+  });
+  session.codexOnDiscover = meta => handleCodexDiscover(session, meta);
   session.subagentConvos = createSubagentConvoTracker({
     publisher: journalPublisher,
     getParentConvoId: () => journalConvoIdFor(session),
@@ -2653,6 +2663,13 @@ function setupSubagentWatcher(session, workdir, sessionId) {
   session.subagentWatcher.on('subagent-start', payload => handleSubagentStart(session, payload));
   session.subagentWatcher.on('subagent-event', payload => handleSubagentEvent(session, payload));
   session.subagentWatcher.snapshot();
+}
+
+// Adapter for CodexWatcher's onDiscover(meta) callback. Keeping journal
+// concerns here lets the watcher remain a filesystem/liveness component.
+function handleCodexDiscover(session, meta) {
+  if (!session || !session.codexConvos) return null;
+  return session.codexConvos.ensureChild(meta);
 }
 
 // Stop a session's subagent watcher and settle its children. finishAll marks
