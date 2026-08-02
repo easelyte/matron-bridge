@@ -123,6 +123,34 @@ describe('TranscriptTail', () => {
     expect(events.map(e => e.n)).toEqual([1, 2]);
   });
 
+  it('preserves a multibyte character split across read chunks', async () => {
+    const prefix = '{"text":"';
+    const padding = 'x'.repeat((64 * 1024) - Buffer.byteLength(prefix) - 1);
+    fs.writeFileSync(file, `${prefix}${padding}€"}\n`);
+    const tail = new TranscriptTail(file, { readFromStart: true });
+    const events = [];
+    tail.on('event', event => events.push(event));
+
+    await tail.start();
+    await tail.stop();
+
+    expect(events).toHaveLength(1);
+    expect(events[0].text).toBe(`${padding}€`);
+  });
+
+  it('keeps retrying a missing initial file for shared read-from-start consumers', async () => {
+    const tail = new TranscriptTail(file, { readFromStart: true, intervalMs: 10 });
+    const events = [];
+    tail.on('event', event => events.push(event));
+
+    await tail.start();
+    fs.writeFileSync(file, '{"type":"late"}\n');
+    await waitFor(() => events.length === 1);
+    await tail.stop();
+
+    expect(events).toEqual([{ type: 'late' }]);
+  });
+
   it('bounds an oversized replay, marks truncation, and preserves terminal events', async () => {
     fs.writeFileSync(file, 'discarded\n{"type":"result","final":true}\n');
     const tail = new TranscriptTail(file, {
@@ -160,7 +188,11 @@ describe('TranscriptTail', () => {
 
   it('rolls back started state when the initial read fails', async () => {
     fs.mkdirSync(file);
-    const tail = new TranscriptTail(file, { readFromStart: true, requireRegularFile: true });
+    const tail = new TranscriptTail(file, {
+      readFromStart: true,
+      requireRegularFile: true,
+      requireInitialFile: true,
+    });
 
     await expect(tail.start()).rejects.toThrow('regular file');
     expect(tail.started).toBe(false);
@@ -174,6 +206,7 @@ describe('TranscriptTail', () => {
     const tail = new TranscriptTail(file, {
       readFromStart: true,
       requireRegularFile: true,
+      requireInitialFile: true,
     });
 
     await expect(tail.start()).rejects.toThrow('symbolic link');

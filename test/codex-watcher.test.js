@@ -80,6 +80,30 @@ describe('CodexWatcher', () => {
     expect(watcher.pollTimer).not.toBeNull();
   });
 
+  it('discovers through polling when native fs.watch is unavailable', async () => {
+    const dir = makeDir();
+    const watchSpy = vi.spyOn(fs, 'watch').mockImplementation(() => {
+      throw new Error('native watch unavailable');
+    });
+    const onDiscover = vi.fn();
+    const watcher = new CodexWatcher({
+      dir,
+      onDiscover,
+      pollIntervalMs: 10,
+      TailClass: FakeTail,
+    });
+    watchers.push(watcher);
+
+    try {
+      await watcher.start();
+      writeMeta(dir, RUN_LATE);
+      await vi.waitFor(() => expect(onDiscover).toHaveBeenCalledOnce());
+      expect(watchSpy).toHaveBeenCalled();
+    } finally {
+      watchSpy.mockRestore();
+    }
+  });
+
   it('holds a discovered meta pending until JSONL exists and tracks live attachment separately', async () => {
     const dir = makeDir();
     const onDiscover = vi.fn();
@@ -166,6 +190,40 @@ describe('CodexWatcher', () => {
     expect(onDiscover).toHaveBeenCalledWith(liveMeta);
     expect(isWrapperAliveFn).toHaveBeenCalledWith(deadMeta);
     expect(isWrapperAliveFn).toHaveBeenCalledWith(liveMeta);
+  });
+
+  it('snapshots terminal runs beyond the first bounded directory batch', async () => {
+    const dir = makeDir();
+    writeMeta(dir, RUN_TERMINAL, { exitCode: 0 });
+    fs.writeFileSync(path.join(dir, `codex-${RUN_TERMINAL}.jsonl`), '{"type":"terminal"}\n');
+    const entries = ['junk', `codex-${RUN_TERMINAL}.jsonl`];
+    const opendirSpy = vi.spyOn(fs, 'opendirSync').mockReturnValue({
+      readSync: vi.fn(() => {
+        const name = entries.shift();
+        return name === undefined ? null : { name };
+      }),
+      closeSync: vi.fn(),
+    });
+    const onDiscover = vi.fn();
+    const watcher = new CodexWatcher({
+      dir,
+      onDiscover,
+      maxMetaScanCount: 1,
+      pollIntervalMs: 60_000,
+      TailClass: FakeTail,
+    });
+    watchers.push(watcher);
+
+    try {
+      await watcher.snapshot();
+    } finally {
+      opendirSpy.mockRestore();
+    }
+    await watcher.scan();
+
+    expect(watcher.seen.has(RUN_TERMINAL)).toBe(true);
+    expect(watcher.tails.has(RUN_TERMINAL)).toBe(false);
+    expect(onDiscover).not.toHaveBeenCalled();
   });
 
   it('rolls back a rejected tail start and retries attachment', async () => {
