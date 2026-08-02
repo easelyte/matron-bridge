@@ -39,7 +39,7 @@ import { promptButtons, promptResponseForButton } from './lib/prompt-buttons.js'
 import { parseOptionReply } from './lib/prompt-reply.js';
 import { sendDelayedPromptAnswer, writePromptAnswer } from './lib/prompt-answer-delivery.js';
 import { SubagentWatcher } from './lib/subagent-watcher.js';
-import { CodexWatcher, createCodexWatcherIsolation } from './lib/codex-watcher.js';
+import { createCodexWatcherIfEnabled, createCodexWatcherIsolation } from './lib/codex-watcher.js';
 import { launchWithCodexSinkEnv } from './lib/codex-paths.js';
 import { createSubagentConvoTracker } from './lib/subagent-convos.js';
 import { createCodexConvoTracker } from './lib/codex-convos.js';
@@ -2666,12 +2666,13 @@ function setupSubagentWatcher(session, workdir, sessionId) {
       isAdmittedRun: runId => session.codexConvos.hasChild(runId),
       log: console,
     });
-    session.codexWatcher = new CodexWatcher({
+    session.codexWatcher = createCodexWatcherIfEnabled({
       workdir,
       sessionId,
       onDiscover: session.codexOnDiscover,
       isolation,
     });
+    session.codexWatcher.start().catch(() => {});
   }
   session.subagentConvos = createSubagentConvoTracker({
     publisher: journalPublisher,

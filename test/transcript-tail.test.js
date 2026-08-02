@@ -122,4 +122,32 @@ describe('TranscriptTail', () => {
     await tail.stop();
     expect(events.map(e => e.n)).toEqual([1, 2]);
   });
+
+  it('rejects an oversized regular file before replaying it', async () => {
+    fs.writeFileSync(file, '{"type":"a"}\n');
+    const tail = new TranscriptTail(file, {
+      readFromStart: true,
+      requireRegularFile: true,
+      maxFileSizeBytes: 4,
+    });
+    const events = [];
+    tail.on('event', event => events.push(event));
+
+    await expect(tail.start()).rejects.toThrow('size limit');
+    await tail.stop();
+    expect(events).toEqual([]);
+  });
+
+  it('rejects a symlink when regular-file enforcement is enabled', async () => {
+    const target = path.join(dir, 'target.jsonl');
+    fs.writeFileSync(target, '{"type":"a"}\n');
+    fs.symlinkSync(target, file);
+    const tail = new TranscriptTail(file, {
+      readFromStart: true,
+      requireRegularFile: true,
+    });
+
+    await expect(tail.start()).rejects.toThrow('symbolic link');
+    await tail.stop();
+  });
 });

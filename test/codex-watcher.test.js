@@ -3,12 +3,17 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { CodexWatcher } from '../lib/codex-watcher.js';
+import {
+  CodexWatcher,
+  DEFAULT_CODEX_TRANSCRIPT_MAX_BYTES,
+  createCodexWatcherIfEnabled,
+} from '../lib/codex-watcher.js';
 
 const RUN_LATE = '1722600000000-1234-abcd';
 const RUN_PENDING = '1722600000001-1234-1234';
 const RUN_TERMINAL = '1722600000002-1234-beef';
 const RUN_LIVE = '1722600000003-1234-cafe';
+const RUN_DEAD = '1722600000004-1234-dead';
 
 function writeMeta(dir, runId, patch = {}) {
   const meta = {
@@ -60,6 +65,7 @@ describe('CodexWatcher', () => {
       TailClass: FakeTail,
     });
     watchers.push(watcher);
+    await watcher.start();
 
     expect(watcher.pollTimer).not.toBeNull();
     writeMeta(dir, RUN_LATE);
@@ -69,7 +75,7 @@ describe('CodexWatcher', () => {
     expect(watcher.pollTimer).not.toBeNull();
   });
 
-  it('holds a discovered meta pending until JSONL exists and marks seen only after attach', () => {
+  it('holds a discovered meta pending until JSONL exists and marks seen only after attach', async () => {
     const dir = makeDir();
     const onDiscover = vi.fn();
     const watcher = new CodexWatcher({
@@ -79,23 +85,24 @@ describe('CodexWatcher', () => {
       TailClass: FakeTail,
     });
     watchers.push(watcher);
+    await watcher.start();
     const meta = writeMeta(dir, RUN_PENDING);
 
-    watcher.scan();
+    await watcher.scan();
 
     expect(onDiscover).toHaveBeenCalledWith(meta);
     expect(watcher.pending.has(RUN_PENDING)).toBe(true);
     expect(watcher.seen.has(RUN_PENDING)).toBe(false);
 
     fs.writeFileSync(path.join(dir, `codex-${RUN_PENDING}.jsonl`), '{"type":"thread.started"}\n');
-    watcher.scan();
+    await watcher.scan();
 
     expect(watcher.pending.has(RUN_PENDING)).toBe(false);
     expect(watcher.seen.has(RUN_PENDING)).toBe(true);
     expect(watcher.tails.get(RUN_PENDING)?.started).toBe(true);
   });
 
-  it('retries discovery when the child handoff fails open', () => {
+  it('retries discovery when the child handoff fails open', async () => {
     const dir = makeDir();
     const onDiscover = vi.fn()
       .mockReturnValueOnce(null)
@@ -107,20 +114,23 @@ describe('CodexWatcher', () => {
       TailClass: FakeTail,
     });
     watchers.push(watcher);
+    await watcher.start();
     writeMeta(dir, RUN_PENDING);
 
-    watcher.scan();
+    await watcher.scan();
     expect(watcher.pending.has(RUN_PENDING)).toBe(false);
 
-    watcher.scan();
+    await watcher.scan();
     expect(onDiscover).toHaveBeenCalledTimes(2);
     expect(watcher.pending.has(RUN_PENDING)).toBe(true);
   });
 
-  it('snapshots terminal JSONL as seen but attaches and resumes a live JSONL', () => {
+  it('replays a live snapshot after listeners are registered and skips both terminal branches', async () => {
     const dir = makeDir();
     writeMeta(dir, RUN_TERMINAL, { exitCode: 0 });
     fs.writeFileSync(path.join(dir, `codex-${RUN_TERMINAL}.jsonl`), '{"type":"terminal"}\n');
+    const deadMeta = writeMeta(dir, RUN_DEAD);
+    fs.writeFileSync(path.join(dir, `codex-${RUN_DEAD}.jsonl`), '{"type":"dead"}\n');
     const liveMeta = writeMeta(dir, RUN_LIVE, { wrapperStartTicks: 'matching' });
     fs.writeFileSync(path.join(dir, `codex-${RUN_LIVE}.jsonl`), '{"type":"live"}\n');
     const onDiscover = vi.fn();
@@ -131,28 +141,130 @@ describe('CodexWatcher', () => {
       onDiscover,
       isWrapperAliveFn,
       pollIntervalMs: 60_000,
-      TailClass: FakeTail,
     });
     watchers.push(watcher);
+    const replayed = [];
+    watcher.on('codex-event', payload => replayed.push(payload));
+
+    expect(replayed).toEqual([]);
+    await watcher.start();
 
     expect(watcher.seen.has(RUN_TERMINAL)).toBe(true);
     expect(watcher.tails.has(RUN_TERMINAL)).toBe(false);
+    expect(watcher.seen.has(RUN_DEAD)).toBe(true);
+    expect(watcher.tails.has(RUN_DEAD)).toBe(false);
     expect(watcher.seen.has(RUN_LIVE)).toBe(true);
-    expect(watcher.tails.get(RUN_LIVE)).toMatchObject({
-      started: true,
-      options: { readFromStart: true },
-    });
+    expect(replayed).toEqual([{ runId: RUN_LIVE, meta: liveMeta, event: { type: 'live' } }]);
     expect(onDiscover).toHaveBeenCalledTimes(1);
     expect(onDiscover).toHaveBeenCalledWith(liveMeta);
+    expect(isWrapperAliveFn).toHaveBeenCalledWith(deadMeta);
     expect(isWrapperAliveFn).toHaveBeenCalledWith(liveMeta);
+  });
+
+  it('rolls back a rejected tail start and retries attachment', async () => {
+    const dir = makeDir();
+    writeMeta(dir, RUN_PENDING);
+    fs.writeFileSync(path.join(dir, `codex-${RUN_PENDING}.jsonl`), '{"type":"live"}\n');
+    let attempts = 0;
+    class RetryTail extends FakeTail {
+      async start() {
+        attempts += 1;
+        if (attempts <= 2) throw new Error('open failed');
+        this.started = true;
+      }
+    }
+    const watcher = new CodexWatcher({
+      dir,
+      pollIntervalMs: 60_000,
+      TailClass: RetryTail,
+      isWrapperAliveFn: () => true,
+    });
+    watchers.push(watcher);
+
+    await watcher.start();
+    expect(watcher.pending.has(RUN_PENDING)).toBe(true);
+    expect(watcher.seen.has(RUN_PENDING)).toBe(false);
+    expect(watcher.tails.has(RUN_PENDING)).toBe(false);
+
+    await watcher.scan();
+    expect(attempts).toBe(3);
+    expect(watcher.pending.has(RUN_PENDING)).toBe(false);
+    expect(watcher.seen.has(RUN_PENDING)).toBe(true);
+  });
+
+  it('does not commit an attachment that finishes after stop', async () => {
+    const dir = makeDir();
+    writeMeta(dir, RUN_PENDING);
+    fs.writeFileSync(path.join(dir, `codex-${RUN_PENDING}.jsonl`), '{"type":"live"}\n');
+    let releaseStart;
+    const startGate = new Promise(resolve => { releaseStart = resolve; });
+    const instances = [];
+    class DelayedTail extends FakeTail {
+      constructor(...args) {
+        super(...args);
+        instances.push(this);
+      }
+      async start() {
+        await startGate;
+        this.started = true;
+      }
+    }
+    const watcher = new CodexWatcher({
+      dir,
+      pollIntervalMs: 60_000,
+      TailClass: DelayedTail,
+      isWrapperAliveFn: () => true,
+    });
+    const starting = watcher.start();
+    await vi.waitFor(() => expect(instances).toHaveLength(1));
+    const stopping = watcher.stop();
+    releaseStart();
+    await Promise.all([starting, stopping]);
+
+    expect(instances[0].started).toBe(false);
+    expect(watcher.tails.size).toBe(0);
+    expect(watcher.seen.has(RUN_PENDING)).toBe(false);
+    expect(await watcher.scan()).toBeUndefined();
+  });
+
+  it('rejects symlinked, non-regular, and oversized transcript sinks', async () => {
+    const dir = makeDir();
+    const symlinkRun = RUN_PENDING;
+    const fifoRun = RUN_LATE;
+    const largeRun = RUN_LIVE;
+    for (const runId of [symlinkRun, fifoRun, largeRun]) writeMeta(dir, runId);
+    const target = path.join(dir, 'target.jsonl');
+    fs.writeFileSync(target, '{"type":"forged"}\n');
+    fs.symlinkSync(target, path.join(dir, `codex-${symlinkRun}.jsonl`));
+    fs.mkdirSync(path.join(dir, `codex-${fifoRun}.jsonl`));
+    const largePath = path.join(dir, `codex-${largeRun}.jsonl`);
+    fs.closeSync(fs.openSync(largePath, 'w'));
+    fs.truncateSync(largePath, DEFAULT_CODEX_TRANSCRIPT_MAX_BYTES + 1);
+    const watcher = new CodexWatcher({
+      dir,
+      pollIntervalMs: 60_000,
+      TailClass: FakeTail,
+      isWrapperAliveFn: () => true,
+    });
+    watchers.push(watcher);
+
+    await watcher.start();
+
+    expect(watcher.tails.size).toBe(0);
+    expect([...watcher.pending.keys()].sort()).toEqual([largeRun, fifoRun, symlinkRun].sort());
   });
 });
 
 describe('bridge watcher wiring', () => {
-  it('constructs the per-session watcher only when Codex visualization is enabled', () => {
-    const source = fs.readFileSync(new URL('../index.js', import.meta.url), 'utf8');
+  it('does not construct a watcher when Codex visualization is disabled', () => {
+    const WatcherClass = vi.fn();
 
-    expect(source).toContain("import { CodexWatcher");
-    expect(source).toMatch(/if \(process\.env\.MATRON_CODEX_VIZ !== '0'\) \{[\s\S]*?new CodexWatcher\(\{/);
+    const watcher = createCodexWatcherIfEnabled(
+      { dir: '/unused' },
+      { env: { MATRON_CODEX_VIZ: '0' }, WatcherClass },
+    );
+
+    expect(watcher).toBeNull();
+    expect(WatcherClass).not.toHaveBeenCalled();
   });
 });
