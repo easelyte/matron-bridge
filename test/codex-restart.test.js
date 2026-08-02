@@ -7,7 +7,7 @@ import { createCodexConvoTracker } from '../lib/codex-convos.js';
 import {
   CodexWatcher,
   createCodexWatcherIsolation,
-  startCodexWatcherIfEnabled,
+  registerCodexWatcherForSession,
 } from '../lib/codex-watcher.js';
 
 const RUN_INTERRUPTED = '1722600000000-1234-abcd';
@@ -81,6 +81,7 @@ function makeWatcher(dir, { onDiscover } = {}) {
   const discover = onDiscover ?? (meta => tracker.ensureChild(meta));
   const watcher = new CodexWatcher({
     dir,
+    sessionId: 'session-1',
     onDiscover: discover,
     isolation,
     isWrapperAliveFn: () => true,
@@ -97,9 +98,9 @@ describe('Codex restart reconciliation', () => {
     writeRun(dir, RUN_INTERRUPTED);
     writeRun(dir, RUN_FINISHED, { exitCode: 0 });
     const { calls, tracker, watcher } = makeWatcher(dir);
-    const session = { id: 'session-1' };
+    const session = { claudeSessionId: 'session-1' };
 
-    expect(watcher.reconcile(session)).toBe(true);
+    await expect(watcher.reconcile(session)).resolves.toBe(true);
     await watcher.start();
 
     expect(tracker.childFor(RUN_INTERRUPTED)).toMatchObject({
@@ -107,22 +108,29 @@ describe('Codex restart reconciliation', () => {
       terminal: true,
       outcome: 'interrupted',
     });
-    expect(tracker.childFor(RUN_FINISHED)).toBeNull();
+    expect(tracker.childFor(RUN_FINISHED)).toMatchObject({
+      state: 'done',
+      terminal: true,
+      outcome: 'completed',
+    });
     expect(calls.map(call => call.options)).toEqual([
       expect.objectContaining({ sessionState: 'running' }),
       expect.objectContaining({ sessionState: 'done', sessionOutcome: 'interrupted' }),
+      expect.objectContaining({ sessionState: 'running' }),
+      expect.objectContaining({ sessionState: 'done', sessionOutcome: 'completed' }),
     ]);
     expect(watcher.seen.has(RUN_INTERRUPTED)).toBe(true);
     expect(watcher.seen.has(RUN_FINISHED)).toBe(true);
     expect(FakeTail.starts).toEqual([]);
   });
 
-  it('runs for a session registered after boot and before watcher startup', async () => {
+  it('runs the production registration hook for a session added after boot and before watcher startup', async () => {
     const dir = makeDir();
     writeRun(dir, RUN_INTERRUPTED);
     const liveSessions = new Map();
     const { tracker, watcher } = makeWatcher(dir);
-    const session = { id: 'late-session' };
+    watcher.sessionId = 'late-session';
+    const session = { claudeSessionId: 'late-session' };
     const order = [];
     const reconcile = vi.spyOn(watcher, 'reconcile').mockImplementation(value => {
       order.push('reconcile');
@@ -137,20 +145,74 @@ describe('Codex restart reconciliation', () => {
     }
 
     expect(liveSessions.size).toBe(0);
-    const registered = startCodexWatcherIfEnabled({}, {
-      WatcherClass: ExistingWatcher,
-      beforeStart: current => current.reconcile(session),
-    });
+    await Promise.resolve(); // bridge boot completes before this session appears
     liveSessions.set('late', session);
+    const registered = registerCodexWatcherForSession(session, {}, {
+      WatcherClass: ExistingWatcher,
+    });
     await vi.waitFor(() => expect(start).toHaveBeenCalledOnce());
 
     expect(registered).toBe(watcher);
     expect(reconcile).toHaveBeenCalledWith(session);
     expect(order.slice(0, 2)).toEqual(['reconcile', 'start']);
     expect(tracker.childFor(RUN_INTERRUPTED)?.outcome).toBe('interrupted');
+
+    const indexSource = fs.readFileSync(new URL('../index.js', import.meta.url), 'utf8');
+    const setupStart = indexSource.indexOf('function setupSubagentWatcher(');
+    const setupEnd = indexSource.indexOf('\nfunction ', setupStart + 1);
+    expect(indexSource.slice(setupStart, setupEnd)).toContain(
+      'registerCodexWatcherForSession(session',
+    );
   });
 
-  it('isolates a malformed old run and continues reconciling siblings', () => {
+  it('leaves a transient discovery failure unseen so reconciliation can retry it', async () => {
+    const dir = makeDir();
+    writeRun(dir, RUN_INTERRUPTED);
+    let attempts = 0;
+    const harness = makeWatcher(dir, {
+      onDiscover: meta => {
+        attempts += 1;
+        return attempts === 1 ? null : harness.tracker.ensureChild(meta);
+      },
+    });
+    const session = { claudeSessionId: 'session-1' };
+
+    await harness.watcher.reconcile(session);
+    expect(harness.watcher.seen.has(RUN_INTERRUPTED)).toBe(false);
+    expect(harness.tracker.childFor(RUN_INTERRUPTED)).toBeNull();
+
+    await harness.watcher.start();
+    expect(harness.watcher.seen.has(RUN_INTERRUPTED)).toBe(true);
+    expect(harness.tracker.childFor(RUN_INTERRUPTED)?.outcome).toBe('interrupted');
+    expect(FakeTail.starts).toEqual([]);
+  });
+
+  it('yields between bounded reconciliation batches', async () => {
+    const dir = makeDir();
+    writeRun(dir, RUN_INTERRUPTED);
+    writeRun(dir, RUN_MALFORMED);
+    const { watcher } = makeWatcher(dir);
+    watcher.maxMetaScanCount = 1;
+    const session = { claudeSessionId: 'session-1' };
+    let yielded = false;
+    setImmediate(() => { yielded = true; });
+
+    await watcher.reconcile(session);
+
+    expect(yielded).toBe(true);
+  });
+
+  it('rejects reconciliation for a different session identity', async () => {
+    const dir = makeDir();
+    writeRun(dir, RUN_INTERRUPTED);
+    const { tracker, watcher } = makeWatcher(dir);
+
+    expect(watcher.reconcile({ claudeSessionId: 'session-2' })).toBe(false);
+    expect(tracker.childFor(RUN_INTERRUPTED)).toBeNull();
+    expect(watcher.seen.has(RUN_INTERRUPTED)).toBe(false);
+  });
+
+  it('isolates a malformed old run and continues reconciling siblings', async () => {
     const dir = makeDir();
     writeRun(dir, RUN_MALFORMED);
     writeRun(dir, RUN_INTERRUPTED);
@@ -162,7 +224,7 @@ describe('Codex restart reconciliation', () => {
     const harness = makeWatcher(dir, { onDiscover });
     tracker = harness.tracker;
 
-    expect(() => harness.watcher.reconcile({ id: 'session-1' })).not.toThrow();
+    await expect(harness.watcher.reconcile({ claudeSessionId: 'session-1' })).resolves.toBe(true);
     expect(tracker.childFor(RUN_MALFORMED)).toBeNull();
     expect(tracker.childFor(RUN_INTERRUPTED)?.outcome).toBe('interrupted');
   });

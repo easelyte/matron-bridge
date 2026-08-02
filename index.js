@@ -39,7 +39,7 @@ import { promptButtons, promptResponseForButton } from './lib/prompt-buttons.js'
 import { parseOptionReply } from './lib/prompt-reply.js';
 import { sendDelayedPromptAnswer, writePromptAnswer } from './lib/prompt-answer-delivery.js';
 import { SubagentWatcher } from './lib/subagent-watcher.js';
-import { createCodexWatcherIsolation, startCodexWatcherIfEnabled } from './lib/codex-watcher.js';
+import { createCodexWatcherIsolation, registerCodexWatcherForSession } from './lib/codex-watcher.js';
 import { launchWithCodexSinkEnv } from './lib/codex-paths.js';
 import { createSubagentConvoTracker } from './lib/subagent-convos.js';
 import { createCodexConvoTracker } from './lib/codex-convos.js';
@@ -2668,13 +2668,12 @@ function setupSubagentWatcher(session, workdir, sessionId) {
       isAdmittedRun: runId => session.codexConvos.hasChild(runId),
       log: console,
     });
-    session.codexWatcher = startCodexWatcherIfEnabled({
+    session.codexWatcher = registerCodexWatcherForSession(session, {
       workdir,
       sessionId,
       onDiscover: session.codexOnDiscover,
       isolation,
     }, {
-      beforeStart: watcher => watcher.reconcile(session),
       onFailure: (_error, failedWatcher) => {
         if (session.codexWatcher === failedWatcher) session.codexWatcher = null;
         Promise.resolve(failedWatcher?.stop?.()).catch(() => {});
