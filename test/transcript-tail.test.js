@@ -186,6 +186,28 @@ describe('TranscriptTail', () => {
     expect(events).toEqual([{ type: 'result', final: true }]);
   });
 
+  it('stops after a cumulative byte budget across repeated sub-cap appends', async () => {
+    fs.writeFileSync(file, '');
+    const tail = new TranscriptTail(file, {
+      intervalMs: 10,
+      maxFileSizeBytes: 32,
+      maxTotalBytes: 25,
+    });
+    const limits = [];
+    tail.on('resourceLimit', error => limits.push(error));
+    await tail.start();
+
+    fs.appendFileSync(file, '{"n":1}\n{"n":2}\n');
+    await waitFor(() => tail.totalBytesRead >= 16);
+    fs.appendFileSync(file, '{"n":3}\n{"n":4}\n');
+    await waitFor(() => limits.length === 1);
+
+    expect(limits[0]).toMatchObject({ code: 'TRANSCRIPT_RESOURCE_LIMIT', resource: 'bytes' });
+    expect(tail.totalBytesRead).toBe(25);
+    expect(tail.started).toBe(false);
+    expect(tail.timer).toBeNull();
+  });
+
   it('rolls back started state when the initial read fails', async () => {
     fs.mkdirSync(file);
     const tail = new TranscriptTail(file, {
