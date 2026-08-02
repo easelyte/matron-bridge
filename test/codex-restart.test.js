@@ -266,6 +266,43 @@ describe('Codex restart reconciliation', () => {
     expect(harness.watcher.seen.has(RUN_INTERRUPTED)).toBe(true);
   });
 
+  it('clears reconciliation after an attached run survives a sibling retry, then watchdogs it', async () => {
+    const dir = makeDir();
+    writeRun(dir, RUN_INTERRUPTED);
+    writeRun(dir, RUN_FAILED, { exitCode: 1 });
+    const alive = new Set([RUN_INTERRUPTED]);
+    let terminalAttempts = 0;
+    let harness;
+    harness = makeWatcher(dir, {
+      isWrapperAliveFn: meta => alive.has(meta.runId),
+      onReconcile: (runId, outcome) => {
+        if (runId === RUN_FAILED && terminalAttempts++ === 0) {
+          throw new Error('transient terminalization failure');
+        }
+        return harness.tracker.terminalizeByRunId(runId, outcome);
+      },
+      breakerThreshold: 3,
+    });
+
+    await expect(harness.watcher.reconcile({ claudeSessionId: 'session-1' })).resolves.toBe(false);
+    expect(harness.watcher.attached.has(RUN_INTERRUPTED)).toBe(true);
+    expect(harness.watcher.reconciliationRequired).toBe(true);
+
+    await expect(harness.watcher._retryReconciliation()).resolves.toBe(true);
+    expect(harness.watcher.reconciliationRequired).toBe(false);
+    expect(harness.watcher.attached.has(RUN_INTERRUPTED)).toBe(true);
+
+    alive.delete(RUN_INTERRUPTED);
+    await harness.watcher.watchdogTick();
+
+    expect(harness.watcher.seen.has(RUN_INTERRUPTED)).toBe(true);
+    expect(harness.watcher.attached.has(RUN_INTERRUPTED)).toBe(false);
+    expect(harness.calls).toContainEqual(expect.objectContaining({
+      convoId: `parent-1:codex:${RUN_INTERRUPTED}`,
+      options: expect.objectContaining({ sessionState: 'done', sessionOutcome: 'interrupted' }),
+    }));
+  });
+
   it('yields between bounded reconciliation batches', async () => {
     const dir = makeDir();
     writeRun(dir, RUN_INTERRUPTED);

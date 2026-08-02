@@ -363,6 +363,21 @@ describe('publish-side Codex redaction', () => {
       claudeSessionId: 'session-1',
       journalConvoId: 'parent',
     };
+    writeFileSync(path.join(dir, `codex-${RUN_ID}.meta.json`), JSON.stringify({
+      runId: RUN_ID,
+      wrapperPid: process.pid,
+      wrapperStartTicks: 'test',
+      deadlineTs: Date.now() + 60_000,
+      schemaVersion: SCHEMA_VERSION,
+    }));
+    writeFileSync(
+      path.join(dir, `codex-${RUN_ID}.jsonl`),
+      [
+        commandEvent('printf replay', 'API_TOKEN=replayed-secret'),
+        { type: 'item.completed', item: { id: 'answer-1', type: 'agent_message', text: 'replayed final answer' } },
+        { type: 'turn.completed' },
+      ].map(event => JSON.stringify(event)).join('\n') + '\n',
+    );
     const watcher = setupCodexWatcherForSession(liveSession, dir, 'session-1', {
       publisher,
       liveSessions: new Map([['room-1', liveSession]]),
@@ -379,22 +394,19 @@ describe('publish-side Codex redaction', () => {
       expect(liveSession.codexWatcherIsolation).toBeDefined();
       expect(watcher.isolation).toBe(liveSession.codexWatcherIsolation);
       await vi.waitFor(() => expect(watcher.started).toBe(true));
-      writeFileSync(path.join(dir, `codex-${RUN_ID}.meta.json`), JSON.stringify({
-        runId: RUN_ID,
-        wrapperPid: process.pid,
-        wrapperStartTicks: 'test',
-        deadlineTs: Date.now() + 60_000,
-        schemaVersion: SCHEMA_VERSION,
-      }));
-      writeFileSync(
-        path.join(dir, `codex-${RUN_ID}.jsonl`),
-        `${JSON.stringify(commandEvent('printf replay', 'API_TOKEN=replayed-secret'))}\n`,
-      );
-      await watcher.scan();
+      await vi.waitFor(() => {
+        expect(publisher.calls.some(call => call.method === 'publishToolOutput')).toBe(true);
+        expect(publisher.calls.some(call => call.method === 'publishText')).toBe(true);
+      });
       const replayCall = publisher.calls.find(call => call.method === 'publishToolOutput');
       expect(replayCall.payload.output).not.toContain('replayed-secret');
       expect(replayCall.payload.output).toContain('[REDACTED:secret-key:');
       expect(replayCall.convoId).toBe(`parent:codex:${RUN_ID}`);
+      expect(publisher.calls).toContainEqual(expect.objectContaining({
+        method: 'publishText',
+        convoId: `parent:codex:${RUN_ID}`,
+        payload: expect.objectContaining({ body: 'replayed final answer' }),
+      }));
 
       const transcript = path.join(dir, `codex-${RUN_ID}.jsonl`);
       writeFileSync(transcript, `${JSON.stringify(commandEvent('printf live', 'COOKIE=live-secret'))}\n`, {

@@ -31,6 +31,22 @@ redaction cannot decide that an arbitrary value is secret: a secret under a
 non-secret-looking key whose value matches no configured pattern may pass and
 must not be printed into agent output.
 
+### Accepted single-principal residual
+
+The live-view sidecar directory is writable by the Codex wrapper and therefore
+by a shell-capable descendant. Such a descendant can forge a matching metadata
+file and JSONL transcript that the journal presents as a Codex run. Shape and
+PID-liveness validation, together with the 64-child limit, bound malformed data
+and volume but do not establish provenance.
+
+This is accepted only for the current single-principal deployment, where the
+operator's own trusted sessions share the principal. It follows the P67 trust
+model and the accepted `show_file` token-isolation residual from #458: forgery
+within the operator's own journal is not a new cross-principal capability.
+Out-of-band, bridge-stamped run registration through a mediator that descendants
+cannot forge is a hard prerequisite before any multi-principal or curated-toolset
+(Nastia) deployment. The current bridge does not claim that provenance.
+
 ## Install and authenticate
 
 Install Codex globally, then authenticate it as the same OS user that launches matron-bridge:
