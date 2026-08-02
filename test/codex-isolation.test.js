@@ -19,9 +19,13 @@ function runId(index) {
 function makeHarness(sessionId = 'session-1', options = {}) {
   const calls = { upsertConvo: [], publishText: [] };
   const publisher = {
-    upsertConvo(convoId, opts) { calls.upsertConvo.push({ convoId, opts }); },
+    upsertConvo(convoId, opts) {
+      calls.upsertConvo.push({ convoId, opts });
+      return true;
+    },
     publishText(convoId, payload, publishOptions) {
       calls.publishText.push({ convoId, payload, options: publishOptions });
+      return true;
     },
   };
   const tracker = createCodexConvoTracker({
@@ -125,8 +129,9 @@ describe('codex watcher isolation', () => {
       publishText(convoId, payload, options) {
         publishAttempts += 1;
         attemptedOptions.push(options);
-        if (publishAttempts === 1) throw new Error('journal unavailable');
+        if (publishAttempts === 1) return false;
         successfulNotes.push({ convoId, payload, options });
+        return true;
       },
     };
     const isolation = createCodexWatcherIsolation({
@@ -162,7 +167,7 @@ describe('codex watcher isolation', () => {
     let isolation;
     isolation = createCodexWatcherIsolation({
       sessionId: 'ordered-breaker',
-      publisher: { publishText() { order.push('note'); } },
+      publisher: { publishText() { order.push('note'); return true; } },
       getParentConvoId: () => 'parent-ordered-breaker',
       terminalizeAll() {
         order.push(`terminalize-all-disabled-${isolation.isDisabled()}`);
@@ -206,10 +211,11 @@ describe('codex watcher isolation', () => {
       upsertConvo(_convoId, opts) {
         if (opts.sessionOutcome === 'completed' && failCompletedUpsert) {
           failCompletedUpsert = false;
-          throw new Error('journal unavailable');
+          return false;
         }
+        return true;
       },
-      publishText() {},
+      publishText() { return true; },
     };
     const tracker = createCodexConvoTracker({
       publisher,
@@ -423,10 +429,11 @@ describe('codex watcher isolation', () => {
         calls.push({ convoId, opts });
         if (opts.sessionOutcome && failTerminalUpsert) {
           failTerminalUpsert = false;
-          throw new Error('journal unavailable');
+          return false;
         }
+        return true;
       },
-      publishText() {},
+      publishText() { return true; },
     };
     const tracker = createCodexConvoTracker({
       publisher,
@@ -465,7 +472,7 @@ describe('codex watcher isolation', () => {
   });
 
   it('retries terminal audit independently after terminalization succeeds', () => {
-    const publisher = { upsertConvo() {}, publishText() {} };
+    const publisher = { upsertConvo() { return true; }, publishText() { return true; } };
     const tracker = createCodexConvoTracker({
       publisher,
       getParentConvoId: () => 'parent-audit-retry',
@@ -532,9 +539,9 @@ describe('per-session codex child creation cap', () => {
   it('does not consume capacity when child publication fails', () => {
     const publisher = {
       upsertConvo: vi.fn()
-        .mockImplementationOnce(() => { throw new Error('offline'); })
-        .mockImplementation(() => {}),
-      publishText() {},
+        .mockImplementationOnce(() => false)
+        .mockImplementation(() => true),
+      publishText() { return true; },
     };
     const tracker = createCodexConvoTracker({
       publisher,
@@ -553,10 +560,10 @@ describe('per-session codex child creation cap', () => {
     const publishText = vi.fn((_convoId, _payload, options) => {
       publishAttempts += 1;
       attemptedOptions.push(options);
-      if (publishAttempts === 1) throw new Error('journal unavailable');
+      return publishAttempts !== 1;
     });
     const tracker = createCodexConvoTracker({
-      publisher: { upsertConvo() {}, publishText },
+      publisher: { upsertConvo() { return true; }, publishText },
       getParentConvoId: () => 'parent',
       maxChildren: 0,
       log: { warn() {} },
@@ -568,7 +575,7 @@ describe('per-session codex child creation cap', () => {
       log: { info() {}, warn() {} },
     });
 
-    expect(tracker.ensureChild({ runId: RUN_1 })).toBeNull();
+    expect(tracker.ensureChild({ runId: RUN_1 })).toBe(false);
     expect(tracker.hasPendingCapNote()).toBe(true);
 
     isolation.retryPending();

@@ -212,4 +212,15 @@ describe('TranscriptTail', () => {
     await expect(tail.start()).rejects.toThrow('symbolic link');
     await tail.stop();
   });
+
+  it('resolves drain failures as explicit error results', async () => {
+    const tail = new TranscriptTail(file, {
+      requireRegularFile: true,
+      requireInitialFile: true,
+    });
+
+    const result = await tail.drain({ windowMs: 0 });
+
+    expect(result).toMatchObject({ ok: false, error: expect.any(Error) });
+  });
 });

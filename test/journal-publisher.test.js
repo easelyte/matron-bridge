@@ -675,7 +675,33 @@ describe('createJournalPublisher', () => {
       log: silentLog,
       WebSocketImpl: DormantTransport,
     });
-    expect(() => pub.publishText('c1', { body: 'hi', from: 'user' }, null)).not.toThrow();
+    expect(pub.publishText('c1', { body: 'hi', from: 'user' }, null)).toBe(true);
+    pub.close();
+  });
+
+  it('reports enqueue preparation failures without throwing', () => {
+    class DormantTransport extends EventEmitter {
+      constructor() {
+        super();
+        this.readyState = 0;
+      }
+      terminate() { this.readyState = 3; }
+    }
+    const pub = createJournalPublisher({
+      url: 'ws://journal.test/ws',
+      token: 'tok',
+      log: silentLog,
+      WebSocketImpl: DormantTransport,
+    });
+    const throwingOptions = Object.defineProperty({}, 'idemKey', {
+      get() { throw null; },
+    });
+    const throwingConvo = Object.defineProperty({}, 'title', {
+      get() { throw new Error('metadata unavailable'); },
+    });
+
+    expect(pub.publishText('c1', { body: 'hi', from: 'user' }, throwingOptions)).toBe(false);
+    expect(pub.upsertConvo('c1', throwingConvo)).toBe(false);
     pub.close();
   });
 

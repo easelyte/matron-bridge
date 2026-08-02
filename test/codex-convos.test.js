@@ -14,7 +14,10 @@ function makePublisher() {
   const calls = { upsertConvo: [] };
   return {
     calls,
-    upsertConvo(convoId, opts) { calls.upsertConvo.push({ convoId, opts }); },
+    upsertConvo(convoId, opts) {
+      calls.upsertConvo.push({ convoId, opts });
+      return true;
+    },
   };
 }
 
@@ -112,6 +115,7 @@ describe('createCodexConvoTracker', () => {
       publisher: {
         upsertConvo() {
           if (throwOnPublish) throw 'journal unavailable';
+          return true;
         },
       },
       getParentConvoId: () => 'parent-uuid',
@@ -128,8 +132,8 @@ describe('createCodexConvoTracker', () => {
     const upsertConvo = recoveringPublisher.upsertConvo;
     recoveringPublisher.upsertConvo = (...args) => {
       attempts += 1;
-      if (attempts === 1) throw new Error('journal unavailable');
-      upsertConvo(...args);
+      if (attempts === 1) return false;
+      return upsertConvo(...args);
     };
     const recovering = createCodexConvoTracker({
       publisher: recoveringPublisher,
@@ -159,8 +163,8 @@ describe('createCodexConvoTracker', () => {
     recoveringPublisher.calls.upsertConvo.length = 0;
     recoveringPublisher.upsertConvo = (...args) => {
       terminalAttempts += 1;
-      if (terminalAttempts === 1) throw new Error('journal unavailable');
-      upsertConvo(...args);
+      if (terminalAttempts === 1) return false;
+      return upsertConvo(...args);
     };
 
     recovering.terminalize(RUN_2, 'failed');

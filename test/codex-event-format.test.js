@@ -30,6 +30,7 @@ function makeContext(overrides = {}) {
     publishText(convoId, payload, options) {
       const args = options === undefined ? [convoId, payload] : [convoId, payload, options];
       record('publishText', args);
+      return true;
     },
     publishStatus(convoId, status) { record('publishStatus', [convoId, status]); },
   };
