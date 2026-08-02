@@ -15,6 +15,9 @@ class DeploySkewWebSocket extends EventEmitter {
   static instances = [];
   static upgraded = false;
   static conversations = new Map();
+  static delayCallbacks = false;
+  static pendingCallbacks = [];
+  static frames = [];
 
   constructor() {
     super();
@@ -25,6 +28,7 @@ class DeploySkewWebSocket extends EventEmitter {
 
   send(data, callback) {
     const frame = JSON.parse(data);
+    DeploySkewWebSocket.frames.push(frame);
     if (frame.op === 'hello') {
       queueMicrotask(() => this.emit('message', JSON.stringify({ op: 'hello_ok' })));
     } else if (frame.op === 'convo_upsert') {
@@ -36,7 +40,13 @@ class DeploySkewWebSocket extends EventEmitter {
           : null,
       });
     }
-    callback?.();
+    if (callback) {
+      if (DeploySkewWebSocket.delayCallbacks && frame.op !== 'hello') {
+        DeploySkewWebSocket.pendingCallbacks.push(callback);
+      } else {
+        callback();
+      }
+    }
   }
 
   close() {
@@ -63,6 +73,9 @@ describe('Codex outcome deploy-skew repair', () => {
     DeploySkewWebSocket.instances.length = 0;
     DeploySkewWebSocket.upgraded = false;
     DeploySkewWebSocket.conversations.clear();
+    DeploySkewWebSocket.delayCallbacks = false;
+    DeploySkewWebSocket.pendingCallbacks.length = 0;
+    DeploySkewWebSocket.frames.length = 0;
 
     let publisher;
     let tracker;
@@ -120,6 +133,81 @@ describe('Codex outcome deploy-skew repair', () => {
     expect(DeploySkewWebSocket.conversations.get(RUNNING_CHILD_ID)).toEqual({
       sessionState: 'running',
       sessionOutcome: null,
+    });
+
+    publisher.close();
+  });
+
+  it('defers reconnect repairs behind a full queue without evicting backlog frames', async () => {
+    DeploySkewWebSocket.instances.length = 0;
+    DeploySkewWebSocket.upgraded = false;
+    DeploySkewWebSocket.conversations.clear();
+    DeploySkewWebSocket.delayCallbacks = false;
+    DeploySkewWebSocket.pendingCallbacks.length = 0;
+    DeploySkewWebSocket.frames.length = 0;
+
+    let publisher;
+    let tracker;
+    const isolation = {
+      guardSession(_label, fn) { fn(); },
+    };
+    publisher = createJournalPublisher({
+      url: 'ws://journal.test/ws',
+      token: 'test-token',
+      log: { warn() {}, info() {} },
+      queueLimit: 3,
+      backoffBaseMs: 1,
+      backoffCapMs: 1,
+      keepaliveIntervalMs: 0,
+      WebSocketImpl: DeploySkewWebSocket,
+      onReconnect: () => journalReemitCodexOutcomes({
+        sessions: new Map([['session-1', {
+          codexConvos: tracker,
+          codexWatcherIsolation: isolation,
+        }]]),
+        publisher,
+      }),
+    });
+    tracker = createCodexConvoTracker({
+      sessionId: 'session-1',
+      publisher,
+      getParentConvoId: () => PARENT_ID,
+      log: { warn() {} },
+    });
+
+    await waitFor(() => DeploySkewWebSocket.instances.length === 1);
+    tracker.ensureChild({ runId: RUN_ID });
+    tracker.terminalize(RUN_ID, 'completed');
+    await waitFor(() => DeploySkewWebSocket.conversations.get(CHILD_ID)?.sessionState === 'done');
+
+    DeploySkewWebSocket.upgraded = true;
+    DeploySkewWebSocket.instances[0].close();
+    publisher.publishText('backlog-1', { body: 'one' });
+    publisher.publishText('backlog-2', { body: 'two' });
+    publisher.publishText('backlog-3', { body: 'three' });
+    DeploySkewWebSocket.delayCallbacks = true;
+
+    await waitFor(() => DeploySkewWebSocket.instances.length === 2);
+    await waitFor(() => DeploySkewWebSocket.pendingCallbacks.length === 3);
+    const secondEpochFrames = DeploySkewWebSocket.frames.filter(frame =>
+      frame.op !== 'hello' && frame.convo_id !== CHILD_ID
+    );
+    expect(secondEpochFrames.slice(-3).map(frame => frame.convo_id)).toEqual([
+      'backlog-1',
+      'backlog-2',
+      'backlog-3',
+    ]);
+    expect(DeploySkewWebSocket.conversations.get(CHILD_ID)?.sessionOutcome).toBeNull();
+
+    for (const callback of DeploySkewWebSocket.pendingCallbacks.splice(0)) callback();
+    DeploySkewWebSocket.delayCallbacks = false;
+    DeploySkewWebSocket.instances[1].close();
+
+    await waitFor(() => DeploySkewWebSocket.instances.length === 3);
+    await waitFor(() => DeploySkewWebSocket.conversations.get(CHILD_ID)?.sessionOutcome === 'completed');
+    expect(DeploySkewWebSocket.conversations.get(CHILD_ID)).toEqual({
+      sessionState: 'done',
+      sessionOutcome: 'completed',
     });
 
     publisher.close();
