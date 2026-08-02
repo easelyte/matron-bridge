@@ -17,6 +17,7 @@ function makeContext() {
       },
       convoId: 'parent:codex:backpressure-run',
       meta: { schemaVersion: PINNED_SCHEMA_VERSION },
+      maxDurableEvents: 200,
       state: {},
     },
   };
@@ -26,11 +27,14 @@ describe('Codex event backpressure', () => {
   it('keeps reasoning ephemeral and caps durable tool output per run', () => {
     const { calls, ctx } = makeContext();
 
+    const reasoningEvents = [
+      { type: 'item.started', item: { id: 'reasoning-started', type: 'reasoning' } },
+      { type: 'item.completed', item: { id: 'reasoning-completed', type: 'reasoning', text: 'thought' } },
+      { type: 'item.started', item: { id: 'interstitial-started', type: 'interstitial' } },
+      { type: 'item.completed', item: { id: 'interstitial-completed', type: 'interstitial', text: 'update' } },
+    ];
     for (let index = 0; index < 500; index += 1) {
-      formatAndRoute({
-        type: 'item.completed',
-        item: { id: `reasoning-${index}`, type: 'reasoning', text: `thought ${index}` },
-      }, ctx);
+      formatAndRoute(reasoningEvents[index % reasoningEvents.length], ctx);
     }
 
     expect(calls.filter(call => (
