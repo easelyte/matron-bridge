@@ -39,7 +39,7 @@ import { promptButtons, promptResponseForButton } from './lib/prompt-buttons.js'
 import { parseOptionReply } from './lib/prompt-reply.js';
 import { sendDelayedPromptAnswer, writePromptAnswer } from './lib/prompt-answer-delivery.js';
 import { SubagentWatcher } from './lib/subagent-watcher.js';
-import { createCodexWatcherIsolation, registerCodexWatcherForSession } from './lib/codex-watcher.js';
+import { createCodexWatcherIsolation, registerCodexWatcherForLiveSession } from './lib/codex-watcher.js';
 import { launchWithCodexSinkEnv } from './lib/codex-paths.js';
 import { createSubagentConvoTracker } from './lib/subagent-convos.js';
 import { createCodexConvoTracker } from './lib/codex-convos.js';
@@ -1378,11 +1378,10 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   // Subagent activity is surfaced on demand: notifyTaskStarted() runs when
   // the parent's stream emits a Task tool_use. The watcher object is cheap
   // to construct; it doesn't poll until the first Task fires.
+  sessions.set(roomId, session);
   if (session.claudeSessionId) {
     setupSubagentWatcher(session, cwd, session.claudeSessionId);
   }
-
-  sessions.set(roomId, session);
   journalSeedTitle(session, { incomingHint: options.journalTitleHint, reattaching: options.journalConvoId != null });
   return session;
 }
@@ -2002,10 +2001,9 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     }
   };
 
+  sessions.set(roomId, session);
   // Subagent activity watcher — see createSession() for the rationale.
   setupSubagentWatcher(session, cwd, sessionId);
-
-  sessions.set(roomId, session);
   return session;
 }
 
@@ -2668,10 +2666,11 @@ function setupSubagentWatcher(session, workdir, sessionId) {
       isAdmittedRun: runId => session.codexConvos.hasChild(runId),
       log: console,
     });
-    registerCodexWatcherForSession(session, {
+    registerCodexWatcherForLiveSession(sessions, session.roomId, {
       workdir,
       sessionId,
       onDiscover: session.codexOnDiscover,
+      onReconcile: (runId, outcome) => session.codexConvos.terminalizeByRunId(runId, outcome),
       isolation,
     }, {
       onFailure: (_error, failedWatcher) => {
