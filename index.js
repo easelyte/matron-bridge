@@ -39,7 +39,7 @@ import { promptButtons, promptResponseForButton } from './lib/prompt-buttons.js'
 import { parseOptionReply } from './lib/prompt-reply.js';
 import { sendDelayedPromptAnswer, writePromptAnswer } from './lib/prompt-answer-delivery.js';
 import { SubagentWatcher } from './lib/subagent-watcher.js';
-import { configureCodexSinkEnv } from './lib/codex-paths.js';
+import { launchWithCodexSinkEnv } from './lib/codex-paths.js';
 import { createSubagentConvoTracker } from './lib/subagent-convos.js';
 import { formatSubagentToolBody } from './lib/subagent-tool-format.js';
 import { ivUploadDir, ivUploadAnnotation } from './lib/iv-uploads.js';
@@ -1152,17 +1152,16 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   delete spawnEnv.SHOW_FILE_TOKEN;
   if (showFileToken) spawnEnv.SHOW_FILE_TOKEN = showFileToken;
 
-  configureCodexSinkEnv({
+  const proc = launchWithCodexSinkEnv({
     spawnEnv,
     workdir: cwd,
     sessionId: identity.sessionId,
-    warn: message => console.warn(message),
-  });
-
-  const proc = spawn('claude', args, {
-    cwd,
-    env: spawnEnv,
-    stdio: ['pipe', 'pipe', 'pipe'],
+    configureOptions: { warn: message => console.warn(message) },
+    launch: configuredEnv => spawn('claude', args, {
+      cwd,
+      env: configuredEnv,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    }),
   });
 
   const session = {
@@ -1733,12 +1732,18 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
 
   debug(`Spawning interactive claude session ${sessionId} in ${cwd}`);
 
-  const iv = createInteractiveSession({
-    roomId,
+  const iv = launchWithCodexSinkEnv({
+    spawnEnv: interactiveEnv,
     workdir: cwd,
     sessionId,
-    claudeArgs,
-    env: interactiveEnv,
+    configureOptions: { warn: message => console.warn(message) },
+    launch: configuredEnv => createInteractiveSession({
+      roomId,
+      workdir: cwd,
+      sessionId,
+      claudeArgs,
+      env: configuredEnv,
+    }),
   });
 
   // Same shape as the --print session object. `proc` is null in iv mode;

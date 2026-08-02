@@ -1,8 +1,13 @@
 import { describe, it, expect, vi } from 'vitest';
+import { readFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { subagentsDirFor } from '../lib/subagent-watcher.js';
-import { codexRunsDirFor, configureCodexSinkEnv } from '../lib/codex-paths.js';
+import {
+  codexRunsDirFor,
+  configureCodexSinkEnv,
+  launchWithCodexSinkEnv,
+} from '../lib/codex-paths.js';
 
 describe('codexRunsDirFor', () => {
   it('uses the same encoded session parent as the subagents directory', () => {
@@ -49,27 +54,65 @@ describe('configureCodexSinkEnv', () => {
     expect(mkdirSync).not.toHaveBeenCalled();
   });
 
-  it('fails open when directory creation throws and allows spawn to proceed', () => {
-    const spawnEnv = { MATRON_CODEX_SINK_DIR: '/inherited/sink' };
-    const warn = vi.fn();
-    const spawn = vi.fn();
+});
 
-    expect(() => {
-      configureCodexSinkEnv({
+describe('Claude spawn-path sink wiring', () => {
+  const indexSource = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
+
+  it('routes both the print and interactive Claude launches through the sink setup', () => {
+    expect(indexSource.match(/launchWithCodexSinkEnv\(\{/g)).toHaveLength(2);
+    expect(indexSource).toMatch(/launch: configuredEnv => spawn\('claude',[\s\S]*?env: configuredEnv/);
+    expect(indexSource).toMatch(/launch: configuredEnv => createInteractiveSession\(\{[\s\S]*?env: configuredEnv/);
+  });
+
+  it.each(['print', 'interactive'])(
+    '%s spawn still fires without a sink after mkdirSync fails',
+    () => {
+      const spawnEnv = { MATRON_CODEX_SINK_DIR: '/inherited/sink' };
+      const launch = vi.fn(env => ({ env }));
+      const warn = vi.fn();
+
+      const result = launchWithCodexSinkEnv({
         spawnEnv,
         workdir: '/workspace',
         sessionId: 'sid',
-        env: {},
-        mkdirSync: () => { throw new Error('EACCES'); },
-        warn,
+        launch,
+        configureOptions: {
+          env: {},
+          mkdirSync: () => { throw new Error('EACCES'); },
+          warn,
+        },
       });
-      spawn('claude', { env: spawnEnv });
-    }).not.toThrow();
 
-    expect(spawn).toHaveBeenCalledOnce();
-    expect(spawnEnv).not.toHaveProperty('MATRON_CODEX_SINK_DIR');
-    expect(warn).toHaveBeenCalledWith(
-      '[codex-viz] sink dir setup failed, viz disabled for this session: EACCES',
-    );
-  });
+      expect(launch).toHaveBeenCalledOnce();
+      expect(launch).toHaveBeenCalledWith(spawnEnv);
+      expect(result).toEqual({ env: spawnEnv });
+      expect(spawnEnv).not.toHaveProperty('MATRON_CODEX_SINK_DIR');
+      expect(warn).toHaveBeenCalledWith(
+        '[codex-viz] sink dir setup failed, viz disabled for this session: EACCES',
+      );
+    },
+  );
+
+  it.each(['print', 'interactive'])(
+    '%s spawn removes an inherited sink when visualization is disabled',
+    () => {
+      const spawnEnv = { MATRON_CODEX_SINK_DIR: '/inherited/sink' };
+      const launch = vi.fn();
+
+      launchWithCodexSinkEnv({
+        spawnEnv,
+        workdir: '/workspace',
+        sessionId: 'sid',
+        launch,
+        configureOptions: {
+          env: { MATRON_CODEX_VIZ: '0', MATRON_CODEX_SINK_DIR: '/inherited/sink' },
+          mkdirSync: vi.fn(),
+        },
+      });
+
+      expect(launch).toHaveBeenCalledOnce();
+      expect(spawnEnv).not.toHaveProperty('MATRON_CODEX_SINK_DIR');
+    },
+  );
 });
