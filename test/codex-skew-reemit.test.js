@@ -1,7 +1,7 @@
 import { EventEmitter } from 'node:events';
 import { describe, expect, it } from 'vitest';
 import WebSocket from 'ws';
-import { createCodexConvoTracker } from '../lib/codex-convos.js';
+import { createCodexConvoTracker, journalReemitCodexOutcomes } from '../lib/codex-convos.js';
 import { createCodexWatcherIsolation } from '../lib/codex-watcher.js';
 import { createJournalPublisher } from '../lib/journal-publisher.js';
 
@@ -75,13 +75,12 @@ describe('Codex outcome deploy-skew repair', () => {
       backoffCapMs: 1,
       keepaliveIntervalMs: 0,
       WebSocketImpl: DeploySkewWebSocket,
-      onReconnect: () => isolation.guardSession('reconnect', () => {
-        for (const [runId, sessionOutcome] of tracker.terminalChildren()) {
-          publisher.upsertConvo(tracker.convoIdFor(runId), {
-            sessionState: 'done',
-            sessionOutcome,
-          });
-        }
+      onReconnect: () => journalReemitCodexOutcomes({
+        sessions: new Map([['session-1', {
+          codexConvos: tracker,
+          codexWatcherIsolation: isolation,
+        }]]),
+        publisher,
       }),
     });
     tracker = createCodexConvoTracker({

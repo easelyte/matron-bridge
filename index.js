@@ -42,7 +42,7 @@ import { SubagentWatcher } from './lib/subagent-watcher.js';
 import { createCodexWatcherIsolation, registerCodexWatcherForLiveSession } from './lib/codex-watcher.js';
 import { launchWithCodexSinkEnv } from './lib/codex-paths.js';
 import { createSubagentConvoTracker } from './lib/subagent-convos.js';
-import { CHILD_STATE_FINISHED, createCodexConvoTracker } from './lib/codex-convos.js';
+import { createCodexConvoTracker, journalReemitCodexOutcomes } from './lib/codex-convos.js';
 import { formatSubagentToolBody } from './lib/subagent-tool-format.js';
 import { ivUploadDir, ivUploadAnnotation } from './lib/iv-uploads.js';
 import { parseUsageLimits, formatLimits } from './lib/usage-limits.js';
@@ -341,7 +341,10 @@ const journalPublisher = createJournalPublisher({
   onStreamResync: (convoId, messageRef, have) => {
     toolStreamPumps.get(toolStreamKey(convoId, messageRef))?.pump.resync(have);
   },
-  onReconnect: journalReemitCodexOutcomes,
+  onReconnect: () => journalReemitCodexOutcomes({
+    sessions,
+    publisher: journalPublisher,
+  }),
   // Agent-RPC dispatch. Arrow + late-bound const (journalRpcHandler is
   // defined below): safe for the same reason onEvent's forward reference
   // is — the callback only ever fires once the socket is live, long after
@@ -2702,28 +2705,6 @@ function setupSubagentWatcher(session, workdir, sessionId) {
 function handleCodexDiscover(session, meta) {
   if (!session || !session.codexConvos) return null;
   return session.codexConvos.ensureChild(meta);
-}
-
-// Repair terminal outcomes that an older journal server may have ignored
-// during a journal-before-bridge deploy skew. Each session is contained by
-// the same T-6.4 isolation boundary as its watcher entry points, so one
-// malformed in-memory tracker cannot abort replay for sibling sessions.
-function journalReemitCodexOutcomes() {
-  for (const session of sessions.values()) {
-    const tracker = session?.codexConvos;
-    const isolation = session?.codexWatcherIsolation;
-    if (!tracker || !isolation) continue;
-    isolation.guardSession('reconnect', () => {
-      for (const [runId, sessionOutcome] of tracker.terminalChildren()) {
-        const childId = tracker.convoIdFor(runId);
-        if (!childId) continue;
-        journalPublisher.upsertConvo(childId, {
-          sessionState: CHILD_STATE_FINISHED,
-          sessionOutcome,
-        });
-      }
-    });
-  }
 }
 
 // Stop a session's subagent watcher and settle its children. finishAll marks
