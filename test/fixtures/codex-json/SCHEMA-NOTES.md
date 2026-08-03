@@ -7,7 +7,7 @@ Flag is `--json` (NOT `--experimental-json`). Events are JSONL, one object per l
 - `turn.started`     — once
 - `item.started`     — an item begins (exit_code null / status "in_progress")
 - `item.completed`   — the same item finishes (exit_code + aggregated_output filled)
-- `turn.completed`   — TERMINAL event (end-of-turn). Completion-signal 2 (non-latching per plan §5) keys off this.
+- `turn.completed`   — TERMINAL event (end-of-turn). Completion-signal 2 (non-latching) keys off this.
 
 ## Item types (the `item.type` field, under `item`)
 - `agent_message`      — assistant text; the LAST one is the final answer (durable, idem-key `${runId}:final`).
@@ -17,7 +17,7 @@ Flag is `--json` (NOT `--experimental-json`). Events are JSONL, one object per l
 ## CADENCE (load-bearing for liveness = PID, not file growth)
 A `command_execution` emits `item.started` then NOTHING until `item.completed` — no interim streaming of aggregated_output. A multi-minute command is silent while alive. Confirmed empirically. → the liveness watchdog MUST use wrapper-PID + /proc start-time (§5), never file-idle.
 
-## DECODER CORRECTION for T-6.1 (vs plan §2)
+## DECODER CORRECTION
 `file_change` carries ONLY `changes:[{path, kind}]` — NO diff body in the exec --json stream. So the decoder posts touched-file PATHS + change kind (a tool_output/"modified X" line), it does NOT get a ready diff body to route through publishEditDiffToConvo. If a real diff is wanted, reconstruct via `git diff` on the touched path (out of scope for the provisional decoder — post path+kind).
 
 ## Per-item model/token

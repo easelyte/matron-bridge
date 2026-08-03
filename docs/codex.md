@@ -43,7 +43,7 @@ notice on the parent conversation.
 
 This is accepted only for the current single-principal deployment, where the
 operator's own trusted sessions share the principal. It follows the P67 trust
-model and the accepted `show_file` token-isolation residual from #458: forgery
+model and the accepted `show_file` token-isolation residual: forgery
 within the operator's own journal is not a new cross-principal capability.
 Out-of-band, bridge-stamped run registration through a mediator that descendants
 cannot forge is a hard prerequisite before any multi-principal or curated-toolset
