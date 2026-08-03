@@ -317,6 +317,7 @@ describe('updatePinnedSummary title flow and log levels', () => {
       workdir: '/srv/project',
       text: 'Useful work',
       defaultWorkdir: '/srv/default',
+      repo: null,
     });
     expect(d.updateRoomName).toHaveBeenCalledWith(
       '!room:example.test',
@@ -324,6 +325,38 @@ describe('updatePinnedSummary title flow and log levels', () => {
     );
     expect(d.warn).not.toHaveBeenCalled();
     expect(d.debug).toHaveBeenCalledWith('[summary] ok', { durationMs: 12 });
+  });
+
+  it('threads an LLM-inferred REPO override into formatRoomTitle', async () => {
+    const d = deps({
+      codexOneShot: vi.fn().mockResolvedValue(
+        success('TITLE: harden RLS gate\nREPO: snafu-studio\nSUMMARY: done'),
+      ),
+    });
+
+    await updatePinnedSummary(session(), d);
+
+    expect(d.formatRoomTitle).toHaveBeenCalledWith({
+      serverLabel: 'VPS',
+      workdir: '/srv/project',
+      text: 'harden RLS gate',
+      defaultWorkdir: '/srv/default',
+      repo: 'snafu-studio',
+    });
+  });
+
+  it('passes repo:null when the model reports REPO: unknown (workdir fallback)', async () => {
+    const d = deps({
+      codexOneShot: vi.fn().mockResolvedValue(
+        success('TITLE: some work\nREPO: unknown\nSUMMARY: done'),
+      ),
+    });
+
+    await updatePinnedSummary(session(), d);
+
+    expect(d.formatRoomTitle).toHaveBeenCalledWith(
+      expect.objectContaining({ text: 'some work', repo: null }),
+    );
   });
 
   it('keeps the existing room name for malformed non-null output', async () => {

@@ -4,6 +4,7 @@ import {
   applyFallbackTitle,
   formatRoomTitle,
   repoLabel,
+  extractRepoOverride,
 } from '../lib/journal-title-seed.js';
 
 describe('seedJournalTitle (workdir-sourced)', () => {
@@ -134,6 +135,112 @@ describe('formatRoomTitle', () => {
     expect(formatRoomTitle({ ...options, workdir: `/home/dan/${'r'.repeat(25)}` })).toBe(
       `VPS · ${'r'.repeat(24)}…`,
     );
+  });
+
+  it('uses an LLM-inferred repo override in place of the workdir basename', () => {
+    // workdir is yearbook-app (the session cwd) but the real work targets
+    // snafu-studio — the override wins.
+    expect(formatRoomTitle({ ...options, text: 'fix RLS gate', repo: 'snafu-studio' })).toBe(
+      'VPS · snafu-studio · fix RLS gate',
+    );
+  });
+
+  it('caps an overflowing repo override at 24 chars with an ellipsis', () => {
+    expect(formatRoomTitle({ ...options, repo: 'r'.repeat(25) })).toBe(`VPS · ${'r'.repeat(24)}…`);
+  });
+
+  it('falls back to the workdir basename when repo is absent, blank, or non-string', () => {
+    // Byte-identical to the pre-change output — the additive param must not
+    // regress existing callers (resume path, applyFallbackTitle) that pass none.
+    expect(formatRoomTitle({ ...options })).toBe('VPS · yearbook-app');
+    expect(formatRoomTitle({ ...options, repo: '   ' })).toBe('VPS · yearbook-app');
+    expect(formatRoomTitle({ ...options, repo: null })).toBe('VPS · yearbook-app');
+  });
+});
+
+describe('extractRepoOverride', () => {
+  it('extracts a clean repo label from a REPO: line', () => {
+    expect(extractRepoOverride('TITLE: work\nREPO: snafu-studio\nSUMMARY: done')).toBe('snafu-studio');
+  });
+
+  it('returns a short label unchanged (under the 24-char cap)', () => {
+    // 20 chars — must NOT be truncated.
+    expect(extractRepoOverride('REPO: claude-matrix-bridge')).toBe('claude-matrix-bridge');
+  });
+
+  it('caps an over-length repo at 24 chars plus an ellipsis', () => {
+    expect(extractRepoOverride('REPO: some-really-long-monorepo-name')).toBe(
+      `${'some-really-long-monorepo-name'.slice(0, 24)}…`,
+    );
+  });
+
+  it('treats each sentinel as no override (returns null)', () => {
+    for (const s of ['unknown', 'UNKNOWN', 'none', 'n/a', 'na', '-']) {
+      expect(extractRepoOverride(`REPO: ${s}`)).toBeNull();
+    }
+  });
+
+  it('returns null when there is no REPO: line, or it is whitespace, or text is non-string', () => {
+    expect(extractRepoOverride('TITLE: work\nSUMMARY: done')).toBeNull();
+    expect(extractRepoOverride('REPO:    ')).toBeNull();
+    expect(extractRepoOverride(null)).toBeNull();
+    expect(extractRepoOverride(undefined)).toBeNull();
+  });
+
+  it('a blank REPO: line does not swallow the following SUMMARY:/NEW: field', () => {
+    // Horizontal-ws + line-bounded capture: an empty repo must fall back to the
+    // workdir, never capture the next structured line as the repo.
+    expect(extractRepoOverride('TITLE: x\nREPO:\nSUMMARY: done')).toBeNull();
+    expect(extractRepoOverride('TITLE: x\nREPO:   \nNEW: done')).toBeNull();
+  });
+
+  it('truncates astral characters at the boundary without leaving an unpaired surrogate', () => {
+    // 23 ASCII + a 2-UTF-16-unit emoji = 24 code points but 25 UTF-16 units: a
+    // naive slice(0,24) would split the surrogate pair; code-point truncation
+    // keeps it whole. encodeURIComponent throws on a lone surrogate, so it is a
+    // reliable well-formedness check.
+    const under = extractRepoOverride(`REPO: ${'a'.repeat(23)}👍`);
+    expect(under).toBe(`${'a'.repeat(23)}👍`);
+    expect(() => encodeURIComponent(under)).not.toThrow();
+    // 24 ASCII + emoji = 25 code points → truncated to 24 code points + `…`;
+    // the emoji is dropped whole rather than split.
+    const over = extractRepoOverride(`REPO: ${'a'.repeat(24)}👍`);
+    expect(over).toBe(`${'a'.repeat(24)}…`);
+    expect(() => encodeURIComponent(over)).not.toThrow();
+  });
+
+  it('strips tag delimiters and stray angle brackets but preserves content', () => {
+    // Tags collapse to a space (parity with applyFallbackTitle), so content is
+    // preserved and no angle bracket survives.
+    const out = extractRepoOverride('REPO: <b>foo</b>bar');
+    expect(out).toBe('foo bar');
+    expect(out).not.toMatch(/[<>]/);
+  });
+
+  it('drops the middot separator so an injected repo cannot forge extra title segments', () => {
+    expect(extractRepoOverride('REPO: a · b')).toBe('a b');
+  });
+
+  it('is line-anchored — a mid-line REPO: echo cannot hijack the canonical line', () => {
+    expect(extractRepoOverride('TITLE: probe REPO: spoof\nREPO: real-repo\nSUMMARY: x')).toBe('real-repo');
+  });
+
+  it('rejects duplicate REPO: lines (ambiguous / spoofable) to the workdir fallback', () => {
+    // A stray REPO: echoed from transcript content before the canonical one
+    // must not be able to select the title — two REPO: lines → no override.
+    expect(extractRepoOverride('REPO: attacker\nTITLE: legit\nREPO: real-repo\nSUMMARY: y')).toBeNull();
+    expect(extractRepoOverride('REPO: a\nREPO: b')).toBeNull();
+  });
+
+  it('strips control, format, and bidi characters before they reach the title', () => {
+    // Bidi override (U+202E) can visually reorder a title; C0 controls (BEL)
+    // are non-printing. Both must be neutralized (-> space, collapsed). The
+    // .toBe assertions prove the chars are gone; the bidi range check is
+    // belt-and-braces.
+    const bidi = extractRepoOverride('REPO: safe\u202Eabc');
+    expect(bidi).toBe('safe abc');
+    expect(bidi).not.toMatch(/[\u202A-\u202E\u2066-\u2069]/);
+    expect(extractRepoOverride('REPO: a\u0007b')).toBe('a b');
   });
 });
 
