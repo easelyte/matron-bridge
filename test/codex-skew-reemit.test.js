@@ -95,7 +95,7 @@ describe('Codex outcome deploy-skew repair', () => {
     publisher.close();
   });
 
-  it('retains and re-emits an evicted final answer without mistaking a socket write for an ack', async () => {
+  it('retains and re-emits an evicted final answer until socket delivery', async () => {
     DeploySkewWebSocket.instances.length = 0;
     DeploySkewWebSocket.conversations.clear();
     DeploySkewWebSocket.pendingCallbacks.length = 0;
@@ -140,7 +140,7 @@ describe('Codex outcome deploy-skew repair', () => {
     await waitFor(() => DeploySkewWebSocket.frames.some(frame =>
       frame.op === 'publish' && frame.idem_key === `${RUN_ID}:final` && frame.payload.body === 'survives'
     ));
-    expect(tracker.pendingFinalAnswer(RUN_ID)).toEqual({ body: 'survives', from: 'assistant' });
+    expect(tracker.pendingFinalAnswer(RUN_ID)).toBeNull();
     expect(state.finalPostLanded).not.toBe(true);
     publisher.close();
   });

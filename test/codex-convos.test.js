@@ -264,4 +264,29 @@ describe('createCodexConvoTracker', () => {
       },
     }]);
   });
+
+  it('bounds retained final answers by per-answer and global byte budgets', () => {
+    const bounded = createCodexConvoTracker({
+      publisher,
+      getParentConvoId: () => 'parent-uuid',
+      log: { warn() {} },
+      maxChildren: 10,
+      maxRetainedFinalAnswerBytes: 8,
+      maxRetainedFinalAnswerTotalBytes: 16,
+    });
+    const runIds = Array.from({ length: 6 }, (_, index) =>
+      `172260000000${index}-1234-${index.toString(16).padStart(4, '0')}`,
+    );
+    for (const runId of runIds) {
+      bounded.ensureChild({ runId });
+      bounded.retainFinalAnswer(runId, { body: 'éééé', from: 'assistant' });
+    }
+
+    expect(bounded.retainedFinalAnswerBytes()).toBe(16);
+    expect([...bounded.pendingFinalAnswers()]).toHaveLength(2);
+    expect(bounded.retainFinalAnswer(runIds[0], { body: '123456789', from: 'assistant' })).toBe(false);
+    expect(bounded.retainedFinalAnswerBytes()).toBe(8);
+    expect(bounded.markFinalAnswerDelivered(runIds[1])).toBe(true);
+    expect(bounded.retainedFinalAnswerBytes()).toBe(0);
+  });
 });

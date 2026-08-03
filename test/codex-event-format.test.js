@@ -132,7 +132,11 @@ describe('formatAndRoute', () => {
       [
         {
           method: 'publishText',
-          args: [ctx.convoId, { body: finalMessage, from: 'assistant' }, { idemKey: 'run-1:final' }],
+          args: [
+            ctx.convoId,
+            { body: finalMessage, from: 'assistant' },
+            { idemKey: 'run-1:final', onDelivered: expect.any(Function) },
+          ],
         },
         { method: 'publishActivity', args: [ctx.convoId, 'idle'] },
       ],
@@ -300,13 +304,34 @@ describe('formatAndRoute', () => {
         args: [
           ctx.convoId,
           { body: 'The durable result', from: 'assistant' },
-          { idemKey: 'run-1:final' },
+          { idemKey: 'run-1:final', onDelivered: expect.any(Function) },
         ],
       },
     ]);
     expect(ctx.state.durableEvents).toBe(201);
     expect(ctx.state.droppedEvents).toBe(1);
     expect(ctx.state.terminalSeen).toBe(true);
+  });
+
+  it('evicts the retained final answer after publisher delivery', () => {
+    const retained = new Map();
+    const { ctx } = makeContext({
+      retainFinalAnswer(runId, payload) { retained.set(runId, payload); },
+      markFinalAnswerDelivered(runId) { retained.delete(runId); },
+    });
+    ctx.publisher.publishText = (_convoId, _payload, options) => {
+      expect(retained.has(ctx.runId)).toBe(true);
+      options.onDelivered();
+      return true;
+    };
+
+    formatAndRoute({
+      type: 'item.completed',
+      item: { id: 'answer-1', type: 'agent_message', text: 'Delivered result' },
+    }, ctx);
+    formatAndRoute({ type: 'turn.completed' }, ctx);
+
+    expect(retained.has(ctx.runId)).toBe(false);
   });
 
   it('passes an unknown item through as text and increments unparsed', () => {

@@ -234,8 +234,12 @@ describe('Codex completion state machine', () => {
     formatAndRoute({ type: 'turn.completed' }, ctx);
 
     expect(harness.calls.publishText).toEqual([
-      expect.objectContaining({ options: { idemKey: `${RUN_ID}:final` } }),
-      expect.objectContaining({ options: { idemKey: `${RUN_ID}:final` } }),
+      expect.objectContaining({
+        options: expect.objectContaining({ idemKey: `${RUN_ID}:final` }),
+      }),
+      expect.objectContaining({
+        options: expect.objectContaining({ idemKey: `${RUN_ID}:final` }),
+      }),
     ]);
   });
 
@@ -274,7 +278,7 @@ describe('Codex completion state machine', () => {
 
     expect(harness.calls.publishText).toContainEqual(expect.objectContaining({
       payload: { body: 'late answer', from: 'assistant' },
-      options: { idemKey: `${RUN_ID}:final` },
+      options: expect.objectContaining({ idemKey: `${RUN_ID}:final` }),
     }));
     expect(harness.tracker.childFor(RUN_ID)).toMatchObject({ terminal: true, outcome: 'completed' });
     expect(tail.drainCount).toBeGreaterThan(0);
