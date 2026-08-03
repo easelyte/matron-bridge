@@ -39,7 +39,12 @@ import { promptButtons, promptResponseForButton } from './lib/prompt-buttons.js'
 import { parseOptionReply } from './lib/prompt-reply.js';
 import { sendDelayedPromptAnswer, writePromptAnswer } from './lib/prompt-answer-delivery.js';
 import { SubagentWatcher } from './lib/subagent-watcher.js';
+import {
+  setupCodexWatcherForSession,
+} from './lib/codex-watcher-setup.js';
+import { launchWithCodexSinkEnv } from './lib/codex-paths.js';
 import { createSubagentConvoTracker } from './lib/subagent-convos.js';
+import { journalReemitCodexOutcomes } from './lib/codex-convos.js';
 import { formatSubagentToolBody } from './lib/subagent-tool-format.js';
 import { ivUploadDir, ivUploadAnnotation } from './lib/iv-uploads.js';
 import { parseUsageLimits, formatLimits } from './lib/usage-limits.js';
@@ -332,12 +337,18 @@ function toolStreamKey(convoId, messageRef) {
 // whole module, including `sessions` and the routing functions below, has
 // finished evaluating).
 const journalPublisher = createJournalPublisher({
-  url: JOURNAL_WS_URL, token: _journalToken, log: console,
+  url: JOURNAL_WS_URL,
+  token: _journalToken,
+  log: console,
   cursorFile: JOURNAL_CURSOR_FILE,
   onEvent: journalHandleInboundEvent,
   onStreamResync: (convoId, messageRef, have) => {
     toolStreamPumps.get(toolStreamKey(convoId, messageRef))?.pump.resync(have);
   },
+  onReconnect: () => journalReemitCodexOutcomes({
+    sessions,
+    publisher: journalPublisher,
+  }),
   // Agent-RPC dispatch. Arrow + late-bound const (journalRpcHandler is
   // defined below): safe for the same reason onEvent's forward reference
   // is — the callback only ever fires once the socket is live, long after
@@ -1151,10 +1162,16 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   delete spawnEnv.SHOW_FILE_TOKEN;
   if (showFileToken) spawnEnv.SHOW_FILE_TOKEN = showFileToken;
 
-  const proc = spawn('claude', args, {
-    cwd,
-    env: spawnEnv,
-    stdio: ['pipe', 'pipe', 'pipe'],
+  const proc = launchWithCodexSinkEnv({
+    spawnEnv,
+    workdir: cwd,
+    sessionId: identity.sessionId,
+    configureOptions: { warn: message => console.warn(message) },
+    launch: configuredEnv => spawn('claude', args, {
+      cwd,
+      env: configuredEnv,
+      stdio: ['pipe', 'pipe', 'pipe'],
+    }),
   });
 
   const session = {
@@ -1369,11 +1386,10 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   // Subagent activity is surfaced on demand: notifyTaskStarted() runs when
   // the parent's stream emits a Task tool_use. The watcher object is cheap
   // to construct; it doesn't poll until the first Task fires.
+  sessions.set(roomId, session);
   if (session.claudeSessionId) {
     setupSubagentWatcher(session, cwd, session.claudeSessionId);
   }
-
-  sessions.set(roomId, session);
   journalSeedTitle(session, { incomingHint: options.journalTitleHint, reattaching: options.journalConvoId != null });
   return session;
 }
@@ -1725,12 +1741,18 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
 
   debug(`Spawning interactive claude session ${sessionId} in ${cwd}`);
 
-  const iv = createInteractiveSession({
-    roomId,
+  const iv = launchWithCodexSinkEnv({
+    spawnEnv: interactiveEnv,
     workdir: cwd,
     sessionId,
-    claudeArgs,
-    env: interactiveEnv,
+    configureOptions: { warn: message => console.warn(message) },
+    launch: configuredEnv => createInteractiveSession({
+      roomId,
+      workdir: cwd,
+      sessionId,
+      claudeArgs,
+      env: configuredEnv,
+    }),
   });
 
   // Same shape as the --print session object. `proc` is null in iv mode;
@@ -1987,10 +2009,9 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     }
   };
 
+  sessions.set(roomId, session);
   // Subagent activity watcher — see createSession() for the rationale.
   setupSubagentWatcher(session, cwd, sessionId);
-
-  sessions.set(roomId, session);
   return session;
 }
 
@@ -2631,6 +2652,10 @@ function resolveQuestionAnswer(session, text) {
 // journalConvoId) is followed. Called from every spawn path (print eager,
 // iv-mode, and the lazy print-mode construction in handleClaudeEvent).
 function setupSubagentWatcher(session, workdir, sessionId) {
+  setupCodexWatcherForSession(session, workdir, sessionId, {
+    publisher: journalPublisher,
+    liveSessions: sessions,
+  });
   session.subagentConvos = createSubagentConvoTracker({
     publisher: journalPublisher,
     getParentConvoId: () => journalConvoIdFor(session),
@@ -2647,6 +2672,10 @@ function setupSubagentWatcher(session, workdir, sessionId) {
 // the catch-all for a subagent whose Task tool_result was never paired) before
 // the tracker is dropped.
 function teardownSubagentTracking(session) {
+  if (session.codexWatcher) {
+    session.codexWatcher.stop().catch(() => {});
+    session.codexWatcher = null;
+  }
   if (session.subagentConvos) {
     session.subagentConvos.finishAll();
     session.subagentConvos = null;

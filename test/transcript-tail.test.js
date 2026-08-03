@@ -122,4 +122,127 @@ describe('TranscriptTail', () => {
     await tail.stop();
     expect(events.map(e => e.n)).toEqual([1, 2]);
   });
+
+  it('preserves a multibyte character split across read chunks', async () => {
+    const prefix = '{"text":"';
+    const padding = 'x'.repeat((64 * 1024) - Buffer.byteLength(prefix) - 1);
+    fs.writeFileSync(file, `${prefix}${padding}€"}\n`);
+    const tail = new TranscriptTail(file, { readFromStart: true });
+    const events = [];
+    tail.on('event', event => events.push(event));
+
+    await tail.start();
+    await tail.stop();
+
+    expect(events).toHaveLength(1);
+    expect(events[0].text).toBe(`${padding}€`);
+  });
+
+  it('keeps retrying a missing initial file for shared read-from-start consumers', async () => {
+    const tail = new TranscriptTail(file, { readFromStart: true, intervalMs: 10 });
+    const events = [];
+    tail.on('event', event => events.push(event));
+
+    await tail.start();
+    fs.writeFileSync(file, '{"type":"late"}\n');
+    await waitFor(() => events.length === 1);
+    await tail.stop();
+
+    expect(events).toEqual([{ type: 'late' }]);
+  });
+
+  it('bounds an oversized replay, marks truncation, and preserves terminal events', async () => {
+    fs.writeFileSync(file, 'discarded\n{"type":"result","final":true}\n');
+    const tail = new TranscriptTail(file, {
+      readFromStart: true,
+      requireRegularFile: true,
+      maxFileSizeBytes: 32,
+    });
+    const events = [];
+    const errors = [];
+    tail.on('event', event => events.push(event));
+    tail.on('parseError', error => errors.push(error));
+
+    await tail.start();
+    await tail.stop();
+    expect(errors.some(item => item.error?.code === 'TRANSCRIPT_TRUNCATED')).toBe(true);
+    expect(events).toContainEqual({ type: 'result', final: true });
+  });
+
+  it('keeps tailing terminal events after an attached file grows past the cap', async () => {
+    fs.writeFileSync(file, '');
+    const tail = new TranscriptTail(file, { maxFileSizeBytes: 32 });
+    const events = [];
+    const errors = [];
+    tail.on('event', event => events.push(event));
+    tail.on('parseError', error => errors.push(error));
+    await tail.start();
+
+    fs.appendFileSync(file, `${'x'.repeat(64)}\n{"type":"result","final":true}\n`);
+    await waitFor(() => events.length === 1);
+    await tail.stop();
+
+    expect(errors.some(item => item.error?.code === 'TRANSCRIPT_TRUNCATED')).toBe(true);
+    expect(events).toEqual([{ type: 'result', final: true }]);
+  });
+
+  it('stops after a cumulative byte budget across repeated sub-cap appends', async () => {
+    fs.writeFileSync(file, '');
+    const tail = new TranscriptTail(file, {
+      intervalMs: 10,
+      maxFileSizeBytes: 32,
+      maxTotalBytes: 25,
+    });
+    const limits = [];
+    tail.on('resourceLimit', error => limits.push(error));
+    await tail.start();
+
+    fs.appendFileSync(file, '{"n":1}\n{"n":2}\n');
+    await waitFor(() => tail.totalBytesRead >= 16);
+    fs.appendFileSync(file, '{"n":3}\n{"n":4}\n');
+    await waitFor(() => limits.length === 1);
+
+    expect(limits[0]).toMatchObject({ code: 'TRANSCRIPT_RESOURCE_LIMIT', resource: 'bytes' });
+    expect(tail.totalBytesRead).toBe(25);
+    expect(tail.started).toBe(false);
+    expect(tail.timer).toBeNull();
+  });
+
+  it('rolls back started state when the initial read fails', async () => {
+    fs.mkdirSync(file);
+    const tail = new TranscriptTail(file, {
+      readFromStart: true,
+      requireRegularFile: true,
+      requireInitialFile: true,
+    });
+
+    await expect(tail.start()).rejects.toThrow('regular file');
+    expect(tail.started).toBe(false);
+    expect(tail.timer).toBeNull();
+  });
+
+  it('rejects a symlink when regular-file enforcement is enabled', async () => {
+    const target = path.join(dir, 'target.jsonl');
+    fs.writeFileSync(target, '{"type":"a"}\n');
+    fs.symlinkSync(target, file);
+    const tail = new TranscriptTail(file, {
+      readFromStart: true,
+      requireRegularFile: true,
+      requireInitialFile: true,
+    });
+
+    await expect(tail.start()).rejects.toThrow('symbolic link');
+    await tail.stop();
+  });
+
+  it('resolves drain failures as explicit error results', async () => {
+    const tail = new TranscriptTail(file, {
+      requireRegularFile: true,
+      requireInitialFile: true,
+    });
+
+    const result = await tail.drain({ windowMs: 0 });
+
+    expect(result).toMatchObject({ ok: false, error: expect.any(Error) });
+  });
 });

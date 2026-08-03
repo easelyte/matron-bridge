@@ -1,0 +1,13 @@
+{"type":"thread.started","thread_id":"019fc273-9ede-71e1-a3fe-541aca1d122e"}
+{"type":"turn.started"}
+{"type":"item.completed","item":{"id":"item_0","type":"agent_message","text":"I’ll execute the three operations strictly in the requested order, using a patch for the file edit."}}
+{"type":"item.started","item":{"id":"item_1","type":"command_execution","command":"/bin/bash -lc 'cat sentinel.env'","aggregated_output":"","exit_code":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_1","type":"command_execution","command":"/bin/bash -lc 'cat sentinel.env'","aggregated_output":"SECRET_TOKEN=sk-REDACTED-FIXTURE-TOKEN\n","exit_code":0,"status":"completed"}}
+{"type":"item.started","item":{"id":"item_2","type":"file_change","changes":[{"path":"/tmp/codex-fixture-wt/mutate_me.txt","kind":"update"}],"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_2","type":"file_change","changes":[{"path":"/tmp/codex-fixture-wt/mutate_me.txt","kind":"update"}],"status":"completed"}}
+{"type":"item.started","item":{"id":"item_3","type":"command_execution","command":"/bin/bash -lc 'sleep 3 && echo done'","aggregated_output":"","exit_code":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_3","type":"command_execution","command":"/bin/bash -lc 'sleep 3 && echo done'","aggregated_output":"done\n","exit_code":0,"status":"completed"}}
+{"type":"item.started","item":{"id":"item_4","type":"command_execution","command":"/bin/bash -lc 'tail -n 3 mutate_me.txt'","aggregated_output":"","exit_code":null,"status":"in_progress"}}
+{"type":"item.completed","item":{"id":"item_4","type":"command_execution","command":"/bin/bash -lc 'tail -n 3 mutate_me.txt'","aggregated_output":"first line\nsecond line\n","exit_code":0,"status":"completed"}}
+{"type":"item.completed","item":{"id":"item_5","type":"agent_message","text":"Completed in order:\n\n1. Printed `sentinel.env`.\n2. Appended `second line` to `mutate_me.txt`.\n3. Ran the sleep command; output: `done`."}}
+{"type":"turn.completed","usage":{"input_tokens":71462,"cached_input_tokens":64256,"cache_write_input_tokens":0,"output_tokens":559,"reasoning_output_tokens":254}}

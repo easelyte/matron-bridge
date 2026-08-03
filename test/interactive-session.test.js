@@ -1,9 +1,10 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { EventEmitter } from 'node:events';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { createInteractiveSession, transcriptPathFor } from '../lib/interactive-session.js';
+import { createInteractiveSession, InteractiveSession, transcriptPathFor } from '../lib/interactive-session.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const STUB = path.join(__dirname, 'stub-claude.mjs');
@@ -22,6 +23,22 @@ describe('transcriptPathFor', () => {
     const p = transcriptPathFor('/home/danbarker/foo', 'abc-123');
     expect(p).toBe(path.join(os.homedir(), '.claude', 'projects', '-home-danbarker-foo', 'abc-123.jsonl'));
   });
+});
+
+it('uses the synchronous zero-window transcript drain fast path', () => {
+  const tail = new EventEmitter();
+  tail.drain = (...args) => { tail.args = args; return Promise.resolve({ ok: true }); };
+  tail.stop = () => Promise.resolve();
+  const ptyHandle = {
+    onData() {},
+    onExit() {},
+  };
+  const session = new InteractiveSession({
+    roomId: 'room', workdir: '/tmp', sessionId: 'session', ptyHandle, tail,
+  });
+
+  expect(() => session.drainTranscript()).not.toThrow();
+  expect(tail.args).toEqual([{ windowMs: 0 }]);
 });
 
 describe('createInteractiveSession', () => {
