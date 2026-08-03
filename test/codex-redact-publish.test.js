@@ -306,6 +306,38 @@ describe('publish-side Codex redaction', () => {
   });
 
   it.each([
+    [
+      'a multiline dotenv quoted value',
+      'API_TOKEN="dotenv-first\ndotenv-second"\nSAFE=value',
+      ['dotenv-first', 'dotenv-second'],
+    ],
+    [
+      'a JSON secret value spanning a line boundary',
+      '{\n  "API_TOKEN":\n    "json-first\njson-second",\n  "safe": true\n}',
+      ['json-first', 'json-second'],
+    ],
+    [
+      'a YAML block scalar secret',
+      'safe: value\nAPI_TOKEN: |-\n  yaml-first\n  yaml-second\nnext: value\n',
+      ['yaml-first', 'yaml-second'],
+    ],
+    [
+      'a PEM private key block',
+      'before\n-----BEGIN PRIVATE KEY-----\npem-first\npem-second\n-----END PRIVATE KEY-----\nafter',
+      ['pem-first', 'pem-second', '-----END PRIVATE KEY-----'],
+    ],
+  ])('fully redacts %s before line-oriented handling', (_label, input, secrets) => {
+    const redact = createPublishRedactor({
+      configPath: '/test/lesson_redactor.yaml',
+      readFileSyncFn: () => POLICY,
+    });
+    const output = redact(input);
+
+    for (const secret of secrets) expect(output).not.toContain(secret);
+    expect(output).toContain('[REDACTED:');
+  });
+
+  it.each([
     ['env NODE_ENV=test npm test', 'test suite passed'],
     ['printenv HOME', '/home/tester'],
     ['export NAME=value', ''],

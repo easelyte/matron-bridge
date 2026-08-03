@@ -103,7 +103,7 @@ describe('Codex outcome deploy-skew repair', () => {
     DeploySkewWebSocket.delayCallbacks = false;
     let publisher;
     let tracker;
-    const isolation = { guardSession(_label, operation) { return operation(); } };
+    const isolation = { guardRepair(_label, operation) { return operation(); } };
     publisher = createJournalPublisher({
       url: 'ws://journal.test/ws', token: 'test-token', queueLimit: 2,
       backoffBaseMs: 1, backoffCapMs: 1, keepaliveIntervalMs: 0,
@@ -225,7 +225,7 @@ describe('Codex outcome deploy-skew repair', () => {
     let publisher;
     let tracker;
     const isolation = {
-      guardSession(_label, fn) { fn(); },
+      guardRepair(_label, fn) { fn(); },
     };
     publisher = createJournalPublisher({
       url: 'ws://journal.test/ws',
@@ -336,6 +336,58 @@ describe('Codex outcome deploy-skew repair', () => {
           convoIdFor: () => CHILD_ID,
         },
         codexWatcherIsolation: siblingIsolation,
+      }],
+    ]);
+
+    expect(() => journalReemitCodexOutcomes({ sessions, publisher })).not.toThrow();
+    expect(repaired).toEqual([{
+      convoId: CHILD_ID,
+      opts: { sessionState: 'done', sessionOutcome: 'completed' },
+    }]);
+  });
+
+  it('repairs terminal outcomes through a disabled breaker and isolates repair throws', () => {
+    const repaired = [];
+    const publisher = {
+      upsertConvo() { return true; },
+      upsertConvoBestEffort(convoId, opts) {
+        repaired.push({ convoId, opts });
+        return true;
+      },
+      publishText() { return true; },
+    };
+    const makeDisabledIsolation = sessionId => {
+      const isolation = createCodexWatcherIsolation({
+        sessionId,
+        publisher,
+        getParentConvoId: () => `parent-${sessionId}`,
+        terminalizeAll: () => [],
+        isAdmittedRun: () => false,
+        breakerThreshold: 1,
+        log: { warn() {}, info() {} },
+      });
+      isolation.guardSession('poll', () => { throw new Error('trip breaker'); });
+      expect(isolation.isDisabled()).toBe(true);
+      return isolation;
+    };
+    const tracker = createCodexConvoTracker({
+      sessionId: 'terminal',
+      publisher,
+      getParentConvoId: () => PARENT_ID,
+      log: { warn() {} },
+    });
+    tracker.ensureChild({ runId: RUN_ID });
+    tracker.terminalize(RUN_ID, 'completed');
+    const sessions = new Map([
+      ['throws', {
+        codexConvos: {
+          terminalChildren() { throw new Error('repair failed'); },
+        },
+        codexWatcherIsolation: makeDisabledIsolation('throws'),
+      }],
+      ['terminal', {
+        codexConvos: tracker,
+        codexWatcherIsolation: makeDisabledIsolation('terminal'),
       }],
     ]);
 
