@@ -537,7 +537,7 @@ describe('createJournalInputConsumer — permission registry seam foundation', (
       findSessionByConvoId: vi.fn((id) => ({ claudeSessionId: id })),
       routeTextToSession: vi.fn(),
       routePromptReply: vi.fn(),
-      notePermissionSeq: vi.fn(),
+      notePermissionSeq: vi.fn(() => true),
       resolvePermissionReply: vi.fn(),
       hasLivePermissionPending: vi.fn(() => false),
       isLivePendingToolUse: vi.fn(() => false),
@@ -550,10 +550,16 @@ describe('createJournalInputConsumer — permission registry seam foundation', (
 
   it('registers a valid bridge-owned permission_request echo exactly once', () => {
     const key = buildPermissionKey('convo-1', 'toolu_1');
+    let assigned = false;
     const deps = makeDeps({
       isLivePendingToolUse: vi.fn((candidateKey, convoId) => (
         candidateKey === key && convoId === 'convo-1'
       )),
+      notePermissionSeq: vi.fn(() => {
+        if (assigned) return false;
+        assigned = true;
+        return true;
+      }),
     });
     const consumer = createJournalInputConsumer(deps);
 
@@ -571,8 +577,9 @@ describe('createJournalInputConsumer — permission registry seam foundation', (
     }));
 
     expect(deps.isLivePendingToolUse).toHaveBeenCalledWith(key, 'convo-1');
-    expect(deps.notePermissionSeq).toHaveBeenCalledTimes(1);
+    expect(deps.notePermissionSeq).toHaveBeenCalledTimes(2);
     expect(deps.notePermissionSeq).toHaveBeenCalledWith(key, 41, 'convo-1');
+    expect(deps.notePermissionSeq.mock.results.map(({ value }) => value)).toEqual([true, false]);
     expect(deps.findSessionByConvoId).not.toHaveBeenCalled();
   });
 
@@ -599,8 +606,18 @@ describe('createJournalInputConsumer — permission registry seam foundation', (
     expect(deps.notePermissionSeq).not.toHaveBeenCalled();
   });
 
-  it('bounds permission echo registrations to the picker-frame retention window', () => {
-    const deps = makeDeps({ isLivePendingToolUse: vi.fn(() => true) });
+  it('never re-registers assigned permission echoes after router-map retention eviction', () => {
+    const pendingPermissionDecisions = new Map();
+    for (let seq = 1; seq <= 17; seq += 1) {
+      pendingPermissionDecisions.set(buildPermissionKey('convo-1', `toolu_${seq}`), {
+        seq: null,
+        convoId: 'convo-1',
+      });
+    }
+    const seams = createPermissionSeams({ pendingPermissionDecisions });
+    const notePermissionSeq = vi.fn(seams.notePermissionSeq);
+    const resolvePermissionReply = vi.fn(seams.resolvePermissionReply);
+    const deps = makeDeps({ ...seams, notePermissionSeq, resolvePermissionReply });
     const consumer = createJournalInputConsumer(deps);
 
     for (let seq = 1; seq <= 17; seq += 1) {
@@ -624,11 +641,24 @@ describe('createJournalInputConsumer — permission registry seam foundation', (
       payload: { tool_use_id: 'toolu_1' },
     }));
 
-    expect(deps.notePermissionSeq).toHaveBeenCalledTimes(18);
+    expect(notePermissionSeq).toHaveBeenCalledTimes(19);
+    expect(notePermissionSeq.mock.results.filter(({ value }) => value === true)).toHaveLength(17);
+    expect(notePermissionSeq.mock.results.slice(-2).map(({ value }) => value)).toEqual([false, false]);
+    expect(pendingPermissionDecisions.get(buildPermissionKey('convo-1', 'toolu_1')).seq).toBe(1);
+    expect(pendingPermissionDecisions.get(buildPermissionKey('convo-1', 'toolu_17')).seq).toBe(17);
+    expect(deps.resolvePermissionReply).not.toHaveBeenCalled();
   });
 
   it('evictPermissionSeq removes only the populated permission seq and leaves picker state intact', () => {
-    const deps = makeDeps({ isLivePendingToolUse: vi.fn(() => true) });
+    const assignedKeys = new Set();
+    const deps = makeDeps({
+      isLivePendingToolUse: vi.fn(() => true),
+      notePermissionSeq: vi.fn((key) => {
+        if (assignedKeys.has(key)) return false;
+        assignedKeys.add(key);
+        return true;
+      }),
+    });
     const consumer = createJournalInputConsumer(deps);
     const firstKey = buildPermissionKey('convo-1', 'toolu_1');
 
@@ -671,7 +701,10 @@ describe('createJournalInputConsumer — permission registry seam foundation', (
       payload: { target_seq: 50, choice: 'model:opus', text: null },
     }));
 
-    expect(deps.notePermissionSeq).toHaveBeenCalledTimes(3);
+    expect(deps.notePermissionSeq).toHaveBeenCalledTimes(4);
+    expect(deps.notePermissionSeq.mock.results.map(({ value }) => value)).toEqual([
+      true, true, false, false,
+    ]);
     expect(deps.resolvePermissionReply).not.toHaveBeenCalled();
     expect(deps.routePromptReply).toHaveBeenCalledTimes(2);
     expect(deps.routePromptReply).toHaveBeenNthCalledWith(
@@ -689,7 +722,15 @@ describe('createJournalInputConsumer — permission registry seam foundation', (
   });
 
   it('evictConvo clears permission frame state and the empty reply buffer idempotently', () => {
-    const deps = makeDeps({ isLivePendingToolUse: vi.fn(() => true) });
+    let assigned = false;
+    const deps = makeDeps({
+      isLivePendingToolUse: vi.fn(() => true),
+      notePermissionSeq: vi.fn(() => {
+        if (assigned) return false;
+        assigned = true;
+        return true;
+      }),
+    });
     const consumer = createJournalInputConsumer(deps);
     const permissionEcho = baseFrame({
       seq: 41,
@@ -704,6 +745,7 @@ describe('createJournalInputConsumer — permission registry seam foundation', (
     expect(() => consumer.evictConvo('convo-1')).not.toThrow();
 
     expect(deps.notePermissionSeq).toHaveBeenCalledTimes(2);
+    expect(deps.notePermissionSeq.mock.results.map(({ value }) => value)).toEqual([true, false]);
   });
 
   it('uses the production permission seams and exposes safe cleanup hooks', () => {
@@ -730,6 +772,8 @@ describe('createJournalInputConsumer — permission registry seam foundation', (
       buildPermissionKey('convo-1', 'toolu_missing'),
       'convo-1',
     )).toBe(false);
+    expect(seams.notePermissionSeq('missing-key', 40, 'convo-1')).toBe(false);
+    expect(seams.notePermissionSeq(key, 40, 'convo-2')).toBe(false);
 
     consumer(baseFrame({
       seq: 41,
@@ -744,6 +788,7 @@ describe('createJournalInputConsumer — permission registry seam foundation', (
       payload: { tool_use_id: 'toolu_1' },
     }));
     expect(pendingPermissionDecisions.get(key).seq).toBe(41);
+    expect(seams.notePermissionSeq(key, 99, 'convo-1')).toBe(false);
     expect(seams.hasLivePermissionPending('convo-1')).toBe(false);
     // A registered seq is still a live tool-use entry; only the convo must match.
     expect(seams.isLivePendingToolUse(key, 'convo-1')).toBe(true);
