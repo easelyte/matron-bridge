@@ -1082,6 +1082,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     : (Array.isArray(persistedForRoom?.mcpExtras) ? persistedForRoom.mcpExtras : []);
   const effectiveMcpExtras = effectiveExtras(mcpExtras, DEFAULT_MCP_EXTRAS);
   const shareEnabled = effectiveMcpExtras.includes('share');
+  const permissionToken = randomUUID();
   let showFileToken;
   let showFilePinnedRoots = null;
   if (shareEnabled) {
@@ -1145,6 +1146,8 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   };
   delete spawnEnv.SHOW_FILE_TOKEN;
   if (showFileToken) spawnEnv.SHOW_FILE_TOKEN = showFileToken;
+  delete spawnEnv.MATRON_PERMISSION_TOKEN;
+  spawnEnv.MATRON_PERMISSION_TOKEN = permissionToken;
 
   const permissionSnapshot = process.env.MATRON_PERMISSION_CARDS
     ? buildPermissionSnapshot({ workdir: cwd })
@@ -1169,6 +1172,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     workdir: cwd,
     ...(showFileToken ? { showFileToken } : {}),
     showFilePinnedRoots,
+    permissionToken,
     _showFileInFlight: 0,
     mcpExtras,
     permissionSnapshot,
@@ -6391,7 +6395,7 @@ const permissionSeams = createPermissionSeams({ pendingPermissionDecisions });
 
 function resolveJournalPermissionReply(key, decision, { username } = {}) {
   const pending = pendingPermissionDecisions.get(key);
-  if (!permissionSeams.resolvePermissionReply(key, decision)) return false;
+  if (!permissionSeams.resolvePermissionReply(key, decision, { username })) return false;
   const label = decision === 'allow' ? 'Allow' : 'Deny';
   journalEchoPromptAnswer(findSessionByClaudeSessionId(pending.convoId), username, label);
   return true;
@@ -6852,6 +6856,7 @@ const apiServer = createServer(async (req, res) => {
         evictPermissionSeq: (key, convoId) => journalInputConsumer.evictPermissionSeq(key, convoId),
         auditPermissionDecisionFn: auditPermissionDecision,
         timeoutMs: PERMISSION_DECISION_TIMEOUT_MS,
+        permissionToken: req.headers['x-matron-permission-token'],
       });
       return;
     }

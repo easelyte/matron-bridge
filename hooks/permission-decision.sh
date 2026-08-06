@@ -28,6 +28,7 @@ fi
 SID=$(printf '%s' "$INPUT" | jq -r '.session_id // empty')
 TUID=$(printf '%s' "$INPUT" | jq -r '.tool_use_id // empty')
 TOOL=$(printf '%s' "$INPUT" | jq -r '.tool_name // empty')
+PERMISSION_TOKEN="${MATRON_PERMISSION_TOKEN:-}"
 PORT="${MATRON_BRIDGE_API_PORT:-9802}"
 BODY=$(jq -nc --arg sid "$SID" --arg tuid "$TUID" --arg tool "$TOOL" \
   '{session_id:$sid,tool_use_id:$tuid,tool_name:$tool}')
@@ -35,6 +36,7 @@ BODY=$(jq -nc --arg sid "$SID" --arg tuid "$TUID" --arg tool "$TOOL" \
 if ! CURL_OUTPUT=$(curl -q -s --noproxy '*' --max-time 1740 -X POST \
   "http://127.0.0.1:${PORT}/permission-decision" \
   -H 'Content-Type: application/json' \
+  -H "X-Matron-Permission-Token: ${PERMISSION_TOKEN}" \
   -d "$BODY" \
   --write-out '\n%{http_code}'); then
   deny_unreachable 'bridge unreachable or timed out'

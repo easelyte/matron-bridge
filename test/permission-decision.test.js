@@ -21,6 +21,8 @@ import {
 } from '../lib/permission-registry.js';
 
 const HOOK = path.resolve('hooks/permission-decision.sh');
+const PERMISSION_TOKEN = 'permission-token-1';
+const ORIGINAL_PERMISSION_CARDS = process.env.MATRON_PERMISSION_CARDS;
 const DEFAULT_INPUT = {
   session_id: 'session-1',
   tool_use_id: 'tool-1',
@@ -43,6 +45,7 @@ function runHook({ input = DEFAULT_INPUT, mode = 'allow', enabled = true } = {})
       PATH: `${testDir}:${parentEnv.PATH}`,
       FAKE_CURL_MODE: mode,
       CURL_CAPTURE: capturePath,
+      MATRON_PERMISSION_TOKEN: PERMISSION_TOKEN,
       ...(enabled ? { MATRON_PERMISSION_CARDS: '1' } : {}),
     },
   });
@@ -57,6 +60,7 @@ function permissionOutput(stdout) {
 }
 
 beforeEach(() => {
+  process.env.MATRON_PERMISSION_CARDS = '1';
   testDir = mkdtempSync(path.join(tmpdir(), 'permission-hook-'));
   capturePath = path.join(testDir, 'curl-args');
   writeFileSync(path.join(testDir, 'curl'), `#!/bin/sh
@@ -75,6 +79,8 @@ esac
 });
 
 afterEach(() => {
+  if (ORIGINAL_PERMISSION_CARDS === undefined) delete process.env.MATRON_PERMISSION_CARDS;
+  else process.env.MATRON_PERMISSION_CARDS = ORIGINAL_PERMISSION_CARDS;
   rmSync(testDir, { recursive: true, force: true });
 });
 
@@ -131,6 +137,8 @@ describe('permission-decision.sh', () => {
       'http://127.0.0.1:9802/permission-decision',
       '-H',
       'Content-Type: application/json',
+      '-H',
+      `X-Matron-Permission-Token: ${PERMISSION_TOKEN}`,
       '-d',
       '{"session_id":"session-1","tool_use_id":"tool-1","tool_name":"Bash"}',
       '--write-out',
@@ -174,11 +182,12 @@ describe('buildPermissionCardPayload', () => {
       tool_input: { token: tokenShapedArgumentValue },
     };
 
-    expect(buildPermissionCardPayload).toHaveLength(3);
+    expect(buildPermissionCardPayload).toHaveLength(4);
     const payload = buildPermissionCardPayload(
       request.tool_use_id,
       request.tool_name,
       request.expires_at,
+      'nonce-1',
     );
 
     expect(payload).toEqual({
@@ -190,6 +199,7 @@ describe('buildPermissionCardPayload', () => {
         { id: 'deny', label: 'Deny' },
       ],
       expires_at: 1_780_000_000_000,
+      nonce: 'nonce-1',
     });
     expect(payload.description).toContain('vercel');
     expect(payload.description).toContain('deploy_to_vercel');
@@ -203,6 +213,7 @@ describe('buildPermissionCardPayload', () => {
       'toolu_permission_2',
       'unqualified_tool_name',
       1_780_000_000_001,
+      'nonce-2',
     ).description).toBe('Allow tool "unqualified_tool_name"?');
   });
 });
@@ -263,6 +274,14 @@ describe('permission hook spawn environment wiring (source inspection)', () => {
     expect(printSpawn).toContain("MATRON_PERMISSION_CARDS: process.env.MATRON_PERMISSION_CARDS || '',");
     expect(interactiveSpawn).not.toContain('MATRON_PERMISSION_CARDS:');
   });
+
+  it('mints and injects a per-session permission token only for print sessions', () => {
+    expect(printSpawn).toContain('const permissionToken = randomUUID();');
+    expect(printSpawn).toContain('spawnEnv.MATRON_PERMISSION_TOKEN = permissionToken;');
+    expect(printSpawn).toContain('permissionToken,');
+    expect(interactiveSpawn).not.toContain('permissionToken');
+    expect(interactiveSpawn).not.toContain('MATRON_PERMISSION_TOKEN');
+  });
 });
 
 const INDEX_SOURCE = readFileSync(path.resolve('index.js'), 'utf8');
@@ -310,6 +329,7 @@ async function openPermissionRouteHarness({
     claudeSessionId: 'session-1',
     alive: true,
     permissionSnapshot: snapshot,
+    permissionToken: PERMISSION_TOKEN,
     ...(includeHandler ? { requestPermissionDecision } : {}),
   };
   const sessions = new Map(includeSession ? [['room-1', target]] : []);
@@ -336,6 +356,7 @@ async function openPermissionRouteHarness({
         evictPermissionSeq: (key, convoId) => evictions.push([key, convoId]),
         auditPermissionDecisionFn,
         timeoutMs,
+        permissionToken: req.headers['x-matron-permission-token'],
       });
     });
   });
@@ -356,14 +377,18 @@ async function openPermissionRouteHarness({
   };
 }
 
-async function postPermission(url, body = {}) {
-  return postPermissionRaw(url, JSON.stringify(body));
+async function postPermission(url, body = {}, permissionToken = PERMISSION_TOKEN) {
+  return postPermissionRaw(url, JSON.stringify(body), permissionToken);
 }
 
-async function postPermissionRaw(url, body) {
+async function postPermissionRaw(url, body, permissionToken = PERMISSION_TOKEN) {
+  const headers = { 'Content-Type': 'application/json' };
+  if (permissionToken !== null) {
+    headers['X-Matron-Permission-Token'] = permissionToken;
+  }
   const response = await fetch(url, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers,
     body,
   });
   return { status: response.status, body: await response.json() };
@@ -389,6 +414,7 @@ function expectSingleAudit(harness, expected) {
     decision: expected.decision,
     source: expected.source,
     reason: expected.reason ?? '',
+    principal: expected.principal ?? null,
     ts: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
   });
   expect(harness.audits[0]).not.toHaveProperty('tool_input');
@@ -410,6 +436,7 @@ describe('permission decision audit acceptance', () => {
     expect(Object.keys(record).sort()).toEqual([
       'decision',
       'event',
+      'principal',
       'reason',
       'seq',
       'session_id',
@@ -461,12 +488,13 @@ describe('permission decision audit acceptance', () => {
       const response = postPermission(operator.url, requestBody);
       await vi.waitFor(() => expect(operator.pending.has(PENDING_KEY)).toBe(true));
       operator.pending.get(PENDING_KEY).seq = 41;
-      expect(operator.resolvePermissionReply(PENDING_KEY, 'allow')).toBe(true);
+      expect(operator.resolvePermissionReply(PENDING_KEY, 'allow', { username: 'dan' })).toBe(true);
       await response;
       expectAcceptedAudit(operator, {
         seq: 41,
         decision: 'allow',
         source: 'operator',
+        principal: 'dan',
       });
     } finally {
       await operator.close();
@@ -493,7 +521,10 @@ describe('permission decision audit acceptance', () => {
     try {
       const clientRequest = request(disconnect.url, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Matron-Permission-Token': PERMISSION_TOKEN,
+        },
       });
       clientRequest.on('error', () => {});
       clientRequest.end(JSON.stringify(requestBody));
@@ -559,7 +590,10 @@ describe('print session requestPermissionDecision', () => {
         { id: 'deny', label: 'Deny' },
       ],
       expires_at: 1_780_000_000_002,
+      nonce: expect.any(String),
     });
+    expect(pendingPermissionDecisions.get(buildPermissionKey('convo-card', 'tool-card')).nonce)
+      .toBe(journalPublisher.publishPermissionRequest.mock.calls[0][1].nonce);
     expect(JSON.stringify(journalPublisher.publishPermissionRequest.mock.calls))
       .not.toContain('must-not-cross-the-card-boundary');
     expect(journalPublisher.publishPermissionRequest.mock.calls[0][1])
@@ -586,7 +620,10 @@ describe('print session requestPermissionDecision', () => {
     });
 
     try {
-      const result = await postPermission(harness.url, DEFAULT_INPUT);
+      const result = await postPermission(harness.url, {
+        ...DEFAULT_INPUT,
+        tool_name: TOOL_NAME,
+      });
 
       expect(result).toEqual({
         status: 200,
@@ -594,7 +631,7 @@ describe('print session requestPermissionDecision', () => {
       });
       expect(harness.pending.size).toBe(0);
       expectSingleAudit(harness, {
-        tool_name: 'Bash',
+        tool_name: TOOL_NAME,
         decision: 'deny',
         source: 'error',
         reason: 'no output channel for session',
@@ -638,6 +675,111 @@ describe('print session requestPermissionDecision', () => {
 });
 
 describe('/permission-decision route', () => {
+  it('is inert and audited when the server-side feature flag is disabled', async () => {
+    const requestPermissionDecision = vi.fn();
+    const harness = await openPermissionRouteHarness({ requestPermissionDecision });
+    delete process.env.MATRON_PERMISSION_CARDS;
+    try {
+      const result = await postPermission(harness.url, {
+        session_id: 'session-1',
+        tool_use_id: 'tool-1',
+        tool_name: TOOL_NAME,
+      });
+
+      expect(result).toEqual({
+        status: 200,
+        body: { decision: 'deny', reason: 'feature disabled' },
+      });
+      expect(requestPermissionDecision).not.toHaveBeenCalled();
+      expect(harness.pending.size).toBe(0);
+      expectSingleAudit(harness, {
+        session_id: null,
+        tool_use_id: null,
+        tool_name: null,
+        decision: 'deny',
+        source: 'error',
+        reason: 'feature disabled',
+      });
+    } finally {
+      process.env.MATRON_PERMISSION_CARDS = '1';
+      await harness.close();
+    }
+  });
+
+  it.each([
+    ['missing', null],
+    ['mismatched', 'wrong-token'],
+  ])('rejects a %s per-session permission token before policy or publication', async (_label, token) => {
+    const classifyPermissionFn = vi.fn();
+    const requestPermissionDecision = vi.fn();
+    const harness = await openPermissionRouteHarness({
+      classifyPermissionFn,
+      requestPermissionDecision,
+    });
+    try {
+      const result = await postPermission(harness.url, {
+        session_id: 'session-1',
+        tool_use_id: 'tool-1',
+        tool_name: TOOL_NAME,
+      }, token);
+
+      expect(result).toEqual({
+        status: 403,
+        body: { decision: 'deny', reason: 'unauthorized' },
+      });
+      expect(classifyPermissionFn).not.toHaveBeenCalled();
+      expect(requestPermissionDecision).not.toHaveBeenCalled();
+      expect(harness.pending.size).toBe(0);
+      expectSingleAudit(harness, {
+        decision: 'deny',
+        source: 'error',
+        reason: 'unauthorized',
+      });
+      expect(JSON.stringify(harness.audits)).not.toContain(PERMISSION_TOKEN);
+      expect(JSON.stringify(harness.audits)).not.toContain('wrong-token');
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it.each([
+    ['unqualified', 'Bash'],
+    ['empty server', 'mcp____tool'],
+    ['empty tool', 'mcp__server__'],
+    ['invalid characters', 'mcp__server__tool secret'],
+    ['overlong', `mcp__server__${'a'.repeat(244)}`],
+  ])('rejects a malformed MCP tool_name: %s', async (_label, toolName) => {
+    const classifyPermissionFn = vi.fn();
+    const requestPermissionDecision = vi.fn();
+    const harness = await openPermissionRouteHarness({
+      classifyPermissionFn,
+      requestPermissionDecision,
+    });
+    try {
+      const result = await postPermission(harness.url, {
+        session_id: 'session-1',
+        tool_use_id: 'tool-1',
+        tool_name: toolName,
+      });
+
+      expect(result).toEqual({
+        status: 400,
+        body: { decision: 'deny', reason: 'invalid tool_name' },
+      });
+      expect(classifyPermissionFn).not.toHaveBeenCalled();
+      expect(requestPermissionDecision).not.toHaveBeenCalled();
+      expect(harness.pending.size).toBe(0);
+      expectSingleAudit(harness, {
+        tool_name: toolName,
+        decision: 'deny',
+        source: 'error',
+        reason: 'invalid tool_name',
+      });
+    } finally {
+      await harness.close();
+    }
+  });
+
   it('fails closed and audits malformed JSON exactly once', async () => {
     const requestPermissionDecision = vi.fn();
     const harness = await openPermissionRouteHarness({ requestPermissionDecision });
@@ -830,7 +972,6 @@ describe('/permission-decision route', () => {
         tool_name: TOOL_NAME,
       });
       await entered;
-      dateNow.mockRestore();
 
       expect(requestPermissionDecision).toHaveBeenCalledWith('tool-1', {
         tool_name: TOOL_NAME,
@@ -1091,6 +1232,45 @@ describe('/permission-decision route', () => {
     }
   });
 
+  it('enforces expiry at operator resolution without waiting for the timer callback', async () => {
+    let handlerEntered;
+    const entered = new Promise(resolve => { handlerEntered = resolve; });
+    const harness = await openPermissionRouteHarness({
+      requestPermissionDecision: vi.fn(handlerEntered),
+      timeoutMs: 60_000,
+    });
+    const dateNow = vi.spyOn(Date, 'now').mockReturnValue(1_780_000_000_000);
+    try {
+      const response = postPermission(harness.url, {
+        session_id: 'session-1',
+        tool_use_id: 'tool-1',
+        tool_name: TOOL_NAME,
+      });
+      await entered;
+      expect(harness.pending.get(PENDING_KEY).expiresAt).toBe(1_780_000_060_000);
+
+      dateNow.mockReturnValue(1_780_000_060_000);
+      expect(harness.resolvePermissionReply(
+        PENDING_KEY,
+        'allow',
+        { username: 'dan' },
+      )).toBe(true);
+
+      await expect(response).resolves.toEqual({
+        status: 200,
+        body: { decision: 'deny', reason: 'timeout' },
+      });
+      expectSingleAudit(harness, {
+        decision: 'deny',
+        source: 'timeout',
+        reason: 'timeout',
+      });
+    } finally {
+      dateNow.mockRestore();
+      await harness.close();
+    }
+  });
+
   it('cleans up once when the real response socket closes before resolution', async () => {
     let handlerEntered;
     const entered = new Promise(resolve => { handlerEntered = resolve; });
@@ -1101,7 +1281,10 @@ describe('/permission-decision route', () => {
     try {
       const clientRequest = request(harness.url, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Matron-Permission-Token': PERMISSION_TOKEN,
+        },
       });
       clientRequest.on('error', () => {});
       clientRequest.end(JSON.stringify({

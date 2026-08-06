@@ -557,8 +557,8 @@ describe('createJournalInputConsumer — permission registry seam foundation', (
     const key = buildPermissionKey('convo-1', 'toolu_1');
     let assigned = false;
     const deps = makeDeps({
-      isLivePendingToolUse: vi.fn((candidateKey, convoId) => (
-        candidateKey === key && convoId === 'convo-1'
+      isLivePendingToolUse: vi.fn((candidateKey, convoId, nonce) => (
+        candidateKey === key && convoId === 'convo-1' && nonce === 'nonce-toolu_1'
       )),
       notePermissionSeq: vi.fn(() => {
         if (assigned) return false;
@@ -572,16 +572,20 @@ describe('createJournalInputConsumer — permission registry seam foundation', (
       seq: 41,
       sender: 'agent:dev-2',
       type: 'permission_request',
-      payload: { tool_use_id: 'toolu_1' },
+      payload: { tool_use_id: 'toolu_1', nonce: 'nonce-toolu_1' },
     }));
     consumer(baseFrame({
       seq: 42,
       sender: 'agent:dev-2',
       type: 'permission_request',
-      payload: { tool_use_id: 'toolu_1' },
+      payload: { tool_use_id: 'toolu_1', nonce: 'nonce-toolu_1' },
     }));
 
-    expect(deps.isLivePendingToolUse).toHaveBeenCalledWith(key, 'convo-1');
+    expect(deps.isLivePendingToolUse).toHaveBeenCalledWith(
+      key,
+      'convo-1',
+      'nonce-toolu_1',
+    );
     expect(deps.notePermissionSeq).toHaveBeenCalledTimes(2);
     expect(deps.notePermissionSeq).toHaveBeenCalledWith(key, 41, 'convo-1');
     expect(deps.notePermissionSeq.mock.results.map(({ value }) => value)).toEqual([true, false]);
@@ -594,8 +598,12 @@ describe('createJournalInputConsumer — permission registry seam foundation', (
     const firstResolve = vi.fn();
     const secondResolve = vi.fn();
     const pendingPermissionDecisions = new Map([
-      [firstKey, { resolve: firstResolve, seq: null, convoId: 'convo-1' }],
-      [secondKey, { resolve: secondResolve, seq: null, convoId: 'convo-1' }],
+      [firstKey, {
+        resolve: firstResolve, seq: null, convoId: 'convo-1', nonce: 'nonce-toolu_1',
+      }],
+      [secondKey, {
+        resolve: secondResolve, seq: null, convoId: 'convo-1', nonce: 'nonce-toolu_2',
+      }],
     ]);
     const deps = makeDeps(createPermissionSeams({ pendingPermissionDecisions }));
     const consumer = createJournalInputConsumer(deps);
@@ -611,7 +619,7 @@ describe('createJournalInputConsumer — permission registry seam foundation', (
         seq,
         sender: 'agent:dev-2',
         type: 'permission_request',
-        payload: { tool_use_id: toolUseId },
+        payload: { tool_use_id: toolUseId, nonce: `nonce-${toolUseId}` },
       }));
     }
     consumer(baseFrame({
@@ -626,9 +634,13 @@ describe('createJournalInputConsumer — permission registry seam foundation', (
     }));
 
     expect(firstResolve).toHaveBeenCalledOnce();
-    expect(firstResolve).toHaveBeenCalledWith({ decision: 'allow', source: 'operator' });
+    expect(firstResolve).toHaveBeenCalledWith({
+      decision: 'allow', source: 'operator', principal: 'dan',
+    });
     expect(secondResolve).toHaveBeenCalledOnce();
-    expect(secondResolve).toHaveBeenCalledWith({ decision: 'deny', source: 'operator' });
+    expect(secondResolve).toHaveBeenCalledWith({
+      decision: 'deny', source: 'operator', principal: 'dan',
+    });
     expect(deps.routePromptReply).not.toHaveBeenCalled();
   });
 
@@ -741,7 +753,7 @@ describe('createJournalInputConsumer — permission registry seam foundation', (
     const key = buildPermissionKey('convo-1', 'toolu_1');
     const resolve = vi.fn();
     const pendingPermissionDecisions = new Map([
-      [key, { resolve, seq: null, convoId: 'convo-1' }],
+      [key, { resolve, seq: null, convoId: 'convo-1', nonce: 'nonce-toolu_1' }],
     ]);
     const deps = makeDeps(createPermissionSeams({ pendingPermissionDecisions }));
     const consumer = createJournalInputConsumer(deps);
@@ -766,11 +778,13 @@ describe('createJournalInputConsumer — permission registry seam foundation', (
       seq: 41,
       sender: 'agent:dev-2',
       type: 'permission_request',
-      payload: { tool_use_id: 'toolu_1' },
+      payload: { tool_use_id: 'toolu_1', nonce: 'nonce-toolu_1' },
     }));
 
     expect(resolve).toHaveBeenCalledOnce();
-    expect(resolve).toHaveBeenCalledWith({ decision: 'allow', source: 'operator' });
+    expect(resolve).toHaveBeenCalledWith({
+      decision: 'allow', source: 'operator', principal: 'dan',
+    });
     expect(deps.routePromptReply).not.toHaveBeenCalled();
   });
 
@@ -827,7 +841,7 @@ describe('createJournalInputConsumer — permission registry seam foundation', (
       const key = buildPermissionKey('convo-1', 'toolu_first');
       const resolve = vi.fn();
       const pendingPermissionDecisions = new Map([
-        [key, { resolve, seq: null, convoId: 'convo-1' }],
+        [key, { resolve, seq: null, convoId: 'convo-1', nonce: 'nonce-toolu_first' }],
       ]);
       const deps = makeDeps(createPermissionSeams({ pendingPermissionDecisions }));
       const consumer = createJournalInputConsumer(deps);
@@ -847,11 +861,13 @@ describe('createJournalInputConsumer — permission registry seam foundation', (
         seq: 41,
         sender: 'agent:dev-2',
         type: 'permission_request',
-        payload: { tool_use_id: 'toolu_first' },
+        payload: { tool_use_id: 'toolu_first', nonce: 'nonce-toolu_first' },
       }));
 
       expect(resolve).toHaveBeenCalledOnce();
-      expect(resolve).toHaveBeenCalledWith({ decision: 'allow', source: 'operator' });
+      expect(resolve).toHaveBeenCalledWith({
+        decision: 'allow', source: 'operator', principal: 'dan',
+      });
       expect(deps.routePromptReply).not.toHaveBeenCalled();
       expect(vi.getTimerCount()).toBe(0);
     } finally {
@@ -866,7 +882,7 @@ describe('createJournalInputConsumer — permission registry seam foundation', (
       const key = buildPermissionKey('convo-1', 'toolu_first');
       const resolve = vi.fn();
       const pendingPermissionDecisions = new Map([
-        [key, { resolve, seq: null, convoId: 'convo-1' }],
+        [key, { resolve, seq: null, convoId: 'convo-1', nonce: 'nonce-toolu_first' }],
       ]);
       const deps = makeDeps(createPermissionSeams({ pendingPermissionDecisions }));
       const consumer = createJournalInputConsumer(deps);
@@ -892,11 +908,13 @@ describe('createJournalInputConsumer — permission registry seam foundation', (
         seq: 41,
         sender: 'agent:dev-2',
         type: 'permission_request',
-        payload: { tool_use_id: 'toolu_first' },
+        payload: { tool_use_id: 'toolu_first', nonce: 'nonce-toolu_first' },
       }));
 
       expect(resolve).toHaveBeenCalledOnce();
-      expect(resolve).toHaveBeenCalledWith({ decision: 'deny', source: 'operator' });
+      expect(resolve).toHaveBeenCalledWith({
+        decision: 'deny', source: 'operator', principal: 'dan',
+      });
       expect(vi.getTimerCount()).toBe(0);
     } finally {
       setTimeoutSpy.mockRestore();
@@ -933,6 +951,7 @@ describe('createJournalInputConsumer — permission registry seam foundation', (
         resolve,
         seq: null,
         convoId: 'convo-1',
+        nonce: `nonce-${toolUseId}`,
       });
     }
     const deps = makeDeps(createPermissionSeams({ pendingPermissionDecisions }));
@@ -943,7 +962,7 @@ describe('createJournalInputConsumer — permission registry seam foundation', (
         seq,
         sender: 'agent:dev-2',
         type: 'permission_request',
-        payload: { tool_use_id: toolUseId },
+        payload: { tool_use_id: toolUseId, nonce: `nonce-${toolUseId}` },
       }));
     }
     for (const [seq, choice] of [[41, 'Allow'], [42, 'allow'], [43, 'yes']]) {
@@ -954,9 +973,15 @@ describe('createJournalInputConsumer — permission registry seam foundation', (
       }));
     }
 
-    expect(resolves[0]).toHaveBeenCalledWith({ decision: 'allow', source: 'operator' });
-    expect(resolves[1]).toHaveBeenCalledWith({ decision: 'allow', source: 'operator' });
-    expect(resolves[2]).toHaveBeenCalledWith({ decision: 'deny', source: 'operator' });
+    expect(resolves[0]).toHaveBeenCalledWith({
+      decision: 'allow', source: 'operator', principal: 'dan',
+    });
+    expect(resolves[1]).toHaveBeenCalledWith({
+      decision: 'allow', source: 'operator', principal: 'dan',
+    });
+    expect(resolves[2]).toHaveBeenCalledWith({
+      decision: 'deny', source: 'operator', principal: 'dan',
+    });
     expect(deps.routePromptReply).not.toHaveBeenCalled();
   });
 
@@ -1113,6 +1138,7 @@ describe('createJournalInputConsumer — permission registry seam foundation', (
       pendingPermissionDecisions.set(buildPermissionKey('convo-1', `toolu_${seq}`), {
         seq: null,
         convoId: 'convo-1',
+        nonce: `nonce-${seq}`,
       });
     }
     const seams = createPermissionSeams({ pendingPermissionDecisions });
@@ -1126,7 +1152,7 @@ describe('createJournalInputConsumer — permission registry seam foundation', (
         seq,
         sender: 'agent:dev-2',
         type: 'permission_request',
-        payload: { tool_use_id: `toolu_${seq}` },
+        payload: { tool_use_id: `toolu_${seq}`, nonce: `nonce-${seq}` },
       }));
     }
     // The permission route rejects the 33rd request at the pending cap, so it
@@ -1306,9 +1332,13 @@ describe('createJournalInputConsumer — permission registry seam foundation', (
     const otherConvoKey = buildPermissionKey('convo-2', 'toolu_3');
     const resolve = vi.fn();
     const pendingPermissionDecisions = new Map([
-      [key, { resolve, seq: null, convoId: 'convo-1' }],
-      [otherKey, { resolve: vi.fn(), seq: 42, convoId: 'convo-1' }],
-      [otherConvoKey, { resolve: vi.fn(), seq: null, convoId: 'convo-2' }],
+      [key, { resolve, seq: null, convoId: 'convo-1', nonce: 'nonce-toolu_1' }],
+      [otherKey, {
+        resolve: vi.fn(), seq: 42, convoId: 'convo-1', nonce: 'nonce-toolu_2',
+      }],
+      [otherConvoKey, {
+        resolve: vi.fn(), seq: null, convoId: 'convo-2', nonce: 'nonce-toolu_3',
+      }],
     ]);
     const seams = createPermissionSeams({ pendingPermissionDecisions });
     const deps = makeDeps(seams);
@@ -1318,11 +1348,13 @@ describe('createJournalInputConsumer — permission registry seam foundation', (
     expect(seams.hasLivePermissionPending('convo-1')).toBe(true);
     expect(seams.hasLivePermissionPending('convo-2')).toBe(true);
     expect(seams.hasLivePermissionPending('convo-missing')).toBe(false);
-    expect(seams.isLivePendingToolUse(key, 'convo-1')).toBe(true);
-    expect(seams.isLivePendingToolUse(key, 'convo-2')).toBe(false);
+    expect(seams.isLivePendingToolUse(key, 'convo-1', 'nonce-toolu_1')).toBe(true);
+    expect(seams.isLivePendingToolUse(key, 'convo-1', 'forged-nonce')).toBe(false);
+    expect(seams.isLivePendingToolUse(key, 'convo-2', 'nonce-toolu_1')).toBe(false);
     expect(seams.isLivePendingToolUse(
       buildPermissionKey('convo-1', 'toolu_missing'),
       'convo-1',
+      'nonce-toolu_1',
     )).toBe(false);
     expect(seams.notePermissionSeq('missing-key', 40, 'convo-1')).toBe(false);
     expect(seams.notePermissionSeq(key, 40, 'convo-2')).toBe(false);
@@ -1331,7 +1363,14 @@ describe('createJournalInputConsumer — permission registry seam foundation', (
       seq: 41,
       sender: 'agent:dev-2',
       type: 'permission_request',
-      payload: { tool_use_id: 'toolu_1' },
+      payload: { tool_use_id: 'toolu_1', nonce: 'forged-nonce' },
+    }));
+    expect(pendingPermissionDecisions.get(key).seq).toBeNull();
+    consumer(baseFrame({
+      seq: 42,
+      sender: 'agent:dev-2',
+      type: 'permission_request',
+      payload: { tool_use_id: 'toolu_1', nonce: 'nonce-toolu_1' },
     }));
     consumer(baseFrame({
       seq: 99,
@@ -1339,14 +1378,16 @@ describe('createJournalInputConsumer — permission registry seam foundation', (
       type: 'permission_request',
       payload: { tool_use_id: 'toolu_1' },
     }));
-    expect(pendingPermissionDecisions.get(key).seq).toBe(41);
+    expect(pendingPermissionDecisions.get(key).seq).toBe(42);
     expect(seams.notePermissionSeq(key, 99, 'convo-1')).toBe(false);
     expect(seams.hasLivePermissionPending('convo-1')).toBe(false);
     // A registered seq is still a live tool-use entry; only the convo must match.
-    expect(seams.isLivePendingToolUse(key, 'convo-1')).toBe(true);
+    expect(seams.isLivePendingToolUse(key, 'convo-1', 'nonce-toolu_1')).toBe(true);
 
-    seams.resolvePermissionReply(key, 'allow');
-    expect(resolve).toHaveBeenCalledWith({ decision: 'allow', source: 'operator' });
+    seams.resolvePermissionReply(key, 'allow', { username: 'dan' });
+    expect(resolve).toHaveBeenCalledWith({
+      decision: 'allow', source: 'operator', principal: 'dan',
+    });
 
     expect(() => consumer.evictPermissionSeq(key, 'convo-1')).not.toThrow();
     expect(() => consumer.evictPermissionSeq('missing-key', 'missing-convo')).not.toThrow();
@@ -1450,7 +1491,7 @@ describe('index.js journal input consumer — permission echo wiring (source ins
     const resolverEnd = src.indexOf('// Assembled once', resolverStart);
     const resolver = src.slice(resolverStart, resolverEnd);
     expect(resolver).toMatch(
-      /if \(!permissionSeams\.resolvePermissionReply\(key, decision\)\) return false;/,
+      /if \(!permissionSeams\.resolvePermissionReply\(key, decision, \{ username \}\)\) return false;/,
     );
     expect(resolver).toMatch(/decision === 'allow' \? 'Allow' : 'Deny'/);
     expect(resolver).toMatch(/journalEchoPromptAnswer\(/);
