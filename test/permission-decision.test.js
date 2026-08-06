@@ -3,6 +3,7 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'no
 import { spawnSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { buildSessionSettings } from '../lib/session-settings.js';
 
 const HOOK = path.resolve('hooks/permission-decision.sh');
 const DEFAULT_INPUT = {
@@ -141,7 +142,34 @@ describe('permission-decision.sh', () => {
   });
 });
 
-describe('permission hook spawn wiring (source inspection)', () => {
+describe('permission hook session settings', () => {
+  function parsedSettings(mode) {
+    return JSON.parse(JSON.stringify(buildSessionSettings(mode)));
+  }
+
+  it('registers exactly one complete permission hook in print mode', () => {
+    const preToolUse = parsedSettings('print').hooks.PreToolUse;
+    const permissionEntries = preToolUse.filter(entry =>
+      entry.matcher === 'mcp__.*'
+      && entry.hooks?.some(hook =>
+        hook.command.endsWith('permission-decision.sh')
+        && hook.timeout === 1800
+      )
+    );
+
+    expect(permissionEntries).toHaveLength(1);
+  });
+
+  it('does not register the permission hook in interactive mode', () => {
+    const preToolUse = parsedSettings('iv').hooks.PreToolUse;
+
+    expect(preToolUse.some(entry =>
+      entry.hooks?.some(hook => hook.command.endsWith('permission-decision.sh'))
+    )).toBe(false);
+  });
+});
+
+describe('permission hook spawn environment wiring (source inspection)', () => {
   const indexSource = readFileSync(path.resolve('index.js'), 'utf8');
   const printSpawn = indexSource.slice(
     indexSource.indexOf('function createSession('),
@@ -151,16 +179,6 @@ describe('permission hook spawn wiring (source inspection)', () => {
     indexSource.indexOf('function createInteractiveSessionForRoom('),
     indexSource.indexOf('// --- Structured Question Handling ---')
   );
-
-  it('registers the permission hook in print spawn args with the required timeout', () => {
-    expect(printSpawn).toMatch(
-      /matcher: 'mcp__\.\*',[\s\S]*?command: path\.join\(__dirname, 'hooks', 'permission-decision\.sh'\),[\s\S]*?timeout: 1800/
-    );
-  });
-
-  it('does not register the permission hook in interactive spawn args', () => {
-    expect(interactiveSpawn).not.toContain('permission-decision.sh');
-  });
 
   it('snapshots MATRON_PERMISSION_CARDS only into the print spawn environment', () => {
     expect(printSpawn).toContain("MATRON_PERMISSION_CARDS: process.env.MATRON_PERMISSION_CARDS || '',");

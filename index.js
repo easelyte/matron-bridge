@@ -49,6 +49,7 @@ import { formatSubagentToolBody } from './lib/subagent-tool-format.js';
 import { ivUploadDir, ivUploadAnnotation } from './lib/iv-uploads.js';
 import { parseUsageLimits, formatLimits } from './lib/usage-limits.js';
 import { resolveSpawnCwd, attachSpawnErrorHandler } from './lib/spawn-guard.js';
+import { buildSessionSettings } from './lib/session-settings.js';
 import { readSessionSummary, listSessionSummaries, listSessionIdsByMtime, pathExists } from './lib/session-summary.js';
 import {
   isIvSlashPassthrough,
@@ -113,14 +114,6 @@ const DEFAULT_BRIDGE_CLAUDE_MD_PATH = path.join(__dirname, 'BRIDGE_CLAUDE.md');
 const DEFAULT_BRIDGE_CODEX_MD_PATH = path.join(__dirname, 'BRIDGE_CODEX.md');
 const FALLBACK_BRIDGE_PROMPT = 'You are running through a remote Matron bridge. The user interacts through chat, not a terminal.';
 const FALLBACK_CODEX_BRIDGE_PROMPT = 'You are running through a remote chat bridge. Work autonomously within the configured sandbox; interactive approvals are unavailable.';
-
-// easelyte fork delta: the bridge runs as root on the VPS, where Claude refuses
-// --dangerously-skip-permissions. Match the live claude-matrix-bridge config —
-// a full tool allow-list via --settings — which Claude accepts under root.
-const BRIDGE_ROOT_PERMISSIONS = {
-  allow: ['Bash(*)', 'Read(*)', 'Write(*)', 'Edit(*)', 'MultiEdit(*)', 'Glob(*)', 'Grep(*)', 'WebFetch(*)', 'WebSearch(*)', 'Skill', 'Agent(*)', 'Task(*)', 'NotebookEdit(*)', 'mcp__show-file__show_file'],
-  deny: [],
-};
 
 // --- Config ---
 
@@ -1107,36 +1100,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     '--append-system-prompt', BRIDGE_SYSTEM_PROMPT,
     '--include-partial-messages',
     '--mcp-config', mcpConfigPathFor(effectiveMcpExtras),
-    '--settings', JSON.stringify({
-      permissions: BRIDGE_ROOT_PERMISSIONS,
-      hooks: {
-        PreCompact: [{
-          hooks: [{
-            type: 'command',
-            command: path.join(__dirname, 'hooks', 'compact-notify.sh'),
-            timeout: 5,
-          }],
-        }],
-        PreToolUse: [{
-          matcher: 'Bash',
-          hooks: [{
-            type: 'command',
-            command: path.join(__dirname, 'hooks', 'matron-bash-tee.sh'),
-          }],
-        }, {
-          // Matcher mcp__.* is POC-confirmed to fire this PreToolUse hook on a
-          // gated MCP call in CC 2.1.222 --print (2026-08-06: a stub server's
-          // mcp__ping__ping call was intercepted and denied; no fallback to the
-          // literal `mcp__` needed). Full round-trip acceptance smoke: T-4.2.
-          matcher: 'mcp__.*',
-          hooks: [{
-            type: 'command',
-            command: path.join(__dirname, 'hooks', 'permission-decision.sh'),
-            timeout: 1800,
-          }],
-        }],
-      },
-    }),
+    '--settings', JSON.stringify(buildSessionSettings('print')),
   ];
   const printModel = options.model === null
     ? undefined
@@ -1698,26 +1662,6 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     ? undefined
     : resolveModel({ option: options.model, persisted: persistedForRoom?.model });
 
-  const settings = {
-    permissions: BRIDGE_ROOT_PERMISSIONS,
-    hooks: {
-      PreCompact: [{
-        hooks: [{ type: 'command', command: path.join(__dirname, 'hooks', 'compact-notify.sh'), timeout: 5 }],
-      }],
-      // ExitPlanMode is NOT intercepted in iv-mode. Claude's own in-TUI
-      // confirmation prompt ("Yes / Yes, manually / Refine / Tell Claude
-      // what to change") is caught by lib/prompt-detector.js and routed
-      // through Matrix as a numbered question — that's the single approval
-      // round. The hook+/plan-decision flow remains in print-mode only.
-      PreToolUse: [
-        { matcher: 'Bash', hooks: [{ type: 'command', command: path.join(__dirname, 'hooks', 'matron-bash-tee.sh') }] },
-      ],
-      Stop: [{
-        hooks: [{ type: 'command', command: path.join(__dirname, 'hooks', 'stop-notify.sh'), timeout: 10 }],
-      }],
-    },
-  };
-
   // Fresh sessions pre-assign --session-id so the transcript path is known
   // before spawn; resumes pass --resume only. The exclusivity rule lives in
   // planSessionIdentity.
@@ -1729,7 +1673,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     // surface the TUI prompt; that constraint no longer applies.
     '--append-system-prompt', BRIDGE_SYSTEM_PROMPT,
     '--mcp-config', mcpConfigPathFor(effectiveMcpExtras),
-    '--settings', JSON.stringify(settings),
+    '--settings', JSON.stringify(buildSessionSettings('iv')),
   );
   if (model) {
     claudeArgs.push('--model', model);
