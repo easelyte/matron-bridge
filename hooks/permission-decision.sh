@@ -32,11 +32,18 @@ PORT="${MATRON_BRIDGE_API_PORT:-9802}"
 BODY=$(jq -nc --arg sid "$SID" --arg tuid "$TUID" --arg tool "$TOOL" \
   '{session_id:$sid,tool_use_id:$tuid,tool_name:$tool}')
 
-if ! RESP=$(curl -s --max-time 1740 -X POST \
+if ! CURL_OUTPUT=$(curl -s --max-time 1740 -X POST \
   "http://127.0.0.1:${PORT}/permission-decision" \
   -H 'Content-Type: application/json' \
-  -d "$BODY"); then
+  -d "$BODY" \
+  --write-out '\n%{http_code}'); then
   deny_unreachable 'bridge unreachable or timed out'
+fi
+
+HTTP_STATUS="${CURL_OUTPUT##*$'\n'}"
+RESP="${CURL_OUTPUT%$'\n'*}"
+if [[ ! "$HTTP_STATUS" =~ ^2[0-9]{2}$ ]]; then
+  deny_unreachable "bridge returned HTTP status ${HTTP_STATUS}"
 fi
 
 if [ -z "$RESP" ]; then
