@@ -1,7 +1,11 @@
 import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'fs';
 import { createJournalInputConsumer, resolvePromptChoice, promptExpectsReply } from '../lib/journal-input-router.js';
-import { buildPermissionKey, createPermissionSeams } from '../lib/permission-registry.js';
+import {
+  buildPermissionKey,
+  createPermissionSeams,
+  PERMISSION_MAX_PENDING_PER_CONVO,
+} from '../lib/permission-registry.js';
 
 const silentLog = { warn: () => {}, error: () => {} };
 
@@ -606,9 +610,9 @@ describe('createJournalInputConsumer — permission registry seam foundation', (
     expect(deps.notePermissionSeq).not.toHaveBeenCalled();
   });
 
-  it('never re-registers assigned permission echoes after router-map retention eviction', () => {
+  it('retains seq-to-key bindings for all 32 allowed live permission cards', () => {
     const pendingPermissionDecisions = new Map();
-    for (let seq = 1; seq <= 17; seq += 1) {
+    for (let seq = 1; seq <= PERMISSION_MAX_PENDING_PER_CONVO; seq += 1) {
       pendingPermissionDecisions.set(buildPermissionKey('convo-1', `toolu_${seq}`), {
         seq: null,
         convoId: 'convo-1',
@@ -620,7 +624,7 @@ describe('createJournalInputConsumer — permission registry seam foundation', (
     const deps = makeDeps({ ...seams, notePermissionSeq, resolvePermissionReply });
     const consumer = createJournalInputConsumer(deps);
 
-    for (let seq = 1; seq <= 17; seq += 1) {
+    for (let seq = 1; seq <= PERMISSION_MAX_PENDING_PER_CONVO; seq += 1) {
       consumer(baseFrame({
         seq,
         sender: 'agent:dev-2',
@@ -628,24 +632,25 @@ describe('createJournalInputConsumer — permission registry seam foundation', (
         payload: { tool_use_id: `toolu_${seq}` },
       }));
     }
+    // The permission route rejects the 33rd request at the pending cap, so it
+    // has no live registry entry and its echo cannot become dispatchable.
     consumer(baseFrame({
-      seq: 17,
+      seq: PERMISSION_MAX_PENDING_PER_CONVO + 1,
       sender: 'agent:dev-2',
       type: 'permission_request',
-      payload: { tool_use_id: 'toolu_17' },
-    }));
-    consumer(baseFrame({
-      seq: 1,
-      sender: 'agent:dev-2',
-      type: 'permission_request',
-      payload: { tool_use_id: 'toolu_1' },
+      payload: { tool_use_id: 'toolu_overflow' },
     }));
 
-    expect(notePermissionSeq).toHaveBeenCalledTimes(19);
-    expect(notePermissionSeq.mock.results.filter(({ value }) => value === true)).toHaveLength(17);
-    expect(notePermissionSeq.mock.results.slice(-2).map(({ value }) => value)).toEqual([false, false]);
-    expect(pendingPermissionDecisions.get(buildPermissionKey('convo-1', 'toolu_1')).seq).toBe(1);
-    expect(pendingPermissionDecisions.get(buildPermissionKey('convo-1', 'toolu_17')).seq).toBe(17);
+    for (let seq = 1; seq <= PERMISSION_MAX_PENDING_PER_CONVO; seq += 1) {
+      expect(consumer.permissionFrameKey('convo-1', seq)).toBe(
+        buildPermissionKey('convo-1', `toolu_${seq}`),
+      );
+    }
+    expect(consumer.permissionFrameKey(
+      'convo-1',
+      PERMISSION_MAX_PENDING_PER_CONVO + 1,
+    )).toBeNull();
+    expect(notePermissionSeq).toHaveBeenCalledTimes(PERMISSION_MAX_PENDING_PER_CONVO);
     expect(deps.resolvePermissionReply).not.toHaveBeenCalled();
   });
 
@@ -721,15 +726,13 @@ describe('createJournalInputConsumer — permission registry seam foundation', (
     );
   });
 
-  it('evictConvo clears permission frame state and the empty reply buffer idempotently', () => {
-    let assigned = false;
+  it('evictConvo clears permission frame membership and the empty reply buffer idempotently', () => {
+    const key = buildPermissionKey('convo-1', 'toolu_1');
     const deps = makeDeps({
-      isLivePendingToolUse: vi.fn(() => true),
-      notePermissionSeq: vi.fn(() => {
-        if (assigned) return false;
-        assigned = true;
-        return true;
-      }),
+      isLivePendingToolUse: vi.fn((candidateKey, convoId) => (
+        candidateKey === key && convoId === 'convo-1'
+      )),
+      notePermissionSeq: vi.fn(() => true),
     });
     const consumer = createJournalInputConsumer(deps);
     const permissionEcho = baseFrame({
@@ -740,12 +743,13 @@ describe('createJournalInputConsumer — permission registry seam foundation', (
     });
 
     consumer(permissionEcho);
+    expect(consumer.permissionFrameKey('convo-1', permissionEcho.seq)).toBe(key);
     consumer.evictConvo('convo-1');
-    consumer(permissionEcho);
+    // A late tap's target seq is no longer a permission-frame member.
+    expect(consumer.permissionFrameKey('convo-1', permissionEcho.seq)).toBeNull();
     expect(() => consumer.evictConvo('convo-1')).not.toThrow();
 
-    expect(deps.notePermissionSeq).toHaveBeenCalledTimes(2);
-    expect(deps.notePermissionSeq.mock.results.map(({ value }) => value)).toEqual([true, false]);
+    expect(deps.notePermissionSeq).toHaveBeenCalledOnce();
   });
 
   it('uses the production permission seams and exposes safe cleanup hooks', () => {
