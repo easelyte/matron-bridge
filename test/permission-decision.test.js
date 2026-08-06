@@ -12,6 +12,8 @@ import {
   createPermissionSeams,
   handlePermissionDecisionRoute,
   PERMISSION_DECISION_MAX_BODY_BYTES,
+  PERMISSION_MAX_PENDING_GLOBAL,
+  PERMISSION_MAX_PENDING_PER_CONVO,
 } from '../lib/permission-registry.js';
 
 const HOOK = path.resolve('hooks/permission-decision.sh');
@@ -237,8 +239,9 @@ async function openPermissionRouteHarness({
   includeHandler = true,
   classifyPermissionFn = classifyPermission,
   timeoutMs = 1000,
+  initialPending = new Map(),
 } = {}) {
-  const pending = new Map();
+  const pending = new Map(initialPending);
   const audits = [];
   const evictions = [];
   const target = {
@@ -468,37 +471,37 @@ describe('/permission-decision route', () => {
     }
   });
 
-  it('classifies a non-string tool_name as default-gated without calling the classifier', async () => {
-    let handlerEntered;
-    const entered = new Promise(resolve => { handlerEntered = resolve; });
+  it.each([
+    ['object', { malformed: true }],
+    ['number', 42],
+    ['missing', undefined],
+  ])('fails closed when tool_name is %s', async (_label, toolName) => {
     const classifyPermissionFn = vi.fn(() => 'allow');
-    const requestPermissionDecision = vi.fn(handlerEntered);
+    const requestPermissionDecision = vi.fn();
     const harness = await openPermissionRouteHarness({
       classifyPermissionFn,
       requestPermissionDecision,
     });
-    const toolName = { malformed: true };
     try {
-      const responsePromise = postPermission(harness.url, {
+      const requestBody = {
         session_id: 'session-1',
         tool_use_id: 'tool-1',
-        tool_name: toolName,
-      });
-      await entered;
+        ...(toolName === undefined ? {} : { tool_name: toolName }),
+      };
+      const result = await postPermission(harness.url, requestBody);
 
+      expect(result).toEqual({
+        status: 400,
+        body: { decision: 'deny', reason: 'tool_name required' },
+      });
       expect(classifyPermissionFn).not.toHaveBeenCalled();
-      expect(requestPermissionDecision).toHaveBeenCalledWith('tool-1', { tool_name: toolName });
-      expect(harness.pending.has(PENDING_KEY)).toBe(true);
-      harness.resolvePermissionReply(PENDING_KEY, 'deny');
-
-      await expect(responsePromise).resolves.toEqual({
-        status: 200,
-        body: { decision: 'deny', reason: '' },
-      });
+      expect(requestPermissionDecision).not.toHaveBeenCalled();
+      expect(harness.pending.size).toBe(0);
       expectSingleAudit(harness, {
-        tool_name: toolName,
+        tool_name: null,
         decision: 'deny',
-        source: 'operator',
+        source: 'error',
+        reason: 'tool_name required',
       });
     } finally {
       await harness.close();
@@ -622,6 +625,83 @@ describe('/permission-decision route', () => {
         expect(audit).not.toHaveProperty('tool_input');
         expect(audit).not.toHaveProperty('executed');
       }
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it.each([
+    {
+      name: 'per-conversation',
+      cap: PERMISSION_MAX_PENDING_PER_CONVO,
+      keyFor: index => `convo-1${String.fromCharCode(0)}existing-${index}`,
+    },
+    {
+      name: 'global',
+      cap: PERMISSION_MAX_PENDING_GLOBAL,
+      keyFor: index => `other-convo-${index}${String.fromCharCode(0)}existing`,
+    },
+  ])('fails closed at the $name pending cap and admits a new entry after finalize', async testCase => {
+    const initialPending = new Map(
+      Array.from({ length: testCase.cap - 1 }, (_, index) => [testCase.keyFor(index), {}]),
+    );
+    const requestPermissionDecision = vi.fn();
+    const harness = await openPermissionRouteHarness({
+      initialPending,
+      requestPermissionDecision,
+    });
+    const liveKey = `convo-1${String.fromCharCode(0)}live`;
+    const replacementKey = `convo-1${String.fromCharCode(0)}replacement`;
+    try {
+      const liveResponse = postPermission(harness.url, {
+        session_id: 'session-1',
+        tool_use_id: 'live',
+        tool_name: TOOL_NAME,
+      });
+      await vi.waitFor(() => expect(requestPermissionDecision).toHaveBeenCalledOnce());
+      expect(harness.pending.size).toBe(testCase.cap);
+
+      const saturatedResponse = await postPermission(harness.url, {
+        session_id: 'session-1',
+        tool_use_id: 'overflow',
+        tool_name: TOOL_NAME,
+      });
+      expect(saturatedResponse).toEqual({
+        status: 200,
+        body: { decision: 'deny', reason: 'too many pending decisions' },
+      });
+      expect(requestPermissionDecision).toHaveBeenCalledOnce();
+      expect(harness.pending.size).toBe(testCase.cap);
+      expect(harness.pending.has(`convo-1${String.fromCharCode(0)}overflow`)).toBe(false);
+      expectSingleAudit(harness, {
+        tool_use_id: 'overflow',
+        decision: 'deny',
+        source: 'error',
+        reason: 'too many pending decisions',
+      });
+
+      harness.resolvePermissionReply(liveKey, 'allow');
+      await expect(liveResponse).resolves.toEqual({
+        status: 200,
+        body: { decision: 'allow', reason: '' },
+      });
+      expect(harness.pending.size).toBe(testCase.cap - 1);
+
+      const replacementResponse = postPermission(harness.url, {
+        session_id: 'session-1',
+        tool_use_id: 'replacement',
+        tool_name: TOOL_NAME,
+      });
+      await vi.waitFor(() => expect(requestPermissionDecision).toHaveBeenCalledTimes(2));
+      expect(harness.pending.has(replacementKey)).toBe(true);
+      expect(harness.pending.size).toBe(testCase.cap);
+
+      harness.resolvePermissionReply(replacementKey, 'deny');
+      await expect(replacementResponse).resolves.toEqual({
+        status: 200,
+        body: { decision: 'deny', reason: '' },
+      });
+      expect(harness.pending.size).toBe(testCase.cap - 1);
     } finally {
       await harness.close();
     }
