@@ -528,6 +528,141 @@ describe('createJournalInputConsumer — non-answerable prompts must not superse
   });
 });
 
+describe('createJournalInputConsumer — permission registry seam foundation', () => {
+  function makeDeps(overrides = {}) {
+    return {
+      isControlConvo: () => false,
+      handleControlCommand: vi.fn(),
+      findSessionByConvoId: vi.fn((id) => ({ claudeSessionId: id })),
+      routeTextToSession: vi.fn(),
+      routePromptReply: vi.fn(),
+      notePermissionSeq: vi.fn(),
+      resolvePermissionReply: vi.fn(),
+      hasLivePermissionPending: vi.fn(() => false),
+      isLivePendingToolUse: vi.fn(() => false),
+      noticeUnknownConvo: vi.fn(),
+      noticeStalePromptReply: vi.fn(),
+      log: silentLog,
+      ...overrides,
+    };
+  }
+
+  const pickerFrame = (seq) => baseFrame({
+    seq,
+    sender: 'agent:dev-2',
+    type: 'prompt',
+    payload: {
+      question: 'Current model: sonnet',
+      mode: 'pick_one',
+      options: [{ id: 'model-sonnet', label: 'Sonnet', value: 'model:sonnet' }],
+    },
+  });
+
+  const pickerReply = (targetSeq) => baseFrame({
+    seq: 100,
+    type: 'prompt_reply',
+    payload: { target_seq: targetSeq, choice: 'model:sonnet', text: null },
+  });
+
+  it('exposes seq-specific permission eviction without disturbing picker or queue state', () => {
+    const deps = makeDeps();
+    const consumer = createJournalInputConsumer(deps);
+    expect(typeof consumer.evictPermissionSeq).toBe('function');
+
+    consumer(pickerFrame(12));
+    consumer.queueRelease.noteQueued('convo-1', {
+      promptId: 'pr_1',
+      itemId: 'pr_1::0',
+    });
+
+    expect(() => consumer.evictPermissionSeq('convo-1 toolu_missing', 'convo-1')).not.toThrow();
+    expect(consumer.queueRelease.listLive('convo-1')).toEqual([
+      { promptId: 'pr_1', itemId: 'pr_1::0' },
+    ]);
+
+    consumer(pickerReply(12));
+    expect(deps.routePromptReply).toHaveBeenCalledWith(
+      { claudeSessionId: 'convo-1' },
+      { target_seq: 12, choice: 'model:sonnet', text: null, picker: true },
+      { username: 'dan' },
+    );
+  });
+
+  it('accepts all four forward seams but leaves echo/reply consumption to later tasks', () => {
+    const deps = makeDeps();
+    const consumer = createJournalInputConsumer(deps);
+
+    consumer(baseFrame({
+      seq: 41,
+      sender: 'agent:dev-2',
+      type: 'permission_request',
+      payload: { tool_use_id: 'toolu_1' },
+    }));
+    consumer.evictPermissionSeq('convo-1 toolu_1', 'convo-1');
+    consumer(baseFrame({
+      seq: 42,
+      type: 'prompt_reply',
+      payload: { target_seq: 41, choice: 'allow', text: null },
+    }));
+
+    expect(deps.notePermissionSeq).not.toHaveBeenCalled();
+    expect(deps.resolvePermissionReply).not.toHaveBeenCalled();
+    expect(deps.hasLivePermissionPending).not.toHaveBeenCalled();
+    expect(deps.isLivePendingToolUse).not.toHaveBeenCalled();
+    expect(deps.routePromptReply).toHaveBeenCalledTimes(1);
+  });
+
+  it('documents the fake index-side pending-map contract carried by the injected seams', () => {
+    const key = 'convo-1 toolu_1';
+    const resolve = vi.fn();
+    const pending = new Map([[key, {
+      resolve,
+      seq: null,
+      convoId: 'convo-1',
+    }]]);
+    const seams = {
+      notePermissionSeq: (candidate, seq, convoId) => {
+        const entry = pending.get(candidate);
+        if (entry?.convoId === convoId && entry.seq === null) entry.seq = seq;
+      },
+      resolvePermissionReply: (candidate, decision) => {
+        pending.get(candidate)?.resolve({ decision });
+      },
+      hasLivePermissionPending: (convoId) => [...pending.values()]
+        .some(entry => entry.convoId === convoId && entry.seq === null),
+      isLivePendingToolUse: (candidate, convoId) => pending.get(candidate)?.convoId === convoId,
+    };
+    const consumer = createJournalInputConsumer(makeDeps(seams));
+
+    expect(typeof consumer.evictPermissionSeq).toBe('function');
+    expect(seams.hasLivePermissionPending('convo-1')).toBe(true);
+    expect(seams.isLivePendingToolUse(key, 'convo-1')).toBe(true);
+    seams.notePermissionSeq(key, 41, 'convo-1');
+    expect(pending.get(key).seq).toBe(41);
+    seams.resolvePermissionReply(key, 'allow');
+    expect(resolve).toHaveBeenCalledWith({ decision: 'allow' });
+  });
+
+  it('module remains one-way and index.js wires the canonical pending registry seams', () => {
+    const routerSrc = readFileSync(new URL('../lib/journal-input-router.js', import.meta.url), 'utf-8');
+    const indexSrc = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
+    expect(typeof createJournalInputConsumer).toBe('function');
+    expect(routerSrc).not.toMatch(/from ['"]\.\.\/index\.js['"]/);
+    expect(indexSrc).toContain('const pendingPermissionDecisions = new Map();');
+    expect(indexSrc).toContain('`${convo_id} ${tool_use_id}`');
+
+    const start = indexSrc.indexOf('createJournalInputConsumer({');
+    const end = indexSrc.indexOf('log: console,', start);
+    expect(start).toBeGreaterThan(-1);
+    expect(end).toBeGreaterThan(start);
+    const args = indexSrc.slice(start, end);
+    expect(args).toMatch(/\bnotePermissionSeq\b/);
+    expect(args).toMatch(/\bresolvePermissionReply\b/);
+    expect(args).toMatch(/\bhasLivePermissionPending\b/);
+    expect(args).toMatch(/\bisLivePendingToolUse\b/);
+  });
+});
+
 // Auto-resume seam: the idle reaper silently kills sessions assuming "the
 // next user message auto-resumes" — true for Matrix room messages, but the
 // journal path used to dead-end with "no longer active". A text or media
