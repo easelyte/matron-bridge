@@ -140,3 +140,30 @@ describe('permission-decision.sh', () => {
     });
   });
 });
+
+describe('permission hook spawn wiring (source inspection)', () => {
+  const indexSource = readFileSync(path.resolve('index.js'), 'utf8');
+  const printSpawn = indexSource.slice(
+    indexSource.indexOf('function createSession('),
+    indexSource.indexOf('// --- Codex programmatic sessions ---')
+  );
+  const interactiveSpawn = indexSource.slice(
+    indexSource.indexOf('function createInteractiveSessionForRoom('),
+    indexSource.indexOf('// --- Structured Question Handling ---')
+  );
+
+  it('registers the permission hook in print spawn args with the required timeout', () => {
+    expect(printSpawn).toMatch(
+      /matcher: 'mcp__\.\*',[\s\S]*?command: path\.join\(__dirname, 'hooks', 'permission-decision\.sh'\),[\s\S]*?timeout: 1800/
+    );
+  });
+
+  it('does not register the permission hook in interactive spawn args', () => {
+    expect(interactiveSpawn).not.toContain('permission-decision.sh');
+  });
+
+  it('snapshots MATRON_PERMISSION_CARDS only into the print spawn environment', () => {
+    expect(printSpawn).toContain("MATRON_PERMISSION_CARDS: process.env.MATRON_PERMISSION_CARDS || '',");
+    expect(interactiveSpawn).not.toContain('MATRON_PERMISSION_CARDS:');
+  });
+});

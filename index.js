@@ -1123,6 +1123,14 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
             type: 'command',
             command: path.join(__dirname, 'hooks', 'matron-bash-tee.sh'),
           }],
+        }, {
+          // Confirmed matcher: mcp__.*; live-CLI smoke is deferred to T-4.1/T-4.2.
+          matcher: 'mcp__.*',
+          hooks: [{
+            type: 'command',
+            command: path.join(__dirname, 'hooks', 'permission-decision.sh'),
+            timeout: 1800,
+          }],
         }],
       },
     }),
@@ -1158,6 +1166,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     // Env is fixed at spawn time; toggling the flag later requires
     // !restart to take effect.
     MATRON_BASH_TEE_ENABLED: showBashOutputAtSpawn ? '1' : '0',
+    MATRON_PERMISSION_CARDS: process.env.MATRON_PERMISSION_CARDS || '',
   };
   delete spawnEnv.SHOW_FILE_TOKEN;
   if (showFileToken) spawnEnv.SHOW_FILE_TOKEN = showFileToken;
