@@ -1147,6 +1147,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   delete spawnEnv.SHOW_FILE_TOKEN;
   if (showFileToken) spawnEnv.SHOW_FILE_TOKEN = showFileToken;
   delete spawnEnv.MATRON_PERMISSION_TOKEN;
+  // CC hooks cannot receive isolated env: the whole claude process inherits this token, authenticating "a process in this print session"; emitted identifiers are parser-bounded.
   spawnEnv.MATRON_PERMISSION_TOKEN = permissionToken;
 
   const permissionSnapshot = process.env.MATRON_PERMISSION_CARDS
@@ -6395,8 +6396,9 @@ const permissionSeams = createPermissionSeams({ pendingPermissionDecisions });
 
 function resolveJournalPermissionReply(key, decision, { username } = {}) {
   const pending = pendingPermissionDecisions.get(key);
-  if (!permissionSeams.resolvePermissionReply(key, decision, { username })) return false;
-  const label = decision === 'allow' ? 'Allow' : 'Deny';
+  const finalized = permissionSeams.resolvePermissionReply(key, decision, { username });
+  if (!finalized || finalized.source !== 'operator') return false;
+  const label = finalized.decision === 'allow' ? 'Allow' : 'Deny';
   journalEchoPromptAnswer(findSessionByClaudeSessionId(pending.convoId), username, label);
   return true;
 }

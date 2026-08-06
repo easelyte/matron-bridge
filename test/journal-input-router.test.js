@@ -1485,15 +1485,15 @@ describe('createJournalInputConsumer — auto-resume of reaped sessions (resumeS
 describe('index.js journal input consumer — permission echo wiring (source inspection)', () => {
   const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
 
-  it('echoes a static label through the normal answer helper only after a live finalizer succeeds', () => {
+  it('echoes the finalized operator label only and suppresses an expired Allow result', () => {
     const resolverStart = src.indexOf('function resolveJournalPermissionReply(');
     expect(resolverStart).toBeGreaterThan(-1);
     const resolverEnd = src.indexOf('// Assembled once', resolverStart);
     const resolver = src.slice(resolverStart, resolverEnd);
-    expect(resolver).toMatch(
-      /if \(!permissionSeams\.resolvePermissionReply\(key, decision, \{ username \}\)\) return false;/,
-    );
-    expect(resolver).toMatch(/decision === 'allow' \? 'Allow' : 'Deny'/);
+    expect(resolver).toMatch(/const finalized = permissionSeams\.resolvePermissionReply/);
+    expect(resolver).toMatch(/finalized\.source !== 'operator'/);
+    expect(resolver).toMatch(/finalized\.decision === 'allow' \? 'Allow' : 'Deny'/);
+    expect(resolver).not.toMatch(/const label = decision ===/);
     expect(resolver).toMatch(/journalEchoPromptAnswer\(/);
     expect(resolver.match(/journalEchoPromptAnswer\(/g)).toHaveLength(1);
 

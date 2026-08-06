@@ -488,7 +488,10 @@ describe('permission decision audit acceptance', () => {
       const response = postPermission(operator.url, requestBody);
       await vi.waitFor(() => expect(operator.pending.has(PENDING_KEY)).toBe(true));
       operator.pending.get(PENDING_KEY).seq = 41;
-      expect(operator.resolvePermissionReply(PENDING_KEY, 'allow', { username: 'dan' })).toBe(true);
+      expect(operator.resolvePermissionReply(PENDING_KEY, 'allow', { username: 'dan' })).toEqual({
+        decision: 'allow',
+        source: 'operator',
+      });
       await response;
       expectAcceptedAudit(operator, {
         seq: 41,
@@ -710,6 +713,8 @@ describe('/permission-decision route', () => {
     ['missing', null],
     ['mismatched', 'wrong-token'],
   ])('rejects a %s per-session permission token before policy or publication', async (_label, token) => {
+    const untrustedToolUseId = 'toolu_sk_live_SECRET123';
+    const untrustedToolName = 'mcp__sk_live_ABC123__probe';
     const classifyPermissionFn = vi.fn();
     const requestPermissionDecision = vi.fn();
     const harness = await openPermissionRouteHarness({
@@ -719,8 +724,8 @@ describe('/permission-decision route', () => {
     try {
       const result = await postPermission(harness.url, {
         session_id: 'session-1',
-        tool_use_id: 'tool-1',
-        tool_name: TOOL_NAME,
+        tool_use_id: untrustedToolUseId,
+        tool_name: untrustedToolName,
       }, token);
 
       expect(result).toEqual({
@@ -731,12 +736,17 @@ describe('/permission-decision route', () => {
       expect(requestPermissionDecision).not.toHaveBeenCalled();
       expect(harness.pending.size).toBe(0);
       expectSingleAudit(harness, {
+        session_id: null,
+        tool_use_id: null,
+        tool_name: null,
         decision: 'deny',
         source: 'error',
         reason: 'unauthorized',
       });
       expect(JSON.stringify(harness.audits)).not.toContain(PERMISSION_TOKEN);
       expect(JSON.stringify(harness.audits)).not.toContain('wrong-token');
+      expect(JSON.stringify(harness.audits)).not.toContain(untrustedToolUseId);
+      expect(JSON.stringify(harness.audits)).not.toContain(untrustedToolName);
     } finally {
       await harness.close();
     }
@@ -770,7 +780,7 @@ describe('/permission-decision route', () => {
       expect(requestPermissionDecision).not.toHaveBeenCalled();
       expect(harness.pending.size).toBe(0);
       expectSingleAudit(harness, {
-        tool_name: toolName,
+        tool_name: null,
         decision: 'deny',
         source: 'error',
         reason: 'invalid tool_name',
@@ -811,6 +821,8 @@ describe('/permission-decision route', () => {
     ['boolean true', true],
     ['boolean false', false],
     ['whitespace', ' \t\n'],
+    ['invalid characters', 'toolu_secret value'],
+    ['overlong', `toolu_${'a'.repeat(123)}`],
   ])('fails closed when tool_use_id is a %s', async (_label, toolUseId) => {
     const requestPermissionDecision = vi.fn();
     const harness = await openPermissionRouteHarness({ requestPermissionDecision });
@@ -823,15 +835,15 @@ describe('/permission-decision route', () => {
 
       expect(result).toEqual({
         status: 400,
-        body: { decision: 'deny', reason: 'tool_use_id required' },
+        body: { decision: 'deny', reason: 'tool_use_id invalid' },
       });
       expect(requestPermissionDecision).not.toHaveBeenCalled();
       expect(harness.pending.size).toBe(0);
       expectSingleAudit(harness, {
-        tool_use_id: toolUseId,
+        tool_use_id: null,
         decision: 'deny',
         source: 'error',
-        reason: 'tool_use_id required',
+        reason: 'tool_use_id invalid',
       });
     } finally {
       await harness.close();
@@ -992,7 +1004,10 @@ describe('/permission-decision route', () => {
 
       const pending = harness.pending.get(PENDING_KEY);
       pending.seq = 42;
-      expect(harness.resolvePermissionReply(PENDING_KEY, 'allow')).toBe(true);
+      expect(harness.resolvePermissionReply(PENDING_KEY, 'allow')).toEqual({
+        decision: 'allow',
+        source: 'operator',
+      });
       expect(harness.resolvePermissionReply(PENDING_KEY, 'deny')).toBe(false);
 
       await expect(responsePromise).resolves.toEqual({
@@ -1254,7 +1269,7 @@ describe('/permission-decision route', () => {
         PENDING_KEY,
         'allow',
         { username: 'dan' },
-      )).toBe(true);
+      )).toEqual({ decision: 'deny', source: 'timeout' });
 
       await expect(response).resolves.toEqual({
         status: 200,
@@ -1324,10 +1339,14 @@ describe('/permission-decision route', () => {
     {
       name: 'unknown session',
       harness: { includeSession: false },
-      request: { session_id: 'missing', tool_use_id: 'tool-1', tool_name: TOOL_NAME },
+      request: {
+        session_id: 'missing-secret-session',
+        tool_use_id: 'toolu_sk_live_SECRET123',
+        tool_name: 'mcp__sk_live_ABC123__probe',
+      },
       status: 404,
       reason: 'unknown session',
-      audit: { session_id: 'missing' },
+      audit: { session_id: null, tool_use_id: null, tool_name: null },
     },
     {
       name: 'non-string session_id',
@@ -1335,7 +1354,7 @@ describe('/permission-decision route', () => {
       request: { session_id: { malformed: true }, tool_use_id: 'tool-1', tool_name: TOOL_NAME },
       status: 404,
       reason: 'unknown session',
-      audit: { session_id: { malformed: true } },
+      audit: { session_id: null, tool_use_id: null, tool_name: null },
     },
     {
       name: 'missing permission handler',
