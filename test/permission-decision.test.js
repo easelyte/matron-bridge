@@ -1,9 +1,11 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
+import { createServer, request } from 'node:http';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { buildSessionSettings } from '../lib/session-settings.js';
+import { classifyPermission } from '../lib/permission-eval.js';
 
 const HOOK = path.resolve('hooks/permission-decision.sh');
 const DEFAULT_INPUT = {
@@ -197,5 +199,366 @@ describe('permission hook spawn environment wiring (source inspection)', () => {
   it('snapshots MATRON_PERMISSION_CARDS only into the print spawn environment', () => {
     expect(printSpawn).toContain("MATRON_PERMISSION_CARDS: process.env.MATRON_PERMISSION_CARDS || '',");
     expect(interactiveSpawn).not.toContain('MATRON_PERMISSION_CARDS:');
+  });
+});
+
+const INDEX_SOURCE = readFileSync(path.resolve('index.js'), 'utf8');
+const auditPermissionDecisionSource = INDEX_SOURCE.slice(
+  INDEX_SOURCE.indexOf('function auditPermissionDecision('),
+  INDEX_SOURCE.indexOf('function handlePermissionDecisionRoute('),
+).trim();
+const handlePermissionDecisionRouteSource = INDEX_SOURCE.slice(
+  INDEX_SOURCE.indexOf('function handlePermissionDecisionRoute('),
+  INDEX_SOURCE.indexOf('function validateShowFileBody('),
+).trim();
+const auditPermissionDecisionFactory = new Function(
+  'console',
+  `return (${auditPermissionDecisionSource});`,
+);
+const handlePermissionDecisionRoute = new Function(
+  `return (${handlePermissionDecisionRouteSource});`,
+)();
+
+const TOOL_NAME = 'mcp__server__tool';
+const DEFAULT_GATED_SNAPSHOT = Object.freeze({
+  mcpAllow: Object.freeze([]),
+  mcpDeny: Object.freeze([]),
+  mcpAsk: Object.freeze([]),
+  uncertain: false,
+});
+
+function permissionSnapshotFor(classification) {
+  return Object.freeze({
+    mcpAllow: Object.freeze(classification === 'allow' ? [TOOL_NAME] : []),
+    mcpDeny: Object.freeze(classification === 'deny' ? [TOOL_NAME] : []),
+    mcpAsk: Object.freeze(classification === 'ask' ? [TOOL_NAME] : []),
+    uncertain: false,
+  });
+}
+
+async function openPermissionRouteHarness({
+  snapshot = DEFAULT_GATED_SNAPSHOT,
+  requestPermissionDecision = () => {},
+  includeSession = true,
+  includeHandler = true,
+  timeoutMs = 1000,
+} = {}) {
+  const pending = new Map();
+  const audits = [];
+  const evictions = [];
+  const target = {
+    claudeSessionId: 'session-1',
+    alive: true,
+    permissionSnapshot: snapshot,
+    ...(includeHandler ? { requestPermissionDecision } : {}),
+  };
+  const sessions = new Map(includeSession ? [['room-1', target]] : []);
+  const auditPermissionDecision = auditPermissionDecisionFactory({
+    log: line => audits.push(JSON.parse(line)),
+  });
+  const server = createServer((req, res) => {
+    let body = '';
+    req.on('data', chunk => { body += chunk; });
+    req.on('end', () => {
+      handlePermissionDecisionRoute({
+        data: JSON.parse(body),
+        res,
+        sessions,
+        pendingPermissionDecisions: pending,
+        classifyPermissionFn: classifyPermission,
+        journalConvoIdForFn: () => 'convo-1',
+        evictPermissionSeq: (key, convoId) => evictions.push([key, convoId]),
+        auditPermissionDecisionFn: auditPermissionDecision,
+        timeoutMs,
+      });
+    });
+  });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const { port } = server.address();
+
+  return {
+    audits,
+    evictions,
+    pending,
+    target,
+    url: `http://127.0.0.1:${port}/permission-decision`,
+    async close() {
+      server.closeAllConnections();
+      await new Promise(resolve => server.close(resolve));
+    },
+  };
+}
+
+async function postPermission(url, body = {}) {
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  return { status: response.status, body: await response.json() };
+}
+
+function expectSingleAudit(harness, expected) {
+  const expectedSessionId = Object.hasOwn(expected, 'session_id')
+    ? expected.session_id
+    : 'session-1';
+  const expectedToolUseId = Object.hasOwn(expected, 'tool_use_id')
+    ? expected.tool_use_id
+    : 'tool-1';
+  const expectedToolName = Object.hasOwn(expected, 'tool_name')
+    ? expected.tool_name
+    : TOOL_NAME;
+  expect(harness.audits).toHaveLength(1);
+  expect(harness.audits[0]).toEqual({
+    event: 'permission_decision',
+    session_id: expectedSessionId,
+    tool_use_id: expectedToolUseId,
+    seq: expected.seq ?? null,
+    tool_name: expectedToolName,
+    decision: expected.decision,
+    source: expected.source,
+    reason: expected.reason ?? '',
+    ts: expect.stringMatching(/^\d{4}-\d{2}-\d{2}T/),
+  });
+  expect(harness.audits[0]).not.toHaveProperty('tool_input');
+  expect(harness.audits[0]).not.toHaveProperty('executed');
+}
+
+describe('/permission-decision route', () => {
+  it.each(['deny', 'ask'])('%s policy matches deny immediately without a card or pending entry', async classification => {
+    const requestPermissionDecision = vi.fn();
+    const harness = await openPermissionRouteHarness({
+      snapshot: permissionSnapshotFor(classification),
+      requestPermissionDecision,
+    });
+    try {
+      const result = await postPermission(harness.url, {
+        session_id: 'session-1',
+        tool_use_id: 'tool-1',
+        tool_name: TOOL_NAME,
+        tool_input: { secret: 'must-not-be-read-or-audited' },
+      });
+
+      expect(result).toEqual({ status: 200, body: { decision: 'deny', reason: 'policy' } });
+      expect(requestPermissionDecision).not.toHaveBeenCalled();
+      expect(harness.pending.size).toBe(0);
+      expect(harness.evictions).toEqual([]);
+      expectSingleAudit(harness, {
+        decision: 'deny',
+        source: 'policy-deny',
+        reason: 'policy',
+      });
+      expect(JSON.stringify(harness.audits)).not.toContain('must-not-be-read-or-audited');
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it('allows an exact confident allow immediately without a card or pending entry', async () => {
+    const requestPermissionDecision = vi.fn();
+    const harness = await openPermissionRouteHarness({
+      snapshot: permissionSnapshotFor('allow'),
+      requestPermissionDecision,
+    });
+    try {
+      const result = await postPermission(harness.url, {
+        session_id: 'session-1',
+        tool_use_id: 'tool-1',
+        tool_name: TOOL_NAME,
+      });
+
+      expect(result).toEqual({ status: 200, body: { decision: 'allow' } });
+      expect(requestPermissionDecision).not.toHaveBeenCalled();
+      expect(harness.pending.size).toBe(0);
+      expectSingleAudit(harness, { decision: 'allow', source: 'auto-allow' });
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it('registers default-gated requests before surfacing the card and survives normal request completion', async () => {
+    let handlerEntered;
+    const entered = new Promise(resolve => { handlerEntered = resolve; });
+    const requestPermissionDecision = vi.fn(handlerEntered);
+    const harness = await openPermissionRouteHarness({ requestPermissionDecision });
+    try {
+      const responsePromise = postPermission(harness.url, {
+        session_id: 'session-1',
+        tool_use_id: 'tool-1',
+        tool_name: TOOL_NAME,
+      });
+      await entered;
+
+      expect(requestPermissionDecision).toHaveBeenCalledWith('tool-1', { tool_name: TOOL_NAME });
+      expect(harness.pending.has('convo-1 tool-1')).toBe(true);
+      expect(harness.pending.get('convo-1 tool-1')).toMatchObject({
+        seq: null,
+        convoId: 'convo-1',
+        tool_name: TOOL_NAME,
+        resolve: expect.any(Function),
+        timer: expect.anything(),
+      });
+      expect(harness.audits).toEqual([]);
+      await new Promise(resolve => setTimeout(resolve, 20));
+      expect(harness.pending.has('convo-1 tool-1')).toBe(true);
+
+      const pending = harness.pending.get('convo-1 tool-1');
+      pending.seq = 42;
+      pending.resolve({ decision: 'allow', reason: 'operator allowed', source: 'operator' });
+      pending.resolve({ decision: 'deny', reason: 'duplicate', source: 'operator' });
+
+      await expect(responsePromise).resolves.toEqual({
+        status: 200,
+        body: { decision: 'allow', reason: 'operator allowed' },
+      });
+      expect(harness.pending.size).toBe(0);
+      expect(harness.evictions).toEqual([['convo-1 tool-1', 'convo-1']]);
+      expectSingleAudit(harness, {
+        seq: 42,
+        decision: 'allow',
+        source: 'operator',
+        reason: 'operator allowed',
+      });
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it('fails closed on timeout and evicts the pending sequence exactly once', async () => {
+    const requestPermissionDecision = vi.fn();
+    const harness = await openPermissionRouteHarness({ requestPermissionDecision, timeoutMs: 10 });
+    try {
+      const result = await postPermission(harness.url, {
+        session_id: 'session-1',
+        tool_use_id: 'tool-1',
+        tool_name: TOOL_NAME,
+      });
+
+      expect(result).toEqual({ status: 200, body: { decision: 'deny', reason: 'timeout' } });
+      expect(requestPermissionDecision).toHaveBeenCalledOnce();
+      expect(harness.pending.size).toBe(0);
+      expect(harness.evictions).toEqual([['convo-1 tool-1', 'convo-1']]);
+      expectSingleAudit(harness, { decision: 'deny', source: 'timeout', reason: 'timeout' });
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it('cleans up once when the real response socket closes before resolution', async () => {
+    let handlerEntered;
+    const entered = new Promise(resolve => { handlerEntered = resolve; });
+    const harness = await openPermissionRouteHarness({
+      requestPermissionDecision: vi.fn(handlerEntered),
+      timeoutMs: 100,
+    });
+    try {
+      const clientRequest = request(harness.url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+      });
+      clientRequest.on('error', () => {});
+      clientRequest.end(JSON.stringify({
+        session_id: 'session-1',
+        tool_use_id: 'tool-1',
+        tool_name: TOOL_NAME,
+      }));
+      await entered;
+      const pending = harness.pending.get('convo-1 tool-1');
+
+      clientRequest.destroy();
+      await vi.waitFor(() => expect(harness.audits).toHaveLength(1));
+      pending.resolve({ decision: 'allow', source: 'operator' });
+      await new Promise(resolve => setTimeout(resolve, 120));
+
+      expect(harness.pending.size).toBe(0);
+      expect(harness.evictions).toEqual([['convo-1 tool-1', 'convo-1']]);
+      expectSingleAudit(harness, {
+        decision: 'deny',
+        source: 'disconnect',
+        reason: 'client disconnect',
+      });
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it.each([
+    {
+      name: 'missing tool_use_id',
+      harness: {},
+      request: { session_id: 'session-1', tool_name: TOOL_NAME },
+      status: 400,
+      reason: 'tool_use_id required',
+      audit: { tool_use_id: null },
+    },
+    {
+      name: 'unknown session',
+      harness: { includeSession: false },
+      request: { session_id: 'missing', tool_use_id: 'tool-1', tool_name: TOOL_NAME },
+      status: 404,
+      reason: 'unknown session',
+      audit: { session_id: 'missing' },
+    },
+    {
+      name: 'missing permission handler',
+      harness: { includeHandler: false },
+      request: { session_id: 'session-1', tool_use_id: 'tool-1', tool_name: TOOL_NAME },
+      status: 503,
+      reason: 'no permission handler',
+      audit: {},
+    },
+  ])('fails closed and audits a $name', async testCase => {
+    const harness = await openPermissionRouteHarness(testCase.harness);
+    try {
+      const result = await postPermission(harness.url, testCase.request);
+
+      expect(result).toEqual({
+        status: testCase.status,
+        body: { decision: 'deny', reason: testCase.reason },
+      });
+      expect(harness.pending.size).toBe(0);
+      expectSingleAudit(harness, {
+        decision: 'deny',
+        source: 'error',
+        reason: testCase.reason,
+        ...testCase.audit,
+      });
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it('fails closed through the finalizer when the session handler throws', async () => {
+    const harness = await openPermissionRouteHarness({
+      requestPermissionDecision: () => { throw new Error('card failed'); },
+    });
+    try {
+      const result = await postPermission(harness.url, {
+        session_id: 'session-1',
+        tool_use_id: 'tool-1',
+        tool_name: TOOL_NAME,
+      });
+
+      expect(result).toEqual({
+        status: 200,
+        body: { decision: 'deny', reason: 'session handler threw: card failed' },
+      });
+      expect(harness.pending.size).toBe(0);
+      expect(harness.evictions).toEqual([['convo-1 tool-1', 'convo-1']]);
+      expectSingleAudit(harness, {
+        decision: 'deny',
+        source: 'error',
+        reason: 'session handler threw: card failed',
+      });
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it('uses the reviewed production deadline and listens for disconnects on the response only', () => {
+    expect(INDEX_SOURCE).toContain('const PERMISSION_DECISION_TIMEOUT_MS = 1680 * 1000;');
+    expect(handlePermissionDecisionRouteSource).toContain("res.on('close'");
+    expect(handlePermissionDecisionRouteSource).not.toContain("req.on('close'");
+    expect(INDEX_SOURCE).toContain("} else if (url.pathname === '/permission-decision') {");
   });
 });
