@@ -1,6 +1,7 @@
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
@@ -34,6 +35,8 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.restoreAllMocks();
+  vi.unstubAllEnvs();
   rmSync(fixtureDir, { recursive: true, force: true });
 });
 
@@ -55,22 +58,45 @@ describe('permission snapshot', () => {
     expect(classifyPermission(snapshot, 'mcp__webflow__data_sites_tool')).toBe('default-gated');
   });
 
-  it.skipIf(!existsSync(PRODUCTION_SETTINGS_LOCAL))(
-    'classifies the real workspace Webflow exact-name allowlist',
-    () => {
-      const fixtureSettings = JSON.parse(readFileSync(WEBFLOW_SETTINGS_FIXTURE, 'utf8'));
-      const settings = JSON.parse(readFileSync(PRODUCTION_SETTINGS_LOCAL, 'utf8'));
-      const fixtureWebflowTools = webflowAllowRules(fixtureSettings);
-      const webflowTools = webflowAllowRules(settings);
-      const snapshot = buildPermissionSnapshot({ sourcePaths: [PRODUCTION_SETTINGS_LOCAL] });
+  it('classifies the live Webflow allowlist when present, otherwise the committed fixture', () => {
+    const sourcePath = existsSync(PRODUCTION_SETTINGS_LOCAL)
+      ? PRODUCTION_SETTINGS_LOCAL
+      : WEBFLOW_SETTINGS_FIXTURE;
+    const fixtureSettings = JSON.parse(readFileSync(WEBFLOW_SETTINGS_FIXTURE, 'utf8'));
+    const settings = JSON.parse(readFileSync(sourcePath, 'utf8'));
+    const fixtureWebflowTools = webflowAllowRules(fixtureSettings);
+    const webflowTools = webflowAllowRules(settings);
+    const snapshot = buildPermissionSnapshot({ sourcePaths: [sourcePath] });
 
-      expect(webflowTools).toEqual(fixtureWebflowTools);
-      for (const toolName of webflowTools) {
-        expect(classifyPermission(snapshot, toolName), toolName).toBe('allow');
-      }
-      expect(classifyPermission(snapshot, 'mcp__webflow__data_sites_tool')).toBe('default-gated');
-    },
-  );
+    expect(webflowTools).toEqual(fixtureWebflowTools);
+    for (const toolName of webflowTools) {
+      expect(classifyPermission(snapshot, toolName), toolName).toBe('allow');
+    }
+    expect(classifyPermission(snapshot, 'mcp__webflow__data_sites_tool')).toBe('default-gated');
+  });
+
+  it('discovers workspace, local, and user permission layers by default', () => {
+    const workdir = path.join(fixtureDir, 'workspace');
+    const homeDir = path.join(fixtureDir, 'home');
+    mkdirSync(path.join(workdir, '.claude'), { recursive: true });
+    mkdirSync(path.join(homeDir, '.claude'), { recursive: true });
+    writeFileSync(path.join(workdir, '.claude', 'settings.json'), JSON.stringify({
+      permissions: { allow: ['mcp__workspace__settings_tool'] },
+    }));
+    writeFileSync(path.join(workdir, '.claude', 'settings.local.json'), JSON.stringify({
+      permissions: { allow: ['mcp__workspace__local_tool'] },
+    }));
+    writeFileSync(path.join(homeDir, '.claude', 'settings.json'), JSON.stringify({
+      permissions: { allow: ['mcp__user__settings_tool'] },
+    }));
+    vi.stubEnv('HOME', homeDir);
+
+    const snapshot = buildPermissionSnapshot({ workdir });
+
+    expect(classifyPermission(snapshot, 'mcp__workspace__settings_tool')).toBe('allow');
+    expect(classifyPermission(snapshot, 'mcp__workspace__local_tool')).toBe('allow');
+    expect(classifyPermission(snapshot, 'mcp__user__settings_tool')).toBe('allow');
+  });
 
   it('ignores non-MCP permission rules in every rule list', () => {
     const source = writeSettings('non-mcp-rules.json', {
@@ -137,14 +163,18 @@ describe('permission snapshot', () => {
       deny: ['mcp__server__denied_tool'],
       ask: ['mcp__server__asked_tool'],
     });
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
-    expect(() => buildPermissionSnapshot({
-      sourcePaths: [malformedPath, policyPath],
-    })).not.toThrow();
+    let snapshot;
+    expect(() => {
+      snapshot = buildPermissionSnapshot({
+        sourcePaths: [malformedPath, policyPath],
+      });
+    }).not.toThrow();
 
-    const snapshot = buildPermissionSnapshot({
-      sourcePaths: [malformedPath, policyPath],
-    });
+    expect(warn).toHaveBeenCalledOnce();
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining(malformedPath));
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('invalid JSON'));
     expect(snapshot.uncertain).toBe(true);
     expect(classifyPermission(snapshot, 'mcp__webflow__data_sites_tool')).toBe('default-gated');
     expect(classifyPermission(snapshot, 'mcp__server__denied_tool')).toBe('deny');
@@ -156,9 +186,11 @@ describe('permission snapshot', () => {
       allow: ['mcp__server__allowed_tool'],
     });
     const missingPath = path.join(fixtureDir, '.claude', 'settings.json');
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
 
     const snapshot = buildPermissionSnapshot({ sourcePaths: [missingPath, allowPath] });
 
+    expect(warn).not.toHaveBeenCalled();
     expect(snapshot.uncertain).toBe(false);
     expect(classifyPermission(snapshot, 'mcp__server__allowed_tool')).toBe('allow');
   });
