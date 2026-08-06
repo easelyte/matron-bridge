@@ -81,6 +81,8 @@ import { handlePickerValue } from './lib/picker-dispatch.js';
 import { createJournalInputConsumer, resolvePromptChoice } from './lib/journal-input-router.js';
 import {
   auditPermissionDecision,
+  buildPermissionCardPayload,
+  buildPermissionKey,
   createPermissionDecisionBodyCollector,
   createPermissionSeams,
   handlePermissionDecisionRoute,
@@ -1209,6 +1211,28 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     chatHistory: [],         // { role, text } - full messages (code/tools stripped)
     pinnedSummaryEventId: null, // event ID of pinned summary message
     pinnedSummaryText: '',       // accumulated summary text (source of truth, not Matrix)
+  };
+
+  session.requestPermissionDecision = (toolUseId, { tool_name, expires_at } = {}) => {
+    const convoId = journalConvoIdFor(session);
+    const exp = typeof expires_at === 'number'
+      ? expires_at
+      : Date.now() + PERMISSION_DECISION_TIMEOUT_MS;
+    const payload = buildPermissionCardPayload(toolUseId, tool_name, exp);
+    if (convoId) {
+      journalPublisher.publishPermissionRequest(convoId, payload);
+      return;
+    }
+
+    const key = buildPermissionKey(convoId, toolUseId);
+    const pending = pendingPermissionDecisions.get(key);
+    if (pending?.resolve) {
+      pending.resolve({
+        decision: 'deny',
+        reason: 'no output channel for session',
+        source: 'error',
+      });
+    }
   };
 
   // A spawn 'error' with no listener is fatal to the whole bridge (crash-loop

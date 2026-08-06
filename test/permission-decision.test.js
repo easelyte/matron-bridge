@@ -265,6 +265,45 @@ describe('permission hook spawn environment wiring (source inspection)', () => {
 
 const INDEX_SOURCE = readFileSync(path.resolve('index.js'), 'utf8');
 const handlePermissionDecisionRouteSource = handlePermissionDecisionRoute.toString();
+const PRINT_SESSION_SOURCE = INDEX_SOURCE.slice(
+  INDEX_SOURCE.indexOf('function createSession('),
+  INDEX_SOURCE.indexOf('// --- Codex programmatic sessions ---'),
+);
+const INTERACTIVE_SESSION_SOURCE = INDEX_SOURCE.slice(
+  INDEX_SOURCE.indexOf('function createInteractiveSessionForRoom('),
+  INDEX_SOURCE.indexOf('// --- Structured Question Handling ---'),
+);
+
+function installPrintPermissionDecisionHandler({
+  session,
+  journalPublisher,
+  pendingPermissionDecisions,
+  timeoutMs = 1000,
+}) {
+  const match = PRINT_SESSION_SOURCE.match(
+    /session\.requestPermissionDecision = ([\s\S]*?\n {2}});\n\n {2}\/\/ A spawn/,
+  );
+  if (!match) throw new Error('print requestPermissionDecision handler not found');
+  const makeHandler = Function(
+    'session',
+    'journalConvoIdFor',
+    'journalPublisher',
+    'buildPermissionCardPayload',
+    'buildPermissionKey',
+    'pendingPermissionDecisions',
+    'PERMISSION_DECISION_TIMEOUT_MS',
+    `return (${match[1]});`,
+  );
+  session.requestPermissionDecision = makeHandler(
+    session,
+    value => value?.journalConvoId || value?.claudeSessionId || null,
+    journalPublisher,
+    buildPermissionCardPayload,
+    buildPermissionKey,
+    pendingPermissionDecisions,
+    timeoutMs,
+  );
+}
 
 const TOOL_NAME = 'mcp__server__tool';
 const PENDING_KEY = buildPermissionKey('convo-1', 'tool-1');
@@ -384,6 +423,67 @@ function expectSingleAudit(harness, expected) {
   expect(harness.audits[0]).not.toHaveProperty('tool_input');
   expect(harness.audits[0]).not.toHaveProperty('executed');
 }
+
+describe('print session requestPermissionDecision', () => {
+  it('publishes exactly one redacted permission request with the route deadline', () => {
+    const session = { journalConvoId: 'convo-card' };
+    const journalPublisher = { publishPermissionRequest: vi.fn() };
+    installPrintPermissionDecisionHandler({
+      session,
+      journalPublisher,
+      pendingPermissionDecisions: new Map(),
+    });
+
+    session.requestPermissionDecision('tool-card', {
+      tool_name: 'mcp__vercel__deploy_to_vercel',
+      expires_at: 1_780_000_000_002,
+      tool_input: { token: 'must-not-cross-the-card-boundary' },
+    });
+
+    expect(journalPublisher.publishPermissionRequest).toHaveBeenCalledOnce();
+    expect(journalPublisher.publishPermissionRequest).toHaveBeenCalledWith('convo-card', {
+      kind: 'permission',
+      tool_use_id: 'tool-card',
+      description: 'Allow vercel tool "deploy_to_vercel"?',
+      options: [
+        { id: 'allow', label: 'Allow' },
+        { id: 'deny', label: 'Deny' },
+      ],
+      expires_at: 1_780_000_000_002,
+    });
+    expect(JSON.stringify(journalPublisher.publishPermissionRequest.mock.calls))
+      .not.toContain('must-not-cross-the-card-boundary');
+  });
+
+  it('denies the matching pending entry when the session has no output channel', () => {
+    const session = {};
+    const resolve = vi.fn();
+    const pendingPermissionDecisions = new Map([
+      [buildPermissionKey(null, 'tool-no-convo'), { resolve }],
+    ]);
+    const journalPublisher = { publishPermissionRequest: vi.fn() };
+    installPrintPermissionDecisionHandler({
+      session,
+      journalPublisher,
+      pendingPermissionDecisions,
+    });
+
+    session.requestPermissionDecision('tool-no-convo', { tool_name: TOOL_NAME });
+
+    expect(journalPublisher.publishPermissionRequest).not.toHaveBeenCalled();
+    expect(resolve).toHaveBeenCalledOnce();
+    expect(resolve).toHaveBeenCalledWith({
+      decision: 'deny',
+      reason: 'no output channel for session',
+      source: 'error',
+    });
+  });
+
+  it('is attached to print sessions only', () => {
+    expect(PRINT_SESSION_SOURCE).toContain('session.requestPermissionDecision =');
+    expect(INTERACTIVE_SESSION_SOURCE).not.toContain('session.requestPermissionDecision =');
+  });
+});
 
 describe('/permission-decision route', () => {
   it('fails closed and audits malformed JSON exactly once', async () => {
@@ -569,6 +669,8 @@ describe('/permission-decision route', () => {
     const entered = new Promise(resolve => { handlerEntered = resolve; });
     const requestPermissionDecision = vi.fn(handlerEntered);
     const harness = await openPermissionRouteHarness({ requestPermissionDecision });
+    const now = 1_780_000_000_000;
+    const dateNow = vi.spyOn(Date, 'now').mockReturnValue(now);
     try {
       const responsePromise = postPermission(harness.url, {
         session_id: 'session-1',
@@ -576,10 +678,15 @@ describe('/permission-decision route', () => {
         tool_name: TOOL_NAME,
       });
       await entered;
+      dateNow.mockRestore();
 
-      expect(requestPermissionDecision).toHaveBeenCalledWith('tool-1', { tool_name: TOOL_NAME });
+      expect(requestPermissionDecision).toHaveBeenCalledWith('tool-1', {
+        tool_name: TOOL_NAME,
+        expires_at: now + 1000,
+      });
       expect(harness.pending.has(PENDING_KEY)).toBe(true);
       expect(harness.pending.get(PENDING_KEY)).toMatchObject({
+        expiresAt: now + 1000,
         seq: null,
         convoId: 'convo-1',
         tool_name: TOOL_NAME,
@@ -607,6 +714,7 @@ describe('/permission-decision route', () => {
         source: 'operator',
       });
     } finally {
+      dateNow.mockRestore();
       await harness.close();
     }
   });
