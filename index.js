@@ -50,6 +50,7 @@ import { ivUploadDir, ivUploadAnnotation } from './lib/iv-uploads.js';
 import { parseUsageLimits, formatLimits } from './lib/usage-limits.js';
 import { resolveSpawnCwd, attachSpawnErrorHandler } from './lib/spawn-guard.js';
 import { buildSessionSettings } from './lib/session-settings.js';
+import { buildPermissionSnapshot } from './lib/permission-eval.js';
 import { readSessionSummary, listSessionSummaries, listSessionIdsByMtime, pathExists } from './lib/session-summary.js';
 import {
   isIvSlashPassthrough,
@@ -1138,6 +1139,8 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   delete spawnEnv.SHOW_FILE_TOKEN;
   if (showFileToken) spawnEnv.SHOW_FILE_TOKEN = showFileToken;
 
+  const permissionSnapshot = buildPermissionSnapshot({ workdir: cwd });
+
   const proc = launchWithCodexSinkEnv({
     spawnEnv,
     workdir: cwd,
@@ -1159,6 +1162,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     showFilePinnedRoots,
     _showFileInFlight: 0,
     mcpExtras,
+    permissionSnapshot,
     responseBuffer: '',
     sendCallback: null,
     pendingPlan: null,
