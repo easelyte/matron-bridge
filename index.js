@@ -1124,7 +1124,10 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
             command: path.join(__dirname, 'hooks', 'matron-bash-tee.sh'),
           }],
         }, {
-          // Confirmed matcher: mcp__.*; live-CLI smoke is deferred to T-4.1/T-4.2.
+          // Matcher mcp__.* is POC-confirmed to fire this PreToolUse hook on a
+          // gated MCP call in CC 2.1.222 --print (2026-08-06: a stub server's
+          // mcp__ping__ping call was intercepted and denied; no fallback to the
+          // literal `mcp__` needed). Full round-trip acceptance smoke: T-4.2.
           matcher: 'mcp__.*',
           hooks: [{
             type: 'command',
