@@ -149,15 +149,21 @@ describe('permission hook session settings', () => {
 
   it('registers exactly one complete permission hook in print mode', () => {
     const preToolUse = parsedSettings('print').hooks.PreToolUse;
-    const permissionEntries = preToolUse.filter(entry =>
-      entry.matcher === 'mcp__.*'
-      && entry.hooks?.some(hook =>
-        hook.command.endsWith('permission-decision.sh')
-        && hook.timeout === 1800
-      )
+    const permissionRegistrations = preToolUse.flatMap(entry =>
+      entry.hooks
+        .filter(hook => hook.command.endsWith('permission-decision.sh'))
+        .map(() => entry)
     );
 
-    expect(permissionEntries).toHaveLength(1);
+    expect(permissionRegistrations).toHaveLength(1);
+    expect(permissionRegistrations[0]).toEqual({
+      matcher: 'mcp__.*',
+      hooks: [{
+        type: 'command',
+        command: HOOK,
+        timeout: 1800,
+      }],
+    });
   });
 
   it('does not register the permission hook in interactive mode', () => {
@@ -179,6 +185,14 @@ describe('permission hook spawn environment wiring (source inspection)', () => {
     indexSource.indexOf('function createInteractiveSessionForRoom('),
     indexSource.indexOf('// --- Structured Question Handling ---')
   );
+
+  it('builds print spawn settings in print mode', () => {
+    expect(printSpawn).toContain("'--settings', JSON.stringify(buildSessionSettings('print')),");
+  });
+
+  it('builds interactive spawn settings in iv mode', () => {
+    expect(interactiveSpawn).toContain("'--settings', JSON.stringify(buildSessionSettings('iv')),");
+  });
 
   it('snapshots MATRON_PERMISSION_CARDS only into the print spawn environment', () => {
     expect(printSpawn).toContain("MATRON_PERMISSION_CARDS: process.env.MATRON_PERMISSION_CARDS || '',");
