@@ -1,5 +1,11 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
 import path from 'node:path';
 import {
   buildPermissionSnapshot,
@@ -34,6 +40,7 @@ const WEBFLOW_EXACT_TOOLS = [
   'mcp__webflow__data_comments_tool',
   'mcp__webflow__get_more_tools',
 ];
+const PRODUCTION_SETTINGS_LOCAL = '/root/.openclaw/workspace/.claude/settings.local.json';
 
 let fixtureDir;
 
@@ -62,17 +69,34 @@ describe('permission snapshot', () => {
     const snapshot = buildPermissionSnapshot({ sourcePaths: [settingsLocal] });
 
     expect(Object.isFrozen(snapshot)).toBe(true);
-    expect(snapshot.mcpAllow).toBeInstanceOf(Set);
-    expect(snapshot.mcpDeny).toBeInstanceOf(Set);
-    expect(snapshot.mcpAsk).toBeInstanceOf(Set);
-    expect(snapshot.mcpAllow.has('Bash(*)')).toBe(false);
-    expect(snapshot.mcpDeny.has('Read(/restricted/**)')).toBe(false);
-    expect(snapshot.mcpAsk.has('Write(*)')).toBe(false);
+    expect(Object.isFrozen(snapshot.mcpAllow)).toBe(true);
+    expect(Object.isFrozen(snapshot.mcpDeny)).toBe(true);
+    expect(Object.isFrozen(snapshot.mcpAsk)).toBe(true);
+    expect(snapshot.mcpAllow).not.toContain('Bash(*)');
+    expect(snapshot.mcpDeny).not.toContain('Read(/restricted/**)');
+    expect(snapshot.mcpAsk).not.toContain('Write(*)');
     for (const toolName of WEBFLOW_EXACT_TOOLS) {
       expect(classifyPermission(snapshot, toolName), toolName).toBe('allow');
     }
     expect(classifyPermission(snapshot, 'mcp__webflow__data_sites_tool')).toBe('default-gated');
   });
+
+  it.skipIf(!existsSync(PRODUCTION_SETTINGS_LOCAL))(
+    'classifies the real workspace Webflow exact-name allowlist',
+    () => {
+      const settings = JSON.parse(readFileSync(PRODUCTION_SETTINGS_LOCAL, 'utf8'));
+      const webflowTools = settings.permissions.allow.filter(rule => (
+        typeof rule === 'string' && rule.startsWith('mcp__webflow__')
+      ));
+      const snapshot = buildPermissionSnapshot({ sourcePaths: [PRODUCTION_SETTINGS_LOCAL] });
+
+      expect(webflowTools.length).toBeGreaterThan(0);
+      for (const toolName of webflowTools) {
+        expect(classifyPermission(snapshot, toolName), toolName).toBe('allow');
+      }
+      expect(classifyPermission(snapshot, 'mcp__webflow__data_sites_tool')).toBe('default-gated');
+    },
+  );
 
   it.each(['mcp__webflow', 'mcp__webflow__*'])(
     'treats server-level allow %s as default-gated uncertainty',
@@ -128,6 +152,31 @@ describe('permission snapshot', () => {
     expect(classifyPermission(snapshot, 'mcp__webflow__data_sites_tool')).toBe('default-gated');
     expect(classifyPermission(snapshot, 'mcp__server__denied_tool')).toBe('deny');
     expect(classifyPermission(snapshot, 'mcp__server__asked_tool')).toBe('ask');
+  });
+
+  it('does not auto-allow an exact match when another source is malformed', () => {
+    const allowPath = writeSettings('allow.json', {
+      allow: ['mcp__server__allowed_tool'],
+    });
+    const malformedPath = path.join(fixtureDir, 'malformed.json');
+    writeFileSync(malformedPath, '{not json');
+
+    const snapshot = buildPermissionSnapshot({ sourcePaths: [allowPath, malformedPath] });
+
+    expect(snapshot.uncertain).toBe(true);
+    expect(classifyPermission(snapshot, 'mcp__server__allowed_tool')).toBe('default-gated');
+  });
+
+  it('cannot be mutated after creation to change a classification', () => {
+    const source = writeSettings('immutable.json', {
+      allow: ['mcp__server__allowed_tool'],
+    });
+    const snapshot = buildPermissionSnapshot({ sourcePaths: [source] });
+
+    expect(() => snapshot.mcpAllow.push('mcp__server__injected_tool')).toThrow(TypeError);
+    expect(() => snapshot.mcpDeny.push('mcp__server__allowed_tool')).toThrow(TypeError);
+    expect(classifyPermission(snapshot, 'mcp__server__injected_tool')).toBe('default-gated');
+    expect(classifyPermission(snapshot, 'mcp__server__allowed_tool')).toBe('allow');
   });
 
   it('includes the bridge print-mode MCP permission in every snapshot', () => {
