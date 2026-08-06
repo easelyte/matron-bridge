@@ -6370,6 +6370,7 @@ function journalResumeConvo(convoId) {
 // frame.convo_id provide the same stable conversation identity without
 // plumbing a transport-specific session_id through the router.
 const pendingPermissionDecisions = new Map();
+const permissionSeams = createPermissionSeams({ pendingPermissionDecisions });
 
 // Assembled once and invoked from journalHandleInboundEvent (the `function`
 // declaration wired into createJournalPublisher near the top of this file —
@@ -6391,7 +6392,7 @@ const journalInputConsumer = createJournalInputConsumer({
   routeTextToSession: journalOnText,
   routeMediaToSession: journalOnMedia,
   routePromptReply: journalOnPromptReply,
-  ...createPermissionSeams({ pendingPermissionDecisions }),
+  ...permissionSeams,
   resumeSessionForConvo: journalResumeConvo,
   noticeUnknownConvo: (convoId, { type }) => {
     journalPublishNotice(convoId, type === 'prompt_reply'
@@ -6415,8 +6416,9 @@ function journalHandleInboundEvent(frame) {
   journalInputConsumer(frame);
 }
 
-// Evict the reply-staleness guard record for a torn-down session's convo
-// (issue #98 nit — the consumer's per-convo map is otherwise never pruned).
+// Finalize pending permission decisions and evict the reply-staleness guard
+// record for a torn-down session's convo (the consumer's per-convo map is
+// otherwise never pruned).
 // Called from every TERMINAL session teardown (the exit handlers' non-restart
 // branches and !stop), alongside the other journal state those sites already
 // settle (journalSessionState 'done' / journalActivity 'idle'). Deliberately
@@ -6427,6 +6429,7 @@ function journalHandleInboundEvent(frame) {
 function journalEvictConvoInput(session) {
   const convoId = journalConvoIdFor(session);
   if (convoId) {
+    permissionSeams.finalizePendingPermissionsForConvo(convoId, 'session ended');
     journalInputConsumer.evictConvo(convoId, {
       clearQueue: () => {
         session.queuedMessages = null;

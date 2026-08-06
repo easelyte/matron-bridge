@@ -51,12 +51,17 @@ if [ -z "$RESP" ]; then
 fi
 
 if ! printf '%s' "$RESP" | jq -e \
-  'type == "object" and (.decision == "allow" or .decision == "deny")' \
+  'type == "object" and (.decision == "pass" or .decision == "allow" or .decision == "deny")' \
   >/dev/null 2>&1; then
   deny_unreachable 'bridge returned an invalid response'
 fi
 
 DECISION=$(printf '%s' "$RESP" | jq -r '.decision')
+if [ "$DECISION" = 'pass' ]; then
+  echo '{}'
+  exit 0
+fi
+
 REASON=$(printf '%s' "$RESP" | jq -r 'if .reason == null then "" else (.reason | tostring) end')
 
 jq -nc --arg decision "$DECISION" --arg reason "$REASON" \

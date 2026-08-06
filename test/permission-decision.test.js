@@ -63,6 +63,7 @@ case "$FAKE_CURL_MODE" in
   empty) printf '\\n200' ;;
   malformed) printf 'not-json\\n200' ;;
   non2xx) printf '{"decision":"allow","reason":"must not pass"}\\n503' ;;
+  pass) printf '{"decision":"pass"}\\n200' ;;
   deny) printf '{"decision":"deny","reason":"operator denied"}\\n200' ;;
   *) printf '{"decision":"allow","reason":"operator allowed"}\\n200' ;;
 esac
@@ -140,6 +141,12 @@ describe('permission-decision.sh', () => {
     });
     expect(rawBody).not.toContain('tool_input');
     expect(rawBody).not.toContain('super-secret-value');
+  });
+
+  it('returns a neutral hook result for a pass decision', () => {
+    const result = runHook({ mode: 'pass' });
+
+    expect(JSON.parse(result.stdout)).toEqual({});
   });
 
   it('returns a valid deny decision', () => {
@@ -449,7 +456,7 @@ describe('/permission-decision route', () => {
     }
   });
 
-  it('allows an exact confident allow immediately without a card or pending entry', async () => {
+  it('passes an exact confident allow to the canonical evaluator without a card or pending entry', async () => {
     const requestPermissionDecision = vi.fn();
     const harness = await openPermissionRouteHarness({
       snapshot: permissionSnapshotFor('allow'),
@@ -462,10 +469,14 @@ describe('/permission-decision route', () => {
         tool_name: TOOL_NAME,
       });
 
-      expect(result).toEqual({ status: 200, body: { decision: 'allow' } });
+      expect(result).toEqual({ status: 200, body: { decision: 'pass' } });
       expect(requestPermissionDecision).not.toHaveBeenCalled();
       expect(harness.pending.size).toBe(0);
-      expectSingleAudit(harness, { decision: 'allow', source: 'auto-allow' });
+      expectSingleAudit(harness, {
+        decision: 'pass',
+        source: 'auto-allow',
+        reason: 'passthrough to canonical evaluator',
+      });
     } finally {
       await harness.close();
     }
@@ -625,6 +636,54 @@ describe('/permission-decision route', () => {
         expect(audit).not.toHaveProperty('tool_input');
         expect(audit).not.toHaveProperty('executed');
       }
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it('finalizes a conversation on teardown and admits an immediate resume of the same tuple', async () => {
+    const requestPermissionDecision = vi.fn();
+    const harness = await openPermissionRouteHarness({ requestPermissionDecision });
+    const requestBody = {
+      session_id: 'session-1',
+      tool_use_id: 'tool-1',
+      tool_name: TOOL_NAME,
+    };
+    try {
+      const firstResponse = postPermission(harness.url, requestBody);
+      await vi.waitFor(() => expect(requestPermissionDecision).toHaveBeenCalledOnce());
+      harness.pending.get(PENDING_KEY).seq = 42;
+
+      harness.finalizePendingPermissionsForConvo('convo-1', 'session ended');
+
+      await expect(firstResponse).resolves.toEqual({
+        status: 200,
+        body: { decision: 'deny', reason: 'session ended' },
+      });
+      expect(harness.pending.size).toBe(0);
+      expect(harness.evictions).toEqual([[PENDING_KEY, 'convo-1']]);
+      expectSingleAudit(harness, {
+        seq: 42,
+        decision: 'deny',
+        source: 'disconnect',
+        reason: 'session ended',
+      });
+
+      const resumedResponse = postPermission(harness.url, requestBody);
+      await vi.waitFor(() => expect(requestPermissionDecision).toHaveBeenCalledTimes(2));
+      expect(harness.pending.has(PENDING_KEY)).toBe(true);
+      expect(harness.audits).toHaveLength(1);
+
+      harness.resolvePermissionReply(PENDING_KEY, 'deny');
+      await expect(resumedResponse).resolves.toEqual({
+        status: 200,
+        body: { decision: 'deny', reason: '' },
+      });
+      expect(harness.audits[1]).toMatchObject({
+        decision: 'deny',
+        source: 'operator',
+        reason: '',
+      });
     } finally {
       await harness.close();
     }
@@ -852,5 +911,19 @@ describe('/permission-decision route', () => {
     expect(handlePermissionDecisionRouteSource).not.toContain("req.on('close'");
     expect(INDEX_SOURCE).toContain('createPermissionDecisionBodyCollector({');
     expect(INDEX_SOURCE).toContain("if (url.pathname === '/permission-decision') {");
+  });
+
+  it('finalizes pending conversation decisions before terminal router eviction', () => {
+    const teardownSource = INDEX_SOURCE.slice(
+      INDEX_SOURCE.indexOf('function journalEvictConvoInput(session)'),
+      INDEX_SOURCE.indexOf('// Plan approval for the `build` keyword'),
+    );
+    const finalizeIndex = teardownSource.indexOf(
+      "permissionSeams.finalizePendingPermissionsForConvo(convoId, 'session ended');",
+    );
+    const evictIndex = teardownSource.indexOf('journalInputConsumer.evictConvo(convoId, {');
+
+    expect(finalizeIndex).toBeGreaterThan(-1);
+    expect(evictIndex).toBeGreaterThan(finalizeIndex);
   });
 });
