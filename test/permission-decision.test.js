@@ -42,17 +42,9 @@ function permissionOutput(stdout) {
 
 beforeEach(() => {
   testDir = mkdtempSync(path.join(tmpdir(), 'permission-hook-'));
-  capturePath = path.join(testDir, 'request-body.json');
+  capturePath = path.join(testDir, 'curl-args');
   writeFileSync(path.join(testDir, 'curl'), `#!/bin/sh
-body=
-while [ "$#" -gt 0 ]; do
-  if [ "$1" = "-d" ]; then
-    shift
-    body="$1"
-  fi
-  shift
-done
-printf '%s' "$body" > "$CURL_CAPTURE"
+printf '%s\\n' "$@" > "$CURL_CAPTURE"
 
 case "$FAKE_CURL_MODE" in
   unreachable) exit 7 ;;
@@ -85,11 +77,18 @@ describe('permission-decision.sh', () => {
   ])('fails closed for a %s bridge response', (mode, reason) => {
     const result = runHook({ mode });
     const output = permissionOutput(result.stdout);
+    const audit = JSON.parse(result.stderr);
 
     expect(output).toEqual({
       hookEventName: 'PreToolUse',
       permissionDecision: 'deny',
       permissionDecisionReason: reason,
+    });
+    expect(audit).toEqual({
+      tool_use_id: 'tool-1',
+      decision: 'deny',
+      source: 'unreachable',
+      reason,
     });
   });
 
@@ -102,7 +101,26 @@ describe('permission-decision.sh', () => {
       permissionDecisionReason: 'operator allowed',
     });
 
-    const rawBody = readFileSync(capturePath, 'utf8');
+    const curlArgs = readFileSync(capturePath, 'utf8').trimEnd().split('\n');
+    expect(curlArgs).toEqual([
+      '-q',
+      '-s',
+      '--noproxy',
+      '*',
+      '--max-time',
+      '1740',
+      '-X',
+      'POST',
+      'http://127.0.0.1:9802/permission-decision',
+      '-H',
+      'Content-Type: application/json',
+      '-d',
+      '{"session_id":"session-1","tool_use_id":"tool-1","tool_name":"Bash"}',
+      '--write-out',
+      '\\n%{http_code}',
+    ]);
+
+    const rawBody = curlArgs[curlArgs.indexOf('-d') + 1];
     expect(JSON.parse(rawBody)).toEqual({
       session_id: 'session-1',
       tool_use_id: 'tool-1',

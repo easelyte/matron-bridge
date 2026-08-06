@@ -32,7 +32,7 @@ PORT="${MATRON_BRIDGE_API_PORT:-9802}"
 BODY=$(jq -nc --arg sid "$SID" --arg tuid "$TUID" --arg tool "$TOOL" \
   '{session_id:$sid,tool_use_id:$tuid,tool_name:$tool}')
 
-if ! CURL_OUTPUT=$(curl -s --max-time 1740 -X POST \
+if ! CURL_OUTPUT=$(curl -q -s --noproxy '*' --max-time 1740 -X POST \
   "http://127.0.0.1:${PORT}/permission-decision" \
   -H 'Content-Type: application/json' \
   -d "$BODY" \
