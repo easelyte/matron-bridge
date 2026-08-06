@@ -8,6 +8,7 @@ import { buildSessionSettings } from '../lib/session-settings.js';
 import { classifyPermission } from '../lib/permission-eval.js';
 import {
   auditPermissionDecision,
+  buildPermissionCardPayload,
   buildPermissionKey,
   createPermissionDecisionBodyCollector,
   createPermissionSeams,
@@ -158,6 +159,49 @@ describe('permission-decision.sh', () => {
       permissionDecision: 'deny',
       permissionDecisionReason: 'operator denied',
     });
+  });
+});
+
+describe('buildPermissionCardPayload', () => {
+  it('builds a server-generic Allow/Deny card without tool argument values', () => {
+    const tokenShapedArgumentValue = 'sk_live_argument_secret_123456789';
+    const request = {
+      tool_use_id: 'toolu_permission_1',
+      tool_name: 'mcp__vercel__deploy_to_vercel',
+      expires_at: 1_780_000_000_000,
+      tool_input: { token: tokenShapedArgumentValue },
+    };
+
+    expect(buildPermissionCardPayload).toHaveLength(3);
+    const payload = buildPermissionCardPayload(
+      request.tool_use_id,
+      request.tool_name,
+      request.expires_at,
+    );
+
+    expect(payload).toEqual({
+      kind: 'permission',
+      tool_use_id: 'toolu_permission_1',
+      description: 'Allow vercel tool "deploy_to_vercel"?',
+      options: [
+        { id: 'allow', label: 'Allow' },
+        { id: 'deny', label: 'Deny' },
+      ],
+      expires_at: 1_780_000_000_000,
+    });
+    expect(payload.description).toContain('vercel');
+    expect(payload.description).toContain('deploy_to_vercel');
+    expect(payload.description).not.toContain('webflow');
+    expect(JSON.stringify(payload)).not.toContain(tokenShapedArgumentValue);
+    expect(JSON.stringify(payload)).not.toContain('tool_input');
+  });
+
+  it('falls back safely to the full unparseable tool name', () => {
+    expect(buildPermissionCardPayload(
+      'toolu_permission_2',
+      'unqualified_tool_name',
+      1_780_000_000_001,
+    ).description).toBe('Allow tool "unqualified_tool_name"?');
   });
 });
 

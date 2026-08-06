@@ -150,12 +150,13 @@ describe('createJournalPublisher', () => {
     await fake.close();
   });
 
-  it('covers publishPrompt and publishToolOutput with the right types', async () => {
+  it('publishes prompt, permission request, and tool output with the right types', async () => {
     const fake = await startFakeServer();
     const pub = createJournalPublisher({ url: fake.url, token: 'tok', log: silentLog, ...FAST_BACKOFF });
 
     pub.upsertConvo('convo-2', {});
     pub.publishPrompt('convo-2', { question: 'Continue?', options: ['yes', 'no'], mode: 'pick_one' });
+    pub.publishPermissionRequest('convo-2', { kind: 'permission', tool_use_id: 't0' });
     pub.publishToolOutput('convo-2', { tool_use_id: 't1', command: 'ls -la', viewer_url: 'https://x', expires_at: 123 });
     pub.publishDiff('convo-2', {
       file_path: '/w/a.swift', display_path: 'a.swift', viewer_url: null,
@@ -163,10 +164,15 @@ describe('createJournalPublisher', () => {
       added: 1, removed: 1, truncated: false, new_file: false,
     });
 
-    await waitFor(() => fake.received.filter(f => f.op === 'publish').length >= 3);
-    const [prompt, toolOutput] = fake.received.filter(f => f.op === 'publish');
+    await waitFor(() => fake.received.filter(f => f.op === 'publish').length >= 4);
+    const [prompt, permissionRequest, toolOutput] = fake.received.filter(f => f.op === 'publish');
     expect(prompt.type).toBe('prompt');
     expect(prompt.payload).toEqual({ question: 'Continue?', options: ['yes', 'no'], mode: 'pick_one' });
+    expect(permissionRequest).toMatchObject({
+      convo_id: 'convo-2',
+      type: 'permission_request',
+      payload: { kind: 'permission', tool_use_id: 't0' },
+    });
     expect(toolOutput.type).toBe('tool_output');
     expect(toolOutput.payload).toEqual({ tool_use_id: 't1', command: 'ls -la', viewer_url: 'https://x', expires_at: 123 });
     const diffFrame = fake.received.find(f => f.op === 'publish' && f.type === 'diff');
@@ -345,6 +351,7 @@ describe('createJournalPublisher', () => {
       pub.upsertConvo('c1', { title: 'x', sessionState: 'running' });
       pub.publishText('c1', { body: 'hi', from: 'user' });
       pub.publishPrompt('c1', { question: 'q?', options: [] });
+      pub.publishPermissionRequest('c1', { kind: 'permission', tool_use_id: 't0' });
       pub.publishToolOutput('c1', { command: 'ls' });
       pub.publishDiff('c1', { diff: 'x' });
       pub.publishFile('c1', { blob_ref: 'm1', content_type: 'application/pdf', name: 'doc.pdf', size: 1, from: 'user' });
