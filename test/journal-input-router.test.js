@@ -587,6 +587,228 @@ describe('createJournalInputConsumer — permission registry seam foundation', (
     expect(deps.findSessionByConvoId).not.toHaveBeenCalled();
   });
 
+  it('binds two concurrent permission replies independently to their own seq keys', () => {
+    const firstKey = buildPermissionKey('convo-1', 'toolu_1');
+    const secondKey = buildPermissionKey('convo-1', 'toolu_2');
+    const firstResolve = vi.fn();
+    const secondResolve = vi.fn();
+    const pendingPermissionDecisions = new Map([
+      [firstKey, { resolve: firstResolve, seq: null, convoId: 'convo-1' }],
+      [secondKey, { resolve: secondResolve, seq: null, convoId: 'convo-1' }],
+    ]);
+    const deps = makeDeps(createPermissionSeams({ pendingPermissionDecisions }));
+    const consumer = createJournalInputConsumer(deps);
+
+    consumer(baseFrame({
+      seq: 50,
+      sender: 'agent:dev-2',
+      type: 'prompt',
+      payload: { question: 'Newer ordinary prompt', options: [] },
+    }));
+    for (const [seq, toolUseId] of [[41, 'toolu_1'], [42, 'toolu_2']]) {
+      consumer(baseFrame({
+        seq,
+        sender: 'agent:dev-2',
+        type: 'permission_request',
+        payload: { tool_use_id: toolUseId },
+      }));
+    }
+    consumer(baseFrame({
+      seq: 51,
+      type: 'prompt_reply',
+      payload: { target_seq: 42, choice: 'deny', text: null },
+    }));
+    consumer(baseFrame({
+      seq: 52,
+      type: 'prompt_reply',
+      payload: { target_seq: 41, choice: 'Allow', text: null },
+    }));
+
+    expect(firstResolve).toHaveBeenCalledOnce();
+    expect(firstResolve).toHaveBeenCalledWith({ decision: 'allow', source: 'operator' });
+    expect(secondResolve).toHaveBeenCalledOnce();
+    expect(secondResolve).toHaveBeenCalledWith({ decision: 'deny', source: 'operator' });
+    expect(deps.routePromptReply).not.toHaveBeenCalled();
+  });
+
+  it('buffers a stale-target tap while a seq-null permission is live, then drains it on echo', () => {
+    const key = buildPermissionKey('convo-1', 'toolu_1');
+    const resolve = vi.fn();
+    const pendingPermissionDecisions = new Map([
+      [key, { resolve, seq: null, convoId: 'convo-1' }],
+    ]);
+    const deps = makeDeps(createPermissionSeams({ pendingPermissionDecisions }));
+    const consumer = createJournalInputConsumer(deps);
+
+    consumer(baseFrame({
+      seq: 50,
+      sender: 'agent:dev-2',
+      type: 'prompt',
+      payload: { question: 'Ordinary prompt', options: [] },
+    }));
+    consumer(baseFrame({
+      seq: 51,
+      type: 'prompt_reply',
+      payload: { target_seq: 41, choice: ' allow ', text: 'tap before echo' },
+    }));
+
+    expect(resolve).not.toHaveBeenCalled();
+    expect(deps.routePromptReply).not.toHaveBeenCalled();
+    expect(deps.noticeStalePromptReply).not.toHaveBeenCalled();
+
+    consumer(baseFrame({
+      seq: 41,
+      sender: 'agent:dev-2',
+      type: 'permission_request',
+      payload: { tool_use_id: 'toolu_1' },
+    }));
+
+    expect(resolve).toHaveBeenCalledOnce();
+    expect(resolve).toHaveBeenCalledWith({ decision: 'allow', source: 'operator' });
+    expect(deps.routePromptReply).not.toHaveBeenCalled();
+  });
+
+  it('refuses an ordinary stale reply immediately when no seq-null permission is live', () => {
+    const deps = makeDeps({ hasLivePermissionPending: vi.fn(() => false) });
+    const consumer = createJournalInputConsumer(deps);
+
+    consumer(baseFrame({
+      seq: 50,
+      sender: 'agent:dev-2',
+      type: 'prompt',
+      payload: { question: 'Latest prompt', options: [] },
+    }));
+    consumer(baseFrame({
+      seq: 51,
+      type: 'prompt_reply',
+      payload: { target_seq: 40, choice: 'opt_a', text: null },
+    }));
+
+    expect(deps.hasLivePermissionPending).toHaveBeenCalledWith('convo-1');
+    expect(deps.noticeStalePromptReply).toHaveBeenCalledOnce();
+    expect(deps.routePromptReply).not.toHaveBeenCalled();
+    expect(deps.resolvePermissionReply).not.toHaveBeenCalled();
+  });
+
+  it('routes an ordinary latest-seq answer unchanged even with a seq-null permission live', () => {
+    const deps = makeDeps({ hasLivePermissionPending: vi.fn(() => true) });
+    const consumer = createJournalInputConsumer(deps);
+
+    consumer(baseFrame({
+      seq: 50,
+      sender: 'agent:dev-2',
+      type: 'prompt',
+      payload: { question: 'Latest prompt', options: [] },
+    }));
+    consumer(baseFrame({
+      seq: 51,
+      type: 'prompt_reply',
+      payload: { target_seq: 50, choice: 'opt_a', text: 'ordinary answer' },
+    }));
+
+    expect(deps.routePromptReply).toHaveBeenCalledWith(
+      { claudeSessionId: 'convo-1' },
+      { target_seq: 50, choice: 'opt_a', text: 'ordinary answer' },
+      { username: 'dan' },
+    );
+    expect(deps.hasLivePermissionPending).not.toHaveBeenCalled();
+    expect(deps.resolvePermissionReply).not.toHaveBeenCalled();
+  });
+
+  it('routes an ordinary answer unchanged when no latest prompt seq is recorded', () => {
+    const deps = makeDeps({ hasLivePermissionPending: vi.fn(() => true) });
+    const consumer = createJournalInputConsumer(deps);
+
+    consumer(baseFrame({
+      seq: 51,
+      type: 'prompt_reply',
+      payload: { target_seq: 40, choice: 'opt_a', text: 'ordinary answer' },
+    }));
+
+    expect(deps.routePromptReply).toHaveBeenCalledWith(
+      { claudeSessionId: 'convo-1' },
+      { target_seq: 40, choice: 'opt_a', text: 'ordinary answer' },
+      { username: 'dan' },
+    );
+    expect(deps.hasLivePermissionPending).not.toHaveBeenCalled();
+    expect(deps.resolvePermissionReply).not.toHaveBeenCalled();
+  });
+
+  it('maps Allow and allow to allow and every other permission choice to deny', () => {
+    const pendingPermissionDecisions = new Map();
+    const resolves = [];
+    for (const toolUseId of ['toolu_1', 'toolu_2', 'toolu_3']) {
+      const resolve = vi.fn();
+      resolves.push(resolve);
+      pendingPermissionDecisions.set(buildPermissionKey('convo-1', toolUseId), {
+        resolve,
+        seq: null,
+        convoId: 'convo-1',
+      });
+    }
+    const deps = makeDeps(createPermissionSeams({ pendingPermissionDecisions }));
+    const consumer = createJournalInputConsumer(deps);
+
+    for (const [seq, toolUseId] of [[41, 'toolu_1'], [42, 'toolu_2'], [43, 'toolu_3']]) {
+      consumer(baseFrame({
+        seq,
+        sender: 'agent:dev-2',
+        type: 'permission_request',
+        payload: { tool_use_id: toolUseId },
+      }));
+    }
+    for (const [seq, choice] of [[41, 'Allow'], [42, 'allow'], [43, 'yes']]) {
+      consumer(baseFrame({
+        seq: seq + 10,
+        type: 'prompt_reply',
+        payload: { target_seq: seq, choice, text: null },
+      }));
+    }
+
+    expect(resolves[0]).toHaveBeenCalledWith({ decision: 'allow', source: 'operator' });
+    expect(resolves[1]).toHaveBeenCalledWith({ decision: 'allow', source: 'operator' });
+    expect(resolves[2]).toHaveBeenCalledWith({ decision: 'deny', source: 'operator' });
+    expect(deps.routePromptReply).not.toHaveBeenCalled();
+  });
+
+  it('drops a buffered reply when its short TTL expires without resolving the later echo', () => {
+    vi.useFakeTimers();
+    try {
+      const deps = makeDeps({
+        hasLivePermissionPending: vi.fn(() => true),
+        isLivePendingToolUse: vi.fn(() => true),
+        notePermissionSeq: vi.fn(() => true),
+      });
+      const consumer = createJournalInputConsumer(deps);
+      consumer(baseFrame({
+        seq: 50,
+        sender: 'agent:dev-2',
+        type: 'prompt',
+        payload: { question: 'Latest prompt', options: [] },
+      }));
+      consumer(baseFrame({
+        seq: 51,
+        type: 'prompt_reply',
+        payload: { target_seq: 41, choice: 'allow', text: null },
+      }));
+
+      expect(vi.getTimerCount()).toBe(1);
+      vi.advanceTimersByTime(5_000);
+      expect(vi.getTimerCount()).toBe(0);
+      consumer(baseFrame({
+        seq: 41,
+        sender: 'agent:dev-2',
+        type: 'permission_request',
+        payload: { tool_use_id: 'toolu_1' },
+      }));
+
+      expect(deps.resolvePermissionReply).not.toHaveBeenCalled();
+      expect(deps.routePromptReply).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it('rejects user-origin, wrong-convo, unknown-tool, empty-id, and non-integer permission echoes', () => {
     const liveKey = buildPermissionKey('convo-1', 'toolu_live');
     const deps = makeDeps({
@@ -726,30 +948,49 @@ describe('createJournalInputConsumer — permission registry seam foundation', (
     );
   });
 
-  it('evictConvo clears permission frame membership and the empty reply buffer idempotently', () => {
-    const key = buildPermissionKey('convo-1', 'toolu_1');
-    const deps = makeDeps({
-      isLivePendingToolUse: vi.fn((candidateKey, convoId) => (
-        candidateKey === key && convoId === 'convo-1'
-      )),
-      notePermissionSeq: vi.fn(() => true),
-    });
-    const consumer = createJournalInputConsumer(deps);
-    const permissionEcho = baseFrame({
-      seq: 41,
-      sender: 'agent:dev-2',
-      type: 'permission_request',
-      payload: { tool_use_id: 'toolu_1' },
-    });
+  it('evictConvo clears permission frame membership and buffered-reply timers idempotently', () => {
+    vi.useFakeTimers();
+    try {
+      const key = buildPermissionKey('convo-1', 'toolu_1');
+      const deps = makeDeps({
+        isLivePendingToolUse: vi.fn((candidateKey, convoId) => (
+          candidateKey === key && convoId === 'convo-1'
+        )),
+        notePermissionSeq: vi.fn(() => true),
+        hasLivePermissionPending: vi.fn(() => true),
+      });
+      const consumer = createJournalInputConsumer(deps);
+      const permissionEcho = baseFrame({
+        seq: 41,
+        sender: 'agent:dev-2',
+        type: 'permission_request',
+        payload: { tool_use_id: 'toolu_1' },
+      });
 
-    consumer(permissionEcho);
-    expect(consumer.permissionFrameKey('convo-1', permissionEcho.seq)).toBe(key);
-    consumer.evictConvo('convo-1');
-    // A late tap's target seq is no longer a permission-frame member.
-    expect(consumer.permissionFrameKey('convo-1', permissionEcho.seq)).toBeNull();
-    expect(() => consumer.evictConvo('convo-1')).not.toThrow();
+      consumer(permissionEcho);
+      expect(consumer.permissionFrameKey('convo-1', permissionEcho.seq)).toBe(key);
+      consumer(baseFrame({
+        seq: 50,
+        sender: 'agent:dev-2',
+        type: 'prompt',
+        payload: { question: 'Latest prompt', options: [] },
+      }));
+      consumer(baseFrame({
+        seq: 51,
+        type: 'prompt_reply',
+        payload: { target_seq: 40, choice: 'allow', text: null },
+      }));
+      expect(vi.getTimerCount()).toBe(1);
+      consumer.evictConvo('convo-1');
+      // A late tap's target seq is no longer a permission-frame member.
+      expect(consumer.permissionFrameKey('convo-1', permissionEcho.seq)).toBeNull();
+      expect(vi.getTimerCount()).toBe(0);
+      expect(() => consumer.evictConvo('convo-1')).not.toThrow();
 
-    expect(deps.notePermissionSeq).toHaveBeenCalledOnce();
+      expect(deps.notePermissionSeq).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('uses the production permission seams and exposes safe cleanup hooks', () => {
