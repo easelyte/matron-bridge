@@ -15,7 +15,12 @@ function makePublisher() {
   const calls = { upsertConvo: [], publishStatus: [], publishText: [], publishDiff: [] };
   return {
     calls,
-    upsertConvo(convoId, opts) { calls.upsertConvo.push({ convoId, opts }); },
+    upsertConvo(convoId, opts, options) {
+      calls.upsertConvo.push({ convoId, opts });
+      // Simulate immediate confirmed delivery so onDelivered-gated cleanup
+      // (subagent finish() store removal) runs synchronously in tests.
+      try { options?.onDelivered?.(); } catch { /* mirror publisher's swallow */ }
+    },
     publishStatus(convoId, status) { calls.publishStatus.push({ convoId, status }); },
     publishText(convoId, payload) { calls.publishText.push({ convoId, payload }); },
     publishDiff(convoId, payload) { calls.publishDiff.push({ convoId, payload }); },
@@ -327,6 +332,85 @@ describe('createSubagentConvoTracker', () => {
     it('noteTaskCompleted for an unknown agent is a safe no-op', () => {
       expect(() => tracker.noteTaskCompleted('agent-ghost')).not.toThrow();
       expect(publisher.calls.upsertConvo).toHaveLength(0);
+    });
+  });
+
+  // The tracker records every minted `running` child into a
+  // persistent store and drops it the moment it finishes, so a bridge restart
+  // can reconcile children that never reached `done` in-process.
+  describe('runningStore integration', () => {
+    function makeStore() {
+      const map = new Map();
+      return {
+        map,
+        calls: { add: [], remove: [] },
+        add(childConvoId, meta) { this.calls.add.push({ childConvoId, meta }); map.set(childConvoId, meta); },
+        remove(childConvoId) { this.calls.remove.push(childConvoId); map.delete(childConvoId); },
+        list() { return [...map.entries()].map(([childConvoId, meta]) => ({ childConvoId, ...meta })); },
+      };
+    }
+
+    it('records a child as running on mint and removes it on finish (terminal transitions)', () => {
+      const publisher = makePublisher();
+      const runningStore = makeStore();
+      const tracker = createSubagentConvoTracker({
+        publisher,
+        getParentConvoId: () => 'parent-uuid',
+        runningStore,
+        log: { warn() {} },
+      });
+
+      tracker.noteTaskStarted('toolu_1');
+      tracker.discover('agent-1', { label: 'A', agentType: null });
+      expect(runningStore.calls.add).toHaveLength(1);
+      expect(runningStore.calls.add[0].childConvoId).toBe('parent-uuid:sub:agent-1');
+      expect(runningStore.calls.add[0].meta).toMatchObject({ parentConvoId: 'parent-uuid', agentId: 'agent-1' });
+      expect(runningStore.list()).toHaveLength(1);
+
+      tracker.noteTaskResult('toolu_1'); // sync-Task tool_result → finish
+      expect(runningStore.calls.remove).toEqual(['parent-uuid:sub:agent-1']);
+      expect(runningStore.list()).toEqual([]);
+    });
+
+    it('does not re-add on repeat discovery of the same agent', () => {
+      const runningStore = makeStore();
+      const tracker = createSubagentConvoTracker({
+        publisher: makePublisher(),
+        getParentConvoId: () => 'parent-uuid',
+        runningStore,
+        log: { warn() {} },
+      });
+      tracker.discover('agent-1', { label: 'A', agentType: null });
+      tracker.discover('agent-1', { label: 'A', agentType: null });
+      expect(runningStore.calls.add).toHaveLength(1);
+    });
+
+    it('finishAll removes every still-running child from the store', () => {
+      const runningStore = makeStore();
+      const tracker = createSubagentConvoTracker({
+        publisher: makePublisher(),
+        getParentConvoId: () => 'parent-uuid',
+        runningStore,
+        log: { warn() {} },
+      });
+      tracker.discover('agent-1', { label: 'A', agentType: null });
+      tracker.discover('agent-2', { label: 'B', agentType: null });
+      expect(runningStore.list()).toHaveLength(2);
+      tracker.finishAll();
+      expect(runningStore.list()).toEqual([]);
+      expect(runningStore.calls.remove.sort()).toEqual(['parent-uuid:sub:agent-1', 'parent-uuid:sub:agent-2']);
+    });
+
+    it('works without a runningStore (optional dependency)', () => {
+      const tracker = createSubagentConvoTracker({
+        publisher: makePublisher(),
+        getParentConvoId: () => 'parent-uuid',
+        log: { warn() {} },
+      });
+      expect(() => {
+        tracker.discover('agent-1', { label: 'A', agentType: null });
+        tracker.finishAll();
+      }).not.toThrow();
     });
   });
 });
