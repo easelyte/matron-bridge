@@ -4,6 +4,7 @@ import { createJournalInputConsumer, resolvePromptChoice, promptExpectsReply } f
 import {
   buildPermissionKey,
   createPermissionSeams,
+  PERMISSION_MAX_PENDING_GLOBAL,
   PERMISSION_MAX_PENDING_PER_CONVO,
 } from '../lib/permission-registry.js';
 
@@ -715,8 +716,46 @@ describe('createJournalInputConsumer — permission registry seam foundation', (
     expect(deps.resolvePermissionReply).not.toHaveBeenCalled();
   });
 
-  it('routes an ordinary answer unchanged when no latest prompt seq is recorded', () => {
-    const deps = makeDeps({ hasLivePermissionPending: vi.fn(() => true) });
+  it('buffers a first-card permission tap before its echo and drains it once the echo arrives', () => {
+    vi.useFakeTimers();
+    try {
+      const key = buildPermissionKey('convo-1', 'toolu_first');
+      const resolve = vi.fn();
+      const pendingPermissionDecisions = new Map([
+        [key, { resolve, seq: null, convoId: 'convo-1' }],
+      ]);
+      const deps = makeDeps(createPermissionSeams({ pendingPermissionDecisions }));
+      const consumer = createJournalInputConsumer(deps);
+
+      consumer(baseFrame({
+        seq: 42,
+        type: 'prompt_reply',
+        payload: { target_seq: 41, choice: 'allow', text: 'tap before echo' },
+      }));
+
+      expect(resolve).not.toHaveBeenCalled();
+      expect(deps.routePromptReply).not.toHaveBeenCalled();
+      expect(deps.noticeStalePromptReply).not.toHaveBeenCalled();
+      expect(vi.getTimerCount()).toBe(1);
+
+      consumer(baseFrame({
+        seq: 41,
+        sender: 'agent:dev-2',
+        type: 'permission_request',
+        payload: { tool_use_id: 'toolu_first' },
+      }));
+
+      expect(resolve).toHaveBeenCalledOnce();
+      expect(resolve).toHaveBeenCalledWith({ decision: 'allow', source: 'operator' });
+      expect(deps.routePromptReply).not.toHaveBeenCalled();
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('routes an ordinary answer when no latest prompt or seq-null permission is recorded', () => {
+    const deps = makeDeps({ hasLivePermissionPending: vi.fn(() => false) });
     const consumer = createJournalInputConsumer(deps);
 
     consumer(baseFrame({
@@ -730,7 +769,7 @@ describe('createJournalInputConsumer — permission registry seam foundation', (
       { target_seq: 40, choice: 'opt_a', text: 'ordinary answer' },
       { username: 'dan' },
     );
-    expect(deps.hasLivePermissionPending).not.toHaveBeenCalled();
+    expect(deps.noticeStalePromptReply).not.toHaveBeenCalled();
     expect(deps.resolvePermissionReply).not.toHaveBeenCalled();
   });
 
@@ -795,6 +834,11 @@ describe('createJournalInputConsumer — permission registry seam foundation', (
       expect(vi.getTimerCount()).toBe(1);
       vi.advanceTimersByTime(5_000);
       expect(vi.getTimerCount()).toBe(0);
+      expect(deps.noticeStalePromptReply).toHaveBeenCalledWith('convo-1', {
+        username: 'dan',
+        targetSeq: 41,
+        latestSeq: 50,
+      });
       consumer(baseFrame({
         seq: 41,
         sender: 'agent:dev-2',
@@ -804,6 +848,87 @@ describe('createJournalInputConsumer — permission registry seam foundation', (
 
       expect(deps.resolvePermissionReply).not.toHaveBeenCalled();
       expect(deps.routePromptReply).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('bounds buffered permission replies at the per-convo pending cap', () => {
+    vi.useFakeTimers();
+    try {
+      const deps = makeDeps({ hasLivePermissionPending: vi.fn(() => true) });
+      const consumer = createJournalInputConsumer(deps);
+      consumer(baseFrame({
+        seq: 1_000,
+        sender: 'agent:dev-2',
+        type: 'prompt',
+        payload: { question: 'Latest prompt', options: [] },
+      }));
+
+      for (let seq = 1; seq <= PERMISSION_MAX_PENDING_PER_CONVO + 1; seq += 1) {
+        consumer(baseFrame({
+          seq: 1_000 + seq,
+          type: 'prompt_reply',
+          payload: { target_seq: seq, choice: 'allow', text: null },
+        }));
+      }
+
+      expect(vi.getTimerCount()).toBe(PERMISSION_MAX_PENDING_PER_CONVO);
+      expect(deps.noticeStalePromptReply).toHaveBeenCalledTimes(1);
+      expect(deps.noticeStalePromptReply).toHaveBeenCalledWith('convo-1', {
+        username: 'dan',
+        targetSeq: PERMISSION_MAX_PENDING_PER_CONVO + 1,
+        latestSeq: 1_000,
+      });
+      expect(deps.routePromptReply).not.toHaveBeenCalled();
+
+      consumer.evictConvo('convo-1');
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('bounds buffered permission replies at the global pending cap', () => {
+    vi.useFakeTimers();
+    try {
+      const deps = makeDeps({ hasLivePermissionPending: vi.fn(() => true) });
+      const consumer = createJournalInputConsumer(deps);
+      const convoCount = PERMISSION_MAX_PENDING_GLOBAL / PERMISSION_MAX_PENDING_PER_CONVO;
+
+      for (let seq = 1; seq <= PERMISSION_MAX_PENDING_GLOBAL; seq += 1) {
+        const convoId = `convo-${Math.floor((seq - 1) / PERMISSION_MAX_PENDING_PER_CONVO)}`;
+        consumer(baseFrame({
+          seq: PERMISSION_MAX_PENDING_GLOBAL + seq,
+          convo_id: convoId,
+          type: 'prompt_reply',
+          payload: { target_seq: seq, choice: 'allow', text: null },
+        }));
+      }
+      consumer(baseFrame({
+        seq: PERMISSION_MAX_PENDING_GLOBAL * 2 + 1,
+        convo_id: 'convo-overflow',
+        type: 'prompt_reply',
+        payload: {
+          target_seq: PERMISSION_MAX_PENDING_GLOBAL + 1,
+          choice: 'allow',
+          text: null,
+        },
+      }));
+
+      expect(vi.getTimerCount()).toBe(PERMISSION_MAX_PENDING_GLOBAL);
+      expect(deps.noticeStalePromptReply).toHaveBeenCalledTimes(1);
+      expect(deps.noticeStalePromptReply).toHaveBeenCalledWith('convo-overflow', {
+        username: 'dan',
+        targetSeq: PERMISSION_MAX_PENDING_GLOBAL + 1,
+        latestSeq: undefined,
+      });
+      expect(deps.routePromptReply).not.toHaveBeenCalled();
+
+      for (let convo = 0; convo < convoCount; convo += 1) {
+        consumer.evictConvo(`convo-${convo}`);
+      }
+      expect(vi.getTimerCount()).toBe(0);
     } finally {
       vi.useRealTimers();
     }
