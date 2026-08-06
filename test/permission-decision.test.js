@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { buildSessionSettings } from '../lib/session-settings.js';
 import { classifyPermission } from '../lib/permission-eval.js';
+import { createJournalPublisher } from '../lib/journal-publisher.js';
 import {
   auditPermissionDecision,
   buildPermissionCardPayload,
@@ -397,8 +398,11 @@ function expectSingleAudit(harness, expected) {
 describe('print session requestPermissionDecision', () => {
   it('publishes exactly one redacted permission request with the route deadline', () => {
     const session = { journalConvoId: 'convo-card' };
-    const journalPublisher = { publishPermissionRequest: vi.fn() };
-    const pendingPermissionDecisions = new Map();
+    const journalPublisher = { publishPermissionRequest: vi.fn(() => true) };
+    const deny = vi.fn();
+    const pendingPermissionDecisions = new Map([
+      [buildPermissionKey('convo-card', 'tool-card'), { resolve: deny }],
+    ]);
     session.requestPermissionDecision = createRequestPermissionDecision(session, {
       journalPublisher,
       pendingPermissionDecisions,
@@ -427,6 +431,44 @@ describe('print session requestPermissionDecision', () => {
       .not.toContain('must-not-cross-the-card-boundary');
     expect(journalPublisher.publishPermissionRequest.mock.calls[0][1])
       .not.toHaveProperty('tool_input');
+    expect(deny).not.toHaveBeenCalled();
+  });
+
+  it('immediately denies and cleans up a real-shaped print request when journaling is disabled', async () => {
+    const journalPublisher = createJournalPublisher({
+      url: '',
+      token: '',
+      log: { warn: vi.fn() },
+    });
+    const harness = await openPermissionRouteHarness({
+      requestPermissionDecision: undefined,
+      timeoutMs: 28 * 60 * 1000,
+    });
+    harness.target.journalConvoId = 'convo-1';
+    harness.target.requestPermissionDecision = createRequestPermissionDecision(harness.target, {
+      journalPublisher,
+      pendingPermissionDecisions: harness.pending,
+      journalConvoIdFor: value => value?.journalConvoId || value?.claudeSessionId || null,
+      timeoutMs: 28 * 60 * 1000,
+    });
+
+    try {
+      const result = await postPermission(harness.url, DEFAULT_INPUT);
+
+      expect(result).toEqual({
+        status: 200,
+        body: { decision: 'deny', reason: 'no output channel for session' },
+      });
+      expect(harness.pending.size).toBe(0);
+      expectSingleAudit(harness, {
+        tool_name: 'Bash',
+        decision: 'deny',
+        source: 'error',
+        reason: 'no output channel for session',
+      });
+    } finally {
+      await harness.close();
+    }
   });
 
   it('denies the matching pending entry when the session has no output channel', () => {

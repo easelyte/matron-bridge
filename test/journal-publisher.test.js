@@ -156,7 +156,10 @@ describe('createJournalPublisher', () => {
 
     pub.upsertConvo('convo-2', {});
     pub.publishPrompt('convo-2', { question: 'Continue?', options: ['yes', 'no'], mode: 'pick_one' });
-    pub.publishPermissionRequest('convo-2', { kind: 'permission', tool_use_id: 't0' });
+    const permissionPublished = pub.publishPermissionRequest(
+      'convo-2',
+      { kind: 'permission', tool_use_id: 't0' },
+    );
     pub.publishToolOutput('convo-2', { tool_use_id: 't1', command: 'ls -la', viewer_url: 'https://x', expires_at: 123 });
     pub.publishDiff('convo-2', {
       file_path: '/w/a.swift', display_path: 'a.swift', viewer_url: null,
@@ -173,6 +176,7 @@ describe('createJournalPublisher', () => {
       type: 'permission_request',
       payload: { kind: 'permission', tool_use_id: 't0' },
     });
+    expect(permissionPublished).toBe(true);
     expect(toolOutput.type).toBe('tool_output');
     expect(toolOutput.payload).toEqual({ tool_use_id: 't1', command: 'ls -la', viewer_url: 'https://x', expires_at: 123 });
     const diffFrame = fake.received.find(f => f.op === 'publish' && f.type === 'diff');
@@ -346,12 +350,15 @@ describe('createJournalPublisher', () => {
     const warnings = [];
     const log = { warn: (...a) => warnings.push(a.join(' ')), error: () => {} };
     const pub = createJournalPublisher({ url: '', token: '', log });
+    expect(pub.publishPermissionRequest(
+      'c1',
+      { kind: 'permission', tool_use_id: 't0' },
+    )).toBe(false);
 
     expect(() => {
       pub.upsertConvo('c1', { title: 'x', sessionState: 'running' });
       pub.publishText('c1', { body: 'hi', from: 'user' });
       pub.publishPrompt('c1', { question: 'q?', options: [] });
-      pub.publishPermissionRequest('c1', { kind: 'permission', tool_use_id: 't0' });
       pub.publishToolOutput('c1', { command: 'ls' });
       pub.publishDiff('c1', { diff: 'x' });
       pub.publishFile('c1', { blob_ref: 'm1', content_type: 'application/pdf', name: 'doc.pdf', size: 1, from: 'user' });
