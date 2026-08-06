@@ -12,35 +12,14 @@ import {
   classifyPermission,
 } from '../lib/permission-eval.js';
 
-const WEBFLOW_EXACT_TOOLS = [
-  'mcp__webflow__webflow_guide_tool',
-  'mcp__webflow__ask_webflow_ai',
-  'mcp__webflow__data_element_tool',
-  'mcp__webflow__data_element_builder',
-  'mcp__webflow__data_element_settings_tool',
-  'mcp__webflow__data_style_tool',
-  'mcp__webflow__data_component_tool',
-  'mcp__webflow__data_component_builder',
-  'mcp__webflow__data_component_props_tool',
-  'mcp__webflow__data_component_variants_tool',
-  'mcp__webflow__data_cms_tool',
-  'mcp__webflow__data_assets_tool',
-  'mcp__webflow__asset_tool',
-  'mcp__webflow__get_asset_preview',
-  'mcp__webflow__data_fonts_tool',
-  'mcp__webflow__data_variable_tool',
-  'mcp__webflow__data_forms_tool',
-  'mcp__webflow__data_localization_tool',
-  'mcp__webflow__data_whtml_builder',
-  'mcp__webflow__data_agent_instructions_tool',
-  'mcp__webflow__designer_tool',
-  'mcp__webflow__element_snapshot_tool',
-  'mcp__webflow__data_sitemap_tool',
-  'mcp__webflow__data_analyze_tool',
-  'mcp__webflow__data_comments_tool',
-  'mcp__webflow__get_more_tools',
-];
+const WEBFLOW_SETTINGS_FIXTURE = path.resolve('test/fixtures/webflow-settings.local.json');
 const PRODUCTION_SETTINGS_LOCAL = '/root/.openclaw/workspace/.claude/settings.local.json';
+
+function webflowAllowRules(settings) {
+  return settings.permissions.allow.filter(rule => (
+    typeof rule === 'string' && rule.startsWith('mcp__webflow__')
+  ));
+}
 
 let fixtureDir;
 
@@ -59,23 +38,18 @@ afterEach(() => {
 });
 
 describe('permission snapshot', () => {
-  it('classifies the hermetic Webflow exact-name allowlist without allowing the absent repro tool', () => {
-    const settingsLocal = writeSettings('settings.local.json', {
-      allow: ['Bash(*)', ...WEBFLOW_EXACT_TOOLS],
-      deny: ['Read(/restricted/**)'],
-      ask: ['Write(*)'],
-    });
-
-    const snapshot = buildPermissionSnapshot({ sourcePaths: [settingsLocal] });
+  it('classifies the committed production Webflow fixture without allowing the absent repro tool', () => {
+    const settings = JSON.parse(readFileSync(WEBFLOW_SETTINGS_FIXTURE, 'utf8'));
+    const webflowTools = webflowAllowRules(settings);
+    const snapshot = buildPermissionSnapshot({ sourcePaths: [WEBFLOW_SETTINGS_FIXTURE] });
 
     expect(Object.isFrozen(snapshot)).toBe(true);
     expect(Object.isFrozen(snapshot.mcpAllow)).toBe(true);
     expect(Object.isFrozen(snapshot.mcpDeny)).toBe(true);
     expect(Object.isFrozen(snapshot.mcpAsk)).toBe(true);
-    expect(snapshot.mcpAllow).not.toContain('Bash(*)');
-    expect(snapshot.mcpDeny).not.toContain('Read(/restricted/**)');
-    expect(snapshot.mcpAsk).not.toContain('Write(*)');
-    for (const toolName of WEBFLOW_EXACT_TOOLS) {
+    expect(webflowTools).toHaveLength(26);
+    expect(webflowTools).not.toContain('mcp__webflow__data_sites_tool');
+    for (const toolName of webflowTools) {
       expect(classifyPermission(snapshot, toolName), toolName).toBe('allow');
     }
     expect(classifyPermission(snapshot, 'mcp__webflow__data_sites_tool')).toBe('default-gated');
@@ -84,19 +58,33 @@ describe('permission snapshot', () => {
   it.skipIf(!existsSync(PRODUCTION_SETTINGS_LOCAL))(
     'classifies the real workspace Webflow exact-name allowlist',
     () => {
+      const fixtureSettings = JSON.parse(readFileSync(WEBFLOW_SETTINGS_FIXTURE, 'utf8'));
       const settings = JSON.parse(readFileSync(PRODUCTION_SETTINGS_LOCAL, 'utf8'));
-      const webflowTools = settings.permissions.allow.filter(rule => (
-        typeof rule === 'string' && rule.startsWith('mcp__webflow__')
-      ));
+      const fixtureWebflowTools = webflowAllowRules(fixtureSettings);
+      const webflowTools = webflowAllowRules(settings);
       const snapshot = buildPermissionSnapshot({ sourcePaths: [PRODUCTION_SETTINGS_LOCAL] });
 
-      expect(webflowTools.length).toBeGreaterThan(0);
+      expect(webflowTools).toEqual(fixtureWebflowTools);
       for (const toolName of webflowTools) {
         expect(classifyPermission(snapshot, toolName), toolName).toBe('allow');
       }
       expect(classifyPermission(snapshot, 'mcp__webflow__data_sites_tool')).toBe('default-gated');
     },
   );
+
+  it('ignores non-MCP permission rules in every rule list', () => {
+    const source = writeSettings('non-mcp-rules.json', {
+      allow: ['Bash(*)'],
+      deny: ['Read(/restricted/**)'],
+      ask: ['Write(*)'],
+    });
+
+    const snapshot = buildPermissionSnapshot({ sourcePaths: [source] });
+
+    expect(snapshot.mcpAllow).not.toContain('Bash(*)');
+    expect(snapshot.mcpDeny).not.toContain('Read(/restricted/**)');
+    expect(snapshot.mcpAsk).not.toContain('Write(*)');
+  });
 
   it.each(['mcp__webflow', 'mcp__webflow__*'])(
     'treats server-level allow %s as default-gated uncertainty',
@@ -107,6 +95,15 @@ describe('permission snapshot', () => {
       expect(classifyPermission(snapshot, 'mcp__webflow__data_sites_tool')).toBe('default-gated');
     },
   );
+
+  it('does not treat an incoming wildcard name as an exact allow', () => {
+    const source = writeSettings('wildcard-name.json', {
+      allow: ['mcp__webflow__*'],
+    });
+    const snapshot = buildPermissionSnapshot({ sourcePaths: [source] });
+
+    expect(classifyPermission(snapshot, 'mcp__webflow__*')).toBe('default-gated');
+  });
 
   it('returns deny or ask for exact matches, with both taking precedence over allow', () => {
     const source = writeSettings('policy.json', {
@@ -133,25 +130,52 @@ describe('permission snapshot', () => {
     expect(classifyPermission(snapshot, 'mcp__allowed__tool')).toBe('default-gated');
   });
 
-  it('fails closed when a source is unreadable or malformed while retaining policy from valid sources', () => {
+  it('fails closed when a source is malformed while retaining policy from valid sources', () => {
     const malformedPath = path.join(fixtureDir, 'malformed.json');
     writeFileSync(malformedPath, '{not json');
     const policyPath = writeSettings('deny.json', {
       deny: ['mcp__server__denied_tool'],
       ask: ['mcp__server__asked_tool'],
     });
-    const unreadablePath = path.join(fixtureDir, 'missing.json');
 
     expect(() => buildPermissionSnapshot({
-      sourcePaths: [unreadablePath, malformedPath, policyPath],
+      sourcePaths: [malformedPath, policyPath],
     })).not.toThrow();
 
     const snapshot = buildPermissionSnapshot({
-      sourcePaths: [unreadablePath, malformedPath, policyPath],
+      sourcePaths: [malformedPath, policyPath],
     });
+    expect(snapshot.uncertain).toBe(true);
     expect(classifyPermission(snapshot, 'mcp__webflow__data_sites_tool')).toBe('default-gated');
     expect(classifyPermission(snapshot, 'mcp__server__denied_tool')).toBe('deny');
     expect(classifyPermission(snapshot, 'mcp__server__asked_tool')).toBe('ask');
+  });
+
+  it('treats a missing optional settings file as an absent layer', () => {
+    const allowPath = writeSettings('allow.json', {
+      allow: ['mcp__server__allowed_tool'],
+    });
+    const missingPath = path.join(fixtureDir, '.claude', 'settings.json');
+
+    const snapshot = buildPermissionSnapshot({ sourcePaths: [missingPath, allowPath] });
+
+    expect(snapshot.uncertain).toBe(false);
+    expect(classifyPermission(snapshot, 'mcp__server__allowed_tool')).toBe('allow');
+  });
+
+  it('suppresses an exact allow after a non-ENOENT read failure', () => {
+    const allowPath = writeSettings('allow.json', {
+      allow: ['mcp__server__allowed_tool'],
+    });
+    const notDirectoryPath = path.join(fixtureDir, 'not-a-directory');
+    writeFileSync(notDirectoryPath, 'file');
+
+    const snapshot = buildPermissionSnapshot({
+      sourcePaths: [allowPath, path.join(notDirectoryPath, 'settings.json')],
+    });
+
+    expect(snapshot.uncertain).toBe(true);
+    expect(classifyPermission(snapshot, 'mcp__server__allowed_tool')).toBe('default-gated');
   });
 
   it('does not auto-allow an exact match when another source is malformed', () => {
