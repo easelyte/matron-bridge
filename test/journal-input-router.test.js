@@ -544,6 +544,7 @@ describe('createJournalInputConsumer — permission registry seam foundation', (
       routePromptReply: vi.fn(),
       notePermissionSeq: vi.fn(() => true),
       resolvePermissionReply: vi.fn(),
+      publishPromptReply: vi.fn(),
       hasLivePermissionPending: vi.fn(() => false),
       isLivePendingToolUse: vi.fn(() => false),
       noticeUnknownConvo: vi.fn(),
@@ -630,6 +631,118 @@ describe('createJournalInputConsumer — permission registry seam foundation', (
     expect(secondResolve).toHaveBeenCalledOnce();
     expect(secondResolve).toHaveBeenCalledWith({ decision: 'deny', source: 'operator' });
     expect(deps.routePromptReply).not.toHaveBeenCalled();
+  });
+
+  it('publishes the static chosen label when an operator resolves a permission', () => {
+    const key = buildPermissionKey('convo-1', 'toolu_1');
+    const deps = makeDeps({
+      isLivePendingToolUse: vi.fn((candidateKey) => candidateKey === key),
+    });
+    const consumer = createJournalInputConsumer(deps);
+
+    consumer(baseFrame({
+      seq: 41,
+      sender: 'agent:dev-2',
+      type: 'permission_request',
+      payload: { tool_use_id: 'toolu_1' },
+    }));
+    consumer(baseFrame({
+      seq: 42,
+      type: 'prompt_reply',
+      payload: { target_seq: 41, choice: 'allow', text: 'must not echo' },
+    }));
+
+    expect(deps.resolvePermissionReply).toHaveBeenCalledWith(key, 'allow');
+    expect(deps.publishPromptReply).toHaveBeenCalledWith('convo-1', {
+      target_seq: 41,
+      choice: 'Allow',
+      text: null,
+    });
+  });
+
+  it('rejects a permission reply whose target_seq equals its own frame seq', () => {
+    const key = buildPermissionKey('convo-1', 'toolu_1');
+    const deps = makeDeps({
+      isLivePendingToolUse: vi.fn((candidateKey) => candidateKey === key),
+    });
+    const consumer = createJournalInputConsumer(deps);
+
+    consumer(baseFrame({
+      seq: 41,
+      sender: 'agent:dev-2',
+      type: 'permission_request',
+      payload: { tool_use_id: 'toolu_1' },
+    }));
+    consumer(baseFrame({
+      seq: 41,
+      type: 'prompt_reply',
+      payload: { target_seq: 41, choice: 'allow', text: null },
+    }));
+
+    expect(deps.resolvePermissionReply).not.toHaveBeenCalled();
+    expect(deps.publishPromptReply).not.toHaveBeenCalled();
+    expect(deps.routePromptReply).not.toHaveBeenCalled();
+    expect(deps.noticeStalePromptReply).toHaveBeenCalledOnce();
+  });
+
+  it('rejects a permission reply whose own frame seq is not an integer', () => {
+    const key = buildPermissionKey('convo-1', 'toolu_1');
+    const deps = makeDeps({
+      isLivePendingToolUse: vi.fn((candidateKey) => candidateKey === key),
+    });
+    const consumer = createJournalInputConsumer(deps);
+
+    consumer(baseFrame({
+      seq: 41,
+      sender: 'agent:dev-2',
+      type: 'permission_request',
+      payload: { tool_use_id: 'toolu_1' },
+    }));
+    consumer(baseFrame({
+      seq: '42',
+      type: 'prompt_reply',
+      payload: { target_seq: 41, choice: 'allow', text: null },
+    }));
+
+    expect(deps.resolvePermissionReply).not.toHaveBeenCalled();
+    expect(deps.publishPromptReply).not.toHaveBeenCalled();
+    expect(deps.routePromptReply).not.toHaveBeenCalled();
+    expect(deps.noticeStalePromptReply).toHaveBeenCalledOnce();
+  });
+
+  it('rejects and never buffers a future target_seq guess', () => {
+    vi.useFakeTimers();
+    try {
+      const key = buildPermissionKey('convo-1', 'toolu_future');
+      const deps = makeDeps({
+        hasLivePermissionPending: vi.fn(() => true),
+        isLivePendingToolUse: vi.fn((candidateKey) => candidateKey === key),
+      });
+      const consumer = createJournalInputConsumer(deps);
+
+      consumer(baseFrame({
+        seq: 40,
+        type: 'prompt_reply',
+        payload: { target_seq: 41, choice: 'allow', text: null },
+      }));
+
+      expect(vi.getTimerCount()).toBe(0);
+      expect(deps.noticeStalePromptReply).toHaveBeenCalledOnce();
+      expect(deps.routePromptReply).not.toHaveBeenCalled();
+
+      consumer(baseFrame({
+        seq: 41,
+        sender: 'agent:dev-2',
+        type: 'permission_request',
+        payload: { tool_use_id: 'toolu_future' },
+      }));
+
+      expect(deps.resolvePermissionReply).not.toHaveBeenCalled();
+      expect(deps.publishPromptReply).not.toHaveBeenCalled();
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('buffers a stale-target tap while a seq-null permission is live, then drains it on echo', () => {
@@ -807,6 +920,9 @@ describe('createJournalInputConsumer — permission registry seam foundation', (
     expect(resolves[0]).toHaveBeenCalledWith({ decision: 'allow', source: 'operator' });
     expect(resolves[1]).toHaveBeenCalledWith({ decision: 'allow', source: 'operator' });
     expect(resolves[2]).toHaveBeenCalledWith({ decision: 'deny', source: 'operator' });
+    expect(deps.publishPromptReply.mock.calls.map(([, payload]) => payload.choice)).toEqual([
+      'Allow', 'Allow', 'Deny',
+    ]);
     expect(deps.routePromptReply).not.toHaveBeenCalled();
   });
 
@@ -1001,7 +1117,7 @@ describe('createJournalInputConsumer — permission registry seam foundation', (
     expect(deps.resolvePermissionReply).not.toHaveBeenCalled();
   });
 
-  it('evictPermissionSeq removes only the populated permission seq and leaves picker state intact', () => {
+  it('evictPermissionSeq tombstones the retired seq and leaves picker state intact', () => {
     const assignedKeys = new Set();
     const deps = makeDeps({
       isLivePendingToolUse: vi.fn(() => true),
@@ -1058,19 +1174,46 @@ describe('createJournalInputConsumer — permission registry seam foundation', (
       true, true, false, false,
     ]);
     expect(deps.resolvePermissionReply).not.toHaveBeenCalled();
-    expect(deps.routePromptReply).toHaveBeenCalledTimes(2);
+    expect(deps.routePromptReply).toHaveBeenCalledTimes(1);
     expect(deps.routePromptReply).toHaveBeenNthCalledWith(
       1,
-      { claudeSessionId: 'convo-1' },
-      { target_seq: 41, choice: 'allow', text: null },
-      { username: 'dan' },
-    );
-    expect(deps.routePromptReply).toHaveBeenNthCalledWith(
-      2,
       { claudeSessionId: 'convo-1' },
       { target_seq: 50, choice: 'model:opus', text: null, picker: true },
       { username: 'dan' },
     );
+  });
+
+  it('ignores a duplicate late tap after operator resolution evicts its permission seq', () => {
+    const key = buildPermissionKey('convo-1', 'toolu_1');
+    let consumer;
+    const deps = makeDeps({
+      isLivePendingToolUse: vi.fn((candidateKey) => candidateKey === key),
+      resolvePermissionReply: vi.fn((candidateKey) => {
+        consumer.evictPermissionSeq(candidateKey, 'convo-1');
+      }),
+    });
+    consumer = createJournalInputConsumer(deps);
+
+    consumer(baseFrame({
+      seq: 41,
+      sender: 'agent:dev-2',
+      type: 'permission_request',
+      payload: { tool_use_id: 'toolu_1' },
+    }));
+    consumer(baseFrame({
+      seq: 42,
+      type: 'prompt_reply',
+      payload: { target_seq: 41, choice: 'allow', text: null },
+    }));
+    consumer(baseFrame({
+      seq: 43,
+      type: 'prompt_reply',
+      payload: { target_seq: 41, choice: 'allow', text: null },
+    }));
+
+    expect(deps.resolvePermissionReply).toHaveBeenCalledOnce();
+    expect(deps.publishPromptReply).toHaveBeenCalledOnce();
+    expect(deps.routePromptReply).not.toHaveBeenCalled();
   });
 
   it('evictConvo clears permission frame membership and buffered-reply timers idempotently', () => {
@@ -1256,6 +1399,21 @@ describe('createJournalInputConsumer — auto-resume of reaped sessions (resumeS
     consumer(baseFrame());
     expect(deps.routeTextToSession).not.toHaveBeenCalled();
     expect(deps.noticeUnknownConvo).toHaveBeenCalledWith('convo-1', { type: 'text', username: 'dan' });
+  });
+});
+
+describe('index.js journal input consumer — permission echo wiring (source inspection)', () => {
+  const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
+
+  it('wires decision labels through the durable prompt_reply publisher', () => {
+    const start = src.indexOf('createJournalInputConsumer({');
+    expect(start).toBeGreaterThan(-1);
+    const end = src.indexOf('log: console,', start);
+    expect(end).toBeGreaterThan(start);
+    const args = src.slice(start, end);
+    expect(args).toMatch(
+      /publishPromptReply:\s*\(convoId, payload\)\s*=>\s*\{\s*journalPublisher\.publishPromptReply\(convoId, payload\);/,
+    );
   });
 });
 

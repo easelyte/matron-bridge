@@ -6403,6 +6403,9 @@ const journalInputConsumer = createJournalInputConsumer({
   routeTextToSession: journalOnText,
   routeMediaToSession: journalOnMedia,
   routePromptReply: journalOnPromptReply,
+  publishPromptReply: (convoId, payload) => {
+    journalPublisher.publishPromptReply(convoId, payload);
+  },
   ...permissionSeams,
   resumeSessionForConvo: journalResumeConvo,
   noticeUnknownConvo: (convoId, { type }) => {
