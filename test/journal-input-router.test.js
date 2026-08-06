@@ -604,7 +604,7 @@ describe('createJournalInputConsumer — permission registry seam foundation', (
     expect(seams.isLivePendingToolUse(key, 'convo-1')).toBe(true);
 
     seams.resolvePermissionReply(key, 'allow');
-    expect(resolve).toHaveBeenCalledWith({ decision: 'allow' });
+    expect(resolve).toHaveBeenCalledWith({ decision: 'allow', source: 'operator' });
 
     // T-2.3 adds the router-owned echo path that registers seq -> key. Until
     // then, populate-then-evict-only-that-seq cannot be tested through an

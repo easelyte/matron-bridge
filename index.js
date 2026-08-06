@@ -79,7 +79,11 @@ import { createRecentFolders } from './lib/recent-folders.js';
 import { cancelQueuedItem, dispatchBusyQueueMagicWord, notifyQueuedMessage, isQueueReleaseTap, resolveQueueReleaseTap } from './lib/busy-queue.js';
 import { handlePickerValue } from './lib/picker-dispatch.js';
 import { createJournalInputConsumer, resolvePromptChoice } from './lib/journal-input-router.js';
-import { createPermissionSeams } from './lib/permission-registry.js';
+import {
+  auditPermissionDecision,
+  createPermissionSeams,
+  handlePermissionDecisionRoute,
+} from './lib/permission-registry.js';
 import { createJournalMediaRouter } from './lib/journal-media.js';
 import { markJournalOrigin, planQueueFlush } from './lib/queue-flush.js';
 import { attachPendingMediaMirror, pendingMediaMirror } from './lib/media-mirror.js';
@@ -6598,142 +6602,6 @@ function auditShowFile({ result, roomId, filePath, error, ...details }) {
   (result === 'ok' ? console.log : console.warn)(JSON.stringify(record));
 }
 
-function auditPermissionDecision({
-  session_id,
-  tool_use_id,
-  seq,
-  tool_name,
-  decision,
-  source,
-  reason,
-}) {
-  console.log(JSON.stringify({
-    event: 'permission_decision',
-    session_id: session_id ?? null,
-    tool_use_id: tool_use_id ?? null,
-    seq: seq ?? null,
-    tool_name: tool_name ?? null,
-    decision,
-    source,
-    reason: reason ?? '',
-    ts: new Date().toISOString(),
-  }));
-}
-
-function handlePermissionDecisionRoute({
-  data,
-  res,
-  sessions,
-  pendingPermissionDecisions,
-  classifyPermissionFn,
-  journalConvoIdForFn,
-  evictPermissionSeq,
-  auditPermissionDecisionFn,
-  timeoutMs,
-}) {
-  const requestData = data && typeof data === 'object' && !Array.isArray(data) ? data : {};
-  const { session_id, tool_use_id, tool_name } = requestData;
-  const reply = (status, payload) => {
-    if (res.writableEnded) return;
-    res.writeHead(status, { 'Content-Type': 'application/json' });
-    res.end(JSON.stringify(payload));
-  };
-  const audit = ({ seq = null, decision = 'deny', source, reason = '' }) => {
-    auditPermissionDecisionFn({
-      session_id,
-      tool_use_id,
-      seq,
-      tool_name,
-      decision,
-      source,
-      reason,
-    });
-  };
-
-  if (!tool_use_id) {
-    const reason = 'tool_use_id required';
-    audit({ source: 'error', reason });
-    reply(400, { decision: 'deny', reason });
-    return;
-  }
-
-  let target = null;
-  if (session_id) {
-    for (const s of sessions.values()) {
-      if (s.claudeSessionId === session_id && s.alive) {
-        target = s;
-        break;
-      }
-    }
-  }
-  if (!target) {
-    const reason = 'unknown session';
-    audit({ source: 'error', reason });
-    reply(404, { decision: 'deny', reason });
-    return;
-  }
-  if (typeof target.requestPermissionDecision !== 'function') {
-    const reason = 'no permission handler';
-    audit({ source: 'error', reason });
-    reply(503, { decision: 'deny', reason });
-    return;
-  }
-
-  const classification = classifyPermissionFn(target.permissionSnapshot, tool_name);
-  if (classification === 'deny' || classification === 'ask') {
-    audit({ source: 'policy-deny', reason: 'policy' });
-    reply(200, { decision: 'deny', reason: 'policy' });
-    return;
-  }
-  if (classification === 'allow') {
-    audit({ decision: 'allow', source: 'auto-allow' });
-    reply(200, { decision: 'allow' });
-    return;
-  }
-
-  const convoId = journalConvoIdForFn(target);
-  const key = `${convoId} ${tool_use_id}`;
-  let timer;
-  const finalize = ({ decision, reason, source }) => {
-    if (!pendingPermissionDecisions.has(key)) return;
-    const pending = pendingPermissionDecisions.get(key);
-    clearTimeout(timer);
-    pendingPermissionDecisions.delete(key);
-    evictPermissionSeq(key, convoId);
-    audit({ seq: pending.seq, decision, source, reason });
-    if (!res.writableEnded) {
-      res.writeHead(200, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify({ decision, reason: reason || '' }));
-    }
-  };
-
-  timer = setTimeout(() => {
-    finalize({ decision: 'deny', reason: 'timeout', source: 'timeout' });
-  }, timeoutMs);
-  pendingPermissionDecisions.set(key, {
-    resolve: finalize,
-    timer,
-    seq: null,
-    convoId,
-    tool_name,
-  });
-  res.on('close', () => {
-    if (!res.writableEnded) {
-      finalize({ decision: 'deny', reason: 'client disconnect', source: 'disconnect' });
-    }
-  });
-
-  try {
-    target.requestPermissionDecision(tool_use_id, { tool_name });
-  } catch (error) {
-    finalize({
-      decision: 'deny',
-      reason: `session handler threw: ${error?.message || error}`,
-      source: 'error',
-    });
-  }
-}
-
 function validateShowFileBody(data) {
   if (data === null || typeof data !== 'object' || Array.isArray(data)
       || (Object.getPrototypeOf(data) !== Object.prototype && Object.getPrototypeOf(data) !== null)) {
@@ -6933,6 +6801,21 @@ const apiServer = createServer(async (req, res) => {
           showFileReservedBytes -= SHOW_FILE_MAX_BYTES;
         }
       }
+      return;
+    }
+
+    if (url.pathname === '/permission-decision') {
+      handlePermissionDecisionRoute({
+        body,
+        res,
+        sessions,
+        pendingPermissionDecisions,
+        classifyPermissionFn: classifyPermission,
+        journalConvoIdForFn: journalConvoIdFor,
+        evictPermissionSeq: (key, convoId) => journalInputConsumer.evictPermissionSeq(key, convoId),
+        auditPermissionDecisionFn: auditPermissionDecision,
+        timeoutMs: PERMISSION_DECISION_TIMEOUT_MS,
+      });
       return;
     }
 
@@ -7257,19 +7140,6 @@ const apiServer = createServer(async (req, res) => {
         }
         res.writeHead(200);
         res.end(JSON.stringify({ ok: true }));
-
-      } else if (url.pathname === '/permission-decision') {
-        handlePermissionDecisionRoute({
-          data,
-          res,
-          sessions,
-          pendingPermissionDecisions,
-          classifyPermissionFn: classifyPermission,
-          journalConvoIdForFn: journalConvoIdFor,
-          evictPermissionSeq: (key, convoId) => journalInputConsumer.evictPermissionSeq(key, convoId),
-          auditPermissionDecisionFn: auditPermissionDecision,
-          timeoutMs: PERMISSION_DECISION_TIMEOUT_MS,
-        });
 
       } else if (url.pathname === '/plan-decision') {
         // PreToolUse hook (hooks/exit-plan-decision.sh) — fires when claude

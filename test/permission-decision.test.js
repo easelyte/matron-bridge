@@ -6,6 +6,11 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { buildSessionSettings } from '../lib/session-settings.js';
 import { classifyPermission } from '../lib/permission-eval.js';
+import {
+  auditPermissionDecision,
+  createPermissionSeams,
+  handlePermissionDecisionRoute,
+} from '../lib/permission-registry.js';
 
 const HOOK = path.resolve('hooks/permission-decision.sh');
 const DEFAULT_INPUT = {
@@ -203,21 +208,7 @@ describe('permission hook spawn environment wiring (source inspection)', () => {
 });
 
 const INDEX_SOURCE = readFileSync(path.resolve('index.js'), 'utf8');
-const auditPermissionDecisionSource = INDEX_SOURCE.slice(
-  INDEX_SOURCE.indexOf('function auditPermissionDecision('),
-  INDEX_SOURCE.indexOf('function handlePermissionDecisionRoute('),
-).trim();
-const handlePermissionDecisionRouteSource = INDEX_SOURCE.slice(
-  INDEX_SOURCE.indexOf('function handlePermissionDecisionRoute('),
-  INDEX_SOURCE.indexOf('function validateShowFileBody('),
-).trim();
-const auditPermissionDecisionFactory = new Function(
-  'console',
-  `return (${auditPermissionDecisionSource});`,
-);
-const handlePermissionDecisionRoute = new Function(
-  `return (${handlePermissionDecisionRouteSource});`,
-)();
+const handlePermissionDecisionRouteSource = handlePermissionDecisionRoute.toString();
 
 const TOOL_NAME = 'mcp__server__tool';
 const DEFAULT_GATED_SNAPSHOT = Object.freeze({
@@ -253,22 +244,24 @@ async function openPermissionRouteHarness({
     ...(includeHandler ? { requestPermissionDecision } : {}),
   };
   const sessions = new Map(includeSession ? [['room-1', target]] : []);
-  const auditPermissionDecision = auditPermissionDecisionFactory({
-    log: line => audits.push(JSON.parse(line)),
-  });
+  const auditPermissionDecisionFn = record => auditPermissionDecision(
+    record,
+    line => audits.push(JSON.parse(line)),
+  );
+  const permissionSeams = createPermissionSeams({ pendingPermissionDecisions: pending });
   const server = createServer((req, res) => {
     let body = '';
     req.on('data', chunk => { body += chunk; });
     req.on('end', () => {
       handlePermissionDecisionRoute({
-        data: JSON.parse(body),
+        body,
         res,
         sessions,
         pendingPermissionDecisions: pending,
         classifyPermissionFn: classifyPermission,
         journalConvoIdForFn: () => 'convo-1',
         evictPermissionSeq: (key, convoId) => evictions.push([key, convoId]),
-        auditPermissionDecisionFn: auditPermissionDecision,
+        auditPermissionDecisionFn,
         timeoutMs,
       });
     });
@@ -280,6 +273,7 @@ async function openPermissionRouteHarness({
     audits,
     evictions,
     pending,
+    ...permissionSeams,
     target,
     url: `http://127.0.0.1:${port}/permission-decision`,
     async close() {
@@ -290,10 +284,14 @@ async function openPermissionRouteHarness({
 }
 
 async function postPermission(url, body = {}) {
+  return postPermissionRaw(url, JSON.stringify(body));
+}
+
+async function postPermissionRaw(url, body) {
   const response = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(body),
+    body,
   });
   return { status: response.status, body: await response.json() };
 }
@@ -325,6 +323,31 @@ function expectSingleAudit(harness, expected) {
 }
 
 describe('/permission-decision route', () => {
+  it('fails closed and audits malformed JSON exactly once', async () => {
+    const requestPermissionDecision = vi.fn();
+    const harness = await openPermissionRouteHarness({ requestPermissionDecision });
+    try {
+      const result = await postPermissionRaw(harness.url, '{not json');
+
+      expect(result).toEqual({
+        status: 400,
+        body: { decision: 'deny', reason: 'invalid json' },
+      });
+      expect(requestPermissionDecision).not.toHaveBeenCalled();
+      expect(harness.pending.size).toBe(0);
+      expectSingleAudit(harness, {
+        session_id: null,
+        tool_use_id: null,
+        tool_name: null,
+        decision: 'deny',
+        source: 'error',
+        reason: 'invalid json',
+      });
+    } finally {
+      await harness.close();
+    }
+  });
+
   it.each(['deny', 'ask'])('%s policy matches deny immediately without a card or pending entry', async classification => {
     const requestPermissionDecision = vi.fn();
     const harness = await openPermissionRouteHarness({
@@ -404,12 +427,12 @@ describe('/permission-decision route', () => {
 
       const pending = harness.pending.get('convo-1 tool-1');
       pending.seq = 42;
-      pending.resolve({ decision: 'allow', reason: 'operator allowed', source: 'operator' });
-      pending.resolve({ decision: 'deny', reason: 'duplicate', source: 'operator' });
+      harness.resolvePermissionReply('convo-1 tool-1', 'allow');
+      harness.resolvePermissionReply('convo-1 tool-1', 'deny');
 
       await expect(responsePromise).resolves.toEqual({
         status: 200,
-        body: { decision: 'allow', reason: 'operator allowed' },
+        body: { decision: 'allow', reason: '' },
       });
       expect(harness.pending.size).toBe(0);
       expect(harness.evictions).toEqual([['convo-1 tool-1', 'convo-1']]);
@@ -417,8 +440,82 @@ describe('/permission-decision route', () => {
         seq: 42,
         decision: 'allow',
         source: 'operator',
-        reason: 'operator allowed',
       });
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it('rejects duplicate live keys without overwriting the original and ignores its stale finalizer', async () => {
+    const requestPermissionDecision = vi.fn();
+    const harness = await openPermissionRouteHarness({ requestPermissionDecision });
+    const requestBody = {
+      session_id: 'session-1',
+      tool_use_id: 'tool-1',
+      tool_name: TOOL_NAME,
+    };
+    try {
+      const firstResponse = postPermission(harness.url, requestBody);
+      await vi.waitFor(() => expect(requestPermissionDecision).toHaveBeenCalledOnce());
+      const firstEntry = harness.pending.get('convo-1 tool-1');
+
+      const duplicateResponse = await postPermission(harness.url, requestBody);
+
+      expect(duplicateResponse).toEqual({
+        status: 200,
+        body: { decision: 'deny', reason: 'duplicate pending decision' },
+      });
+      expect(requestPermissionDecision).toHaveBeenCalledOnce();
+      expect(harness.pending.get('convo-1 tool-1')).toBe(firstEntry);
+      expect(harness.evictions).toEqual([]);
+      expectSingleAudit(harness, {
+        decision: 'deny',
+        source: 'error',
+        reason: 'duplicate pending decision',
+      });
+
+      harness.resolvePermissionReply('convo-1 tool-1', 'allow');
+      await expect(firstResponse).resolves.toEqual({
+        status: 200,
+        body: { decision: 'allow', reason: '' },
+      });
+      expect(harness.evictions).toEqual([['convo-1 tool-1', 'convo-1']]);
+      expect(harness.audits[1]).toMatchObject({
+        decision: 'allow',
+        source: 'operator',
+        reason: '',
+      });
+
+      const replacementResponse = postPermission(harness.url, requestBody);
+      await vi.waitFor(() => {
+        expect(requestPermissionDecision).toHaveBeenCalledTimes(2);
+        expect(harness.pending.get('convo-1 tool-1')).not.toBe(firstEntry);
+      });
+      const replacementEntry = harness.pending.get('convo-1 tool-1');
+
+      firstEntry.resolve({ decision: 'deny', reason: 'stale', source: 'timeout' });
+      expect(harness.pending.get('convo-1 tool-1')).toBe(replacementEntry);
+      expect(harness.evictions).toEqual([['convo-1 tool-1', 'convo-1']]);
+      expect(harness.audits).toHaveLength(2);
+
+      harness.resolvePermissionReply('convo-1 tool-1', 'deny');
+      await expect(replacementResponse).resolves.toEqual({
+        status: 200,
+        body: { decision: 'deny', reason: '' },
+      });
+      expect(harness.evictions).toEqual([
+        ['convo-1 tool-1', 'convo-1'],
+        ['convo-1 tool-1', 'convo-1'],
+      ]);
+      expect(harness.audits[2]).toMatchObject({
+        decision: 'deny',
+        source: 'operator',
+        reason: '',
+      });
+      for (const audit of harness.audits) {
+        expect(audit).not.toHaveProperty('tool_input');
+        expect(audit).not.toHaveProperty('executed');
+      }
     } finally {
       await harness.close();
     }
@@ -559,6 +656,6 @@ describe('/permission-decision route', () => {
     expect(INDEX_SOURCE).toContain('const PERMISSION_DECISION_TIMEOUT_MS = 1680 * 1000;');
     expect(handlePermissionDecisionRouteSource).toContain("res.on('close'");
     expect(handlePermissionDecisionRouteSource).not.toContain("req.on('close'");
-    expect(INDEX_SOURCE).toContain("} else if (url.pathname === '/permission-decision') {");
+    expect(INDEX_SOURCE).toContain("if (url.pathname === '/permission-decision') {");
   });
 });
