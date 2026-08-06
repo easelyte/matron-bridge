@@ -81,6 +81,7 @@ import { handlePickerValue } from './lib/picker-dispatch.js';
 import { createJournalInputConsumer, resolvePromptChoice } from './lib/journal-input-router.js';
 import {
   auditPermissionDecision,
+  createPermissionDecisionBodyCollector,
   createPermissionSeams,
   handlePermissionDecisionRoute,
 } from './lib/permission-registry.js';
@@ -6684,8 +6685,15 @@ const apiServer = createServer(async (req, res) => {
   let body = '';
   let bodyBytes = 0;
   let showFileBodyTooLarge = false;
+  const permissionDecisionBody = url.pathname === '/permission-decision'
+    ? createPermissionDecisionBodyCollector({ res, auditPermissionDecisionFn: auditPermissionDecision })
+    : null;
   req.on('data', chunk => {
-    if (showFileBodyTooLarge) return;
+    if (showFileBodyTooLarge || permissionDecisionBody?.tooLarge) return;
+    if (permissionDecisionBody) {
+      permissionDecisionBody.append(chunk);
+      return;
+    }
     bodyBytes += chunk.length;
     if (url.pathname === '/show-file' && bodyBytes > 64 * 1024) {
       showFileBodyTooLarge = true;
@@ -6698,7 +6706,7 @@ const apiServer = createServer(async (req, res) => {
     body += chunk;
   });
   req.on('end', async () => {
-    if (showFileBodyTooLarge) return;
+    if (showFileBodyTooLarge || permissionDecisionBody?.tooLarge) return;
 
     if (url.pathname === '/show-file') {
       let filePath;
@@ -6806,7 +6814,7 @@ const apiServer = createServer(async (req, res) => {
 
     if (url.pathname === '/permission-decision') {
       handlePermissionDecisionRoute({
-        body,
+        body: permissionDecisionBody.body,
         res,
         sessions,
         pendingPermissionDecisions,
