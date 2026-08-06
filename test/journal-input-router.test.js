@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'fs';
 import { createJournalInputConsumer, resolvePromptChoice, promptExpectsReply } from '../lib/journal-input-router.js';
-import { createPermissionSeams } from '../lib/permission-registry.js';
+import { buildPermissionKey, createPermissionSeams } from '../lib/permission-registry.js';
 
 const silentLog = { warn: () => {}, error: () => {} };
 
@@ -558,7 +558,7 @@ describe('createJournalInputConsumer — permission registry seam foundation', (
       type: 'permission_request',
       payload: { tool_use_id: 'toolu_1' },
     }));
-    consumer.evictPermissionSeq('convo-1 toolu_1', 'convo-1');
+    consumer.evictPermissionSeq(buildPermissionKey('convo-1', 'toolu_1'), 'convo-1');
     consumer(baseFrame({
       seq: 42,
       type: 'prompt_reply',
@@ -573,9 +573,9 @@ describe('createJournalInputConsumer — permission registry seam foundation', (
   });
 
   it('uses the production permission seams and exposes safe cleanup hooks', () => {
-    const key = 'convo-1 toolu_1';
-    const otherKey = 'convo-1 toolu_2';
-    const otherConvoKey = 'convo-2 toolu_3';
+    const key = buildPermissionKey('convo-1', 'toolu_1');
+    const otherKey = buildPermissionKey('convo-1', 'toolu_2');
+    const otherConvoKey = buildPermissionKey('convo-2', 'toolu_3');
     const resolve = vi.fn();
     const pendingPermissionDecisions = new Map([
       [key, { resolve, seq: null, convoId: 'convo-1' }],
@@ -592,7 +592,10 @@ describe('createJournalInputConsumer — permission registry seam foundation', (
     expect(seams.hasLivePermissionPending('convo-missing')).toBe(false);
     expect(seams.isLivePendingToolUse(key, 'convo-1')).toBe(true);
     expect(seams.isLivePendingToolUse(key, 'convo-2')).toBe(false);
-    expect(seams.isLivePendingToolUse('convo-1 toolu_missing', 'convo-1')).toBe(false);
+    expect(seams.isLivePendingToolUse(
+      buildPermissionKey('convo-1', 'toolu_missing'),
+      'convo-1',
+    )).toBe(false);
 
     seams.notePermissionSeq(key, 40, 'convo-2');
     expect(pendingPermissionDecisions.get(key).seq).toBeNull();

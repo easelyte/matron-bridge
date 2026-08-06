@@ -8,6 +8,7 @@ import { buildSessionSettings } from '../lib/session-settings.js';
 import { classifyPermission } from '../lib/permission-eval.js';
 import {
   auditPermissionDecision,
+  buildPermissionKey,
   createPermissionDecisionBodyCollector,
   createPermissionSeams,
   handlePermissionDecisionRoute,
@@ -222,7 +223,7 @@ const INDEX_SOURCE = readFileSync(path.resolve('index.js'), 'utf8');
 const handlePermissionDecisionRouteSource = handlePermissionDecisionRoute.toString();
 
 const TOOL_NAME = 'mcp__server__tool';
-const PENDING_KEY = `convo-1${String.fromCharCode(0)}tool-1`;
+const PENDING_KEY = buildPermissionKey('convo-1', 'tool-1');
 const DEFAULT_GATED_SNAPSHOT = Object.freeze({
   mcpAllow: Object.freeze([]),
   mcpDeny: Object.freeze([]),
@@ -693,12 +694,12 @@ describe('/permission-decision route', () => {
     {
       name: 'per-conversation',
       cap: PERMISSION_MAX_PENDING_PER_CONVO,
-      keyFor: index => `convo-1${String.fromCharCode(0)}existing-${index}`,
+      keyFor: index => buildPermissionKey('convo-1', `existing-${index}`),
     },
     {
       name: 'global',
       cap: PERMISSION_MAX_PENDING_GLOBAL,
-      keyFor: index => `other-convo-${index}${String.fromCharCode(0)}existing`,
+      keyFor: index => buildPermissionKey(`other-convo-${index}`, 'existing'),
     },
   ])('fails closed at the $name pending cap and admits a new entry after finalize', async testCase => {
     const initialPending = new Map(
@@ -709,8 +710,8 @@ describe('/permission-decision route', () => {
       initialPending,
       requestPermissionDecision,
     });
-    const liveKey = `convo-1${String.fromCharCode(0)}live`;
-    const replacementKey = `convo-1${String.fromCharCode(0)}replacement`;
+    const liveKey = buildPermissionKey('convo-1', 'live');
+    const replacementKey = buildPermissionKey('convo-1', 'replacement');
     try {
       const liveResponse = postPermission(harness.url, {
         session_id: 'session-1',
@@ -731,7 +732,7 @@ describe('/permission-decision route', () => {
       });
       expect(requestPermissionDecision).toHaveBeenCalledOnce();
       expect(harness.pending.size).toBe(testCase.cap);
-      expect(harness.pending.has(`convo-1${String.fromCharCode(0)}overflow`)).toBe(false);
+      expect(harness.pending.has(buildPermissionKey('convo-1', 'overflow'))).toBe(false);
       expectSingleAudit(harness, {
         tool_use_id: 'overflow',
         decision: 'deny',

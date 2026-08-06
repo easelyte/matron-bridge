@@ -1145,7 +1145,9 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   delete spawnEnv.SHOW_FILE_TOKEN;
   if (showFileToken) spawnEnv.SHOW_FILE_TOKEN = showFileToken;
 
-  const permissionSnapshot = buildPermissionSnapshot({ workdir: cwd });
+  const permissionSnapshot = process.env.MATRON_PERMISSION_CARDS
+    ? buildPermissionSnapshot({ workdir: cwd })
+    : null;
 
   const proc = launchWithCodexSinkEnv({
     spawnEnv,
@@ -6365,8 +6367,9 @@ function journalResumeConvo(convoId) {
   return null;
 }
 
-// Canonical HTTP-side permission registry. Keys are the full P56 tuple
-// `${convo_id} ${tool_use_id}`; journalConvoIdFor(session) and inbound
+// Canonical HTTP-side permission registry. Keys are the full P56 tuple with
+// a NUL separator (`convo_id + "\0" + tool_use_id`);
+// journalConvoIdFor(session) and inbound
 // frame.convo_id provide the same stable conversation identity without
 // plumbing a transport-specific session_id through the router.
 const pendingPermissionDecisions = new Map();

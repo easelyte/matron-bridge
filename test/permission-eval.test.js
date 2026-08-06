@@ -7,10 +7,12 @@ import {
   rmSync,
   writeFileSync,
 } from 'node:fs';
+import { spawnSync } from 'node:child_process';
 import path from 'node:path';
 import {
   buildPermissionSnapshot,
   classifyPermission,
+  PERMISSION_SOURCE_MAX_BYTES,
 } from '../lib/permission-eval.js';
 
 const WEBFLOW_SETTINGS_FIXTURE = path.resolve('test/fixtures/webflow-settings.local.json');
@@ -195,6 +197,62 @@ describe('permission snapshot', () => {
     expect(classifyPermission(snapshot, 'mcp__server__allowed_tool')).toBe('allow');
   });
 
+  it('rejects a FIFO as uncertain without hanging', () => {
+    const fifoPath = path.join(fixtureDir, 'settings.fifo');
+    const mkfifo = spawnSync('mkfifo', [fifoPath], { encoding: 'utf8' });
+    expect(mkfifo.error).toBeUndefined();
+    expect(mkfifo.status).toBe(0);
+
+    const script = `
+      import { buildPermissionSnapshot } from './lib/permission-eval.js';
+      const snapshot = buildPermissionSnapshot({ sourcePaths: [${JSON.stringify(fifoPath)}] });
+      process.stdout.write(JSON.stringify(snapshot));
+    `;
+    const result = spawnSync(process.execPath, ['--input-type=module', '--eval', script], {
+      cwd: path.resolve('.'),
+      encoding: 'utf8',
+      timeout: 1000,
+    });
+
+    expect(result.error).toBeUndefined();
+    expect(result.status).toBe(0);
+    expect(JSON.parse(result.stdout).uncertain).toBe(true);
+    expect(result.stderr).toContain('source is not a regular file');
+  });
+
+  it('rejects an oversized source as uncertain without reading it', () => {
+    const source = path.join(fixtureDir, 'oversized.json');
+    writeFileSync(source, Buffer.alloc(PERMISSION_SOURCE_MAX_BYTES + 1, 0x20));
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const snapshot = buildPermissionSnapshot({ sourcePaths: [source] });
+
+    expect(snapshot.uncertain).toBe(true);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('byte limit'));
+  });
+
+  it('rejects another non-regular source as uncertain', () => {
+    const source = path.join(fixtureDir, 'settings-directory');
+    mkdirSync(source);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const snapshot = buildPermissionSnapshot({ sourcePaths: [source] });
+
+    expect(snapshot.uncertain).toBe(true);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('not a regular file'));
+  });
+
+  it('still classifies permissions from a bounded regular file', () => {
+    const source = writeSettings('regular.json', {
+      allow: ['mcp__server__allowed_tool'],
+    });
+
+    const snapshot = buildPermissionSnapshot({ sourcePaths: [source] });
+
+    expect(snapshot.uncertain).toBe(false);
+    expect(classifyPermission(snapshot, 'mcp__server__allowed_tool')).toBe('allow');
+  });
+
   it('suppresses an exact allow after a non-ENOENT read failure', () => {
     const allowPath = writeSettings('allow.json', {
       allow: ['mcp__server__allowed_tool'],
@@ -249,8 +307,10 @@ describe('print-session snapshot wiring (source inspection)', () => {
     indexSource.indexOf('// --- Codex programmatic sessions ---'),
   );
 
-  it('builds the snapshot from the print session workdir and stores it on the session', () => {
+  it('only builds the snapshot when permission cards are enabled and stores null otherwise', () => {
+    expect(printSpawn).toContain('const permissionSnapshot = process.env.MATRON_PERMISSION_CARDS');
     expect(printSpawn).toContain('buildPermissionSnapshot({ workdir: cwd })');
+    expect(printSpawn).toContain(': null;');
     expect(printSpawn).toContain('permissionSnapshot,');
   });
 });
