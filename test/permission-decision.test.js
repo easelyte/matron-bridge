@@ -718,8 +718,8 @@ describe('/permission-decision route', () => {
 
       const pending = harness.pending.get(PENDING_KEY);
       pending.seq = 42;
-      harness.resolvePermissionReply(PENDING_KEY, 'allow');
-      harness.resolvePermissionReply(PENDING_KEY, 'deny');
+      expect(harness.resolvePermissionReply(PENDING_KEY, 'allow')).toBe(true);
+      expect(harness.resolvePermissionReply(PENDING_KEY, 'deny')).toBe(false);
 
       await expect(responsePromise).resolves.toEqual({
         status: 200,

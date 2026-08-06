@@ -5776,6 +5776,12 @@ function journalEchoToRoom(session, plain, html) {
   sendToRoom(session.roomId, plain, html, { skipJournalMirror: true }).catch(() => {});
 }
 
+function journalEchoPromptAnswer(session, username, label) {
+  journalEchoToRoom(session,
+    `📱 ${username} answered: ${label}`,
+    `📱 <b>${escapeHtml(username)} answered:</b> ${escapeHtml(label)}`);
+}
+
 // ctx for a session-scoped command dispatch (Deliverable 1/2, journal side):
 // replies go through the NORMAL sendToRoom for the session's Matrix room —
 // which already mirrors to the journal, so both surfaces see the command's
@@ -6287,7 +6293,7 @@ function journalOnPromptReply(session, answer, { username }) {
     journalPublishNotice(journalConvoIdFor(session), "Nothing to answer right now — there's no open prompt in this session.");
     return;
   }
-  journalEchoToRoom(session, `📱 ${username} answered: ${label}`, `📱 <b>${escapeHtml(username)} answered:</b> ${escapeHtml(label)}`);
+  journalEchoPromptAnswer(session, username, label);
 }
 
 function journalIsControlConvo(convoId) {
@@ -6383,6 +6389,14 @@ function journalResumeConvo(convoId) {
 const pendingPermissionDecisions = new Map();
 const permissionSeams = createPermissionSeams({ pendingPermissionDecisions });
 
+function resolveJournalPermissionReply(key, decision, { username } = {}) {
+  const pending = pendingPermissionDecisions.get(key);
+  if (!permissionSeams.resolvePermissionReply(key, decision)) return false;
+  const label = decision === 'allow' ? 'Allow' : 'Deny';
+  journalEchoPromptAnswer(findSessionByClaudeSessionId(pending.convoId), username, label);
+  return true;
+}
+
 // Assembled once and invoked from journalHandleInboundEvent (the `function`
 // declaration wired into createJournalPublisher near the top of this file —
 // hoisted, so that forward reference is safe). Permission registry operations
@@ -6403,10 +6417,8 @@ const journalInputConsumer = createJournalInputConsumer({
   routeTextToSession: journalOnText,
   routeMediaToSession: journalOnMedia,
   routePromptReply: journalOnPromptReply,
-  publishPromptReply: (convoId, payload) => {
-    journalPublisher.publishPromptReply(convoId, payload);
-  },
   ...permissionSeams,
+  resolvePermissionReply: resolveJournalPermissionReply,
   resumeSessionForConvo: journalResumeConvo,
   noticeUnknownConvo: (convoId, { type }) => {
     journalPublishNotice(convoId, type === 'prompt_reply'
