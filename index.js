@@ -81,10 +81,9 @@ import { handlePickerValue } from './lib/picker-dispatch.js';
 import { createJournalInputConsumer, resolvePromptChoice } from './lib/journal-input-router.js';
 import {
   auditPermissionDecision,
-  buildPermissionCardPayload,
-  buildPermissionKey,
   createPermissionDecisionBodyCollector,
   createPermissionSeams,
+  createRequestPermissionDecision,
   handlePermissionDecisionRoute,
 } from './lib/permission-registry.js';
 import { createJournalMediaRouter } from './lib/journal-media.js';
@@ -1213,27 +1212,12 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     pinnedSummaryText: '',       // accumulated summary text (source of truth, not Matrix)
   };
 
-  session.requestPermissionDecision = (toolUseId, { tool_name, expires_at } = {}) => {
-    const convoId = journalConvoIdFor(session);
-    const exp = typeof expires_at === 'number'
-      ? expires_at
-      : Date.now() + PERMISSION_DECISION_TIMEOUT_MS;
-    const payload = buildPermissionCardPayload(toolUseId, tool_name, exp);
-    if (convoId) {
-      journalPublisher.publishPermissionRequest(convoId, payload);
-      return;
-    }
-
-    const key = buildPermissionKey(convoId, toolUseId);
-    const pending = pendingPermissionDecisions.get(key);
-    if (pending?.resolve) {
-      pending.resolve({
-        decision: 'deny',
-        reason: 'no output channel for session',
-        source: 'error',
-      });
-    }
-  };
+  session.requestPermissionDecision = createRequestPermissionDecision(session, {
+    journalPublisher,
+    pendingPermissionDecisions,
+    journalConvoIdFor,
+    timeoutMs: PERMISSION_DECISION_TIMEOUT_MS,
+  });
 
   // A spawn 'error' with no listener is fatal to the whole bridge (crash-loop
   // of 2026-07-16). Cleanup and the 3-restart cap stay in proc.on('close'),

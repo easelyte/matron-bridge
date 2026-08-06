@@ -12,6 +12,7 @@ import {
   buildPermissionKey,
   createPermissionDecisionBodyCollector,
   createPermissionSeams,
+  createRequestPermissionDecision,
   handlePermissionDecisionRoute,
   PERMISSION_DECISION_MAX_BODY_BYTES,
   PERMISSION_MAX_PENDING_GLOBAL,
@@ -274,37 +275,6 @@ const INTERACTIVE_SESSION_SOURCE = INDEX_SOURCE.slice(
   INDEX_SOURCE.indexOf('// --- Structured Question Handling ---'),
 );
 
-function installPrintPermissionDecisionHandler({
-  session,
-  journalPublisher,
-  pendingPermissionDecisions,
-  timeoutMs = 1000,
-}) {
-  const match = PRINT_SESSION_SOURCE.match(
-    /session\.requestPermissionDecision = ([\s\S]*?\n {2}});\n\n {2}\/\/ A spawn/,
-  );
-  if (!match) throw new Error('print requestPermissionDecision handler not found');
-  const makeHandler = Function(
-    'session',
-    'journalConvoIdFor',
-    'journalPublisher',
-    'buildPermissionCardPayload',
-    'buildPermissionKey',
-    'pendingPermissionDecisions',
-    'PERMISSION_DECISION_TIMEOUT_MS',
-    `return (${match[1]});`,
-  );
-  session.requestPermissionDecision = makeHandler(
-    session,
-    value => value?.journalConvoId || value?.claudeSessionId || null,
-    journalPublisher,
-    buildPermissionCardPayload,
-    buildPermissionKey,
-    pendingPermissionDecisions,
-    timeoutMs,
-  );
-}
-
 const TOOL_NAME = 'mcp__server__tool';
 const PENDING_KEY = buildPermissionKey('convo-1', 'tool-1');
 const DEFAULT_GATED_SNAPSHOT = Object.freeze({
@@ -428,10 +398,12 @@ describe('print session requestPermissionDecision', () => {
   it('publishes exactly one redacted permission request with the route deadline', () => {
     const session = { journalConvoId: 'convo-card' };
     const journalPublisher = { publishPermissionRequest: vi.fn() };
-    installPrintPermissionDecisionHandler({
-      session,
+    const pendingPermissionDecisions = new Map();
+    session.requestPermissionDecision = createRequestPermissionDecision(session, {
       journalPublisher,
-      pendingPermissionDecisions: new Map(),
+      pendingPermissionDecisions,
+      journalConvoIdFor: value => value?.journalConvoId || value?.claudeSessionId || null,
+      timeoutMs: 1000,
     });
 
     session.requestPermissionDecision('tool-card', {
@@ -453,19 +425,22 @@ describe('print session requestPermissionDecision', () => {
     });
     expect(JSON.stringify(journalPublisher.publishPermissionRequest.mock.calls))
       .not.toContain('must-not-cross-the-card-boundary');
+    expect(journalPublisher.publishPermissionRequest.mock.calls[0][1])
+      .not.toHaveProperty('tool_input');
   });
 
   it('denies the matching pending entry when the session has no output channel', () => {
-    const session = {};
+    const session = { claudeSessionId: 'session-no-channel' };
     const resolve = vi.fn();
     const pendingPermissionDecisions = new Map([
       [buildPermissionKey(null, 'tool-no-convo'), { resolve }],
     ]);
     const journalPublisher = { publishPermissionRequest: vi.fn() };
-    installPrintPermissionDecisionHandler({
-      session,
+    session.requestPermissionDecision = createRequestPermissionDecision(session, {
       journalPublisher,
       pendingPermissionDecisions,
+      journalConvoIdFor: () => null,
+      timeoutMs: 1000,
     });
 
     session.requestPermissionDecision('tool-no-convo', { tool_name: TOOL_NAME });
@@ -480,8 +455,10 @@ describe('print session requestPermissionDecision', () => {
   });
 
   it('is attached to print sessions only', () => {
-    expect(PRINT_SESSION_SOURCE).toContain('session.requestPermissionDecision =');
-    expect(INTERACTIVE_SESSION_SOURCE).not.toContain('session.requestPermissionDecision =');
+    expect(PRINT_SESSION_SOURCE).toContain(
+      'session.requestPermissionDecision = createRequestPermissionDecision(session, {',
+    );
+    expect(INTERACTIVE_SESSION_SOURCE).not.toContain('createRequestPermissionDecision(');
   });
 });
 
