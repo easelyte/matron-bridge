@@ -395,6 +395,139 @@ function expectSingleAudit(harness, expected) {
   expect(harness.audits[0]).not.toHaveProperty('executed');
 }
 
+describe('permission decision audit acceptance', () => {
+  const tokenShapedArgumentValue = 'sk_live_audit_argument_secret_123456789';
+  const requestBody = {
+    session_id: 'session-1',
+    tool_use_id: 'tool-1',
+    tool_name: TOOL_NAME,
+    tool_input: { api_key: tokenShapedArgumentValue },
+  };
+
+  function expectAcceptedAudit(harness, expected) {
+    expectSingleAudit(harness, expected);
+    const record = harness.audits[0];
+    expect(Object.keys(record).sort()).toEqual([
+      'decision',
+      'event',
+      'reason',
+      'seq',
+      'session_id',
+      'source',
+      'tool_name',
+      'tool_use_id',
+      'ts',
+    ]);
+    expect(typeof record.tool_name).toBe('string');
+    expect(new Date(record.ts).toISOString()).toBe(record.ts);
+    expect(JSON.stringify(harness.audits)).not.toContain(tokenShapedArgumentValue);
+    expect(record).not.toHaveProperty('tool_input');
+    expect(record).not.toHaveProperty('executed');
+  }
+
+  it('emits one exact, redacted record for every decision source', async () => {
+    const autoAllow = await openPermissionRouteHarness({
+      snapshot: permissionSnapshotFor('allow'),
+    });
+    try {
+      await postPermission(autoAllow.url, requestBody);
+      expectAcceptedAudit(autoAllow, {
+        seq: null,
+        decision: 'pass',
+        source: 'auto-allow',
+        reason: 'passthrough to canonical evaluator',
+      });
+    } finally {
+      await autoAllow.close();
+    }
+
+    const policyDeny = await openPermissionRouteHarness({
+      snapshot: permissionSnapshotFor('deny'),
+    });
+    try {
+      await postPermission(policyDeny.url, requestBody);
+      expectAcceptedAudit(policyDeny, {
+        seq: null,
+        decision: 'deny',
+        source: 'policy-deny',
+        reason: 'policy',
+      });
+    } finally {
+      await policyDeny.close();
+    }
+
+    const operator = await openPermissionRouteHarness();
+    try {
+      const response = postPermission(operator.url, requestBody);
+      await vi.waitFor(() => expect(operator.pending.has(PENDING_KEY)).toBe(true));
+      operator.pending.get(PENDING_KEY).seq = 41;
+      expect(operator.resolvePermissionReply(PENDING_KEY, 'allow')).toBe(true);
+      await response;
+      expectAcceptedAudit(operator, {
+        seq: 41,
+        decision: 'allow',
+        source: 'operator',
+      });
+    } finally {
+      await operator.close();
+    }
+
+    const timeout = await openPermissionRouteHarness({ timeoutMs: 10 });
+    try {
+      await postPermission(timeout.url, requestBody);
+      expectAcceptedAudit(timeout, {
+        decision: 'deny',
+        source: 'timeout',
+        reason: 'timeout',
+      });
+    } finally {
+      await timeout.close();
+    }
+
+    let disconnectHandlerEntered;
+    const disconnectEntered = new Promise(resolve => { disconnectHandlerEntered = resolve; });
+    const disconnect = await openPermissionRouteHarness({
+      requestPermissionDecision: disconnectHandlerEntered,
+      timeoutMs: 100,
+    });
+    try {
+      const clientRequest = request(disconnect.url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+      });
+      clientRequest.on('error', () => {});
+      clientRequest.end(JSON.stringify(requestBody));
+      await disconnectEntered;
+      disconnect.pending.get(PENDING_KEY).seq = 42;
+      clientRequest.destroy();
+      await vi.waitFor(() => expect(disconnect.audits).toHaveLength(1));
+      expectAcceptedAudit(disconnect, {
+        seq: 42,
+        decision: 'deny',
+        source: 'disconnect',
+        reason: 'client disconnect',
+      });
+    } finally {
+      await disconnect.close();
+    }
+
+    const error = await openPermissionRouteHarness();
+    try {
+      const { tool_use_id: _omitted, ...missingToolUseId } = requestBody;
+      await postPermission(error.url, missingToolUseId);
+      expectAcceptedAudit(error, {
+        tool_use_id: null,
+        seq: null,
+        decision: 'deny',
+        source: 'error',
+        reason: 'tool_use_id required',
+      });
+    } finally {
+      await error.close();
+    }
+  });
+});
+
 describe('print session requestPermissionDecision', () => {
   it('publishes exactly one redacted permission request with the route deadline', () => {
     const session = { journalConvoId: 'convo-card' };
