@@ -346,6 +346,28 @@ describe('createJournalPublisher', () => {
     await fake.close();
   });
 
+  it('notifies an evicted permission frame without allowing its callback to throw', async () => {
+    const port = await getFreePort();
+    const warnings = [];
+    const log = { warn: (...a) => warnings.push(a.join(' ')), error: () => {} };
+    const pub = createJournalPublisher({
+      url: `ws://127.0.0.1:${port}/ws`, token: 'tok', log, queueLimit: 1, ...FAST_BACKOFF,
+    });
+    let evictionCount = 0;
+
+    expect(pub.publishPermissionRequest('c1', { tool_use_id: 't0' }, {
+      onEvicted: () => {
+        evictionCount += 1;
+        throw new Error('test callback failure');
+      },
+    })).toBe(true);
+    expect(() => pub.publishText('c1', { body: 'newer', from: 'user' })).not.toThrow();
+
+    expect(evictionCount).toBe(1);
+    expect(warnings.some(w => w.includes('eviction callback failed: test callback failure'))).toBe(true);
+    pub.close();
+  });
+
   it('disabled mode (no url/token): every method is a safe no-op, nothing throws', async () => {
     const warnings = [];
     const log = { warn: (...a) => warnings.push(a.join(' ')), error: () => {} };

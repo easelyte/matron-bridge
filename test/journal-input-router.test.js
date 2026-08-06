@@ -4,6 +4,7 @@ import { createJournalInputConsumer, resolvePromptChoice, promptExpectsReply } f
 import {
   buildPermissionKey,
   createPermissionSeams,
+  PERMISSION_DECISION_TIMEOUT_MS,
   PERMISSION_MAX_PENDING_GLOBAL,
   PERMISSION_MAX_PENDING_PER_CONVO,
 } from '../lib/permission-registry.js';
@@ -985,7 +986,50 @@ describe('createJournalInputConsumer — permission registry seam foundation', (
     expect(deps.routePromptReply).not.toHaveBeenCalled();
   });
 
-  it('drops a buffered reply when its short TTL expires without resolving the later echo', () => {
+  it('retains a buffered reply beyond five seconds and drains it on a slow echo', () => {
+    vi.useFakeTimers();
+    try {
+      const key = buildPermissionKey('convo-1', 'toolu_1');
+      const resolve = vi.fn();
+      const pendingPermissionDecisions = new Map([
+        [key, { resolve, seq: null, convoId: 'convo-1', nonce: 'nonce-toolu_1' }],
+      ]);
+      const deps = makeDeps(createPermissionSeams({ pendingPermissionDecisions }));
+      const consumer = createJournalInputConsumer(deps);
+      consumer(baseFrame({
+        seq: 50,
+        sender: 'agent:dev-2',
+        type: 'prompt',
+        payload: { question: 'Latest prompt', options: [] },
+      }));
+      consumer(baseFrame({
+        seq: 51,
+        type: 'prompt_reply',
+        payload: { target_seq: 41, choice: 'allow', text: null },
+      }));
+
+      expect(vi.getTimerCount()).toBe(1);
+      vi.advanceTimersByTime(6_000);
+      expect(vi.getTimerCount()).toBe(1);
+      expect(deps.noticeStalePromptReply).not.toHaveBeenCalled();
+      consumer(baseFrame({
+        seq: 41,
+        sender: 'agent:dev-2',
+        type: 'permission_request',
+        payload: { tool_use_id: 'toolu_1', nonce: 'nonce-toolu_1' },
+      }));
+
+      expect(resolve).toHaveBeenCalledWith({
+        decision: 'allow', source: 'operator', principal: 'dan',
+      });
+      expect(vi.getTimerCount()).toBe(0);
+      expect(deps.routePromptReply).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('expires an undrained buffered reply with the permission-card deadline', () => {
     vi.useFakeTimers();
     try {
       const deps = makeDeps({
@@ -1006,23 +1050,17 @@ describe('createJournalInputConsumer — permission registry seam foundation', (
         payload: { target_seq: 41, choice: 'allow', text: null },
       }));
 
+      vi.advanceTimersByTime(PERMISSION_DECISION_TIMEOUT_MS - 1);
       expect(vi.getTimerCount()).toBe(1);
-      vi.advanceTimersByTime(5_000);
+      expect(deps.noticeStalePromptReply).not.toHaveBeenCalled();
+      vi.advanceTimersByTime(1);
+
       expect(vi.getTimerCount()).toBe(0);
       expect(deps.noticeStalePromptReply).toHaveBeenCalledWith('convo-1', {
         username: 'dan',
         targetSeq: 41,
         latestSeq: 50,
       });
-      consumer(baseFrame({
-        seq: 41,
-        sender: 'agent:dev-2',
-        type: 'permission_request',
-        payload: { tool_use_id: 'toolu_1' },
-      }));
-
-      expect(deps.resolvePermissionReply).not.toHaveBeenCalled();
-      expect(deps.routePromptReply).not.toHaveBeenCalled();
     } finally {
       vi.useRealTimers();
     }

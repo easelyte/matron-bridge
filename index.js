@@ -85,6 +85,7 @@ import {
   createPermissionSeams,
   createRequestPermissionDecision,
   handlePermissionDecisionRoute,
+  PERMISSION_DECISION_TIMEOUT_MS,
 } from './lib/permission-registry.js';
 import { createJournalMediaRouter } from './lib/journal-media.js';
 import { markJournalOrigin, planQueueFlush } from './lib/queue-flush.js';
@@ -6619,8 +6620,6 @@ const pendingPlanDecisions = new Map();
 // --- Local HTTP API ---
 
 const API_PORT = parseInt(process.env.MATRON_BRIDGE_API_PORT || '9802', 10);
-const PERMISSION_DECISION_TIMEOUT_MS = 1680 * 1000;
-
 function auditShowFile({ result, roomId, filePath, error, ...details }) {
   const record = {
     event: 'show_file',

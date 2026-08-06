@@ -16,6 +16,7 @@ import {
   createRequestPermissionDecision,
   handlePermissionDecisionRoute,
   PERMISSION_DECISION_MAX_BODY_BYTES,
+  PERMISSION_DECISION_TIMEOUT_MS,
   PERMISSION_MAX_PENDING_GLOBAL,
   PERMISSION_MAX_PENDING_PER_CONVO,
 } from '../lib/permission-registry.js';
@@ -594,6 +595,8 @@ describe('print session requestPermissionDecision', () => {
       ],
       expires_at: 1_780_000_000_002,
       nonce: expect.any(String),
+    }, {
+      onEvicted: expect.any(Function),
     });
     expect(pendingPermissionDecisions.get(buildPermissionKey('convo-card', 'tool-card')).nonce)
       .toBe(journalPublisher.publishPermissionRequest.mock.calls[0][1].nonce);
@@ -638,6 +641,47 @@ describe('print session requestPermissionDecision', () => {
         decision: 'deny',
         source: 'error',
         reason: 'no output channel for session',
+      });
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it('immediately denies through the route finalizer when its queued card is evicted', async () => {
+    const journalPublisher = {
+      publishPermissionRequest: vi.fn((_convoId, _payload, { onEvicted }) => {
+        onEvicted();
+        return true;
+      }),
+    };
+    const harness = await openPermissionRouteHarness({
+      requestPermissionDecision: undefined,
+      timeoutMs: PERMISSION_DECISION_TIMEOUT_MS,
+    });
+    harness.target.journalConvoId = 'convo-1';
+    harness.target.requestPermissionDecision = createRequestPermissionDecision(harness.target, {
+      journalPublisher,
+      pendingPermissionDecisions: harness.pending,
+      journalConvoIdFor: value => value?.journalConvoId || value?.claudeSessionId || null,
+      timeoutMs: PERMISSION_DECISION_TIMEOUT_MS,
+    });
+
+    try {
+      const result = await postPermission(harness.url, {
+        ...DEFAULT_INPUT,
+        tool_name: TOOL_NAME,
+      });
+
+      expect(result).toEqual({
+        status: 200,
+        body: { decision: 'deny', reason: 'card evicted before delivery' },
+      });
+      expect(harness.pending.size).toBe(0);
+      expectSingleAudit(harness, {
+        tool_name: TOOL_NAME,
+        decision: 'deny',
+        source: 'error',
+        reason: 'card evicted before delivery',
       });
     } finally {
       await harness.close();
@@ -1413,7 +1457,8 @@ describe('/permission-decision route', () => {
   });
 
   it('uses the reviewed production deadline and listens for disconnects on the response only', () => {
-    expect(INDEX_SOURCE).toContain('const PERMISSION_DECISION_TIMEOUT_MS = 1680 * 1000;');
+    expect(PERMISSION_DECISION_TIMEOUT_MS).toBe(1680 * 1000);
+    expect(INDEX_SOURCE).toContain('PERMISSION_DECISION_TIMEOUT_MS,');
     expect(handlePermissionDecisionRouteSource).toContain("res.on('close'");
     expect(handlePermissionDecisionRouteSource).not.toContain("req.on('close'");
     expect(INDEX_SOURCE).toContain('createPermissionDecisionBodyCollector({');
