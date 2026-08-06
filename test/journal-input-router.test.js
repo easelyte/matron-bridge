@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'fs';
 import { createJournalInputConsumer, resolvePromptChoice, promptExpectsReply } from '../lib/journal-input-router.js';
+import { createPermissionSeams } from '../lib/permission-registry.js';
 
 const silentLog = { warn: () => {}, error: () => {} };
 
@@ -564,30 +565,6 @@ describe('createJournalInputConsumer — permission registry seam foundation', (
     payload: { target_seq: targetSeq, choice: 'model:sonnet', text: null },
   });
 
-  it('exposes seq-specific permission eviction without disturbing picker or queue state', () => {
-    const deps = makeDeps();
-    const consumer = createJournalInputConsumer(deps);
-    expect(typeof consumer.evictPermissionSeq).toBe('function');
-
-    consumer(pickerFrame(12));
-    consumer.queueRelease.noteQueued('convo-1', {
-      promptId: 'pr_1',
-      itemId: 'pr_1::0',
-    });
-
-    expect(() => consumer.evictPermissionSeq('convo-1 toolu_missing', 'convo-1')).not.toThrow();
-    expect(consumer.queueRelease.listLive('convo-1')).toEqual([
-      { promptId: 'pr_1', itemId: 'pr_1::0' },
-    ]);
-
-    consumer(pickerReply(12));
-    expect(deps.routePromptReply).toHaveBeenCalledWith(
-      { claudeSessionId: 'convo-1' },
-      { target_seq: 12, choice: 'model:sonnet', text: null, picker: true },
-      { username: 'dan' },
-    );
-  });
-
   it('accepts all four forward seams but leaves echo/reply consumption to later tasks', () => {
     const deps = makeDeps();
     const consumer = createJournalInputConsumer(deps);
@@ -612,54 +589,80 @@ describe('createJournalInputConsumer — permission registry seam foundation', (
     expect(deps.routePromptReply).toHaveBeenCalledTimes(1);
   });
 
-  it('documents the fake index-side pending-map contract carried by the injected seams', () => {
+  it('uses the production seams and evicts only the targeted permission frame', () => {
     const key = 'convo-1 toolu_1';
+    const otherKey = 'convo-1 toolu_2';
+    const otherConvoKey = 'convo-2 toolu_3';
     const resolve = vi.fn();
-    const pending = new Map([[key, {
-      resolve,
-      seq: null,
-      convoId: 'convo-1',
-    }]]);
-    const seams = {
-      notePermissionSeq: (candidate, seq, convoId) => {
-        const entry = pending.get(candidate);
-        if (entry?.convoId === convoId && entry.seq === null) entry.seq = seq;
-      },
-      resolvePermissionReply: (candidate, decision) => {
-        pending.get(candidate)?.resolve({ decision });
-      },
-      hasLivePermissionPending: (convoId) => [...pending.values()]
-        .some(entry => entry.convoId === convoId && entry.seq === null),
-      isLivePendingToolUse: (candidate, convoId) => pending.get(candidate)?.convoId === convoId,
-    };
-    const consumer = createJournalInputConsumer(makeDeps(seams));
+    const pendingPermissionDecisions = new Map([
+      [key, { resolve, seq: null, convoId: 'convo-1' }],
+      [otherKey, { resolve: vi.fn(), seq: 42, convoId: 'convo-1' }],
+      [otherConvoKey, { resolve: vi.fn(), seq: null, convoId: 'convo-2' }],
+    ]);
+    const permissionFramesByConvo = new Map([
+      ['convo-1', new Map([[41, key], [42, otherKey]])],
+      ['convo-2', new Map([[51, otherConvoKey]])],
+    ]);
+    const seams = createPermissionSeams({ pendingPermissionDecisions });
+    const deps = makeDeps({ ...seams, permissionFramesByConvo });
+    const consumer = createJournalInputConsumer(deps);
 
     expect(typeof consumer.evictPermissionSeq).toBe('function');
     expect(seams.hasLivePermissionPending('convo-1')).toBe(true);
+    expect(seams.hasLivePermissionPending('convo-2')).toBe(true);
+    expect(seams.hasLivePermissionPending('convo-missing')).toBe(false);
     expect(seams.isLivePendingToolUse(key, 'convo-1')).toBe(true);
+    expect(seams.isLivePendingToolUse(key, 'convo-2')).toBe(false);
+    expect(seams.isLivePendingToolUse('convo-1 toolu_missing', 'convo-1')).toBe(false);
+
+    seams.notePermissionSeq(key, 40, 'convo-2');
+    expect(pendingPermissionDecisions.get(key).seq).toBeNull();
     seams.notePermissionSeq(key, 41, 'convo-1');
-    expect(pending.get(key).seq).toBe(41);
+    seams.notePermissionSeq(key, 99, 'convo-1');
+    expect(pendingPermissionDecisions.get(key).seq).toBe(41);
+    expect(seams.hasLivePermissionPending('convo-1')).toBe(false);
+    // A registered seq is still a live tool-use entry; only the convo must match.
+    expect(seams.isLivePendingToolUse(key, 'convo-1')).toBe(true);
+
     seams.resolvePermissionReply(key, 'allow');
     expect(resolve).toHaveBeenCalledWith({ decision: 'allow' });
-  });
 
-  it('module remains one-way and index.js wires the canonical pending registry seams', () => {
-    const routerSrc = readFileSync(new URL('../lib/journal-input-router.js', import.meta.url), 'utf-8');
-    const indexSrc = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
-    expect(typeof createJournalInputConsumer).toBe('function');
-    expect(routerSrc).not.toMatch(/from ['"]\.\.\/index\.js['"]/);
-    expect(indexSrc).toContain('const pendingPermissionDecisions = new Map();');
-    expect(indexSrc).toContain('`${convo_id} ${tool_use_id}`');
+    consumer(pickerFrame(12));
+    consumer.queueRelease.noteQueued('convo-1', {
+      promptId: 'pr_1',
+      itemId: 'pr_1::0',
+    });
+    consumer.evictPermissionSeq(key, 'convo-1');
 
-    const start = indexSrc.indexOf('createJournalInputConsumer({');
-    const end = indexSrc.indexOf('log: console,', start);
-    expect(start).toBeGreaterThan(-1);
-    expect(end).toBeGreaterThan(start);
-    const args = indexSrc.slice(start, end);
-    expect(args).toMatch(/\bnotePermissionSeq\b/);
-    expect(args).toMatch(/\bresolvePermissionReply\b/);
-    expect(args).toMatch(/\bhasLivePermissionPending\b/);
-    expect(args).toMatch(/\bisLivePendingToolUse\b/);
+    expect(permissionFramesByConvo.get('convo-1')).toEqual(new Map([[42, otherKey]]));
+    expect(permissionFramesByConvo.get('convo-2')).toEqual(new Map([[51, otherConvoKey]]));
+    expect(permissionFramesByConvo.get('convo-1').has(41)).toBe(false);
+    expect(consumer.queueRelease.listLive('convo-1')).toEqual([
+      { promptId: 'pr_1', itemId: 'pr_1::0' },
+    ]);
+
+    consumer(pickerReply(12));
+    expect(deps.routePromptReply).toHaveBeenNthCalledWith(
+      1,
+      { claudeSessionId: 'convo-1' },
+      { target_seq: 12, choice: 'model:sonnet', text: null, picker: true },
+      { username: 'dan' },
+    );
+
+    // With its permission membership gone, a late tap follows the ordinary
+    // prompt path and cannot invoke the permission resolver.
+    consumer(baseFrame({
+      seq: 100,
+      type: 'prompt_reply',
+      payload: { target_seq: 41, choice: 'allow', text: null },
+    }));
+    expect(deps.routePromptReply).toHaveBeenNthCalledWith(
+      2,
+      { claudeSessionId: 'convo-1' },
+      { target_seq: 41, choice: 'allow', text: null },
+      { username: 'dan' },
+    );
+    expect(resolve).toHaveBeenCalledTimes(1);
   });
 });
 

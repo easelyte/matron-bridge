@@ -79,6 +79,7 @@ import { createRecentFolders } from './lib/recent-folders.js';
 import { cancelQueuedItem, dispatchBusyQueueMagicWord, notifyQueuedMessage, isQueueReleaseTap, resolveQueueReleaseTap } from './lib/busy-queue.js';
 import { handlePickerValue } from './lib/picker-dispatch.js';
 import { createJournalInputConsumer, resolvePromptChoice } from './lib/journal-input-router.js';
+import { createPermissionSeams } from './lib/permission-registry.js';
 import { createJournalMediaRouter } from './lib/journal-media.js';
 import { markJournalOrigin, planQueueFlush } from './lib/queue-flush.js';
 import { attachPendingMediaMirror, pendingMediaMirror } from './lib/media-mirror.js';
@@ -6359,12 +6360,16 @@ function journalResumeConvo(convoId) {
   return null;
 }
 
+// Canonical HTTP-side permission registry. Keys are the full P56 tuple
+// `${convo_id} ${tool_use_id}`; journalConvoIdFor(session) and inbound
+// frame.convo_id provide the same stable conversation identity without
+// plumbing a transport-specific session_id through the router.
+const pendingPermissionDecisions = new Map();
+
 // Assembled once and invoked from journalHandleInboundEvent (the `function`
 // declaration wired into createJournalPublisher near the top of this file —
-// hoisted, so that forward reference is safe). The permission callbacks close
-// over pendingPermissionDecisions, declared with the other HTTP pending state
-// below; the router only stores those callbacks here, and inbound events can
-// only call them after module evaluation has completed and the socket is live.
+// hoisted, so that forward reference is safe). Permission registry operations
+// come from the same factory exercised by the router contract tests.
 const journalInputConsumer = createJournalInputConsumer({
   isControlConvo: journalIsControlConvo,
   handleControlCommand: (body) => {
@@ -6381,24 +6386,7 @@ const journalInputConsumer = createJournalInputConsumer({
   routeTextToSession: journalOnText,
   routeMediaToSession: journalOnMedia,
   routePromptReply: journalOnPromptReply,
-  notePermissionSeq: (key, seq, convoId) => {
-    const pending = pendingPermissionDecisions.get(key);
-    if (pending?.convoId === convoId && pending.seq === null) pending.seq = seq;
-  },
-  resolvePermissionReply: (key, decision) => {
-    const pending = pendingPermissionDecisions.get(key);
-    if (typeof pending?.resolve === 'function') pending.resolve({ decision });
-  },
-  hasLivePermissionPending: (convoId) => {
-    for (const pending of pendingPermissionDecisions.values()) {
-      if (pending?.convoId === convoId && pending.seq === null) return true;
-    }
-    return false;
-  },
-  isLivePendingToolUse: (key, convoId) => {
-    const pending = pendingPermissionDecisions.get(key);
-    return !!pending && pending.convoId === convoId;
-  },
+  ...createPermissionSeams({ pendingPermissionDecisions }),
   resumeSessionForConvo: journalResumeConvo,
   noticeUnknownConvo: (convoId, { type }) => {
     journalPublishNotice(convoId, type === 'prompt_reply'
@@ -6587,11 +6575,6 @@ const pendingSensitiveData = new Map(); // Map<sensitiveId, { label, content, vi
 // /plan-decision; the bridge resolves it once the user replies on Matrix.
 // Phase 4 wires the session-side handler that actually surfaces the plan.
 const pendingPlanDecisions = new Map();
-// Canonical HTTP-side permission registry. Keys are the full P56 tuple
-// `${convo_id} ${tool_use_id}`; journalConvoIdFor(session) and inbound
-// frame.convo_id provide the same stable conversation identity without
-// plumbing a transport-specific session_id through the router.
-const pendingPermissionDecisions = new Map();
 
 // --- Local HTTP API ---
 
