@@ -548,8 +548,13 @@ describe('createJournalInputConsumer — permission registry seam foundation', (
     };
   }
 
-  it('accepts all four forward seams but leaves echo/reply consumption to later tasks', () => {
-    const deps = makeDeps();
+  it('registers a valid bridge-owned permission_request echo exactly once', () => {
+    const key = buildPermissionKey('convo-1', 'toolu_1');
+    const deps = makeDeps({
+      isLivePendingToolUse: vi.fn((candidateKey, convoId) => (
+        candidateKey === key && convoId === 'convo-1'
+      )),
+    });
     const consumer = createJournalInputConsumer(deps);
 
     consumer(baseFrame({
@@ -558,18 +563,147 @@ describe('createJournalInputConsumer — permission registry seam foundation', (
       type: 'permission_request',
       payload: { tool_use_id: 'toolu_1' },
     }));
-    consumer.evictPermissionSeq(buildPermissionKey('convo-1', 'toolu_1'), 'convo-1');
     consumer(baseFrame({
       seq: 42,
+      sender: 'agent:dev-2',
+      type: 'permission_request',
+      payload: { tool_use_id: 'toolu_1' },
+    }));
+
+    expect(deps.isLivePendingToolUse).toHaveBeenCalledWith(key, 'convo-1');
+    expect(deps.notePermissionSeq).toHaveBeenCalledTimes(1);
+    expect(deps.notePermissionSeq).toHaveBeenCalledWith(key, 41, 'convo-1');
+    expect(deps.findSessionByConvoId).not.toHaveBeenCalled();
+  });
+
+  it('rejects user-origin, wrong-convo, unknown-tool, empty-id, and non-integer permission echoes', () => {
+    const liveKey = buildPermissionKey('convo-1', 'toolu_live');
+    const deps = makeDeps({
+      isLivePendingToolUse: vi.fn((key, convoId) => (
+        key === liveKey && convoId === 'convo-1'
+      )),
+    });
+    const consumer = createJournalInputConsumer(deps);
+
+    const invalidFrames = [
+      { seq: 40, sender: 'user:dan', convo_id: 'convo-1', payload: { tool_use_id: 'toolu_live' } },
+      { seq: 41, sender: 'agent:dev-2', convo_id: 'convo-2', payload: { tool_use_id: 'toolu_live' } },
+      { seq: 42, sender: 'agent:dev-2', convo_id: 'convo-1', payload: { tool_use_id: 'toolu_unknown' } },
+      { seq: 43, sender: 'agent:dev-2', convo_id: 'convo-1', payload: { tool_use_id: '   ' } },
+      { seq: '44', sender: 'agent:dev-2', convo_id: 'convo-1', payload: { tool_use_id: 'toolu_live' } },
+    ];
+    for (const overrides of invalidFrames) {
+      consumer(baseFrame({ type: 'permission_request', ...overrides }));
+    }
+
+    expect(deps.notePermissionSeq).not.toHaveBeenCalled();
+  });
+
+  it('bounds permission echo registrations to the picker-frame retention window', () => {
+    const deps = makeDeps({ isLivePendingToolUse: vi.fn(() => true) });
+    const consumer = createJournalInputConsumer(deps);
+
+    for (let seq = 1; seq <= 17; seq += 1) {
+      consumer(baseFrame({
+        seq,
+        sender: 'agent:dev-2',
+        type: 'permission_request',
+        payload: { tool_use_id: `toolu_${seq}` },
+      }));
+    }
+    consumer(baseFrame({
+      seq: 17,
+      sender: 'agent:dev-2',
+      type: 'permission_request',
+      payload: { tool_use_id: 'toolu_17' },
+    }));
+    consumer(baseFrame({
+      seq: 1,
+      sender: 'agent:dev-2',
+      type: 'permission_request',
+      payload: { tool_use_id: 'toolu_1' },
+    }));
+
+    expect(deps.notePermissionSeq).toHaveBeenCalledTimes(18);
+  });
+
+  it('evictPermissionSeq removes only the populated permission seq and leaves picker state intact', () => {
+    const deps = makeDeps({ isLivePendingToolUse: vi.fn(() => true) });
+    const consumer = createJournalInputConsumer(deps);
+    const firstKey = buildPermissionKey('convo-1', 'toolu_1');
+
+    for (const [seq, toolUseId] of [[41, 'toolu_1'], [42, 'toolu_2']]) {
+      consumer(baseFrame({
+        seq,
+        sender: 'agent:dev-2',
+        type: 'permission_request',
+        payload: { tool_use_id: toolUseId },
+      }));
+    }
+    consumer(baseFrame({
+      seq: 50,
+      sender: 'agent:dev-2',
+      type: 'prompt',
+      payload: { options: [{ id: 'model-opus', value: 'model:opus' }] },
+    }));
+
+    consumer.evictPermissionSeq(firstKey, 'convo-1');
+    consumer(baseFrame({
+      seq: 41,
+      sender: 'agent:dev-2',
+      type: 'permission_request',
+      payload: { tool_use_id: 'toolu_1' },
+    }));
+    consumer(baseFrame({
+      seq: 42,
+      sender: 'agent:dev-2',
+      type: 'permission_request',
+      payload: { tool_use_id: 'toolu_2' },
+    }));
+    consumer(baseFrame({
+      seq: 51,
       type: 'prompt_reply',
       payload: { target_seq: 41, choice: 'allow', text: null },
     }));
+    consumer(baseFrame({
+      seq: 52,
+      type: 'prompt_reply',
+      payload: { target_seq: 50, choice: 'model:opus', text: null },
+    }));
 
-    expect(deps.notePermissionSeq).not.toHaveBeenCalled();
+    expect(deps.notePermissionSeq).toHaveBeenCalledTimes(3);
     expect(deps.resolvePermissionReply).not.toHaveBeenCalled();
-    expect(deps.hasLivePermissionPending).not.toHaveBeenCalled();
-    expect(deps.isLivePendingToolUse).not.toHaveBeenCalled();
-    expect(deps.routePromptReply).toHaveBeenCalledTimes(1);
+    expect(deps.routePromptReply).toHaveBeenCalledTimes(2);
+    expect(deps.routePromptReply).toHaveBeenNthCalledWith(
+      1,
+      { claudeSessionId: 'convo-1' },
+      { target_seq: 41, choice: 'allow', text: null },
+      { username: 'dan' },
+    );
+    expect(deps.routePromptReply).toHaveBeenNthCalledWith(
+      2,
+      { claudeSessionId: 'convo-1' },
+      { target_seq: 50, choice: 'model:opus', text: null, picker: true },
+      { username: 'dan' },
+    );
+  });
+
+  it('evictConvo clears permission frame state and the empty reply buffer idempotently', () => {
+    const deps = makeDeps({ isLivePendingToolUse: vi.fn(() => true) });
+    const consumer = createJournalInputConsumer(deps);
+    const permissionEcho = baseFrame({
+      seq: 41,
+      sender: 'agent:dev-2',
+      type: 'permission_request',
+      payload: { tool_use_id: 'toolu_1' },
+    });
+
+    consumer(permissionEcho);
+    consumer.evictConvo('convo-1');
+    consumer(permissionEcho);
+    expect(() => consumer.evictConvo('convo-1')).not.toThrow();
+
+    expect(deps.notePermissionSeq).toHaveBeenCalledTimes(2);
   });
 
   it('uses the production permission seams and exposes safe cleanup hooks', () => {
@@ -597,10 +731,18 @@ describe('createJournalInputConsumer — permission registry seam foundation', (
       'convo-1',
     )).toBe(false);
 
-    seams.notePermissionSeq(key, 40, 'convo-2');
-    expect(pendingPermissionDecisions.get(key).seq).toBeNull();
-    seams.notePermissionSeq(key, 41, 'convo-1');
-    seams.notePermissionSeq(key, 99, 'convo-1');
+    consumer(baseFrame({
+      seq: 41,
+      sender: 'agent:dev-2',
+      type: 'permission_request',
+      payload: { tool_use_id: 'toolu_1' },
+    }));
+    consumer(baseFrame({
+      seq: 99,
+      sender: 'agent:dev-2',
+      type: 'permission_request',
+      payload: { tool_use_id: 'toolu_1' },
+    }));
     expect(pendingPermissionDecisions.get(key).seq).toBe(41);
     expect(seams.hasLivePermissionPending('convo-1')).toBe(false);
     // A registered seq is still a live tool-use entry; only the convo must match.
@@ -609,9 +751,6 @@ describe('createJournalInputConsumer — permission registry seam foundation', (
     seams.resolvePermissionReply(key, 'allow');
     expect(resolve).toHaveBeenCalledWith({ decision: 'allow', source: 'operator' });
 
-    // T-2.3 adds the router-owned echo path that registers seq -> key. Until
-    // then, populate-then-evict-only-that-seq cannot be tested through an
-    // owned path; cover that behavior there rather than exposing this map.
     expect(() => consumer.evictPermissionSeq(key, 'convo-1')).not.toThrow();
     expect(() => consumer.evictPermissionSeq('missing-key', 'missing-convo')).not.toThrow();
     expect(() => consumer.evictConvo('convo-1')).not.toThrow();
