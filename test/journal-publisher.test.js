@@ -150,12 +150,16 @@ describe('createJournalPublisher', () => {
     await fake.close();
   });
 
-  it('covers publishPrompt and publishToolOutput with the right types', async () => {
+  it('publishes prompt, permission request, and tool output with the right types', async () => {
     const fake = await startFakeServer();
     const pub = createJournalPublisher({ url: fake.url, token: 'tok', log: silentLog, ...FAST_BACKOFF });
 
     pub.upsertConvo('convo-2', {});
     pub.publishPrompt('convo-2', { question: 'Continue?', options: ['yes', 'no'], mode: 'pick_one' });
+    const permissionPublished = pub.publishPermissionRequest(
+      'convo-2',
+      { kind: 'permission', tool_use_id: 't0' },
+    );
     pub.publishToolOutput('convo-2', { tool_use_id: 't1', command: 'ls -la', viewer_url: 'https://x', expires_at: 123 });
     pub.publishDiff('convo-2', {
       file_path: '/w/a.swift', display_path: 'a.swift', viewer_url: null,
@@ -163,10 +167,16 @@ describe('createJournalPublisher', () => {
       added: 1, removed: 1, truncated: false, new_file: false,
     });
 
-    await waitFor(() => fake.received.filter(f => f.op === 'publish').length >= 3);
-    const [prompt, toolOutput] = fake.received.filter(f => f.op === 'publish');
+    await waitFor(() => fake.received.filter(f => f.op === 'publish').length >= 4);
+    const [prompt, permissionRequest, toolOutput] = fake.received.filter(f => f.op === 'publish');
     expect(prompt.type).toBe('prompt');
     expect(prompt.payload).toEqual({ question: 'Continue?', options: ['yes', 'no'], mode: 'pick_one' });
+    expect(permissionRequest).toMatchObject({
+      convo_id: 'convo-2',
+      type: 'permission_request',
+      payload: { kind: 'permission', tool_use_id: 't0' },
+    });
+    expect(permissionPublished).toBe(true);
     expect(toolOutput.type).toBe('tool_output');
     expect(toolOutput.payload).toEqual({ tool_use_id: 't1', command: 'ls -la', viewer_url: 'https://x', expires_at: 123 });
     const diffFrame = fake.received.find(f => f.op === 'publish' && f.type === 'diff');
@@ -336,10 +346,36 @@ describe('createJournalPublisher', () => {
     await fake.close();
   });
 
+  it('notifies an evicted permission frame without allowing its callback to throw', async () => {
+    const port = await getFreePort();
+    const warnings = [];
+    const log = { warn: (...a) => warnings.push(a.join(' ')), error: () => {} };
+    const pub = createJournalPublisher({
+      url: `ws://127.0.0.1:${port}/ws`, token: 'tok', log, queueLimit: 1, ...FAST_BACKOFF,
+    });
+    let evictionCount = 0;
+
+    expect(pub.publishPermissionRequest('c1', { tool_use_id: 't0' }, {
+      onEvicted: () => {
+        evictionCount += 1;
+        throw new Error('test callback failure');
+      },
+    })).toBe(true);
+    expect(() => pub.publishText('c1', { body: 'newer', from: 'user' })).not.toThrow();
+
+    expect(evictionCount).toBe(1);
+    expect(warnings.some(w => w.includes('eviction callback failed: test callback failure'))).toBe(true);
+    pub.close();
+  });
+
   it('disabled mode (no url/token): every method is a safe no-op, nothing throws', async () => {
     const warnings = [];
     const log = { warn: (...a) => warnings.push(a.join(' ')), error: () => {} };
     const pub = createJournalPublisher({ url: '', token: '', log });
+    expect(pub.publishPermissionRequest(
+      'c1',
+      { kind: 'permission', tool_use_id: 't0' },
+    )).toBe(false);
 
     expect(() => {
       pub.upsertConvo('c1', { title: 'x', sessionState: 'running' });

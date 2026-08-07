@@ -1,0 +1,32 @@
+{
+  "permissions": {
+    "allow": [
+      "mcp__webflow__webflow_guide_tool",
+      "mcp__webflow__ask_webflow_ai",
+      "mcp__webflow__data_element_tool",
+      "mcp__webflow__data_element_builder",
+      "mcp__webflow__data_element_settings_tool",
+      "mcp__webflow__data_style_tool",
+      "mcp__webflow__data_component_tool",
+      "mcp__webflow__data_component_builder",
+      "mcp__webflow__data_component_props_tool",
+      "mcp__webflow__data_component_variants_tool",
+      "mcp__webflow__data_cms_tool",
+      "mcp__webflow__data_assets_tool",
+      "mcp__webflow__asset_tool",
+      "mcp__webflow__get_asset_preview",
+      "mcp__webflow__data_fonts_tool",
+      "mcp__webflow__data_variable_tool",
+      "mcp__webflow__data_forms_tool",
+      "mcp__webflow__data_localization_tool",
+      "mcp__webflow__data_whtml_builder",
+      "mcp__webflow__data_agent_instructions_tool",
+      "mcp__webflow__designer_tool",
+      "mcp__webflow__element_snapshot_tool",
+      "mcp__webflow__data_sitemap_tool",
+      "mcp__webflow__data_analyze_tool",
+      "mcp__webflow__data_comments_tool",
+      "mcp__webflow__get_more_tools"
+    ]
+  }
+}

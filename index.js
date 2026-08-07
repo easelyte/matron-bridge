@@ -49,6 +49,8 @@ import { formatSubagentToolBody } from './lib/subagent-tool-format.js';
 import { ivUploadDir, ivUploadAnnotation } from './lib/iv-uploads.js';
 import { parseUsageLimits, formatLimits } from './lib/usage-limits.js';
 import { resolveSpawnCwd, attachSpawnErrorHandler } from './lib/spawn-guard.js';
+import { buildSessionSettings } from './lib/session-settings.js';
+import { buildPermissionSnapshot, classifyPermission } from './lib/permission-eval.js';
 import { readSessionSummary, listSessionSummaries, listSessionIdsByMtime, pathExists } from './lib/session-summary.js';
 import {
   isIvSlashPassthrough,
@@ -77,6 +79,14 @@ import { createRecentFolders } from './lib/recent-folders.js';
 import { cancelQueuedItem, dispatchBusyQueueMagicWord, notifyQueuedMessage, isQueueReleaseTap, resolveQueueReleaseTap } from './lib/busy-queue.js';
 import { handlePickerValue } from './lib/picker-dispatch.js';
 import { createJournalInputConsumer, resolvePromptChoice } from './lib/journal-input-router.js';
+import {
+  auditPermissionDecision,
+  createPermissionDecisionBodyCollector,
+  createPermissionSeams,
+  createRequestPermissionDecision,
+  handlePermissionDecisionRoute,
+  PERMISSION_DECISION_TIMEOUT_MS,
+} from './lib/permission-registry.js';
 import { createJournalMediaRouter } from './lib/journal-media.js';
 import { markJournalOrigin, planQueueFlush } from './lib/queue-flush.js';
 import { attachPendingMediaMirror, pendingMediaMirror } from './lib/media-mirror.js';
@@ -113,14 +123,6 @@ const DEFAULT_BRIDGE_CLAUDE_MD_PATH = path.join(__dirname, 'BRIDGE_CLAUDE.md');
 const DEFAULT_BRIDGE_CODEX_MD_PATH = path.join(__dirname, 'BRIDGE_CODEX.md');
 const FALLBACK_BRIDGE_PROMPT = 'You are running through a remote Matron bridge. The user interacts through chat, not a terminal.';
 const FALLBACK_CODEX_BRIDGE_PROMPT = 'You are running through a remote chat bridge. Work autonomously within the configured sandbox; interactive approvals are unavailable.';
-
-// easelyte fork delta: the bridge runs as root on the VPS, where Claude refuses
-// --dangerously-skip-permissions. Match the live claude-matrix-bridge config —
-// a full tool allow-list via --settings — which Claude accepts under root.
-const BRIDGE_ROOT_PERMISSIONS = {
-  allow: ['Bash(*)', 'Read(*)', 'Write(*)', 'Edit(*)', 'MultiEdit(*)', 'Glob(*)', 'Grep(*)', 'WebFetch(*)', 'WebSearch(*)', 'Skill', 'Agent(*)', 'Task(*)', 'NotebookEdit(*)', 'mcp__show-file__show_file'],
-  deny: [],
-};
 
 // --- Config ---
 
@@ -1081,6 +1083,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     : (Array.isArray(persistedForRoom?.mcpExtras) ? persistedForRoom.mcpExtras : []);
   const effectiveMcpExtras = effectiveExtras(mcpExtras, DEFAULT_MCP_EXTRAS);
   const shareEnabled = effectiveMcpExtras.includes('share');
+  const permissionToken = randomUUID();
   let showFileToken;
   let showFilePinnedRoots = null;
   if (shareEnabled) {
@@ -1107,25 +1110,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     '--append-system-prompt', BRIDGE_SYSTEM_PROMPT,
     '--include-partial-messages',
     '--mcp-config', mcpConfigPathFor(effectiveMcpExtras),
-    '--settings', JSON.stringify({
-      permissions: BRIDGE_ROOT_PERMISSIONS,
-      hooks: {
-        PreCompact: [{
-          hooks: [{
-            type: 'command',
-            command: path.join(__dirname, 'hooks', 'compact-notify.sh'),
-            timeout: 5,
-          }],
-        }],
-        PreToolUse: [{
-          matcher: 'Bash',
-          hooks: [{
-            type: 'command',
-            command: path.join(__dirname, 'hooks', 'matron-bash-tee.sh'),
-          }],
-        }],
-      },
-    }),
+    '--settings', JSON.stringify(buildSessionSettings('print')),
   ];
   const printModel = options.model === null
     ? undefined
@@ -1158,9 +1143,17 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     // Env is fixed at spawn time; toggling the flag later requires
     // !restart to take effect.
     MATRON_BASH_TEE_ENABLED: showBashOutputAtSpawn ? '1' : '0',
+    MATRON_PERMISSION_CARDS: process.env.MATRON_PERMISSION_CARDS || '',
   };
   delete spawnEnv.SHOW_FILE_TOKEN;
   if (showFileToken) spawnEnv.SHOW_FILE_TOKEN = showFileToken;
+  delete spawnEnv.MATRON_PERMISSION_TOKEN;
+  // CC hooks cannot receive isolated env: the whole claude process inherits this token, authenticating "a process in this print session"; emitted identifiers are parser-bounded.
+  spawnEnv.MATRON_PERMISSION_TOKEN = permissionToken;
+
+  const permissionSnapshot = process.env.MATRON_PERMISSION_CARDS
+    ? buildPermissionSnapshot({ workdir: cwd })
+    : null;
 
   const proc = launchWithCodexSinkEnv({
     spawnEnv,
@@ -1181,8 +1174,10 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     workdir: cwd,
     ...(showFileToken ? { showFileToken } : {}),
     showFilePinnedRoots,
+    permissionToken,
     _showFileInFlight: 0,
     mcpExtras,
+    permissionSnapshot,
     responseBuffer: '',
     sendCallback: null,
     pendingPlan: null,
@@ -1222,6 +1217,13 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     pinnedSummaryEventId: null, // event ID of pinned summary message
     pinnedSummaryText: '',       // accumulated summary text (source of truth, not Matrix)
   };
+
+  session.requestPermissionDecision = createRequestPermissionDecision(session, {
+    journalPublisher,
+    pendingPermissionDecisions,
+    journalConvoIdFor,
+    timeoutMs: PERMISSION_DECISION_TIMEOUT_MS,
+  });
 
   // A spawn 'error' with no listener is fatal to the whole bridge (crash-loop
   // of 2026-07-16). Cleanup and the 3-restart cap stay in proc.on('close'),
@@ -1686,26 +1688,6 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     ? undefined
     : resolveModel({ option: options.model, persisted: persistedForRoom?.model });
 
-  const settings = {
-    permissions: BRIDGE_ROOT_PERMISSIONS,
-    hooks: {
-      PreCompact: [{
-        hooks: [{ type: 'command', command: path.join(__dirname, 'hooks', 'compact-notify.sh'), timeout: 5 }],
-      }],
-      // ExitPlanMode is NOT intercepted in iv-mode. Claude's own in-TUI
-      // confirmation prompt ("Yes / Yes, manually / Refine / Tell Claude
-      // what to change") is caught by lib/prompt-detector.js and routed
-      // through Matrix as a numbered question — that's the single approval
-      // round. The hook+/plan-decision flow remains in print-mode only.
-      PreToolUse: [
-        { matcher: 'Bash', hooks: [{ type: 'command', command: path.join(__dirname, 'hooks', 'matron-bash-tee.sh') }] },
-      ],
-      Stop: [{
-        hooks: [{ type: 'command', command: path.join(__dirname, 'hooks', 'stop-notify.sh'), timeout: 10 }],
-      }],
-    },
-  };
-
   // Fresh sessions pre-assign --session-id so the transcript path is known
   // before spawn; resumes pass --resume only. The exclusivity rule lives in
   // planSessionIdentity.
@@ -1717,7 +1699,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     // surface the TUI prompt; that constraint no longer applies.
     '--append-system-prompt', BRIDGE_SYSTEM_PROMPT,
     '--mcp-config', mcpConfigPathFor(effectiveMcpExtras),
-    '--settings', JSON.stringify(settings),
+    '--settings', JSON.stringify(buildSessionSettings('iv')),
   );
   if (model) {
     claudeArgs.push('--model', model);
@@ -5800,6 +5782,12 @@ function journalEchoToRoom(session, plain, html) {
   sendToRoom(session.roomId, plain, html, { skipJournalMirror: true }).catch(() => {});
 }
 
+function journalEchoPromptAnswer(session, username, label) {
+  journalEchoToRoom(session,
+    `📱 ${username} answered: ${label}`,
+    `📱 <b>${escapeHtml(username)} answered:</b> ${escapeHtml(label)}`);
+}
+
 // ctx for a session-scoped command dispatch (Deliverable 1/2, journal side):
 // replies go through the NORMAL sendToRoom for the session's Matrix room —
 // which already mirrors to the journal, so both surfaces see the command's
@@ -6311,7 +6299,7 @@ function journalOnPromptReply(session, answer, { username }) {
     journalPublishNotice(journalConvoIdFor(session), "Nothing to answer right now — there's no open prompt in this session.");
     return;
   }
-  journalEchoToRoom(session, `📱 ${username} answered: ${label}`, `📱 <b>${escapeHtml(username)} answered:</b> ${escapeHtml(label)}`);
+  journalEchoPromptAnswer(session, username, label);
 }
 
 function journalIsControlConvo(convoId) {
@@ -6399,11 +6387,27 @@ function journalResumeConvo(convoId) {
   return null;
 }
 
-// Assembled once, after every dependency above is defined, and invoked from
-// journalHandleInboundEvent (the `function` declaration wired into
-// createJournalPublisher near the top of this file — hoisted, so that
-// forward reference is safe; only ACTUALLY called once the socket is live,
-// long after this assignment has run).
+// Canonical HTTP-side permission registry. Keys are the full P56 tuple with
+// a NUL separator (`convo_id + "\0" + tool_use_id`);
+// journalConvoIdFor(session) and inbound
+// frame.convo_id provide the same stable conversation identity without
+// plumbing a transport-specific session_id through the router.
+const pendingPermissionDecisions = new Map();
+const permissionSeams = createPermissionSeams({ pendingPermissionDecisions });
+
+function resolveJournalPermissionReply(key, decision, { username } = {}) {
+  const pending = pendingPermissionDecisions.get(key);
+  const finalized = permissionSeams.resolvePermissionReply(key, decision, { username });
+  if (!finalized || finalized.source !== 'operator') return false;
+  const label = finalized.decision === 'allow' ? 'Allow' : 'Deny';
+  journalEchoPromptAnswer(findSessionByClaudeSessionId(pending.convoId), username, label);
+  return true;
+}
+
+// Assembled once and invoked from journalHandleInboundEvent (the `function`
+// declaration wired into createJournalPublisher near the top of this file —
+// hoisted, so that forward reference is safe). Permission registry operations
+// come from the same factory exercised by the router contract tests.
 const journalInputConsumer = createJournalInputConsumer({
   isControlConvo: journalIsControlConvo,
   handleControlCommand: (body) => {
@@ -6420,6 +6424,8 @@ const journalInputConsumer = createJournalInputConsumer({
   routeTextToSession: journalOnText,
   routeMediaToSession: journalOnMedia,
   routePromptReply: journalOnPromptReply,
+  ...permissionSeams,
+  resolvePermissionReply: resolveJournalPermissionReply,
   resumeSessionForConvo: journalResumeConvo,
   noticeUnknownConvo: (convoId, { type }) => {
     journalPublishNotice(convoId, type === 'prompt_reply'
@@ -6443,8 +6449,9 @@ function journalHandleInboundEvent(frame) {
   journalInputConsumer(frame);
 }
 
-// Evict the reply-staleness guard record for a torn-down session's convo
-// (issue #98 nit — the consumer's per-convo map is otherwise never pruned).
+// Finalize pending permission decisions and evict the reply-staleness guard
+// record for a torn-down session's convo (the consumer's per-convo map is
+// otherwise never pruned).
 // Called from every TERMINAL session teardown (the exit handlers' non-restart
 // branches and !stop), alongside the other journal state those sites already
 // settle (journalSessionState 'done' / journalActivity 'idle'). Deliberately
@@ -6455,6 +6462,7 @@ function journalHandleInboundEvent(frame) {
 function journalEvictConvoInput(session) {
   const convoId = journalConvoIdFor(session);
   if (convoId) {
+    permissionSeams.finalizePendingPermissionsForConvo(convoId, 'session ended');
     journalInputConsumer.evictConvo(convoId, {
       clearQueue: () => {
         session.queuedMessages = null;
@@ -6612,7 +6620,6 @@ const pendingPlanDecisions = new Map();
 // --- Local HTTP API ---
 
 const API_PORT = parseInt(process.env.MATRON_BRIDGE_API_PORT || '9802', 10);
-
 function auditShowFile({ result, roomId, filePath, error, ...details }) {
   const record = {
     event: 'show_file',
@@ -6712,8 +6719,15 @@ const apiServer = createServer(async (req, res) => {
   let body = '';
   let bodyBytes = 0;
   let showFileBodyTooLarge = false;
+  const permissionDecisionBody = url.pathname === '/permission-decision'
+    ? createPermissionDecisionBodyCollector({ res, auditPermissionDecisionFn: auditPermissionDecision })
+    : null;
   req.on('data', chunk => {
-    if (showFileBodyTooLarge) return;
+    if (showFileBodyTooLarge || permissionDecisionBody?.tooLarge) return;
+    if (permissionDecisionBody) {
+      permissionDecisionBody.append(chunk);
+      return;
+    }
     bodyBytes += chunk.length;
     if (url.pathname === '/show-file' && bodyBytes > 64 * 1024) {
       showFileBodyTooLarge = true;
@@ -6726,7 +6740,7 @@ const apiServer = createServer(async (req, res) => {
     body += chunk;
   });
   req.on('end', async () => {
-    if (showFileBodyTooLarge) return;
+    if (showFileBodyTooLarge || permissionDecisionBody?.tooLarge) return;
 
     if (url.pathname === '/show-file') {
       let filePath;
@@ -6829,6 +6843,22 @@ const apiServer = createServer(async (req, res) => {
           showFileReservedBytes -= SHOW_FILE_MAX_BYTES;
         }
       }
+      return;
+    }
+
+    if (url.pathname === '/permission-decision') {
+      handlePermissionDecisionRoute({
+        body: permissionDecisionBody.body,
+        res,
+        sessions,
+        pendingPermissionDecisions,
+        classifyPermissionFn: classifyPermission,
+        journalConvoIdForFn: journalConvoIdFor,
+        evictPermissionSeq: (key, convoId) => journalInputConsumer.evictPermissionSeq(key, convoId),
+        auditPermissionDecisionFn: auditPermissionDecision,
+        timeoutMs: PERMISSION_DECISION_TIMEOUT_MS,
+        permissionToken: req.headers['x-matron-permission-token'],
+      });
       return;
     }
 

@@ -1,6 +1,13 @@
 import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'fs';
 import { createJournalInputConsumer, resolvePromptChoice, promptExpectsReply } from '../lib/journal-input-router.js';
+import {
+  buildPermissionKey,
+  createPermissionSeams,
+  PERMISSION_DECISION_TIMEOUT_MS,
+  PERMISSION_MAX_PENDING_GLOBAL,
+  PERMISSION_MAX_PENDING_PER_CONVO,
+} from '../lib/permission-registry.js';
 
 const silentLog = { warn: () => {}, error: () => {} };
 
@@ -528,6 +535,904 @@ describe('createJournalInputConsumer — non-answerable prompts must not superse
   });
 });
 
+describe('createJournalInputConsumer — permission registry seam foundation', () => {
+  function makeDeps(overrides = {}) {
+    return {
+      isControlConvo: () => false,
+      handleControlCommand: vi.fn(),
+      findSessionByConvoId: vi.fn((id) => ({ claudeSessionId: id })),
+      routeTextToSession: vi.fn(),
+      routePromptReply: vi.fn(),
+      notePermissionSeq: vi.fn(() => true),
+      resolvePermissionReply: vi.fn(),
+      hasLivePermissionPending: vi.fn(() => false),
+      isLivePendingToolUse: vi.fn(() => false),
+      noticeUnknownConvo: vi.fn(),
+      noticeStalePromptReply: vi.fn(),
+      log: silentLog,
+      ...overrides,
+    };
+  }
+
+  it('registers a valid bridge-owned permission_request echo exactly once', () => {
+    const key = buildPermissionKey('convo-1', 'toolu_1');
+    let assigned = false;
+    const deps = makeDeps({
+      isLivePendingToolUse: vi.fn((candidateKey, convoId, nonce) => (
+        candidateKey === key && convoId === 'convo-1' && nonce === 'nonce-toolu_1'
+      )),
+      notePermissionSeq: vi.fn(() => {
+        if (assigned) return false;
+        assigned = true;
+        return true;
+      }),
+    });
+    const consumer = createJournalInputConsumer(deps);
+
+    consumer(baseFrame({
+      seq: 41,
+      sender: 'agent:dev-2',
+      type: 'permission_request',
+      payload: { tool_use_id: 'toolu_1', nonce: 'nonce-toolu_1' },
+    }));
+    consumer(baseFrame({
+      seq: 42,
+      sender: 'agent:dev-2',
+      type: 'permission_request',
+      payload: { tool_use_id: 'toolu_1', nonce: 'nonce-toolu_1' },
+    }));
+
+    expect(deps.isLivePendingToolUse).toHaveBeenCalledWith(
+      key,
+      'convo-1',
+      'nonce-toolu_1',
+    );
+    expect(deps.notePermissionSeq).toHaveBeenCalledTimes(2);
+    expect(deps.notePermissionSeq).toHaveBeenCalledWith(key, 41, 'convo-1');
+    expect(deps.notePermissionSeq.mock.results.map(({ value }) => value)).toEqual([true, false]);
+    expect(deps.findSessionByConvoId).not.toHaveBeenCalled();
+  });
+
+  it('binds two concurrent permission replies independently to their own seq keys', () => {
+    const firstKey = buildPermissionKey('convo-1', 'toolu_1');
+    const secondKey = buildPermissionKey('convo-1', 'toolu_2');
+    const firstResolve = vi.fn();
+    const secondResolve = vi.fn();
+    const pendingPermissionDecisions = new Map([
+      [firstKey, {
+        resolve: firstResolve, seq: null, convoId: 'convo-1', nonce: 'nonce-toolu_1',
+      }],
+      [secondKey, {
+        resolve: secondResolve, seq: null, convoId: 'convo-1', nonce: 'nonce-toolu_2',
+      }],
+    ]);
+    const deps = makeDeps(createPermissionSeams({ pendingPermissionDecisions }));
+    const consumer = createJournalInputConsumer(deps);
+
+    consumer(baseFrame({
+      seq: 50,
+      sender: 'agent:dev-2',
+      type: 'prompt',
+      payload: { question: 'Newer ordinary prompt', options: [] },
+    }));
+    for (const [seq, toolUseId] of [[41, 'toolu_1'], [42, 'toolu_2']]) {
+      consumer(baseFrame({
+        seq,
+        sender: 'agent:dev-2',
+        type: 'permission_request',
+        payload: { tool_use_id: toolUseId, nonce: `nonce-${toolUseId}` },
+      }));
+    }
+    consumer(baseFrame({
+      seq: 51,
+      type: 'prompt_reply',
+      payload: { target_seq: 42, choice: 'deny', text: null },
+    }));
+    consumer(baseFrame({
+      seq: 52,
+      type: 'prompt_reply',
+      payload: { target_seq: 41, choice: 'Allow', text: null },
+    }));
+
+    expect(firstResolve).toHaveBeenCalledOnce();
+    expect(firstResolve).toHaveBeenCalledWith({
+      decision: 'allow', source: 'operator', principal: 'dan',
+    });
+    expect(secondResolve).toHaveBeenCalledOnce();
+    expect(secondResolve).toHaveBeenCalledWith({
+      decision: 'deny', source: 'operator', principal: 'dan',
+    });
+    expect(deps.routePromptReply).not.toHaveBeenCalled();
+  });
+
+  it('passes the operator identity to the permission finalizer', () => {
+    const key = buildPermissionKey('convo-1', 'toolu_1');
+    const deps = makeDeps({
+      isLivePendingToolUse: vi.fn((candidateKey) => candidateKey === key),
+    });
+    const consumer = createJournalInputConsumer(deps);
+
+    consumer(baseFrame({
+      seq: 41,
+      sender: 'agent:dev-2',
+      type: 'permission_request',
+      payload: { tool_use_id: 'toolu_1' },
+    }));
+    consumer(baseFrame({
+      seq: 42,
+      type: 'prompt_reply',
+      payload: { target_seq: 41, choice: 'allow', text: 'must not echo' },
+    }));
+
+    expect(deps.resolvePermissionReply).toHaveBeenCalledWith(key, 'allow', { username: 'dan' });
+    expect(deps.routePromptReply).not.toHaveBeenCalled();
+  });
+
+  it('resolves a proven permission member even when target_seq equals its own frame seq', () => {
+    const key = buildPermissionKey('convo-1', 'toolu_1');
+    const deps = makeDeps({
+      isLivePendingToolUse: vi.fn((candidateKey) => candidateKey === key),
+    });
+    const consumer = createJournalInputConsumer(deps);
+
+    consumer(baseFrame({
+      seq: 41,
+      sender: 'agent:dev-2',
+      type: 'permission_request',
+      payload: { tool_use_id: 'toolu_1' },
+    }));
+    consumer(baseFrame({
+      seq: 41,
+      type: 'prompt_reply',
+      payload: { target_seq: 41, choice: 'allow', text: null },
+    }));
+
+    expect(deps.resolvePermissionReply).toHaveBeenCalledWith(key, 'allow', { username: 'dan' });
+    expect(deps.routePromptReply).not.toHaveBeenCalled();
+    expect(deps.noticeStalePromptReply).not.toHaveBeenCalled();
+  });
+
+  it('resolves a proven permission member even when its reply frame seq is not an integer', () => {
+    const key = buildPermissionKey('convo-1', 'toolu_1');
+    const deps = makeDeps({
+      isLivePendingToolUse: vi.fn((candidateKey) => candidateKey === key),
+    });
+    const consumer = createJournalInputConsumer(deps);
+
+    consumer(baseFrame({
+      seq: 41,
+      sender: 'agent:dev-2',
+      type: 'permission_request',
+      payload: { tool_use_id: 'toolu_1' },
+    }));
+    consumer(baseFrame({
+      seq: '42',
+      type: 'prompt_reply',
+      payload: { target_seq: 41, choice: 'allow', text: null },
+    }));
+
+    expect(deps.resolvePermissionReply).toHaveBeenCalledWith(key, 'allow', { username: 'dan' });
+    expect(deps.routePromptReply).not.toHaveBeenCalled();
+    expect(deps.noticeStalePromptReply).not.toHaveBeenCalled();
+  });
+
+  it('rejects and never buffers a future target_seq guess', () => {
+    vi.useFakeTimers();
+    try {
+      const key = buildPermissionKey('convo-1', 'toolu_future');
+      const deps = makeDeps({
+        hasLivePermissionPending: vi.fn(() => true),
+        isLivePendingToolUse: vi.fn((candidateKey) => candidateKey === key),
+      });
+      const consumer = createJournalInputConsumer(deps);
+
+      consumer(baseFrame({
+        seq: 40,
+        type: 'prompt_reply',
+        payload: { target_seq: 41, choice: 'allow', text: null },
+      }));
+
+      expect(vi.getTimerCount()).toBe(0);
+      expect(deps.noticeStalePromptReply).toHaveBeenCalledOnce();
+      expect(deps.routePromptReply).not.toHaveBeenCalled();
+
+      consumer(baseFrame({
+        seq: 41,
+        sender: 'agent:dev-2',
+        type: 'permission_request',
+        payload: { tool_use_id: 'toolu_future' },
+      }));
+
+      expect(deps.resolvePermissionReply).not.toHaveBeenCalled();
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('buffers a stale-target tap while a seq-null permission is live, then drains it on echo', () => {
+    const key = buildPermissionKey('convo-1', 'toolu_1');
+    const resolve = vi.fn();
+    const pendingPermissionDecisions = new Map([
+      [key, { resolve, seq: null, convoId: 'convo-1', nonce: 'nonce-toolu_1' }],
+    ]);
+    const deps = makeDeps(createPermissionSeams({ pendingPermissionDecisions }));
+    const consumer = createJournalInputConsumer(deps);
+
+    consumer(baseFrame({
+      seq: 50,
+      sender: 'agent:dev-2',
+      type: 'prompt',
+      payload: { question: 'Ordinary prompt', options: [] },
+    }));
+    consumer(baseFrame({
+      seq: 51,
+      type: 'prompt_reply',
+      payload: { target_seq: 41, choice: ' allow ', text: 'tap before echo' },
+    }));
+
+    expect(resolve).not.toHaveBeenCalled();
+    expect(deps.routePromptReply).not.toHaveBeenCalled();
+    expect(deps.noticeStalePromptReply).not.toHaveBeenCalled();
+
+    consumer(baseFrame({
+      seq: 41,
+      sender: 'agent:dev-2',
+      type: 'permission_request',
+      payload: { tool_use_id: 'toolu_1', nonce: 'nonce-toolu_1' },
+    }));
+
+    expect(resolve).toHaveBeenCalledOnce();
+    expect(resolve).toHaveBeenCalledWith({
+      decision: 'allow', source: 'operator', principal: 'dan',
+    });
+    expect(deps.routePromptReply).not.toHaveBeenCalled();
+  });
+
+  it('refuses an ordinary stale reply immediately when no seq-null permission is live', () => {
+    const deps = makeDeps({ hasLivePermissionPending: vi.fn(() => false) });
+    const consumer = createJournalInputConsumer(deps);
+
+    consumer(baseFrame({
+      seq: 50,
+      sender: 'agent:dev-2',
+      type: 'prompt',
+      payload: { question: 'Latest prompt', options: [] },
+    }));
+    consumer(baseFrame({
+      seq: 51,
+      type: 'prompt_reply',
+      payload: { target_seq: 40, choice: 'opt_a', text: null },
+    }));
+
+    expect(deps.hasLivePermissionPending).toHaveBeenCalledWith('convo-1');
+    expect(deps.noticeStalePromptReply).toHaveBeenCalledOnce();
+    expect(deps.routePromptReply).not.toHaveBeenCalled();
+    expect(deps.resolvePermissionReply).not.toHaveBeenCalled();
+  });
+
+  it('routes an ordinary latest-seq answer unchanged even with a seq-null permission live', () => {
+    const deps = makeDeps({ hasLivePermissionPending: vi.fn(() => true) });
+    const consumer = createJournalInputConsumer(deps);
+
+    consumer(baseFrame({
+      seq: 50,
+      sender: 'agent:dev-2',
+      type: 'prompt',
+      payload: { question: 'Latest prompt', options: [] },
+    }));
+    consumer(baseFrame({
+      seq: 51,
+      type: 'prompt_reply',
+      payload: { target_seq: 50, choice: 'opt_a', text: 'ordinary answer' },
+    }));
+
+    expect(deps.routePromptReply).toHaveBeenCalledWith(
+      { claudeSessionId: 'convo-1' },
+      { target_seq: 50, choice: 'opt_a', text: 'ordinary answer' },
+      { username: 'dan' },
+    );
+    expect(deps.hasLivePermissionPending).not.toHaveBeenCalled();
+    expect(deps.resolvePermissionReply).not.toHaveBeenCalled();
+  });
+
+  it('buffers a first-card permission tap before its echo and drains it once the echo arrives', () => {
+    vi.useFakeTimers();
+    try {
+      const key = buildPermissionKey('convo-1', 'toolu_first');
+      const resolve = vi.fn();
+      const pendingPermissionDecisions = new Map([
+        [key, { resolve, seq: null, convoId: 'convo-1', nonce: 'nonce-toolu_first' }],
+      ]);
+      const deps = makeDeps(createPermissionSeams({ pendingPermissionDecisions }));
+      const consumer = createJournalInputConsumer(deps);
+
+      consumer(baseFrame({
+        seq: 42,
+        type: 'prompt_reply',
+        payload: { target_seq: 41, choice: 'allow', text: 'tap before echo' },
+      }));
+
+      expect(resolve).not.toHaveBeenCalled();
+      expect(deps.routePromptReply).not.toHaveBeenCalled();
+      expect(deps.noticeStalePromptReply).not.toHaveBeenCalled();
+      expect(vi.getTimerCount()).toBe(1);
+
+      consumer(baseFrame({
+        seq: 41,
+        sender: 'agent:dev-2',
+        type: 'permission_request',
+        payload: { tool_use_id: 'toolu_first', nonce: 'nonce-toolu_first' },
+      }));
+
+      expect(resolve).toHaveBeenCalledOnce();
+      expect(resolve).toHaveBeenCalledWith({
+        decision: 'allow', source: 'operator', principal: 'dan',
+      });
+      expect(deps.routePromptReply).not.toHaveBeenCalled();
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('keeps the first buffered decision and its original TTL on a conflicting duplicate', () => {
+    vi.useFakeTimers();
+    const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout');
+    try {
+      const key = buildPermissionKey('convo-1', 'toolu_first');
+      const resolve = vi.fn();
+      const pendingPermissionDecisions = new Map([
+        [key, { resolve, seq: null, convoId: 'convo-1', nonce: 'nonce-toolu_first' }],
+      ]);
+      const deps = makeDeps(createPermissionSeams({ pendingPermissionDecisions }));
+      const consumer = createJournalInputConsumer(deps);
+
+      consumer(baseFrame({
+        seq: 42,
+        type: 'prompt_reply',
+        payload: { target_seq: 41, choice: 'deny', text: null },
+      }));
+      expect(setTimeoutSpy).toHaveBeenCalledOnce();
+
+      vi.advanceTimersByTime(1_000);
+      consumer(baseFrame({
+        seq: 43,
+        type: 'prompt_reply',
+        payload: { target_seq: 41, choice: 'allow', text: null },
+      }));
+
+      expect(setTimeoutSpy).toHaveBeenCalledOnce();
+      expect(vi.getTimerCount()).toBe(1);
+
+      consumer(baseFrame({
+        seq: 41,
+        sender: 'agent:dev-2',
+        type: 'permission_request',
+        payload: { tool_use_id: 'toolu_first', nonce: 'nonce-toolu_first' },
+      }));
+
+      expect(resolve).toHaveBeenCalledOnce();
+      expect(resolve).toHaveBeenCalledWith({
+        decision: 'deny', source: 'operator', principal: 'dan',
+      });
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      setTimeoutSpy.mockRestore();
+      vi.useRealTimers();
+    }
+  });
+
+  it('routes an ordinary answer when no latest prompt or seq-null permission is recorded', () => {
+    const deps = makeDeps({ hasLivePermissionPending: vi.fn(() => false) });
+    const consumer = createJournalInputConsumer(deps);
+
+    consumer(baseFrame({
+      seq: 51,
+      type: 'prompt_reply',
+      payload: { target_seq: 40, choice: 'opt_a', text: 'ordinary answer' },
+    }));
+
+    expect(deps.routePromptReply).toHaveBeenCalledWith(
+      { claudeSessionId: 'convo-1' },
+      { target_seq: 40, choice: 'opt_a', text: 'ordinary answer' },
+      { username: 'dan' },
+    );
+    expect(deps.noticeStalePromptReply).not.toHaveBeenCalled();
+    expect(deps.resolvePermissionReply).not.toHaveBeenCalled();
+  });
+
+  it('maps Allow and allow to allow and every other permission choice to deny', () => {
+    const pendingPermissionDecisions = new Map();
+    const resolves = [];
+    for (const toolUseId of ['toolu_1', 'toolu_2', 'toolu_3']) {
+      const resolve = vi.fn();
+      resolves.push(resolve);
+      pendingPermissionDecisions.set(buildPermissionKey('convo-1', toolUseId), {
+        resolve,
+        seq: null,
+        convoId: 'convo-1',
+        nonce: `nonce-${toolUseId}`,
+      });
+    }
+    const deps = makeDeps(createPermissionSeams({ pendingPermissionDecisions }));
+    const consumer = createJournalInputConsumer(deps);
+
+    for (const [seq, toolUseId] of [[41, 'toolu_1'], [42, 'toolu_2'], [43, 'toolu_3']]) {
+      consumer(baseFrame({
+        seq,
+        sender: 'agent:dev-2',
+        type: 'permission_request',
+        payload: { tool_use_id: toolUseId, nonce: `nonce-${toolUseId}` },
+      }));
+    }
+    for (const [seq, choice] of [[41, 'Allow'], [42, 'allow'], [43, 'yes']]) {
+      consumer(baseFrame({
+        seq: seq + 10,
+        type: 'prompt_reply',
+        payload: { target_seq: seq, choice, text: null },
+      }));
+    }
+
+    expect(resolves[0]).toHaveBeenCalledWith({
+      decision: 'allow', source: 'operator', principal: 'dan',
+    });
+    expect(resolves[1]).toHaveBeenCalledWith({
+      decision: 'allow', source: 'operator', principal: 'dan',
+    });
+    expect(resolves[2]).toHaveBeenCalledWith({
+      decision: 'deny', source: 'operator', principal: 'dan',
+    });
+    expect(deps.routePromptReply).not.toHaveBeenCalled();
+  });
+
+  it('retains a buffered reply beyond five seconds and drains it on a slow echo', () => {
+    vi.useFakeTimers();
+    try {
+      const key = buildPermissionKey('convo-1', 'toolu_1');
+      const resolve = vi.fn();
+      const pendingPermissionDecisions = new Map([
+        [key, { resolve, seq: null, convoId: 'convo-1', nonce: 'nonce-toolu_1' }],
+      ]);
+      const deps = makeDeps(createPermissionSeams({ pendingPermissionDecisions }));
+      const consumer = createJournalInputConsumer(deps);
+      consumer(baseFrame({
+        seq: 50,
+        sender: 'agent:dev-2',
+        type: 'prompt',
+        payload: { question: 'Latest prompt', options: [] },
+      }));
+      consumer(baseFrame({
+        seq: 51,
+        type: 'prompt_reply',
+        payload: { target_seq: 41, choice: 'allow', text: null },
+      }));
+
+      expect(vi.getTimerCount()).toBe(1);
+      vi.advanceTimersByTime(6_000);
+      expect(vi.getTimerCount()).toBe(1);
+      expect(deps.noticeStalePromptReply).not.toHaveBeenCalled();
+      consumer(baseFrame({
+        seq: 41,
+        sender: 'agent:dev-2',
+        type: 'permission_request',
+        payload: { tool_use_id: 'toolu_1', nonce: 'nonce-toolu_1' },
+      }));
+
+      expect(resolve).toHaveBeenCalledWith({
+        decision: 'allow', source: 'operator', principal: 'dan',
+      });
+      expect(vi.getTimerCount()).toBe(0);
+      expect(deps.routePromptReply).not.toHaveBeenCalled();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('expires an undrained buffered reply with the permission-card deadline', () => {
+    vi.useFakeTimers();
+    try {
+      const deps = makeDeps({
+        hasLivePermissionPending: vi.fn(() => true),
+        isLivePendingToolUse: vi.fn(() => true),
+        notePermissionSeq: vi.fn(() => true),
+      });
+      const consumer = createJournalInputConsumer(deps);
+      consumer(baseFrame({
+        seq: 50,
+        sender: 'agent:dev-2',
+        type: 'prompt',
+        payload: { question: 'Latest prompt', options: [] },
+      }));
+      consumer(baseFrame({
+        seq: 51,
+        type: 'prompt_reply',
+        payload: { target_seq: 41, choice: 'allow', text: null },
+      }));
+
+      vi.advanceTimersByTime(PERMISSION_DECISION_TIMEOUT_MS - 1);
+      expect(vi.getTimerCount()).toBe(1);
+      expect(deps.noticeStalePromptReply).not.toHaveBeenCalled();
+      vi.advanceTimersByTime(1);
+
+      expect(vi.getTimerCount()).toBe(0);
+      expect(deps.noticeStalePromptReply).toHaveBeenCalledWith('convo-1', {
+        username: 'dan',
+        targetSeq: 41,
+        latestSeq: 50,
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('bounds buffered permission replies at the per-convo pending cap', () => {
+    vi.useFakeTimers();
+    try {
+      const deps = makeDeps({ hasLivePermissionPending: vi.fn(() => true) });
+      const consumer = createJournalInputConsumer(deps);
+      consumer(baseFrame({
+        seq: 1_000,
+        sender: 'agent:dev-2',
+        type: 'prompt',
+        payload: { question: 'Latest prompt', options: [] },
+      }));
+
+      for (let seq = 1; seq <= PERMISSION_MAX_PENDING_PER_CONVO + 1; seq += 1) {
+        consumer(baseFrame({
+          seq: 1_000 + seq,
+          type: 'prompt_reply',
+          payload: { target_seq: seq, choice: 'allow', text: null },
+        }));
+      }
+
+      expect(vi.getTimerCount()).toBe(PERMISSION_MAX_PENDING_PER_CONVO);
+      expect(deps.noticeStalePromptReply).toHaveBeenCalledTimes(1);
+      expect(deps.noticeStalePromptReply).toHaveBeenCalledWith('convo-1', {
+        username: 'dan',
+        targetSeq: PERMISSION_MAX_PENDING_PER_CONVO + 1,
+        latestSeq: 1_000,
+      });
+      expect(deps.routePromptReply).not.toHaveBeenCalled();
+
+      consumer.evictConvo('convo-1');
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('bounds buffered permission replies at the global pending cap', () => {
+    vi.useFakeTimers();
+    try {
+      const deps = makeDeps({ hasLivePermissionPending: vi.fn(() => true) });
+      const consumer = createJournalInputConsumer(deps);
+      const convoCount = PERMISSION_MAX_PENDING_GLOBAL / PERMISSION_MAX_PENDING_PER_CONVO;
+
+      for (let seq = 1; seq <= PERMISSION_MAX_PENDING_GLOBAL; seq += 1) {
+        const convoId = `convo-${Math.floor((seq - 1) / PERMISSION_MAX_PENDING_PER_CONVO)}`;
+        consumer(baseFrame({
+          seq: PERMISSION_MAX_PENDING_GLOBAL + seq,
+          convo_id: convoId,
+          type: 'prompt_reply',
+          payload: { target_seq: seq, choice: 'allow', text: null },
+        }));
+      }
+      consumer(baseFrame({
+        seq: PERMISSION_MAX_PENDING_GLOBAL * 2 + 1,
+        convo_id: 'convo-overflow',
+        type: 'prompt_reply',
+        payload: {
+          target_seq: PERMISSION_MAX_PENDING_GLOBAL + 1,
+          choice: 'allow',
+          text: null,
+        },
+      }));
+
+      expect(vi.getTimerCount()).toBe(PERMISSION_MAX_PENDING_GLOBAL);
+      expect(deps.noticeStalePromptReply).toHaveBeenCalledTimes(1);
+      expect(deps.noticeStalePromptReply).toHaveBeenCalledWith('convo-overflow', {
+        username: 'dan',
+        targetSeq: PERMISSION_MAX_PENDING_GLOBAL + 1,
+        latestSeq: undefined,
+      });
+      expect(deps.routePromptReply).not.toHaveBeenCalled();
+
+      for (let convo = 0; convo < convoCount; convo += 1) {
+        consumer.evictConvo(`convo-${convo}`);
+      }
+      expect(vi.getTimerCount()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('rejects user-origin, wrong-convo, unknown-tool, empty-id, and non-integer permission echoes', () => {
+    const liveKey = buildPermissionKey('convo-1', 'toolu_live');
+    const deps = makeDeps({
+      isLivePendingToolUse: vi.fn((key, convoId) => (
+        key === liveKey && convoId === 'convo-1'
+      )),
+    });
+    const consumer = createJournalInputConsumer(deps);
+
+    const invalidFrames = [
+      { seq: 40, sender: 'user:dan', convo_id: 'convo-1', payload: { tool_use_id: 'toolu_live' } },
+      { seq: 41, sender: 'agent:dev-2', convo_id: 'convo-2', payload: { tool_use_id: 'toolu_live' } },
+      { seq: 42, sender: 'agent:dev-2', convo_id: 'convo-1', payload: { tool_use_id: 'toolu_unknown' } },
+      { seq: 43, sender: 'agent:dev-2', convo_id: 'convo-1', payload: { tool_use_id: '   ' } },
+      { seq: '44', sender: 'agent:dev-2', convo_id: 'convo-1', payload: { tool_use_id: 'toolu_live' } },
+    ];
+    for (const overrides of invalidFrames) {
+      consumer(baseFrame({ type: 'permission_request', ...overrides }));
+    }
+
+    expect(deps.notePermissionSeq).not.toHaveBeenCalled();
+  });
+
+  it('retains seq-to-key bindings for all 32 allowed live permission cards', () => {
+    const pendingPermissionDecisions = new Map();
+    for (let seq = 1; seq <= PERMISSION_MAX_PENDING_PER_CONVO; seq += 1) {
+      pendingPermissionDecisions.set(buildPermissionKey('convo-1', `toolu_${seq}`), {
+        seq: null,
+        convoId: 'convo-1',
+        nonce: `nonce-${seq}`,
+      });
+    }
+    const seams = createPermissionSeams({ pendingPermissionDecisions });
+    const notePermissionSeq = vi.fn(seams.notePermissionSeq);
+    const resolvePermissionReply = vi.fn(seams.resolvePermissionReply);
+    const deps = makeDeps({ ...seams, notePermissionSeq, resolvePermissionReply });
+    const consumer = createJournalInputConsumer(deps);
+
+    for (let seq = 1; seq <= PERMISSION_MAX_PENDING_PER_CONVO; seq += 1) {
+      consumer(baseFrame({
+        seq,
+        sender: 'agent:dev-2',
+        type: 'permission_request',
+        payload: { tool_use_id: `toolu_${seq}`, nonce: `nonce-${seq}` },
+      }));
+    }
+    // The permission route rejects the 33rd request at the pending cap, so it
+    // has no live registry entry and its echo cannot become dispatchable.
+    consumer(baseFrame({
+      seq: PERMISSION_MAX_PENDING_PER_CONVO + 1,
+      sender: 'agent:dev-2',
+      type: 'permission_request',
+      payload: { tool_use_id: 'toolu_overflow' },
+    }));
+
+    for (let seq = 1; seq <= PERMISSION_MAX_PENDING_PER_CONVO; seq += 1) {
+      expect(consumer.permissionFrameKey('convo-1', seq)).toBe(
+        buildPermissionKey('convo-1', `toolu_${seq}`),
+      );
+    }
+    expect(consumer.permissionFrameKey(
+      'convo-1',
+      PERMISSION_MAX_PENDING_PER_CONVO + 1,
+    )).toBeNull();
+    expect(notePermissionSeq).toHaveBeenCalledTimes(PERMISSION_MAX_PENDING_PER_CONVO);
+    expect(deps.resolvePermissionReply).not.toHaveBeenCalled();
+  });
+
+  it('evictPermissionSeq tombstones the retired seq and leaves picker state intact', () => {
+    const assignedKeys = new Set();
+    const deps = makeDeps({
+      isLivePendingToolUse: vi.fn(() => true),
+      notePermissionSeq: vi.fn((key) => {
+        if (assignedKeys.has(key)) return false;
+        assignedKeys.add(key);
+        return true;
+      }),
+    });
+    const consumer = createJournalInputConsumer(deps);
+    const firstKey = buildPermissionKey('convo-1', 'toolu_1');
+
+    for (const [seq, toolUseId] of [[41, 'toolu_1'], [42, 'toolu_2']]) {
+      consumer(baseFrame({
+        seq,
+        sender: 'agent:dev-2',
+        type: 'permission_request',
+        payload: { tool_use_id: toolUseId },
+      }));
+    }
+    consumer(baseFrame({
+      seq: 50,
+      sender: 'agent:dev-2',
+      type: 'prompt',
+      payload: { options: [{ id: 'model-opus', value: 'model:opus' }] },
+    }));
+
+    consumer.evictPermissionSeq(firstKey, 'convo-1');
+    consumer(baseFrame({
+      seq: 41,
+      sender: 'agent:dev-2',
+      type: 'permission_request',
+      payload: { tool_use_id: 'toolu_1' },
+    }));
+    consumer(baseFrame({
+      seq: 42,
+      sender: 'agent:dev-2',
+      type: 'permission_request',
+      payload: { tool_use_id: 'toolu_2' },
+    }));
+    consumer(baseFrame({
+      seq: 51,
+      type: 'prompt_reply',
+      payload: { target_seq: 41, choice: 'allow', text: null },
+    }));
+    consumer(baseFrame({
+      seq: 52,
+      type: 'prompt_reply',
+      payload: { target_seq: 50, choice: 'model:opus', text: null },
+    }));
+
+    expect(deps.notePermissionSeq).toHaveBeenCalledTimes(4);
+    expect(deps.notePermissionSeq.mock.results.map(({ value }) => value)).toEqual([
+      true, true, false, false,
+    ]);
+    expect(deps.resolvePermissionReply).not.toHaveBeenCalled();
+    expect(deps.routePromptReply).toHaveBeenCalledTimes(1);
+    expect(deps.routePromptReply).toHaveBeenNthCalledWith(
+      1,
+      { claudeSessionId: 'convo-1' },
+      { target_seq: 50, choice: 'model:opus', text: null, picker: true },
+      { username: 'dan' },
+    );
+  });
+
+  it('notices a duplicate late tap after operator resolution evicts its permission seq', () => {
+    const key = buildPermissionKey('convo-1', 'toolu_1');
+    let consumer;
+    const deps = makeDeps({
+      isLivePendingToolUse: vi.fn((candidateKey) => candidateKey === key),
+      resolvePermissionReply: vi.fn((candidateKey) => {
+        consumer.evictPermissionSeq(candidateKey, 'convo-1');
+      }),
+    });
+    consumer = createJournalInputConsumer(deps);
+
+    consumer(baseFrame({
+      seq: 41,
+      sender: 'agent:dev-2',
+      type: 'permission_request',
+      payload: { tool_use_id: 'toolu_1' },
+    }));
+    consumer(baseFrame({
+      seq: 42,
+      type: 'prompt_reply',
+      payload: { target_seq: 41, choice: 'allow', text: null },
+    }));
+    consumer(baseFrame({
+      seq: 43,
+      type: 'prompt_reply',
+      payload: { target_seq: 41, choice: 'allow', text: null },
+    }));
+
+    expect(deps.resolvePermissionReply).toHaveBeenCalledOnce();
+    expect(deps.routePromptReply).not.toHaveBeenCalled();
+    expect(deps.noticeStalePromptReply).toHaveBeenCalledOnce();
+    expect(deps.noticeStalePromptReply).toHaveBeenCalledWith('convo-1', {
+      username: 'dan',
+      targetSeq: 41,
+      latestSeq: undefined,
+    });
+  });
+
+  it('evictConvo clears permission frame membership and buffered-reply timers idempotently', () => {
+    vi.useFakeTimers();
+    try {
+      const key = buildPermissionKey('convo-1', 'toolu_1');
+      const deps = makeDeps({
+        isLivePendingToolUse: vi.fn((candidateKey, convoId) => (
+          candidateKey === key && convoId === 'convo-1'
+        )),
+        notePermissionSeq: vi.fn(() => true),
+        hasLivePermissionPending: vi.fn(() => true),
+      });
+      const consumer = createJournalInputConsumer(deps);
+      const permissionEcho = baseFrame({
+        seq: 41,
+        sender: 'agent:dev-2',
+        type: 'permission_request',
+        payload: { tool_use_id: 'toolu_1' },
+      });
+
+      consumer(permissionEcho);
+      expect(consumer.permissionFrameKey('convo-1', permissionEcho.seq)).toBe(key);
+      consumer(baseFrame({
+        seq: 50,
+        sender: 'agent:dev-2',
+        type: 'prompt',
+        payload: { question: 'Latest prompt', options: [] },
+      }));
+      consumer(baseFrame({
+        seq: 51,
+        type: 'prompt_reply',
+        payload: { target_seq: 40, choice: 'allow', text: null },
+      }));
+      expect(vi.getTimerCount()).toBe(1);
+      consumer.evictConvo('convo-1');
+      // A late tap's target seq is no longer a permission-frame member.
+      expect(consumer.permissionFrameKey('convo-1', permissionEcho.seq)).toBeNull();
+      expect(vi.getTimerCount()).toBe(0);
+      expect(() => consumer.evictConvo('convo-1')).not.toThrow();
+
+      expect(deps.notePermissionSeq).toHaveBeenCalledOnce();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('uses the production permission seams and exposes safe cleanup hooks', () => {
+    const key = buildPermissionKey('convo-1', 'toolu_1');
+    const otherKey = buildPermissionKey('convo-1', 'toolu_2');
+    const otherConvoKey = buildPermissionKey('convo-2', 'toolu_3');
+    const resolve = vi.fn();
+    const pendingPermissionDecisions = new Map([
+      [key, { resolve, seq: null, convoId: 'convo-1', nonce: 'nonce-toolu_1' }],
+      [otherKey, {
+        resolve: vi.fn(), seq: 42, convoId: 'convo-1', nonce: 'nonce-toolu_2',
+      }],
+      [otherConvoKey, {
+        resolve: vi.fn(), seq: null, convoId: 'convo-2', nonce: 'nonce-toolu_3',
+      }],
+    ]);
+    const seams = createPermissionSeams({ pendingPermissionDecisions });
+    const deps = makeDeps(seams);
+    const consumer = createJournalInputConsumer(deps);
+
+    expect(typeof consumer.evictPermissionSeq).toBe('function');
+    expect(seams.hasLivePermissionPending('convo-1')).toBe(true);
+    expect(seams.hasLivePermissionPending('convo-2')).toBe(true);
+    expect(seams.hasLivePermissionPending('convo-missing')).toBe(false);
+    expect(seams.isLivePendingToolUse(key, 'convo-1', 'nonce-toolu_1')).toBe(true);
+    expect(seams.isLivePendingToolUse(key, 'convo-1', 'forged-nonce')).toBe(false);
+    expect(seams.isLivePendingToolUse(key, 'convo-2', 'nonce-toolu_1')).toBe(false);
+    expect(seams.isLivePendingToolUse(
+      buildPermissionKey('convo-1', 'toolu_missing'),
+      'convo-1',
+      'nonce-toolu_1',
+    )).toBe(false);
+    expect(seams.notePermissionSeq('missing-key', 40, 'convo-1')).toBe(false);
+    expect(seams.notePermissionSeq(key, 40, 'convo-2')).toBe(false);
+
+    consumer(baseFrame({
+      seq: 41,
+      sender: 'agent:dev-2',
+      type: 'permission_request',
+      payload: { tool_use_id: 'toolu_1', nonce: 'forged-nonce' },
+    }));
+    expect(pendingPermissionDecisions.get(key).seq).toBeNull();
+    consumer(baseFrame({
+      seq: 42,
+      sender: 'agent:dev-2',
+      type: 'permission_request',
+      payload: { tool_use_id: 'toolu_1', nonce: 'nonce-toolu_1' },
+    }));
+    consumer(baseFrame({
+      seq: 99,
+      sender: 'agent:dev-2',
+      type: 'permission_request',
+      payload: { tool_use_id: 'toolu_1' },
+    }));
+    expect(pendingPermissionDecisions.get(key).seq).toBe(42);
+    expect(seams.notePermissionSeq(key, 99, 'convo-1')).toBe(false);
+    expect(seams.hasLivePermissionPending('convo-1')).toBe(false);
+    // A registered seq is still a live tool-use entry; only the convo must match.
+    expect(seams.isLivePendingToolUse(key, 'convo-1', 'nonce-toolu_1')).toBe(true);
+
+    seams.resolvePermissionReply(key, 'allow', { username: 'dan' });
+    expect(resolve).toHaveBeenCalledWith({
+      decision: 'allow', source: 'operator', principal: 'dan',
+    });
+
+    expect(() => consumer.evictPermissionSeq(key, 'convo-1')).not.toThrow();
+    expect(() => consumer.evictPermissionSeq('missing-key', 'missing-convo')).not.toThrow();
+    expect(() => consumer.evictConvo('convo-1')).not.toThrow();
+  });
+});
+
 // Auto-resume seam: the idle reaper silently kills sessions assuming "the
 // next user message auto-resumes" — true for Matrix room messages, but the
 // journal path used to dead-end with "no longer active". A text or media
@@ -612,6 +1517,35 @@ describe('createJournalInputConsumer — auto-resume of reaped sessions (resumeS
     consumer(baseFrame());
     expect(deps.routeTextToSession).not.toHaveBeenCalled();
     expect(deps.noticeUnknownConvo).toHaveBeenCalledWith('convo-1', { type: 'text', username: 'dan' });
+  });
+});
+
+describe('index.js journal input consumer — permission echo wiring (source inspection)', () => {
+  const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
+
+  it('echoes the finalized operator label only and suppresses an expired Allow result', () => {
+    const resolverStart = src.indexOf('function resolveJournalPermissionReply(');
+    expect(resolverStart).toBeGreaterThan(-1);
+    const resolverEnd = src.indexOf('// Assembled once', resolverStart);
+    const resolver = src.slice(resolverStart, resolverEnd);
+    expect(resolver).toMatch(/const finalized = permissionSeams\.resolvePermissionReply/);
+    expect(resolver).toMatch(/finalized\.source !== 'operator'/);
+    expect(resolver).toMatch(/finalized\.decision === 'allow' \? 'Allow' : 'Deny'/);
+    expect(resolver).not.toMatch(/const label = decision ===/);
+    expect(resolver).toMatch(/journalEchoPromptAnswer\(/);
+    expect(resolver.match(/journalEchoPromptAnswer\(/g)).toHaveLength(1);
+
+    const promptReplyStart = src.indexOf('function journalOnPromptReply(');
+    const promptReplyEnd = src.indexOf('function journalIsControlConvo(', promptReplyStart);
+    expect(src.slice(promptReplyStart, promptReplyEnd)).toMatch(/journalEchoPromptAnswer\(/);
+
+    const start = src.indexOf('createJournalInputConsumer({');
+    expect(start).toBeGreaterThan(-1);
+    const end = src.indexOf('log: console,', start);
+    expect(end).toBeGreaterThan(start);
+    const args = src.slice(start, end);
+    expect(args).toMatch(/resolvePermissionReply:\s*resolveJournalPermissionReply/);
+    expect(args).not.toMatch(/publishPromptReply/);
   });
 });
 
