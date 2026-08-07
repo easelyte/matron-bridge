@@ -364,9 +364,9 @@ describe('formatAndRoute', () => {
     ]);
   });
 
-  it('warns once and degrades every event to text for an unpinned schema', () => {
+  it('warns once and degrades every event to text for an out-of-band schema', () => {
     const { calls, ctx } = makeContext({
-      meta: { schemaVersion: 'codex-cli 0.147.0', model: 'future-model' },
+      meta: { schemaVersion: 'codex-cli 0.148.0', model: 'future-model' },
     });
     const events = fixtureEvents().slice(0, 2);
 
@@ -378,6 +378,29 @@ describe('formatAndRoute', () => {
       args: [ctx.convoId, { body: JSON.stringify(event), from: 'assistant' }],
     })));
     expect(ctx.state.unparsed).toBe(2);
+  });
+
+  it('routes in-band 0.146.x–0.147.x runs through the rich item mapping', () => {
+    const commandEvent = {
+      type: 'item.completed',
+      item: {
+        id: 'item_1', type: 'command_execution', command: 'printf ok',
+        aggregated_output: 'ok', exit_code: 0, status: 'completed',
+      },
+    };
+    for (const schemaVersion of ['codex-cli 0.146.1', 'codex-cli 0.147.0']) {
+      const { calls, ctx } = makeContext({ meta: { schemaVersion } });
+      formatAndRoute(commandEvent, ctx);
+      expect(ctx.log.warn, schemaVersion).not.toHaveBeenCalled();
+      const itemCalls = calls.filter(call => call.method !== 'publishStatus');
+      expect(itemCalls, schemaVersion).toEqual([{
+        method: 'publishToolOutput',
+        args: [ctx.convoId, {
+          tool_use_id: 'item_1', command: 'printf ok',
+          output: 'ok', exit_code: 0, status: 'completed',
+        }],
+      }]);
+    }
   });
 
   it('requires an exact complete schema version identifier', () => {
