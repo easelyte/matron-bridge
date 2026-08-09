@@ -4,3 +4,4 @@ node_modules/
 .mcp-config-generated*.json
 journal-cursor.json
 .codex-session-tmp/
+.env.bak*
