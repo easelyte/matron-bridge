@@ -519,7 +519,13 @@ describe('cancelQueuedItem', () => {
         live.splice(live.findIndex(entry => entry.itemId === itemId), 1);
       }),
     };
-    const emitRelease = vi.fn();
+    // The real emitRelease write-ahead precedes the destructive splice and runs
+    // the mutate thunk only on a durable put (loop #536). The stub mimics a
+    // durable emit: run the thunk, return true.
+    const emitRelease = vi.fn((_convoId, _fields, { mutate } = {}) => {
+      mutate?.();
+      return true;
+    });
 
     expect(cancelQueuedItem(session, {
       itemId: 'pr_2::0',
@@ -539,7 +545,31 @@ describe('cancelQueuedItem', () => {
       promptId: 'pr_2',
       action: 'cancel',
       releasedIds: ['pr_2::0'],
+    }, expect.objectContaining({ mutate: expect.any(Function) }));
+  });
+
+  it('fail-closed: a non-durable emitRelease (write-ahead failed) leaves the queue intact and drops nothing', () => {
+    const session = makeSession({
+      queueNotifications: [
+        { eventId: '$ev1', plain: 'first', id: 'pr_1::0' },
+        { eventId: '$ev2', plain: 'second', id: 'pr_2::0' },
+      ],
     });
+    const queueRelease = { dropItem: vi.fn() };
+    // emitRelease returns false WITHOUT running the mutate thunk (disk fault).
+    const emitRelease = vi.fn(() => false);
+
+    expect(cancelQueuedItem(session, {
+      itemId: 'pr_2::0',
+      promptId: 'pr_2',
+      convoId: 'convo-1',
+      queueRelease,
+      emitRelease,
+    })).toBe(false);
+
+    expect(session.queuedMessages).toHaveLength(2);       // nothing spliced
+    expect(session.queueNotifications).toHaveLength(2);
+    expect(queueRelease.dropItem).not.toHaveBeenCalled(); // card stays actionable
   });
 
   it('does nothing when the stable id no longer maps to the queue', () => {
@@ -642,27 +672,39 @@ describe('resolveQueueReleaseTap', () => {
 });
 
 describe('queued-release publisher wiring', () => {
-  it('emitRelease publishes exactly one structured prompt_reply per call', () => {
+  it('emitRelease write-aheads before publishing exactly one structured prompt_reply with a deterministic idem_key', () => {
     const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
-    const start = src.indexOf('function emitRelease(convoId, { promptId, action, releasedIds })');
+    const start = src.indexOf('function emitRelease(convoId, { promptId, action, releasedIds }');
     expect(start).toBeGreaterThan(-1);
-    const end = src.indexOf('\n}\n\nfunction journalUpsertConvo', start);
+    const end = src.indexOf('\n}\n\n// In-process retry driver', start);
     expect(end).toBeGreaterThan(start);
 
     const publishPromptReply = vi.fn();
+    const put = vi.fn(() => true); // durable write-ahead
     const now = vi.spyOn(Date, 'now').mockReturnValue(1_722_000_000_000);
     const emitRelease = runInNewContext(
       `(${src.slice(start, end + 2)})`,
-      { journalPublisher: { publishPromptReply }, Date },
+      { journalPublisher: { publishPromptReply }, releaseOutbox: { put }, console, Date },
     );
 
     try {
-      emitRelease('convo-1', {
+      const result = emitRelease('convo-1', {
         promptId: 'pr_123',
         action: 'cancel',
         releasedIds: ['pr_123::0'],
       });
 
+      expect(result).toBe(true);
+      // Write-ahead persisted a `pending` record keyed (promptId, itemId, action)
+      // BEFORE the publish.
+      expect(put).toHaveBeenCalledTimes(1);
+      expect(put).toHaveBeenCalledWith('pr_123 pr_123::0 cancel', expect.objectContaining({
+        convoId: 'convo-1',
+        promptId: 'pr_123',
+        itemId: 'pr_123::0',
+        action: 'cancel',
+        status: 'pending',
+      }));
       expect(publishPromptReply).toHaveBeenCalledTimes(1);
       expect(publishPromptReply).toHaveBeenCalledWith('convo-1', {
         kind: 'queued_release',
@@ -670,16 +712,39 @@ describe('queued-release publisher wiring', () => {
         action: 'cancel',
         released: ['pr_123::0'],
         at: 1_722_000_000_000,
-      });
+      }, { idemKey: 'qr pr_123 cancel' });
     } finally {
       now.mockRestore();
     }
   });
 
+  it('emitRelease fail-closes when the write-ahead put returns false: no mutate, no publish', () => {
+    const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
+    const start = src.indexOf('function emitRelease(convoId, { promptId, action, releasedIds }');
+    const end = src.indexOf('\n}\n\n// In-process retry driver', start);
+    const publishPromptReply = vi.fn();
+    const put = vi.fn(() => false); // disk fault
+    const mutate = vi.fn();
+    const emitRelease = runInNewContext(
+      `(${src.slice(start, end + 2)})`,
+      { journalPublisher: { publishPromptReply }, releaseOutbox: { put }, console, Date },
+    );
+
+    const result = emitRelease('convo-1', {
+      promptId: 'pr_9',
+      action: 'send',
+      releasedIds: ['pr_9::0'],
+    }, { mutate });
+
+    expect(result).toBe(false);
+    expect(mutate).not.toHaveBeenCalled();
+    expect(publishPromptReply).not.toHaveBeenCalled();
+  });
+
   it('the durable publisher exposes prompt_reply through safePublish', () => {
     const src = readFileSync(new URL('../lib/journal-publisher.js', import.meta.url), 'utf-8');
     expect(src).toMatch(
-      /publishPromptReply\(convoId,\s*payload\)\s*\{\s*safePublish\(convoId,\s*['"]prompt_reply['"],\s*payload\);\s*\}/,
+      /publishPromptReply\(convoId,\s*payload,\s*options\)\s*\{[\s\S]*?safePublish\(convoId,\s*['"]prompt_reply['"],\s*payload,\s*options\);\s*\}/,
     );
   });
 

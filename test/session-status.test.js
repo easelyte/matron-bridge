@@ -370,11 +370,15 @@ describe('index.js wiring', () => {
     // main() owns the fixed-cadence sampler so journalStatus only ever reads it.
     const main = src.slice(src.indexOf('async function main('));
     expect(main).toContain('startCpuSampler(');
-    // Both signal handlers tear it down so the interval doesn't leak.
+    // Shutdown now runs through the async gracefulShutdown() settle path (#536);
+    // it tears down the sampler so the interval doesn't leak, and both signal
+    // handlers delegate to it.
+    const shutdown = src.slice(src.indexOf('async function gracefulShutdown('));
+    expect(shutdown).toContain('stopCpuSampler()');
     const sigint = src.slice(src.indexOf("process.on('SIGINT'"));
-    expect(sigint).toContain('stopCpuSampler()');
+    expect(sigint).toContain("gracefulShutdown('SIGINT')");
     const sigterm = src.slice(src.indexOf("process.on('SIGTERM'"));
-    expect(sigterm).toContain('stopCpuSampler()');
+    expect(sigterm).toContain("gracefulShutdown('SIGTERM')");
   });
 
   it('defines a journalStatus helper that publishes via publishStatus', () => {
