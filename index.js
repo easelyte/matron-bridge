@@ -801,27 +801,24 @@ function reconcileReleaseOutbox() {
   for (const rec of releaseOutbox.list()) {
     if (rec.status !== 'pending_inherited') continue;
     const expiredKey = `${rec.promptId}\0${rec.itemId}\0expired`;
-    // Persist the expired-recovery record BEFORE publishing (upsert; on a
-    // second boot where the inherited record IS the expired record, this
-    // relabels it back to `pending` in place under the same key).
-    releaseOutbox.put(expiredKey, {
-      convoId: rec.convoId,
-      promptId: rec.promptId,
-      itemId: rec.itemId,
-      action: 'expired',
-      releasedIds: [rec.itemId],
-      status: 'pending',
-      at: Date.now(),
-    });
-    emitRelease(rec.convoId, {
+    // emitRelease write-aheads the expired-recovery record (key === expiredKey,
+    // status `pending`) BEFORE publishing, then publishes the terminal `expired`
+    // release. On a second boot where the inherited record IS the expired record
+    // this relabels it back to `pending` in place under the same key. Returns
+    // false (fail-closed) if the durable write-ahead can't persist.
+    const emitted = emitRelease(rec.convoId, {
       promptId: rec.promptId,
       action: 'expired',
       releasedIds: [rec.itemId],
     });
-    // F1 self-delete guard: only remove the inherited original when its key
-    // differs from expiredKey. On a second boot (expired-on-expired) the keys
-    // match, so we must NOT delete the record we just re-wrote.
-    if (rec.key !== expiredKey) releaseOutbox.remove(rec.key);
+    // F2: only remove the inherited original when the expired release was
+    // durably emitted. If emitRelease fail-closed (disk fault), keep the
+    // inherited record so a later boot retries — never delete with nothing
+    // published, else `_releaseReconciled` would permanently orphan the card.
+    // F1 self-delete guard: also require rec.key !== expiredKey — on an
+    // expired-on-expired second boot the keys match, so we must NOT delete the
+    // record we just re-wrote.
+    if (emitted && rec.key !== expiredKey) releaseOutbox.remove(rec.key);
   }
   releaseOutbox.sweepAcked();
 }
