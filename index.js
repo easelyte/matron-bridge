@@ -45,6 +45,7 @@ import {
 import { launchWithCodexSinkEnv } from './lib/codex-paths.js';
 import { createSubagentConvoTracker } from './lib/subagent-convos.js';
 import { createSubagentRunningStore } from './lib/subagent-running-store.js';
+import { createQueuedReleaseOutbox } from './lib/queued-release-outbox.js';
 import { selectStrandedChildren } from './lib/subagent-reconcile.js';
 import { journalReemitCodexOutcomes } from './lib/codex-convos.js';
 import { formatSubagentToolBody } from './lib/subagent-tool-format.js';
@@ -75,7 +76,7 @@ import {
   parseShowFileUploadTimeoutMs,
   shareAgentMedia,
 } from './lib/show-file.js';
-import { createJournalPublisher } from './lib/journal-publisher.js';
+import { createJournalPublisher, FLUSH_TIMEOUT_MS } from './lib/journal-publisher.js';
 import { createRpcRequestHandler } from './lib/journal-rpc.js';
 import { createRecentFolders } from './lib/recent-folders.js';
 import { cancelQueuedItem, dispatchBusyQueueMagicWord, notifyQueuedMessage, isQueueReleaseTap, resolveQueueReleaseTap } from './lib/busy-queue.js';
@@ -358,7 +359,23 @@ const journalPublisher = createJournalPublisher({
       sessions,
       publisher: journalPublisher,
     });
+    // Queued-release durability (spec §3 step 6): reconnect is one of the two
+    // retry triggers. Safe on the FIRST hello_ok of a fresh boot even before
+    // reconcile runs — inherited records are already `pending_inherited`
+    // (relabelled at load), which the driver skips (state gate, not timing).
+    republishPendingReleases();
+    // Boot reconciliation (spec §5): expire every `pending_inherited` orphan.
+    // Runs once, on the first hello_ok after boot (the publisher is live, so the
+    // terminal `expired` release can actually be sent). Inherited records are a
+    // boot-only concern; later reconnects have none to reconcile.
+    if (!_releaseReconciled) {
+      _releaseReconciled = true;
+      reconcileReleaseOutbox();
+    }
   },
+  // Send-completion retry trigger (the mandatory one): re-publishes an
+  // overflow-evicted release frame on a healthy socket that never reconnects.
+  onSendCapacity: () => republishPendingReleases(),
   // Agent-RPC dispatch. Arrow + late-bound const (journalRpcHandler is
   // defined below): safe for the same reason onEvent's forward reference
   // is — the callback only ever fires once the socket is live, long after
@@ -586,6 +603,16 @@ const sessions = new Map(); // roomId -> session
 // A single shared store is safe — childConvoIds are globally unique.
 const subagentRunningStore = createSubagentRunningStore({ log: console });
 
+// Persistent, crash-safe write-ahead outbox for queued_release resolutions
+// (loop #536). Constructed here so it loads + relabels any inherited on-disk
+// `pending` records to `pending_inherited` synchronously at boot, before the
+// publisher fires any hook. emitRelease writes-ahead into it; the router's
+// echo-ack flips records `acked`; the retry driver + boot reconcile read it.
+const releaseOutbox = createQueuedReleaseOutbox({ log: console });
+// One-shot guard so boot reconciliation (reconcileReleaseOutbox) runs on the
+// first hello_ok only, not on every later reconnect.
+let _releaseReconciled = false;
+
 // RPC-start (lib/journal-rpc.js `start`): the !start command body minus the
 // origin-room replies — an RPC start has no origin chat room. Returns the
 // session; the RPC handler answers with its claudeSessionId (the journal
@@ -698,14 +725,102 @@ function journalPublish(session, method, payload) {
   }
 }
 
-function emitRelease(convoId, { promptId, action, releasedIds }) {
+// Transactional release seam (loop #536, spec §3). Order: write-ahead a durable
+// `pending` outbox record → (if a mutate thunk is supplied) run the irreversible
+// queue mutation → publish with a deterministic idem_key. FAIL-CLOSED: if the
+// write-ahead can't durably persist, ABORT before the mutation and the publish
+// (return false), leaving the card actionable — a failed durability prerequisite
+// must never let the irreversible mutation proceed with no recoverable record.
+// Returns true on a durable emit, false on a fail-closed abort.
+function emitRelease(convoId, { promptId, action, releasedIds }, { mutate } = {}) {
+  const itemId = (Array.isArray(releasedIds) && releasedIds.length)
+    ? releasedIds[0]
+    : `${promptId}::0`;
+  const at = Date.now();
+  const recordKey = `${promptId}\0${itemId}\0${action}`;
+  const durable = releaseOutbox.put(recordKey, {
+    convoId,
+    promptId,
+    itemId,
+    action,
+    releasedIds: Array.isArray(releasedIds) ? releasedIds : [itemId],
+    status: 'pending',
+    at,
+  });
+  if (!durable) {
+    console.warn(`[queued-release-outbox] write-ahead failed for ${recordKey} — aborting release (card stays actionable)`);
+    return false;
+  }
+  try { mutate?.(); }
+  catch (e) { console.warn(`[emitRelease] mutate thunk threw for ${recordKey}: ${e?.message ?? String(e)}`); }
   journalPublisher.publishPromptReply(convoId, {
     kind: 'queued_release',
     prompt_id: promptId,
     action,
     released: releasedIds,
-    at: Date.now(),
-  });
+    at,
+  }, { idemKey: `qr\0${promptId}\0${action}` });
+  return true;
+}
+
+// In-process retry driver (spec §3 step 6). Re-publishes every SAME-EPOCH
+// `pending` outbox record whose frame is not already in the outbound queue,
+// with its deterministic idem_key (so a re-publish of an already-journaled
+// release is a server-side dedup no-op). SKIPS `pending_inherited` (the state
+// gate — only boot reconcile touches those) and `acked`. Fired by two triggers
+// (onSendCapacity + onReconnect); the in-progress flag coalesces overlapping
+// fires into one pass.
+let _republishingReleases = false;
+function republishPendingReleases() {
+  if (_republishingReleases) return;
+  _republishingReleases = true;
+  try {
+    for (const rec of releaseOutbox.list()) {
+      if (rec.status !== 'pending') continue; // skip pending_inherited + acked
+      const idemKey = `qr\0${rec.promptId}\0${rec.action}`;
+      if (journalPublisher.hasQueuedIdem(idemKey)) continue; // frame still queued
+      journalPublisher.publishPromptReply(rec.convoId, {
+        kind: 'queued_release',
+        prompt_id: rec.promptId,
+        action: rec.action,
+        released: rec.releasedIds,
+        at: rec.at,
+      }, { idemKey });
+    }
+  } finally {
+    _republishingReleases = false;
+  }
+}
+
+// Boot reconciliation (spec §5). The SOLE toucher of `pending_inherited`. For
+// each inherited orphan (a release a prior process wrote but never got acked),
+// emit a terminal `expired` release via the normal write-ahead path — never
+// blind-re-publish the original send/cancel (device_id may differ post-restart,
+// so a re-publish could double-ink; expired is the conservative honest state).
+function reconcileReleaseOutbox() {
+  for (const rec of releaseOutbox.list()) {
+    if (rec.status !== 'pending_inherited') continue;
+    const expiredKey = `${rec.promptId}\0${rec.itemId}\0expired`;
+    // emitRelease write-aheads the expired-recovery record (key === expiredKey,
+    // status `pending`) BEFORE publishing, then publishes the terminal `expired`
+    // release. On a second boot where the inherited record IS the expired record
+    // this relabels it back to `pending` in place under the same key. Returns
+    // false (fail-closed) if the durable write-ahead can't persist.
+    const emitted = emitRelease(rec.convoId, {
+      promptId: rec.promptId,
+      action: 'expired',
+      releasedIds: [rec.itemId],
+    });
+    // F2: only remove the inherited original when the expired release was
+    // durably emitted. If emitRelease fail-closed (disk fault), keep the
+    // inherited record so a later boot retries — never delete with nothing
+    // published, else `_releaseReconciled` would permanently orphan the card.
+    // F1 self-delete guard: also require rec.key !== expiredKey — on an
+    // expired-on-expired second boot the keys match, so we must NOT delete the
+    // record we just re-wrote.
+    if (emitted && rec.key !== expiredKey) releaseOutbox.remove(rec.key);
+  }
+  releaseOutbox.sweepAcked();
 }
 
 function journalUpsertConvo(session, opts) {
@@ -6518,6 +6633,15 @@ const journalInputConsumer = createJournalInputConsumer({
       "That prompt has been superseded by a newer one — your answer wasn't delivered. Check the latest prompt and answer that instead.");
   },
   emitRelease,
+  // Queued-release universal echo-ack (spec §3 step 5): the echo of our own
+  // release is the true commit signal — flip the outbox record `acked` in
+  // memory unconditionally. Matched by (promptId, action) across
+  // send/cancel/expired.
+  onReleaseEcho: (_convoId, { promptId, action }) => {
+    if (typeof promptId === 'string' && typeof action === 'string') {
+      releaseOutbox.markAcked(promptId, action);
+    }
+  },
   log: console,
 });
 
@@ -7824,21 +7948,29 @@ main().catch(err => {
   process.exit(1);
 });
 
-process.on('SIGINT', () => {
-  console.log('\nShutting down...');
+// Async shutdown that SETTLES in-flight release frames before exit (loop #536,
+// spec §4). Idempotent: a second signal short-circuits via `shuttingDown`. The
+// outbound queue is drained (or the bounded flush timeout elapses — a dead
+// socket can't hang shutdown), so a clean restart delivers pending releases
+// inline; anything still unsettled is durable in the outbox and reconciled on
+// next boot.
+let shuttingDown = false;
+async function gracefulShutdown(signal) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  if (signal === 'SIGINT') console.log('\nShutting down...');
   if (_hostVitalsPushHandle) { clearInterval(_hostVitalsPushHandle); _hostVitalsPushHandle = null; }
   stopCpuSampler();
   for (const [, session] of sessions) {
     killSession(session);
   }
+  try {
+    await journalPublisher.flush({ timeoutMs: FLUSH_TIMEOUT_MS });
+  } catch (e) {
+    try { console.warn(`[shutdown] release flush failed: ${e?.message ?? String(e)}`); } catch { /* ignore */ }
+  }
   process.exit(0);
-});
+}
 
-process.on('SIGTERM', () => {
-  if (_hostVitalsPushHandle) { clearInterval(_hostVitalsPushHandle); _hostVitalsPushHandle = null; }
-  stopCpuSampler();
-  for (const [, session] of sessions) {
-    killSession(session);
-  }
-  process.exit(0);
-});
+process.on('SIGINT', () => { gracefulShutdown('SIGINT'); });
+process.on('SIGTERM', () => { gracefulShutdown('SIGTERM'); });
