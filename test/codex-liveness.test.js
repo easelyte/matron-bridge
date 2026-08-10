@@ -31,6 +31,39 @@ describe('isWrapperAlive', () => {
       wrapperStartTicks: '1',
     })).toBe(false);
   });
+
+  // F2 (T-6.6): non-Linux (dev/macOS) has no /proc — liveness-only via
+  // kill(pid,0), start-ticks ignored. Linux keeps the identity check.
+  describe('non-linux platform guard (F2)', () => {
+    it('reports a live pid alive on darwin without reading /proc start-ticks', () => {
+      expect(isWrapperAlive(
+        { wrapperPid: process.pid, wrapperStartTicks: 'ignored-off-linux' },
+        { platform: 'darwin' },
+      )).toBe(true);
+    });
+
+    it('reports a dead pid dead on darwin', () => {
+      expect(isWrapperAlive(
+        { wrapperPid: 2_147_483_647, wrapperStartTicks: 'ignored-off-linux' },
+        { platform: 'darwin' },
+      )).toBe(false);
+    });
+
+    it('still rejects a start-tick mismatch on linux (identity check intact)', () => {
+      const staleStartTicks = (BigInt(currentStartTicks()) + 1n).toString();
+      expect(isWrapperAlive(
+        { wrapperPid: process.pid, wrapperStartTicks: staleStartTicks },
+        { platform: 'linux' },
+      )).toBe(false);
+    });
+
+    it('still accepts matching start-ticks on linux', () => {
+      expect(isWrapperAlive(
+        { wrapperPid: process.pid, wrapperStartTicks: currentStartTicks() },
+        { platform: 'linux' },
+      )).toBe(true);
+    });
+  });
 });
 
 describe('pastDeadline', () => {

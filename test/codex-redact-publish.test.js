@@ -433,6 +433,7 @@ describe('publish-side Codex redaction', () => {
         isWrapperAliveFn: () => true,
       },
       log: { error: vi.fn(), info: vi.fn(), warn: vi.fn() },
+      watcherDependencies: { env: { MATRON_CODEX_VIZ: '1' }, detectProducer: () => true },
     });
 
     try {

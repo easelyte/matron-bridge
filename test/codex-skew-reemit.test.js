@@ -398,3 +398,116 @@ describe('Codex outcome deploy-skew repair', () => {
     }]);
   });
 });
+
+// F7 (T-6.7): a controllable mock publisher that models the best-effort
+// contract precisely — publishTextBestEffort records the call and fires
+// onDelivered only when delivery is enabled (delivery === true). While
+// undelivered (outage), the enqueue returns false and the note stays pending,
+// exactly like an eviction into pendingRepairs.
+function makeMockPublisher() {
+  const calls = [];
+  let delivery = false;
+  return {
+    calls,
+    setDelivery(value) { delivery = value; },
+    publishTextBestEffort(convoId, payload, opts = {}) {
+      const rec = { convoId, payload, idemKey: opts.idemKey, onDelivered: opts.onDelivered };
+      calls.push(rec);
+      if (delivery) { rec.onDelivered?.(); return true; }
+      return false;
+    },
+    publishText() { return true; },
+    upsertConvo() { return true; },
+    upsertConvoBestEffort() { return true; },
+  };
+}
+
+describe('Codex failure-notice durability (F7)', () => {
+  it('cap note is best-effort, stays pending until delivery, and re-emits idempotently on reconnect', () => {
+    const publisher = makeMockPublisher();
+    publisher.setDelivery(false); // outage: enqueued, not delivered
+    const tracker = createCodexConvoTracker({
+      sessionId: 'session-1', publisher, getParentConvoId: () => PARENT_ID,
+      log: { warn() {} }, maxChildren: 1,
+    });
+
+    tracker.ensureChild({ runId: RUN_ID });          // first child admitted
+    tracker.ensureChild({ runId: SECOND_RUN_ID });   // over the cap → cap note posted
+
+    // (a) retained + pending (latch open), best-effort with the stable idem key.
+    const capIdem = 'session-1:childcap';
+    expect(publisher.calls.filter(c => c.idemKey === capIdem)).toHaveLength(1);
+    expect(tracker.hasPendingCapNote()).toBe(true);
+    expect(tracker.pendingCapNote()).toEqual({
+      parentConvoId: PARENT_ID,
+      payload: { body: expect.any(String), from: 'assistant' },
+      idemKey: capIdem,
+    });
+
+    // (b) reconnect replays it with the SAME idem key; latch still open.
+    const isolation = { guardRepair: (_l, op) => op(), pendingBreakerNote: () => null };
+    journalReemitCodexOutcomes({
+      sessions: new Map([['session-1', { codexConvos: tracker, codexWatcherIsolation: isolation }]]),
+      publisher,
+    });
+    const capEmits = publisher.calls.filter(c => c.idemKey === capIdem);
+    expect(capEmits).toHaveLength(2); // once at post, once at reconnect
+    expect(tracker.hasPendingCapNote()).toBe(true); // not delivered → still pending
+
+    // Delivery of the replay closes the latch; no further pending note.
+    capEmits[1].onDelivered();
+    expect(tracker.hasPendingCapNote()).toBe(false);
+    expect(tracker.pendingCapNote()).toBeNull();
+  });
+
+  it('cap note latches immediately when delivery succeeds on first publish', () => {
+    const publisher = makeMockPublisher();
+    publisher.setDelivery(true);
+    const tracker = createCodexConvoTracker({
+      sessionId: 'session-1', publisher, getParentConvoId: () => PARENT_ID,
+      log: { warn() {} }, maxChildren: 1,
+    });
+    tracker.ensureChild({ runId: RUN_ID });
+    tracker.ensureChild({ runId: SECOND_RUN_ID });
+    expect(tracker.hasPendingCapNote()).toBe(false); // delivered → latched
+    expect(tracker.pendingCapNote()).toBeNull();
+  });
+
+  it('breaker note is best-effort, stays pending until delivery, and re-emits on reconnect', () => {
+    const publisher = makeMockPublisher();
+    publisher.setDelivery(false);
+    const isolation = createCodexWatcherIsolation({
+      sessionId: 'session-1', publisher, getParentConvoId: () => PARENT_ID,
+      terminalizeAll: () => [], isAdmittedRun: () => false, breakerThreshold: 1,
+      log: { warn() {}, info() {} },
+    });
+
+    isolation.guardSession('poll', () => { throw new Error('trip breaker'); });
+    expect(isolation.isDisabled()).toBe(true);
+
+    const breakerIdem = 'session-1:breaker';
+    expect(publisher.calls.filter(c => c.idemKey === breakerIdem)).toHaveLength(1);
+    expect(isolation.pendingBreakerNote()).toEqual({
+      parentConvoId: PARENT_ID,
+      payload: { body: expect.any(String), from: 'assistant' },
+      idemKey: breakerIdem,
+    });
+
+    const tracker = {
+      pendingFinalAnswers: () => new Map(),
+      terminalChildren: () => new Map(),
+      convoIdFor: () => null,
+      pendingCapNote: () => null,
+    };
+    journalReemitCodexOutcomes({
+      sessions: new Map([['session-1', { codexConvos: tracker, codexWatcherIsolation: isolation }]]),
+      publisher,
+    });
+    const breakerEmits = publisher.calls.filter(c => c.idemKey === breakerIdem);
+    expect(breakerEmits.length).toBeGreaterThanOrEqual(2);
+    expect(isolation.pendingBreakerNote()).not.toBeNull(); // undelivered → pending
+
+    breakerEmits[breakerEmits.length - 1].onDelivered();
+    expect(isolation.pendingBreakerNote()).toBeNull();
+  });
+});

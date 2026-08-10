@@ -425,6 +425,123 @@ describe('CodexWatcher', () => {
   });
 });
 
+describe('CodexWatcher F5 partial-meta transient retry', () => {
+  const PARTIAL = RUN_PENDING;
+  const SIBLING = RUN_TERMINAL;
+
+  function writePartialMeta(dir, runId) {
+    // A genuinely half-written meta: valid prefix, truncated mid-object → JSON.parse
+    // throws SyntaxError. This is exactly what a NON-atomic producer would expose.
+    fs.writeFileSync(path.join(dir, `codex-${runId}.meta.json`), `{"runId":"${runId}","wrapperPid":`);
+  }
+
+  it('retains a mid-write partial meta without stalling sibling discovery, then discovers it once complete', async () => {
+    const dir = makeDir();
+    let now = 1_000_000;
+    writeMeta(dir, SIBLING, { exitCode: 0 }); // valid terminal sibling
+    writePartialMeta(dir, PARTIAL);
+    const reconciled = [];
+    const watcher = new CodexWatcher({
+      dir,
+      sessionId: 'sess',
+      now: () => now,
+      onReconcile: (runId, outcome) => { reconciled.push([runId, outcome]); return true; },
+      pollIntervalMs: 60_000,
+      TailClass: FakeTail,
+      isWrapperAliveFn: () => true,
+    });
+    watchers.push(watcher);
+
+    const complete = await watcher.reconcile({ claudeSessionId: 'sess' });
+
+    // No global-discovery stall: the pass completes and reconciliationRequired clears
+    // even though the partial meta is still unparseable.
+    expect(complete).toBe(true);
+    expect(watcher.reconciliationRequired).toBe(false);
+    // Sibling valid run in the same pass IS discovered/terminalized.
+    expect(reconciled).toEqual([[SIBLING, 'completed']]);
+    // Partial run is RETAINED (not permanentlySkipped) for a later retry.
+    expect(watcher.permanentlySkipped.has(`codex-${PARTIAL}.meta.json`)).toBe(false);
+    expect(watcher.metaParsePending.has(PARTIAL)).toBe(true);
+    expect(watcher.reconcilePending.has(PARTIAL)).toBe(true);
+
+    // Complete the file before either bound fires → discovery on the next scan.
+    writeMeta(dir, PARTIAL);
+    fs.writeFileSync(path.join(dir, `codex-${PARTIAL}.jsonl`), '{"type":"thread.started"}\n');
+    await watcher.scan();
+
+    expect(watcher.metaParsePending.has(PARTIAL)).toBe(false);
+    expect(watcher.attached.has(PARTIAL)).toBe(true);
+    expect(watcher.permanentlySkipped.has(`codex-${PARTIAL}.meta.json`)).toBe(false);
+  });
+
+  it('recovers a partial meta completed within <=4 attempts (below the cap)', async () => {
+    const dir = makeDir();
+    let now = 1_000_000;
+    writePartialMeta(dir, PARTIAL);
+    const watcher = new CodexWatcher({
+      dir, sessionId: 'sess', now: () => now,
+      metaParseMaxAttempts: 5, metaParseTtlMs: 5000,
+      onReconcile: () => true, pollIntervalMs: 60_000, TailClass: FakeTail,
+      isWrapperAliveFn: () => true,
+    });
+    watchers.push(watcher);
+
+    // 3 failing passes, clock barely moves (well within TTL, below attempt cap).
+    for (let i = 0; i < 3; i += 1) { now += 10; await watcher._reconcile(); }
+    expect(watcher.permanentlySkipped.has(`codex-${PARTIAL}.meta.json`)).toBe(false);
+    expect(watcher.metaParsePending.get(PARTIAL)?.attempts).toBe(3);
+
+    // Complete it, then a scan recovers it (never quarantined).
+    writeMeta(dir, PARTIAL);
+    fs.writeFileSync(path.join(dir, `codex-${PARTIAL}.jsonl`), '{"type":"thread.started"}\n');
+    await watcher.scan();
+    expect(watcher.attached.has(PARTIAL)).toBe(true);
+    expect(watcher.permanentlySkipped.has(`codex-${PARTIAL}.meta.json`)).toBe(false);
+  });
+
+  it('quarantines at the attempt cap under rapid ticks inside the TTL', async () => {
+    const dir = makeDir();
+    let now = 1_000_000;
+    writePartialMeta(dir, PARTIAL);
+    const watcher = new CodexWatcher({
+      dir, sessionId: 'sess', now: () => now,
+      metaParseMaxAttempts: 5, metaParseTtlMs: 5000,
+      onReconcile: () => true, pollIntervalMs: 60_000, TailClass: FakeTail,
+    });
+    watchers.push(watcher);
+
+    for (let i = 0; i < 4; i += 1) { now += 10; await watcher._reconcile(); }
+    // 4 rapid attempts, still within TTL → NOT yet quarantined.
+    expect(watcher.permanentlySkipped.has(`codex-${PARTIAL}.meta.json`)).toBe(false);
+
+    now += 10; // 5th attempt, still well inside 5000ms → attempt cap trips.
+    await watcher._reconcile();
+    expect(watcher.permanentlySkipped.has(`codex-${PARTIAL}.meta.json`)).toBe(true);
+    expect(watcher.metaParsePending.has(PARTIAL)).toBe(false);
+  });
+
+  it('quarantines at the TTL when a valid meta never arrives (few attempts)', async () => {
+    const dir = makeDir();
+    let now = 1_000_000;
+    writePartialMeta(dir, PARTIAL);
+    const watcher = new CodexWatcher({
+      dir, sessionId: 'sess', now: () => now,
+      metaParseMaxAttempts: 5, metaParseTtlMs: 5000,
+      onReconcile: () => true, pollIntervalMs: 60_000, TailClass: FakeTail,
+    });
+    watchers.push(watcher);
+
+    now += 10; await watcher._reconcile(); // attempt 1, firstObservedAt=1_000_010
+    expect(watcher.permanentlySkipped.has(`codex-${PARTIAL}.meta.json`)).toBe(false);
+
+    now += 6000; // past the 5000ms TTL, only 2 attempts total
+    await watcher._reconcile();
+    expect(watcher.permanentlySkipped.has(`codex-${PARTIAL}.meta.json`)).toBe(true);
+    expect(watcher.metaParsePending.has(PARTIAL)).toBe(false);
+  });
+});
+
 describe('bridge watcher wiring', () => {
   it('does not construct a watcher when Codex visualization is disabled', () => {
     const WatcherClass = vi.fn();
@@ -445,9 +562,44 @@ describe('bridge watcher wiring', () => {
       ? class { constructor() { throw new Error('construct'); } }
       : class { start() { throw new Error('start'); } };
 
-    expect(() => startCodexWatcherIfEnabled({}, { WatcherClass, log, onFailure })).not.toThrow();
+    // A producer is present, so activation proceeds to construction/startup.
+    expect(() => startCodexWatcherIfEnabled({}, {
+      env: { MATRON_CODEX_VIZ: '1' }, WatcherClass, log, onFailure, detectProducer: () => true,
+    })).not.toThrow();
     await Promise.resolve();
     expect(onFailure).toHaveBeenCalledOnce();
     expect(log.warn).toHaveBeenCalledOnce();
+  });
+
+  // T-1.6 / AC#2: the fail-loud activation guard.
+  it('warns and does NOT construct a watcher when VIZ=1 but no producer is detected', () => {
+    const WatcherClass = vi.fn();
+    const log = { warn: vi.fn() };
+
+    const watcher = createCodexWatcherIfEnabled(
+      { dir: '/unused' },
+      { env: { MATRON_CODEX_VIZ: '1' }, WatcherClass, log, detectProducer: () => false },
+    );
+
+    expect(watcher).toBeNull();
+    expect(WatcherClass).not.toHaveBeenCalled();
+    expect(log.warn).toHaveBeenCalledOnce();
+    expect(log.warn.mock.calls[0][0]).toMatch(/no producer/);
+  });
+
+  it('constructs the watcher when a producer IS detected (e.g. wrapper-only, shim absent)', () => {
+    const WatcherClass = vi.fn();
+    const log = { warn: vi.fn() };
+
+    // MATRON_CODEX_REAL_BIN set → the real detectProducer returns true even with
+    // the shim absent from PATH (no false-disable of the valid wrapper producer).
+    const watcher = createCodexWatcherIfEnabled(
+      { dir: '/unused' },
+      { env: { MATRON_CODEX_VIZ: '1', MATRON_CODEX_REAL_BIN: '/usr/bin/codex' }, WatcherClass, log },
+    );
+
+    expect(watcher).not.toBeNull();
+    expect(WatcherClass).toHaveBeenCalledOnce();
+    expect(log.warn).not.toHaveBeenCalled();
   });
 });
