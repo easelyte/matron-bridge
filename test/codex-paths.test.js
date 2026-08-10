@@ -2,7 +2,6 @@ import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { subagentsDirFor } from '../lib/subagent-watcher.js';
 import {
   codexRunsDirFor,
   configureCodexSinkEnv,
@@ -10,15 +9,28 @@ import {
 } from '../lib/codex-paths.js';
 
 describe('codexRunsDirFor', () => {
-  it('uses the same encoded session parent as the subagents directory', () => {
-    const workdir = '/root/.openclaw/workspace';
+  it('anchors the sink to the sessionId, outside the encoded-cwd project tree', () => {
     const sessionId = 'abc-123';
-    const dir = codexRunsDirFor(workdir, sessionId);
+    const dir = codexRunsDirFor('/root/.openclaw/workspace', sessionId);
 
     expect(dir).toBe(path.join(
-      os.homedir(), '.claude', 'projects', '-root--openclaw-workspace', sessionId, 'codex-runs',
+      os.homedir(), '.claude', 'matron', 'codex-sinks', sessionId, 'codex-runs',
     ) + path.sep);
-    expect(path.dirname(dir)).toBe(path.dirname(subagentsDirFor(workdir, sessionId)));
+    // Must NOT live under Claude Code's `projects/` tree, which is re-homed on
+    // cwd change (EnterWorktree) and would orphan the frozen sink env (#630).
+    expect(dir).not.toContain(`${path.sep}projects${path.sep}`);
+  });
+
+  it('yields the SAME sink dir for a worktree cwd as for the main cwd (loop #630)', () => {
+    const sessionId = '00000000-1111-2222-3333-444444444444';
+    const mainCwd = '/root/workspace';
+    const worktreeCwd = '/root/workspace/.claude/worktrees/feature-x';
+
+    // A session that starts in main and later EnterWorktree's must resolve the
+    // same sink path on both sides, so producer-write == watcher-watch survives
+    // the cwd change. Parity here is what a card actually depends on.
+    expect(codexRunsDirFor(worktreeCwd, sessionId))
+      .toBe(codexRunsDirFor(mainCwd, sessionId));
   });
 });
 
