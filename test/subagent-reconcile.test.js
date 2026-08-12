@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { selectStrandedChildren } from '../lib/subagent-reconcile.js';
+import { selectStrandedChildren, strandedRepairFrames } from '../lib/subagent-reconcile.js';
 
 // Records mirror what subagent-running-store writes: childConvoId is the
 // canonical `${parentConvoId}:sub:${agentId}` (see childConvoId in
@@ -73,5 +73,53 @@ describe('selectStrandedChildren', () => {
       { childConvoId: 'ok:sub:a1', parentConvoId: 'ok', agentId: 'a1' },
     ];
     expect(selectStrandedChildren(entries, new Set())).toEqual({ stranded: ['ok:sub:a1'], malformed: [] });
+  });
+});
+
+// The repair frames the reconcile loop actually publishes. The parentConvoId
+// MUST ride each frame: reconcile fires precisely in the crash window where the
+// original `running` upsert may never have reached the journal, so `convo_upsert`
+// can INSERT a fresh row — and parent_convo_id is INSERT-only (immutable after).
+// A frame without it mints a permanent untitled ROOT orphan. This shape test
+// would have caught the omission the blocking review flagged.
+describe('strandedRepairFrames', () => {
+  it('carries the correct parentConvoId for every stranded child (the fix)', () => {
+    const entries = [
+      { childConvoId: 'pDead:sub:b2', parentConvoId: 'pDead', agentId: 'b2' },
+      { childConvoId: 'pGone:sub:d4', parentConvoId: 'pGone', agentId: 'd4' },
+    ];
+    const stranded = ['pDead:sub:b2', 'pGone:sub:d4'];
+    expect(strandedRepairFrames(entries, stranded)).toEqual([
+      { childConvoId: 'pDead:sub:b2', parentConvoId: 'pDead' },
+      { childConvoId: 'pGone:sub:d4', parentConvoId: 'pGone' },
+    ]);
+  });
+
+  it('joins by childConvoId regardless of entry order, ignoring unstranded entries', () => {
+    const entries = [
+      { childConvoId: 'pLive:sub:a1', parentConvoId: 'pLive', agentId: 'a1' }, // not stranded
+      { childConvoId: 'pDead:sub:b2', parentConvoId: 'pDead', agentId: 'b2' },
+    ];
+    expect(strandedRepairFrames(entries, ['pDead:sub:b2'])).toEqual([
+      { childConvoId: 'pDead:sub:b2', parentConvoId: 'pDead' },
+    ]);
+  });
+
+  it('end-to-end with selectStrandedChildren: every published frame is parent-linked', () => {
+    const entries = [
+      { childConvoId: 'pLive:sub:a1', parentConvoId: 'pLive', agentId: 'a1' },
+      { childConvoId: 'pDead:sub:b2', parentConvoId: 'pDead', agentId: 'b2' },
+    ];
+    const { stranded } = selectStrandedChildren(entries, new Set(['pLive']));
+    const frames = strandedRepairFrames(entries, stranded);
+    expect(frames).toEqual([{ childConvoId: 'pDead:sub:b2', parentConvoId: 'pDead' }]);
+    // No frame may ever carry an undefined parentConvoId in normal operation
+    // (selectStrandedChildren already validated provenance on each stranded id).
+    expect(frames.every(f => typeof f.parentConvoId === 'string' && f.parentConvoId)).toBe(true);
+  });
+
+  it('handles empty / missing inputs without throwing', () => {
+    expect(strandedRepairFrames([], [])).toEqual([]);
+    expect(strandedRepairFrames(undefined, undefined)).toEqual([]);
   });
 });

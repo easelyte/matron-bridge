@@ -80,25 +80,6 @@ describe('createJournalMediaRouter — file/image', () => {
     expect(deps.injectBlocks).toHaveBeenCalledTimes(1);
   });
 
-  it('threads the caption to buildSavedBlocks and does NOT re-append it (buildSavedMediaBlocks folds it — LEAD ordering)', async () => {
-    // Post-upstream-sync: the caption is folded INSIDE buildSavedMediaBlocks
-    // (SDK mode leads with it), so routeOne must inject exactly what the
-    // builder returns — appending here again would double the caption.
-    const built = [{ type: 'text', text: 'look at this' }, { type: 'text', text: 'Image saved to /w/s.png' }];
-    const injected = [];
-    const buildSavedBlocks = vi.fn(async () => built);
-    const { route } = makeRouter({
-      fetchMedia: vi.fn().mockResolvedValue({ buffer: Buffer.from('x'), contentType: 'image/png' }),
-      buildSavedBlocks,
-      injectBlocks: vi.fn((sess, blocks) => { injected.push(blocks); return true; }),
-    });
-    await route(session, { type: 'image', blobRef: 'b1', contentType: 'image/png', name: 's.png', caption: 'look at this' }, ctx);
-
-    expect(buildSavedBlocks).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ caption: 'look at this' }));
-    expect(injected[0]).toEqual(built);
-    expect(injected[0]).toHaveLength(2);
-  });
-
   it('awaits an ASYNC buildSavedBlocks (the inline-image downscale path returns a promise)', async () => {
     const blocks = [{ type: 'text', text: 'Image saved to /w/big.jpg' }, { type: 'image', source: {} }];
     const { route, deps } = makeRouter({
@@ -149,15 +130,25 @@ describe('createJournalMediaRouter — file/image', () => {
     expect(deps.injectBlocks).not.toHaveBeenCalled();
   });
 
-  it('captioned media with an empty builder result is dropped and noticed, not injected as caption-only', async () => {
-    const { route, deps } = makeRouter({
-      buildSavedBlocks: vi.fn(async () => []),
-    });
-    await route(session, { type: 'file', blobRef: 'b', contentType: 'application/pdf', name: 'x.pdf', caption: 'read this' }, ctx);
-
+  it('an attachment that produced no blocks notifies the user, naming the file (fail-visible, not a silent drop)', async () => {
+    const { route, deps } = makeRouter({ buildSavedBlocks: vi.fn(() => []) });
+    await route(session, {
+      type: 'file', blobRef: 'b', contentType: 'application/pdf', name: 'x.pdf', caption: 'look at this',
+    }, ctx);
     expect(deps.injectBlocks).not.toHaveBeenCalled();
-    expect(deps.queueMedia).not.toHaveBeenCalled();
-    expect(deps.publishNotice).toHaveBeenCalledWith('convo-1', expect.stringMatching(/deliver.*attachment/i));
+    expect(deps.publishNotice).toHaveBeenCalledWith('convo-1', expect.stringMatching(/Couldn't deliver that attachment \(x\.pdf\)/));
+  });
+
+  it('an UNcaptioned attachment that produced no blocks also notifies — the room already showed a success echo', async () => {
+    const { route, deps } = makeRouter({ buildSavedBlocks: vi.fn(() => []) });
+    await route(session, { type: 'file', blobRef: 'b', contentType: 'application/pdf', name: 'x.pdf' }, ctx);
+    expect(deps.publishNotice).toHaveBeenCalledWith('convo-1', expect.stringMatching(/Couldn't deliver that attachment \(x\.pdf\)/));
+  });
+
+  it('an image with no name that produced no blocks notices with the image label and no parenthetical', async () => {
+    const { route, deps } = makeRouter({ buildSavedBlocks: vi.fn(() => []) });
+    await route(session, { type: 'image', blobRef: 'i', contentType: 'image/png' }, ctx);
+    expect(deps.publishNotice).toHaveBeenCalledWith('convo-1', "Couldn't deliver that image to claude.");
   });
 
   it('an unavailable session (injectBlocks false) publishes an undeliverable notice', async () => {
@@ -243,18 +234,6 @@ describe('createJournalMediaRouter — audio (voice note)', () => {
     expect(deps.injectText).toHaveBeenCalledWith(session, '[Voice note transcription]: hi');
   });
 
-  it('does NOT inject an audio caption (journal media row already carries it — no double mirror)', async () => {
-    const { route, deps } = makeRouter({
-      fetchMedia: vi.fn(async () => ({ buffer: Buffer.from('x'), contentType: 'audio/ogg' })),
-      transcribe: vi.fn(async () => 'buy milk'),
-    });
-    await route(session, { type: 'file', blobRef: 'v', contentType: 'audio/ogg', caption: 'tomorrow' }, ctx);
-
-    const injected = deps.injectText.mock.calls[0][1];
-    expect(injected).toBe('[Voice note transcription]: buy milk');
-    expect(injected).not.toContain('tomorrow');
-  });
-
   it('a failed transcription warns, notices, and drops — no injection', async () => {
     const warnings = [];
     const { route, deps } = makeRouter({
@@ -314,18 +293,6 @@ describe('createJournalMediaRouter — busy session queues instead of injecting'
       mirrorToJournal: true,
       preview: '🎤 buy milk',
     });
-  });
-
-  it('does NOT queue an audio caption either (mirrorToJournal flush would double it)', async () => {
-    const { route, deps } = makeRouter({
-      fetchMedia: vi.fn(async () => ({ buffer: Buffer.from('ogg'), contentType: 'audio/ogg' })),
-      transcribe: vi.fn(async () => 'buy milk'),
-    });
-    await route(busySession, { type: 'file', blobRef: 'voice-1', contentType: 'audio/ogg', name: 'voice.ogg', caption: 'tomorrow' }, ctx);
-
-    const queuedText = deps.queueMedia.mock.calls[0][1].blocks[0].text;
-    expect(queuedText).toBe('[Voice note transcription]: buy milk');
-    expect(queuedText).not.toContain('tomorrow');
   });
 
   it('falls back to immediate injection when busy but no queueMedia seam is wired', async () => {

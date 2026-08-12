@@ -1,13 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'fs';
-import { createJournalInputConsumer, resolvePromptChoice, promptExpectsReply } from '../lib/journal-input-router.js';
-import {
-  buildPermissionKey,
-  createPermissionSeams,
-  PERMISSION_DECISION_TIMEOUT_MS,
-  PERMISSION_MAX_PENDING_GLOBAL,
-  PERMISSION_MAX_PENDING_PER_CONVO,
-} from '../lib/permission-registry.js';
+import { createJournalInputConsumer, resolvePromptChoice, promptExpectsReply, isResumePickerTap, isPickerFrame } from '../lib/journal-input-router.js';
 
 const silentLog = { warn: () => {}, error: () => {} };
 
@@ -46,6 +39,25 @@ describe('resolvePromptChoice', () => {
 
   it('returns null for an unmatched id/label', () => {
     expect(resolvePromptChoice(options, 'nonsense')).toBeNull();
+  });
+
+  it('matches by option value (Matron card taps send the button VALUE as choice)', () => {
+    // iv TUI prompt buttons (lib/prompt-buttons.js) carry value `prompt-opt:<i>`
+    // alongside id `prompt-opt-<i>` — a tap must resolve, not fall through to
+    // "Nothing to answer right now".
+    const ivOptions = [
+      { id: 'prompt-opt-0', label: 'Claude account with subscription', value: 'prompt-opt:0' },
+      { id: 'prompt-opt-1', label: 'Anthropic Console account', value: 'prompt-opt:1' },
+    ];
+    expect(resolvePromptChoice(ivOptions, 'prompt-opt:1')).toEqual({ option: ivOptions[1], index: 1 });
+  });
+
+  it('prefers an id match over a value match when both could apply', () => {
+    const collide = [
+      { id: 'a', label: 'First', value: 'b' },
+      { id: 'b', label: 'Second', value: 'c' },
+    ];
+    expect(resolvePromptChoice(collide, 'b')).toEqual({ option: collide[1], index: 1 });
   });
 
   it('returns null for null/undefined/empty choice', () => {
@@ -499,6 +511,7 @@ describe('createJournalInputConsumer — non-answerable prompts must not superse
     const emitRelease = vi.fn((convoId, release) => {
       order.push(`release:${release.releasedIds[0]}`);
       expect(convoId).toBe('convo-1');
+      return true; // durable emit — the fail-closed gate only clears on success
     });
     const consumer = createJournalInputConsumer(makeDeps({ emitRelease }));
     consumer.queueRelease.noteQueued('convo-1', {
@@ -532,904 +545,6 @@ describe('createJournalInputConsumer — non-answerable prompts must not superse
     });
     expect(emitRelease).toHaveBeenCalledTimes(2);
     expect(order.at(-1)).toBe('clear-again');
-  });
-});
-
-describe('createJournalInputConsumer — permission registry seam foundation', () => {
-  function makeDeps(overrides = {}) {
-    return {
-      isControlConvo: () => false,
-      handleControlCommand: vi.fn(),
-      findSessionByConvoId: vi.fn((id) => ({ claudeSessionId: id })),
-      routeTextToSession: vi.fn(),
-      routePromptReply: vi.fn(),
-      notePermissionSeq: vi.fn(() => true),
-      resolvePermissionReply: vi.fn(),
-      hasLivePermissionPending: vi.fn(() => false),
-      isLivePendingToolUse: vi.fn(() => false),
-      noticeUnknownConvo: vi.fn(),
-      noticeStalePromptReply: vi.fn(),
-      log: silentLog,
-      ...overrides,
-    };
-  }
-
-  it('registers a valid bridge-owned permission_request echo exactly once', () => {
-    const key = buildPermissionKey('convo-1', 'toolu_1');
-    let assigned = false;
-    const deps = makeDeps({
-      isLivePendingToolUse: vi.fn((candidateKey, convoId, nonce) => (
-        candidateKey === key && convoId === 'convo-1' && nonce === 'nonce-toolu_1'
-      )),
-      notePermissionSeq: vi.fn(() => {
-        if (assigned) return false;
-        assigned = true;
-        return true;
-      }),
-    });
-    const consumer = createJournalInputConsumer(deps);
-
-    consumer(baseFrame({
-      seq: 41,
-      sender: 'agent:dev-2',
-      type: 'permission_request',
-      payload: { tool_use_id: 'toolu_1', nonce: 'nonce-toolu_1' },
-    }));
-    consumer(baseFrame({
-      seq: 42,
-      sender: 'agent:dev-2',
-      type: 'permission_request',
-      payload: { tool_use_id: 'toolu_1', nonce: 'nonce-toolu_1' },
-    }));
-
-    expect(deps.isLivePendingToolUse).toHaveBeenCalledWith(
-      key,
-      'convo-1',
-      'nonce-toolu_1',
-    );
-    expect(deps.notePermissionSeq).toHaveBeenCalledTimes(2);
-    expect(deps.notePermissionSeq).toHaveBeenCalledWith(key, 41, 'convo-1');
-    expect(deps.notePermissionSeq.mock.results.map(({ value }) => value)).toEqual([true, false]);
-    expect(deps.findSessionByConvoId).not.toHaveBeenCalled();
-  });
-
-  it('binds two concurrent permission replies independently to their own seq keys', () => {
-    const firstKey = buildPermissionKey('convo-1', 'toolu_1');
-    const secondKey = buildPermissionKey('convo-1', 'toolu_2');
-    const firstResolve = vi.fn();
-    const secondResolve = vi.fn();
-    const pendingPermissionDecisions = new Map([
-      [firstKey, {
-        resolve: firstResolve, seq: null, convoId: 'convo-1', nonce: 'nonce-toolu_1',
-      }],
-      [secondKey, {
-        resolve: secondResolve, seq: null, convoId: 'convo-1', nonce: 'nonce-toolu_2',
-      }],
-    ]);
-    const deps = makeDeps(createPermissionSeams({ pendingPermissionDecisions }));
-    const consumer = createJournalInputConsumer(deps);
-
-    consumer(baseFrame({
-      seq: 50,
-      sender: 'agent:dev-2',
-      type: 'prompt',
-      payload: { question: 'Newer ordinary prompt', options: [] },
-    }));
-    for (const [seq, toolUseId] of [[41, 'toolu_1'], [42, 'toolu_2']]) {
-      consumer(baseFrame({
-        seq,
-        sender: 'agent:dev-2',
-        type: 'permission_request',
-        payload: { tool_use_id: toolUseId, nonce: `nonce-${toolUseId}` },
-      }));
-    }
-    consumer(baseFrame({
-      seq: 51,
-      type: 'prompt_reply',
-      payload: { target_seq: 42, choice: 'deny', text: null },
-    }));
-    consumer(baseFrame({
-      seq: 52,
-      type: 'prompt_reply',
-      payload: { target_seq: 41, choice: 'Allow', text: null },
-    }));
-
-    expect(firstResolve).toHaveBeenCalledOnce();
-    expect(firstResolve).toHaveBeenCalledWith({
-      decision: 'allow', source: 'operator', principal: 'dan',
-    });
-    expect(secondResolve).toHaveBeenCalledOnce();
-    expect(secondResolve).toHaveBeenCalledWith({
-      decision: 'deny', source: 'operator', principal: 'dan',
-    });
-    expect(deps.routePromptReply).not.toHaveBeenCalled();
-  });
-
-  it('passes the operator identity to the permission finalizer', () => {
-    const key = buildPermissionKey('convo-1', 'toolu_1');
-    const deps = makeDeps({
-      isLivePendingToolUse: vi.fn((candidateKey) => candidateKey === key),
-    });
-    const consumer = createJournalInputConsumer(deps);
-
-    consumer(baseFrame({
-      seq: 41,
-      sender: 'agent:dev-2',
-      type: 'permission_request',
-      payload: { tool_use_id: 'toolu_1' },
-    }));
-    consumer(baseFrame({
-      seq: 42,
-      type: 'prompt_reply',
-      payload: { target_seq: 41, choice: 'allow', text: 'must not echo' },
-    }));
-
-    expect(deps.resolvePermissionReply).toHaveBeenCalledWith(key, 'allow', { username: 'dan' });
-    expect(deps.routePromptReply).not.toHaveBeenCalled();
-  });
-
-  it('resolves a proven permission member even when target_seq equals its own frame seq', () => {
-    const key = buildPermissionKey('convo-1', 'toolu_1');
-    const deps = makeDeps({
-      isLivePendingToolUse: vi.fn((candidateKey) => candidateKey === key),
-    });
-    const consumer = createJournalInputConsumer(deps);
-
-    consumer(baseFrame({
-      seq: 41,
-      sender: 'agent:dev-2',
-      type: 'permission_request',
-      payload: { tool_use_id: 'toolu_1' },
-    }));
-    consumer(baseFrame({
-      seq: 41,
-      type: 'prompt_reply',
-      payload: { target_seq: 41, choice: 'allow', text: null },
-    }));
-
-    expect(deps.resolvePermissionReply).toHaveBeenCalledWith(key, 'allow', { username: 'dan' });
-    expect(deps.routePromptReply).not.toHaveBeenCalled();
-    expect(deps.noticeStalePromptReply).not.toHaveBeenCalled();
-  });
-
-  it('resolves a proven permission member even when its reply frame seq is not an integer', () => {
-    const key = buildPermissionKey('convo-1', 'toolu_1');
-    const deps = makeDeps({
-      isLivePendingToolUse: vi.fn((candidateKey) => candidateKey === key),
-    });
-    const consumer = createJournalInputConsumer(deps);
-
-    consumer(baseFrame({
-      seq: 41,
-      sender: 'agent:dev-2',
-      type: 'permission_request',
-      payload: { tool_use_id: 'toolu_1' },
-    }));
-    consumer(baseFrame({
-      seq: '42',
-      type: 'prompt_reply',
-      payload: { target_seq: 41, choice: 'allow', text: null },
-    }));
-
-    expect(deps.resolvePermissionReply).toHaveBeenCalledWith(key, 'allow', { username: 'dan' });
-    expect(deps.routePromptReply).not.toHaveBeenCalled();
-    expect(deps.noticeStalePromptReply).not.toHaveBeenCalled();
-  });
-
-  it('rejects and never buffers a future target_seq guess', () => {
-    vi.useFakeTimers();
-    try {
-      const key = buildPermissionKey('convo-1', 'toolu_future');
-      const deps = makeDeps({
-        hasLivePermissionPending: vi.fn(() => true),
-        isLivePendingToolUse: vi.fn((candidateKey) => candidateKey === key),
-      });
-      const consumer = createJournalInputConsumer(deps);
-
-      consumer(baseFrame({
-        seq: 40,
-        type: 'prompt_reply',
-        payload: { target_seq: 41, choice: 'allow', text: null },
-      }));
-
-      expect(vi.getTimerCount()).toBe(0);
-      expect(deps.noticeStalePromptReply).toHaveBeenCalledOnce();
-      expect(deps.routePromptReply).not.toHaveBeenCalled();
-
-      consumer(baseFrame({
-        seq: 41,
-        sender: 'agent:dev-2',
-        type: 'permission_request',
-        payload: { tool_use_id: 'toolu_future' },
-      }));
-
-      expect(deps.resolvePermissionReply).not.toHaveBeenCalled();
-      expect(vi.getTimerCount()).toBe(0);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it('buffers a stale-target tap while a seq-null permission is live, then drains it on echo', () => {
-    const key = buildPermissionKey('convo-1', 'toolu_1');
-    const resolve = vi.fn();
-    const pendingPermissionDecisions = new Map([
-      [key, { resolve, seq: null, convoId: 'convo-1', nonce: 'nonce-toolu_1' }],
-    ]);
-    const deps = makeDeps(createPermissionSeams({ pendingPermissionDecisions }));
-    const consumer = createJournalInputConsumer(deps);
-
-    consumer(baseFrame({
-      seq: 50,
-      sender: 'agent:dev-2',
-      type: 'prompt',
-      payload: { question: 'Ordinary prompt', options: [] },
-    }));
-    consumer(baseFrame({
-      seq: 51,
-      type: 'prompt_reply',
-      payload: { target_seq: 41, choice: ' allow ', text: 'tap before echo' },
-    }));
-
-    expect(resolve).not.toHaveBeenCalled();
-    expect(deps.routePromptReply).not.toHaveBeenCalled();
-    expect(deps.noticeStalePromptReply).not.toHaveBeenCalled();
-
-    consumer(baseFrame({
-      seq: 41,
-      sender: 'agent:dev-2',
-      type: 'permission_request',
-      payload: { tool_use_id: 'toolu_1', nonce: 'nonce-toolu_1' },
-    }));
-
-    expect(resolve).toHaveBeenCalledOnce();
-    expect(resolve).toHaveBeenCalledWith({
-      decision: 'allow', source: 'operator', principal: 'dan',
-    });
-    expect(deps.routePromptReply).not.toHaveBeenCalled();
-  });
-
-  it('refuses an ordinary stale reply immediately when no seq-null permission is live', () => {
-    const deps = makeDeps({ hasLivePermissionPending: vi.fn(() => false) });
-    const consumer = createJournalInputConsumer(deps);
-
-    consumer(baseFrame({
-      seq: 50,
-      sender: 'agent:dev-2',
-      type: 'prompt',
-      payload: { question: 'Latest prompt', options: [] },
-    }));
-    consumer(baseFrame({
-      seq: 51,
-      type: 'prompt_reply',
-      payload: { target_seq: 40, choice: 'opt_a', text: null },
-    }));
-
-    expect(deps.hasLivePermissionPending).toHaveBeenCalledWith('convo-1');
-    expect(deps.noticeStalePromptReply).toHaveBeenCalledOnce();
-    expect(deps.routePromptReply).not.toHaveBeenCalled();
-    expect(deps.resolvePermissionReply).not.toHaveBeenCalled();
-  });
-
-  it('routes an ordinary latest-seq answer unchanged even with a seq-null permission live', () => {
-    const deps = makeDeps({ hasLivePermissionPending: vi.fn(() => true) });
-    const consumer = createJournalInputConsumer(deps);
-
-    consumer(baseFrame({
-      seq: 50,
-      sender: 'agent:dev-2',
-      type: 'prompt',
-      payload: { question: 'Latest prompt', options: [] },
-    }));
-    consumer(baseFrame({
-      seq: 51,
-      type: 'prompt_reply',
-      payload: { target_seq: 50, choice: 'opt_a', text: 'ordinary answer' },
-    }));
-
-    expect(deps.routePromptReply).toHaveBeenCalledWith(
-      { claudeSessionId: 'convo-1' },
-      { target_seq: 50, choice: 'opt_a', text: 'ordinary answer' },
-      { username: 'dan' },
-    );
-    expect(deps.hasLivePermissionPending).not.toHaveBeenCalled();
-    expect(deps.resolvePermissionReply).not.toHaveBeenCalled();
-  });
-
-  it('buffers a first-card permission tap before its echo and drains it once the echo arrives', () => {
-    vi.useFakeTimers();
-    try {
-      const key = buildPermissionKey('convo-1', 'toolu_first');
-      const resolve = vi.fn();
-      const pendingPermissionDecisions = new Map([
-        [key, { resolve, seq: null, convoId: 'convo-1', nonce: 'nonce-toolu_first' }],
-      ]);
-      const deps = makeDeps(createPermissionSeams({ pendingPermissionDecisions }));
-      const consumer = createJournalInputConsumer(deps);
-
-      consumer(baseFrame({
-        seq: 42,
-        type: 'prompt_reply',
-        payload: { target_seq: 41, choice: 'allow', text: 'tap before echo' },
-      }));
-
-      expect(resolve).not.toHaveBeenCalled();
-      expect(deps.routePromptReply).not.toHaveBeenCalled();
-      expect(deps.noticeStalePromptReply).not.toHaveBeenCalled();
-      expect(vi.getTimerCount()).toBe(1);
-
-      consumer(baseFrame({
-        seq: 41,
-        sender: 'agent:dev-2',
-        type: 'permission_request',
-        payload: { tool_use_id: 'toolu_first', nonce: 'nonce-toolu_first' },
-      }));
-
-      expect(resolve).toHaveBeenCalledOnce();
-      expect(resolve).toHaveBeenCalledWith({
-        decision: 'allow', source: 'operator', principal: 'dan',
-      });
-      expect(deps.routePromptReply).not.toHaveBeenCalled();
-      expect(vi.getTimerCount()).toBe(0);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it('keeps the first buffered decision and its original TTL on a conflicting duplicate', () => {
-    vi.useFakeTimers();
-    const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout');
-    try {
-      const key = buildPermissionKey('convo-1', 'toolu_first');
-      const resolve = vi.fn();
-      const pendingPermissionDecisions = new Map([
-        [key, { resolve, seq: null, convoId: 'convo-1', nonce: 'nonce-toolu_first' }],
-      ]);
-      const deps = makeDeps(createPermissionSeams({ pendingPermissionDecisions }));
-      const consumer = createJournalInputConsumer(deps);
-
-      consumer(baseFrame({
-        seq: 42,
-        type: 'prompt_reply',
-        payload: { target_seq: 41, choice: 'deny', text: null },
-      }));
-      expect(setTimeoutSpy).toHaveBeenCalledOnce();
-
-      vi.advanceTimersByTime(1_000);
-      consumer(baseFrame({
-        seq: 43,
-        type: 'prompt_reply',
-        payload: { target_seq: 41, choice: 'allow', text: null },
-      }));
-
-      expect(setTimeoutSpy).toHaveBeenCalledOnce();
-      expect(vi.getTimerCount()).toBe(1);
-
-      consumer(baseFrame({
-        seq: 41,
-        sender: 'agent:dev-2',
-        type: 'permission_request',
-        payload: { tool_use_id: 'toolu_first', nonce: 'nonce-toolu_first' },
-      }));
-
-      expect(resolve).toHaveBeenCalledOnce();
-      expect(resolve).toHaveBeenCalledWith({
-        decision: 'deny', source: 'operator', principal: 'dan',
-      });
-      expect(vi.getTimerCount()).toBe(0);
-    } finally {
-      setTimeoutSpy.mockRestore();
-      vi.useRealTimers();
-    }
-  });
-
-  it('routes an ordinary answer when no latest prompt or seq-null permission is recorded', () => {
-    const deps = makeDeps({ hasLivePermissionPending: vi.fn(() => false) });
-    const consumer = createJournalInputConsumer(deps);
-
-    consumer(baseFrame({
-      seq: 51,
-      type: 'prompt_reply',
-      payload: { target_seq: 40, choice: 'opt_a', text: 'ordinary answer' },
-    }));
-
-    expect(deps.routePromptReply).toHaveBeenCalledWith(
-      { claudeSessionId: 'convo-1' },
-      { target_seq: 40, choice: 'opt_a', text: 'ordinary answer' },
-      { username: 'dan' },
-    );
-    expect(deps.noticeStalePromptReply).not.toHaveBeenCalled();
-    expect(deps.resolvePermissionReply).not.toHaveBeenCalled();
-  });
-
-  it('maps Allow and allow to allow and every other permission choice to deny', () => {
-    const pendingPermissionDecisions = new Map();
-    const resolves = [];
-    for (const toolUseId of ['toolu_1', 'toolu_2', 'toolu_3']) {
-      const resolve = vi.fn();
-      resolves.push(resolve);
-      pendingPermissionDecisions.set(buildPermissionKey('convo-1', toolUseId), {
-        resolve,
-        seq: null,
-        convoId: 'convo-1',
-        nonce: `nonce-${toolUseId}`,
-      });
-    }
-    const deps = makeDeps(createPermissionSeams({ pendingPermissionDecisions }));
-    const consumer = createJournalInputConsumer(deps);
-
-    for (const [seq, toolUseId] of [[41, 'toolu_1'], [42, 'toolu_2'], [43, 'toolu_3']]) {
-      consumer(baseFrame({
-        seq,
-        sender: 'agent:dev-2',
-        type: 'permission_request',
-        payload: { tool_use_id: toolUseId, nonce: `nonce-${toolUseId}` },
-      }));
-    }
-    for (const [seq, choice] of [[41, 'Allow'], [42, 'allow'], [43, 'yes']]) {
-      consumer(baseFrame({
-        seq: seq + 10,
-        type: 'prompt_reply',
-        payload: { target_seq: seq, choice, text: null },
-      }));
-    }
-
-    expect(resolves[0]).toHaveBeenCalledWith({
-      decision: 'allow', source: 'operator', principal: 'dan',
-    });
-    expect(resolves[1]).toHaveBeenCalledWith({
-      decision: 'allow', source: 'operator', principal: 'dan',
-    });
-    expect(resolves[2]).toHaveBeenCalledWith({
-      decision: 'deny', source: 'operator', principal: 'dan',
-    });
-    expect(deps.routePromptReply).not.toHaveBeenCalled();
-  });
-
-  it('retains a buffered reply beyond five seconds and drains it on a slow echo', () => {
-    vi.useFakeTimers();
-    try {
-      const key = buildPermissionKey('convo-1', 'toolu_1');
-      const resolve = vi.fn();
-      const pendingPermissionDecisions = new Map([
-        [key, { resolve, seq: null, convoId: 'convo-1', nonce: 'nonce-toolu_1' }],
-      ]);
-      const deps = makeDeps(createPermissionSeams({ pendingPermissionDecisions }));
-      const consumer = createJournalInputConsumer(deps);
-      consumer(baseFrame({
-        seq: 50,
-        sender: 'agent:dev-2',
-        type: 'prompt',
-        payload: { question: 'Latest prompt', options: [] },
-      }));
-      consumer(baseFrame({
-        seq: 51,
-        type: 'prompt_reply',
-        payload: { target_seq: 41, choice: 'allow', text: null },
-      }));
-
-      expect(vi.getTimerCount()).toBe(1);
-      vi.advanceTimersByTime(6_000);
-      expect(vi.getTimerCount()).toBe(1);
-      expect(deps.noticeStalePromptReply).not.toHaveBeenCalled();
-      consumer(baseFrame({
-        seq: 41,
-        sender: 'agent:dev-2',
-        type: 'permission_request',
-        payload: { tool_use_id: 'toolu_1', nonce: 'nonce-toolu_1' },
-      }));
-
-      expect(resolve).toHaveBeenCalledWith({
-        decision: 'allow', source: 'operator', principal: 'dan',
-      });
-      expect(vi.getTimerCount()).toBe(0);
-      expect(deps.routePromptReply).not.toHaveBeenCalled();
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it('expires an undrained buffered reply with the permission-card deadline', () => {
-    vi.useFakeTimers();
-    try {
-      const deps = makeDeps({
-        hasLivePermissionPending: vi.fn(() => true),
-        isLivePendingToolUse: vi.fn(() => true),
-        notePermissionSeq: vi.fn(() => true),
-      });
-      const consumer = createJournalInputConsumer(deps);
-      consumer(baseFrame({
-        seq: 50,
-        sender: 'agent:dev-2',
-        type: 'prompt',
-        payload: { question: 'Latest prompt', options: [] },
-      }));
-      consumer(baseFrame({
-        seq: 51,
-        type: 'prompt_reply',
-        payload: { target_seq: 41, choice: 'allow', text: null },
-      }));
-
-      vi.advanceTimersByTime(PERMISSION_DECISION_TIMEOUT_MS - 1);
-      expect(vi.getTimerCount()).toBe(1);
-      expect(deps.noticeStalePromptReply).not.toHaveBeenCalled();
-      vi.advanceTimersByTime(1);
-
-      expect(vi.getTimerCount()).toBe(0);
-      expect(deps.noticeStalePromptReply).toHaveBeenCalledWith('convo-1', {
-        username: 'dan',
-        targetSeq: 41,
-        latestSeq: 50,
-      });
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it('bounds buffered permission replies at the per-convo pending cap', () => {
-    vi.useFakeTimers();
-    try {
-      const deps = makeDeps({ hasLivePermissionPending: vi.fn(() => true) });
-      const consumer = createJournalInputConsumer(deps);
-      consumer(baseFrame({
-        seq: 1_000,
-        sender: 'agent:dev-2',
-        type: 'prompt',
-        payload: { question: 'Latest prompt', options: [] },
-      }));
-
-      for (let seq = 1; seq <= PERMISSION_MAX_PENDING_PER_CONVO + 1; seq += 1) {
-        consumer(baseFrame({
-          seq: 1_000 + seq,
-          type: 'prompt_reply',
-          payload: { target_seq: seq, choice: 'allow', text: null },
-        }));
-      }
-
-      expect(vi.getTimerCount()).toBe(PERMISSION_MAX_PENDING_PER_CONVO);
-      expect(deps.noticeStalePromptReply).toHaveBeenCalledTimes(1);
-      expect(deps.noticeStalePromptReply).toHaveBeenCalledWith('convo-1', {
-        username: 'dan',
-        targetSeq: PERMISSION_MAX_PENDING_PER_CONVO + 1,
-        latestSeq: 1_000,
-      });
-      expect(deps.routePromptReply).not.toHaveBeenCalled();
-
-      consumer.evictConvo('convo-1');
-      expect(vi.getTimerCount()).toBe(0);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it('bounds buffered permission replies at the global pending cap', () => {
-    vi.useFakeTimers();
-    try {
-      const deps = makeDeps({ hasLivePermissionPending: vi.fn(() => true) });
-      const consumer = createJournalInputConsumer(deps);
-      const convoCount = PERMISSION_MAX_PENDING_GLOBAL / PERMISSION_MAX_PENDING_PER_CONVO;
-
-      for (let seq = 1; seq <= PERMISSION_MAX_PENDING_GLOBAL; seq += 1) {
-        const convoId = `convo-${Math.floor((seq - 1) / PERMISSION_MAX_PENDING_PER_CONVO)}`;
-        consumer(baseFrame({
-          seq: PERMISSION_MAX_PENDING_GLOBAL + seq,
-          convo_id: convoId,
-          type: 'prompt_reply',
-          payload: { target_seq: seq, choice: 'allow', text: null },
-        }));
-      }
-      consumer(baseFrame({
-        seq: PERMISSION_MAX_PENDING_GLOBAL * 2 + 1,
-        convo_id: 'convo-overflow',
-        type: 'prompt_reply',
-        payload: {
-          target_seq: PERMISSION_MAX_PENDING_GLOBAL + 1,
-          choice: 'allow',
-          text: null,
-        },
-      }));
-
-      expect(vi.getTimerCount()).toBe(PERMISSION_MAX_PENDING_GLOBAL);
-      expect(deps.noticeStalePromptReply).toHaveBeenCalledTimes(1);
-      expect(deps.noticeStalePromptReply).toHaveBeenCalledWith('convo-overflow', {
-        username: 'dan',
-        targetSeq: PERMISSION_MAX_PENDING_GLOBAL + 1,
-        latestSeq: undefined,
-      });
-      expect(deps.routePromptReply).not.toHaveBeenCalled();
-
-      for (let convo = 0; convo < convoCount; convo += 1) {
-        consumer.evictConvo(`convo-${convo}`);
-      }
-      expect(vi.getTimerCount()).toBe(0);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it('rejects user-origin, wrong-convo, unknown-tool, empty-id, and non-integer permission echoes', () => {
-    const liveKey = buildPermissionKey('convo-1', 'toolu_live');
-    const deps = makeDeps({
-      isLivePendingToolUse: vi.fn((key, convoId) => (
-        key === liveKey && convoId === 'convo-1'
-      )),
-    });
-    const consumer = createJournalInputConsumer(deps);
-
-    const invalidFrames = [
-      { seq: 40, sender: 'user:dan', convo_id: 'convo-1', payload: { tool_use_id: 'toolu_live' } },
-      { seq: 41, sender: 'agent:dev-2', convo_id: 'convo-2', payload: { tool_use_id: 'toolu_live' } },
-      { seq: 42, sender: 'agent:dev-2', convo_id: 'convo-1', payload: { tool_use_id: 'toolu_unknown' } },
-      { seq: 43, sender: 'agent:dev-2', convo_id: 'convo-1', payload: { tool_use_id: '   ' } },
-      { seq: '44', sender: 'agent:dev-2', convo_id: 'convo-1', payload: { tool_use_id: 'toolu_live' } },
-    ];
-    for (const overrides of invalidFrames) {
-      consumer(baseFrame({ type: 'permission_request', ...overrides }));
-    }
-
-    expect(deps.notePermissionSeq).not.toHaveBeenCalled();
-  });
-
-  it('retains seq-to-key bindings for all 32 allowed live permission cards', () => {
-    const pendingPermissionDecisions = new Map();
-    for (let seq = 1; seq <= PERMISSION_MAX_PENDING_PER_CONVO; seq += 1) {
-      pendingPermissionDecisions.set(buildPermissionKey('convo-1', `toolu_${seq}`), {
-        seq: null,
-        convoId: 'convo-1',
-        nonce: `nonce-${seq}`,
-      });
-    }
-    const seams = createPermissionSeams({ pendingPermissionDecisions });
-    const notePermissionSeq = vi.fn(seams.notePermissionSeq);
-    const resolvePermissionReply = vi.fn(seams.resolvePermissionReply);
-    const deps = makeDeps({ ...seams, notePermissionSeq, resolvePermissionReply });
-    const consumer = createJournalInputConsumer(deps);
-
-    for (let seq = 1; seq <= PERMISSION_MAX_PENDING_PER_CONVO; seq += 1) {
-      consumer(baseFrame({
-        seq,
-        sender: 'agent:dev-2',
-        type: 'permission_request',
-        payload: { tool_use_id: `toolu_${seq}`, nonce: `nonce-${seq}` },
-      }));
-    }
-    // The permission route rejects the 33rd request at the pending cap, so it
-    // has no live registry entry and its echo cannot become dispatchable.
-    consumer(baseFrame({
-      seq: PERMISSION_MAX_PENDING_PER_CONVO + 1,
-      sender: 'agent:dev-2',
-      type: 'permission_request',
-      payload: { tool_use_id: 'toolu_overflow' },
-    }));
-
-    for (let seq = 1; seq <= PERMISSION_MAX_PENDING_PER_CONVO; seq += 1) {
-      expect(consumer.permissionFrameKey('convo-1', seq)).toBe(
-        buildPermissionKey('convo-1', `toolu_${seq}`),
-      );
-    }
-    expect(consumer.permissionFrameKey(
-      'convo-1',
-      PERMISSION_MAX_PENDING_PER_CONVO + 1,
-    )).toBeNull();
-    expect(notePermissionSeq).toHaveBeenCalledTimes(PERMISSION_MAX_PENDING_PER_CONVO);
-    expect(deps.resolvePermissionReply).not.toHaveBeenCalled();
-  });
-
-  it('evictPermissionSeq tombstones the retired seq and leaves picker state intact', () => {
-    const assignedKeys = new Set();
-    const deps = makeDeps({
-      isLivePendingToolUse: vi.fn(() => true),
-      notePermissionSeq: vi.fn((key) => {
-        if (assignedKeys.has(key)) return false;
-        assignedKeys.add(key);
-        return true;
-      }),
-    });
-    const consumer = createJournalInputConsumer(deps);
-    const firstKey = buildPermissionKey('convo-1', 'toolu_1');
-
-    for (const [seq, toolUseId] of [[41, 'toolu_1'], [42, 'toolu_2']]) {
-      consumer(baseFrame({
-        seq,
-        sender: 'agent:dev-2',
-        type: 'permission_request',
-        payload: { tool_use_id: toolUseId },
-      }));
-    }
-    consumer(baseFrame({
-      seq: 50,
-      sender: 'agent:dev-2',
-      type: 'prompt',
-      payload: { options: [{ id: 'model-opus', value: 'model:opus' }] },
-    }));
-
-    consumer.evictPermissionSeq(firstKey, 'convo-1');
-    consumer(baseFrame({
-      seq: 41,
-      sender: 'agent:dev-2',
-      type: 'permission_request',
-      payload: { tool_use_id: 'toolu_1' },
-    }));
-    consumer(baseFrame({
-      seq: 42,
-      sender: 'agent:dev-2',
-      type: 'permission_request',
-      payload: { tool_use_id: 'toolu_2' },
-    }));
-    consumer(baseFrame({
-      seq: 51,
-      type: 'prompt_reply',
-      payload: { target_seq: 41, choice: 'allow', text: null },
-    }));
-    consumer(baseFrame({
-      seq: 52,
-      type: 'prompt_reply',
-      payload: { target_seq: 50, choice: 'model:opus', text: null },
-    }));
-
-    expect(deps.notePermissionSeq).toHaveBeenCalledTimes(4);
-    expect(deps.notePermissionSeq.mock.results.map(({ value }) => value)).toEqual([
-      true, true, false, false,
-    ]);
-    expect(deps.resolvePermissionReply).not.toHaveBeenCalled();
-    expect(deps.routePromptReply).toHaveBeenCalledTimes(1);
-    expect(deps.routePromptReply).toHaveBeenNthCalledWith(
-      1,
-      { claudeSessionId: 'convo-1' },
-      { target_seq: 50, choice: 'model:opus', text: null, picker: true },
-      { username: 'dan' },
-    );
-  });
-
-  it('notices a duplicate late tap after operator resolution evicts its permission seq', () => {
-    const key = buildPermissionKey('convo-1', 'toolu_1');
-    let consumer;
-    const deps = makeDeps({
-      isLivePendingToolUse: vi.fn((candidateKey) => candidateKey === key),
-      resolvePermissionReply: vi.fn((candidateKey) => {
-        consumer.evictPermissionSeq(candidateKey, 'convo-1');
-      }),
-    });
-    consumer = createJournalInputConsumer(deps);
-
-    consumer(baseFrame({
-      seq: 41,
-      sender: 'agent:dev-2',
-      type: 'permission_request',
-      payload: { tool_use_id: 'toolu_1' },
-    }));
-    consumer(baseFrame({
-      seq: 42,
-      type: 'prompt_reply',
-      payload: { target_seq: 41, choice: 'allow', text: null },
-    }));
-    consumer(baseFrame({
-      seq: 43,
-      type: 'prompt_reply',
-      payload: { target_seq: 41, choice: 'allow', text: null },
-    }));
-
-    expect(deps.resolvePermissionReply).toHaveBeenCalledOnce();
-    expect(deps.routePromptReply).not.toHaveBeenCalled();
-    expect(deps.noticeStalePromptReply).toHaveBeenCalledOnce();
-    expect(deps.noticeStalePromptReply).toHaveBeenCalledWith('convo-1', {
-      username: 'dan',
-      targetSeq: 41,
-      latestSeq: undefined,
-    });
-  });
-
-  it('evictConvo clears permission frame membership and buffered-reply timers idempotently', () => {
-    vi.useFakeTimers();
-    try {
-      const key = buildPermissionKey('convo-1', 'toolu_1');
-      const deps = makeDeps({
-        isLivePendingToolUse: vi.fn((candidateKey, convoId) => (
-          candidateKey === key && convoId === 'convo-1'
-        )),
-        notePermissionSeq: vi.fn(() => true),
-        hasLivePermissionPending: vi.fn(() => true),
-      });
-      const consumer = createJournalInputConsumer(deps);
-      const permissionEcho = baseFrame({
-        seq: 41,
-        sender: 'agent:dev-2',
-        type: 'permission_request',
-        payload: { tool_use_id: 'toolu_1' },
-      });
-
-      consumer(permissionEcho);
-      expect(consumer.permissionFrameKey('convo-1', permissionEcho.seq)).toBe(key);
-      consumer(baseFrame({
-        seq: 50,
-        sender: 'agent:dev-2',
-        type: 'prompt',
-        payload: { question: 'Latest prompt', options: [] },
-      }));
-      consumer(baseFrame({
-        seq: 51,
-        type: 'prompt_reply',
-        payload: { target_seq: 40, choice: 'allow', text: null },
-      }));
-      expect(vi.getTimerCount()).toBe(1);
-      consumer.evictConvo('convo-1');
-      // A late tap's target seq is no longer a permission-frame member.
-      expect(consumer.permissionFrameKey('convo-1', permissionEcho.seq)).toBeNull();
-      expect(vi.getTimerCount()).toBe(0);
-      expect(() => consumer.evictConvo('convo-1')).not.toThrow();
-
-      expect(deps.notePermissionSeq).toHaveBeenCalledOnce();
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it('uses the production permission seams and exposes safe cleanup hooks', () => {
-    const key = buildPermissionKey('convo-1', 'toolu_1');
-    const otherKey = buildPermissionKey('convo-1', 'toolu_2');
-    const otherConvoKey = buildPermissionKey('convo-2', 'toolu_3');
-    const resolve = vi.fn();
-    const pendingPermissionDecisions = new Map([
-      [key, { resolve, seq: null, convoId: 'convo-1', nonce: 'nonce-toolu_1' }],
-      [otherKey, {
-        resolve: vi.fn(), seq: 42, convoId: 'convo-1', nonce: 'nonce-toolu_2',
-      }],
-      [otherConvoKey, {
-        resolve: vi.fn(), seq: null, convoId: 'convo-2', nonce: 'nonce-toolu_3',
-      }],
-    ]);
-    const seams = createPermissionSeams({ pendingPermissionDecisions });
-    const deps = makeDeps(seams);
-    const consumer = createJournalInputConsumer(deps);
-
-    expect(typeof consumer.evictPermissionSeq).toBe('function');
-    expect(seams.hasLivePermissionPending('convo-1')).toBe(true);
-    expect(seams.hasLivePermissionPending('convo-2')).toBe(true);
-    expect(seams.hasLivePermissionPending('convo-missing')).toBe(false);
-    expect(seams.isLivePendingToolUse(key, 'convo-1', 'nonce-toolu_1')).toBe(true);
-    expect(seams.isLivePendingToolUse(key, 'convo-1', 'forged-nonce')).toBe(false);
-    expect(seams.isLivePendingToolUse(key, 'convo-2', 'nonce-toolu_1')).toBe(false);
-    expect(seams.isLivePendingToolUse(
-      buildPermissionKey('convo-1', 'toolu_missing'),
-      'convo-1',
-      'nonce-toolu_1',
-    )).toBe(false);
-    expect(seams.notePermissionSeq('missing-key', 40, 'convo-1')).toBe(false);
-    expect(seams.notePermissionSeq(key, 40, 'convo-2')).toBe(false);
-
-    consumer(baseFrame({
-      seq: 41,
-      sender: 'agent:dev-2',
-      type: 'permission_request',
-      payload: { tool_use_id: 'toolu_1', nonce: 'forged-nonce' },
-    }));
-    expect(pendingPermissionDecisions.get(key).seq).toBeNull();
-    consumer(baseFrame({
-      seq: 42,
-      sender: 'agent:dev-2',
-      type: 'permission_request',
-      payload: { tool_use_id: 'toolu_1', nonce: 'nonce-toolu_1' },
-    }));
-    consumer(baseFrame({
-      seq: 99,
-      sender: 'agent:dev-2',
-      type: 'permission_request',
-      payload: { tool_use_id: 'toolu_1' },
-    }));
-    expect(pendingPermissionDecisions.get(key).seq).toBe(42);
-    expect(seams.notePermissionSeq(key, 99, 'convo-1')).toBe(false);
-    expect(seams.hasLivePermissionPending('convo-1')).toBe(false);
-    // A registered seq is still a live tool-use entry; only the convo must match.
-    expect(seams.isLivePendingToolUse(key, 'convo-1', 'nonce-toolu_1')).toBe(true);
-
-    seams.resolvePermissionReply(key, 'allow', { username: 'dan' });
-    expect(resolve).toHaveBeenCalledWith({
-      decision: 'allow', source: 'operator', principal: 'dan',
-    });
-
-    expect(() => consumer.evictPermissionSeq(key, 'convo-1')).not.toThrow();
-    expect(() => consumer.evictPermissionSeq('missing-key', 'missing-convo')).not.toThrow();
-    expect(() => consumer.evictConvo('convo-1')).not.toThrow();
   });
 });
 
@@ -1518,34 +633,65 @@ describe('createJournalInputConsumer — auto-resume of reaped sessions (resumeS
     expect(deps.routeTextToSession).not.toHaveBeenCalled();
     expect(deps.noticeUnknownConvo).toHaveBeenCalledWith('convo-1', { type: 'text', username: 'dan' });
   });
-});
 
-describe('index.js journal input consumer — permission echo wiring (source inspection)', () => {
-  const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
+  // Restart carry-on (Task 3 review, Finding 1): the isResumePickerTap unit
+  // tests above only cover the pure predicate — they say nothing about
+  // whether the GATE actually wires it in. These drive the gate through the
+  // real onJournalEvent entry point (registering a picker frame, then
+  // replying to it), the same way the picker-dispatch tests below do, so a
+  // stubbed gate that trusts value shape alone (`choice.startsWith('resume:')`)
+  // or that drops convo/frame scoping would fail them.
+  describe('restart carry-on: verified resume taps', () => {
+    const resumeCard = (seq, value, convoId = 'convo-1') => baseFrame({
+      seq, convo_id: convoId, sender: 'agent:dev-2', type: 'prompt',
+      payload: { question: 'Carry on?', options: [{ id: 'resume-x', value }] },
+    });
 
-  it('echoes the finalized operator label only and suppresses an expired Allow result', () => {
-    const resolverStart = src.indexOf('function resolveJournalPermissionReply(');
-    expect(resolverStart).toBeGreaterThan(-1);
-    const resolverEnd = src.indexOf('// Assembled once', resolverStart);
-    const resolver = src.slice(resolverStart, resolverEnd);
-    expect(resolver).toMatch(/const finalized = permissionSeams\.resolvePermissionReply/);
-    expect(resolver).toMatch(/finalized\.source !== 'operator'/);
-    expect(resolver).toMatch(/finalized\.decision === 'allow' \? 'Allow' : 'Deny'/);
-    expect(resolver).not.toMatch(/const label = decision ===/);
-    expect(resolver).toMatch(/journalEchoPromptAnswer\(/);
-    expect(resolver.match(/journalEchoPromptAnswer\(/g)).toHaveLength(1);
+    const resumeReply = (targetSeq, choice, convoId = 'convo-1') => baseFrame({
+      seq: 200, convo_id: convoId, type: 'prompt_reply',
+      payload: { target_seq: targetSeq, choice, text: null },
+    });
 
-    const promptReplyStart = src.indexOf('function journalOnPromptReply(');
-    const promptReplyEnd = src.indexOf('function journalIsControlConvo(', promptReplyStart);
-    expect(src.slice(promptReplyStart, promptReplyEnd)).toMatch(/journalEchoPromptAnswer\(/);
+    it('a resume: choice whose target_seq names the frame that offered it DOES resume', () => {
+      const deps = makeDeps();
+      const consumer = createJournalInputConsumer(deps);
+      consumer(resumeCard(12, 'resume:convo-1'));       // bridge-published carry-on card
+      consumer(resumeReply(12, 'resume:convo-1'));       // matching verified tap
+      expect(deps.resumeSessionForConvo).toHaveBeenCalledWith('convo-1', { username: 'dan' });
+      expect(deps.routePromptReply).toHaveBeenCalledTimes(1);
+      expect(deps.routePromptReply.mock.calls[0][1]).toEqual({
+        target_seq: 12, choice: 'resume:convo-1', text: null, picker: true,
+      });
+    });
 
-    const start = src.indexOf('createJournalInputConsumer({');
-    expect(start).toBeGreaterThan(-1);
-    const end = src.indexOf('log: console,', start);
-    expect(end).toBeGreaterThan(start);
-    const args = src.slice(start, end);
-    expect(args).toMatch(/resolvePermissionReply:\s*resolveJournalPermissionReply/);
-    expect(args).not.toMatch(/publishPromptReply/);
+    it('a resume: choice with NO registered frame does NOT resume — unknown-convo notice instead', () => {
+      const deps = makeDeps();
+      const consumer = createJournalInputConsumer(deps);
+      consumer(resumeReply(12, 'resume:convo-1')); // no card was ever published at seq 12
+      expect(deps.resumeSessionForConvo).not.toHaveBeenCalled();
+      expect(deps.routePromptReply).not.toHaveBeenCalled();
+      expect(deps.noticeUnknownConvo).toHaveBeenCalledWith('convo-1', { type: 'prompt_reply', username: 'dan' });
+    });
+
+    it('a resume: choice whose target_seq names a frame that offered a DIFFERENT value does NOT resume', () => {
+      const deps = makeDeps();
+      const consumer = createJournalInputConsumer(deps);
+      consumer(resumeCard(12, 'resume:other-convo'));
+      consumer(resumeReply(12, 'resume:convo-1')); // not the value that frame offered
+      expect(deps.resumeSessionForConvo).not.toHaveBeenCalled();
+      expect(deps.routePromptReply).not.toHaveBeenCalled();
+      expect(deps.noticeUnknownConvo).toHaveBeenCalledWith('convo-1', { type: 'prompt_reply', username: 'dan' });
+    });
+
+    it('a resume: choice does not resume via a picker frame recorded for a DIFFERENT convo (convo scoping)', () => {
+      const deps = makeDeps();
+      const consumer = createJournalInputConsumer(deps);
+      consumer(resumeCard(12, 'resume:convo-a', 'convo-a'));
+      consumer(resumeReply(12, 'resume:convo-a', 'convo-b')); // same seq/value, different convo
+      expect(deps.resumeSessionForConvo).not.toHaveBeenCalled();
+      expect(deps.routePromptReply).not.toHaveBeenCalled();
+      expect(deps.noticeUnknownConvo).toHaveBeenCalledWith('convo-b', { type: 'prompt_reply', username: 'dan' });
+    });
   });
 });
 
@@ -1636,14 +782,29 @@ describe('promptExpectsReply', () => {
     expect(promptExpectsReply({ options: [{ id: 'prompt-opt-0', label: 'Yes' }, { id: 'prompt-opt-1', label: 'No' }] })).toBe(true);
   });
 
-  it('is false for model/effort/mode pickers', () => {
+  it('is false for model/effort/mode pickers and timer confirmation cards', () => {
     expect(promptExpectsReply({ options: [{ id: 'model-sonnet', label: 'Sonnet' }] })).toBe(false);
     expect(promptExpectsReply({ options: [{ id: 'effort-high', label: 'High' }] })).toBe(false);
     expect(promptExpectsReply({ options: [{ id: 'mode-print', label: 'Print' }] })).toBe(false);
+    // Load-bearing for /timer: the set card must not advance the staleness
+    // guard, or setting a timer would make the NEXT genuine reply "stale".
+    expect(promptExpectsReply({ options: [{ id: 'timer-cancel-5', label: '🚫 Cancel timer' }] })).toBe(false);
   });
 
   it('is false for queue-notification action buttons (cancel/interrupt)', () => {
     expect(promptExpectsReply({ options: [{ id: 'cancel', label: '✕ Cancel' }, { id: 'interrupt', label: '⚡ Send now' }] })).toBe(false);
+  });
+
+  it('is false for a structured queued_release card (kind check, no options array)', () => {
+    // Load-bearing: the queued_release card payload has NO `options` array, so
+    // without the explicit kind short-circuit promptExpectsReply would default
+    // to TRUE, advance the staleness guard on the card's own seq, and then
+    // wrongly refuse the NEXT genuine prompt reply as stale. The kind check
+    // keeps the card non-answerable regardless of its (absent) options.
+    expect(promptExpectsReply({ kind: 'queued_release', prompt_id: 'pr_1', items: [{ id: 'pr_1::0', text: 'hi' }] })).toBe(false);
+    // Even if a future card grows an answerable-looking options array, the kind
+    // wins.
+    expect(promptExpectsReply({ kind: 'queued_release', options: [{ id: 'opt_a', label: 'A' }] })).toBe(false);
   });
 
   it('defaults to true (guard stays active) for unrecognized or missing option shapes', () => {
@@ -1688,34 +849,6 @@ describe('createJournalInputConsumer — media (file/image) routing', () => {
     type: 'file',
     payload: { blob_ref: 'blob-1', content_type: 'application/pdf', name: 'report.pdf', size: 1234 },
     ...overrides,
-  });
-
-  it('extracts and trims payload.caption into the media object (no length clamp — a caption is a prompt)', () => {
-    const deps = makeDeps();
-    const consumer = createJournalInputConsumer(deps);
-    const framed = (payload) => fileFrame({ payload: { ...fileFrame().payload, ...payload } });
-
-    consumer(framed({ caption: '  look at this  ' }));
-    expect(deps.routeMediaToSession).toHaveBeenCalledWith(
-      expect.anything(),
-      expect.objectContaining({ caption: 'look at this' }),
-      expect.anything(),
-    );
-
-    // A long caption passes through unbounded (operator decision 2026-07-18):
-    // the caption is a prompt that rides with the upload, not a label, so the
-    // bridge does not truncate it. It is still trimmed at the edges.
-    deps.routeMediaToSession.mockClear();
-    consumer(framed({ caption: 'x'.repeat(5000) }));
-    expect(deps.routeMediaToSession.mock.calls[0][1].caption).toHaveLength(5000);
-
-    deps.routeMediaToSession.mockClear();
-    consumer(framed({}));
-    expect(deps.routeMediaToSession.mock.calls[0][1].caption).toBeNull();
-
-    deps.routeMediaToSession.mockClear();
-    consumer(framed({ caption: '   ' }));
-    expect(deps.routeMediaToSession.mock.calls[0][1].caption).toBeNull();
   });
 
   it('routes a user file event to routeMediaToSession with the resolved media shape', () => {
@@ -1898,13 +1031,15 @@ describe('createJournalInputConsumer — media (file/image) routing', () => {
   });
 });
 
-// Queue-tile taps from Matron arrive as prompt_reply frames whose `choice`
-// carries the tile's option VALUE (`interrupt` / `cancel:<n>`). Their tile
-// never advances the staleness guard (non-answerable, issue #98), so the
-// guard's target_seq comparison would wrongly refuse them whenever ANY
-// answerable prompt has been recorded — the consumer must classify them by
-// value shape and route them around the guard.
-describe('createJournalInputConsumer — queue-action replies bypass the staleness guard', () => {
+// Issue #165: value-shape classification of queue taps is RETIRED. A queue
+// tap is now proven ONLY by target_seq membership in the queued-release
+// registry (see the queued-release describe below). A prompt_reply whose
+// `choice` merely LOOKS like a legacy queue action (`interrupt`, `cancel:2`)
+// but whose target_seq is not a queued-release card is an ORDINARY answer and
+// must be handled exactly like any other answer — delivered when it targets
+// the current prompt, refused as stale when it targets a superseded one. This
+// block is the #165 label-hijack regression for the router path.
+describe('createJournalInputConsumer — queue-action-shaped labels are ordinary answers (#165)', () => {
   function makeDeps(overrides = {}) {
     return {
       isControlConvo: () => false,
@@ -1932,29 +1067,41 @@ describe('createJournalInputConsumer — queue-action replies bypass the stalene
     payload: { target_seq: targetSeq, choice, text: null },
   });
 
-  it('an interrupt tap routes even when its target_seq mismatches the latest answerable prompt', () => {
+  it('#165: a genuine answer labeled "interrupt" targeting the CURRENT prompt is delivered, not hijacked', () => {
     const deps = makeDeps();
     const consumer = createJournalInputConsumer(deps);
-    consumer(answerableFrame(10));           // guard now expects target_seq 10
-    consumer(queueReply(12, 'interrupt'));   // tile at seq 12 — mismatch, but a queue action
+    consumer(answerableFrame(10));            // latest answerable prompt: seq 10
+    consumer(queueReply(10, 'interrupt'));    // genuine answer to THAT prompt
     expect(deps.noticeStalePromptReply).not.toHaveBeenCalled();
     expect(deps.routePromptReply).toHaveBeenCalledTimes(1);
     expect(deps.routePromptReply.mock.calls[0][1]).toEqual({
-      target_seq: 12, choice: 'interrupt', text: null,
+      target_seq: 10, choice: 'interrupt', text: null,
     });
   });
 
-  it('an indexed cancel tap routes the same way', () => {
+  it('#165: a genuine answer labeled "cancel:2" targeting the CURRENT prompt is delivered', () => {
     const deps = makeDeps();
     const consumer = createJournalInputConsumer(deps);
     consumer(answerableFrame(10));
-    consumer(queueReply(12, 'cancel:0'));
+    consumer(queueReply(10, 'cancel:2'));
     expect(deps.noticeStalePromptReply).not.toHaveBeenCalled();
     expect(deps.routePromptReply).toHaveBeenCalledWith(
       expect.anything(),
-      { target_seq: 12, choice: 'cancel:0', text: null },
+      { target_seq: 10, choice: 'cancel:2', text: null },
       { username: 'dan' },
     );
+  });
+
+  it('a queue-action-shaped label with a mismatched target_seq is refused as stale, like any answer', () => {
+    // No value-shape route-around: `interrupt` with a superseded target_seq is
+    // now treated exactly like `opt_a` below — refused as stale (a notice, not
+    // a silent no-op), never routed around the guard.
+    const deps = makeDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(answerableFrame(10));
+    consumer(queueReply(12, 'interrupt'));   // target_seq 12 != latest 10, not a queue card
+    expect(deps.routePromptReply).not.toHaveBeenCalled();
+    expect(deps.noticeStalePromptReply).toHaveBeenCalledTimes(1);
   });
 
   it('a NON-queue choice with a mismatched target_seq is still refused as stale', () => {
@@ -1972,9 +1119,10 @@ describe('createJournalInputConsumer — queue-action replies bypass the stalene
 // `mode:<target>`). Like queue-tile taps, their picker frame never advances
 // the staleness guard (non-answerable, issue #98), so the guard's target_seq
 // comparison would wrongly refuse the tap whenever ANY answerable prompt has
-// been recorded for the convo. The consumer must classify them by value shape
-// (lib/picker-dispatch.js isPickerValue) and route them around the guard —
-// exactly like the queue-action block (loop #461).
+// been recorded for the convo. The consumer classifies them by frame
+// provenance — target_seq must name a recorded picker frame and the choice
+// must be among the values that frame offered — and routes them around the
+// guard (the same seq-provenance principle the queued-release path uses).
 describe('createJournalInputConsumer — picker replies bypass the staleness guard', () => {
   function makeDeps(overrides = {}) {
     return {
@@ -1999,8 +1147,8 @@ describe('createJournalInputConsumer — picker replies bypass the staleness gua
   });
 
   // A published picker frame (option ids model-* / effort-* / mode-*).
-  const pickerFrame = (seq, opts) => baseFrame({
-    seq, sender: 'agent:dev-2', type: 'prompt',
+  const pickerFrame = (seq, opts, sender = 'agent:dev-2') => baseFrame({
+    seq, sender, type: 'prompt',
     payload: { question: 'pick', mode: 'pick_one', options: opts },
   });
 
@@ -2013,6 +1161,8 @@ describe('createJournalInputConsumer — picker replies bypass the staleness gua
     ['model:sonnet', [{ id: 'model-sonnet', value: 'model:sonnet' }]],
     ['effort:high', [{ id: 'effort-high', value: 'effort:high' }]],
     ['mode:print', [{ id: 'mode-print', value: 'mode:print' }]],
+    // The /timer set-confirmation card's Cancel button rides the same path.
+    ['timer:cancel:5', [{ id: 'timer-cancel-5', value: 'timer:cancel:5' }]],
   ])(
     'a %s tap whose target_seq identifies its picker frame routes (flagged picker) even past a later answerable prompt',
     (choice, opts) => {
@@ -2086,6 +1236,23 @@ describe('createJournalInputConsumer — picker replies bypass the staleness gua
     expect(deps.noticeStalePromptReply).toHaveBeenCalledTimes(1);
   });
 
+  // Task 3 review, Finding 2: option ids/values are just strings on the wire
+  // — nothing stops a client device from publishing a `type:'prompt'` frame
+  // shaped exactly like a picker (id 'resume-x', value 'resume:x'). Frame
+  // registration must be gated on sender, the same provenance stance the
+  // sibling queued_release branch already takes, or a non-bridge sender
+  // could get its lookalike frame recorded and later verified as if the
+  // bridge had published it.
+  it('a picker-shaped frame from a non-agent sender does NOT register — a later matching reply is refused as stale, not dispatched', () => {
+    const deps = makeDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(pickerFrame(12, [{ id: 'model-sonnet', value: 'model:sonnet' }], 'user:dan')); // spoofed sender
+    consumer(answerableFrame(10));
+    consumer(pickerReply(12, 'model:sonnet'));
+    expect(deps.routePromptReply).not.toHaveBeenCalled();
+    expect(deps.noticeStalePromptReply).toHaveBeenCalledTimes(1);
+  });
+
   it('evictConvo clears the picker-frame record for that convo', () => {
     const deps = makeDeps();
     const consumer = createJournalInputConsumer(deps);
@@ -2129,5 +1296,573 @@ describe('createJournalInputConsumer — picker replies bypass the staleness gua
     expect(deps.routePromptReply).toHaveBeenCalledTimes(1);
     expect(deps.routePromptReply.mock.calls[0][1]).toMatchObject({ target_seq: 12, picker: true });
     expect(deps.noticeStalePromptReply).toHaveBeenCalledTimes(1);
+  });
+});
+
+// Coverage gap (b): a full round-trip through onJournalEvent — the bridge's
+// own queued_release card echoes back (agent sender) and records its seq, then
+// user prompt_reply frames exercise the classify intercept: a valid action
+// routes, an unknown action warns + notices, and a post-resolution (tombstoned)
+// tap is dropped with a notice. No value-shape classification anywhere.
+describe('createJournalInputConsumer — queued_release end-to-end', () => {
+  const CONVO = 'convo-1';
+  const PROMPT = 'pr_e2e';
+  const ITEM = 'pr_e2e::0';
+  const CARD_SEQ = 77;
+
+  function makeDeps(overrides = {}) {
+    const warnings = [];
+    return {
+      deps: {
+        isControlConvo: () => false,
+        handleControlCommand: vi.fn(),
+        findSessionByConvoId: vi.fn(() => ({ claudeSessionId: CONVO })),
+        routeTextToSession: vi.fn(),
+        routePromptReply: vi.fn(),
+        noticeUnknownConvo: vi.fn(),
+        noticeStalePromptReply: vi.fn(),
+        noticeQueuedReleaseIgnored: vi.fn(),
+        log: { warn: (m) => warnings.push(m), error: () => {} },
+        ...overrides,
+      },
+      warnings,
+    };
+  }
+
+  // The bridge-authored card echoing back to the router (agent sender).
+  const cardEcho = () => baseFrame({
+    seq: CARD_SEQ, sender: 'agent:dev-2', type: 'prompt',
+    convo_id: CONVO,
+    payload: { kind: 'queued_release', prompt_id: PROMPT, items: [{ id: ITEM, text: 'hi' }] },
+  });
+
+  const tap = (choice) => baseFrame({
+    seq: 200, sender: 'user:dan', type: 'prompt_reply',
+    convo_id: CONVO,
+    payload: { target_seq: CARD_SEQ, choice, text: null },
+  });
+
+  it('records the card seq, routes a valid tap, notices an invalid one, and drops a tombstoned one', () => {
+    const { deps, warnings } = makeDeps();
+    const consumer = createJournalInputConsumer(deps);
+    // Reserve the live identity (index.js does this from notifyQueuedMessage).
+    consumer.queueRelease.noteQueued(CONVO, { promptId: PROMPT, itemId: ITEM });
+    // The card echoes back → annotateSeq binds CARD_SEQ to the live prompt.
+    consumer(cardEcho());
+
+    // Valid action → classify 'live' → routed to the reply seam, NOT the
+    // ordinary answer echo path.
+    consumer(tap('send'));
+    expect(deps.routePromptReply).toHaveBeenCalledTimes(1);
+    expect(deps.routePromptReply.mock.calls[0][1]).toEqual({
+      target_seq: CARD_SEQ, choice: 'send', text: null,
+    });
+    expect(deps.noticeStalePromptReply).not.toHaveBeenCalled();
+
+    // Unknown action on a known card → warn + user notice, no route.
+    consumer(tap('frobnicate'));
+    expect(deps.routePromptReply).toHaveBeenCalledTimes(1); // unchanged
+    expect(deps.noticeQueuedReleaseIgnored).toHaveBeenCalledWith(CONVO, expect.objectContaining({ reason: 'invalid-action' }));
+    expect(warnings.some(w => /invalid queued_release action/.test(w))).toBe(true);
+
+    // Resolve the card (index.js does this via dropItem after the flush/cancel).
+    consumer.queueRelease.dropItem(CONVO, ITEM);
+
+    // A late/duplicate tap now classifies 'tombstoned' → dropped with a notice,
+    // never falling through to the ordinary answer path.
+    deps.noticeQueuedReleaseIgnored.mockClear();
+    consumer(tap('send'));
+    expect(deps.routePromptReply).toHaveBeenCalledTimes(1); // still unchanged
+    expect(deps.noticeQueuedReleaseIgnored).toHaveBeenCalledWith(CONVO, expect.objectContaining({ reason: 'tombstoned' }));
+  });
+});
+
+// Ghost-answer window (post-restart): a prompt_reply whose target_seq predates
+// this bridge process is answering a prompt whose asking session is gone. Since
+// resolvePromptChoice matches options by case-insensitive label and the
+// queued-release wire values (send/cancel) are common real-prompt labels,
+// routing it to the current prompt could silently answer the WRONG one. Refuse.
+describe('createJournalInputConsumer — ghost-answer refusal (processStartSeq)', () => {
+  function makeDeps(overrides = {}) {
+    return {
+      isControlConvo: () => false,
+      handleControlCommand: vi.fn(),
+      findSessionByConvoId: vi.fn((id) => ({ claudeSessionId: id })),
+      routeTextToSession: vi.fn(),
+      routePromptReply: vi.fn(),
+      noticeUnknownConvo: vi.fn(),
+      noticeStalePromptReply: vi.fn(),
+      noticeGhostPromptReply: vi.fn(),
+      processStartSeq: 100,
+      log: silentLog,
+      ...overrides,
+    };
+  }
+
+  const answerable = (seq) => baseFrame({
+    seq, sender: 'agent:dev-2', type: 'prompt',
+    payload: { question: 'ok?', mode: 'pick_one', options: [{ id: 'send', label: 'Send' }] },
+  });
+  const reply = (targetSeq, choice) => baseFrame({
+    seq: 500, type: 'prompt_reply', payload: { target_seq: targetSeq, choice, text: null },
+  });
+
+  it('refuses a reply whose target_seq predates process start, with a notice and no route', () => {
+    const deps = makeDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(reply(50, 'send')); // 50 <= processStartSeq 100 → ghost
+    expect(deps.routePromptReply).not.toHaveBeenCalled();
+    expect(deps.noticeGhostPromptReply).toHaveBeenCalledWith('convo-1', expect.objectContaining({ targetSeq: 50 }));
+  });
+
+  it('refuses even at the exact boundary seq (<= is inclusive)', () => {
+    const deps = makeDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(reply(100, 'cancel'));
+    expect(deps.routePromptReply).not.toHaveBeenCalled();
+    expect(deps.noticeGhostPromptReply).toHaveBeenCalledTimes(1);
+  });
+
+  it('delivers a reply whose target_seq is after process start (a real current answer)', () => {
+    const deps = makeDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(answerable(150));      // current prompt, seq 150 > 100
+    consumer(reply(150, 'send'));   // genuine answer to it
+    expect(deps.noticeGhostPromptReply).not.toHaveBeenCalled();
+    expect(deps.routePromptReply).toHaveBeenCalledTimes(1);
+    expect(deps.routePromptReply.mock.calls[0][1]).toMatchObject({ target_seq: 150, choice: 'send' });
+  });
+
+  it('disables the check when processStartSeq is null (first boot)', () => {
+    const deps = makeDeps({ processStartSeq: null });
+    const consumer = createJournalInputConsumer(deps);
+    consumer(answerable(5));
+    consumer(reply(5, 'send'));
+    expect(deps.noticeGhostPromptReply).not.toHaveBeenCalled();
+    expect(deps.routePromptReply).toHaveBeenCalledTimes(1);
+  });
+});
+
+// The agent-chat room carve-out (spec: agent chat phase 3, Task 6). Frames in
+// a conversation this bridge participates in as a room are session input even
+// when agent-sent — that's the whole point of a room — so they divert to
+// routeRoomFrame ABOVE the user:* loop guard. Own echoes are dropped by
+// device id when both the frame's sender_device_id and our own id are known,
+// by device name otherwise; unknown identity fails CLOSED (drop + warn once).
+describe('agent-chat room carve-out', () => {
+  const roomRecord = { sessionRoomId: '!s1:bridge', role: 'guest', state: 'joined', title: 'Test room' };
+
+  function makeRoomDeps(overrides = {}) {
+    return {
+      isControlConvo: vi.fn(() => false),
+      handleControlCommand: vi.fn(),
+      findSessionByConvoId: vi.fn(() => ({ claudeSessionId: 'room-1' })),
+      routeTextToSession: vi.fn(),
+      routePromptReply: vi.fn(),
+      noticeUnknownConvo: vi.fn(),
+      roomFor: vi.fn((id) => (id === 'room-1' ? { ...roomRecord } : null)),
+      routeRoomFrame: vi.fn(),
+      selfAgentName: vi.fn(() => 'dev-1'),
+      log: silentLog,
+      ...overrides,
+    };
+  }
+
+  function roomFrame(overrides = {}) {
+    return baseFrame({ convo_id: 'room-1', sender: 'agent:dev-2', ...overrides });
+  }
+
+  it('routes an agent text frame in an active room to routeRoomFrame (never the main input path)', () => {
+    const deps = makeRoomDeps();
+    const consumer = createJournalInputConsumer(deps);
+    const frame = roomFrame();
+    consumer(frame);
+    expect(deps.routeRoomFrame).toHaveBeenCalledTimes(1);
+    const [room, routed] = deps.routeRoomFrame.mock.calls[0];
+    expect(room).toMatchObject({ sessionRoomId: '!s1:bridge' });
+    expect(routed).toBe(frame);
+    expect(deps.routeTextToSession).not.toHaveBeenCalled();
+    expect(deps.findSessionByConvoId).not.toHaveBeenCalled();
+  });
+
+  it('routes a USER frame in an active room to routeRoomFrame, not routeTextToSession', () => {
+    const deps = makeRoomDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(roomFrame({ sender: 'user:dan' }));
+    expect(deps.routeRoomFrame).toHaveBeenCalledTimes(1);
+    expect(deps.routeTextToSession).not.toHaveBeenCalled();
+  });
+
+  it('routes a media (image/file) frame in an active room even without a routeMediaToSession seam', () => {
+    const deps = makeRoomDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(roomFrame({ type: 'image', payload: { name: 'cat.png', blob_ref: 'b1' } }));
+    consumer(roomFrame({ type: 'file', payload: { name: 'notes.txt', blob_ref: 'b2' } }));
+    expect(deps.routeRoomFrame).toHaveBeenCalledTimes(2);
+  });
+
+  it('drops this bridge\'s own echo (sender agent:<self>)', () => {
+    const deps = makeRoomDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(roomFrame({ sender: 'agent:dev-1' }));
+    expect(deps.routeRoomFrame).not.toHaveBeenCalled();
+    expect(deps.routeTextToSession).not.toHaveBeenCalled();
+  });
+
+  it('warns exactly once when the peer shares our device name (own-echo drop would kill the room silently)', () => {
+    const log = { warn: vi.fn(), error: vi.fn() };
+    const deps = makeRoomDeps({
+      roomFor: vi.fn((id) => (id === 'room-1' ? { ...roomRecord, peerName: 'dev-1' } : null)),
+      log,
+    });
+    const consumer = createJournalInputConsumer(deps);
+    consumer(roomFrame({ sender: 'agent:dev-1' }));
+    consumer(roomFrame({ sender: 'agent:dev-1', payload: { body: 'again' } }));
+    expect(deps.routeRoomFrame).not.toHaveBeenCalled(); // still fails safe
+    const ambiguousWarns = log.warn.mock.calls.filter(([msg]) => /same device name/.test(msg));
+    expect(ambiguousWarns).toHaveLength(1);
+  });
+
+  it('a distinct peer name never triggers the ambiguous-name warning on own echoes', () => {
+    const log = { warn: vi.fn(), error: vi.fn() };
+    const deps = makeRoomDeps({
+      roomFor: vi.fn((id) => (id === 'room-1' ? { ...roomRecord, peerName: 'dev-2' } : null)),
+      log,
+    });
+    const consumer = createJournalInputConsumer(deps);
+    consumer(roomFrame({ sender: 'agent:dev-1' }));
+    expect(log.warn.mock.calls.filter(([msg]) => /same device name/.test(msg))).toHaveLength(0);
+  });
+
+  it('fails CLOSED on unknown identity: agent frames dropped, warned exactly once', () => {
+    const log = { warn: vi.fn(), error: vi.fn() };
+    const deps = makeRoomDeps({ selfAgentName: vi.fn(() => null), log });
+    const consumer = createJournalInputConsumer(deps);
+    consumer(roomFrame());
+    consumer(roomFrame({ payload: { body: 'again' } }));
+    expect(deps.routeRoomFrame).not.toHaveBeenCalled();
+    const identityWarns = log.warn.mock.calls.filter(([msg]) => /identity/.test(msg));
+    expect(identityWarns).toHaveLength(1);
+  });
+
+  it('a missing selfAgentName seam behaves like unknown identity (drop, fail closed)', () => {
+    const deps = makeRoomDeps({ selfAgentName: undefined });
+    const consumer = createJournalInputConsumer(deps);
+    consumer(roomFrame());
+    expect(deps.routeRoomFrame).not.toHaveBeenCalled();
+  });
+
+  it('drops an agent frame whose sender_device_id matches our own device id even when the sender NAME differs', () => {
+    const deps = makeRoomDeps({ selfAgentDeviceId: vi.fn(() => 42) });
+    const consumer = createJournalInputConsumer(deps);
+    consumer(roomFrame({ sender: 'agent:someone-else', sender_device_id: 42 }));
+    expect(deps.routeRoomFrame).not.toHaveBeenCalled();
+    expect(deps.routeTextToSession).not.toHaveBeenCalled();
+  });
+
+  it("routes a SAME-NAMED peer's frame when its sender_device_id differs from ours (no ambiguous-name warning)", () => {
+    const log = { warn: vi.fn(), error: vi.fn() };
+    const deps = makeRoomDeps({
+      selfAgentDeviceId: vi.fn(() => 42),
+      roomFor: vi.fn((id) => (id === 'room-1' ? { ...roomRecord, peerName: 'dev-1' } : null)),
+      log,
+    });
+    const consumer = createJournalInputConsumer(deps);
+    consumer(roomFrame({ sender: 'agent:dev-1', sender_device_id: 7 }));
+    expect(deps.routeRoomFrame).toHaveBeenCalledTimes(1);
+    expect(log.warn.mock.calls.filter(([msg]) => /same device name/.test(msg))).toHaveLength(0);
+  });
+
+  it('a frame WITHOUT sender_device_id falls back to name logic even when our own id is known', () => {
+    const deps = makeRoomDeps({ selfAgentDeviceId: vi.fn(() => 42) });
+    const consumer = createJournalInputConsumer(deps);
+    consumer(roomFrame({ sender: 'agent:dev-1' })); // own name, no id → dropped
+    expect(deps.routeRoomFrame).not.toHaveBeenCalled();
+    consumer(roomFrame({ sender: 'agent:dev-2' })); // peer name, no id → routes
+    expect(deps.routeRoomFrame).toHaveBeenCalledTimes(1);
+  });
+
+  it('device id 0 is a real id: selfAgentDeviceId 0 + frame sender_device_id 0 drops as own echo', () => {
+    // Pins Number.isInteger over truthiness: with a truthy check, id 0 would
+    // fall back to the name path and this differently-named echo would route.
+    const deps = makeRoomDeps({ selfAgentDeviceId: vi.fn(() => 0) });
+    const consumer = createJournalInputConsumer(deps);
+    consumer(roomFrame({ sender: 'agent:someone-else', sender_device_id: 0 }));
+    expect(deps.routeRoomFrame).not.toHaveBeenCalled();
+    expect(deps.routeTextToSession).not.toHaveBeenCalled();
+  });
+
+  it('a string-typed sender_device_id warns exactly once and falls back to name matching', () => {
+    const log = { warn: vi.fn(), error: vi.fn() };
+    const deps = makeRoomDeps({ selfAgentDeviceId: vi.fn(() => 42), log });
+    const consumer = createJournalInputConsumer(deps);
+    consumer(roomFrame({ sender: 'agent:dev-1', sender_device_id: '42' })); // own name → dropped via name path
+    consumer(roomFrame({ sender: 'agent:dev-2', sender_device_id: '7' })); // peer name → routes via name path
+    expect(deps.routeRoomFrame).toHaveBeenCalledTimes(1);
+    const w = log.warn.mock.calls.filter(([msg]) => /non-integer sender_device_id/.test(msg));
+    expect(w).toHaveLength(1);
+  });
+
+  it('sender_device_id present but own identity UNKNOWN fails closed via the name path (warnOnceNoIdentity)', () => {
+    const log = { warn: vi.fn(), error: vi.fn() };
+    const deps = makeRoomDeps({
+      selfAgentDeviceId: vi.fn(() => null),
+      selfAgentName: vi.fn(() => null),
+      log,
+    });
+    const consumer = createJournalInputConsumer(deps);
+    consumer(roomFrame({ sender_device_id: 7 }));
+    consumer(roomFrame({ sender_device_id: 7, payload: { body: 'again' } }));
+    expect(deps.routeRoomFrame).not.toHaveBeenCalled();
+    expect(log.warn.mock.calls.filter(([msg]) => /identity/.test(msg))).toHaveLength(1);
+  });
+
+  it('drops a prompt_reply in a room convo entirely (prompt flows never route through rooms)', () => {
+    const deps = makeRoomDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(roomFrame({ sender: 'user:dan', type: 'prompt_reply', payload: { target_seq: 3, choice: 'opt_a' } }));
+    expect(deps.routeRoomFrame).not.toHaveBeenCalled();
+    expect(deps.routePromptReply).not.toHaveBeenCalled();
+  });
+
+  it('drops non-input frame types in a room (session_status et al.) without routing', () => {
+    const deps = makeRoomDeps();
+    const consumer = createJournalInputConsumer(deps);
+    for (const type of ['prompt', 'tool_output', 'session_status', 'read_marker', 'convo_meta', 'diff']) {
+      consumer(roomFrame({ type }));
+    }
+    expect(deps.routeRoomFrame).not.toHaveBeenCalled();
+  });
+
+  it('drops a room frame whose sender is neither agent:* nor user:*', () => {
+    const deps = makeRoomDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(roomFrame({ sender: 'bridge' }));
+    consumer(roomFrame({ sender: 42 }));
+    expect(deps.routeRoomFrame).not.toHaveBeenCalled();
+  });
+
+  it('an INACTIVE room (roomFor null) falls through to the normal guard: agent frame dropped, user frame routes to the session', () => {
+    const deps = makeRoomDeps({ roomFor: vi.fn(() => null) });
+    const consumer = createJournalInputConsumer(deps);
+    consumer(roomFrame()); // agent-sent → loop-prevention filter drops it
+    expect(deps.routeRoomFrame).not.toHaveBeenCalled();
+    expect(deps.routeTextToSession).not.toHaveBeenCalled();
+    consumer(roomFrame({ sender: 'user:dan' })); // user-sent → ordinary input
+    expect(deps.routeTextToSession).toHaveBeenCalledTimes(1);
+    expect(deps.routeRoomFrame).not.toHaveBeenCalled();
+  });
+
+  it('a routeRoomFrame that throws is contained (warned, consumer never throws)', () => {
+    const log = { warn: vi.fn(), error: vi.fn() };
+    const deps = makeRoomDeps({ routeRoomFrame: vi.fn(() => { throw new Error('boom'); }), log });
+    const consumer = createJournalInputConsumer(deps);
+    expect(() => consumer(roomFrame())).not.toThrow();
+    expect(log.warn.mock.calls.some(([msg]) => /routeRoomFrame threw: boom/.test(msg))).toBe(true);
+  });
+
+  it('non-room convos are completely unaffected by the seams being present', () => {
+    const deps = makeRoomDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(baseFrame()); // convo-1 — roomFor returns null for it
+    expect(deps.routeTextToSession).toHaveBeenCalledTimes(1);
+    expect(deps.routeRoomFrame).not.toHaveBeenCalled();
+  });
+});
+
+// The wiring half of the room carve-out: index.js can't be imported
+// in-process, so pin by source inspection that the consumer actually
+// receives the room seams, that room delivery's isBusy covers BOTH busy and
+// the resume-hold state (sendToSession's _awaitingInputReady branch returns
+// true WITHOUT setting busy — Task 5 review finding 9), and that every
+// turn-end/teardown seam speaks to roomDelivery.
+describe('index.js agent-chat room wiring (source inspection)', () => {
+  const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
+
+  it('passes roomFor/routeRoomFrame/selfAgentName/selfAgentDeviceId to createJournalInputConsumer (before log:)', () => {
+    const start = src.indexOf('createJournalInputConsumer({');
+    expect(start).toBeGreaterThan(-1);
+    const end = src.indexOf('log: console,', start);
+    expect(end).toBeGreaterThan(start);
+    const args = src.slice(start, end);
+    expect(args).toMatch(/\broomFor\b/);
+    expect(args).toMatch(/routeRoomFrame: journalOnRoomFrame/);
+    expect(args).toMatch(/selfAgentName: \(\) => journalPublisher\.identity\(\)\?\.name \|\| null/);
+    expect(args).toMatch(/selfAgentDeviceId: \(\) => journalPublisher\.identity\(\)\?\.deviceId \?\? null/);
+    expect(args).toMatch(/agentRooms\.isActive\(convoId\)/);
+  });
+
+  it("room delivery's isBusy is the full composite: busy, resume-hold, and BOTH open-prompt states", () => {
+    const start = src.indexOf('function sessionOccupiedForRoomDelivery(');
+    expect(start).toBeGreaterThan(-1);
+    const end = src.indexOf('}', start);
+    const body = src.slice(start, end);
+    expect(body).toMatch(/session\.busy/);
+    expect(body).toMatch(/session\._awaitingInputReady/);
+    // Task 6 review C2: the prompt paths deliberately clear busy so the
+    // user's answer types into the PTY — a room message must not take the
+    // idle branch there and answer the prompt.
+    expect(body).toMatch(/session\.waitingForAnswer/);
+    expect(body).toMatch(/session\.pendingInteractivePrompt/);
+    // …and it is what createRoomDelivery actually receives as isBusy.
+    const rd = src.indexOf('createRoomDelivery({');
+    expect(rd).toBeGreaterThan(-1);
+    const rdEnd = src.indexOf('});', rd);
+    expect(src.slice(rd, rdEnd)).toMatch(/isBusy: sessionOccupiedForRoomDelivery/);
+    // The injected turn must not re-mirror into the session's own convo.
+    expect(src.slice(rd, rdEnd)).toMatch(/skipJournalMirror: true/);
+  });
+
+  it('every turn-end seam flushes the pending room inbox through the ONE shared occupied-gated helper', () => {
+    // Task 6 review C1/C2/I3/I4: the seams (codex, iv, print, resume-hold
+    // release) plus journalOnRoomFrame's self-heal all go through
+    // maybeFlushRoomDelivery — never a bare roomDelivery.flush of their own,
+    // so the occupied gate can't drift per seam.
+    const gated = src.match(/maybeFlushRoomDelivery\(session\)/g) || [];
+    expect(gated.length).toBeGreaterThanOrEqual(5);
+    const bareFlushes = src.match(/roomDelivery\.flush\(session, session\.roomId\)/g) || [];
+    expect(bareFlushes).toHaveLength(1); // inside maybeFlushRoomDelivery only
+    expect(src).toMatch(/function maybeFlushRoomDelivery\(session\) \{\s*\n\s*if \(sessionOccupiedForRoomDelivery\(session\)\) return;/);
+    // …and a queue flush that dispatched a turn suppresses the room flush
+    // (the new turn's own end seam picks it up) — one gate per seam family:
+    // codex, iv onTurnEnd, print result, and the resume-hold release (which
+    // flushes a queue carried across a restart — see restart-deferral tests).
+    expect(src.match(/flushPendingSessionQueue\(session\) === true/g) || []).toHaveLength(4);
+    // The parked-slash release path must not append a room block onto the
+    // just-typed slash command (Task 6 review I3) — but ONLY when the slash
+    // was actually typed; the couldn't-run/held-messages branches typed
+    // nothing and must still flush (whole-branch review, M4).
+    expect(src).toMatch(/if \(!parkedSlashTyped\) maybeFlushRoomDelivery\(session\);/);
+    expect(src).toMatch(/parkedSlashTyped = true;\s*\n\s*debug\(`typed parked /);
+  });
+
+  // Dan, 2026-08-09: "perhaps it could even show eg when the receiving chat
+  // has queued the message but not had it delivered yet". A ⏳ that never
+  // resolves is worse than none, so these pin both halves and the one case
+  // where "busy" does NOT mean queued.
+  describe('the queued-but-not-delivered state', () => {
+    const frame = (() => {
+      const start = src.indexOf('function journalOnRoomFrame(');
+      return src.slice(start, src.indexOf('\nfunction ', start + 1));
+    })();
+
+    it('reads queued-ness off the inbox, not deliver()\'s boolean', () => {
+      // deliver() returns true for BOTH branches — "accepted", not
+      // "delivered". Empty-before/non-empty-after is the only honest test of
+      // "this message opened a pending batch".
+      expect(frame).toMatch(/const queuedBefore = roomDelivery\.pendingCount\(session\.roomId\)/);
+      expect(frame).toMatch(/queuedBefore === 0 && roomDelivery\.pendingCount\(session\.roomId\) > 0/);
+    });
+
+    it('publishes ⏳ only AFTER the reply-waiter short-circuit', () => {
+      // During an agent_chat_send wait the session is busy but the reply is
+      // consumed inline as the tool result and never queued at all. A notice
+      // published before the short-circuit would claim "queued" in exactly
+      // the case the peer agent answered fastest.
+      const resolve = frame.indexOf('roomReplyWaiters.resolve(');
+      const queued = frame.indexOf('ROOM_MESSAGE_QUEUED_NOTICE');
+      expect(resolve).toBeGreaterThan(-1);
+      expect(queued).toBeGreaterThan(resolve);
+    });
+
+    it('gates ⏳ to peer agents, like the 💬 notice it follows', () => {
+      // A `user:` frame is Dan typing into the room convo himself; he gets no
+      // 💬 line for it, so a bare ⏳ would have nothing to attach to.
+      expect(frame).toMatch(/const isPeerAgent = sender\.startsWith\('agent:'\)/);
+      expect(frame).toMatch(/if \(isPeerAgent\) \{/);
+      expect(frame).toMatch(/if \(isPeerAgent && queuedBefore === 0/);
+    });
+
+    it('drains an older batch BEFORE publishing this message\'s notice', () => {
+      // Otherwise the journal reads out of order: the 💬 for a message that
+      // arrived second appears above the 📨 closing the batch before it.
+      const flush = frame.indexOf('maybeFlushRoomDelivery(session)');
+      const notice = frame.indexOf('formatRoomMessageNotice(');
+      expect(flush).toBeGreaterThan(-1);
+      expect(notice).toBeGreaterThan(flush);
+    });
+
+    it('closes the ⏳ at the flush seam, counting BEFORE flush clears the inbox', () => {
+      const start = src.indexOf('function maybeFlushRoomDelivery(');
+      const body = src.slice(start, src.indexOf('\n}', start));
+      const count = body.indexOf('roomDelivery.pendingCount(');
+      const flush = body.indexOf('roomDelivery.flush(');
+      expect(count).toBeGreaterThan(-1);
+      expect(flush).toBeGreaterThan(count);
+      // Nothing queued => nothing to close, and no notice at all.
+      expect(body).toMatch(/if \(!queued\) return;/);
+      // A refused inject must say so rather than leave the ⏳ hanging.
+      expect(body).toMatch(/flushed \? formatRoomDeliveredNotice\(queued\) : formatRoomDeliveryFailedNotice\(queued\)/);
+    });
+  });
+
+  it('terminal teardown drops the pending room inbox with the session', () => {
+    const start = src.indexOf('function journalEvictConvoInput(');
+    expect(start).toBeGreaterThan(-1);
+    const end = src.indexOf('\nfunction ', start + 1);
+    expect(src.slice(start, end)).toMatch(/roomDelivery\.dropSession\(session\?\.roomId\)/);
+    // …and closes the ⏳ those dropped messages left open (Bugbot, #197): a
+    // silent drop is the never-resolving indicator this feature exists to
+    // avoid. Counted BEFORE the drop clears the inbox.
+    const teardown = src.slice(start, end);
+    expect(teardown.indexOf('roomDelivery.pendingCount(')).toBeLessThan(teardown.indexOf('roomDelivery.dropSession('));
+    expect(teardown).toMatch(/if \(strandedRoomMessages && convoId\) \{\s*\n\s*journalPublishNotice\(convoId, formatRoomDeliveryFailedNotice\(strandedRoomMessages\)\)/);
+    // Eviction must auto-leave every joined room so the peer's bridge doesn't
+    // keep publishing into a black hole (whole-branch review, I4).
+    expect(src.slice(start, end)).toMatch(/agentInvites\.leave\(\{ roomId: r\.roomId \}\)[\s\S]*agentRooms\.setState\(r\.roomId, 'left'\)/);
+  });
+
+  it('an inbound join_request never touches the room record — only the pendingJoinRequests seam (whole-branch review, C1)', () => {
+    const start = src.indexOf('function journalInjectInviteRequest(');
+    expect(start).toBeGreaterThan(-1);
+    const end = src.indexOf('\nfunction ', start + 1);
+    const body = src.slice(start, end);
+    expect(body).toMatch(/if \(isJoin\) \{[^}]*pendingJoinRequests\.set/);
+    // The record() call must live in the non-join else branch only.
+    const isJoinBlock = body.match(/if \(isJoin\) \{[\s\S]*?\n {4}\} else \{/)?.[0] ?? '';
+    expect(isJoinBlock).not.toMatch(/agentRooms\.record/);
+  });
+
+  it('the publisher receives thunked invite/op-error dispatch into the (later-built) invite manager', () => {
+    const start = src.indexOf('createJournalPublisher({');
+    expect(start).toBeGreaterThan(-1);
+    const end = src.indexOf('});', start);
+    const args = src.slice(start, end);
+    expect(args).toMatch(/onInviteFrame: \(frame\) => agentInvites\?\.onInviteFrame\(frame\)/);
+    // Agent-spawn frames are thunked the same way, into the (later-built)
+    // agentSpawnHandlers; onOpError tries the spawn side FIRST (its `true`
+    // return means it consumed the ref) before falling through to invites.
+    expect(args).toMatch(/onSpawnFrame: \(frame\) => agentSpawnHandlers\?\.onSpawnFrame\(frame\)/);
+    expect(args).toMatch(/onOpError: \(e\) => \{ if \(agentSpawnHandlers\?\.onOpError\?\.\(e\)\) return; agentInvites\?\.onOpError\(e\); \}/);
+  });
+});
+
+describe('isResumePickerTap', () => {
+  it('accepts a resume choice the frame actually offered', () => {
+    expect(isResumePickerTap(new Set(['resume:abc123def456']), 'resume:abc123def456')).toBe(true);
+  });
+
+  it('rejects a resume choice the frame did not offer', () => {
+    expect(isResumePickerTap(new Set(['resume:abc123def456']), 'resume:other9999999')).toBe(false);
+  });
+
+  it('rejects non-resume picker values', () => {
+    expect(isResumePickerTap(new Set(['model:sonnet']), 'model:sonnet')).toBe(false);
+  });
+
+  it('rejects when there is no frame', () => {
+    expect(isResumePickerTap(null, 'resume:abc123def456')).toBe(false);
+    expect(isResumePickerTap(undefined, 'resume:abc123def456')).toBe(false);
+  });
+
+  it('rejects a non-string choice', () => {
+    expect(isResumePickerTap(new Set(['resume:abc123def456']), null)).toBe(false);
+    expect(isResumePickerTap(new Set(['resume:abc123def456']), 7)).toBe(false);
+  });
+});
+
+describe('isPickerFrame with resume options', () => {
+  it('classifies a resume- option frame as a picker', () => {
+    expect(isPickerFrame({ options: [{ id: 'resume-abc123def456', value: 'resume:abc123def456' }] })).toBe(true);
   });
 });

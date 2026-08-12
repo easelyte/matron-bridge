@@ -88,62 +88,6 @@ describe('extractMcpExtraFlags', () => {
   });
 });
 
-describe('extractPromptFlag', () => {
-  it('extracts a quoted multi-word prompt and returns the rest verbatim', () => {
-    expect(extractPromptFlag('/opt/work --prompt "do the thing now"'))
-      .toEqual({ prompt: 'do the thing now', rest: '/opt/work', error: null });
-  });
-
-  it('does NOT consume flags/args inside the quoted prompt', () => {
-    expect(extractPromptFlag('--prompt "investigate /some/dir and --browser"'))
-      .toEqual({ prompt: 'investigate /some/dir and --browser', rest: '', error: null });
-  });
-
-  it('accepts a single unquoted token', () => {
-    expect(extractPromptFlag('/opt/work --prompt hello'))
-      .toEqual({ prompt: 'hello', rest: '/opt/work', error: null });
-  });
-
-  it('preserves surrounding tokens on both sides of --prompt in rest', () => {
-    expect(extractPromptFlag('--browser --prompt "go" /opt/work'))
-      .toEqual({ prompt: 'go', rest: '--browser /opt/work', error: null });
-  });
-
-  it('errors on an unterminated quote', () => {
-    const r = extractPromptFlag('--prompt "unterminated text');
-    expect(r.prompt).toBeNull();
-    expect(r.error).toMatch(/missing closing quote/);
-  });
-
-  it('honors backslash-escaped quotes inside the prompt', () => {
-    expect(extractPromptFlag('/repo --prompt "say \\"hello\\" then stop"'))
-      .toEqual({ prompt: 'say "hello" then stop', rest: '/repo', error: null });
-  });
-
-  it('rejects an empty quoted prompt (P8)', () => {
-    const r = extractPromptFlag('/opt/work --prompt ""');
-    expect(r.prompt).toBeNull();
-    expect(r.error).toMatch(/non-empty/);
-  });
-
-  it('returns null + unchanged rest when --prompt is absent', () => {
-    expect(extractPromptFlag('/opt/work now'))
-      .toEqual({ prompt: null, rest: '/opt/work now', error: null });
-  });
-
-  it('does NOT match --prompt as a substring (--prompted / --prompt-extra)', () => {
-    expect(extractPromptFlag('/opt/work --prompted'))
-      .toEqual({ prompt: null, rest: '/opt/work --prompted', error: null });
-    expect(extractPromptFlag('--prompt-extra foo'))
-      .toEqual({ prompt: null, rest: '--prompt-extra foo', error: null });
-  });
-
-  it('handles a bare empty arg string (plain !start)', () => {
-    expect(extractPromptFlag(''))
-      .toEqual({ prompt: null, rest: '', error: null });
-  });
-});
-
 // The browser extra's real on-disk shape since the xvfb-run leak fix: the MCP
 // is wrapped in repo-relative ./hooks/xvfb-wrap.sh, which must be resolved to
 // an absolute path in the generated config — claude runs with the SESSION
@@ -311,13 +255,70 @@ describe('effectiveExtras', () => {
 });
 
 describe('resolveDefaultExtras', () => {
-  it('enables share by default and disables it with the kill-switch', () => {
-    expect(resolveDefaultExtras(undefined)).toEqual(['share']);
+  it('disables share by default and enables it only with the opt-in flag', () => {
+    expect(resolveDefaultExtras(undefined)).toEqual([]);
     expect(resolveDefaultExtras('0')).toEqual([]);
-    expect(effectiveExtras([], resolveDefaultExtras('0'))).toEqual([]);
+    expect(resolveDefaultExtras('1')).toEqual(['share']);
+    expect(effectiveExtras([], resolveDefaultExtras('1'))).toEqual(['share']);
   });
 
-  it('keeps an explicitly requested share extra when the kill-switch is on', () => {
-    expect(effectiveExtras(['share'], resolveDefaultExtras('0'))).toEqual(['share']);
+  it('keeps an explicitly requested share extra even when the default is off', () => {
+    expect(effectiveExtras(['share'], resolveDefaultExtras(undefined))).toEqual(['share']);
+  });
+});
+
+describe('extractPromptFlag', () => {
+  it('extracts a quoted multi-word prompt and returns the rest verbatim', () => {
+    expect(extractPromptFlag('/opt/work --prompt "do the thing now"'))
+      .toEqual({ prompt: 'do the thing now', rest: '/opt/work', error: null });
+  });
+
+  it('does NOT consume flags/args inside the quoted prompt', () => {
+    expect(extractPromptFlag('--prompt "investigate /some/dir and --browser"'))
+      .toEqual({ prompt: 'investigate /some/dir and --browser', rest: '', error: null });
+  });
+
+  it('accepts a single unquoted token', () => {
+    expect(extractPromptFlag('/opt/work --prompt hello'))
+      .toEqual({ prompt: 'hello', rest: '/opt/work', error: null });
+  });
+
+  it('preserves surrounding tokens on both sides of --prompt in rest', () => {
+    expect(extractPromptFlag('--browser --prompt "go" /opt/work'))
+      .toEqual({ prompt: 'go', rest: '--browser /opt/work', error: null });
+  });
+
+  it('errors on an unterminated quote', () => {
+    const r = extractPromptFlag('--prompt "unterminated text');
+    expect(r.prompt).toBeNull();
+    expect(r.error).toMatch(/missing closing quote/);
+  });
+
+  it('honors backslash-escaped quotes inside the prompt', () => {
+    expect(extractPromptFlag('/repo --prompt "say \\"hello\\" then stop"'))
+      .toEqual({ prompt: 'say "hello" then stop', rest: '/repo', error: null });
+  });
+
+  it('rejects an empty quoted prompt (P8)', () => {
+    const r = extractPromptFlag('/opt/work --prompt ""');
+    expect(r.prompt).toBeNull();
+    expect(r.error).toMatch(/non-empty/);
+  });
+
+  it('returns null + unchanged rest when --prompt is absent', () => {
+    expect(extractPromptFlag('/opt/work now'))
+      .toEqual({ prompt: null, rest: '/opt/work now', error: null });
+  });
+
+  it('does NOT match --prompt as a substring (--prompted / --prompt-extra)', () => {
+    expect(extractPromptFlag('/opt/work --prompted'))
+      .toEqual({ prompt: null, rest: '/opt/work --prompted', error: null });
+    expect(extractPromptFlag('--prompt-extra foo'))
+      .toEqual({ prompt: null, rest: '--prompt-extra foo', error: null });
+  });
+
+  it('handles a bare empty arg string (plain !start)', () => {
+    expect(extractPromptFlag(''))
+      .toEqual({ prompt: null, rest: '', error: null });
   });
 });

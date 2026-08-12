@@ -59,7 +59,7 @@ function makePublisher(extra = {}) {
   return publisher;
 }
 
-async function connected(publisher) {
+async function connected() {
   await waitFor(() => ManualSocket.instances[0]?.sent.some(f => f.op === 'hello'));
   ManualSocket.instances[0].emit('message', JSON.stringify({ op: 'hello_ok' }));
   return ManualSocket.instances[0];
@@ -68,7 +68,7 @@ async function connected(publisher) {
 describe('journal-publisher — queued-release durability hooks', () => {
   it('publishPromptReply threads a deterministic idem_key onto the enqueued frame', async () => {
     const publisher = makePublisher();
-    const sock = await connected(publisher);
+    const sock = await connected();
     publisher.publishPromptReply('convo-1', { kind: 'queued_release', prompt_id: 'pr_1', action: 'send' }, { idemKey: 'qr\0pr_1\0send' });
     await waitFor(() => sock.sent.some(f => f.type === 'prompt_reply'));
     const frame = sock.sent.find(f => f.type === 'prompt_reply');
@@ -77,7 +77,7 @@ describe('journal-publisher — queued-release durability hooks', () => {
 
   it('publishPromptReply without options keeps a random idem_key (backward compatible)', async () => {
     const publisher = makePublisher();
-    const sock = await connected(publisher);
+    const sock = await connected();
     publisher.publishPromptReply('convo-1', { kind: 'queued_release', prompt_id: 'pr_1', action: 'send' });
     await waitFor(() => sock.sent.some(f => f.type === 'prompt_reply'));
     const frame = sock.sent.find(f => f.type === 'prompt_reply');
@@ -87,7 +87,7 @@ describe('journal-publisher — queued-release durability hooks', () => {
 
   it('hasQueuedIdem reports a frame still sitting in the outbound queue, false once confirmed', async () => {
     const publisher = makePublisher();
-    const sock = await connected(publisher);
+    const sock = await connected();
     publisher.publishPromptReply('convo-1', { kind: 'queued_release', prompt_id: 'pr_1', action: 'send' }, { idemKey: 'qr\0pr_1\0send' });
     await waitFor(() => sock.sent.some(f => f.type === 'prompt_reply'));
     expect(publisher.hasQueuedIdem('qr\0pr_1\0send')).toBe(true);
@@ -100,7 +100,7 @@ describe('journal-publisher — queued-release durability hooks', () => {
   it('onSendCapacity fires when pump confirms a send and the queue has headroom (send-completion trigger)', async () => {
     const onSendCapacity = vi.fn();
     const publisher = makePublisher({ onSendCapacity });
-    const sock = await connected(publisher);
+    const sock = await connected();
     publisher.publishPromptReply('convo-1', { kind: 'queued_release', prompt_id: 'pr_1', action: 'send' }, { idemKey: 'qr\0pr_1\0send' });
     await waitFor(() => sock.sent.some(f => f.type === 'prompt_reply'));
     expect(onSendCapacity).not.toHaveBeenCalled(); // not yet confirmed
@@ -111,7 +111,7 @@ describe('journal-publisher — queued-release durability hooks', () => {
 
   it('flush() resolves drained:true once the queue drains', async () => {
     const publisher = makePublisher();
-    const sock = await connected(publisher);
+    const sock = await connected();
     publisher.publishPromptReply('convo-1', { kind: 'queued_release', prompt_id: 'pr_1', action: 'send' }, { idemKey: 'qr\0pr_1\0send' });
     await waitFor(() => sock.sent.some(f => f.type === 'prompt_reply'));
     const flushed = publisher.flush({ timeoutMs: 500 });
@@ -121,7 +121,7 @@ describe('journal-publisher — queued-release durability hooks', () => {
 
   it('flush() resolves drained:false on a dead socket within the timeout (does not hang)', async () => {
     const publisher = makePublisher();
-    const sock = await connected(publisher);
+    const sock = await connected();
     publisher.publishPromptReply('convo-1', { kind: 'queued_release', prompt_id: 'pr_1', action: 'send' }, { idemKey: 'qr\0pr_1\0send' });
     await waitFor(() => sock.sent.some(f => f.type === 'prompt_reply'));
     // never confirm -> the frame stays queued
@@ -130,7 +130,7 @@ describe('journal-publisher — queued-release durability hooks', () => {
 
   it('flush() on an empty queue resolves drained:true immediately', async () => {
     const publisher = makePublisher();
-    await connected(publisher);
+    await connected();
     await expect(publisher.flush({ timeoutMs: 5 })).resolves.toEqual({ drained: true });
   });
 

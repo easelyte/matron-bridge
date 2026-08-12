@@ -105,7 +105,7 @@ describe('createRecentFolders', () => {
     expect(store.list()).toEqual([{ path: '/w/a', lastUsed: 1000 }]);
   });
 
-  // #460: the sole durable file must never be truncated in place. A save
+  // PR #151: the sole durable file must never be truncated in place. A save
   // writes a temp file first, then atomically renames it onto the target —
   // the target is only ever replaced by a complete file.
   it('save is atomic: writes a temp file, then renames it onto the target (never truncates target directly)', () => {

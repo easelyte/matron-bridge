@@ -30,7 +30,7 @@ function share(deps, overrides = {}) {
   return shareAgentMedia({
     filePath: '/work/chart.PNG',
     caption: 'Quarterly chart',
-    pinnedRoots: { pinned: true },
+    pinnedRoots: { roots: [{ realPath: '/work' }] },
     maxBytes: 50 * 1024 * 1024,
     uploadTimeoutMs: 30000,
     deps,
@@ -46,8 +46,9 @@ describe('shareAgentMedia', () => {
     const result = await share(deps);
 
     expect(deps.validateAndOpen).toHaveBeenCalledWith('/work/chart.PNG', {
-      allowedRoots: { pinned: true },
+      allowedRoots: { roots: [{ realPath: '/work' }] },
       maxBytes: 50 * 1024 * 1024,
+      strictSnapshot: true,
     });
     expect(deps.uploadMedia).toHaveBeenCalledWith({
       bytes: content,
@@ -125,6 +126,37 @@ describe('shareAgentMedia', () => {
     await expect(share(deps)).resolves.toEqual({ denied: reason });
     expect(deps.uploadMedia).not.toHaveBeenCalled();
     expect(deps.publish).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ['a pinned object with no roots', { roots: [] }],
+    ['a pinned object missing roots', { pinned: true }],
+    ['undefined', undefined],
+  ])('fails closed with bad-workdir when the pinned root set is %s', async (_label, pinnedRoots) => {
+    const deps = makeDeps();
+
+    await expect(share(deps, { pinnedRoots })).resolves.toEqual({ denied: 'bad-workdir' });
+    expect(deps.validateAndOpen).not.toHaveBeenCalled();
+    expect(deps.uploadMedia).not.toHaveBeenCalled();
+    expect(deps.publish).not.toHaveBeenCalled();
+  });
+
+  it('routes an SVG to the downloadable-attachment path, not an inline image', async () => {
+    const content = Buffer.from('<svg></svg>');
+    const deps = makeDeps({ realPath: '/work/diagram.svg', content });
+    deps.uploadMedia.mockResolvedValue({ media_id: 'media-svg' });
+
+    const result = await share(deps, { filePath: '/work/diagram.svg' });
+
+    expect(deps.uploadMedia).toHaveBeenCalledWith(expect.objectContaining({
+      contentType: 'application/octet-stream',
+      name: 'diagram.svg',
+    }));
+    expect(deps.publish).toHaveBeenCalledWith('publishFile', expect.objectContaining({
+      blob_ref: 'media-svg',
+      content_type: 'application/octet-stream',
+    }));
+    expect(result).toEqual(expect.objectContaining({ ok: true, kind: 'file' }));
   });
 
   it('returns upload-failed and does not publish when uploadMedia returns null', async () => {

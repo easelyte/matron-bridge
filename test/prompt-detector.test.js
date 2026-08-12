@@ -2,7 +2,7 @@ import { describe, it, test, expect } from 'vitest';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
-import { classifyScreen, stripAnsi, stripInputBox, isIdleReadyScreen, PromptDetector, looksLikeUnclassifiedMenu, extractPreamble, preambleMatchesText, stripQueuedWidget } from '../lib/prompt-detector.js';
+import { classifyScreen, stripAnsi, stripInputBox, isIdleReadyScreen, PromptDetector, looksLikeUnclassifiedMenu, extractPreamble, preambleMatchesText, stripQueuedWidget, loginSuccessNearAutoEnterCue } from '../lib/prompt-detector.js';
 
 const __dir = path.dirname(fileURLToPath(import.meta.url));
 
@@ -321,14 +321,31 @@ describe('classifyScreen — arrow-menu', () => {
     expect(r.options.map(o => o.label)).toEqual(['Option A', 'Option B', 'Option C']);
   });
 
-  it('detects > selection marker', () => {
+  it('does NOT treat ASCII > as an arrow-menu marker (transcript user-message prefix)', () => {
+    // Claude's TUI renders past USER messages as `> hi` — a resume's
+    // full-screen repaint is full of these, and treating `>` as a selection
+    // marker turned chat history into phantom menus (the "hi / 1 agent type
+    // available" card in the /login flow). Real menus always use ❯/▶/►.
     const screen = [
       'Pick:',
       '> First',
       '  Second',
     ].join('\n');
-    const r = classifyScreen(screen);
-    expect(r.kind).toBe('arrow-menu');
+    expect(classifyScreen(screen)).toBeNull();
+  });
+
+  it('does NOT misread a resumed transcript (`> hi` + status line) as an arrow-menu', () => {
+    // Regression: the exact shape that surfaced a garbage prompt card during
+    // the /login flow — the tail of an assistant message, the user's own
+    // `> hi`, and claude's "1 agent type available" startup status line.
+    const screen = [
+      'run through it (or if anything misbehaves) and I\'ll',
+      'verify each step in the bridge logs.',
+      '',
+      '> hi',
+      '  1 agent type available',
+    ].join('\n');
+    expect(classifyScreen(screen)).toBeNull();
   });
 
   it('does NOT misread a folded-paste input box as an arrow-menu', () => {
@@ -970,6 +987,71 @@ describe('PromptDetector', () => {
     expect(prompts).toHaveLength(1);
     expect(unclassified).toHaveLength(0);
   });
+
+  it('emits screen-update for the letter-spaced post-login "Press Enter to continue" screen', async () => {
+    // The TUI shimmer-animates this line with per-character escapes, which
+    // stripAnsi renders letter-spaced — the old word-spaced cue regex never
+    // matched it, so no screen-update fired and the user had to send !enter.
+    const det = new PromptDetector({ idleMs: 40 });
+    const updates = [];
+    det.on('screen-update', u => updates.push(u));
+    det.feed('Login successful.\n P r e s s   E n t e r   t o   c o n t i n u e …');
+    await new Promise(r => setTimeout(r, 120));
+    expect(updates).toHaveLength(1);
+    expect(updates[0].hasInputCue).toBe(true);
+  });
+
+  it('distinguishes the paste-code cue from the press-enter cue across renders', async () => {
+    const det = new PromptDetector({ idleMs: 40 });
+    const updates = [];
+    det.on('screen-update', u => updates.push(u));
+    det.feed('Browser didn\'t open? Use the url below to sign in\nhttps://claude.ai/oauth?x=1\nPaste code here if prompted >');
+    await new Promise(r => setTimeout(r, 120));
+    det.feed('Login successful. Press Enter to continue…');
+    await new Promise(r => setTimeout(r, 120));
+    expect(updates).toHaveLength(2);
+  });
+
+  it('suppresses a re-render whose long URL was truncated mid-repaint', async () => {
+    // After the user pastes their OAuth code the wizard repaints; a partial
+    // capture can cut the URL's query tail, and a full-vs-truncated pair must
+    // not read as two different sign-in screens (duplicate card in chat).
+    const base = 'https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code';
+    const det = new PromptDetector({ idleMs: 40 });
+    const updates = [];
+    det.on('screen-update', u => updates.push(u));
+    det.feed(`Claude needs you to sign in.\nOpen this URL: ${base}&state=abc123\nPaste code here >`);
+    await new Promise(r => setTimeout(r, 120));
+    det.feed(`Claude needs you to sign in.\nOpen this URL: ${base.slice(0, 100)}\nPaste code here >`);
+    await new Promise(r => setTimeout(r, 120));
+    expect(updates).toHaveLength(1);
+  });
+
+  it('suppresses a wizard repaint whose cue phrase flapped within the oauth family', async () => {
+    // After the user pastes their code the wizard repaints: "Paste code
+    // here" can scroll away while "use the url below" remains. Both are the
+    // SAME sign-in screen — per-phrase cue tokens made the dedup signature
+    // flap and re-sent the card (live-test round 2).
+    const det = new PromptDetector({ idleMs: 40 });
+    const updates = [];
+    det.on('screen-update', u => updates.push(u));
+    det.feed('Browser didn\'t open? Use the url below to sign in\nhttps://claude.ai/oauth?x=1\nPaste code here if prompted >');
+    await new Promise(r => setTimeout(r, 120));
+    det.feed('Use the url below to sign in\nhttps://claude.ai/oauth?x=1');
+    await new Promise(r => setTimeout(r, 120));
+    expect(updates).toHaveLength(1);
+  });
+
+  it('still emits for a genuinely different URL under the same cue', async () => {
+    const det = new PromptDetector({ idleMs: 40 });
+    const updates = [];
+    det.on('screen-update', u => updates.push(u));
+    det.feed('Open this URL: https://claude.ai/first\nPaste code here >');
+    await new Promise(r => setTimeout(r, 120));
+    det.feed('Open this URL: https://claude.ai/second\nPaste code here >');
+    await new Promise(r => setTimeout(r, 120));
+    expect(updates).toHaveLength(2);
+  });
 });
 
 describe('looksLikeUnclassifiedMenu', () => {
@@ -1269,6 +1351,33 @@ describe('isIdleReadyScreen', () => {
     expect(isIdleReadyScreen('⏵⏵bypasspermissionson·esctointerrupt')).toBe(false);
   });
 
+  it('returns true for the logged-out screen (parked /login must not wait for the hardcap)', () => {
+    // A `claude --resume` spawned while logged out never paints the normal
+    // idle footer — without the logged-out token, a parked /login only ran at
+    // the 120s hardcap while the user's retries bounced off "still resuming".
+    expect(isIdleReadyScreen('❯ \n──────\nNot logged in · Please run /login')).toBe(true);
+    expect(isIdleReadyScreen('❯ \n──────\nNot logged in · Run /login')).toBe(true);
+    // Letter-spaced render of the same state must also match.
+    expect(isIdleReadyScreen('N o t   l o g g e d   i n  ·  Run /login')).toBe(true);
+  });
+
+  it('is NOT ready for mere conversation text containing "not logged in"', () => {
+    // A resumed session repaints its old transcript into the tail; prose
+    // discussing login states must not release the resume hold. Only the
+    // exact status-footer form (with the · separator and /login command)
+    // counts.
+    expect(isIdleReadyScreen('● The deploy failed because you are not logged in to npm.\n✻ Loading…')).toBe(false);
+    expect(isIdleReadyScreen('● It said "Not logged in" and then continued.')).toBe(false);
+  });
+
+  it('is NOT ready when the logged-out footer sits above the bottom lines (stale scrollback)', () => {
+    const screen = [
+      'Not logged in · Please run /login',
+      'line 1', 'line 2', 'line 3', 'line 4', 'line 5', 'line 6',
+    ].join('\n');
+    expect(isIdleReadyScreen(screen)).toBe(false);
+  });
+
   it('is NOT ready while the resume-summary picker is showing', () => {
     // The picker shows "Enter to confirm · Esc to cancel" — NOT the idle
     // "bypass permissions" status line — so the resume hold must keep waiting
@@ -1311,5 +1420,84 @@ describe('classifyScreen — resume-from-summary picker', () => {
       "Don't ask me again",
     ]);
     expect(r.question).toMatch(/recommend resuming from a summary/);
+  });
+});
+
+describe('loginSuccessNearAutoEnterCue', () => {
+  it('matches the real post-login success screen (success line just above the cue)', () => {
+    const screen = [
+      ' Login successful. Logged in as pat@example.com',
+      '',
+      ' Press Enter to continue…',
+    ].join('\n');
+    expect(loginSuccessNearAutoEnterCue(screen)).toBe(true);
+  });
+
+  it('matches when success and cue share a single line', () => {
+    expect(loginSuccessNearAutoEnterCue('Login successful. Press Enter to continue…')).toBe(true);
+  });
+
+  it('matches the letter-spaced shimmer rendering of the success screen', () => {
+    const screen = [
+      'L o g i n   s u c c e s s f u l .',
+      'P r e s s   E n t e r   t o   c o n t i n u e …',
+    ].join('\n');
+    expect(loginSuccessNearAutoEnterCue(screen)).toBe(true);
+  });
+
+  it('does NOT match stale success text in scrollback above an unrelated cue', () => {
+    // A resumed session repaints its old transcript into the tail. A previous
+    // login's success text sitting well above a later "Press Enter to
+    // dismiss" notice must not read as a fresh login success — a
+    // whole-screen match here is what triggered spurious auto-returns to
+    // print mode (Bugbot, PR #162).
+    const screen = [
+      '> earlier chat about how the login successful message looked',
+      'assistant: yes, it said "Logged in as pat@example.com"',
+      'some more transcript',
+      'and more transcript',
+      'yet more transcript',
+      'still more transcript',
+      'A new version of claude is available.',
+      'Press Enter to dismiss',
+    ].join('\n');
+    expect(loginSuccessNearAutoEnterCue(screen)).toBe(false);
+  });
+
+  it('does NOT match a success screen with no press-Enter cue', () => {
+    expect(loginSuccessNearAutoEnterCue('Login successful. Logged in as pat@example.com')).toBe(false);
+  });
+
+  it('handles empty and cue-less input', () => {
+    expect(loginSuccessNearAutoEnterCue('')).toBe(false);
+    expect(loginSuccessNearAutoEnterCue('just some ordinary output')).toBe(false);
+  });
+});
+
+describe('loginSuccessNearAutoEnterCue (wrapped cue)', () => {
+  it('finds a press-Enter cue wrapped across two lines', () => {
+    // Narrow terminals can wrap the cue; the auto-Enter decision matches the
+    // whole compacted screen so it still fires — the success locator must
+    // agree or the flow never returns to print mode.
+    const screen = [
+      ' Login successful. Logged in as pat@example.com',
+      ' Press Enter',
+      ' to continue…',
+    ].join('\n');
+    expect(loginSuccessNearAutoEnterCue(screen)).toBe(true);
+  });
+
+  it('still rejects stale success text far above a wrapped cue', () => {
+    const screen = [
+      'transcript: the login successful message from before',
+      'more transcript',
+      'more transcript',
+      'more transcript',
+      'more transcript',
+      'A new version is available.',
+      'Press Enter',
+      'to dismiss',
+    ].join('\n');
+    expect(loginSuccessNearAutoEnterCue(screen)).toBe(false);
   });
 });

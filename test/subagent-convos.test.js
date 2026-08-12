@@ -198,6 +198,11 @@ describe('createSubagentConvoTracker', () => {
     const { convoId, opts } = publisher.calls.upsertConvo[0];
     expect(convoId).toBe('parent-uuid:sub:agent-1');
     expect(opts.sessionState).toBe(CHILD_STATE_FINISHED);
+    // Hardening: the terminal frame must carry parentConvoId. finish() normally
+    // runs after the row already exists (UPDATE ignores parentage), but if the
+    // `running` upsert was lost this `done` frame becomes the INSERT — and
+    // parent_convo_id is INSERT-only. Omitting it would mint a root orphan.
+    expect(opts.parentConvoId).toBe('parent-uuid');
   });
 
   it('an unrelated Task tool_result does not finish any child', () => {
@@ -292,7 +297,10 @@ describe('createSubagentConvoTracker', () => {
       publisher.calls.upsertConvo.length = 0;
       tracker.noteTaskCompleted('agent-bg');
       expect(publisher.calls.upsertConvo).toEqual([
-        { convoId: 'parent-uuid:sub:agent-bg', opts: { sessionState: CHILD_STATE_FINISHED } },
+        {
+          convoId: 'parent-uuid:sub:agent-bg',
+          opts: { sessionState: CHILD_STATE_FINISHED, parentConvoId: 'parent-uuid' },
+        },
       ]);
       // Idempotent — a duplicate notification or late finishAll never re-emits.
       tracker.noteTaskCompleted('agent-bg');
@@ -385,6 +393,66 @@ describe('createSubagentConvoTracker', () => {
       expect(runningStore.calls.add).toHaveLength(1);
     });
 
+    it('does not publish a running child when the write-ahead record fails, and re-mints on retry', () => {
+      const publisher = makePublisher();
+      let addResult = false; // store can't durably persist yet
+      const store = {
+        calls: { add: [], remove: [] },
+        add(childConvoId, meta) { this.calls.add.push({ childConvoId, meta }); return addResult; },
+        remove(childConvoId) { this.calls.remove.push(childConvoId); },
+        list() { return []; },
+      };
+      const tracker = createSubagentConvoTracker({
+        publisher,
+        getParentConvoId: () => 'parent-uuid',
+        runningStore: store,
+        log: { warn() {} },
+      });
+
+      // Write-ahead failed → the child must NOT be published (no server-visible
+      // running child with no recovery record).
+      tracker.discover('agent-1', { label: 'A', agentType: null });
+      expect(store.calls.add).toHaveLength(1);
+      expect(publisher.calls.upsertConvo).toHaveLength(0);
+
+      // The mint rolled back, so a later watcher poll re-discovers the agent;
+      // once the store can persist, it mints and publishes normally.
+      addResult = true;
+      tracker.discover('agent-1', { label: 'A', agentType: null });
+      expect(store.calls.add).toHaveLength(2);
+      expect(publisher.calls.upsertConvo).toHaveLength(1);
+    });
+
+    it('restores the consumed FIFO Task ref on write-ahead failure so the retry re-pairs it', () => {
+      const publisher = makePublisher();
+      let addResult = false;
+      const store = {
+        calls: { add: [], remove: [] },
+        add(childConvoId, meta) { this.calls.add.push({ childConvoId, meta }); return addResult; },
+        remove(childConvoId) { this.calls.remove.push(childConvoId); },
+        list() { return []; },
+      };
+      const tracker = createSubagentConvoTracker({
+        publisher,
+        getParentConvoId: () => 'parent-uuid',
+        runningStore: store,
+        log: { warn() {} },
+      });
+
+      tracker.noteTaskStarted('toolu_1'); // queues a sync-Task FIFO ref
+      // First discover fails to persist → rolls back AND returns the FIFO ref.
+      tracker.discover('agent-1', { label: 'A', agentType: null });
+      expect(publisher.calls.upsertConvo).toHaveLength(0);
+
+      // Retry persists → the restored FIFO ref must re-pair, so the child's later
+      // Task result can find it and drive finish() (store removal on delivery).
+      addResult = true;
+      tracker.discover('agent-1', { label: 'A', agentType: null });
+      expect(publisher.calls.upsertConvo).toHaveLength(1);
+      tracker.noteTaskResult('toolu_1');
+      expect(store.calls.remove).toEqual(['parent-uuid:sub:agent-1']);
+    });
+
     it('finishAll removes every still-running child from the store', () => {
       const runningStore = makeStore();
       const tracker = createSubagentConvoTracker({
@@ -399,6 +467,44 @@ describe('createSubagentConvoTracker', () => {
       tracker.finishAll();
       expect(runningStore.list()).toEqual([]);
       expect(runningStore.calls.remove.sort()).toEqual(['parent-uuid:sub:agent-1', 'parent-uuid:sub:agent-2']);
+    });
+
+    it('keeps the write-ahead record when the done frame is never confirmed delivered', () => {
+      // The real journal publisher only fires onDelivered on CONFIRMED socket
+      // delivery. A crash-before-flush / queue-overflow drop means it never
+      // fires — the write-ahead record must survive so the next startup/reconnect
+      // reconcile re-publishes `done`. The default fake publisher confirms
+      // synchronously, so this NON-confirming publisher is what actually
+      // exercises the central "clear the store ONLY on delivery" invariant.
+      const neverConfirms = {
+        calls: { upsertConvo: [] },
+        upsertConvo(convoId, opts /* , options */) {
+          // Deliberately drop `options.onDelivered` on the floor (never call it).
+          this.calls.upsertConvo.push({ convoId, opts });
+        },
+        publishStatus() {},
+        publishText() {},
+        publishDiff() {},
+      };
+      const runningStore = makeStore();
+      const tracker = createSubagentConvoTracker({
+        publisher: neverConfirms,
+        getParentConvoId: () => 'parent-uuid',
+        runningStore,
+        log: { warn() {} },
+      });
+
+      tracker.noteTaskStarted('toolu_1');
+      tracker.discover('agent-1', { label: 'A', agentType: null });
+      expect(runningStore.list()).toHaveLength(1);
+
+      tracker.noteTaskResult('toolu_1'); // → finish(): publishes done, gates removal on delivery
+      // The done frame was published...
+      expect(neverConfirms.calls.upsertConvo.some(
+        u => u.opts.sessionState === CHILD_STATE_FINISHED)).toBe(true);
+      // ...but delivery was never confirmed, so the record MUST survive for retry.
+      expect(runningStore.calls.remove).toEqual([]);
+      expect(runningStore.list()).toHaveLength(1);
     });
 
     it('works without a runningStore (optional dependency)', () => {

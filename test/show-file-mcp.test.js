@@ -40,6 +40,46 @@ describe('show-file MCP adapter', () => {
     }));
   });
 
+  it.each([
+    ['missing-token', 400],
+    ['invalid-token', 403],
+  ])('maps %s to a self-explaining "not enabled" message', async (reason, status) => {
+    const fetchImpl = vi.fn().mockResolvedValue(new Response(
+      JSON.stringify({ error: 'token must be a non-empty string', reason }),
+      { status, headers: { 'Content-Type': 'application/json' } },
+    ));
+    const handleShowFile = createShowFileHandler({
+      bridgeApi: 'http://bridge.test',
+      token: 'test-token',
+      fetchImpl,
+    });
+
+    const result = await handleShowFile({ path: '/work/chart.png' });
+
+    expect(result.content[0].text).toBe(
+      'Could not show chart.png: show_file is not enabled for this session',
+    );
+  });
+
+  it.each(['invalid-body', 'invalid-path', 'invalid-caption'])(
+    'surfaces the %s validation reason instead of a generic internal error',
+    async (reason) => {
+      const fetchImpl = vi.fn().mockResolvedValue(new Response(
+        JSON.stringify({ error: 'human-readable message', reason }),
+        { status: 400, headers: { 'Content-Type': 'application/json' } },
+      ));
+      const handleShowFile = createShowFileHandler({
+        bridgeApi: 'http://bridge.test',
+        token: 'test-token',
+        fetchImpl,
+      });
+
+      const result = await handleShowFile({ path: '/work/chart.png' });
+
+      expect(result.content[0].text).toBe(`Could not show chart.png: ${reason}`);
+    },
+  );
+
   it('surfaces Retry-After for a saturated endpoint', async () => {
     const fetchImpl = vi.fn().mockResolvedValue(new Response(
       JSON.stringify({ error: 'saturated' }),

@@ -6,12 +6,14 @@ import {
   codexRunsDirFor,
   configureCodexSinkEnv,
   launchWithCodexSinkEnv,
+  pruneStaleCodexSinks,
+  SHIPPED_SHIM_DIR,
 } from '../lib/codex-paths.js';
 
 describe('codexRunsDirFor', () => {
   it('anchors the sink to the sessionId, outside the encoded-cwd project tree', () => {
     const sessionId = 'abc-123';
-    const dir = codexRunsDirFor('/root/.openclaw/workspace', sessionId);
+    const dir = codexRunsDirFor('/home/user/project', sessionId);
 
     expect(dir).toBe(path.join(
       os.homedir(), '.claude', 'matron', 'codex-sinks', sessionId, 'codex-runs',
@@ -23,8 +25,8 @@ describe('codexRunsDirFor', () => {
 
   it('yields the SAME sink dir for a worktree cwd as for the main cwd (loop #630)', () => {
     const sessionId = '00000000-1111-2222-3333-444444444444';
-    const mainCwd = '/root/workspace';
-    const worktreeCwd = '/root/workspace/.claude/worktrees/feature-x';
+    const mainCwd = '/home/user/project';
+    const worktreeCwd = '/home/user/project/.claude/worktrees/feature-x';
 
     // A session that starts in main and later EnterWorktree's must resolve the
     // same sink path on both sides, so producer-write == watcher-watch survives
@@ -32,22 +34,65 @@ describe('codexRunsDirFor', () => {
     expect(codexRunsDirFor(worktreeCwd, sessionId))
       .toBe(codexRunsDirFor(mainCwd, sessionId));
   });
+
+  it('rejects a sessionId that could traverse out of the sinks root', () => {
+    for (const bad of ['..', '../evil', 'a/../../etc', 'a/b', 'a\\b', 'x\0y', '', '.']) {
+      expect(() => codexRunsDirFor('/home/user/project', bad)).toThrow(/unsafe sessionId/);
+    }
+    // A normal UUID session id is fine.
+    expect(() => codexRunsDirFor('/home/user/project', '00000000-1111-2222-3333-444444444444')).not.toThrow();
+  });
 });
 
 describe('configureCodexSinkEnv', () => {
-  it('injects an existing session-scoped sibling directory', () => {
-    const spawnEnv = {};
+  it('injects an existing session-scoped sibling directory (0700) and deploys the shim on PATH', () => {
+    const spawnEnv = { PATH: '/usr/bin:/bin' };
     const mkdirSync = vi.fn();
+    const chmodSync = vi.fn();
     const dir = configureCodexSinkEnv({
       spawnEnv,
-      workdir: '/root/.openclaw/workspace',
+      workdir: '/home/user/.config/agent-workspace',
       sessionId: 'abc-123',
-      env: {},
+      env: { MATRON_CODEX_VIZ: '1' },
       mkdirSync,
+      chmodSync,
     });
 
-    expect(mkdirSync).toHaveBeenCalledWith(dir, { recursive: true });
+    // The sink holds unredacted JSONL: created 0700 and pinned via chmod.
+    expect(mkdirSync).toHaveBeenCalledWith(dir, { recursive: true, mode: 0o700 });
+    expect(chmodSync).toHaveBeenCalledWith(dir, 0o700);
     expect(spawnEnv.MATRON_CODEX_SINK_DIR).toBe(dir);
+    // Deployment half of the activation guard: the shim dir is prepended so the
+    // spawned session's bare `codex` resolves to the producer.
+    expect(spawnEnv.PATH.split(path.delimiter)[0]).toBe(SHIPPED_SHIM_DIR);
+    expect(spawnEnv.PATH).toContain('/usr/bin:/bin');
+  });
+
+  it('does not double-prepend the shim dir when it is already first on PATH', () => {
+    const first = `${SHIPPED_SHIM_DIR}${path.delimiter}/usr/bin`;
+    const spawnEnv = { PATH: first };
+    configureCodexSinkEnv({
+      spawnEnv,
+      workdir: '/w',
+      sessionId: 'sid',
+      env: { MATRON_CODEX_VIZ: '1' },
+      mkdirSync: vi.fn(),
+      chmodSync: vi.fn(),
+    });
+    expect(spawnEnv.PATH).toBe(first);
+  });
+
+  it('does not touch PATH when visualization is disabled', () => {
+    const spawnEnv = { PATH: '/usr/bin', MATRON_CODEX_SINK_DIR: '/inherited' };
+    configureCodexSinkEnv({
+      spawnEnv,
+      workdir: '/w',
+      sessionId: 'sid',
+      env: { MATRON_CODEX_VIZ: '0' },
+      mkdirSync: vi.fn(),
+      chmodSync: vi.fn(),
+    });
+    expect(spawnEnv.PATH).toBe('/usr/bin');
   });
 
   it('deletes an inherited sink when visualization is disabled', () => {
@@ -66,6 +111,111 @@ describe('configureCodexSinkEnv', () => {
     expect(mkdirSync).not.toHaveBeenCalled();
   });
 
+});
+
+describe('pruneStaleCodexSinks', () => {
+  const DAY = 24 * 60 * 60 * 1000;
+  // Model the real sink layout: <root>/<sessionId>/codex-runs/<file>. Retention
+  // must key off the NEWEST activity (the codex-runs subdir / its files), not the
+  // <sessionId> dir mtime, which only tracks creation. Each session in `tree`:
+  //   { dir: <ms>, runs: <ms>|undefined, files: { name: <ms> }|undefined }
+  function fakeFs(tree) {
+    const removed = [];
+    const impl = {
+      readdirSync: (dir, opts) => {
+        if (path.basename(dir) === 'codex-runs') {
+          const sid = path.basename(path.dirname(dir));
+          const files = tree[sid]?.files;
+          if (files === undefined) throw new Error('ENOENT'); // no codex-runs yet
+          return Object.keys(files);
+        }
+        // root listing (the withFileTypes call in the sweep loop)
+        expect(opts).toEqual({ withFileTypes: true });
+        return Object.keys(tree).map(name => ({ name, isDirectory: () => true }));
+      },
+      statSync: p => {
+        const base = path.basename(p);
+        if (base === 'codex-runs') {
+          const sid = path.basename(path.dirname(p));
+          const m = tree[sid]?.runs;
+          if (m === undefined) throw new Error('ENOENT');
+          return { mtimeMs: m };
+        }
+        const parent = path.basename(path.dirname(p));
+        if (parent === 'codex-runs') {
+          const sid = path.basename(path.dirname(path.dirname(p)));
+          const m = tree[sid]?.files?.[base];
+          if (m === undefined) throw new Error('ENOENT');
+          return { mtimeMs: m };
+        }
+        // session dir
+        const m = tree[base]?.dir;
+        if (m === undefined) throw new Error('ENOENT');
+        return { mtimeMs: m };
+      },
+      rmSync: dir => { removed.push(path.basename(dir)); },
+    };
+    return { removed, impl };
+  }
+
+  it('removes only session dirs whose newest activity is older than the retention window', () => {
+    const now = () => 100 * DAY;
+    const { impl, removed } = fakeFs({
+      'fresh-sid': { dir: 99 * DAY }, // 1 day old — keep
+      'stale-sid': { dir: 80 * DAY }, // 20 days old — prune
+    });
+    const count = pruneStaleCodexSinks({ now, maxAgeMs: 7 * DAY, root: '/sinks', fsImpl: impl });
+    expect(count).toBe(1);
+    expect(removed).toEqual(['stale-sid']);
+  });
+
+  it('keeps a session whose dir mtime is old but whose codex-runs child is fresh', () => {
+    // The exact case the parent-dir-mtime bug got wrong: a long-lived session
+    // started >retention ago but still actively writing runs must NOT be pruned.
+    const now = () => 100 * DAY;
+    const { impl, removed } = fakeFs({
+      'active-old-start': {
+        dir: 80 * DAY, // session dir created 20 days ago — stale by dir mtime alone
+        runs: 99 * DAY, // ...but codex-runs touched 1 day ago
+        files: { 'codex-x.jsonl': 99.5 * DAY }, // newest write 12h ago — fresh
+      },
+    });
+    const count = pruneStaleCodexSinks({ now, maxAgeMs: 7 * DAY, root: '/sinks', fsImpl: impl });
+    expect(count).toBe(0);
+    expect(removed).toEqual([]);
+  });
+
+  it('prunes a session that is stale across the dir AND its codex-runs child', () => {
+    const now = () => 100 * DAY;
+    const { impl, removed } = fakeFs({
+      'stale-sid': {
+        dir: 80 * DAY,
+        runs: 85 * DAY,
+        files: { 'codex-x.jsonl': 85 * DAY }, // newest activity still 15 days old
+      },
+    });
+    const count = pruneStaleCodexSinks({ now, maxAgeMs: 7 * DAY, root: '/sinks', fsImpl: impl });
+    expect(count).toBe(1);
+    expect(removed).toEqual(['stale-sid']);
+  });
+
+  it('returns 0 and never throws when the sink root does not exist', () => {
+    const impl = { readdirSync: () => { throw new Error('ENOENT'); } };
+    expect(pruneStaleCodexSinks({ now: () => 0, root: '/nope', fsImpl: impl })).toBe(0);
+  });
+
+  it('falls back to the default window for a negative/invalid retention (never mass-deletes)', () => {
+    // MATRON_CODEX_SINK_RETENTION_MS=-1 is truthy; a negative window would push
+    // the cutoff into the FUTURE and delete every sink dir. A fresh sink must
+    // survive — with the bug, this prunes it (cutoff = now + 1).
+    const now = () => 100 * DAY;
+    const { impl, removed } = fakeFs({
+      'fresh-sid': { dir: 99.5 * DAY }, // 12h old
+    });
+    const count = pruneStaleCodexSinks({ now, maxAgeMs: -1, root: '/sinks', fsImpl: impl });
+    expect(count).toBe(0);
+    expect(removed).toEqual([]);
+  });
 });
 
 describe('Claude spawn-path sink wiring', () => {
@@ -90,7 +240,7 @@ describe('Claude spawn-path sink wiring', () => {
         sessionId: 'sid',
         launch,
         configureOptions: {
-          env: {},
+          env: { MATRON_CODEX_VIZ: '1' },
           mkdirSync: () => { throw new Error('EACCES'); },
           warn,
         },

@@ -49,7 +49,9 @@ describe('isWrapperAlive', () => {
       )).toBe(false);
     });
 
-    it('still rejects a start-tick mismatch on linux (identity check intact)', () => {
+    // These two read the caller's real /proc/<pid>/stat via currentStartTicks(),
+    // which throws off Linux — skip there (macOS is a documented dev platform).
+    it.skipIf(process.platform !== 'linux')('still rejects a start-tick mismatch on linux (identity check intact)', () => {
       const staleStartTicks = (BigInt(currentStartTicks()) + 1n).toString();
       expect(isWrapperAlive(
         { wrapperPid: process.pid, wrapperStartTicks: staleStartTicks },
@@ -57,7 +59,7 @@ describe('isWrapperAlive', () => {
       )).toBe(false);
     });
 
-    it('still accepts matching start-ticks on linux', () => {
+    it.skipIf(process.platform !== 'linux')('still accepts matching start-ticks on linux', () => {
       expect(isWrapperAlive(
         { wrapperPid: process.pid, wrapperStartTicks: currentStartTicks() },
         { platform: 'linux' },

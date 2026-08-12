@@ -7,7 +7,21 @@ import { generateSignedUrl, verifyToken } from '../lib/viewer-tokens.js';
 import { validateAndOpen, FileLinkDenied, MAX_DOWNLOAD_BYTES } from '../lib/file-link-guard.js';
 export { generateSignedUrl, verifyToken };
 
-const PORT = process.env.MATRON_VIEWER_PORT || 9803;
+// Port resolution with a legacy-name fallback: the Matrix→Matron rename left
+// old .envs setting MATRIX_VIEWER_PORT, and the silent default fallback bound
+// the viewer on 9803 while the Cloudflare tunnel forwarded to the configured
+// port — a 502 with both services "active" (2026-08-10). Honour the stale
+// name so an un-migrated .env keeps working, but warn loudly so it gets fixed.
+export function resolveViewerPort(env = process.env, warn = console.warn) {
+  if (env.MATRON_VIEWER_PORT) return env.MATRON_VIEWER_PORT;
+  if (env.MATRIX_VIEWER_PORT) {
+    warn('[viewer] MATRIX_VIEWER_PORT is the stale pre-rename name — rename it to MATRON_VIEWER_PORT in .env. Using its value for now.');
+    return env.MATRIX_VIEWER_PORT;
+  }
+  return 9803;
+}
+
+const PORT = resolveViewerPort();
 const SECRET = process.env.HMAC_SECRET;
 
 const app = express();
@@ -114,9 +128,44 @@ function renderSecretSuccess() {
 </html>`;
 }
 
-function renderSensitiveData(label, content) {
-  const escaped = escapeHtml(content);
+// Resolve the name the browser saves sensitive content under. Explicit
+// filename wins; otherwise a filename-looking token in the label; otherwise
+// a label slug. Always reduced to a safe basename (no separators, no leading
+// dot) — the value comes from the bridge API but ends up in an <a download>
+// attribute and on the user's disk.
+export function sensitiveFilename(label, filename) {
+  const sanitize = (name) =>
+    String(name).replace(/[^A-Za-z0-9._-]/g, '_').replace(/^[._]+/, '').slice(0, 128);
+  if (filename) {
+    const clean = sanitize(filename);
+    if (clean) return clean;
+  }
+  const inLabel = String(label ?? '').match(/[A-Za-z0-9._-]+\.[A-Za-z0-9]{1,8}(?![A-Za-z0-9])/);
+  if (inLabel) {
+    const clean = sanitize(inLabel[0]);
+    if (clean) return clean;
+  }
+  const slug = String(label ?? '').toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 60);
+  return `${slug || 'sensitive-data'}.txt`;
+}
+
+// Shell page for one-time sensitive data. Deliberately contains NO secret:
+// browsers, Safe Browsing, and Matrix URL previewers all GET links before or
+// as the user clicks them, and with a one-time store the prefetch used to BE
+// the view ("already been viewed" before the user ever saw it). The secret
+// only moves on POST /sensitive/reveal, which nothing automated sends —
+// mode 'view' shows it in-page, mode 'download' saves it straight to a file.
+function renderSensitiveShell(label, token, mode, oneTime = true) {
   const labelEscaped = escapeHtml(label);
+  const tokenJson = scriptJsonString(token);
+  const modeJson = scriptJsonString(mode);
+  // Must agree with what the chat notification promised: a share created with
+  // one_time:false stays usable until it expires, and telling the user it is
+  // one-time makes them treat a live secret as spent.
+  const warning = oneTime
+    ? '⚠️ This is a one-time link.'
+    : '⚠️ This link can be used more than once, until it expires.';
 
   return `<!DOCTYPE html>
 <html>
@@ -129,35 +178,96 @@ function renderSensitiveData(label, content) {
     .header { padding: 20px; background: #161b22; border: 1px solid #30363d; border-radius: 8px; margin-bottom: 20px; }
     .label { font-size: 18px; font-weight: 600; margin-bottom: 8px; }
     .warning { color: #f85149; font-size: 13px; display: flex; align-items: center; gap: 8px; }
+    .note { color: #8b949e; font-size: 13px; margin-top: 8px; }
     .content { padding: 20px; background: #161b22; border: 1px solid #30363d; border-radius: 8px; position: relative; }
     .content pre { margin: 0; font-family: 'SF Mono', 'Fira Code', monospace; font-size: 14px; line-height: 1.6; white-space: pre-wrap; word-wrap: break-word; }
-    .copy-btn { position: absolute; top: 12px; right: 12px; padding: 6px 12px; background: #238636; border: none; border-radius: 6px; color: #fff; font-size: 12px; cursor: pointer; }
-    .copy-btn:hover { background: #2ea043; }
-    .copy-btn.copied { background: #1f6feb; }
+    .btns { position: absolute; top: 12px; right: 12px; display: flex; gap: 8px; }
+    button { padding: 10px 24px; background: #238636; border: none; border-radius: 6px; color: #fff; font-size: 14px; font-weight: 600; cursor: pointer; }
+    button:hover { background: #2ea043; }
+    .btns button { padding: 6px 12px; font-size: 12px; font-weight: 400; }
+    .btns button.copied { background: #1f6feb; }
+    .dl-btn { background: #1f6feb !important; }
+    .dl-btn:hover { background: #388bfd !important; }
+    .error { color: #f85149; }
   </style>
 </head>
 <body>
   <div class="header">
     <div class="label">🔐 ${labelEscaped}</div>
-    <div class="warning">⚠️ This is a one-time link. Once you close this page, the data will be permanently deleted.</div>
+    <div class="warning">${warning}</div>
+    <div class="note">Nothing has been revealed yet — the data is fetched only when you press the button below.</div>
   </div>
-  <div class="content">
-    <button class="copy-btn" onclick="copyToClipboard()">Copy</button>
-    <pre id="content">${escaped}</pre>
+  <div class="content" id="box">
+    <button id="go"></button>
   </div>
   <script>
-    function copyToClipboard() {
-      const content = document.getElementById('content').textContent;
-      navigator.clipboard.writeText(content).then(() => {
-        const btn = document.querySelector('.copy-btn');
-        btn.textContent = 'Copied!';
-        btn.classList.add('copied');
-        setTimeout(() => {
-          btn.textContent = 'Copy';
-          btn.classList.remove('copied');
-        }, 2000);
-      });
+    const TOKEN = ${tokenJson};
+    const MODE = ${modeJson};
+    const box = document.getElementById('box');
+    const go = document.getElementById('go');
+    go.textContent = MODE === 'download' ? 'Download' : 'Reveal';
+
+    function saveBlob(content, filename) {
+      const blob = new Blob([content], { type: 'application/octet-stream' });
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(a.href);
     }
+
+    function showRevealed(data) {
+      box.textContent = '';
+      const btns = document.createElement('div');
+      btns.className = 'btns';
+      const dl = document.createElement('button');
+      dl.className = 'dl-btn';
+      dl.textContent = 'Download';
+      dl.onclick = () => saveBlob(data.content, data.filename);
+      const cp = document.createElement('button');
+      cp.className = 'copy-btn';
+      cp.textContent = 'Copy';
+      cp.onclick = () => navigator.clipboard.writeText(data.content).then(() => {
+        cp.textContent = 'Copied!';
+        cp.classList.add('copied');
+        setTimeout(() => { cp.textContent = 'Copy'; cp.classList.remove('copied'); }, 2000);
+      });
+      btns.append(dl, cp);
+      const pre = document.createElement('pre');
+      pre.textContent = data.content;
+      box.append(btns, pre);
+    }
+
+    go.onclick = async () => {
+      go.disabled = true;
+      try {
+        const res = await fetch('/sensitive/reveal', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ token: TOKEN }),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          box.textContent = '';
+          const p = document.createElement('p');
+          p.className = 'error';
+          p.textContent = '⚠️ ' + (data.error || 'Failed to retrieve the data');
+          box.append(p);
+          return;
+        }
+        if (MODE === 'download') {
+          saveBlob(data.content, data.filename);
+          box.textContent = 'Saved as ' + data.filename + '. You can close this tab.';
+        } else {
+          showRevealed(data);
+        }
+      } catch (e) {
+        go.disabled = false;
+        alert('Failed to retrieve the data: ' + e.message);
+      }
+    };
   </script>
 </body>
 </html>`;
@@ -315,7 +425,14 @@ app.post('/secret', async (req, res) => {
   }
 });
 
-app.get('/sensitive', async (req, res) => {
+// Both sensitive GET routes serve only the no-secret shell page — the GET
+// must be safe to repeat (prefetchers, Safe Browsing, URL previewers), so the
+// one-time consumption happens exclusively in POST /sensitive/reveal below.
+// They still answer "is this token valid?" though, so they stay rate-limited
+// alongside the routes that move bytes: a guesser must not get unlimited
+// probes just because this particular reply is only a shell page. What they
+// no longer share is the reveal POST's budget — see revealLimiter below.
+app.get('/sensitive', downloadLimiter, (req, res) => {
   const { token } = req.query;
   if (!token) return res.status(400).send('Missing token');
 
@@ -323,22 +440,68 @@ app.get('/sensitive', async (req, res) => {
   if (!data) return res.status(403).send('Invalid or expired token');
   if (!data.sensitiveId || !data.label) return res.status(400).send('Invalid sensitive data token');
 
+  res.type('html').send(renderSensitiveShell(data.label, token, 'view', data.ot !== false));
+});
+
+// Direct-download variant: same shell, but the click saves straight to a file
+// instead of rendering the content. Requires dl:true in the token (same
+// discriminator pattern as /view vs /download) so the two link flavours stay
+// distinct in chat even though both now land on a click-through page.
+app.get('/sensitive-download', downloadLimiter, (req, res) => {
+  const { token } = req.query;
+  if (!token) return res.status(400).send('Missing token');
+
+  const data = verifyToken(token);
+  if (!data || data.dl !== true || !data.sensitiveId || !data.label) {
+    return res.status(403).send('Invalid or expired token');
+  }
+
+  res.type('html').send(renderSensitiveShell(data.label, token, 'download', data.ot !== false));
+});
+
+// Own budget, deliberately not the GET one. Behind the tunnel every request
+// arrives from the loopback IP, so a shared limiter is one global counter —
+// and the shell GETs are the requests nobody controls: previewers, Safe
+// Browsing, a refresh, a probe. Any of that could spend the window and 429
+// the single POST the user actually pressed a button for. Separate counters
+// keep both properties: guessing stays bounded per route, and cheap
+// repeatable GETs can no longer starve the one action that matters.
+const revealLimiter = rateLimit({
+  windowMs: 60_000,
+  limit: parseInt(process.env.REVEAL_RATE_LIMIT || '30', 10),
+  standardHeaders: false,
+  legacyHeaders: false,
+  validate: { xForwardedForHeader: false },
+});
+
+// The only place the secret actually moves. POST-only so nothing automated
+// triggers it (link previewers and browser prefetch send GETs); called by the
+// shell page's button handler. Accepts both token flavours. Responds JSON —
+// the shell renders content/errors client-side via textContent.
+app.post('/sensitive/reveal', revealLimiter, async (req, res) => {
+  const { token } = req.body || {};
+  if (!token) return res.status(400).json({ error: 'Missing token' });
+
+  const data = verifyToken(token);
+  if (!data || !data.sensitiveId) {
+    return res.status(403).json({ error: 'Invalid or expired token' });
+  }
+
   try {
     const resp = await fetch(`http://127.0.0.1:${BRIDGE_API_PORT}/sensitive/${data.sensitiveId}`);
 
     if (!resp.ok) {
-      const err = await resp.json();
-      const safeErr = (err.error || 'Unknown error').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
-      return res.status(resp.status).type('html').send(
-        `<!DOCTYPE html><html><head><meta charset="utf-8"><title>Error</title><style>body{margin:0;background:#0d1117;color:#e6edf3;font-family:sans-serif;display:flex;align-items:center;justify-content:center;min-height:100vh;}.card{text-align:center;padding:40px;}h2{color:#f85149;}</style></head><body><div class="card"><h2>⚠️ Error</h2><p>${safeErr}</p></div></body></html>`
-      );
+      const err = await resp.json().catch(() => ({}));
+      return res.status(resp.status).json({ error: err.error || 'Unknown error' });
     }
 
-    const { label, content } = await resp.json();
-    res.type('html').send(renderSensitiveData(label, content));
+    const { label, content, filename } = await resp.json();
+    // sensitiveFilename output is [A-Za-z0-9._-] only — safe for the client
+    // to hand to the browser's download attribute.
+    res.json({ label, content, filename: sensitiveFilename(label, filename) });
   } catch (err) {
     console.error('Sensitive data fetch error:', err);
-    res.status(500).send('Failed to reach bridge API');
+    res.status(500).json({ error: 'Failed to reach bridge API' });
   }
 });
 

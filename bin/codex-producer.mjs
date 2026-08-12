@@ -98,11 +98,31 @@ export function mintRunId({ pid = process.pid, now = Date.now } = {}) {
   return runId;
 }
 
+// Both resolve probes run the resolved binary synchronously ON the bridge's
+// startup path, so they must be bounded: a hung `codex` would otherwise stall
+// the shim before it spawns anything, and a verbose one could blow the default
+// stdout buffer (ENOBUFS) and get misread as "no JSON flag". Bound both by time
+// and buffer, and surface a spawn-level error (timeout / ENOBUFS) as a distinct
+// loud failure rather than letting it fall through to the not-found paths.
+const PROBE_TIMEOUT_MS = 5000;
+const PROBE_MAX_BUFFER = 1024 * 1024;
+
+function runProbe(runner, realbin, args) {
+  const res = runner(realbin, args, {
+    encoding: 'utf8', timeout: PROBE_TIMEOUT_MS, maxBuffer: PROBE_MAX_BUFFER,
+  });
+  if (res.error) {
+    const error = new Error(`[codex-shim] probe '${realbin} ${args.join(' ')}' failed: ${res.error.message}`);
+    error.code = 'PROBE_FAILED';
+    throw error;
+  }
+  return `${res.stdout || ''}${res.stderr || ''}`;
+}
+
 // T-1.2: resolve the JSON event-stream flag against the resolved binary; fail
 // loud rather than launch a run that produces no transcript.
 export function resolveJsonFlag(realbin, { runner = spawnSync } = {}) {
-  const help = runner(realbin, ['exec', '--help'], { encoding: 'utf8' });
-  const text = `${help.stdout || ''}${help.stderr || ''}`;
+  const text = runProbe(runner, realbin, ['exec', '--help']);
   if (/(^|\s)--json(\s|$|=)/.test(text)) return '--json';
   if (/(^|\s)--experimental-json(\s|$|=)/.test(text)) return '--experimental-json';
   const error = new Error('[codex-shim] resolved codex has no JSON event stream');
@@ -112,8 +132,7 @@ export function resolveJsonFlag(realbin, { runner = spawnSync } = {}) {
 
 // T-1.2: schemaVersion string 'codex-cli X.Y.Z' from `<realbin> --version`.
 export function resolveSchemaVersion(realbin, { runner = spawnSync } = {}) {
-  const res = runner(realbin, ['--version'], { encoding: 'utf8' });
-  const text = `${res.stdout || ''}${res.stderr || ''}`;
+  const text = runProbe(runner, realbin, ['--version']);
   const match = /codex-cli\s+(\d+\.\d+\.\d+)/.exec(text);
   if (!match) {
     const error = new Error('[codex-shim] codex --version did not yield "codex-cli X.Y.Z"');
@@ -189,11 +208,47 @@ function resolveMaxRunMs(env) {
   return Number.isFinite(raw) && raw > 0 ? raw : DEFAULT_MAX_RUN_MS;
 }
 
+// Non-producer path (non-`exec` subcommand, or no sink configured). It must own
+// the child's process group and forward catchable signals exactly like
+// runProducer: with the shim on PATH, the bridge's own Codex backend runs
+// through here, and an interrupt mid-turn (`session.codex.interrupt('SIGINT')`)
+// otherwise kills the shim only — the real `codex` keeps the inherited stdio and
+// the turn wedges until the orphan exits. Resolve on 'close' (all stdio ended),
+// not 'exit'.
 function passthrough(realbin, args, { spawnFn, env }) {
   return new Promise(resolve => {
-    const child = spawnFn(realbin, args, { stdio: 'inherit', env });
-    child.on('error', () => resolve(127));
-    child.on('exit', (code, signal) => resolve(signal ? 128 + osSignalNumber(signal) : (code ?? 0)));
+    const child = spawnFn(realbin, args, {
+      stdio: 'inherit',
+      detached: true, // lead its own process group so we can signal the subtree
+      // TRADEOFF: detached (POSIX setsid) puts the child in its own session with
+      // NO controlling terminal. For the piped `codex exec` producer path this is
+      // irrelevant (non-interactive, no TUI). But a genuinely interactive `codex`
+      // TUI reaching this passthrough won't receive kernel-delivered SIGWINCH on
+      // terminal resize (SIGWINCH is delivered to the controlling terminal's
+      // foreground process group, which the detached child has left), so its
+      // layout won't reflow until the next redraw. Accepted: owning the process
+      // group is required to forward SIGINT/SIGTERM/SIGHUP to the whole subtree
+      // (an un-forwarded interrupt wedges the turn), and the interactive-TUI-
+      // through-the-shim case is not a path the bridge drives.
+      env,
+    });
+
+    let signalled = null;
+    const onSignal = sig => {
+      signalled = sig;
+      try { process.kill(-child.pid, sig); }
+      catch { try { child.kill(sig); } catch { /* child already gone */ } }
+    };
+    const signals = ['SIGINT', 'SIGTERM', 'SIGHUP'];
+    for (const sig of signals) process.on(sig, onSignal);
+    const cleanupSignals = () => { for (const sig of signals) process.removeListener(sig, onSignal); };
+
+    child.on('error', () => { cleanupSignals(); resolve(127); });
+    child.on('close', (code, signal) => {
+      cleanupSignals();
+      const term = signal || signalled;
+      resolve(term ? 128 + osSignalNumber(term) : (code ?? 0));
+    });
   });
 }
 
@@ -228,8 +283,13 @@ async function runProducer(realbin, argv, ctx) {
   const jsonlPath = path.join(sinkDir, `codex-${runId}.jsonl`);
   const jsonlFd = fs.openSync(jsonlPath, fs.constants.O_CREAT | fs.constants.O_WRONLY | fs.constants.O_APPEND, 0o600);
 
-  // exec <jsonFlag> <original exec args...> (argv[0] === 'exec')
-  const childArgs = ['exec', jsonFlag, ...argv.slice(1)];
+  // exec <jsonFlag> <original exec args...> (argv[0] === 'exec').
+  // Insert the JSON flag only when the caller didn't already pass one: on
+  // argv shapes like `exec resume --json <id>` an unconditional prepend both
+  // duplicates the flag and misplaces it ahead of the `resume` subcommand.
+  const rest = argv.slice(1);
+  const hasJsonFlag = rest.some(a => a === jsonFlag || a === '--json' || a === '--experimental-json');
+  const childArgs = hasJsonFlag ? ['exec', ...rest] : ['exec', jsonFlag, ...rest];
   const child = spawnFn(realbin, childArgs, {
     stdio: ['inherit', 'pipe', 'inherit'],
     detached: true, // lead its own process group so we can signal the subtree
@@ -245,10 +305,18 @@ async function runProducer(realbin, argv, ctx) {
   };
 
   return new Promise(resolve => {
+    // An EPIPE on either pipe (the caller closed the read end mid-turn) would
+    // otherwise surface as an uncaught 'error' and kill the shim before the
+    // terminal meta is written. Note the write below is guarded by try/catch, but
+    // a stream write error is delivered ASYNCHRONOUSLY via 'error', not thrown
+    // synchronously — so the guard alone is insufficient. Listen on BOTH the
+    // child's stdout and the caller's stdout; 'close' still settles the run.
+    child.stdout.on('error', () => {});
+    if (typeof stdout.on === 'function') stdout.on('error', () => {});
     child.stdout.on('data', chunk => {
       // Verbatim tee: JSONL sink (append) + caller stdout, byte-identical.
       try { fs.writeSync(jsonlFd, chunk); } catch { /* sink loss must not break the run */ }
-      stdout.write(chunk);
+      try { stdout.write(chunk); } catch { /* caller stdout gone; sink already has it */ }
     });
 
     let signalled = null;
@@ -268,7 +336,11 @@ async function runProducer(realbin, argv, ctx) {
       finish(resolve, 127);
     });
 
-    child.on('exit', (code, signal) => {
+    // 'close' (not 'exit'): 'exit' can fire while child.stdout is still open —
+    // e.g. a descendant inherited the pipe — and later tee'd chunks would then
+    // reach stdout.write() after finish() closed the sink fd, diverging the sink
+    // from the caller's stdout. 'close' fires only once all stdio has ended.
+    child.on('close', (code, signal) => {
       cleanupSignals();
       const terminal = { ...meta };
       if (signal || signalled) {
@@ -325,10 +397,15 @@ const isMain = (() => {
 })();
 
 if (isMain) {
+  // Set exitCode and let the event loop drain rather than process.exit(): with a
+  // piped stdout Node flushes asynchronously, and process.exit() would terminate
+  // before that queue drains, dropping the final teed bytes even though the
+  // synchronous JSONL sink kept them. The shim holds no handles after finish()
+  // closes the sink fd, so the process exits on its own once stdout drains.
   runShim(process.argv.slice(2))
-    .then(code => process.exit(code))
+    .then(code => { process.exitCode = code; })
     .catch(error => {
       try { process.stderr.write(`[codex-shim] fatal: ${error?.message ?? error}\n`); } catch { /* noop */ }
-      process.exit(1);
+      process.exitCode = 1;
     });
 }

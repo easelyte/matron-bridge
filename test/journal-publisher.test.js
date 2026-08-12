@@ -3,7 +3,7 @@ import { EventEmitter } from 'node:events';
 import WebSocket, { WebSocketServer } from 'ws';
 import net from 'net';
 import http from 'node:http';
-import { mkdtempSync, readFileSync, existsSync } from 'fs';
+import { mkdtempSync, readFileSync, existsSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import path from 'path';
 import { createJournalPublisher } from '../lib/journal-publisher.js';
@@ -56,7 +56,11 @@ function startFakeServer({ onHello, onFrame } = {}, port = 0) {
       if (msg.op === 'hello') {
         conn.helloCursor = msg.cursor ?? null;
         const reply = (onHello && onHello(msg, conn, connections.length - 1)) || { seq: 0 };
-        ws.send(JSON.stringify({ kind: 'control', op: 'hello_ok', seq: reply.seq ?? 0 }));
+        // Spread any extra reply fields (e.g. device_id/name identity from the
+        // Phase 3 journal) into hello_ok; every pre-existing onHello returns
+        // only { seq }.
+        const { seq = 0, ...extra } = reply;
+        ws.send(JSON.stringify({ kind: 'control', op: 'hello_ok', seq, ...extra }));
         return;
       }
       conn.frames.push(msg);
@@ -795,6 +799,24 @@ describe('createJournalPublisher', () => {
     await fake.close();
   });
 
+  it('publishSummary enqueues a durable summary publish frame', async () => {
+    const fake = await startFakeServer();
+    const pub = createJournalPublisher({ url: fake.url, token: 'tok', log: silentLog, ...FAST_BACKOFF });
+
+    pub.upsertConvo('convo-1', {});
+    pub.publishSummary('convo-1', { toc: 'Did the thing', detail: 'Now doing X.', model: 'gpt-5.6-luna' });
+
+    await waitFor(() => fake.received.filter(f => f.op === 'publish').length >= 1);
+    const frame = fake.received.find((f) => f.op === 'publish' && f.type === 'summary');
+
+    expect(frame.convo_id).toBe('convo-1');
+    expect(frame.payload).toEqual({ toc: 'Did the thing', detail: 'Now doing X.', model: 'gpt-5.6-luna' });
+    expect(frame.idem_key).toBeTruthy();
+
+    pub.close();
+    await fake.close();
+  });
+
   it('markRead enqueues a read_marker frame with no idem_key, FIFO right after the preceding publish', async () => {
     const fake = await startFakeServer();
     const pub = createJournalPublisher({ url: fake.url, token: 'tok', log: silentLog, ...FAST_BACKOFF });
@@ -1243,6 +1265,33 @@ describe('createJournalPublisher — onEvent + cursor persistence', () => {
     await fake.close();
   });
 
+  it('exposes startSeq = the persisted cursor at construction (the router ghost-answer boundary)', async () => {
+    const fake = await startFakeServer();
+    const cursorFile = tmpCursorFile();
+    writeFileSync(cursorFile, JSON.stringify({ cursor: 42 }));
+    const pub = createJournalPublisher({
+      url: fake.url, token: 'tok', log: silentLog, ...FAST_BACKOFF, ...FAST_CURSOR,
+      cursorFile, onEvent: () => {},
+    });
+    // Fixed at construction (loadPersistedCursor runs synchronously); a
+    // prompt_reply targeting seq <= 42 predates this process and is refused.
+    expect(pub.startSeq).toBe(42);
+    pub.close();
+    await fake.close();
+  });
+
+  it('startSeq is null on first boot (no persisted cursor) so the ghost check is disabled', async () => {
+    const fake = await startFakeServer();
+    const cursorFile = tmpCursorFile(); // never written
+    const pub = createJournalPublisher({
+      url: fake.url, token: 'tok', log: silentLog, ...FAST_BACKOFF, ...FAST_CURSOR,
+      cursorFile, onEvent: () => {},
+    });
+    expect(pub.startSeq).toBeNull();
+    pub.close();
+    await fake.close();
+  });
+
   it('dedupes: a frame with seq <= the last delivered seq is never redelivered to onEvent (replay overlap)', async () => {
     const fake = await startFakeServer();
     const cursorFile = tmpCursorFile();
@@ -1519,5 +1568,407 @@ describe('tool-output streaming (streamAppend / stream_resync / finalizeToolOutp
       pub.streamAppend('c1', 'tu1', 0, 'x', { tool: 'Bash', command: 'x' });
       pub.finalizeToolOutput('c1', 'tu1', {}, null);
     }).not.toThrow();
+  });
+});
+
+// Agent-chat room support (Phase 3): identity capture from hello_ok, the
+// kind:'invite' ephemeral dispatch, op-error dispatch, direct room-op sends,
+// and the summary field on convo_upsert. See docs/protocol.md in
+// matron-journal ("Agent chat rooms").
+describe('createJournalPublisher — agent-chat room ops', () => {
+  const IDENTITY_HELLO = { onHello: () => ({ seq: 0, device_id: 7, name: 'mac-agent' }) };
+
+  it('captures identity from a hello_ok carrying device_id and name', async () => {
+    const fake = await startFakeServer(IDENTITY_HELLO);
+    const pub = createJournalPublisher({ url: fake.url, token: 'tok', log: silentLog, ...FAST_BACKOFF });
+    expect(pub.identity()).toBeNull(); // not yet connected
+    await waitFor(() => pub.identity() !== null);
+    expect(pub.identity()).toEqual({ deviceId: 7, name: 'mac-agent' });
+    pub.close();
+    await fake.close();
+  });
+
+  it('identity stays null against a pre-identity journal (hello_ok without the fields)', async () => {
+    const fake = await startFakeServer(); // default hello_ok: seq only
+    const pub = createJournalPublisher({ url: fake.url, token: 'tok', log: silentLog, ...FAST_BACKOFF });
+    // Prove the handshake completed (a publish is confirmed) before asserting.
+    pub.publishText('c1', { body: 'hi', from: 'user' });
+    await waitFor(() => fake.received.length >= 1);
+    expect(pub.identity()).toBeNull();
+    pub.close();
+    await fake.close();
+  });
+
+  it('dispatches inbound kind:invite frames to onInviteFrame', async () => {
+    const fake = await startFakeServer();
+    const seen = [];
+    const pub = createJournalPublisher({
+      url: fake.url, token: 'tok', log: silentLog, ...FAST_BACKOFF,
+      onInviteFrame: (f) => seen.push(f),
+    });
+    await waitFor(() => fake.connections.length === 1);
+    await delay(50); // hello_ok round-trip
+    const frame = {
+      kind: 'invite', event: 'request', room_id: 'r1',
+      from_device_id: 4, from_name: 'dev-2', topic: 'ci', justification: 'need logs',
+    };
+    fake.connections[0].ws.send(JSON.stringify(frame));
+    await waitFor(() => seen.length === 1);
+    expect(seen[0]).toEqual(frame);
+    pub.close();
+    await fake.close();
+  });
+
+  it('ignores malformed invite frames (missing event or room_id) and survives them', async () => {
+    const fake = await startFakeServer();
+    const seen = [];
+    const pub = createJournalPublisher({
+      url: fake.url, token: 'tok', log: silentLog, ...FAST_BACKOFF,
+      onInviteFrame: (f) => seen.push(f),
+    });
+    await waitFor(() => fake.connections.length === 1);
+    await delay(50);
+    const push = (f) => fake.connections[0].ws.send(JSON.stringify(f));
+    push({ kind: 'invite', room_id: 'r1' });                      // no event
+    push({ kind: 'invite', event: 'request' });                   // no room_id
+    push({ kind: 'invite', event: 42, room_id: 'r1' });           // non-string event
+    push({ kind: 'invite', event: 'request', room_id: 7 });       // non-string room_id
+    // then a valid one proves the socket handler survived all of the above
+    push({ kind: 'invite', event: 'delivered', room_id: 'r-ok' });
+    await waitFor(() => seen.length === 1);
+    expect(seen[0].room_id).toBe('r-ok');
+    pub.close();
+    await fake.close();
+  });
+
+  it('a throwing onInviteFrame warns and does not kill the socket handler', async () => {
+    const fake = await startFakeServer();
+    const warnings = [];
+    const seen = [];
+    const pub = createJournalPublisher({
+      url: fake.url, token: 'tok', log: { warn: (m) => warnings.push(m), error: () => {} }, ...FAST_BACKOFF,
+      onInviteFrame: (f) => { seen.push(f); if (f.room_id === 'boom') throw new Error('boom'); },
+    });
+    await waitFor(() => fake.connections.length === 1);
+    await delay(50);
+    fake.connections[0].ws.send(JSON.stringify({ kind: 'invite', event: 'request', room_id: 'boom' }));
+    await waitFor(() => warnings.some((w) => w.includes('onInviteFrame handler threw')));
+    fake.connections[0].ws.send(JSON.stringify({ kind: 'invite', event: 'request', room_id: 'after' }));
+    await waitFor(() => seen.length === 2);
+    pub.close();
+    await fake.close();
+  });
+
+  it('dispatches inbound kind:spawn frames to onSpawnFrame', async () => {
+    const fake = await startFakeServer();
+    const seen = [];
+    const pub = createJournalPublisher({
+      url: fake.url, token: 'tok', log: silentLog, ...FAST_BACKOFF,
+      onSpawnFrame: (f) => seen.push(f),
+    });
+    await waitFor(() => fake.connections.length === 1);
+    await delay(50); // hello_ok round-trip
+    const frame = { kind: 'spawn', event: 'pending', request_id: 'r' };
+    fake.connections[0].ws.send(JSON.stringify(frame));
+    await waitFor(() => seen.length === 1);
+    expect(seen[0]).toEqual(frame);
+    pub.close();
+    await fake.close();
+  });
+
+  it('ignores a malformed spawn frame (missing event) and survives it', async () => {
+    const fake = await startFakeServer();
+    const seen = [];
+    const pub = createJournalPublisher({
+      url: fake.url, token: 'tok', log: silentLog, ...FAST_BACKOFF,
+      onSpawnFrame: (f) => seen.push(f),
+    });
+    await waitFor(() => fake.connections.length === 1);
+    await delay(50);
+    const push = (f) => fake.connections[0].ws.send(JSON.stringify(f));
+    push({ kind: 'spawn', request_id: 'r' });              // no event
+    push({ kind: 'spawn', event: 42, request_id: 'r' });   // non-string event
+    push({ kind: 'spawn', event: 'outcome' });             // no request_id
+    push({ kind: 'spawn', event: 'outcome', request_id: 7 });   // non-string request_id
+    push({ kind: 'spawn', event: 'outcome', request_id: '' });  // empty request_id
+    push({ kind: 'spawn', event: 'outcome', request_id: 'x'.repeat(129) }); // over the 128 wire cap
+    push({ kind: 'spawn', event: 'pending', request_id: 'r-ok' });
+    await waitFor(() => seen.length === 1);
+    expect(seen[0].request_id).toBe('r-ok');
+    pub.close();
+    await fake.close();
+  });
+
+  it('the absence of onSpawnFrame does not throw on an inbound spawn frame', async () => {
+    const fake = await startFakeServer();
+    const pub = createJournalPublisher({ url: fake.url, token: 'tok', log: silentLog, ...FAST_BACKOFF });
+    await waitFor(() => fake.connections.length === 1);
+    await delay(50);
+    expect(() => fake.connections[0].ws.send(JSON.stringify({ kind: 'spawn', event: 'pending', request_id: 'r' }))).not.toThrow();
+    await delay(50);
+    pub.close();
+    await fake.close();
+  });
+
+  it('a throwing onSpawnFrame warns and does not kill the socket handler', async () => {
+    const fake = await startFakeServer();
+    const warnings = [];
+    const seen = [];
+    const pub = createJournalPublisher({
+      url: fake.url, token: 'tok', log: { warn: (m) => warnings.push(m), error: () => {} }, ...FAST_BACKOFF,
+      onSpawnFrame: (f) => { seen.push(f); if (f.request_id === 'boom') throw new Error('boom'); },
+    });
+    await waitFor(() => fake.connections.length === 1);
+    await delay(50);
+    fake.connections[0].ws.send(JSON.stringify({ kind: 'spawn', event: 'pending', request_id: 'boom' }));
+    await waitFor(() => warnings.some((w) => w.includes('onSpawnFrame handler threw')));
+    fake.connections[0].ws.send(JSON.stringify({ kind: 'spawn', event: 'pending', request_id: 'after' }));
+    await waitFor(() => seen.length === 2);
+    pub.close();
+    await fake.close();
+  });
+
+  it('dispatches inbound error frames to onOpError with {code, ref, detail, roomId:null when absent}, after the warn-once', async () => {
+    const fake = await startFakeServer({
+      onFrame: (msg) => (msg.op === 'agent_invite'
+        ? { kind: 'control', op: 'error', code: 'offline', ref: 'agent_invite', detail: 'peer bridge offline' }
+        : null),
+    });
+    const warnings = [];
+    const opErrors = [];
+    const pub = createJournalPublisher({
+      url: fake.url, token: 'tok', log: { warn: (m) => warnings.push(m), error: () => {} }, ...FAST_BACKOFF,
+      onOpError: (e) => opErrors.push(e),
+    });
+    await waitFor(() => fake.connections.length === 1);
+    await delay(50);
+    expect(pub.sendRoomOp({ op: 'agent_invite', room_id: 'r1', target_device_id: 4, justification: 'j' })).toBe(true);
+    await waitFor(() => opErrors.length === 1);
+    expect(opErrors[0]).toEqual({ code: 'offline', ref: 'agent_invite', detail: 'peer bridge offline', roomId: null });
+    // The pre-existing warn-once still fired for the same frame.
+    expect(warnings.some((w) => w.includes('server error frame'))).toBe(true);
+    pub.close();
+    await fake.close();
+  });
+
+  it('an error frame\'s room_id (newer journals) reaches onOpError as roomId', async () => {
+    const fake = await startFakeServer({
+      onFrame: (msg) => (msg.op === 'agent_invite'
+        ? { kind: 'control', op: 'error', code: 'conflict', ref: 'agent_invite', detail: 'dup', room_id: 'r-err' }
+        : null),
+    });
+    const opErrors = [];
+    const pub = createJournalPublisher({
+      url: fake.url, token: 'tok', log: silentLog, ...FAST_BACKOFF,
+      onOpError: (e) => opErrors.push(e),
+    });
+    await waitFor(() => fake.connections.length === 1);
+    await delay(50);
+    expect(pub.sendRoomOp({ op: 'agent_invite', room_id: 'r-err', target_device_id: 4, justification: 'j' })).toBe(true);
+    await waitFor(() => opErrors.length === 1);
+    expect(opErrors[0]).toEqual({ code: 'conflict', ref: 'agent_invite', detail: 'dup', roomId: 'r-err' });
+    pub.close();
+    await fake.close();
+  });
+
+  it('an empty-string or numeric room_id on an error frame normalizes to roomId:null (non-empty-string guard)', async () => {
+    // Pins the guard against a `?? null` simplification: '' must not become
+    // a falsy-but-present key, and a numeric id must never reach the
+    // string-keyed waiter map in agent-invites.
+    const fake = await startFakeServer({
+      onFrame: (msg) => (msg.op === 'agent_invite'
+        ? { kind: 'control', op: 'error', code: 'conflict', ref: 'agent_invite', detail: 'dup',
+            room_id: msg.room_id === 'r-empty' ? '' : 7 }
+        : null),
+    });
+    const opErrors = [];
+    const pub = createJournalPublisher({
+      url: fake.url, token: 'tok', log: silentLog, ...FAST_BACKOFF,
+      onOpError: (e) => opErrors.push(e),
+    });
+    await waitFor(() => fake.connections.length === 1);
+    await delay(50);
+    expect(pub.sendRoomOp({ op: 'agent_invite', room_id: 'r-empty', target_device_id: 4, justification: 'j' })).toBe(true);
+    await waitFor(() => opErrors.length === 1);
+    expect(pub.sendRoomOp({ op: 'agent_invite', room_id: 'r-num', target_device_id: 4, justification: 'j' })).toBe(true);
+    await waitFor(() => opErrors.length === 2);
+    expect(opErrors[0]).toEqual({ code: 'conflict', ref: 'agent_invite', detail: 'dup', roomId: null });
+    expect(opErrors[1]).toEqual({ code: 'conflict', ref: 'agent_invite', detail: 'dup', roomId: null });
+    pub.close();
+    await fake.close();
+  });
+
+  it('a throwing onOpError is swallowed (handler survives)', async () => {
+    const fake = await startFakeServer({
+      onFrame: (msg) => (msg.op === 'agent_invite'
+        ? { kind: 'control', op: 'error', code: 'conflict', ref: 'agent_invite' }
+        : null),
+    });
+    const opErrors = [];
+    const pub = createJournalPublisher({
+      url: fake.url, token: 'tok', log: silentLog, ...FAST_BACKOFF,
+      onOpError: (e) => { opErrors.push(e); throw new Error('boom'); },
+    });
+    await waitFor(() => fake.connections.length === 1);
+    await delay(50);
+    pub.sendRoomOp({ op: 'agent_invite', room_id: 'r1', target_device_id: 4, justification: 'j' });
+    await waitFor(() => opErrors.length === 1);
+    // Socket still alive: a publish still round-trips.
+    pub.publishText('c1', { body: 'still alive', from: 'user' });
+    await waitFor(() => fake.received.some((f) => f.op === 'publish'));
+    pub.close();
+    await fake.close();
+  });
+
+  it('sendRoomOp: false before connect, true after, and the frame arrives verbatim', async () => {
+    const fake = await startFakeServer(IDENTITY_HELLO);
+    const pub = createJournalPublisher({ url: fake.url, token: 'tok', log: silentLog, ...FAST_BACKOFF });
+    const frame = { op: 'agent_invite', room_id: 'room-9', target_device_id: 4, topic: 'ci', justification: 'because' };
+    expect(pub.sendRoomOp(frame)).toBe(false); // not connected yet — refused, not queued
+    await waitFor(() => pub.identity() !== null); // hello_ok landed
+    expect(pub.sendRoomOp(frame)).toBe(true);
+    await waitFor(() => fake.received.length >= 1);
+    expect(fake.received[0]).toEqual(frame);
+    // The refused pre-connect send was NOT queued: exactly one copy arrived.
+    await delay(50);
+    expect(fake.received.filter((f) => f.op === 'agent_invite').length).toBe(1);
+    pub.close();
+    await fake.close();
+  });
+
+  it('upsertConvo carries summary when given and omits it otherwise', async () => {
+    const fake = await startFakeServer();
+    const pub = createJournalPublisher({ url: fake.url, token: 'tok', log: silentLog, ...FAST_BACKOFF });
+    pub.upsertConvo('c1', { title: 'Room A', summary: 'Working on CI flakes.' });
+    pub.upsertConvo('c1', { sessionState: 'running' });
+    await waitFor(() => fake.received.length >= 2);
+    expect(fake.received[0]).toMatchObject({ op: 'convo_upsert', convo_id: 'c1', title: 'Room A', summary: 'Working on CI flakes.' });
+    expect(fake.received[1].summary).toBeUndefined();
+    expect('summary' in fake.received[1]).toBe(false);
+    pub.close();
+    await fake.close();
+  });
+
+  it('the disabled no-op publisher exposes all four new methods', async () => {
+    const noop = createJournalPublisher({ url: null, token: null, log: silentLog });
+    expect(noop.sendRoomOp({ op: 'agent_leave', room_id: 'r' })).toBe(false);
+    expect(noop.identity()).toBeNull();
+    await expect(noop.fetchRoster()).resolves.toBeNull();
+    await expect(noop.fetchMessages('c1')).resolves.toBeNull();
+  });
+});
+
+// Agent-chat HTTP GETs (roster + room-message reads) — same derived-base-URL,
+// Bearer-auth, null-on-any-failure convention as uploadMedia/fetchMedia.
+describe('createJournalPublisher — roster/messages HTTP GETs', () => {
+  const ROSTER = {
+    agents: [{ device_id: 4, name: 'dev-2' }],
+    conversations: [{ id: 'c1', title: 'CI flakes', session_state: 'running', summary: 's', agent_device_id: 4, last_ts: 123 }],
+  };
+
+  it('fetchRoster: happy path GETs /roster with Bearer auth and returns the parsed body', async () => {
+    const httpServer = await startFakeHttpServer((entry, res) => {
+      if (entry.url === '/roster') {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify(ROSTER));
+      } else {
+        res.writeHead(404); res.end();
+      }
+    });
+    const wsUrl = `ws://127.0.0.1:${httpServer.port}/ws`;
+    const pub = createJournalPublisher({ url: wsUrl, token: 'tok-roster', log: silentLog, ...FAST_BACKOFF });
+
+    const result = await pub.fetchRoster();
+    expect(result).toEqual(ROSTER);
+
+    const reqs = httpServer.received.filter((r) => r.url === '/roster');
+    expect(reqs.length).toBe(1);
+    expect(reqs[0].method).toBe('GET');
+    expect(reqs[0].headers['authorization']).toBe('Bearer tok-roster');
+
+    pub.close();
+    await httpServer.close();
+  });
+
+  it('fetchRoster: a non-2xx response resolves null, never throws', async () => {
+    const httpServer = await startFakeHttpServer((_entry, res) => { res.writeHead(403); res.end(); });
+    const wsUrl = `ws://127.0.0.1:${httpServer.port}/ws`;
+    const pub = createJournalPublisher({ url: wsUrl, token: 'tok', log: silentLog, ...FAST_BACKOFF });
+    await expect(pub.fetchRoster()).resolves.toBeNull();
+    pub.close();
+    await httpServer.close();
+  });
+
+  it('fetchRoster: a network failure (nothing listening) resolves null, never throws', async () => {
+    const port = await getFreePort();
+    const pub = createJournalPublisher({ url: `ws://127.0.0.1:${port}/ws`, token: 'tok', log: silentLog, ...FAST_BACKOFF });
+    await expect(pub.fetchRoster()).resolves.toBeNull();
+    pub.close();
+  });
+
+  it('fetchMessages: happy path GETs /convo/:id/messages with limit and Bearer, omitting before_seq when null', async () => {
+    const events = { events: [{ seq: 1, type: 'text', sender: 'agent:dev-2', payload: { body: 'hi' } }] };
+    const httpServer = await startFakeHttpServer((entry, res) => {
+      if (entry.url.startsWith('/convo/')) {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify(events));
+      } else {
+        res.writeHead(404); res.end();
+      }
+    });
+    const wsUrl = `ws://127.0.0.1:${httpServer.port}/ws`;
+    const pub = createJournalPublisher({ url: wsUrl, token: 'tok-msgs', log: silentLog, ...FAST_BACKOFF });
+
+    const result = await pub.fetchMessages('room-1');
+    expect(result).toEqual(events);
+
+    const reqs = httpServer.received.filter((r) => r.url.startsWith('/convo/'));
+    expect(reqs.length).toBe(1);
+    expect(reqs[0].method).toBe('GET');
+    expect(reqs[0].headers['authorization']).toBe('Bearer tok-msgs');
+    const url = new URL(reqs[0].url, 'http://x');
+    expect(url.pathname).toBe('/convo/room-1/messages');
+    expect(url.searchParams.get('limit')).toBe('50'); // default
+    expect(url.searchParams.has('before_seq')).toBe(false); // omitted when null
+
+    pub.close();
+    await httpServer.close();
+  });
+
+  it('fetchMessages: carries before_seq and a custom limit when given', async () => {
+    const httpServer = await startFakeHttpServer((_entry, res) => {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ events: [] }));
+    });
+    const wsUrl = `ws://127.0.0.1:${httpServer.port}/ws`;
+    const pub = createJournalPublisher({ url: wsUrl, token: 'tok', log: silentLog, ...FAST_BACKOFF });
+
+    await pub.fetchMessages('room-2', { beforeSeq: 42, limit: 10 });
+
+    const reqs = httpServer.received.filter((r) => r.url.startsWith('/convo/'));
+    expect(reqs.length).toBe(1);
+    const url = new URL(reqs[0].url, 'http://x');
+    expect(url.pathname).toBe('/convo/room-2/messages');
+    expect(url.searchParams.get('before_seq')).toBe('42');
+    expect(url.searchParams.get('limit')).toBe('10');
+
+    pub.close();
+    await httpServer.close();
+  });
+
+  it('fetchMessages: a non-2xx response resolves null, never throws', async () => {
+    const httpServer = await startFakeHttpServer((_entry, res) => { res.writeHead(403); res.end(); });
+    const wsUrl = `ws://127.0.0.1:${httpServer.port}/ws`;
+    const pub = createJournalPublisher({ url: wsUrl, token: 'tok', log: silentLog, ...FAST_BACKOFF });
+    await expect(pub.fetchMessages('room-3')).resolves.toBeNull();
+    pub.close();
+    await httpServer.close();
+  });
+
+  it('fetchMessages: a network failure (nothing listening) resolves null, never throws', async () => {
+    const port = await getFreePort();
+    const pub = createJournalPublisher({ url: `ws://127.0.0.1:${port}/ws`, token: 'tok', log: silentLog, ...FAST_BACKOFF });
+    await expect(pub.fetchMessages('room-4')).resolves.toBeNull();
+    pub.close();
   });
 });

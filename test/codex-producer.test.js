@@ -274,7 +274,93 @@ describe('producer shim — signal forwarding + no orphan (T-6.4)', () => {
     const meta = JSON.parse(fs.readFileSync(path.join(sink, metaName), 'utf8'));
     expect(meta.interrupted).toBe(true);
     expect(Object.hasOwn(meta, 'exitCode')).toBe(false);
+  }, 20000); // 3x waitFor (5s each) + a subprocess spawn exceed the 5s default;
+  // give the real failure room to surface instead of a framework-timeout abort.
+});
+
+describe('producer shim — JSON flag insertion (no duplicate/misplaced)', () => {
+  it('does not re-insert --json when the caller already passed it (exec resume --json)', () => {
+    const dir = makeDir();
+    fs.mkdirSync(path.join(dir, 'real'));
+    const argvFile = path.join(dir, 'argv.txt');
+    // Record the child's argv, then emit a minimal completed stream.
+    const real = writeFakeCodex(path.join(dir, 'real'), {
+      body: [
+        '  cat >/dev/null',
+        `  printf '%s\\n' "$@" > ${JSON.stringify(argvFile)}`,
+        "  printf '%s\\n' '{\"type\":\"turn.completed\"}'",
+      ].join('\n'),
+    });
+    const sink = path.join(dir, 'sink');
+    const { code } = runShimSubprocess(['exec', 'resume', '--json', '-'], {
+      env: { MATRON_CODEX_REAL_BIN: real, MATRON_CODEX_SINK_DIR: sink },
+      input: 'hi\n',
+    });
+    expect(code).toBe(0);
+    const argv = fs.readFileSync(argvFile, 'utf8').split('\n').filter(Boolean);
+    // Exactly one --json, and `resume` still immediately follows `exec`.
+    expect(argv.filter(a => a === '--json')).toHaveLength(1);
+    expect(argv[0]).toBe('exec');
+    expect(argv[1]).toBe('resume');
   });
+
+  it('inserts --json exactly once when the caller omitted it (exec -)', () => {
+    const dir = makeDir();
+    fs.mkdirSync(path.join(dir, 'real'));
+    const argvFile = path.join(dir, 'argv.txt');
+    const real = writeFakeCodex(path.join(dir, 'real'), {
+      body: [
+        '  cat >/dev/null',
+        `  printf '%s\\n' "$@" > ${JSON.stringify(argvFile)}`,
+        "  printf '%s\\n' '{\"type\":\"turn.completed\"}'",
+      ].join('\n'),
+    });
+    const sink = path.join(dir, 'sink');
+    const { code } = runShimSubprocess(['exec', '-'], {
+      env: { MATRON_CODEX_REAL_BIN: real, MATRON_CODEX_SINK_DIR: sink },
+      input: 'hi\n',
+    });
+    expect(code).toBe(0);
+    const argv = fs.readFileSync(argvFile, 'utf8').split('\n').filter(Boolean);
+    expect(argv.filter(a => a === '--json')).toHaveLength(1);
+    expect(argv[0]).toBe('exec');
+    expect(argv[1]).toBe('--json');
+  });
+});
+
+describe('producer shim — passthrough forwards signals + no orphan', () => {
+  it('forwards SIGTERM to the passthrough child group and reaps it (non-exec subcommand)', async () => {
+    const dir = makeDir();
+    fs.mkdirSync(path.join(dir, 'real'));
+    const pidFile = path.join(dir, 'child.pid');
+    // A non-exec subcommand routes through passthrough(); make it long-lived so
+    // an unforwarded signal would orphan it (the wedge Dan flagged).
+    const realPath = path.join(dir, 'real', 'codex');
+    fs.writeFileSync(realPath, [
+      '#!/usr/bin/env bash',
+      `if [[ "$1" != "exec" ]]; then echo $$ > ${JSON.stringify(pidFile)}; sleep 30; exit 0; fi`,
+      'exit 0',
+      '',
+    ].join('\n'));
+    fs.chmodSync(realPath, 0o755);
+
+    const child = spawn(process.execPath, [SHIM, 'login'], {
+      env: { PATH: process.env.PATH, MATRON_CODEX_REAL_BIN: realPath },
+      stdio: ['pipe', 'pipe', 'pipe'],
+    });
+
+    await waitFor(() => fs.existsSync(pidFile) && fs.readFileSync(pidFile, 'utf8').trim().length > 0);
+    const childPid = Number(fs.readFileSync(pidFile, 'utf8').trim());
+
+    const exitCode = await new Promise(resolve => {
+      child.on('exit', (code, signal) => resolve(signal ? `sig:${signal}` : code));
+      child.kill('SIGTERM');
+    });
+    expect(exitCode === 143 || exitCode === 'sig:SIGTERM').toBe(true);
+
+    await waitFor(() => !isAlive(childPid));
+    expect(isAlive(childPid)).toBe(false);
+  }, 20000);
 });
 
 // T-1.7: live smoke against a REAL codex (flat-rate CLI). Skipped where no

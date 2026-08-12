@@ -41,6 +41,18 @@ describe('planQueueFlush', () => {
     expect(mirrorText).toBe('one\n\ntwo\n\nthree');
   });
 
+  // planQueueFlush itself is unchanged by the compact-first rule — the split
+  // happens upstream (lib/compact-priority.js), and what arrives here is a
+  // one-entry batch. Pinned because the whole point of the split is that
+  // /compact reaches Claude as its own clean message, not concatenated with
+  // anything: merged with a second entry it reads as *compaction
+  // instructions* and that entry's work is silently never done.
+  it('a lone compact batch becomes exactly one text block, uncontaminated', () => {
+    const { blocks, mirrorText } = planQueueFlush([text('/compact')]);
+    expect(blocks).toEqual([{ type: 'text', text: '/compact' }]);
+    expect(mirrorText).toBe('/compact');
+  });
+
   it('all-Matron (journal-origin) queue: one merged send, mirrors nothing', () => {
     const { blocks, mirrorText } = planQueueFlush([
       markJournalOrigin(text('a')),

@@ -555,6 +555,18 @@ describe('bridge watcher wiring', () => {
     expect(WatcherClass).not.toHaveBeenCalled();
   });
 
+  it('is off by default — constructs no watcher unless explicitly enabled', () => {
+    const WatcherClass = vi.fn();
+
+    const watcher = createCodexWatcherIfEnabled(
+      { dir: '/unused' },
+      { env: {}, WatcherClass },
+    );
+
+    expect(watcher).toBeNull();
+    expect(WatcherClass).not.toHaveBeenCalled();
+  });
+
   it.each(['construction', 'startup'])('fails open when watcher %s throws', async failure => {
     const onFailure = vi.fn();
     const log = { warn: vi.fn() };
@@ -591,11 +603,13 @@ describe('bridge watcher wiring', () => {
     const WatcherClass = vi.fn();
     const log = { warn: vi.fn() };
 
-    // MATRON_CODEX_REAL_BIN set → the real detectProducer returns true even with
-    // the shim absent from PATH (no false-disable of the valid wrapper producer).
+    // MATRON_CODEX_REAL_BIN set to a RESOLVABLE binary → the real detectProducer
+    // returns true even with the shim absent from PATH (no false-disable of the
+    // valid wrapper producer). process.execPath always resolves; detectProducer
+    // now requires the configured bin to exist, so an arbitrary path won't do.
     const watcher = createCodexWatcherIfEnabled(
       { dir: '/unused' },
-      { env: { MATRON_CODEX_VIZ: '1', MATRON_CODEX_REAL_BIN: '/usr/bin/codex' }, WatcherClass, log },
+      { env: { MATRON_CODEX_VIZ: '1', MATRON_CODEX_REAL_BIN: process.execPath }, WatcherClass, log },
     );
 
     expect(watcher).not.toBeNull();

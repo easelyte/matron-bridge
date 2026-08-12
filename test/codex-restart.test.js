@@ -168,6 +168,7 @@ describe('Codex restart reconciliation', () => {
 
     await Promise.resolve(); // bridge boot completes before this session appears
     const registered = registerCodexWatcherForLiveSession(liveSessions, 'late-room', {}, {
+      env: { MATRON_CODEX_VIZ: '1' },
       WatcherClass: ExistingWatcher,
       detectProducer: () => true, // T-1.6: a producer is present in this scenario
     });

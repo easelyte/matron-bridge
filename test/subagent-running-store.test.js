@@ -4,31 +4,22 @@ import path from 'node:path';
 import os from 'node:os';
 import { createSubagentRunningStore } from '../lib/subagent-running-store.js';
 
-function tmpFile() {
-  return path.join(os.tmpdir(), `subagent-running-${process.pid}-${Math.random().toString(16).slice(2)}.json`);
-}
-
 describe('subagent-running-store', () => {
+  let dir;
   let file;
   let store;
 
   beforeEach(() => {
-    file = tmpFile();
+    // A private 0700 temp DIR (not a bare name in the shared tmpdir) so the
+    // store file + its siblings (.tmp, .corrupt-*) can't collide with or be
+    // pre-created by another user, and cleanup is a single recursive remove.
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'subagent-running-'));
+    file = path.join(dir, 'store.json');
     store = createSubagentRunningStore({ file });
   });
 
   afterEach(() => {
-    for (const f of [file, `${file}.tmp`]) {
-      try { fs.unlinkSync(f); } catch { /* ignore */ }
-    }
-    // Quarantined corrupt files (file.corrupt-<ts>) from the corruption test.
-    try {
-      const dir = path.dirname(file);
-      const base = path.basename(file);
-      for (const name of fs.readdirSync(dir)) {
-        if (name.startsWith(`${base}.corrupt-`)) fs.unlinkSync(path.join(dir, name));
-      }
-    } catch { /* ignore */ }
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
   });
 
   it('list() is empty before anything is added (missing file)', () => {

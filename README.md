@@ -1,6 +1,6 @@
 # matron-bridge
 
-Chat with Claude Code or Codex CLI sessions from anywhere. The bridge spawns and manages coding-agent sessions on your dev box and connects them to a [matron-journal](https://github.com/Matronhq/matron-journal) server, so the native Matron apps ([iOS](https://github.com/Matronhq/matron-apple), [desktop](https://github.com/Matronhq/matron-desktop), [web](https://github.com/Matronhq/matron-web)) can chat with them — including live typing/streaming indicators and a return path for user input.
+**matron-bridge** runs beside the Claude Code and Codex CLIs on your dev box, spawns and manages agent sessions, and publishes them to a [matron-journal](https://github.com/Matronhq/matron-journal) server. The Matron apps — [Apple](https://github.com/Matronhq/matron-apple) (iPhone + Mac), [Android](https://github.com/Matronhq/matron-android), [desktop](https://github.com/Matronhq/matron-desktop), and [web](https://github.com/Matronhq/matron-web) — chat with those sessions from anywhere, with live streaming and a return path for user input. See [matron.chat](https://matron.chat) for the overview.
 
 Claude uses `--print` structured JSON streaming. Codex uses the stable programmatic `codex exec --json` interface, starting one process per turn and resuming the same Codex thread automatically.
 
@@ -35,7 +35,7 @@ brew install cloudflared
 ```bash
 npm install
 cp .env.example .env
-# Edit .env — set JOURNAL_WS_URL + JOURNAL_TOKEN_FILE (or JOURNAL_TOKEN) and ALLOWED_USER_IDS
+# Edit .env — set JOURNAL_WS_URL + JOURNAL_TOKEN_FILE (or JOURNAL_TOKEN), ALLOWED_USER_IDS, and HMAC_SECRET (openssl rand -hex 32) for file/secret links
 npm start
 ```
 
@@ -71,7 +71,9 @@ You can keep Claude Code as the default and select Codex per conversation instea
 
 After changing `.env`, restart the bridge or re-run the service installer as described below. See [Using the Codex backend](docs/codex.md) for sandbox guidance, `/switch` behavior, provider-specific commands, files/media, and troubleshooting.
 
-To run as a managed service, use the OS-detecting installer:
+### Run as a managed service
+
+Use the OS-detecting installer:
 
 ```bash
 setup/install.sh                # installs npm deps, seeds .env
@@ -89,23 +91,23 @@ After editing `.env`, re-run `setup/service.sh` (on macOS, launchd has no
 `EnvironmentFile` equivalent — values are inlined into the plist at install
 time).
 
-## Publishing The Viewer On macOS
+## Publishing the viewer
 
-The macOS service installer starts both matron-bridge and the local file viewer. The viewer listens on `127.0.0.1:$MATRON_VIEWER_PORT` and powers file links, secure secret requests, and one-time sensitive-data links.
+The service installer starts two units on both Linux and macOS: the bridge and the local file viewer. The viewer listens on `127.0.0.1:$MATRON_VIEWER_PORT` and powers file links, secure secret requests, and one-time sensitive-data links.
 
 To make those links usable from Matron clients, set `VIEWER_BASE_URL` to a public HTTPS URL that forwards to the local viewer (e.g. via a Cloudflare named tunnel or your own reverse proxy pointed at `127.0.0.1:$MATRON_VIEWER_PORT`). The bridge no longer ships its own Cloudflare tunnel helper — provisioning the tunnel/DNS is a dev-box-level concern, not something this repo manages.
 
 ### Live command output rides the journal protocol
 
 Live Bash output streams to Matron clients over the authenticated
-matron-journal WebSocket (`stream_append` frames — see the design spec
-`docs/superpowers/specs/2026-07-13-tool-output-streaming-design.md` in the
-matron-journal repo). It no longer uses `VIEWER_BASE_URL` or the viewer's
+matron-journal WebSocket (`stream_append` frames — see the
+[tool-output streaming design spec](https://github.com/Matronhq/matron-journal/blob/master/docs/superpowers/specs/2026-07-13-tool-output-streaming-design.md)
+in the matron-journal repo). It no longer uses `VIEWER_BASE_URL` or the viewer's
 `/live/ws` endpoint, and new `chat.matron.live_output` events carry no
 `viewer_url`. The viewer service is still required for file links, secure
 secret requests, and one-time sensitive-data links.
 
-## Managing The Service
+## Managing the service
 
 **Linux (systemd):**
 
@@ -115,6 +117,8 @@ secret requests, and one-time sensitive-data links.
 | Restart | `sudo systemctl restart matron-bridge` |
 | Logs | `journalctl -u matron-bridge -f` |
 | Stop | `sudo systemctl stop matron-bridge` |
+
+The installer also manages `matron-bridge-viewer` — substitute that unit name for viewer status and logs.
 
 **macOS (launchd, user scope):**
 
@@ -148,6 +152,13 @@ For `SCOPE=system` setups, replace `gui/$UID` with `system` and `~/Library/Launc
 | `LINK_EXPIRY_MS` | Signed URL expiry in ms | `900000` (15 min) |
 | `MATRON_BRIDGE_API_PORT` | Internal API port (hooks, MCP, viewer) | `9802` |
 | `MATRON_VIEWER_PORT` | Local file viewer port | `9803` |
+| `DOWNLOAD_RATE_LIMIT` | Viewer requests per minute for file downloads and sensitive-link shell pages | `30` |
+| `REVEAL_RATE_LIMIT` | Viewer requests per minute for `POST /sensitive/reveal`, counted separately so shell loads cannot exhaust it | `30` |
+| `WHISPER_MODEL_PATH` | whisper.cpp model for voice-note transcription | `~/.local/share/whisper-cpp/models/ggml-small.bin` |
+| `WHISPER_LANGUAGE` | Voice-note transcription language | `en` |
+| `OPENAI_API_KEY` | Optional OpenAI API key; when set, preferred for conversation titles and rolling TOC summaries (using `gpt-5.6-luna` by default) | — |
+| `GEMINI_API_KEY` | Optional Gemini API key; used as fallback summarizer when `OPENAI_API_KEY` is unset; both key and summary features are skipped when both are empty | — |
+| `SUMMARY_MODEL` | Overrides the active provider's default model for titles and summaries; applies to whichever of OpenAI or Gemini is configured | — |
 
 ## Commands
 
@@ -157,9 +168,9 @@ For `SCOPE=system` setups, replace `gui/$UID` with `system` and `~/Library/Launc
 |---|---|
 | `!start [--claude\|--codex] [workdir]` | Start a session with the selected agent (optional custom workdir) |
 | `!start now` | Start a fresh session (skip resume offer) |
-| `!start --browser [workdir]` | Claude only: also load the chrome-devtools MCP (off by default to save ~260M/session). The flag is order-independent and also accepted by `!resume`, `!workdir`, and `!restart`. |
+| `!start --browser [workdir]` | Claude only: also load the chrome-devtools MCP (off by default to save ~400M/session). The flag is order-independent and also accepted by `!resume`, `!workdir`, and `!restart`. |
 | `!stop` | Stop the current session |
-| `!restart [--browser]` | Stop and immediately resume the session (`--browser` is Claude-only) |
+| `!restart [--force] [--browser]` | Restart the session; mid-turn it waits for the turn to finish unless `--force` is given (`--browser` is Claude-only) |
 | `!resume [--claude\|--codex] <n\|id> [--browser]` | Resume a previous session (`--browser` is Claude-only) |
 | `!sessions [--claude\|--codex]` | List past sessions for an agent |
 | `!workdir [--claude\|--codex] <path> [--browser]` | Start an agent session in another working directory (`--browser` is Claude-only) |
@@ -169,13 +180,18 @@ For `SCOPE=system` setups, replace `gui/$UID` with `system` and `~/Library/Launc
 | `!working` | Toggle tool call visibility |
 | `!mcp` | Show MCP server status |
 | `!model [model-id\|default]` | Show or change the active provider's model |
-| `!mode` | Show the active mode (Codex is programmatic-only) |
+| `!mode [interactive\|print]` | Show or switch the Claude session between PTY-interactive and `--print` mode (Codex is programmatic-only); see `MATRON_INTERACTIVE_MODE` above |
+| `!login` / `!logout` | Log in to / out of your Anthropic account (auto-switches the session to interactive mode) |
 | `!effort [level]` | Show or set reasoning effort (Claude only; use Codex config for Codex) |
 | `!cost` | Show session cost |
 | `!usage` | Show token usage stats |
 | `!limits` | Show subscription limits when the active backend exposes them (not available for Codex) |
+| `!timer <duration> <message>` | Send a message to this chat later (e.g. `!timer 30m /compact`); `!timer` lists pending timers, `!timer cancel <id\|all>` cancels |
+| `!context` | Claude's context report trimmed to the model and token headline; `!context-full` prints the untrimmed report |
 | `!tools` | List available tools |
 | `!help` | Show available commands |
+
+While the agent is busy, messages queue automatically; `!esc` cancels the current turn without killing the session, and sending `interrupt` force-interrupts.
 
 Any other message is forwarded directly to the selected agent. Claude Code slash commands (e.g. `/commit`, `/review-pr`) are passed through in Claude interactive mode; Codex programmatic sessions treat messages as normal task prompts. `/model` changes a model within the active provider; `/switch` hands the bridge conversation between Claude and Codex.
 
@@ -188,7 +204,7 @@ What rides the journal connection:
 - **Outbound mirror** — session output, uploaded files/images (media mirroring), and read-marker advances are published as journal events. The media HTTP endpoint is derived from `JOURNAL_WS_URL`; no extra config.
 - **Ephemeral live UX** — activity indicators (typing / "running `<command>`…") and in-progress assistant-text streaming for Matron clients viewing the conversation. Best-effort: never queued or replayed, so an outage means a missed indicator, not a stale one.
 - **Return path** — user messages and prompt-button replies sent from Matron clients are routed into the owning coding-agent session. The inbound cursor persists to `JOURNAL_CURSOR_FILE` so a restart resumes where it left off.
-- **Control convo** — one stable conversation (`JOURNAL_CONTROL_CONVO_ID`, default `bridge-<hostname>`) accepts session-management commands from Matron clients: `/start [--claude|--codex] [dir]` (alias `new`), `/sessions [--claude|--codex]` (alias `list`), `/resume`, `/workdir`, `/help`. Session-scoped commands (`/status`, `/stop`, …) don't apply there — they belong to each session's own conversation. `/` and `!` prefixes are interchangeable.
+- **Control convo** — one stable conversation (`JOURNAL_CONTROL_CONVO_ID`, default `bridge-<hostname>`) accepts session-management commands from Matron clients: `/start [--claude|--codex] [dir]` (alias `new`), `/sessions [--claude|--codex]` (alias `list`), `/resume`, `/workdir`, `/help`. Session-scoped commands (`/status`, `/stop`, …) don't apply there — they belong to each session's own conversation.
 
 | Variable | Description | Default |
 |---|---|---|
@@ -200,6 +216,20 @@ What rides the journal connection:
 | `JOURNAL_STREAM_INTERVAL_MS` | Streaming-overlay coalescing floor (at most one in-progress frame per conversation+message per window) | `200` |
 
 Provision the agent token on the journal server with `matron-admin agent add <user> <device-name>`.
+
+## Agent-to-agent chat
+
+Bridge sessions on the same journal server can chat with each other. An agent room is an ordinary journal conversation plus an invite lifecycle: the session that starts a room owns it, invited sessions join as guests, and pending invites expire after 30 minutes. Room state survives bridge restarts.
+
+Every session gets these MCP tools via `ask-user.js`:
+
+- `agent_roster` — list the user's other agent sessions (titles, states, rolling summaries)
+- `agent_chat_start` — pick a target from the roster and invite its agent to a new room
+- `agent_chat_accept` / `agent_chat_refuse` — answer an inbound chat request
+- `agent_chat_join` / `agent_chat_leave` — ask to join an existing room by id, or leave one
+- `agent_chat_send` / `agent_chat_read` — post to a room, or catch up on its recent messages
+
+Inbound requests are also posted into the invited session's conversation, so the user sees who asked and why. Invites never block: the inviting agent keeps working, and answers and room replies arrive as later turns.
 
 ## How it works
 
@@ -214,6 +244,17 @@ Provision the agent token on the journal server with `matron-admin agent add <us
 9. Crashed sessions auto-restart up to 3 times
 10. Messages sent while an agent is busy are queued and sent when the turn completes
 
+## Development
+
+```bash
+npm test        # vitest suite
+npm run lint    # eslint, zero warnings allowed
+npm run check   # node --check on every entrypoint
+npm run ci      # lint + check + test + npm audit (high)
+```
+
+CI runs the same gates on Node 20 and 22.
+
 ## File structure
 
 ```
@@ -222,7 +263,7 @@ matron-bridge/
 ├── lib/                  # Bridge modules: journal-* (Matron transport), command
 │                         # dispatch, prompt detection/buttons, PTY interactive mode,
 │                         # media mirroring, transcription, session summaries, …
-├── ask-user.js           # MCP server for user questions / secure secret flows
+├── ask-user.js           # MCP server: secret requests, sensitive-data links, attachments, agent-chat room tools
 ├── BRIDGE_CLAUDE.md      # Extra instructions for bridge-spawned Claude sessions
 ├── BRIDGE_CODEX.md       # Extra instructions for bridge-spawned Codex turns
 ├── docs/codex.md         # Codex setup, switching, security, and troubleshooting
@@ -231,7 +272,6 @@ matron-bridge/
 ├── setup/                # OS-dispatching installer, service, whisper
 ├── hooks/                # Claude Code hooks used by bridge sessions
 ├── test/                 # Vitest suite
-├── docs/
 ├── SECURITY.md
 ├── package.json
 └── .env.example

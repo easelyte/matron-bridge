@@ -23,13 +23,39 @@ The bridge:
 
 The installed Codex CLI remains responsible for model access, authentication, user/project configuration, `AGENTS.md`, skills, rules, MCP servers, and tool execution.
 
-Before Codex events are durably published, the bridge applies the canonical
-value-pattern policy and also redacts assignment values whose keys look secret
-(for example, `DATABASE_PASSWORD=...` or `"API_TOKEN": "..."`). Recognizable
-raw environment dumps are dropped as an additional safeguard. Pattern-based
-redaction cannot decide that an arbitrary value is secret: a secret under a
-non-secret-looking key whose value matches no configured pattern may pass and
-must not be printed into agent output.
+### Enabling the live view
+
+The Codex live view is opt-in. Set `MATRON_CODEX_VIZ=1` in the bridge environment
+to activate it. When it is unset (the default), the bridge provisions no sink
+directory and starts no watcher, so existing sessions behave exactly as before.
+
+The live view needs an event **producer** on the session's PATH. With
+`MATRON_CODEX_VIZ=1` the bridge deploys one automatically: it prepends its
+shipped `bin/shim` directory to each launched session's `PATH`, so the session's
+`codex` resolves to the redaction-aware producer shim (which forwards to the real
+`codex` found later on PATH). No manual PATH step is required. A son-of-anton–style
+integration that sets `MATRON_CODEX_REAL_BIN` to a redaction-aware wrapper is also
+recognized as a producer; the activation guard evaluates the session's environment
+(not the bridge's), and if neither a shim on PATH nor a resolvable
+`MATRON_CODEX_REAL_BIN` is present it logs one warning and leaves the live view
+disabled rather than rendering a silent empty view.
+
+Sink directories accumulate under `~/.claude/matron/codex-sinks/<sessionId>/`
+(outside Claude Code's own pruned project tree). The bridge sweeps stale session
+sink dirs at boot — staleness is measured from a session's newest run activity
+(its `codex-runs/` writes), not from when the session dir was created, so a
+long-lived but still-active session is not pruned. Override the retention window
+with `MATRON_CODEX_SINK_RETENTION_MS` (default 7 days).
+
+Before Codex events are durably published, the bridge redacts assignment values
+whose keys look secret (for example, `DATABASE_PASSWORD=...` or
+`"API_TOKEN": "..."`) and drops recognizable raw environment dumps as an
+additional safeguard. This built-in secret-key baseline always applies. An
+optional value-pattern policy adds format-based rules on top (for example, known
+token shapes); point `MATRON_REDACTOR_CONFIG` at a YAML policy file to enable it.
+Pattern-based redaction cannot decide that an arbitrary value is secret: a secret
+under a non-secret-looking key whose value matches no configured pattern may pass
+and must not be printed into agent output.
 
 ### Accepted single-principal residual
 
@@ -41,25 +67,23 @@ historical restart reconciliation, bound malformed data and volume but do not
 establish provenance. Runs beyond either budget are omitted after one durable
 notice on the parent conversation.
 
-This is accepted only for the current single-principal deployment, where the
-operator's own trusted sessions share the principal. It follows the P67 trust
-model and the accepted `show_file` token-isolation residual: forgery
-within the operator's own journal is not a new cross-principal capability.
-Out-of-band, bridge-stamped run registration through a mediator that descendants
-cannot forge is a hard prerequisite before any multi-principal or curated-toolset
-(Nastia) deployment. The current bridge does not claim that provenance.
+This is accepted only for a single-principal deployment, where the operator's own
+trusted sessions share the OS principal: forgery within the operator's own journal
+is not a new cross-principal capability. Out-of-band, bridge-stamped run
+registration through a mediator that descendants cannot forge is a hard
+prerequisite before any multi-principal or shared-toolset deployment. The current
+bridge does not claim that provenance.
 
-### Activation-gating residual
+### Known outcome-delivery edge
 
 The common disconnected-journal case is repaired by reconnect outcome re-emit
 and terminal-field coalescing. A narrower edge remains if a parent session is
 replaced during the outage after its terminal frame has been evicted from the
 bounded publisher queue: the old tracker is no longer attached to a session,
 so its child outcome cannot be re-emitted and the journal may continue to show
-that child as running. Before `EPIPE_TOLERANT_VERSIONS` is changed to activate
-the visualization, this must be closed with a session-independent terminal
-ledger that re-emits outcomes until the publisher receives authoritative
-acknowledgement.
+that child as running. Closing this fully would require a session-independent
+terminal ledger that re-emits outcomes until the publisher receives an
+authoritative acknowledgement.
 
 ## Install and authenticate
 

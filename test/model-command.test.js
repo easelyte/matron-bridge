@@ -101,10 +101,25 @@ describe('planPrintModelSwitch', () => {
     expect(d.ok).toBe(false);
     expect(d.message).toMatch(/Unknown model/);
   });
-  it('refuses while the session is busy', () => {
-    const d = planPrintModelSwitch({ busy: true, claudeSessionId: 'abc' }, 'sonnet');
+  // Mid-turn is no longer a refusal: the planner hands back a defer signal
+  // (with the normalized alias) so the caller can park `!model <alias>` on
+  // the deferred-command stash — replayed at the turn-end seam BEFORE the
+  // queue flush, so the switch applies ahead of every queued message,
+  // /compact included.
+  it('defers while the session is busy, normalized alias included', () => {
+    const d = planPrintModelSwitch({ busy: true, claudeSessionId: 'abc', _sessionConfirmed: true }, '  SONNET ');
     expect(d.ok).toBe(false);
-    expect(d.message).toMatch(/turn/i);
+    expect(d.defer).toBe(true);
+    expect(d.normalized).toBe('sonnet');
+    expect(d.message).toMatch(/queued/i);
+    expect(d.message).toMatch(/before any queued/i);
+  });
+
+  it('still rejects an unknown alias outright while busy — never parks garbage', () => {
+    const d = planPrintModelSwitch({ busy: true, claudeSessionId: 'abc' }, 'banana');
+    expect(d.ok).toBe(false);
+    expect(d.defer).toBeFalsy();
+    expect(d.message).toMatch(/Unknown model/);
   });
   it('refuses while the session has no id yet (fresh print session)', () => {
     const d = planPrintModelSwitch({ busy: false, claudeSessionId: null }, 'sonnet');

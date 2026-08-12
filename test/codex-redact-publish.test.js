@@ -1,5 +1,6 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { homedir, tmpdir } from 'node:os';
+import { createHash } from 'node:crypto';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import { createCodexConvoTracker } from '../lib/codex-convos.js';
@@ -11,7 +12,6 @@ const RUN_ID = '1722600000000-1234-abcd';
 const SCHEMA_VERSION = 'codex-cli 0.146.0';
 const SENTINEL = 'SENTINEL_CREDENTIAL';
 const REDACTED = '[REDACTED:test]';
-const CANONICAL_WORKSPACE = path.join(homedir(), '.openclaw', 'workspace');
 
 function replaceSentinel(value) {
   return value.replaceAll(SENTINEL, REDACTED);
@@ -65,9 +65,9 @@ function commandEvent(command, output = 'ok') {
 }
 
 describe('publish-side Codex redaction', () => {
-  it('uses the canonical policy shape and hashed replacement format', () => {
+  it('uses the policy shape and hashed replacement format', () => {
     const redact = createPublishRedactor({
-      configPath: '/test/lesson_redactor.yaml',
+      configPath: '/test/redactor.yaml',
       readFileSyncFn: () => POLICY,
     });
 
@@ -76,7 +76,7 @@ describe('publish-side Codex redaction', () => {
 
   it('does not classify ordinary identifier collisions as secret keys', () => {
     const redact = createPublishRedactor({
-      configPath: '/test/lesson_redactor.yaml',
+      configPath: '/test/redactor.yaml',
       readFileSyncFn: () => POLICY,
     });
 
@@ -86,46 +86,69 @@ describe('publish-side Codex redaction', () => {
     expect(redact('AUTH=hidden\nGOOGLE_TOKEN=hidden')).not.toContain('=hidden');
   });
 
-  it('loads the real canonical policy and redacts its representative secret families', () => {
-    const policyPath = resolveRedactorConfigPath({ env: {} });
-    expect(policyPath).toBe(path.join(CANONICAL_WORKSPACE, 'memory/config/lesson_redactor.yaml'));
-    const redact = createPublishRedactor({ env: {} });
-    const samples = [
-      ['aws-access-key-id', 'AKIAIOSFODNN7EXAMPLE'],
-      ['aws-secret-access-key', `aws secret access key: ${'a'.repeat(40)}`],
-      ['anthropic-api-key', `sk-ant-${'a'.repeat(24)}`],
-      ['openai-api-key', `sk-${'b'.repeat(24)}`],
-      ['github-token', `ghp_${'c'.repeat(36)}`],
-      ['slack-token', 'xoxb-EXAMPLEONLYNOTAREALTOKEN'],
-      ['bearer-token', `Bearer ${'d'.repeat(24)}`],
-      ['telegram-bot-token', `123456789:${'e'.repeat(30)}`],
-      ['private-key-pem', '-----BEGIN PRIVATE KEY-----'],
-      ['tavily-api-key', `tvly-${'f'.repeat(24)}`],
-    ];
-    const canonicalPolicy = readFileSync(policyPath, 'utf8');
-    for (const [name, sample] of samples) {
-      expect(canonicalPolicy).toContain(`name: ${name}`);
-      expect(redact(sample), name).not.toContain(sample);
-      expect(redact(sample), name).toContain(`[REDACTED:${name}:`);
-    }
-    // Google OAuth is not currently a named canonical rule, but the shared
-    // secret-key belt still protects it when emitted as environment output.
+  it('applies the built-in baseline when no policy is configured', () => {
+    // With no policy file the redactor still runs the built-in secret-key /
+    // private-key-PEM / env-dump belt. It never reads from disk in this mode.
+    const reads = [];
+    const redact = createPublishRedactor({
+      env: {},
+      readFileSyncFn: file => {
+        reads.push(file);
+        return '';
+      },
+    });
+    expect(redact('API_KEY=unstructured-value')).not.toContain('unstructured-value');
     expect(redact('GOOGLE_TOKEN=ya29.a0AfH6SMB-example_token')).not.toContain('ya29.');
+    expect(redact('-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----'))
+      .toContain('[REDACTED:private-key-pem:');
+    // The baseline is key-oriented: an ordinary identifier is left intact.
+    expect(redact('author=Alice')).toBe('author=Alice');
+    expect(reads).toEqual([]);
+  });
+
+  it('layers optional policy value-patterns on top of the baseline', () => {
+    // An optional YAML policy adds value-format rules (bare tokens with no
+    // key=) on top of the built-in belt, with the hashed replacement format.
+    const policy = [
+      'patterns:',
+      '  - name: aws-access-key-id',
+      "    regex: 'AKIA[0-9A-Z]{16}'",
+      '  - name: github-token',
+      "    regex: 'ghp_[A-Za-z0-9]{36}'",
+    ].join('\n');
+    const redact = createPublishRedactor({
+      configPath: '/test/redactor.yaml',
+      readFileSyncFn: () => policy,
+    });
+    expect(redact('AKIAIOSFODNN7EXAMPLE')).toMatch(/^\[REDACTED:aws-access-key-id:[0-9a-f]{8}\]$/);
+    expect(redact(`ghp_${'c'.repeat(36)}`)).toMatch(/^\[REDACTED:github-token:[0-9a-f]{8}\]$/);
+    // The built-in belt still fires alongside the extra patterns.
     expect(redact('API_KEY=unstructured-value')).not.toContain('unstructured-value');
   });
 
-  it('resolves an explicit tilde config and otherwise uses the canonical workspace root', () => {
+  it('resolves an explicit tilde config, an env override, and a workspace root', () => {
+    // Explicit configPath wins and tilde-expands.
     expect(resolveRedactorConfigPath({
-      workspaceRoot: '/canonical/workspace',
+      workspaceRoot: '/some/workspace',
       configPath: '~/policy/redactor.yaml',
       homedir: '/home/tester',
       env: {},
     })).toBe('/home/tester/policy/redactor.yaml');
+    // The MATRON_REDACTOR_CONFIG env var is honored when no configPath is given.
     expect(resolveRedactorConfigPath({
       homedir: '/home/tester',
+      env: { MATRON_REDACTOR_CONFIG: '/etc/matron/redactor.yaml' },
+    })).toBe('/etc/matron/redactor.yaml');
+    // A workspaceRoot supplies a conventional location.
+    expect(resolveRedactorConfigPath({
+      workspaceRoot: '/some/workspace',
+      homedir: '/home/tester',
       env: {},
-    })).toBe('/home/tester/.openclaw/workspace/memory/config/lesson_redactor.yaml');
+    })).toBe('/some/workspace/config/redactor.yaml');
+    // With nothing configured there is no path (baseline-only mode).
+    expect(resolveRedactorConfigPath({ homedir: '/home/tester', env: {} })).toBeNull();
 
+    // Baseline-only redactor never touches the filesystem.
     const reads = [];
     const redact = createPublishRedactor({
       homedir: '/home/tester',
@@ -136,8 +159,7 @@ describe('publish-side Codex redaction', () => {
       },
     });
     redact('safe');
-    expect(reads).toEqual(['/home/tester/.openclaw/workspace/memory/config/lesson_redactor.yaml']);
-    expect(reads[0]).not.toContain('/arbitrary/session-workdir');
+    expect(reads).toEqual([]);
   });
 
   it.each([
@@ -170,7 +192,7 @@ describe('publish-side Codex redaction', () => {
   ])('fails closed for %s instead of applying a partial policy', (_label, policy) => {
     const log = { error: vi.fn() };
     const redact = createPublishRedactor({
-      configPath: '/test/lesson_redactor.yaml',
+      configPath: '/test/redactor.yaml',
       readFileSyncFn: () => policy,
       log,
     });
@@ -187,10 +209,109 @@ describe('publish-side Codex redaction', () => {
     ['inline case flag', 'prefix(?i)token', 'PREFIXTOKEN'],
   ])('translates canonical Python regex feature %s', (_label, regex, sample) => {
     const redact = createPublishRedactor({
-      configPath: '/test/lesson_redactor.yaml',
+      configPath: '/test/redactor.yaml',
       readFileSyncFn: () => ['patterns:', '  - name: translated', `    regex: '${regex}'`].join('\n'),
     });
     expect(redact(sample)).toMatch(/^\[REDACTED:translated:[0-9a-f]{8}\]$/);
+  });
+
+  it('keys the redaction marker so it correlates within a run but is not a plaintext fingerprint', () => {
+    const redact = createPublishRedactor({});
+    const first = redact('password=hunter2');
+    const second = redact('password=hunter2');
+    const marker = /\[REDACTED:secret-key:([0-9a-f]{8})\]/.exec(first)?.[1];
+
+    expect(marker).toMatch(/^[0-9a-f]{8}$/);
+    // Identical secret -> identical marker within the process: the useful property.
+    expect(second).toBe(first);
+    // ...but the marker is an HMAC under a per-process key, not a bare sha256
+    // prefix of the plaintext, so it can't be brute-forced offline from the journal.
+    const plaintextFingerprint = createHash('sha256').update('hunter2', 'utf8').digest('hex').slice(0, 8);
+    expect(marker).not.toBe(plaintextFingerprint);
+  });
+
+  const makeOversizeRedactor = (overrides = {}) => createPublishRedactor({
+    configPath: '/test/redactor.yaml',
+    readFileSyncFn: () => ['patterns:', '  - name: cc', '    regex: SECRETVAL'].join('\n'),
+    maxOperatorPatternBytes: 32,
+    ...overrides,
+  });
+
+  it('defaults to fail-closed truncate over the size threshold: drops the un-vetted tail', () => {
+    const log = { warn: vi.fn() };
+    const redact = makeOversizeRedactor({ log });
+
+    // A secret past the bound (after 64 chars) must NOT publish once the payload is
+    // over the operator-pattern limit — the old fail-open let it through.
+    const oversize = `${'x'.repeat(64)}\npassword=hunter2\nSECRETVAL`;
+    const out = redact(oversize);
+    expect(out).not.toContain('SECRETVAL');
+    expect(out).toContain('[REDACTED-OVERSIZE:');
+    expect(log.warn).toHaveBeenCalledOnce();
+
+    // A second oversize input does not warn again.
+    redact(`${oversize}\nmore`);
+    expect(log.warn).toHaveBeenCalledOnce();
+
+    // A small input still runs the operator pattern in full.
+    expect(redact('SECRETVAL')).toMatch(/^\[REDACTED:cc:[0-9a-f]{8}\]$/);
+  });
+
+  it('truncate still fully redacts operator secrets that fall within the bounded head', () => {
+    const redact = makeOversizeRedactor();
+    // SECRETVAL sits in the first 32 chars → inside the head → redacted; tail dropped.
+    const out = redact(`SECRETVAL\n${'x'.repeat(200)}`);
+    expect(out).not.toContain('SECRETVAL');
+    expect(out).toMatch(/\[REDACTED:cc:[0-9a-f]{8}\]/);
+    expect(out).toContain('[REDACTED-OVERSIZE:');
+  });
+
+  it("oversizePolicy 'drop' withholds the whole payload", () => {
+    const redact = makeOversizeRedactor({ oversizePolicy: 'drop' });
+    const out = redact(`${'x'.repeat(64)}\nSECRETVAL`);
+    expect(out).not.toContain('SECRETVAL');
+    expect(out).not.toContain('x'.repeat(64));
+    expect(out).toMatch(/^\[REDACTED-OVERSIZE: \d+B payload withheld/);
+  });
+
+  it("oversizePolicy 'skip' preserves the legacy fail-open behavior (opt-in)", () => {
+    const redact = makeOversizeRedactor({ oversizePolicy: 'skip' });
+    const oversize = `${'x'.repeat(64)}\npassword=hunter2\nSECRETVAL`;
+    const out = redact(oversize);
+    // Legacy: operator pattern skipped so SECRETVAL survives, baseline still redacts.
+    expect(out).toContain('SECRETVAL');
+    expect(out).toContain('[REDACTED:secret-key:');
+  });
+
+  it('reads the oversize policy from MATRON_REDACT_OVERSIZE_POLICY when no explicit option is set', () => {
+    const redact = makeOversizeRedactor({ env: { MATRON_REDACT_OVERSIZE_POLICY: 'skip' } });
+    const out = redact(`${'x'.repeat(64)}\nSECRETVAL`);
+    expect(out).toContain('SECRETVAL'); // env-selected 'skip' → operator pattern skipped
+  });
+
+  it('measures the bound in UTF-8 bytes, not UTF-16 code units', () => {
+    const redact = makeOversizeRedactor(); // 32-byte bound
+    // 30 three-byte chars = 30 code units (< 32) but 90 UTF-8 bytes (> 32). A
+    // code-unit check would wrongly treat this as under the bound.
+    const out = redact('中'.repeat(30));
+    expect(out).toContain('[REDACTED-OVERSIZE:'); // detected as oversize despite <32 code units
+  });
+
+  it('drops a secret that straddles the truncation cut — never a partial prefix', () => {
+    const redact = makeOversizeRedactor(); // 32-byte bound
+    // The safe head ends at the last newline within the bound (byte 9). SECRETVAL
+    // begins after it, so it lands entirely in the dropped tail.
+    const out = redact(`8 chars.\nSECRETVAL${'x'.repeat(80)}`);
+    expect(out).not.toContain('SECRET'); // not even a prefix of the secret leaks
+    expect(out).toContain('[REDACTED-OVERSIZE:');
+  });
+
+  it('drops the whole payload (empty head) when no newline fits in the bound', () => {
+    const redact = makeOversizeRedactor(); // 32-byte bound
+    const out = redact(`${'x'.repeat(64)}\nSECRETVAL`); // no newline in the first 32 bytes
+    expect(out).not.toContain('x'.repeat(64));
+    expect(out).not.toContain('SECRETVAL');
+    expect(out.startsWith('[REDACTED-OVERSIZE:')).toBe(true); // annotation only, no partial line
   });
 
   it('redacts every allowlisted string and excludes unknown fields before publishing', () => {
@@ -295,7 +416,7 @@ describe('publish-side Codex redaction', () => {
 
   it('redacts a secret-key assignment after a harmless NUL-delimited segment', () => {
     const redact = createPublishRedactor({
-      configPath: '/test/lesson_redactor.yaml',
+      configPath: '/test/redactor.yaml',
       readFileSyncFn: () => POLICY,
     });
     const output = redact('HOME=/root\0API_TOKEN=unstructured-secret\0PATH=/bin');
@@ -303,6 +424,32 @@ describe('publish-side Codex redaction', () => {
     expect(output).not.toContain('unstructured-secret');
     expect(output).toContain('HOME=/root\0API_TOKEN=[REDACTED:secret-key:');
     expect(output).toContain('\0PATH=/bin');
+  });
+
+  it.each([
+    ['space-separated', 'curl --password hunter2 https://x', 'hunter2'],
+    ['equals-separated', 'curl --password=hunter2 https://x', 'hunter2'],
+    ['single-dash long flag', 'tool -token opaque-secret-value', 'opaque-secret-value'],
+    ['hyphenated key suffix', 'svc --api-key abc123def --verbose', 'abc123def'],
+    ['auth flag mid-command', 'mytool --auth Bearer-xyz next-arg', 'Bearer-xyz'],
+    ['quoted value with spaces', 'cmd --secret "s3 cr3t val" tail', 's3 cr3t val'],
+  ])('redacts a secret-named CLI flag value (%s)', (_label, input, secret) => {
+    const redact = createPublishRedactor({
+      configPath: '/test/redactor.yaml',
+      readFileSyncFn: () => POLICY,
+    });
+    const output = redact(input);
+    expect(output).not.toContain(secret);
+    expect(output).toContain('[REDACTED:secret-key:');
+  });
+
+  it('leaves non-secret CLI flags and their values untouched', () => {
+    const redact = createPublishRedactor({
+      configPath: '/test/redactor.yaml',
+      readFileSyncFn: () => POLICY,
+    });
+    const input = 'curl --output result.json --retry 3 https://example.com';
+    expect(redact(input)).toBe(input);
   });
 
   it.each([
@@ -328,7 +475,7 @@ describe('publish-side Codex redaction', () => {
     ],
   ])('fully redacts %s before line-oriented handling', (_label, input, secrets) => {
     const redact = createPublishRedactor({
-      configPath: '/test/lesson_redactor.yaml',
+      configPath: '/test/redactor.yaml',
       readFileSyncFn: () => POLICY,
     });
     const output = redact(input);
@@ -473,7 +620,7 @@ describe('publish-side Codex redaction', () => {
   it('uses one production redactor for every publication route and the child title', () => {
     const publisher = makePublisher();
     const redact = createPublishRedactor({
-      configPath: '/test/lesson_redactor.yaml',
+      configPath: '/test/redactor.yaml',
       readFileSyncFn: () => POLICY,
     });
     const cases = [

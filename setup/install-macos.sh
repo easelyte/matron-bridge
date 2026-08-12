@@ -25,7 +25,7 @@ echo "User: $SERVICE_USER"
 echo
 
 if ! command -v node >/dev/null 2>&1; then
-  echo "ERROR: node not found on PATH. Install Node.js 20+ (e.g. 'brew install node@20')." >&2
+  echo "ERROR: node not found on PATH. Install Node.js 22+ (e.g. 'brew install node@22')." >&2
   exit 1
 fi
 

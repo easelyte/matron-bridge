@@ -130,9 +130,10 @@ describe('validateAndOpen', () => {
     }
   });
 
-  it('rejects a file whose descriptor size changes after reading', async () => {
-    const filePath = path.join(dir, 'mutated.txt');
-    writeFileSync(filePath, 'abcdef');
+  // Helper: spy fs open so that every read of `filePath` truncates it to
+  // `truncateTo` after returning, simulating a file that changes size between
+  // the stat-time snapshot and read completion.
+  const withSizeChangingRead = async (filePath, truncateTo, fn) => {
     const actualOpen = fsp.open.bind(fsp);
     let readSpy;
     const openSpy = vi.spyOn(fsp, 'open').mockImplementation(async (...args) => {
@@ -140,18 +141,69 @@ describe('validateAndOpen', () => {
       const actualRead = fd.read.bind(fd);
       readSpy = vi.spyOn(fd, 'read').mockImplementation(async (...readArgs) => {
         const result = await actualRead(...readArgs);
-        await fsp.truncate(filePath, 1);
+        await fsp.truncate(filePath, truncateTo);
         return result;
       });
       return fd;
     });
-
     try {
-      expect(await denied(filePath, { workdir: dir })).toBe('unreadable');
+      return await fn();
     } finally {
       readSpy?.mockRestore();
       openSpy.mockRestore();
     }
+  };
+
+  it('strict mode rejects a file whose descriptor size changes after reading', async () => {
+    const filePath = path.join(dir, 'mutated-strict.txt');
+    writeFileSync(filePath, 'abcdef');
+    await withSizeChangingRead(filePath, 1, async () => {
+      expect(await denied(filePath, { workdir: dir, strictSnapshot: true })).toBe('unreadable');
+    });
+  });
+
+  // Helper: same-length in-place overwrite mid-read. Size is unchanged, so the
+  // size-only guard would miss it; mtime/ctime move, which strict mode catches.
+  const withContentChangingRead = async (filePath, replacement, fn) => {
+    const actualOpen = fsp.open.bind(fsp);
+    let readSpy;
+    const openSpy = vi.spyOn(fsp, 'open').mockImplementation(async (...args) => {
+      const fd = await actualOpen(...args);
+      const actualRead = fd.read.bind(fd);
+      readSpy = vi.spyOn(fd, 'read').mockImplementation(async (...readArgs) => {
+        const result = await actualRead(...readArgs);
+        writeFileSync(filePath, replacement);
+        const future = new Date(Date.now() + 10_000);
+        await fsp.utimes(filePath, future, future);
+        return result;
+      });
+      return fd;
+    });
+    try {
+      return await fn();
+    } finally {
+      readSpy?.mockRestore();
+      openSpy.mockRestore();
+    }
+  };
+
+  it('strict mode rejects a same-size in-place overwrite during read', async () => {
+    const filePath = path.join(dir, 'mutated-content-strict.txt');
+    writeFileSync(filePath, 'abcdef');
+    await withContentChangingRead(filePath, 'ABCDEF', async () => {
+      expect(await denied(filePath, { workdir: dir, strictSnapshot: true })).toBe('unreadable');
+    });
+  });
+
+  it('default (non-strict) mode returns the bounded snapshot for a size-changing file', async () => {
+    const filePath = path.join(dir, 'mutated-serve.txt');
+    writeFileSync(filePath, 'abcdef');
+    const { content } = await withSizeChangingRead(filePath, 1, () =>
+      validateAndOpen(filePath, { workdir: dir }),
+    );
+    // The read captured all 6 stat-time bytes before the truncate, so /view +
+    // /download serve that bounded snapshot rather than 404-ing a live file.
+    expect(content.toString()).toBe('abcdef');
   });
 
   it('rejects a symlink at the final component', async () => {

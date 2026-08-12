@@ -162,6 +162,47 @@ describe('codex watcher isolation', () => {
     });
   });
 
+  it('enqueues the best-effort breaker note once during an outage, re-arming only on reconnect', () => {
+    const bestEffortCalls = [];
+    const publisher = {
+      // Simulates a journal outage: enqueues but never acknowledges delivery
+      // (onDelivered is captured, never invoked).
+      publishTextBestEffort(convoId, payload, options) {
+        bestEffortCalls.push({ convoId, payload, options });
+        return true;
+      },
+    };
+    const isolation = createCodexWatcherIsolation({
+      sessionId: 'breaker-outage',
+      publisher,
+      getParentConvoId: () => 'parent-breaker-outage',
+      terminalize: () => false,
+      isAdmittedRun: () => false,
+      breakerThreshold: 1,
+      log: { info() {}, warn() {} },
+    });
+
+    // Trip the breaker, then hammer the hot path (guardSession fires per sink
+    // write). Without the enqueued-latch this would enqueue a duplicate note
+    // per call and flood the shared best-effort queue.
+    isolation.guardSession('poll', () => { throw new Error('scan failed'); });
+    expect(isolation.isDisabled()).toBe(true);
+    for (let i = 0; i < 5; i += 1) isolation.guardSession('fs-watch', () => 'noop');
+    expect(bestEffortCalls).toHaveLength(1);
+
+    // Reconnect replay reads the pending note and re-arms the hot path.
+    const pending = isolation.pendingBreakerNote();
+    expect(pending).toMatchObject({ idemKey: 'breaker-outage:breaker' });
+    isolation.guardSession('fs-watch', () => 'noop');
+    expect(bestEffortCalls).toHaveLength(2);
+
+    // Once delivery is acknowledged, the note is latched permanently.
+    isolation.markBreakerNoteDelivered();
+    for (let i = 0; i < 5; i += 1) isolation.guardSession('fs-watch', () => 'noop');
+    expect(bestEffortCalls).toHaveLength(2);
+    expect(isolation.pendingBreakerNote()).toBeNull();
+  });
+
   it('disables, terminalizes every child, then posts the breaker note', () => {
     const order = [];
     let isolation;

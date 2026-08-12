@@ -11,26 +11,27 @@
     "start": "node index.js",
     "test": "vitest run",
     "lint": "eslint . --max-warnings=0",
-    "check": "node --check index.js && node --check ask-user.js && node --check viewer/server.js && node --check viewer/start.js && node --check lib/transcribe.js && node --check lib/inline-image.js && node --check lib/viewer-tokens.js && node --check lib/mcp-config-mac.js && node --check lib/mcp-config.js && node --check lib/pre-trust.js && node --check lib/pty-input.js && node --check lib/transcript-tail.js && node --check lib/prompt-detector.js && node --check lib/prompt-answer-delivery.js && node --check lib/interactive-session.js && node --check lib/iv-uploads.js && node --check lib/journal-publisher.js && node --check lib/journal-title-seed.js && node --check lib/codex-oneshot.js && node --check lib/pinned-summary.js && node --check lib/journal-stream.js && node --check lib/tool-stream-pump.js && node --check lib/busy-queue.js && node --check lib/journal-input-router.js && node --check lib/permission-registry.js && node --check lib/journal-media.js && node --check lib/queue-flush.js && node --check lib/command-dispatch.js && node --check lib/agent-backend.js && node --check lib/agent-handoff.js && node --check lib/codex-session.js && node --check lib/file-link-guard.js && node --check lib/print-interrupt.js && node --check lib/session-summary.js && node --check test/stub-claude.mjs && node --check lib/journal-rpc.js && node --check lib/recent-folders.js && node --check lib/spawn-guard.js",
+    "check": "node --check index.js && node --check ask-user.js && node --check viewer/server.js && node --check viewer/start.js && node --check lib/transcribe.js && node --check lib/inline-image.js && node --check lib/viewer-tokens.js && node --check lib/mcp-config-mac.js && node --check lib/mcp-config.js && node --check lib/pre-trust.js && node --check lib/pty-input.js && node --check lib/transcript-tail.js && node --check lib/prompt-detector.js && node --check lib/prompt-answer-delivery.js && node --check lib/interactive-session.js && node --check lib/transcript-dir.js && node --check lib/iv-uploads.js && node --check lib/journal-publisher.js && node --check lib/journal-title-seed.js && node --check lib/journal-stream.js && node --check lib/tool-stream-pump.js && node --check lib/busy-queue.js && node --check lib/journal-input-router.js && node --check lib/convo-seq-registry.js && node --check lib/journal-media.js && node --check lib/queue-flush.js && node --check lib/compact-priority.js && node --check lib/command-dispatch.js && node --check lib/timer-command.js && node --check lib/agent-backend.js && node --check lib/agent-handoff.js && node --check lib/codex-session.js && node --check lib/file-link-guard.js && node --check lib/print-interrupt.js && node --check lib/session-summary.js && node --check test/stub-claude.mjs && node --check lib/journal-rpc.js && node --check lib/recent-folders.js && node --check lib/spawn-guard.js && node --check lib/atomic-write.js && node --check lib/send-attachment.js && node --check lib/agent-rooms.js && node --check lib/agent-invites.js && node --check lib/room-delivery.js && node --check lib/peer-text.js && node --check lib/agent-chat.js && node --check lib/room-reply-waiters.js && node --check lib/invite-target.js && node --check lib/summary-model.js && node --check lib/summary-pass.js && node --check lib/inflight-marker.js && node --check lib/codex-oneshot.js && node --check lib/pinned-summary.js && node --check lib/permission-registry.js",
     "audit:high": "npm audit --audit-level=high",
     "ci": "npm run lint && npm run check && npm test && npm run audit:high"
   },
   "dependencies": {
-    "@anthropic-ai/sdk": "^0.111.0",
-    "@modelcontextprotocol/sdk": "^1.29.0",
-    "diff": "^7.0.0",
+    "@anthropic-ai/sdk": "^0.115.0",
+    "@google/generative-ai": "^0.24.1",
+    "@modelcontextprotocol/sdk": "^1.30.0",
+    "diff": "^9.0.0",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
-    "express-rate-limit": "^8.6.0",
+    "express-rate-limit": "^8.6.2",
     "node-pty": "^1.0.0",
     "sharp": "^0.35.3",
-    "ws": "^8.21.0",
+    "ws": "^8.21.2",
     "zod": "^4.4.3"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
-    "eslint": "^10.7.0",
-    "globals": "^17.7.0",
+    "eslint": "^10.8.0",
+    "globals": "^17.9.0",
     "vitest": "^4.1.10"
   },
   "license": "AGPL-3.0-only",
@@ -39,6 +40,11 @@
     "qs": "^6.14.1",
     "tough-cookie": "^4.1.4",
     "sanitize-html": "^2.17.4",
-    "fast-uri": "^3.1.2"
+    "fast-uri": "^3.1.5",
+    "brace-expansion": "^5.0.9",
+    "ip-address": "^10.4.0",
+    "postcss": "^8.5.26",
+    "hono": "^4.12.34",
+    "@hono/node-server": "^2.0.5"
   }
 }
