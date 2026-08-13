@@ -5432,18 +5432,25 @@ async function maybeUpdatePinnedSummary(session) {
 // would wait for the NEXT turn-end, and a conversation that goes quiet right
 // after would keep a stale summary indefinitely. Bounded: at most one rerun
 // per dropped trigger, and the min-new gate re-checks before the rerun fires.
+//
+// This latch MUST use a distinct field from updatePinnedSummary's own
+// `_summaryInFlight` guard (lib/pinned-summary.js). The fork-sync 2026-08-12
+// merge blended this upstream turn-end gate with the fork's codex-titles inner
+// pass, and both used `_summaryInFlight`: this caller set it, then the inner
+// guard saw it already set and bailed on every run — codex never fired and
+// titles stopped regenerating. Keep the two layers' latches separate.
 function maybeSummarizeAtTurnEnd(session) {
   const count = session.chatHistory?.length || 0;
   if (count - (session.lastSummaryMsgCount || 0) < SUMMARY_MIN_NEW) return;
-  if (session._summaryInFlight) {
+  if (session._summaryTurnInFlight) {
     session._summaryRerunQueued = true;
     return;
   }
-  session._summaryInFlight = true;
+  session._summaryTurnInFlight = true;
   maybeUpdatePinnedSummary(session)
     .catch((e) => console.warn(`[summary] turn-end pass failed for ${session.roomId}: ${e.message}`))
     .finally(() => {
-      session._summaryInFlight = false;
+      session._summaryTurnInFlight = false;
       if (session._summaryRerunQueued) {
         session._summaryRerunQueued = false;
         maybeSummarizeAtTurnEnd(session);
