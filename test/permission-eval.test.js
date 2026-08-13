@@ -52,12 +52,12 @@ describe('permission snapshot', () => {
     expect(Object.isFrozen(snapshot.mcpAllow)).toBe(true);
     expect(Object.isFrozen(snapshot.mcpDeny)).toBe(true);
     expect(Object.isFrozen(snapshot.mcpAsk)).toBe(true);
-    expect(webflowTools).toHaveLength(26);
-    expect(webflowTools).not.toContain('mcp__webflow__data_sites_tool');
+    expect(webflowTools).toHaveLength(28);
+    expect(webflowTools).not.toContain('mcp__webflow__data_scripts_tool');
     for (const toolName of webflowTools) {
       expect(classifyPermission(snapshot, toolName), toolName).toBe('allow');
     }
-    expect(classifyPermission(snapshot, 'mcp__webflow__data_sites_tool')).toBe('default-gated');
+    expect(classifyPermission(snapshot, 'mcp__webflow__data_scripts_tool')).toBe('default-gated');
   });
 
   it('classifies the live Webflow allowlist when present, otherwise the committed fixture', () => {
@@ -74,7 +74,7 @@ describe('permission snapshot', () => {
     for (const toolName of webflowTools) {
       expect(classifyPermission(snapshot, toolName), toolName).toBe('allow');
     }
-    expect(classifyPermission(snapshot, 'mcp__webflow__data_sites_tool')).toBe('default-gated');
+    expect(classifyPermission(snapshot, 'mcp__webflow__data_scripts_tool')).toBe('default-gated');
   });
 
   it('discovers workspace, local, and user permission layers by default', () => {
