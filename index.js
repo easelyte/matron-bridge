@@ -3576,6 +3576,20 @@ function handleClaudeEvent(session, event) {
     setupSubagentWatcher(session, session.workdir, session.claudeSessionId);
   }
 
+  // Re-home the subagent watcher when the session changes cwd mid-flight
+  // (EnterWorktree). Claude relocates the subagents dir to the new cwd's
+  // project-dir encoding, so a watcher frozen on the spawn cwd polls a stale
+  // path and subagent cards stop rendering (loop #631). Stream events carry the
+  // live per-entry cwd; track the last one seen so we only act on a real move,
+  // then let the watcher re-point (a no-op when the encoded dir is unchanged).
+  if (session.subagentWatcher && typeof event.cwd === 'string' && event.cwd
+      && event.cwd !== session._lastWatcherCwd) {
+    session._lastWatcherCwd = event.cwd;
+    if (session.subagentWatcher.repoint(event.cwd)) {
+      console.log(`[subagent-rehome] room ${session.roomId}: session ${String(session.claudeSessionId).slice(0, 8)}… moved to ${event.cwd}; re-pointed subagent watcher`);
+    }
+  }
+
   // Log all event types for plan mode debugging
   if (event.type) {
     const extras = [];
