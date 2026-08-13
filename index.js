@@ -51,7 +51,7 @@ import { SubagentWatcher } from './lib/subagent-watcher.js';
 import {
   setupCodexWatcherForSession,
 } from './lib/codex-watcher-setup.js';
-import { launchWithCodexSinkEnv, pruneStaleCodexSinks } from './lib/codex-paths.js';
+import { launchWithCodexSinkEnv, pruneStaleCodexSinks, removeCodexSinkForSession } from './lib/codex-paths.js';
 import { createSubagentConvoTracker } from './lib/subagent-convos.js';
 import { createQueuedReleaseOutbox } from './lib/queued-release-outbox.js';
 import { createSubagentRunningStore } from './lib/subagent-running-store.js';
@@ -3351,6 +3351,16 @@ function teardownSubagentTracking(session) {
   if (session.codexWatcher) {
     session.codexWatcher.stop().catch(() => {});
     session.codexWatcher = null;
+  }
+  // #632: reclaim this session's codex-viz sink dir on teardown. The sink lives
+  // outside Claude Code's pruned project tree, so without this it lingers until
+  // the boot-time age-based sweep (pruneStaleCodexSinks, still the backstop).
+  // Guard on the same viz env gate that created the sink + wired the watcher
+  // (the watcher-dependency env source), so we never rm on a session that never
+  // ran viz. Best-effort — removeCodexSinkForSession never throws.
+  const vizEnv = session.codexSpawnEnv || process.env;
+  if (vizEnv.MATRON_CODEX_VIZ === '1' && session.claudeSessionId) {
+    removeCodexSinkForSession(session.claudeSessionId);
   }
   if (session.subagentConvos) {
     session.subagentConvos.finishAll();
