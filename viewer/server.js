@@ -335,55 +335,6 @@ app.get('/download', downloadLimiter, async (req, res) => {
 
 const BRIDGE_API_PORT = process.env.MATRON_BRIDGE_API_PORT || 9802;
 
-app.get('/action', async (req, res) => {
-  const { token } = req.query;
-  if (!token) return res.status(400).send('Missing token');
-
-  const data = verifyToken(token);
-  if (!data) return res.status(403).send('Invalid or expired token');
-
-  const { action, roomId, index } = data;
-  if (!action || !roomId) return res.status(400).send('Invalid action token');
-
-  try {
-    let endpoint, body, label;
-    if (action === 'interrupt') {
-      endpoint = '/interrupt';
-      body = { roomId };
-      label = '⚡ Sending queued messages';
-    } else if (action === 'cancel') {
-      endpoint = '/cancel-queued';
-      body = { roomId, index };
-      label = '✕ Cancelled';
-    } else {
-      return res.status(400).send('Unknown action');
-    }
-
-    const resp = await fetch(`http://127.0.0.1:${BRIDGE_API_PORT}${endpoint}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-
-    if (!resp.ok) {
-      const err = await resp.text();
-      const safeErr = err.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-      return res.type('html').send(`<!DOCTYPE html><html><body><h2>Action failed</h2><p>${safeErr}</p></body></html>`);
-    }
-
-    res.type('html').send(`<!DOCTYPE html>
-<html>
-<head><meta charset="utf-8"><title>Action performed</title>
-<style>body{margin:0;display:flex;align-items:center;justify-content:center;min-height:100vh;background:#0d1117;color:#e6edf3;font-family:-apple-system,BlinkMacSystemFont,sans-serif;}
-.card{text-align:center;padding:40px;}</style></head>
-<body><div class="card"><h2>${label}</h2><p>Action performed. You can close this tab.</p></div></body>
-</html>`);
-  } catch (err) {
-    console.error('Action proxy error:', err);
-    res.status(500).send('Failed to reach bridge API');
-  }
-});
-
 app.get('/secret', (req, res) => {
   const { token } = req.query;
   if (!token) return res.status(400).send('Missing token');
