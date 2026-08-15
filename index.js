@@ -7371,6 +7371,21 @@ function journalOnText(session, body, { username }) {
 // skipJournalMirror; a voice note's transcript IS published (as the user's
 // message, via sendTextToSession) so it's visible in the journal too,
 // mirroring what the Matrix m.audio path records.
+// True only while `session` is still the live, canonical session for its room:
+// alive AND the exact object the sessions map still points at. Media prep is
+// async (fetch/transcribe/build), so the session captured at routeMedia entry
+// can be stopped, idle-reaped, or replaced by an agent switch before delivery.
+// Revalidating here stops the router from recreating queue state on a dead or
+// detached session (media lost, card taps dangle). Single-operator: the map is
+// tiny, so the values scan is cheap.
+function isCanonicalLiveSession(session) {
+  if (!session || !session.alive) return false;
+  for (const s of sessions.values()) {
+    if (s === session) return true;
+  }
+  return false;
+}
+
 const journalMediaRouter = createJournalMediaRouter({
   fetchMedia: (blobRef) => journalPublisher.fetchMedia(blobRef),
   transcribe: (buffer, mime) => transcribeAudio(buffer, mime, { modelPath: WHISPER_MODEL_PATH, language: WHISPER_LANGUAGE }),
@@ -7395,6 +7410,7 @@ const journalMediaRouter = createJournalMediaRouter({
   injectText: (session, text) => sendTextToSession(session, text),
   injectBlocks: (session, blocks) => sendToSession(session, blocks, { skipJournalMirror: true }),
   queueMedia: (session, entry) => journalQueueMedia(session, entry),
+  isCanonicalSession: (session) => isCanonicalLiveSession(session),
   echoToRoom: journalEchoToRoom,
   publishNotice: journalPublishNotice,
   escapeHtml,
@@ -9225,6 +9241,15 @@ async function switchAgentSession(roomId, targetAgent, { sendReply }) {
   next.showWorking = existing.showWorking;
   next.showBashOutput = existing.showBashOutput;
   next.chatHistory = history;
+  // Carry queued messages + their notification tiles across the agent switch,
+  // mirroring recreateSession. killSession(existing) above set alive=false but
+  // leaves queuedMessages/queueNotifications intact (flushPendingSessionQueue
+  // no-ops on a dead session), so pending user input survives the switch
+  // instead of being silently orphaned. The journal convo id is stable across
+  // the switch (stableConvoId), so the queue-release registry entries already
+  // map to `next` by convo id + item id and need no carryForward.
+  next.queuedMessages = existing.queuedMessages;
+  next.queueNotifications = existing.queueNotifications;
   next.pinnedSummaryText = existing.pinnedSummaryText;
   next.pinnedSummaryEventId = existing.pinnedSummaryEventId;
   next.lastSummaryMsgCount = existing.lastSummaryMsgCount || 0;

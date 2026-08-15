@@ -15,6 +15,7 @@ function makeRouter(overrides = {}) {
     injectText: vi.fn(() => true),
     injectBlocks: vi.fn(() => true),
     queueMedia: vi.fn(async () => {}),
+    isCanonicalSession: vi.fn(() => true),
     echoToRoom: vi.fn(),
     publishNotice: vi.fn(),
     escapeHtml: (s) => String(s),
@@ -306,5 +307,84 @@ describe('createJournalMediaRouter — busy session queues instead of injecting'
     await route(session, { type: 'file', blobRef: 'b', contentType: 'application/pdf', name: 'x.pdf' }, ctx);
     expect(deps.injectBlocks).toHaveBeenCalledTimes(1);
     expect(deps.queueMedia).not.toHaveBeenCalled();
+  });
+});
+
+describe('createJournalMediaRouter — session torn down during async prep (#537 canonicality guard)', () => {
+  const busySession = { claudeSessionId: 'convo-1', roomId: '!r:s', busy: true };
+
+  it('a session already gone at fetch time drops a saved file EARLY — before the disk-writing build (no orphan file)', async () => {
+    const { route, deps } = makeRouter({ isCanonicalSession: () => false });
+    await route(busySession, { type: 'file', blobRef: 'b', contentType: 'application/pdf', name: 'report.pdf' }, ctx);
+
+    expect(deps.buildSavedBlocks).not.toHaveBeenCalled(); // early guard skips the side-effecting prep
+    expect(deps.queueMedia).not.toHaveBeenCalled();
+    expect(deps.injectBlocks).not.toHaveBeenCalled();
+    expect(deps.publishNotice).toHaveBeenCalledTimes(1);
+    const [convoId, body] = deps.publishNotice.mock.calls[0];
+    expect(convoId).toBe('convo-1');
+    expect(body).toMatch(/report\.pdf/);
+    expect(body).toMatch(/session ended/);
+  });
+
+  it('a session already gone at fetch time drops a voice note EARLY — before transcription (no wasted CPU)', async () => {
+    const { route, deps } = makeRouter({
+      fetchMedia: vi.fn(async () => ({ buffer: Buffer.from('ogg'), contentType: 'audio/ogg' })),
+      transcribe: vi.fn(async () => 'buy milk'),
+      isCanonicalSession: () => false,
+    });
+    await route(busySession, { type: 'file', blobRef: 'v', contentType: 'audio/ogg', name: 'voice.ogg' }, ctx);
+
+    expect(deps.transcribe).not.toHaveBeenCalled(); // early guard skips transcription
+    expect(deps.queueMedia).not.toHaveBeenCalled();
+    expect(deps.injectText).not.toHaveBeenCalled();
+    expect(deps.publishNotice).toHaveBeenCalledTimes(1);
+    expect(deps.publishNotice.mock.calls[0][1]).toMatch(/voice note/);
+  });
+
+  it('reads canonicality at DELIVERY too: a session live at fetch but torn down DURING the build is still dropped (never queued)', async () => {
+    let live = true;
+    const { route, deps } = makeRouter({
+      // Passes the early guard (live at fetch time), then goes non-canonical
+      // while the async build runs — the delivery-time guard must still catch it.
+      buildSavedBlocks: vi.fn(async () => { live = false; return [{ type: 'text', text: 'saved' }]; }),
+      isCanonicalSession: () => live,
+    });
+    await route(busySession, { type: 'file', blobRef: 'b', contentType: 'application/pdf', name: 'x.pdf' }, ctx);
+
+    expect(deps.buildSavedBlocks).toHaveBeenCalledTimes(1); // early guard passed; build ran
+    expect(deps.queueMedia).not.toHaveBeenCalled();         // delivery guard caught the mid-build teardown
+    expect(deps.injectBlocks).not.toHaveBeenCalled();
+    expect(deps.publishNotice).toHaveBeenCalledTimes(1);
+  });
+
+  it('a still-canonical busy session queues as before — the guard does not regress the happy path', async () => {
+    const { route, deps } = makeRouter({ isCanonicalSession: () => true });
+    await route(busySession, { type: 'file', blobRef: 'b', contentType: 'application/pdf', name: 'x.pdf' }, ctx);
+
+    expect(deps.queueMedia).toHaveBeenCalledTimes(1);
+    expect(deps.publishNotice).not.toHaveBeenCalled();
+  });
+
+  it('publishes the drop notice to the STABLE journal convo id, not the native session id (survives an agent switch) (#537 F1)', async () => {
+    // After a switch the captured session keeps journalConvoId (the server-known
+    // conversation) but its claudeSessionId is the new native id. The notice
+    // must target journalConvoId, or the journal server rejects the publish and
+    // the user sees neither the media nor the promised failure notice.
+    const switchedSession = { claudeSessionId: 'native-new', journalConvoId: 'stable-convo', roomId: '!r:s', busy: true };
+    const { route, deps } = makeRouter({ isCanonicalSession: () => false });
+    await route(switchedSession, { type: 'file', blobRef: 'b', contentType: 'application/pdf', name: 'report.pdf' }, ctx);
+
+    expect(deps.queueMedia).not.toHaveBeenCalled();
+    expect(deps.publishNotice).toHaveBeenCalledTimes(1);
+    expect(deps.publishNotice.mock.calls[0][0]).toBe('stable-convo');
+  });
+
+  it('fails loud at construction when isCanonicalSession is not wired (#537 F3)', () => {
+    expect(() => createJournalMediaRouter({
+      fetchMedia: vi.fn(), transcribe: vi.fn(), buildSavedBlocks: vi.fn(),
+      injectText: vi.fn(), injectBlocks: vi.fn(), echoToRoom: vi.fn(), publishNotice: vi.fn(),
+      // isCanonicalSession deliberately omitted
+    })).toThrow(/isCanonicalSession/);
   });
 });
