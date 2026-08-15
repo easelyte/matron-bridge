@@ -1303,6 +1303,26 @@ describe('local (same-bridge) rooms', () => {
       const res = await f.handlers.chatAccept({ roomId: '!guest', room_id: id });
       expect(res.status).toBe(409);
     });
+
+    it('409s an accept whose inviting session is gone — no joined room bound to a dead key', async () => {
+      const f = makeFixture();
+      const id = localRoom(f, { guestState: 'pending', state: 'pending' });
+      f.sessions.delete('!sess');
+      const res = await f.handlers.chatAccept({ roomId: '!guest', room_id: id });
+      expect(res.status).toBe(409);
+      expect(res.body.error).toMatch(/inviting session is gone/);
+      expect(f.rooms.get(id).guestState).toBe('pending');
+      expect(f.localAnswer).not.toHaveBeenCalled();
+    });
+
+    it('a refusal still flows when the inviting session is dead — it only closes the room out', async () => {
+      const f = makeFixture();
+      const id = localRoom(f, { guestState: 'pending', state: 'pending' });
+      f.sessions.get('!sess').alive = false;
+      const res = await f.handlers.chatRefuse({ roomId: '!guest', room_id: id });
+      expect(res.status).toBe(200);
+      expect(f.rooms.get(id).guestState).toBe('refused');
+    });
   });
 
   describe('sending', () => {
@@ -1357,6 +1377,28 @@ describe('local (same-bridge) rooms', () => {
       expect(res.body.note).toMatch(/already left/);
       // The owner side was NOT flipped by the no-op.
       expect(f.rooms.get(id).state).toBe('joined');
+    });
+
+    it('a guest leaving an unanswered invite refuses it instead of ghosting the owner', async () => {
+      const f = makeFixture();
+      const id = localRoom(f, { guestState: 'pending', state: 'pending' });
+      const res = await f.handlers.chatLeave({ roomId: '!guest', room_id: id });
+      expect(res.status).toBe(200);
+      expect(f.rooms.get(id).guestState).toBe('refused');
+      // The loopback refusal settles the owner's chatStart waiters (or
+      // surfaces as a late-answer turn) — that IS the peer notification,
+      // so no separate 'left the room' FYI on top of it.
+      expect(f.localAnswer).toHaveBeenCalledWith(id, { accept: false, reason: 'left the room without answering' });
+      expect(f.notifyRoomPeer).not.toHaveBeenCalled();
+    });
+
+    it("a binding that ended another way (refused) is a calm 200 and the peer is NOT told 'left'", async () => {
+      const f = makeFixture();
+      const id = localRoom(f, { guestState: 'refused', state: 'refused' });
+      const res = await f.handlers.chatLeave({ roomId: '!guest', room_id: id });
+      expect(res.status).toBe(200);
+      expect(res.body.note).toMatch(/already refused/);
+      expect(f.notifyRoomPeer).not.toHaveBeenCalled();
     });
   });
 
