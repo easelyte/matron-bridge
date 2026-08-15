@@ -41,6 +41,7 @@ function makeFixture(overrides = {}) {
   };
   const invites = {
     invite: vi.fn(async (args) => { calls.push({ call: 'invite', args }); return overrides.inviteOutcome ?? { kind: 'accepted', peerDeviceId: 7 }; }),
+    inviteLocal: vi.fn(async (args) => { calls.push({ call: 'inviteLocal', args }); return overrides.inviteLocalOutcome ?? { kind: 'accepted', peerDeviceId: 1 }; }),
     join: vi.fn(async (args) => { calls.push({ call: 'join', args }); return overrides.joinOutcome ?? { kind: 'accepted', peerDeviceId: 7 }; }),
     answer: vi.fn(() => true),
     answerAwait: vi.fn(async (args) => { calls.push({ call: 'answerAwait', args }); return overrides.answerAwaitOutcome ?? { kind: 'answered' }; }),
@@ -52,6 +53,11 @@ function makeFixture(overrides = {}) {
   // this bridge owns — held OUTSIDE the rooms registry (C1).
   const pendingJoin = new Map();
   const log = { warn: vi.fn() };
+  const deliverLocalInvite = 'deliverLocalInvite' in overrides ? overrides.deliverLocalInvite
+    : vi.fn((frame) => calls.push({ call: 'deliverLocalInvite', frame }));
+  const localAnswer = vi.fn((roomId, args) => calls.push({ call: 'localAnswer', roomId, args }));
+  const routeLocalRoomMessage = vi.fn((roomId, fromKey, body) => calls.push({ call: 'routeLocalRoomMessage', roomId, fromKey, body }));
+  const notifyRoomPeer = vi.fn((roomId, sessionKey, text) => calls.push({ call: 'notifyRoomPeer', roomId, sessionKey, text }));
   const handlers = createAgentChatHandlers({
     sessions, publisher, rooms, invites,
     awaitRoomMessage: overrides.awaitRoomMessage,
@@ -59,9 +65,10 @@ function makeFixture(overrides = {}) {
     clearPendingPeer: (roomId) => pendingJoin.delete(roomId),
     journalConvoIdFor: (s) => s.convoId || null,
     serverLabel: '2',
+    deliverLocalInvite, localAnswer, routeLocalRoomMessage, notifyRoomPeer,
     log,
   });
-  return { handlers, calls, publisher, rooms, invites, sessions, pendingJoin, log };
+  return { handlers, calls, publisher, rooms, invites, sessions, pendingJoin, log, deliverLocalInvite, localAnswer, routeLocalRoomMessage, notifyRoomPeer };
 }
 
 describe('createAgentChatHandlers', () => {
@@ -223,11 +230,43 @@ describe('createAgentChatHandlers', () => {
       expect(res.body.error).toMatch(/no owning agent/i);
     });
 
-    it('400s a self-targeted conversation', async () => {
-      const { handlers } = makeFixture();
+    it('400s a self-targeted conversation only when the local-invite seam is absent', async () => {
+      const { handlers } = makeFixture({ deliverLocalInvite: null });
       const res = await handlers.chatStart({ ...good, target_convo_id: 'convo-self' });
       expect(res.status).toBe(400);
       expect(res.body.error).toMatch(/this bridge/i);
+    });
+
+    it("400s the caller's own conversation — no chatting with yourself", async () => {
+      const { handlers, invites } = makeFixture({ publisher: { fetchRoster: async () => ({
+        ...ROSTER,
+        conversations: [...ROSTER.conversations, { id: 'convo-sess', title: 'Me', session_state: 'running', summary: '', agent_device_id: 1, last_ts: 444 }],
+      }) } });
+      const res = await handlers.chatStart({ ...good, target_convo_id: 'convo-sess' });
+      expect(res.status).toBe(400);
+      expect(res.body.error).toMatch(/own conversation/i);
+      expect(invites.inviteLocal).not.toHaveBeenCalled();
+    });
+
+    it('same-bridge target: arms inviteLocal BEFORE injecting the request, labels the room by convo title, and never calls invite()', async () => {
+      const { handlers, calls, invites, deliverLocalInvite } = makeFixture();
+      const res = await handlers.chatStart({ ...good, target_convo_id: 'convo-self' });
+      expect(res.status).toBe(200);
+      expect(res.body.status).toBe('accepted');
+      const chatRoomId = res.body.room_id;
+      // Order: room publish + owner record, then waiters armed (inviteLocal),
+      // then the local inject — a request delivered before the waiters exist
+      // can settle into the void.
+      expect(calls.map((c) => c.call)).toEqual(['upsertConvo', 'publishText', 'record', 'inviteLocal', 'deliverLocalInvite']);
+      expect(calls[0].opts.title).toBe('mac ↔ Local work — ci triage');
+      expect(calls[2].fields).toMatchObject({ role: 'owner', state: 'pending', sessionRoomId: '!sess', peerDeviceId: 1, peerName: 'Local work' });
+      expect(invites.invite).not.toHaveBeenCalled();
+      expect(deliverLocalInvite).toHaveBeenCalledWith(expect.objectContaining({
+        event: 'request', local: true, room_id: chatRoomId,
+        from_device_id: 1, from_name: 'mac',
+        target_convo_id: 'convo-self', from_convo_id: 'convo-sess',
+        topic: 'ci triage', justification: expect.any(String),
+      }));
     });
 
     it('accepted: mints a room, upserts title, publishes opening message, records, invites — in that order', async () => {
@@ -522,7 +561,7 @@ describe('createAgentChatHandlers', () => {
       const f = makeFixture({ awaitRoomMessage });
       const id = joined(f);
       const res = await f.handlers.chatSend({ roomId: '!sess', room_id: id, message: 'ping', wait_seconds: 999 });
-      expect(awaitRoomMessage).toHaveBeenCalledWith(id, 60_000);
+      expect(awaitRoomMessage).toHaveBeenCalledWith(id, 60_000, '!sess');
       expect(res.body).toEqual({ ok: true, reply: { from: 'dev-2 (agent)', body: 'yo' } });
     });
 
@@ -531,7 +570,7 @@ describe('createAgentChatHandlers', () => {
       const f = makeFixture({ awaitRoomMessage });
       const id = joined(f);
       const res = await f.handlers.chatSend({ roomId: '!sess', room_id: id, message: 'ping', wait_seconds: 5 });
-      expect(awaitRoomMessage).toHaveBeenCalledWith(id, 5000);
+      expect(awaitRoomMessage).toHaveBeenCalledWith(id, 5000, '!sess');
       expect(res.body.note).toMatch(/later turn/);
     });
   });
@@ -1068,7 +1107,9 @@ describe('index.js routes + ask-user.js tools (source inspection)', () => {
   it('constructs the handlers with the awaitRoomMessage seam fed from journalOnRoomFrame', () => {
     expect(indexSrc).toMatch(/createAgentChatHandlers\(\{/);
     expect(indexSrc).toMatch(/\bawaitRoomMessage,/);
-    expect(indexSrc).toMatch(/function awaitRoomMessage\(chatRoomId, ms\)/);
+    // sessionKey in the waiter key: a local room binds two sessions, and a
+    // room-keyed waiter would let one session's frame consume the other's wait.
+    expect(indexSrc).toMatch(/function awaitRoomMessage\(chatRoomId, ms, sessionKey\)/);
     // A reply consumed by a waiter is the tool result itself: journalOnRoomFrame
     // must SHORT-CIRCUIT before roomDelivery.deliver, or the same message is
     // queued and re-delivered as a duplicate injected turn at turn end
@@ -1077,7 +1118,7 @@ describe('index.js routes + ask-user.js tools (source inspection)', () => {
     // function, but it has to clear the queued-notice rationale that now sits
     // between the two (the ⏳ is published after the short-circuit for the
     // same reason the short-circuit exists).
-    expect(indexSrc).toMatch(/if \(roomReplyWaiters\.resolve\(frame\.convo_id, \{ from, body \}\)\) return;[\s\S]{0,1400}roomDelivery\.deliver\(/);
+    expect(indexSrc).toMatch(/if \(roomReplyWaiters\.resolve\(replyWaiterKey\(frame\.convo_id, room\.sessionRoomId\), \{ from, body \}\)\) return;[\s\S]{0,1400}roomDelivery\.deliver\(/);
   });
 
   it('holds inbound join_requests in pendingJoinRequests, never the rooms registry (C1)', () => {
@@ -1090,7 +1131,12 @@ describe('index.js routes + ask-user.js tools (source inspection)', () => {
     const body = indexSrc.slice(start, end);
     expect(body).toMatch(/if \(isJoin\) \{[\s\S]{0,400}pendingJoinRequests\.set\(frame\.room_id, \{ deviceId: frame\.from_device_id/);
     expect(body).toMatch(/\} else \{[\s\S]{0,200}agentRooms\.record\(frame\.room_id, \{\s*\n\s*role: 'guest',/);
-    expect((body.match(/agentRooms\.record\(/g) || [])).toHaveLength(1);
+    // Exactly two record() calls: the remote guest binding, and the local
+    // (same-bridge) branch's guest FIELDS — which must never touch
+    // role/state/sessionRoomId, or it clobbers the owner binding chatStart
+    // wrote (the C1 registry-destruction shape again).
+    expect((body.match(/agentRooms\.record\(/g) || [])).toHaveLength(2);
+    expect(body).toMatch(/\} else if \(frame\.local\) \{[\s\S]{0,500}agentRooms\.record\(frame\.room_id, \{ guestSessionRoomId: session\.roomId, guestState: 'pending' \}\)/);
     // …and the handlers receive the read/clear seams plus the I2 guard dep.
     const wiring = indexSrc.slice(indexSrc.indexOf('const agentChatHandlers = createAgentChatHandlers({'));
     const wiringEnd = wiring.indexOf('});');
@@ -1139,7 +1185,11 @@ describe('index.js routes + ask-user.js tools (source inspection)', () => {
     const drop = body.indexOf('roomDelivery.dropSession(session?.roomId)');
     expect(loop).toBeGreaterThan(-1);
     expect(drop).toBeGreaterThan(loop);
-    expect(body).toMatch(/if \(r\.state === 'joined'\) \{[\s\S]{0,120}agentInvites\.leave\(\{ roomId: r\.roomId \}\)[\s\S]{0,120}agentRooms\.setState\(r\.roomId, 'left'\)/);
+    expect(body).toMatch(/if \(r\.state !== 'joined'\) continue;/);
+    expect(body).toMatch(/agentInvites\.leave\(\{ roomId: r\.roomId \}\)[\s\S]{0,120}agentRooms\.setState\(r\.roomId, 'left'\)/);
+    // Local rooms skip the journal op and flip BOTH bindings, telling the
+    // surviving end directly.
+    expect(body).toMatch(/r\.guestSessionRoomId != null[\s\S]{0,600}setGuestState\(r\.roomId, 'left'\)/);
   });
 
   it('declares all agent-chat MCP tools in ask-user.js', () => {
@@ -1200,5 +1250,128 @@ describe('index.js routes + ask-user.js tools (source inspection)', () => {
     // A guest accept surfaces the backfilled opening messages inline.
     expect(block).toMatch(/data\.messages \|\| \[\]/);
     expect(block).toMatch(/The room so far:/);
+  });
+});
+
+// Same-bridge ("local") rooms: one registry record binds BOTH sessions —
+// owner in the primary fields, invited session in the guest fields — and
+// every lifecycle hop (answer, message, leave) is a local seam call instead
+// of a journal op, because the journal drops own-device echoes.
+describe('local (same-bridge) rooms', () => {
+  // A joined local room between '!sess' (owner) and '!guest' (guest), with
+  // the guest session live in the fixture's sessions map.
+  function localRoom(f, { guestState = 'joined', state = 'joined' } = {}) {
+    f.sessions.set('!guest', { busy: false, alive: true, convoId: 'convo-guest' });
+    f.rooms.record('room-l', {
+      role: 'owner', state, sessionRoomId: '!sess',
+      guestSessionRoomId: '!guest', guestState,
+      peerDeviceId: 1, peerName: 'Local work', title: 'mac ↔ Local work',
+    });
+    return 'room-l';
+  }
+
+  describe('guest answering (chatAccept / chatRefuse)', () => {
+    it('accept flips the guest binding first, loops the answer back, and backfills', async () => {
+      const f = makeFixture({ publisher: { fetchMessages: async () => ({ events: [
+        { type: 'text', sender: 'agent:mac', ts: 1, payload: { body: 'opening' } },
+      ] }) } });
+      const id = localRoom(f, { guestState: 'pending', state: 'pending' });
+      const res = await f.handlers.chatAccept({ roomId: '!guest', room_id: id });
+      expect(res.status).toBe(200);
+      expect(res.body.ok).toBe(true);
+      expect(res.body.messages).toEqual([{ sender: 'agent:mac', type: 'text', ts: 1, body: 'opening' }]);
+      expect(f.rooms.get(id).guestState).toBe('joined');
+      expect(f.localAnswer).toHaveBeenCalledWith(id, { accept: true, reason: undefined });
+      // No journal answer op for a local invite — there is nothing to answer.
+      expect(f.invites.answerAwait).not.toHaveBeenCalled();
+    });
+
+    it('refuse goes terminal on the guest binding without a journal op', async () => {
+      const f = makeFixture();
+      const id = localRoom(f, { guestState: 'pending', state: 'pending' });
+      const res = await f.handlers.chatRefuse({ roomId: '!guest', room_id: id, reason: 'busy here' });
+      expect(res.status).toBe(200);
+      expect(res.body.refused).toBe(true);
+      expect(f.rooms.get(id).guestState).toBe('refused');
+      expect(f.localAnswer).toHaveBeenCalledWith(id, { accept: false, reason: 'busy here' });
+      expect(f.invites.answer).not.toHaveBeenCalled();
+    });
+
+    it('409s a non-pending guest binding', async () => {
+      const f = makeFixture();
+      const id = localRoom(f, { guestState: 'joined' });
+      const res = await f.handlers.chatAccept({ roomId: '!guest', room_id: id });
+      expect(res.status).toBe(409);
+    });
+  });
+
+  describe('sending', () => {
+    it('routes a local room message to the other binding after publishing', async () => {
+      const f = makeFixture();
+      const id = localRoom(f);
+      const res = await f.handlers.chatSend({ roomId: '!guest', room_id: id, message: 'hello owner' });
+      expect(res.status).toBe(200);
+      expect(f.routeLocalRoomMessage).toHaveBeenCalledWith(id, '!guest', 'hello owner');
+    });
+
+    it('does NOT route remote rooms locally', async () => {
+      const f = makeFixture();
+      f.rooms.record('room-r', { role: 'guest', state: 'joined', sessionRoomId: '!sess' });
+      await f.handlers.chatSend({ roomId: '!sess', room_id: 'room-r', message: 'hi' });
+      expect(f.routeLocalRoomMessage).not.toHaveBeenCalled();
+    });
+
+    it('gates the guest by its OWN binding state, not the record primary', async () => {
+      const f = makeFixture();
+      const id = localRoom(f, { guestState: 'pending', state: 'joined' });
+      const res = await f.handlers.chatSend({ roomId: '!guest', room_id: id, message: 'too early' });
+      expect(res.status).toBe(409);
+      expect(res.body.error).toMatch(/pending/);
+    });
+  });
+
+  describe('leaving', () => {
+    it('flips both bindings, tells the other end, and skips the journal', async () => {
+      const f = makeFixture();
+      const id = localRoom(f);
+      const res = await f.handlers.chatLeave({ roomId: '!guest', room_id: id });
+      expect(res.status).toBe(200);
+      const r = f.rooms.get(id);
+      expect(r.state).toBe('left');
+      expect(r.guestState).toBe('left');
+      expect(f.notifyRoomPeer).toHaveBeenCalledWith(id, '!sess', 'left the room');
+      expect(f.invites.leave).not.toHaveBeenCalled();
+    });
+
+    it('owner leaving notifies the guest binding', async () => {
+      const f = makeFixture();
+      const id = localRoom(f);
+      await f.handlers.chatLeave({ roomId: '!sess', room_id: id });
+      expect(f.notifyRoomPeer).toHaveBeenCalledWith(id, '!guest', 'left the room');
+    });
+
+    it("reports 'already left' off the caller's own binding", async () => {
+      const f = makeFixture();
+      const id = localRoom(f, { guestState: 'left' });
+      const res = await f.handlers.chatLeave({ roomId: '!guest', room_id: id });
+      expect(res.body.note).toMatch(/already left/);
+      // The owner side was NOT flipped by the no-op.
+      expect(f.rooms.get(id).state).toBe('joined');
+    });
+  });
+
+  describe('reading', () => {
+    it('either binding can read a joined local room', async () => {
+      const f = makeFixture({ publisher: { fetchMessages: async () => ({ events: [] }) } });
+      const id = localRoom(f);
+      expect((await f.handlers.chatRead({ roomId: '!sess', room_id: id })).status).toBe(200);
+      expect((await f.handlers.chatRead({ roomId: '!guest', room_id: id })).status).toBe(200);
+    });
+
+    it('a never-joined guest binding gets the stranger 404 on read', async () => {
+      const f = makeFixture();
+      const id = localRoom(f, { guestState: 'pending' });
+      expect((await f.handlers.chatRead({ roomId: '!guest', room_id: id })).status).toBe(404);
+    });
   });
 });

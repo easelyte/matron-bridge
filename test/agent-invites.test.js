@@ -722,3 +722,38 @@ describe('formatInviteRequestNotice', () => {
     expect(formatInviteRequestNotice({})).toBe('🤝 An agent (device unknown) requests a chat with this session');
   });
 });
+
+// inviteLocal(): the same-bridge invite — no journal op, no 'delivered'
+// stage; the caller injects the request locally right after this arms the
+// waiters, and ack/answer come back as loopback onInviteFrame calls.
+describe('inviteLocal()', () => {
+  it('never touches the journal and resolves on a loopback accept', async () => {
+    const { inv, sendRoomOp, rooms } = makeInvites();
+    rooms.record('room-l', { role: 'owner', state: 'pending', sessionRoomId: '!owner' });
+    const p = inv.inviteLocal({ roomId: 'room-l' });
+    // Waiters are armed synchronously: a same-tick loopback settles them.
+    inv.onInviteFrame({ event: 'ack', room_id: 'room-l', session_state: 'idle' });
+    inv.onInviteFrame({ event: 'answer', room_id: 'room-l', accept: true, peer_device_id: 1, from_device_id: 1 });
+    await expect(p).resolves.toEqual({ kind: 'accepted', peerDeviceId: 1 });
+    expect(sendRoomOp).not.toHaveBeenCalled();
+    // The loopback answer flips the owner binding like a journal one.
+    expect(rooms.get('room-l').state).toBe('joined');
+  });
+
+  it('maps a busy loopback ack to pending_busy', async () => {
+    const { inv, sendRoomOp } = makeInvites();
+    const p = inv.inviteLocal({ roomId: 'room-l' });
+    inv.onInviteFrame({ event: 'ack', room_id: 'room-l', session_state: 'busy' });
+    await expect(p).resolves.toEqual({ kind: 'pending_busy' });
+    expect(sendRoomOp).not.toHaveBeenCalled();
+  });
+
+  it('surfaces a loopback refusal with its reason, not as an expiry', async () => {
+    const { inv, rooms } = makeInvites();
+    rooms.record('room-l', { role: 'owner', state: 'pending', sessionRoomId: '!owner' });
+    const p = inv.inviteLocal({ roomId: 'room-l' });
+    inv.onInviteFrame({ event: 'answer', room_id: 'room-l', accept: false, reason: 'mid-deploy', from_device_id: 1 });
+    await expect(p).resolves.toMatchObject({ kind: 'refused', reason: 'mid-deploy' });
+    expect(rooms.get('room-l').state).toBe('refused');
+  });
+});

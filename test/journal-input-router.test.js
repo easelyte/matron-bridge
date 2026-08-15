@@ -1741,8 +1741,11 @@ describe('index.js agent-chat room wiring (source inspection)', () => {
   // resolves is worse than none, so these pin both halves and the one case
   // where "busy" does NOT mean queued.
   describe('the queued-but-not-delivered state', () => {
+    // The per-recipient body: journalOnRoomFrame is now a thin fan-out over
+    // the room's bindings (a local room binds two sessions); the delivery
+    // pipeline these tests pin lives in deliverRoomFrameTo.
     const frame = (() => {
-      const start = src.indexOf('function journalOnRoomFrame(');
+      const start = src.indexOf('function deliverRoomFrameTo(');
       return src.slice(start, src.indexOf('\nfunction ', start + 1));
     })();
 

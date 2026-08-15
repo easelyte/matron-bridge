@@ -214,10 +214,11 @@ server.tool(
         .sort((a, b) => (b.last_ts || 0) - (a.last_ts || 0))
         .slice(0, 30)
         .map((c) => {
-          // Rows owned by this bridge are listed but are NOT valid
-          // agent_chat_start targets (the bridge rejects self-targets).
+          // Rows owned by this bridge are valid targets too (same-bridge
+          // rooms): the invite is delivered locally instead of via the
+          // journal. Only the caller's OWN conversation is refused.
           const agent = c.agent_device_id == null ? ' (no agent)'
-            : (mine != null && c.agent_device_id === mine) ? ' (this bridge — not targetable)'
+            : (mine != null && c.agent_device_id === mine) ? ' (this bridge)'
               : ` (agent ${c.agent_device_id})`;
           const summary = c.summary ? `: ${String(c.summary).slice(0, 200)}` : '';
           return `- ${c.id} — "${c.title || 'untitled'}" [${c.session_state || 'unknown'}]${agent}${summary}`;
@@ -280,7 +281,7 @@ server.tool(
 
 server.tool(
   'agent_chat_start',
-  "Start a chat room with one of the user's other agent sessions: pick a target conversation from agent_roster, and the bridge invites its agent. If the result is pending or pending_busy, do NOT wait or poll: continue your own work — the answer and any replies arrive automatically as later turns.",
+  "Start a chat room with one of the user's other agent sessions: pick a target conversation from agent_roster, and the bridge invites its agent. Sessions on this same bridge are valid targets too (the invite is delivered locally). If the result is pending or pending_busy, do NOT wait or poll: continue your own work — the answer and any replies arrive automatically as later turns.",
   {
     target_convo_id: z.string().describe('Conversation id of the target session, from agent_roster'),
     topic: z.string().optional().describe('Optional short topic for the room title'),

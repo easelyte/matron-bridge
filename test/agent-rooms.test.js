@@ -280,3 +280,61 @@ describe('createAgentRooms', () => {
     expect(snapshots[3].r1).toMatchObject({ ...REC, state: 'joined' });
   });
 });
+
+// Guest bindings: a same-bridge room's second local participant, held in
+// guestSessionRoomId/guestState on the SAME record as the owner binding.
+describe('guest bindings (local rooms)', () => {
+  const LOCAL = { role: 'owner', state: 'pending', sessionRoomId: '!owner', guestSessionRoomId: '!guest', guestState: 'pending' };
+
+  it('records and reports both bindings', () => {
+    const { rooms } = makeStore();
+    rooms.record('r1', LOCAL);
+    expect(rooms.bindingFor('r1', '!owner')).toEqual({ role: 'owner', state: 'pending', binding: 'primary' });
+    expect(rooms.bindingFor('r1', '!guest')).toEqual({ role: 'guest', state: 'pending', binding: 'guest' });
+    expect(rooms.bindingFor('r1', '!stranger')).toBeNull();
+    expect(rooms.bindingFor('r-ghost', '!owner')).toBeNull();
+  });
+
+  it('remote rooms have a null guest binding and bindingFor stays primary-only', () => {
+    const { rooms } = makeStore();
+    rooms.record('r1', REC);
+    expect(rooms.get('r1').guestSessionRoomId).toBeNull();
+    expect(rooms.bindingFor('r1', '!sess1')).toEqual({ role: 'owner', state: 'pending', binding: 'primary' });
+  });
+
+  it('setGuestState flips only the guest side, with the same terminal discipline as setState', () => {
+    const { rooms } = makeStore();
+    rooms.record('r1', LOCAL);
+    expect(rooms.setGuestState('r1', 'joined')).toMatchObject({ guestState: 'joined', state: 'pending' });
+    expect(rooms.setGuestState('r1', 'left')).toMatchObject({ guestState: 'left' });
+    // Terminal: a late answer must not resurrect it.
+    expect(rooms.setGuestState('r1', 'joined')).toBeNull();
+    expect(rooms.get('r1').guestState).toBe('left');
+    // No guest binding -> no-op.
+    rooms.record('r2', REC);
+    expect(rooms.setGuestState('r2', 'joined')).toBeNull();
+    // Bogus state -> no-op.
+    rooms.record('r3', LOCAL);
+    expect(rooms.setGuestState('r3', 'bogus')).toBeNull();
+  });
+
+  it('forSession reports the guest binding with role/state substituted', () => {
+    const { rooms } = makeStore();
+    rooms.record('r1', { ...LOCAL, guestState: 'joined' });
+    rooms.record('r2', REC);
+    expect(rooms.forSession('!owner')).toEqual([expect.objectContaining({ roomId: 'r1', role: 'owner', state: 'pending', binding: 'primary' })]);
+    expect(rooms.forSession('!guest')).toEqual([expect.objectContaining({ roomId: 'r1', role: 'guest', state: 'joined', binding: 'guest', guestSessionRoomId: '!guest' })]);
+    expect(rooms.forSession('!sess1')).toEqual([expect.objectContaining({ roomId: 'r2', binding: 'primary' })]);
+  });
+
+  it('guest fields survive a partial re-record and a persistence round-trip', () => {
+    const save = vi.fn();
+    const { rooms } = makeStore({ save });
+    rooms.record('r1', LOCAL);
+    rooms.record('r1', { state: 'joined' }); // partial: guest fields untouched
+    expect(rooms.get('r1')).toMatchObject({ state: 'joined', guestSessionRoomId: '!guest', guestState: 'pending' });
+    const persisted = save.mock.calls.at(-1)[0];
+    const { rooms: reloaded } = makeStore({ initial: persisted });
+    expect(reloaded.bindingFor('r1', '!guest')).toEqual({ role: 'guest', state: 'pending', binding: 'guest' });
+  });
+});

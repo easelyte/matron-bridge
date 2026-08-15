@@ -8011,8 +8011,15 @@ const peerDelivery = createRoomDelivery({
 // the tool result itself and is NOT also delivered as a turn (see the
 // resolve() short-circuit in journalOnRoomFrame).
 const roomReplyWaiters = createRoomReplyWaiters();
-function awaitRoomMessage(chatRoomId, ms) {
-  return roomReplyWaiters.await(chatRoomId, ms);
+// Waiters are keyed per (room, session), not per room: a local (same-bridge)
+// room binds TWO sessions here, and a room-keyed waiter would let a frame
+// fanned out to one session consume the OTHER session's pending wait — the
+// consumed reply then never reaches the session that armed it. Remote rooms
+// bind exactly one session per bridge, so the composite key changes nothing
+// for them. ' ' cannot appear in either id.
+const replyWaiterKey = (chatRoomId, sessionKey) => `${chatRoomId} ${sessionKey || ''}`;
+function awaitRoomMessage(chatRoomId, ms, sessionKey) {
+  return roomReplyWaiters.await(replyWaiterKey(chatRoomId, sessionKey), ms);
 }
 
 // Router seam for a persisted peer_message fanned into its target convo.
@@ -8060,9 +8067,22 @@ function journalOnPeerMessage(frame) {
 }
 
 // Router seam: a journal frame in an active room convo lands here instead of
-// the main-convo input path. Formats the peer's message as a `[room …]` line
-// and hands it to roomDelivery against the room's bound session.
+// the main-convo input path. Fans out to every session the room binds on
+// this bridge — one for a remote room, both ends for a local one (only
+// user:-sender frames reach here for local rooms; agent frames are this
+// device's own echoes, dropped upstream, and delivered locally instead by
+// routeLocalRoomMessage).
 function journalOnRoomFrame(room, frame) {
+  deliverRoomFrameTo(room, frame);
+  if (room.guestSessionRoomId != null && room.guestSessionRoomId !== room.sessionRoomId) {
+    deliverRoomFrameTo({ ...room, sessionRoomId: room.guestSessionRoomId }, frame);
+  }
+}
+
+// One recipient's share of a room frame: formats the peer's message as a
+// `[room …]` line and hands it to roomDelivery against room.sessionRoomId
+// (callers substitute the guest binding in for the fan-out above).
+function deliverRoomFrameTo(room, frame) {
   const session = sessions.get(room.sessionRoomId);
   if (!session || !session.alive) {
     debug(`room frame for ${frame.convo_id} but session ${room.sessionRoomId} not live — dropping (agent_chat_read recovers)`);
@@ -8118,7 +8138,7 @@ function journalOnRoomFrame(room, frame) {
   // so deliver() would queue the SAME message and wake the agent with a
   // duplicate `[room …]` turn at turn end (Task 8 review, finding 1). The
   // journal keeps the durable copy; agent_chat_read recovers.
-  if (roomReplyWaiters.resolve(frame.convo_id, { from, body })) return;
+  if (roomReplyWaiters.resolve(replyWaiterKey(frame.convo_id, room.sessionRoomId), { from, body })) return;
   // Queued-vs-injected is read off the inbox rather than deliver()'s boolean,
   // which reports "accepted" for both branches. Empty before and non-empty
   // after is precisely "this message opened a pending batch" — the one
@@ -8166,14 +8186,23 @@ function journalInjectInviteRequest(frame) {
     // conversation exists on this device but isn't running right now, which
     // is a different fact from "this box is idle" and the one the caller
     // needs to hear (it picked that conversation off the roster).
-    agentInvites.answer({
-      roomId: frame.room_id,
-      peerDeviceId: isJoin ? frame.from_device_id : null,
-      accept: false,
-      reason: !isJoin && frame.target_convo_id
-        ? 'that conversation has no running session right now'
-        : 'no active session on this box',
-    });
+    const refusalReason = !isJoin && frame.target_convo_id
+      ? 'that conversation is not running and could not be resumed'
+      : 'no active session on this box';
+    if (frame.local) {
+      // Same-bridge request: the journal holds no invite to answer — the
+      // refusal loops straight back into the invites manager, where it
+      // settles the owner's chatStart waiters exactly as a journal answer
+      // frame would. from_device_id present: a refusal, not a server expiry.
+      agentInvites.onInviteFrame({ event: 'answer', room_id: frame.room_id, accept: false, reason: refusalReason, from_device_id: frame.from_device_id });
+    } else {
+      agentInvites.answer({
+        roomId: frame.room_id,
+        peerDeviceId: isJoin ? frame.from_device_id : null,
+        accept: false,
+        reason: refusalReason,
+      });
+    }
     return;
   }
   if (isJoin) {
@@ -8182,6 +8211,12 @@ function journalInjectInviteRequest(frame) {
     // the requester over it is exactly the C1 registry-destruction bug. Just
     // remember who is asking, for answerInvite's pendingPeerFor seam.
     pendingJoinRequests.set(frame.room_id, { deviceId: frame.from_device_id, at: Date.now() });
+  } else if (frame.local) {
+    // Same-bridge request: the room record already holds the OWNER binding
+    // (chatStart wrote it before injecting this frame), so the invited
+    // session lands in the guest fields — record() merging a guest role over
+    // the owner here is the same registry-destruction shape as C1.
+    agentRooms.record(frame.room_id, { guestSessionRoomId: session.roomId, guestState: 'pending' });
   } else {
     agentRooms.record(frame.room_id, {
       role: 'guest',
@@ -8192,7 +8227,13 @@ function journalInjectInviteRequest(frame) {
       title: room?.title || null,
     });
   }
-  agentInvites.ack({ roomId: frame.room_id, peerDeviceId: isJoin ? frame.from_device_id : null, sessionState: sessionOccupiedForRoomDelivery(session) ? 'busy' : 'idle' });
+  if (frame.local) {
+    // Loopback, not a journal op: the ack settles the owner's chatStart
+    // waiter (busy → pending_busy, idle → keep waiting for the answer).
+    agentInvites.onInviteFrame({ event: 'ack', room_id: frame.room_id, session_state: sessionOccupiedForRoomDelivery(session) ? 'busy' : 'idle' });
+  } else {
+    agentInvites.ack({ roomId: frame.room_id, peerDeviceId: isJoin ? frame.from_device_id : null, sessionState: sessionOccupiedForRoomDelivery(session) ? 'busy' : 'idle' });
+  }
   const who = frame.from_name ? `"${frame.from_name}"` : `device ${frame.from_device_id}`;
   const ask = isJoin
     ? `Agent ${who} asks to join your room ${frame.room_id}: ${frame.justification}`
@@ -8233,13 +8274,47 @@ function journalInjectInviteRequest(frame) {
 
 // Room-lifecycle FYI (late answers, peer left) surfaced to the bound session
 // as a turn. Fail-quiet when the room or its session is gone — the journal
-// keeps the durable record.
-function journalNotifyRoomEvent(roomId, text) {
+// keeps the durable record. sessionKey overrides the default primary-binding
+// target: a local room's lifecycle events must reach the OTHER end, which
+// may be the guest binding.
+function journalNotifyRoomEvent(roomId, text, { sessionKey } = {}) {
   const room = agentRooms.get(roomId);
   if (!room) return;
-  const session = sessions.get(room.sessionRoomId);
+  const session = sessions.get(sessionKey || room.sessionRoomId);
   if (!session || !session.alive) return;
   roomDelivery.deliver(session, session.roomId, { roomId, roomTitle: room.title || null, from: 'bridge', body: `Room ${roomId}: the peer ${text}.`, at: Date.now() });
+}
+
+// A local room's message hop: the journal's echo of an own-device agent
+// frame is dropped by the input router, so a message published into a
+// same-bridge room is handed to the OTHER bound session here, through the
+// same per-recipient delivery a journal frame takes (💬 user notice,
+// reply-waiter resolve, busy coalescing all included). Only 'joined'
+// recipients: a pending guest gets the backlog via the accept backfill.
+function routeLocalRoomMessage(roomId, fromSessionKey, body) {
+  routeLocalRoomFrame(roomId, fromSessionKey, { type: 'text', payload: { body } });
+}
+
+// Attachment twin (send_attachment with chat_room_id): same hop, with the
+// file/image payload deliverRoomFrameTo already knows how to render.
+function routeLocalRoomAttachment(roomId, fromSessionKey, { kind, name, caption, blobRef }) {
+  routeLocalRoomFrame(roomId, fromSessionKey, {
+    type: kind === 'image' ? 'image' : 'file',
+    payload: { name, ...(caption ? { caption } : {}), ...(blobRef ? { blob_ref: blobRef } : {}) },
+  });
+}
+
+function routeLocalRoomFrame(roomId, fromSessionKey, { type, payload }) {
+  const room = agentRooms.get(roomId);
+  if (!room || room.guestSessionRoomId == null) return;
+  const name = journalPublisher.identity()?.name || 'agent';
+  const frame = { convo_id: roomId, type, sender: `agent:${name}`, payload, ts: Date.now() };
+  for (const key of [room.sessionRoomId, room.guestSessionRoomId]) {
+    if (!key || key === fromSessionKey) continue;
+    const state = key === room.sessionRoomId ? room.state : room.guestState;
+    if (state !== 'joined') continue;
+    deliverRoomFrameTo({ ...room, sessionRoomId: key }, frame);
+  }
 }
 
 // Constructed here (not at the `let` declaration next to the publisher) so
@@ -8376,10 +8451,19 @@ function journalEvictConvoInput(session) {
   // one left to report a failure to; an owner's leave is rejected
   // server-side, a journal gap noted in the PR) and mark the binding left.
   for (const r of agentRooms.forSession(session?.roomId)) {
-    if (r.state === 'joined') {
-      agentInvites.leave({ roomId: r.roomId }).catch(() => {});
+    if (r.state !== 'joined') continue;
+    if (r.guestSessionRoomId != null) {
+      // Local room: no journal participant state to leave — flip both
+      // bindings (pairwise rooms end when either side goes) and tell the
+      // surviving end directly, the way a remote 'left' frame would have.
+      const otherKey = r.binding === 'guest' ? r.sessionRoomId : r.guestSessionRoomId;
       agentRooms.setState(r.roomId, 'left');
+      agentRooms.setGuestState(r.roomId, 'left');
+      journalNotifyRoomEvent(r.roomId, 'left the room', { sessionKey: otherKey });
+      continue;
     }
+    agentInvites.leave({ roomId: r.roomId }).catch(() => {});
+    agentRooms.setState(r.roomId, 'left');
   }
   // …and drops any pending room-message inbox with the session: there is no
   // live session left to coalesce into, and the room content is durable in
@@ -8609,6 +8693,7 @@ const handleSendAttachment = createSendAttachmentHandler({
   publisher: journalPublisher,
   journalConvoIdFor,
   rooms: agentRooms,
+  onLocalRoomAttachment: routeLocalRoomAttachment,
 });
 
 // The agent-chat tools (lib/agent-chat.js), mounted below as thin
@@ -8627,6 +8712,18 @@ const agentChatHandlers = createAgentChatHandlers({
   // chatJoin's own-session-convo guard (I2).
   journalConvoIdFor,
   serverLabel: SERVER_LABEL,
+  // Same-bridge (local) room seams: the request goes through the SAME
+  // inbound-request pipeline a journal frame takes (targeting, wake, turn
+  // injection), the answer loops back into the invites manager instead of a
+  // journal op, and message/lifecycle hops are delivered directly since the
+  // journal drops own-device echoes.
+  deliverLocalInvite: journalInjectInviteRequest,
+  localAnswer: (roomId, { accept, reason }) => agentInvites.onInviteFrame({
+    event: 'answer', room_id: roomId, accept, ...(reason ? { reason } : {}),
+    from_device_id: journalPublisher.identity()?.deviceId ?? -1,
+  }),
+  routeLocalRoomMessage,
+  notifyRoomPeer: (roomId, sessionKey, text) => journalNotifyRoomEvent(roomId, text, { sessionKey }),
   log: console,
 });
 
