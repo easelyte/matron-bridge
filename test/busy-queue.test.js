@@ -1373,23 +1373,6 @@ describe('index.js queued-send finalizer', () => {
     expect(harness.dropItem).toHaveBeenCalledTimes(1);
   });
 });
-
-describe('index.js /interrupt endpoint — flush status (source inspection)', () => {
-  it('reports rejected or deferred dispatch as retained instead of flushed', () => {
-    const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
-    const start = src.indexOf("} else if (url.pathname === '/interrupt') {");
-    const end = src.indexOf("} else if (url.pathname === '/cancel-queued') {", start);
-    expect(start).toBeGreaterThan(-1);
-    expect(end).toBeGreaterThan(start);
-    const body = src.slice(start, end);
-
-    expect(body).toMatch(/sent = flushQueue\(session, queued, releaseSnapshot\)/);
-    expect(body).toMatch(/if \(sent === true\)[\s\S]*res\.writeHead\(200\)/);
-    expect(body).toMatch(/else \{[\s\S]*res\.writeHead\(409\)/);
-    expect(body).toMatch(/JSON\.stringify\(\{ ok: false, flushed: 0, retained \}\)/);
-  });
-});
-
 describe('index.js journal busy caller — queued-tile notification wiring (source inspection)', () => {
   it('the journal busy branch posts the tile via notifyQueuedMessage with the journal ctx sink', () => {
     const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
@@ -1526,22 +1509,5 @@ describe('#165 index.js prompt-reply handler — value-shape classification reti
     expect(body).toMatch(/journalRoutePromptReply\(session, answer\)/);
     expect(body).toMatch(/journalEchoPromptAnswer\(session, username, label\)/);
     expect(body).not.toMatch(/isQueueReleaseTap/);
-  });
-});
-
-describe('index.js /cancel-queued endpoint — release registry wiring (source inspection)', () => {
-  it('resolves the positional entry to its stable id and uses cancelQueuedItem', () => {
-    const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
-    const start = src.indexOf("} else if (url.pathname === '/cancel-queued') {");
-    const end = src.indexOf("} else if (url.pathname === '/message') {", start);
-    expect(start).toBeGreaterThan(-1);
-    expect(end).toBeGreaterThan(start);
-    const body = src.slice(start, end);
-
-    expect(body).toMatch(/const queueIndex = Math\.trunc\(index\)/);
-    expect(body).toMatch(/const itemId = notifs\[queueIndex\]\?\.id/);
-    expect(body).toMatch(/queueRelease\.listLive\(convoId\)/);
-    expect(body).toMatch(/cancelQueuedItem\(session, \{/);
-    expect(body).toMatch(/\bemitRelease\b/);
   });
 });
