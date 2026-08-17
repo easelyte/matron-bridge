@@ -116,6 +116,7 @@ import { markJournalOrigin, planQueueFlush } from './lib/queue-flush.js';
 import { isCompactCommand, compactBatchSize, hasQueuedCompact } from './lib/compact-priority.js';
 import { attachPendingMediaMirror, pendingMediaMirror } from './lib/media-mirror.js';
 import { seedJournalTitle, applyFallbackTitle, formatRoomTitle } from './lib/journal-title-seed.js';
+import { scoreToolRepo, dominantRepo, emptyRepoScores } from './lib/repo-infer.js';
 import { codexOneShot } from './lib/codex-oneshot.js';
 import { updatePinnedSummary } from './lib/pinned-summary.js';
 import { SUMMARY_MIN_NEW } from './lib/summary-pass.js';
@@ -3706,6 +3707,19 @@ function handleClaudeEvent(session, event) {
         const toolName = block.name;
         const input = block.input || {};
 
+        // Activity-based repo signal for journal titles: which repo this session
+        // is actually working in (edits win over reads). The cwd is useless here
+        // — cross-repo work is rooted in son-of-anton and reaches siblings by
+        // path — so we accumulate from tool_use file paths instead. Persist only
+        // when it changed (cheap, but not every tool call), piggybacking the
+        // chatHistory that recordConversationMessage already writes.
+        if (!session.repoScores) session.repoScores = emptyRepoScores();
+        if (scoreToolRepo(session.repoScores, toolName, input, DEFAULT_WORKDIR) && session.claudeSessionId) {
+          persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, {
+            repoScores: session.repoScores,
+          });
+        }
+
         if (toolName === 'ExitPlanMode' && !session.iv) {
           // Print-mode only: stash the tool_use_id so a "build" reply can
           // emit the matching tool_result later. iv-mode handles approval
@@ -4439,7 +4453,7 @@ function flushResponse(session) {
     recordConversationMessage(session, 'assistant', cleanText);
     // Fallback titling stays on the flush path (names short convos); the
     // LLM summary pass moved to turn-end (maybeSummarizeAtTurnEnd).
-    applyFallbackTitle(session, { serverLabel: SERVER_LABEL, updateRoomName, workdir: session.workdir, defaultWorkdir: DEFAULT_WORKDIR });
+    applyFallbackTitle(session, { serverLabel: SERVER_LABEL, updateRoomName, workdir: session.workdir, defaultWorkdir: DEFAULT_WORKDIR, repo: dominantRepo(session.repoScores) });
   }
 
   // Arm the durable ref for the very next journal mirror (the first chunk's
@@ -5418,6 +5432,7 @@ async function maybeUpdatePinnedSummary(session) {
     warn: (...args) => console.warn(...args),
     serverLabel: SERVER_LABEL,
     defaultWorkdir: DEFAULT_WORKDIR,
+    inferRepo: (s) => dominantRepo(s.repoScores),
   }).catch(e => console.warn('[summary] wrapper error', {
     error: String(e?.message || e),
     roomId: session.roomId,
@@ -6051,6 +6066,9 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       session.pinnedSummaryEventId = resumePersisted?.pinnedSummaryEventId || null;
       session.lastSummaryMsgCount = resumePersisted?.lastSummaryMsgCount || 0;
       session.lastRosterText = resumePersisted?.lastRosterText || '';
+      // Carry the activity-inferred repo signal across resume so a rehydrated
+      // session names its journal from prior activity, not a bare basename.
+      session.repoScores = resumePersisted?.repoScores || emptyRepoScores();
       session.sendCallback = sessionSendReply;
       session.sendHtml = sessionSendHtml;
       session.sendButtonMessage = sessionSendButtons;

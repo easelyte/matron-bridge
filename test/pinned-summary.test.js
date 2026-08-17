@@ -301,6 +301,7 @@ describe('updatePinnedSummary title flow and log levels', () => {
       updateRoomName: d.updateRoomName,
       workdir: '/srv/project',
       defaultWorkdir: '/srv/default',
+      repo: null,
     });
     expect(d.debug).toHaveBeenCalledWith('[summary] kill-switch', { killSwitch: true });
     expect(d.warn).not.toHaveBeenCalled();
@@ -345,6 +346,34 @@ describe('updatePinnedSummary title flow and log levels', () => {
     });
   });
 
+  it('falls back to the activity-inferred repo when the model omits REPO', async () => {
+    const d = deps({
+      codexOneShot: vi.fn().mockResolvedValue(success('TITLE: some work\nSUMMARY: done')),
+      inferRepo: () => 'goodfellow',
+    });
+
+    await updatePinnedSummary(session(), d);
+
+    expect(d.formatRoomTitle).toHaveBeenCalledWith(
+      expect.objectContaining({ text: 'some work', repo: 'goodfellow' }),
+    );
+  });
+
+  it('lets the model REPO override win over the activity-inferred repo', async () => {
+    const d = deps({
+      codexOneShot: vi.fn().mockResolvedValue(
+        success('TITLE: some work\nREPO: easelyte/goodfellow\nSUMMARY: done'),
+      ),
+      inferRepo: () => 'goodfellow',
+    });
+
+    await updatePinnedSummary(session(), d);
+
+    expect(d.formatRoomTitle).toHaveBeenCalledWith(
+      expect.objectContaining({ text: 'some work', repo: 'easelyte/goodfellow' }),
+    );
+  });
+
   it('passes repo:null when the model reports REPO: unknown (workdir fallback)', async () => {
     const d = deps({
       codexOneShot: vi.fn().mockResolvedValue(
@@ -385,6 +414,7 @@ describe('updatePinnedSummary title flow and log levels', () => {
       updateRoomName: d.updateRoomName,
       workdir: '/srv/project',
       defaultWorkdir: '/srv/default',
+      repo: null,
     });
     expect(d.warn).toHaveBeenCalledWith('[summary] failed', {
       reason: 'spawn-error',
