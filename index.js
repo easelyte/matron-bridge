@@ -1766,6 +1766,8 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
         // so its established flag carries as well.
         restarted._journalBuffer = session._journalBuffer;
         restarted._journalTitleHint = session._journalTitleHint;
+        restarted._fallbackTitleApplied = session._fallbackTitleApplied; // preserve fallback ownership so a repo upgrade survives restart (F2r3)
+        restarted._fallbackTitleValue = session._fallbackTitleValue;
         restarted._journalState = session._journalState;
         restarted._journalConvoEstablished = session._journalConvoEstablished;
         sessions.set(roomId, restarted);
@@ -2459,6 +2461,8 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
         // Carry journal-mirror state (see the matching print-mode block).
         restarted._journalBuffer = session._journalBuffer;
         restarted._journalTitleHint = session._journalTitleHint;
+        restarted._fallbackTitleApplied = session._fallbackTitleApplied; // preserve fallback ownership so a repo upgrade survives restart (F2r3)
+        restarted._fallbackTitleValue = session._fallbackTitleValue;
         restarted._journalState = session._journalState;
         restarted._journalConvoEstablished = session._journalConvoEstablished;
         sessions.set(roomId, restarted);
@@ -9300,6 +9304,8 @@ async function switchAgentSession(roomId, targetAgent, { sendReply }) {
   next.journalConvoId = stableConvoId;
   next._journalBuffer = existing._journalBuffer;
   next._journalTitleHint = existing._journalTitleHint;
+  next._fallbackTitleApplied = existing._fallbackTitleApplied; // preserve fallback ownership so a repo upgrade survives replacement (F2r3)
+  next._fallbackTitleValue = existing._fallbackTitleValue;
   next._journalState = existing._journalState;
   next._journalActivityState = existing._journalActivityState;
   next._journalConvoEstablished = existing._journalConvoEstablished;
@@ -9507,6 +9513,8 @@ function recreateSession(roomId, overrides, { sendReply, sendHtml }) {
   next.turnCount = existing.turnCount;
   next._journalBuffer = existing._journalBuffer;
   next._journalTitleHint = existing._journalTitleHint;
+  next._fallbackTitleApplied = existing._fallbackTitleApplied; // preserve fallback ownership so a repo upgrade survives replacement (F2r3)
+  next._fallbackTitleValue = existing._fallbackTitleValue;
   next._journalState = existing._journalState;
   next._journalActivityState = existing._journalActivityState;
   next._journalConvoEstablished = existing._journalConvoEstablished;

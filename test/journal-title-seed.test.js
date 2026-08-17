@@ -314,9 +314,20 @@ describe('applyFallbackTitle (repo-aware first-user-message naming)', () => {
     // A tool result commits goodfellow activity → the fallback upgrades.
     expect(applyFallbackTitle(session, { ...d, repo: 'goodfellow' })).toBe(true);
     expect(d.updateRoomName).toHaveBeenLastCalledWith('!abc', 'VPS · goodfellow · fix it');
-    // No further upgrade — the repo is now locked in.
-    expect(applyFallbackTitle(session, { ...d, repo: 'snafu-studio' })).toBe(false);
+    // Same repo again → no redundant rename.
+    expect(applyFallbackTitle(session, { ...d, repo: 'goodfellow' })).toBe(false);
     expect(d.updateRoomName).toHaveBeenCalledTimes(2);
+  });
+
+  it('corrects a read-then-write session: weak read does not lock the repo (F1r3)', () => {
+    const session = { roomId: '!abc', claudeSessionId: 'f0aa', chatHistory: [{ role: 'user', text: 'fix it' }] };
+    const d = hintTrackingDeps(session);
+    // First committed signal is a READ of son-of-anton (dominant with no writes).
+    expect(applyFallbackTitle(session, { ...d, repo: 'son-of-anton' })).toBe(true);
+    expect(d.updateRoomName).toHaveBeenLastCalledWith('!abc', 'VPS · son-of-anton · fix it');
+    // A later WRITE makes goodfellow dominant — the title MUST correct, not lock.
+    expect(applyFallbackTitle(session, { ...d, repo: 'goodfellow' })).toBe(true);
+    expect(d.updateRoomName).toHaveBeenLastCalledWith('!abc', 'VPS · goodfellow · fix it');
   });
 
   it('does not upgrade if a later title (e.g. a codex pass) replaced ours', () => {
@@ -336,7 +347,7 @@ describe('applyFallbackTitle (repo-aware first-user-message naming)', () => {
     const d = hintTrackingDeps(session);
     expect(applyFallbackTitle(session, { ...d, repo: 'goodfellow' })).toBe(true);
     expect(d.updateRoomName).toHaveBeenLastCalledWith('!abc', 'VPS · goodfellow · fix it');
-    expect(session._fallbackRepoInferred).toBe(true);
+    expect(session._fallbackTitleValue).toBe('VPS · goodfellow · fix it');
   });
 
   it('strips tags, collapses whitespace, and truncates to 60 chars with an ellipsis', () => {
