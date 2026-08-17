@@ -4439,7 +4439,7 @@ function flushResponse(session) {
     recordConversationMessage(session, 'assistant', cleanText);
     // Fallback titling stays on the flush path (names short convos); the
     // LLM summary pass moved to turn-end (maybeSummarizeAtTurnEnd).
-    applyFallbackTitle(session, { serverLabel: SERVER_LABEL, updateRoomName, workdir: session.workdir });
+    applyFallbackTitle(session, { serverLabel: SERVER_LABEL, updateRoomName, workdir: session.workdir, defaultWorkdir: DEFAULT_WORKDIR });
   }
 
   // Arm the durable ref for the very next journal mirror (the first chunk's
