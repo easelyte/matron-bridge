@@ -296,6 +296,49 @@ describe('applyFallbackTitle (repo-aware first-user-message naming)', () => {
     expect(d.updateRoomName).toHaveBeenCalledTimes(1);
   });
 
+  // updateRoomName → journalUpsertConvo sets _journalTitleHint in production;
+  // mirror that here so the upgrade guard (title-still-ours) is exercised.
+  const hintTrackingDeps = (session) => ({
+    serverLabel: 'VPS',
+    workdir: '/home/dan/proj',
+    defaultWorkdir: '/home/dan/son-of-anton',
+    updateRoomName: vi.fn((_roomId, name) => { session._journalTitleHint = name; }),
+  });
+
+  it('upgrades a repo-less fallback once a repo signal arrives (F1r2)', () => {
+    const session = { roomId: '!abc', claudeSessionId: 'f0aa', chatHistory: [{ role: 'user', text: 'fix it' }] };
+    const d = hintTrackingDeps(session);
+    // First application: no repo yet → titled from the workdir basename.
+    expect(applyFallbackTitle(session, d)).toBe(true);
+    expect(d.updateRoomName).toHaveBeenLastCalledWith('!abc', 'VPS · proj · fix it');
+    // A tool result commits goodfellow activity → the fallback upgrades.
+    expect(applyFallbackTitle(session, { ...d, repo: 'goodfellow' })).toBe(true);
+    expect(d.updateRoomName).toHaveBeenLastCalledWith('!abc', 'VPS · goodfellow · fix it');
+    // No further upgrade — the repo is now locked in.
+    expect(applyFallbackTitle(session, { ...d, repo: 'snafu-studio' })).toBe(false);
+    expect(d.updateRoomName).toHaveBeenCalledTimes(2);
+  });
+
+  it('does not upgrade if a later title (e.g. a codex pass) replaced ours', () => {
+    const session = { roomId: '!abc', claudeSessionId: 'f0aa', chatHistory: [{ role: 'user', text: 'fix it' }] };
+    const d = hintTrackingDeps(session);
+    expect(applyFallbackTitle(session, d)).toBe(true);
+    // Simulate a codex summary pass winning the title in between.
+    session._journalTitleHint = 'VPS · goodfellow · Codex-authored title';
+    expect(applyFallbackTitle(session, { ...d, repo: 'goodfellow' })).toBe(false);
+    expect(d.updateRoomName).toHaveBeenCalledTimes(1); // only the initial fallback
+  });
+
+  it('applies with the repo directly when the fallback first fires post-commit', () => {
+    // A tool-only first turn (no assistant text → no earlier flush) reaches the
+    // commit path before any fallback; it should title WITH the repo immediately.
+    const session = { roomId: '!abc', claudeSessionId: 'f0aa', chatHistory: [{ role: 'user', text: 'fix it' }] };
+    const d = hintTrackingDeps(session);
+    expect(applyFallbackTitle(session, { ...d, repo: 'goodfellow' })).toBe(true);
+    expect(d.updateRoomName).toHaveBeenLastCalledWith('!abc', 'VPS · goodfellow · fix it');
+    expect(session._fallbackRepoInferred).toBe(true);
+  });
+
   it('strips tags, collapses whitespace, and truncates to 60 chars with an ellipsis', () => {
     const long = 'refactor <ide-opened-file></ide-opened-file> the whole\n\n  session   store so that every folder ever used shows up in the picker';
     const session = { roomId: '!abc', claudeSessionId: 'f0aa', chatHistory: [{ role: 'user', text: long }] };

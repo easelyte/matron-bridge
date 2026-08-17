@@ -4292,10 +4292,22 @@ function handleClaudeEvent(session, event) {
             session._pendingRepoSignals.delete(block.tool_use_id);
             if (!block.is_error) {
               if (!session.repoScores) session.repoScores = emptyRepoScores();
-              if (commitRepoSignals(session.repoScores, staged) && session.claudeSessionId) {
-                persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, {
-                  repoScores: session.repoScores,
+              if (commitRepoSignals(session.repoScores, staged)) {
+                // Upgrade a repo-less fallback title now that we know the repo
+                // (F1r2). No-op unless the fallback was applied without a repo
+                // and still owns the title — see applyFallbackTitle's guard.
+                applyFallbackTitle(session, {
+                  serverLabel: SERVER_LABEL,
+                  updateRoomName,
+                  workdir: session.workdir,
+                  defaultWorkdir: DEFAULT_WORKDIR,
+                  repo: dominantRepo(session.repoScores),
                 });
+                if (session.claudeSessionId) {
+                  persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, {
+                    repoScores: session.repoScores,
+                  });
+                }
               }
             }
           }
@@ -8383,6 +8395,10 @@ function resumePersistedSession(roomId, prev, { skipJournalMirror = false } = {}
   newSession.pinnedSummaryEventId = prev.pinnedSummaryEventId || null;
   newSession.lastSummaryMsgCount = prev.lastSummaryMsgCount || 0;
   newSession.lastRosterText = prev.lastRosterText || '';
+  // Carry + harden the activity-inferred repo signal across auto-resume (F2r2):
+  // this idle-reap/restart path is distinct from the explicit /resume path and
+  // must not drop the durable signal either.
+  newSession.repoScores = normalizeRepoScores(prev.repoScores);
   newSession.sendCallback = sendReply;
   newSession.sendHtml = sendHtmlFn;
   newSession.sendButtonMessage = (prompt, buttons, mode, plainText, html, payload) =>
