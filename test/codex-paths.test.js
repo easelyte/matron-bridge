@@ -82,6 +82,26 @@ describe('configureCodexSinkEnv', () => {
     expect(spawnEnv.PATH).toBe(first);
   });
 
+  it('does NOT prepend the shim in wrapper-producer mode (MATRON_CODEX_REAL_BIN set) but still sets the sink dir', () => {
+    // The son-of-anton wrapper is the sole producer here; if the shim were also
+    // on PATH the wrapper's internal bare `codex exec` would resolve to it and
+    // emit a duplicate card for the same run (the dual-producer bug).
+    const spawnEnv = { PATH: '/usr/bin:/bin' };
+    const dir = configureCodexSinkEnv({
+      spawnEnv,
+      workdir: '/w',
+      sessionId: 'sid',
+      env: { MATRON_CODEX_VIZ: '1', MATRON_CODEX_REAL_BIN: '/opt/real/codex' },
+      mkdirSync: vi.fn(),
+      chmodSync: vi.fn(),
+    });
+    // Sink dir still provisioned (the wrapper writes into it)...
+    expect(spawnEnv.MATRON_CODEX_SINK_DIR).toBe(dir);
+    // ...but the shim is NOT prepended, so bare `codex` reaches the real codex.
+    expect(spawnEnv.PATH).toBe('/usr/bin:/bin');
+    expect(spawnEnv.PATH.split(path.delimiter)[0]).not.toBe(SHIPPED_SHIM_DIR);
+  });
+
   it('does not touch PATH when visualization is disabled', () => {
     const spawnEnv = { PATH: '/usr/bin', MATRON_CODEX_SINK_DIR: '/inherited' };
     configureCodexSinkEnv({
