@@ -10,9 +10,9 @@ const ROSTER = {
     { device_id: 7, name: 'dev-2' },
   ],
   conversations: [
-    { id: 'convo-remote', title: 'Remote work', session_state: 'running', summary: 'porting the app', agent_device_id: 7, last_ts: 111 },
-    { id: 'convo-self', title: 'Local work', session_state: 'running', summary: null, agent_device_id: 1, last_ts: 222 },
-    { id: 'convo-orphan', title: 'No agent', session_state: 'ended', summary: '', agent_device_id: null, last_ts: 333 },
+    { id: 'convo-remote', title: 'Remote work', session_state: 'running', summary: 'porting the app', agent_device_id: 7, last_ts: 111, agent_kind: 'codex' },
+    { id: 'convo-self', title: 'Local work', session_state: 'running', summary: null, agent_device_id: 1, last_ts: 222, agent_kind: 'claude' },
+    { id: 'convo-orphan', title: 'No agent', session_state: 'ended', summary: '', agent_device_id: null, last_ts: 333 }, // no agent_kind → maps to null
   ],
 };
 
@@ -86,9 +86,9 @@ describe('createAgentChatHandlers', () => {
       expect(res.body.self).toEqual({ device_id: 1, name: 'mac' });
       expect(res.body.agents).toEqual([{ device_id: 7, name: 'dev-2' }]);
       expect(res.body.conversations).toEqual([
-        { id: 'convo-remote', title: 'Remote work', session_state: 'running', summary: 'porting the app', agent_device_id: 7, last_ts: 111 },
-        { id: 'convo-self', title: 'Local work', session_state: 'running', summary: '', agent_device_id: 1, last_ts: 222 },
-        { id: 'convo-orphan', title: 'No agent', session_state: 'ended', summary: '', agent_device_id: null, last_ts: 333 },
+        { id: 'convo-remote', title: 'Remote work', session_state: 'running', summary: 'porting the app', agent_device_id: 7, last_ts: 111, agent_kind: 'codex' },
+        { id: 'convo-self', title: 'Local work', session_state: 'running', summary: '', agent_device_id: 1, last_ts: 222, agent_kind: 'claude' },
+        { id: 'convo-orphan', title: 'No agent', session_state: 'ended', summary: '', agent_device_id: null, last_ts: 333, agent_kind: null }, // #619 T-1.3: forwarded, null when journal omits it
       ]);
     });
 
