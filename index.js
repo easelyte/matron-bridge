@@ -116,7 +116,7 @@ import { markJournalOrigin, planQueueFlush } from './lib/queue-flush.js';
 import { isCompactCommand, compactBatchSize, hasQueuedCompact } from './lib/compact-priority.js';
 import { attachPendingMediaMirror, pendingMediaMirror } from './lib/media-mirror.js';
 import { seedJournalTitle, applyFallbackTitle, formatRoomTitle } from './lib/journal-title-seed.js';
-import { scoreToolRepo, dominantRepo, emptyRepoScores } from './lib/repo-infer.js';
+import { toolRepoSignals, commitRepoSignals, dominantRepo, emptyRepoScores, normalizeRepoScores } from './lib/repo-infer.js';
 import { codexOneShot } from './lib/codex-oneshot.js';
 import { updatePinnedSummary } from './lib/pinned-summary.js';
 import { SUMMARY_MIN_NEW } from './lib/summary-pass.js';
@@ -159,6 +159,10 @@ const ALLOWED_USER_IDS = (process.env.ALLOWED_USER_IDS || '')
   .filter(Boolean);
 
 const DEFAULT_WORKDIR = path.resolve(expandHome(process.env.DEFAULT_WORKDIR || process.cwd()));
+// Cap on un-committed repo signals staged per session (tool_use blocks awaiting
+// their tool_result). Bounds the rare residue from denied/orphaned tools; a
+// normal tool always drains its entry on result. Oldest-evicted when exceeded.
+const MAX_PENDING_REPO_SIGNALS = 256;
 const DEFAULT_AGENT = resolveAgent({ fallback: process.env.MATRON_DEFAULT_AGENT || AGENT_CLAUDE });
 if (process.env.MATRON_DEFAULT_AGENT && !normalizeAgent(process.env.MATRON_DEFAULT_AGENT)) {
   console.warn(`[agent] Unknown MATRON_DEFAULT_AGENT=${JSON.stringify(process.env.MATRON_DEFAULT_AGENT)}; defaulting to claude.`);
@@ -1749,6 +1753,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
         restarted.pinnedSummaryEventId = session.pinnedSummaryEventId;
         restarted.lastSummaryMsgCount = session.lastSummaryMsgCount || 0;
         restarted.lastRosterText = session.lastRosterText || '';
+        restarted.repoScores = session.repoScores; // carry activity-inferred repo signal across restart
         restarted._agentHistoryCursor = session._agentHistoryCursor;
         restarted._pendingAgentHandoff = session._pendingAgentHandoff;
         restarted._agentSessions = session._agentSessions;
@@ -2445,6 +2450,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
         restarted.pinnedSummaryEventId = session.pinnedSummaryEventId;
         restarted.lastSummaryMsgCount = session.lastSummaryMsgCount || 0;
         restarted.lastRosterText = session.lastRosterText || '';
+        restarted.repoScores = session.repoScores; // carry activity-inferred repo signal across restart
         restarted._agentHistoryCursor = session._agentHistoryCursor;
         restarted._pendingAgentHandoff = session._pendingAgentHandoff;
         restarted._agentSessions = session._agentSessions;
@@ -3710,14 +3716,19 @@ function handleClaudeEvent(session, event) {
         // Activity-based repo signal for journal titles: which repo this session
         // is actually working in (edits win over reads). The cwd is useless here
         // — cross-repo work is rooted in son-of-anton and reaches siblings by
-        // path — so we accumulate from tool_use file paths instead. Persist only
-        // when it changed (cheap, but not every tool call), piggybacking the
-        // chatHistory that recordConversationMessage already writes.
-        if (!session.repoScores) session.repoScores = emptyRepoScores();
-        if (scoreToolRepo(session.repoScores, toolName, input, DEFAULT_WORKDIR) && session.claudeSessionId) {
-          persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, {
-            repoScores: session.repoScores,
-          });
+        // path — so we infer from tool file paths. STAGE the signal here keyed
+        // by tool_use id; it is committed only once the tool_result confirms
+        // success (see the 'user' case), so a denied or failed Edit never counts
+        // as activity (F2). Bounded so denials/orphans that never produce a
+        // result cannot grow the map without limit.
+        const repoSignals = toolRepoSignals(toolName, input, DEFAULT_WORKDIR);
+        if (repoSignals.length && block.id) {
+          if (!session._pendingRepoSignals) session._pendingRepoSignals = new Map();
+          const pending = session._pendingRepoSignals;
+          pending.set(block.id, repoSignals);
+          while (pending.size > MAX_PENDING_REPO_SIGNALS) {
+            pending.delete(pending.keys().next().value);
+          }
         }
 
         if (toolName === 'ExitPlanMode' && !session.iv) {
@@ -4271,6 +4282,23 @@ function handleClaudeEvent(session, event) {
       const userContent = event.message?.content;
       if (Array.isArray(userContent)) {
         for (const block of userContent) {
+          // Commit a staged repo signal (see the 'assistant' tool_use case)
+          // once its result lands. Only a NON-error result counts — a failed or
+          // denied Edit/Write must not name the session for work that never
+          // happened (F2). Either way the pending entry is drained.
+          if (block.type === 'tool_result' && block.tool_use_id
+              && session._pendingRepoSignals?.has(block.tool_use_id)) {
+            const staged = session._pendingRepoSignals.get(block.tool_use_id);
+            session._pendingRepoSignals.delete(block.tool_use_id);
+            if (!block.is_error) {
+              if (!session.repoScores) session.repoScores = emptyRepoScores();
+              if (commitRepoSignals(session.repoScores, staged) && session.claudeSessionId) {
+                persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, {
+                  repoScores: session.repoScores,
+                });
+              }
+            }
+          }
           // Mark live-output complete on tool_result for any tracked Bash command.
           if (block.type === 'tool_result' && block.tool_use_id) {
             // A Task tool_result means the subagent it spawned has completed —
@@ -6053,11 +6081,17 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
           ? { interactive: resumeState.interactiveMode }
           : {}),
       });
+      // Restore + normalize the activity-inferred repo signal BEFORE titling so
+      // a rehydrated session names its journal from prior activity, not a bare
+      // basename (F1). normalizeRepoScores hardens against version-skewed
+      // persisted state reaching the event path (F5).
+      const resumeRepoScores = normalizeRepoScores(resumePersisted?.repoScores);
       const roomName = formatRoomTitle({
         serverLabel: SERVER_LABEL,
         workdir: session.workdir,
         text: summary || (`Resumed ${shortId}`),
         defaultWorkdir: DEFAULT_WORKDIR,
+        repo: dominantRepo(resumeRepoScores),
       });
       session.originRoomId = roomId;
       session.firstMessageCaptured = true; // don't re-rename on first message
@@ -6066,9 +6100,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       session.pinnedSummaryEventId = resumePersisted?.pinnedSummaryEventId || null;
       session.lastSummaryMsgCount = resumePersisted?.lastSummaryMsgCount || 0;
       session.lastRosterText = resumePersisted?.lastRosterText || '';
-      // Carry the activity-inferred repo signal across resume so a rehydrated
-      // session names its journal from prior activity, not a bare basename.
-      session.repoScores = resumePersisted?.repoScores || emptyRepoScores();
+      session.repoScores = resumeRepoScores;
       session.sendCallback = sessionSendReply;
       session.sendHtml = sessionSendHtml;
       session.sendButtonMessage = sessionSendButtons;
@@ -6096,6 +6128,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         pinnedSummaryEventId: session.pinnedSummaryEventId,
         lastSummaryMsgCount: session.lastSummaryMsgCount || 0,
         lastRosterText: session.lastRosterText || '',
+        repoScores: session.repoScores,
         model: session.currentModel || null,
         interactiveMode: selectedAgent === AGENT_CLAUDE ? !!session.iv : undefined,
         mcpExtras: session.mcpExtras,
@@ -9247,6 +9280,7 @@ async function switchAgentSession(roomId, targetAgent, { sendReply }) {
   next.pinnedSummaryEventId = existing.pinnedSummaryEventId;
   next.lastSummaryMsgCount = existing.lastSummaryMsgCount || 0;
   next.lastRosterText = existing.lastRosterText || '';
+  next.repoScores = existing.repoScores; // carry activity-inferred repo signal across replacement
   next.journalConvoId = stableConvoId;
   next._journalBuffer = existing._journalBuffer;
   next._journalTitleHint = existing._journalTitleHint;
@@ -9449,6 +9483,7 @@ function recreateSession(roomId, overrides, { sendReply, sendHtml }) {
   next.pinnedSummaryEventId = existing.pinnedSummaryEventId;
   next.lastSummaryMsgCount = existing.lastSummaryMsgCount || 0;
   next.lastRosterText = existing.lastRosterText || '';
+  next.repoScores = existing.repoScores; // carry activity-inferred repo signal across replacement
   next._agentHistoryCursor = existing._agentHistoryCursor;
   next._pendingAgentHandoff = existing._pendingAgentHandoff;
   next._agentSessions = existing._agentSessions;

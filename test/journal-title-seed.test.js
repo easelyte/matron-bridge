@@ -156,6 +156,18 @@ describe('formatRoomTitle', () => {
     expect(formatRoomTitle({ ...options, repo: '   ' })).toBe('VPS · yearbook-app');
     expect(formatRoomTitle({ ...options, repo: null })).toBe('VPS · yearbook-app');
   });
+
+  it('sanitizes an untrusted repo label at the sink (F3)', () => {
+    // A filesystem-derived label could contain the `·` separator, bidi/control
+    // chars, or angle brackets and forge/reorder title segments. formatRoomTitle
+    // must clean every repo source, not trust the caller.
+    expect(formatRoomTitle({ ...options, text: 'work', repo: 'a·b' })).toBe('VPS · a b · work');
+    expect(formatRoomTitle({ ...options, text: 'work', repo: 'evil‮reh' }))
+      .toBe('VPS · evil reh · work');
+    expect(formatRoomTitle({ ...options, text: 'work', repo: 'x<script>y' })).toBe('VPS · x y · work');
+    // Empty-after-cleaning falls back to the workdir basename.
+    expect(formatRoomTitle({ ...options, text: 'work', repo: '···' })).toBe('VPS · yearbook-app · work');
+  });
 });
 
 describe('extractRepoOverride', () => {
