@@ -74,3 +74,36 @@ describe('journal publisher session outcome', () => {
     pub.close();
   });
 });
+
+describe('journal publisher agent kind', () => {
+  it('forwards a defined agent_kind and omits the key when absent', async () => {
+    FakeWebSocket.instances.length = 0;
+    const pub = createJournalPublisher({
+      url: 'ws://journal.test/ws',
+      token: 'test-token',
+      log: { warn() {} },
+      keepaliveIntervalMs: 0,
+      WebSocketImpl: FakeWebSocket,
+    });
+
+    await nextTurn();
+    // A top-level codex-backed conversation stamps its backend kind...
+    pub.upsertConvo('codex-top-1', { sessionState: 'running', agentKind: 'codex' });
+    // ...while an upsert that omits it leaves the key off the frame entirely, so
+    // the server COALESCEs and any recorded kind survives.
+    pub.upsertConvo('claude-top-1', { title: 'x' });
+    await nextTurn();
+
+    const [codexFrame, plainFrame] = FakeWebSocket.instances[0].frames;
+    expect(codexFrame).toMatchObject({
+      op: 'convo_upsert',
+      convo_id: 'codex-top-1',
+      session_state: 'running',
+      agent_kind: 'codex',
+    });
+    expect(plainFrame).toMatchObject({ op: 'convo_upsert', convo_id: 'claude-top-1', title: 'x' });
+    expect('agent_kind' in plainFrame).toBe(false);
+
+    pub.close();
+  });
+});

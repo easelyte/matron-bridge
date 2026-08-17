@@ -836,7 +836,10 @@ function journalPublish(session, method, payload) {
     if (!session._journalConvoEstablished) {
       session._journalConvoEstablished = true;
       if (method !== 'upsertConvo') {
-        journalPublisher.upsertConvo(convoId, { title: session._journalTitleHint });
+        // Carry the backend kind on the bootstrap upsert too (loop #619), so a
+        // convo first touched by a non-upsert publish (e.g. an assistant notice
+        // before the first state transition) is marked codex/claude immediately.
+        journalPublisher.upsertConvo(convoId, { title: session._journalTitleHint, agentKind: session.agent });
       }
     }
     journalPublisher[method](convoId, payload);
@@ -1011,7 +1014,16 @@ function journalUpsertConvo(session, opts) {
     persistSession(session.roomId, session.claudeSessionId, session.workdir,
       session.originRoomId, { journalTitleHint: opts.title });
   }
-  journalPublish(session, 'upsertConvo', opts);
+  // Stamp the backend kind on every session-scoped upsert so clients can mark
+  // codex vs claude on top-level conversation rows (loop #619). session.agent
+  // ('claude' | 'codex') is set at session creation; a caller that already
+  // supplied agentKind wins. agent_kind is COALESCE-sticky server-side, so
+  // re-sending it on each state transition is idempotent.
+  journalPublish(
+    session,
+    'upsertConvo',
+    session.agent && opts.agentKind === undefined ? { ...opts, agentKind: session.agent } : opts,
+  );
 }
 
 // opts.incomingHint: the title carried across a restart/resume (see
