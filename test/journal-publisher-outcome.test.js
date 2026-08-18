@@ -1,7 +1,7 @@
 import { EventEmitter } from 'node:events';
 import { describe, expect, it } from 'vitest';
 import WebSocket from 'ws';
-import { createJournalPublisher } from '../lib/journal-publisher.js';
+import { createJournalPublisher, peerMessageIdemKey } from '../lib/journal-publisher.js';
 
 class FakeWebSocket extends EventEmitter {
   static instances = [];
@@ -104,6 +104,91 @@ describe('journal publisher agent kind', () => {
     expect(plainFrame).toMatchObject({ op: 'convo_upsert', convo_id: 'claude-top-1', title: 'x' });
     expect('agent_kind' in plainFrame).toBe(false);
 
+    pub.close();
+  });
+});
+
+describe('journal publisher peer messages', () => {
+  it('hashes canonical tuples without plain-concatenation collisions', () => {
+    expect(peerMessageIdemKey('ab', 'c', 'd')).not.toBe(peerMessageIdemKey('a', 'bc', 'd'));
+    expect(peerMessageIdemKey('from', 'target', 'body')).toBe(peerMessageIdemKey('from', 'target', 'body'));
+  });
+
+  it('emits the agent op with a deterministic content-derived key', async () => {
+    FakeWebSocket.instances.length = 0;
+    const pub = createJournalPublisher({
+      url: 'ws://journal.test/ws', token: 'test-token', log: { warn() {} },
+      keepaliveIntervalMs: 0, WebSocketImpl: FakeWebSocket,
+    });
+    await nextTurn();
+
+    const first = await pub.sendPeerMessage({ targetConvo: 'target', fromConvo: 'from', body: 'coordinate' });
+    const second = await pub.sendPeerMessage({ targetConvo: 'target', fromConvo: 'from', body: 'coordinate' });
+
+    expect(first).toEqual({ sent: true });
+    expect(second).toEqual({ sent: true });
+    const frames = FakeWebSocket.instances[0].frames;
+    expect(frames).toHaveLength(2);
+    expect(frames[0]).toEqual({
+      op: 'peer_message', target_convo: 'target', from_convo: 'from', body: 'coordinate',
+      idem_key: peerMessageIdemKey('from', 'target', 'coordinate'),
+    });
+    expect(frames[1].idem_key).toBe(frames[0].idem_key);
+    pub.close();
+  });
+
+  it('retransmits an unconfirmed frame with the same key inside the horizon', async () => {
+    class DropFirstPeerConfirmWebSocket extends FakeWebSocket {
+      send(data, callback) {
+        const frame = JSON.parse(data);
+        if (frame.op !== 'peer_message' || DropFirstPeerConfirmWebSocket.instances.length > 1) {
+          return super.send(data, callback);
+        }
+        this.frames.push(frame);
+        callback?.(new Error('simulated transport loss'));
+      }
+    }
+    DropFirstPeerConfirmWebSocket.instances.length = 0;
+    const pub = createJournalPublisher({
+      url: 'ws://journal.test/ws', token: 'test-token', log: { warn() {} },
+      keepaliveIntervalMs: 0, backoffBaseMs: 1, backoffCapMs: 1,
+      peerMessageRetryHorizonMs: 100, WebSocketImpl: DropFirstPeerConfirmWebSocket,
+    });
+    await nextTurn();
+
+    const outcome = await pub.sendPeerMessage({ targetConvo: 'target', fromConvo: 'from', body: 'once' });
+
+    expect(outcome).toEqual({ sent: true });
+    expect(DropFirstPeerConfirmWebSocket.instances).toHaveLength(2);
+    const frames = DropFirstPeerConfirmWebSocket.instances.flatMap((socket) => socket.frames);
+    expect(frames).toHaveLength(2);
+    expect(new Set(frames.map((frame) => frame.idem_key)).size).toBe(1);
+    pub.close();
+  });
+
+  it('stops at the retry horizon and reports uncertainty', async () => {
+    class NeverConfirmPeerWebSocket extends FakeWebSocket {
+      send(data, callback) {
+        const frame = JSON.parse(data);
+        if (frame.op === 'peer_message') {
+          this.frames.push(frame);
+          return;
+        }
+        return super.send(data, callback);
+      }
+    }
+    NeverConfirmPeerWebSocket.instances.length = 0;
+    const pub = createJournalPublisher({
+      url: 'ws://journal.test/ws', token: 'test-token', log: { warn() {} },
+      keepaliveIntervalMs: 0, peerMessageRetryHorizonMs: 10,
+      WebSocketImpl: NeverConfirmPeerWebSocket,
+    });
+    await nextTurn();
+
+    const outcome = await pub.sendPeerMessage({ targetConvo: 'target', fromConvo: 'from', body: 'uncertain' });
+
+    expect(outcome).toEqual({ queued: false, uncertain: true });
+    expect(NeverConfirmPeerWebSocket.instances[0].frames).toHaveLength(1);
     pub.close();
   });
 });

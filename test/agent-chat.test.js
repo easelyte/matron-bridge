@@ -28,6 +28,10 @@ function makeFixture(overrides = {}) {
     fetchMessages: async () => ({ events: [] }),
     upsertConvo: (convoId, opts) => calls.push({ call: 'upsertConvo', convoId, opts }),
     publishText: (convoId, payload) => calls.push({ call: 'publishText', convoId, payload }),
+    sendPeerMessage: vi.fn(async (args) => {
+      calls.push({ call: 'sendPeerMessage', args });
+      return { sent: true };
+    }),
     ...overrides.publisher,
   };
   const registry = createAgentRooms({ log: { warn: () => {} } });
@@ -88,11 +92,27 @@ describe('createAgentChatHandlers', () => {
       expect(calls).toEqual([]);
     });
 
-    it('fails loudly for a valid request until the peer-message transport task lands', async () => {
+    it('emits a peer message with caller-bound attribution and ignores supplied attribution', async () => {
       const { handlers, calls } = makeFixture();
-      const res = await handlers.agentMessage({ roomId: '!sess', target_convo: 'convo-remote', body: 'coordinate this' });
-      expect(res).toEqual({ status: 501, body: { error: 'agent_message transport is not implemented yet' } });
-      expect(calls).toEqual([]);
+      const res = await handlers.agentMessage({
+        roomId: '!sess', target_convo: 'convo-remote', body: 'coordinate this',
+        from_convo: 'model-forged',
+      });
+      expect(res).toEqual({ status: 200, body: { sent: true } });
+      expect(calls).toEqual([{
+        call: 'sendPeerMessage',
+        args: { targetConvo: 'convo-remote', fromConvo: '!sess', body: 'coordinate this' },
+      }]);
+    });
+
+    it('surfaces transport-horizon exhaustion as uncertain', async () => {
+      const { handlers } = makeFixture({
+        publisher: { sendPeerMessage: vi.fn(async () => ({ queued: false, uncertain: true })) },
+      });
+      const res = await handlers.agentMessage({
+        roomId: '!sess', target_convo: 'convo-remote', body: 'coordinate this',
+      });
+      expect(res).toEqual({ status: 200, body: { queued: false, uncertain: true } });
     });
   });
 
