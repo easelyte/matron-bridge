@@ -553,13 +553,17 @@ function loadPersistedSessions() {
   return {};
 }
 
+function savePersistedSessionsOrThrow(data) {
+  // Atomic replace (PR #151 follow-up): this file is rewritten on every
+  // message, and loadPersistedSessions treats a corrupt file as {} — so a
+  // truncating in-place write that dies mid-rewrite silently drops every
+  // persisted session, and the next persist overwrites the evidence.
+  atomicWriteFileSync(SESSIONS_FILE, JSON.stringify(data, null, 2));
+}
+
 function savePersistedSessions(data) {
   try {
-    // Atomic replace (PR #151 follow-up): this file is rewritten on every
-    // message, and loadPersistedSessions treats a corrupt file as {} — so a
-    // truncating in-place write that dies mid-rewrite silently drops every
-    // persisted session, and the next persist overwrites the evidence.
-    atomicWriteFileSync(SESSIONS_FILE, JSON.stringify(data, null, 2));
+    savePersistedSessionsOrThrow(data);
   } catch (e) {
     console.error('Failed to save sessions file:', e.message);
   }
@@ -574,7 +578,7 @@ recentFolders.seedFrom(Object.values(loadPersistedSessions()).map((rec) => ({
   lastUsed: rec?.lastUsed,
 })));
 
-function persistSession(roomId, sessionId, workdir, originRoomId, extra) {
+function persistSession(roomId, sessionId, workdir, originRoomId, extra, { failLoud = false } = {}) {
   recentFolders.touch(workdir, Date.now());
   const data = loadPersistedSessions();
   const existing = data[String(roomId)] || {};
@@ -657,7 +661,8 @@ function persistSession(roomId, sessionId, workdir, originRoomId, extra) {
     ...(activeAgent ? { agent: activeAgent } : {}),
     agentSessions,
   };
-  savePersistedSessions(data);
+  if (failLoud) savePersistedSessionsOrThrow(data);
+  else savePersistedSessions(data);
 }
 
 function getPersistedSession(roomId) {
@@ -7984,10 +7989,10 @@ function journalOnPeerMessage(frame) {
   // but replay must still skip it rather than inject the same peer line twice.
   if (!Number.isInteger(frame.seq) || frame.seq <= session.peerHandledWatermark) return;
 
-  session.peerHandledWatermark = frame.seq;
   persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, {
-    peerHandledWatermark: session.peerHandledWatermark,
-  });
+    peerHandledWatermark: frame.seq,
+  }, { failLoud: true });
+  session.peerHandledWatermark = frame.seq;
 
   // Enqueue/inject delivery is added by the following peer handoff tasks.
 }
