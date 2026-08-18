@@ -7955,6 +7955,17 @@ function awaitRoomMessage(chatRoomId, ms) {
   return roomReplyWaiters.await(chatRoomId, ms);
 }
 
+// Router seam for a persisted peer_message fanned into its target convo.
+// `sessions` is keyed by Matrix roomId, so target resolution must use the
+// journal-convo reverse lookup (including after a native session resume).
+// Offline targets stay journal-visible but are not resumed or injected in v1.
+function journalOnPeerMessage(frame) {
+  const session = findSessionByClaudeSessionId(frame.convo_id);
+  if (!session || !session.alive) return;
+
+  // Delivery is added by the following peer handoff/watermark tasks.
+}
+
 // Router seam: a journal frame in an active room convo lands here instead of
 // the main-convo input path. Formats the peer's message as a `[room …]` line
 // and hands it to roomDelivery against the room's bound session.
@@ -8223,6 +8234,7 @@ const journalInputConsumer = createJournalInputConsumer({
   // when both are known, by device name otherwise.
   roomFor: (convoId) => (agentRooms.isActive(convoId) ? agentRooms.get(convoId) : null),
   routeRoomFrame: journalOnRoomFrame,
+  journalOnPeerMessage,
   selfAgentName: () => journalPublisher.identity()?.name || null,
   selfAgentDeviceId: () => journalPublisher.identity()?.deviceId ?? null,
   // Queued-release universal echo-ack (spec §3 step 5): the echo of our own
