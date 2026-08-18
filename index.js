@@ -8778,9 +8778,16 @@ const apiServer = createServer(async (req, res) => {
         return;
       }
 
+      // The per-session MCP process reads its BRIDGE_ROOM_ID env into ROOM_ID
+      // and carries it as data.roomId. Overwrite any caller-supplied attribution
+      // before the handler sees it; the model-facing tool cannot set roomId.
       if (url.pathname === '/agent-message') {
+        if (data && typeof data === 'object') data.from_convo = data.roomId;
         await respondAgentChatRoute(res, data, agentChatHandlers.agentMessage,
           (status, b) => debug(`agent-message ${status} ${b.error || 'ok'}`));
+        // Accepted v1 residual (peer-message design §6/§9): callerSession
+        // shares the unauthenticated localhost roomId trust model used by every
+        // agent_* route. Harden all loopback routes together, not this one alone.
         return;
       }
 
