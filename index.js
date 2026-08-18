@@ -7983,6 +7983,10 @@ function formatPeerDelivery(messages, { droppedCount = 0 } = {}) {
 
 const peerDelivery = createRoomDelivery({
   isBusy: sessionOccupiedForRoomDelivery,
+  // R501 §9 is layered: formatPeerDelivery marks this ordinary role:'user'
+  // turn as hostile-by-default, while the deployment-conditional downstream
+  // MATRON_PERMISSION_CARDS gate covers tool calls. When that gate is off, the
+  // in-band marker is the sole control; peers gain no capability or elevation.
   injectTurn: (session, text) => sendTextToSession(session, text, { skipJournalMirror: true }),
   formatter: formatPeerDelivery,
   maxPendingBytes: 16 * 1024,
