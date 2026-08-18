@@ -1,15 +1,9 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
+import { describe, it } from 'vitest';
 import { createAgentChatHandlers } from '../lib/agent-chat.js';
 import { createRoomDelivery } from '../lib/room-delivery.js';
 import { oneLine } from '../lib/peer-text.js';
-
-// This repository normally runs Vitest, while the cross-repo peer-message
-// plan's bridge gate is `node --test`. Keep this behavioral suite runnable by
-// both so the same assertions guard both entry points.
-const { describe, it } = process.env.VITEST
-  ? await import('vitest')
-  : await import('node:test');
 
 const indexSource = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
 const fixture = JSON.parse(readFileSync(
@@ -37,13 +31,13 @@ const buildPeerRuntime = new Function(
   'sendTextToSession',
   `${sourceBetween('function journalConvoIdFor(', '// Reverse lookup for the journal return path:')}
    ${sourceBetween('function findSessionByClaudeSessionId(', '// --- Journal dual-post mirroring ---')}
-   ${sourceBetween('function sessionOccupiedForRoomDelivery(', '// The one shared room-flush gate')}
-   ${sourceBetween('const PEER_UNTRUSTED_MARKER =', '// Per-room once-listener registry')}
+   ${sourceBetween('function sessionOccupiedForRoomDelivery(', '// Per-room once-listener registry')}
    ${sourceBetween('function journalOnPeerMessage(', '// Router seam: a journal frame in an active room convo')}
    return {
      findSessionByClaudeSessionId,
      formatPeerDelivery,
      journalOnPeerMessage,
+     maybeFlushRoomDelivery,
      peerDelivery,
      sessionOccupiedForRoomDelivery,
    };`,
@@ -72,7 +66,7 @@ function session(overrides = {}) {
   };
 }
 
-function makeRuntime({ target = session(), persistImpl } = {}) {
+function makeRuntime({ target = session(), persistImpl, markBusyOnInject = false } = {}) {
   const sessions = new Map(target ? [[target.roomId, target]] : []);
   const persistCalls = [];
   const injectCalls = [];
@@ -82,6 +76,7 @@ function makeRuntime({ target = session(), persistImpl } = {}) {
   };
   const sendTextToSession = (...args) => {
     injectCalls.push(args);
+    if (markBusyOnInject) args[0].busy = true;
     return true;
   };
   const runtime = buildPeerRuntime(
@@ -170,6 +165,41 @@ describe('journalOnPeerMessage receive behavior', () => {
     runtime.journalOnPeerMessage(frame);
     assert.equal(runtime.injectCalls.length, 1);
     assert.equal(runtime.persistCalls.length, 1);
+  });
+
+  it('drains an older peer before a new frame after escape clears busy, without wedging', () => {
+    const target = session({ busy: true });
+    const runtime = makeRuntime({ target, markBusyOnInject: true });
+
+    runtime.journalOnPeerMessage(peerFrame({ seq: 1, payload: { body: 'seq1' } }));
+    assert.equal(runtime.peerDelivery.pendingCount(target.roomId), 1);
+    assert.equal(runtime.injectCalls.length, 0);
+
+    // Mirrors the !esc/interrupt-wedge escape paths: busy becomes false but
+    // those paths do not themselves pass through the turn-end flush seam.
+    target.busy = false;
+    runtime.journalOnPeerMessage(peerFrame({ seq: 2, payload: { body: 'seq2' } }));
+
+    assert.equal(runtime.injectCalls.length, 1);
+    assert.equal(runtime.injectCalls[0][1].endsWith('] seq1'), true);
+    assert.equal(runtime.peerDelivery.pendingCount(target.roomId), 1);
+    assert.equal(target.busy, true);
+
+    // Completion of the recovered seq1 turn drains seq2; completion of seq2
+    // leaves no pending frame or synthetic busy state behind.
+    target.busy = false;
+    runtime.maybeFlushRoomDelivery(target);
+    assert.deepEqual(
+      runtime.injectCalls.map((call) => call[1].slice(call[1].lastIndexOf('] ') + 2)),
+      ['seq1', 'seq2'],
+    );
+    assert.equal(runtime.peerDelivery.pendingCount(target.roomId), 0);
+    assert.equal(target.busy, true);
+
+    target.busy = false;
+    runtime.maybeFlushRoomDelivery(target);
+    assert.equal(runtime.peerDelivery.pendingCount(target.roomId), 0);
+    assert.equal(target.busy, false);
   });
 
   it('does not inject an offline target while agent_message still honestly reports queued', async () => {

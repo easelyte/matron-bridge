@@ -8013,6 +8013,12 @@ function journalOnPeerMessage(frame) {
   const session = findSessionByClaudeSessionId(frame.convo_id);
   if (!session || !session.alive) return;
 
+  // Self-heal a pending inbox after any path that cleared busy without a
+  // turn-end flush (for example esc-cancel or the interrupt-wedge timer).
+  // Drain older peer frames before accepting this one so a newly arrived
+  // frame can never overtake the backlog.
+  maybeFlushRoomDelivery(session);
+
   // The watermark records HANDOFF, not eventual injection. A busy session's
   // in-memory queue is best-effort: after a crash the queued item may be gone,
   // but replay must still skip it rather than inject the same peer line twice.
