@@ -232,6 +232,28 @@ server.tool(
 );
 
 server.tool(
+  'agent_sessions',
+  "List this user's addressable agent sessions for direct coordination. Each entry includes its conversation id, title, state, agent kind, and whether it is this session; never target an entry where is_self is true.",
+  {},
+  async () => {
+    try {
+      const postRes = await fetch(`${BRIDGE_API}/agent-sessions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ roomId: ROOM_ID }),
+      });
+      const data = await postRes.json().catch(() => ({}));
+      if (!postRes.ok) {
+        return { content: [{ type: 'text', text: `agent_sessions failed: ${data.error || `HTTP ${postRes.status}`}` }] };
+      }
+      return { content: [{ type: 'text', text: JSON.stringify(data.sessions || [], null, 2) }] };
+    } catch (err) {
+      return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
+    }
+  }
+);
+
+server.tool(
   'agent_chat_start',
   "Start a chat room with one of the user's other agent sessions: pick a target conversation from agent_roster, and the bridge invites its agent. If the result is pending or pending_busy, do NOT wait or poll: continue your own work — the answer and any replies arrive automatically as later turns.",
   {

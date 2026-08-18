@@ -8503,7 +8503,7 @@ const handleSendAttachment = createSendAttachmentHandler({
   rooms: agentRooms,
 });
 
-// The eight agent-chat room tools (lib/agent-chat.js), mounted below as thin
+// The agent-chat tools (lib/agent-chat.js), mounted below as thin
 // loopback routes in the /send-attachment pattern. awaitRoomMessage is the
 // per-room once-listener seam defined next to journalOnRoomFrame.
 const agentChatHandlers = createAgentChatHandlers({
@@ -8563,7 +8563,7 @@ agentSpawnHandlers = createAgentSpawnHandlers({
   log: console,
 });
 
-// Adapter wrapper for the eight agent-chat loopback routes: a throw inside a
+// Adapter wrapper for the agent-chat loopback routes: a throw inside a
 // handler must surface as that route's own 500 with the real message — not
 // bubble to the request body's outer catch and masquerade as
 // "HTTP 400 Invalid JSON" (Task 8 review, finding 5).
@@ -8769,6 +8769,12 @@ const apiServer = createServer(async (req, res) => {
       if (url.pathname === '/agent-roster') {
         await respondAgentChatRoute(res, data, agentChatHandlers.roster,
           (status, b) => debug(`agent-roster ${status} ${b.error || `${(b.conversations || []).length} convos`}`));
+        return;
+      }
+
+      if (url.pathname === '/agent-sessions') {
+        await respondAgentChatRoute(res, data, agentChatHandlers.agentSessions,
+          (status, b) => debug(`agent-sessions ${status} ${b.error || `${(b.sessions || []).length} sessions`}`));
         return;
       }
 
