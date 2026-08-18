@@ -30,7 +30,7 @@ function makeFixture(overrides = {}) {
     publishText: (convoId, payload) => calls.push({ call: 'publishText', convoId, payload }),
     sendPeerMessage: vi.fn(async (args) => {
       calls.push({ call: 'sendPeerMessage', args });
-      return { sent: true };
+      return { sent: true, seq: 99, duplicate: false, delivered: true, offline: false };
     }),
     ...overrides.publisher,
   };
@@ -92,13 +92,13 @@ describe('createAgentChatHandlers', () => {
       expect(calls).toEqual([]);
     });
 
-    it('emits a peer message with caller-bound attribution and ignores supplied attribution', async () => {
+    it('emits with caller-bound attribution and maps transport success to only queued:true', async () => {
       const { handlers, calls } = makeFixture();
       const res = await handlers.agentMessage({
         roomId: '!sess', target_convo: 'convo-remote', body: 'coordinate this',
         from_convo: 'model-forged',
       });
-      expect(res).toEqual({ status: 200, body: { sent: true } });
+      expect(res).toEqual({ status: 200, body: { queued: true } });
       expect(calls).toEqual([{
         call: 'sendPeerMessage',
         args: { targetConvo: 'convo-remote', fromConvo: '!sess', body: 'coordinate this' },
