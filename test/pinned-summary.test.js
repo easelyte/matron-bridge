@@ -322,7 +322,7 @@ describe('updatePinnedSummary title flow and log levels', () => {
     });
     expect(d.updateRoomName).toHaveBeenCalledWith(
       '!room:example.test',
-      'VPS:/srv/project:Useful work',
+      '[se] VPS:/srv/project:Useful work',
     );
     expect(d.warn).not.toHaveBeenCalled();
     expect(d.debug).toHaveBeenCalledWith('[summary] ok', { durationMs: 12 });

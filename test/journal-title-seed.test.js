@@ -115,25 +115,25 @@ describe('formatRoomTitle', () => {
 
   it('formats the server and repo without text or a session id', () => {
     const title = formatRoomTitle(options);
-    expect(title).toBe('VPS · yearbook-app');
+    expect(title).toBe('yearbook-app');
     expect(title).not.toMatch(/:\w{2}/);
   });
 
   it('formats the server, repo, and text without a session id', () => {
     const title = formatRoomTitle({ ...options, text: 'Fix the photo upload race' });
-    expect(title).toBe('VPS · yearbook-app · Fix the photo upload race');
+    expect(title).toBe('yearbook-app · Fix the photo upload race');
     expect(title).not.toMatch(/:\w{2}/);
   });
 
   it('truncates overflowing text at 60 characters with an ellipsis', () => {
     expect(formatRoomTitle({ ...options, text: 'x'.repeat(61) })).toBe(
-      `VPS · yearbook-app · ${'x'.repeat(60)}…`,
+      `yearbook-app · ${'x'.repeat(60)}…`,
     );
   });
 
   it('truncates an overflowing repo label at 24 characters with an ellipsis', () => {
     expect(formatRoomTitle({ ...options, workdir: `/home/dan/${'r'.repeat(25)}` })).toBe(
-      `VPS · ${'r'.repeat(24)}…`,
+      `${'r'.repeat(24)}…`,
     );
   });
 
@@ -141,32 +141,32 @@ describe('formatRoomTitle', () => {
     // workdir is yearbook-app (the session cwd) but the real work targets
     // snafu-studio — the override wins.
     expect(formatRoomTitle({ ...options, text: 'fix RLS gate', repo: 'snafu-studio' })).toBe(
-      'VPS · snafu-studio · fix RLS gate',
+      'snafu-studio · fix RLS gate',
     );
   });
 
   it('caps an overflowing repo override at 24 chars with an ellipsis', () => {
-    expect(formatRoomTitle({ ...options, repo: 'r'.repeat(25) })).toBe(`VPS · ${'r'.repeat(24)}…`);
+    expect(formatRoomTitle({ ...options, repo: 'r'.repeat(25) })).toBe(`${'r'.repeat(24)}…`);
   });
 
   it('falls back to the workdir basename when repo is absent, blank, or non-string', () => {
     // Byte-identical to the pre-change output — the additive param must not
     // regress existing callers (resume path, applyFallbackTitle) that pass none.
-    expect(formatRoomTitle({ ...options })).toBe('VPS · yearbook-app');
-    expect(formatRoomTitle({ ...options, repo: '   ' })).toBe('VPS · yearbook-app');
-    expect(formatRoomTitle({ ...options, repo: null })).toBe('VPS · yearbook-app');
+    expect(formatRoomTitle({ ...options })).toBe('yearbook-app');
+    expect(formatRoomTitle({ ...options, repo: '   ' })).toBe('yearbook-app');
+    expect(formatRoomTitle({ ...options, repo: null })).toBe('yearbook-app');
   });
 
   it('sanitizes an untrusted repo label at the sink (F3)', () => {
     // A filesystem-derived label could contain the `·` separator, bidi/control
     // chars, or angle brackets and forge/reorder title segments. formatRoomTitle
     // must clean every repo source, not trust the caller.
-    expect(formatRoomTitle({ ...options, text: 'work', repo: 'a·b' })).toBe('VPS · a b · work');
+    expect(formatRoomTitle({ ...options, text: 'work', repo: 'a·b' })).toBe('a b · work');
     expect(formatRoomTitle({ ...options, text: 'work', repo: 'evil‮reh' }))
-      .toBe('VPS · evil reh · work');
-    expect(formatRoomTitle({ ...options, text: 'work', repo: 'x<script>y' })).toBe('VPS · x y · work');
+      .toBe('evil reh · work');
+    expect(formatRoomTitle({ ...options, text: 'work', repo: 'x<script>y' })).toBe('x y · work');
     // Empty-after-cleaning falls back to the workdir basename.
-    expect(formatRoomTitle({ ...options, text: 'work', repo: '···' })).toBe('VPS · yearbook-app · work');
+    expect(formatRoomTitle({ ...options, text: 'work', repo: '···' })).toBe('yearbook-app · work');
   });
 });
 
@@ -275,7 +275,7 @@ describe('applyFallbackTitle (repo-aware first-user-message naming)', () => {
     };
     const d = deps();
     expect(applyFallbackTitle(session, d)).toBe(true);
-    expect(d.updateRoomName).toHaveBeenCalledWith('!abc', 'VPS · proj · fix the folder picker');
+    expect(d.updateRoomName).toHaveBeenCalledWith('!abc', '[f0] proj · fix the folder picker');
   });
 
   it('does nothing until a user message exists, then still applies later', () => {
@@ -285,7 +285,7 @@ describe('applyFallbackTitle (repo-aware first-user-message naming)', () => {
     expect(d.updateRoomName).not.toHaveBeenCalled();
     session.chatHistory.push({ role: 'user', text: 'now do the thing' });
     expect(applyFallbackTitle(session, d)).toBe(true);
-    expect(d.updateRoomName).toHaveBeenCalledWith('!abc', 'VPS · proj · now do the thing');
+    expect(d.updateRoomName).toHaveBeenCalledWith('!abc', '[f0] proj · now do the thing');
   });
 
   it('applies only once per session', () => {
@@ -310,10 +310,10 @@ describe('applyFallbackTitle (repo-aware first-user-message naming)', () => {
     const d = hintTrackingDeps(session);
     // First application: no repo yet → titled from the workdir basename.
     expect(applyFallbackTitle(session, d)).toBe(true);
-    expect(d.updateRoomName).toHaveBeenLastCalledWith('!abc', 'VPS · proj · fix it');
+    expect(d.updateRoomName).toHaveBeenLastCalledWith('!abc', '[f0] proj · fix it');
     // A tool result commits goodfellow activity → the fallback upgrades.
     expect(applyFallbackTitle(session, { ...d, repo: 'goodfellow' })).toBe(true);
-    expect(d.updateRoomName).toHaveBeenLastCalledWith('!abc', 'VPS · goodfellow · fix it');
+    expect(d.updateRoomName).toHaveBeenLastCalledWith('!abc', '[f0] goodfellow · fix it');
     // Same repo again → no redundant rename.
     expect(applyFallbackTitle(session, { ...d, repo: 'goodfellow' })).toBe(false);
     expect(d.updateRoomName).toHaveBeenCalledTimes(2);
@@ -324,10 +324,10 @@ describe('applyFallbackTitle (repo-aware first-user-message naming)', () => {
     const d = hintTrackingDeps(session);
     // First committed signal is a READ of son-of-anton (dominant with no writes).
     expect(applyFallbackTitle(session, { ...d, repo: 'son-of-anton' })).toBe(true);
-    expect(d.updateRoomName).toHaveBeenLastCalledWith('!abc', 'VPS · son-of-anton · fix it');
+    expect(d.updateRoomName).toHaveBeenLastCalledWith('!abc', '[f0] son-of-anton · fix it');
     // A later WRITE makes goodfellow dominant — the title MUST correct, not lock.
     expect(applyFallbackTitle(session, { ...d, repo: 'goodfellow' })).toBe(true);
-    expect(d.updateRoomName).toHaveBeenLastCalledWith('!abc', 'VPS · goodfellow · fix it');
+    expect(d.updateRoomName).toHaveBeenLastCalledWith('!abc', '[f0] goodfellow · fix it');
   });
 
   it('does not upgrade if a later title (e.g. a codex pass) replaced ours', () => {
@@ -335,7 +335,7 @@ describe('applyFallbackTitle (repo-aware first-user-message naming)', () => {
     const d = hintTrackingDeps(session);
     expect(applyFallbackTitle(session, d)).toBe(true);
     // Simulate a codex summary pass winning the title in between.
-    session._journalTitleHint = 'VPS · goodfellow · Codex-authored title';
+    session._journalTitleHint = 'goodfellow · Codex-authored title';
     expect(applyFallbackTitle(session, { ...d, repo: 'goodfellow' })).toBe(false);
     expect(d.updateRoomName).toHaveBeenCalledTimes(1); // only the initial fallback
   });
@@ -346,8 +346,8 @@ describe('applyFallbackTitle (repo-aware first-user-message naming)', () => {
     const session = { roomId: '!abc', claudeSessionId: 'f0aa', chatHistory: [{ role: 'user', text: 'fix it' }] };
     const d = hintTrackingDeps(session);
     expect(applyFallbackTitle(session, { ...d, repo: 'goodfellow' })).toBe(true);
-    expect(d.updateRoomName).toHaveBeenLastCalledWith('!abc', 'VPS · goodfellow · fix it');
-    expect(session._fallbackTitleValue).toBe('VPS · goodfellow · fix it');
+    expect(d.updateRoomName).toHaveBeenLastCalledWith('!abc', '[f0] goodfellow · fix it');
+    expect(session._fallbackTitleValue).toBe('[f0] goodfellow · fix it');
   });
 
   it('strips tags, collapses whitespace, and truncates to 60 chars with an ellipsis', () => {
@@ -356,9 +356,9 @@ describe('applyFallbackTitle (repo-aware first-user-message naming)', () => {
     const d = deps();
     expect(applyFallbackTitle(session, d)).toBe(true);
     const title = d.updateRoomName.mock.calls[0][1];
-    expect(title.startsWith('VPS · proj · refactor the whole session store')).toBe(true);
+    expect(title.startsWith('[f0] proj · refactor the whole session store')).toBe(true);
     expect(title.endsWith('…')).toBe(true);
-    expect(title.length).toBe('VPS · proj · '.length + 61);
+    expect(title.length).toBe('[f0] proj · '.length + 61);
   });
 
   it('falls back to the room id for the short prefix and survives a missing history', () => {
@@ -367,7 +367,7 @@ describe('applyFallbackTitle (repo-aware first-user-message naming)', () => {
     expect(applyFallbackTitle(session, d)).toBe(false);
     session.chatHistory = [{ role: 'user', text: 'hi' }];
     expect(applyFallbackTitle(session, d)).toBe(true);
-    expect(d.updateRoomName).toHaveBeenCalledWith('!room', 'VPS · proj · hi');
+    expect(d.updateRoomName).toHaveBeenCalledWith('!room', '[!r] proj · hi');
   });
 
   it('never lets angle brackets or reassembled script fragments into the title', () => {
@@ -402,7 +402,7 @@ describe('applyFallbackTitle (repo-aware first-user-message naming)', () => {
     };
     const d = { ...deps(), workdir: '/home/dan/proj' };
     expect(applyFallbackTitle(session, d)).toBe(true);
-    expect(d.updateRoomName).toHaveBeenCalledWith('!abc', 'VPS · proj · carry on');
+    expect(d.updateRoomName).toHaveBeenCalledWith('!abc', '[f0] proj · carry on');
   });
 
   it('skips a tag-only first user message and titles from the next real one', () => {
@@ -416,6 +416,6 @@ describe('applyFallbackTitle (repo-aware first-user-message naming)', () => {
     };
     const d = deps();
     expect(applyFallbackTitle(session, d)).toBe(true);
-    expect(d.updateRoomName).toHaveBeenCalledWith('!abc', 'VPS · proj · the real prompt');
+    expect(d.updateRoomName).toHaveBeenCalledWith('!abc', '[f0] proj · the real prompt');
   });
 });
