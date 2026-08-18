@@ -7981,6 +7981,15 @@ function formatPeerDelivery(messages, { droppedCount = 0 } = {}) {
   return lines.join('\n');
 }
 
+function logPeerMessageDelivery(convo, seq, decision) {
+  console.info(JSON.stringify({
+    event: 'peer_message_delivery',
+    convo,
+    seq,
+    decision,
+  }));
+}
+
 const peerDelivery = createRoomDelivery({
   isBusy: sessionOccupiedForRoomDelivery,
   // R501 §9 is layered: formatPeerDelivery marks this ordinary role:'user'
@@ -7991,6 +8000,7 @@ const peerDelivery = createRoomDelivery({
   formatter: formatPeerDelivery,
   maxPendingBytes: 16 * 1024,
   pendingBytesOf: (message) => Buffer.byteLength(oneLine(message.body), 'utf8'),
+  onDrop: (message) => logPeerMessageDelivery(message.convo, message.seq, 'dropped-by-cap'),
   log: console,
 });
 
@@ -8011,7 +8021,10 @@ function awaitRoomMessage(chatRoomId, ms) {
 // Offline targets stay journal-visible but are not resumed or injected in v1.
 function journalOnPeerMessage(frame) {
   const session = findSessionByClaudeSessionId(frame.convo_id);
-  if (!session || !session.alive) return;
+  if (!session || !session.alive) {
+    logPeerMessageDelivery(frame.convo_id, frame.seq, 'skipped-offline');
+    return;
+  }
 
   // Self-heal a pending inbox after any path that cleared busy without a
   // turn-end flush (for example esc-cancel or the interrupt-wedge timer).
@@ -8022,7 +8035,11 @@ function journalOnPeerMessage(frame) {
   // The watermark records HANDOFF, not eventual injection. A busy session's
   // in-memory queue is best-effort: after a crash the queued item may be gone,
   // but replay must still skip it rather than inject the same peer line twice.
-  if (!Number.isInteger(frame.seq) || frame.seq <= session.peerHandledWatermark) return;
+  if (!Number.isInteger(frame.seq)) return;
+  if (frame.seq <= session.peerHandledWatermark) {
+    logPeerMessageDelivery(frame.convo_id, frame.seq, 'skipped-by-watermark');
+    return;
+  }
 
   persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, {
     peerHandledWatermark: frame.seq,
@@ -8030,12 +8047,16 @@ function journalOnPeerMessage(frame) {
   session.peerHandledWatermark = frame.seq;
 
   const payload = frame.payload || {};
+  const decision = sessionOccupiedForRoomDelivery(session) ? 'coalesced' : 'injected';
   peerDelivery.deliver(session, session.roomId, {
     roomId: payload.from_convo,
+    convo: frame.convo_id,
+    seq: frame.seq,
     from_name: payload.from_name,
     from_kind: payload.from_kind,
     body: payload.body,
   });
+  logPeerMessageDelivery(frame.convo_id, frame.seq, decision);
 }
 
 // Router seam: a journal frame in an active room convo lands here instead of
