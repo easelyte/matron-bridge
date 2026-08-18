@@ -587,6 +587,9 @@ function persistSession(roomId, sessionId, workdir, originRoomId, extra) {
   if (live && Array.isArray(live.mcpExtras)) derived.mcpExtras = live.mcpExtras;
   if (live?.agent) derived.agent = live.agent;
   if (live?.journalConvoId) derived.journalConvoId = live.journalConvoId;
+  if (live && Number.isInteger(live.peerHandledWatermark)) {
+    derived.peerHandledWatermark = live.peerHandledWatermark;
+  }
   const activeAgent = normalizeAgent(extra?.agent || live?.agent || existing.agent);
   const existingAgent = normalizeAgent(existing.agent) || (existing.sessionId ? AGENT_CLAUDE : null);
   const historyLength = live?.chatHistory?.length || existing.chatHistory?.length || 0;
@@ -1615,6 +1618,9 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     // --session-id on an already-persisted id (#136 / PR #151).
     _sessionConfirmed: identity.resumed,
     journalConvoId: options.journalConvoId || persistedMode?.journalConvoId || identity.sessionId,
+    peerHandledWatermark: Number.isInteger(persistedMode?.peerHandledWatermark)
+      ? persistedMode.peerHandledWatermark
+      : 0,
     _agentSessions: mergeAgentStates({}, options.agentSessions || persistedMode?.agentSessions),
     _agentHistoryCursor: 0,
     busy: false,
@@ -1871,6 +1877,9 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
     // journal protocol and existing persistence/routing code.
     claudeSessionId: resumeSessionId || null,
     journalConvoId: options.journalConvoId || persisted?.journalConvoId || resumeSessionId || null,
+    peerHandledWatermark: Number.isInteger(persisted?.peerHandledWatermark)
+      ? persisted.peerHandledWatermark
+      : 0,
     _agentSessions: mergeAgentStates({}, options.agentSessions || persisted?.agentSessions),
     _agentHistoryCursor: 0,
     busy: false,
@@ -2318,6 +2327,9 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     restartCount: 0,
     claudeSessionId: sessionId,
     journalConvoId: options.journalConvoId || persistedForRoom?.journalConvoId || sessionId,
+    peerHandledWatermark: Number.isInteger(persistedForRoom?.peerHandledWatermark)
+      ? persistedForRoom.peerHandledWatermark
+      : 0,
     _agentSessions: mergeAgentStates({}, options.agentSessions || persistedForRoom?.agentSessions),
     _agentHistoryCursor: 0,
     busy: false,
@@ -6129,6 +6141,9 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       session.lastSummaryMsgCount = resumePersisted?.lastSummaryMsgCount || 0;
       session.lastRosterText = resumePersisted?.lastRosterText || '';
       session.repoScores = resumeRepoScores;
+      session.peerHandledWatermark = Number.isInteger(resumePersisted?.peerHandledWatermark)
+        ? resumePersisted.peerHandledWatermark
+        : 0;
       session.sendCallback = sessionSendReply;
       session.sendHtml = sessionSendHtml;
       session.sendButtonMessage = sessionSendButtons;
@@ -6157,6 +6172,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         lastSummaryMsgCount: session.lastSummaryMsgCount || 0,
         lastRosterText: session.lastRosterText || '',
         repoScores: session.repoScores,
+        peerHandledWatermark: session.peerHandledWatermark,
         model: session.currentModel || null,
         interactiveMode: selectedAgent === AGENT_CLAUDE ? !!session.iv : undefined,
         mcpExtras: session.mcpExtras,
@@ -7963,7 +7979,17 @@ function journalOnPeerMessage(frame) {
   const session = findSessionByClaudeSessionId(frame.convo_id);
   if (!session || !session.alive) return;
 
-  // Delivery is added by the following peer handoff/watermark tasks.
+  // The watermark records HANDOFF, not eventual injection. A busy session's
+  // in-memory queue is best-effort: after a crash the queued item may be gone,
+  // but replay must still skip it rather than inject the same peer line twice.
+  if (!Number.isInteger(frame.seq) || frame.seq <= session.peerHandledWatermark) return;
+
+  session.peerHandledWatermark = frame.seq;
+  persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, {
+    peerHandledWatermark: session.peerHandledWatermark,
+  });
+
+  // Enqueue/inject delivery is added by the following peer handoff tasks.
 }
 
 // Router seam: a journal frame in an active room convo lands here instead of
