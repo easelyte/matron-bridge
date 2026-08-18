@@ -99,10 +99,19 @@ describe('createAgentChatHandlers', () => {
         from_convo: 'model-forged',
       });
       expect(res).toEqual({ status: 200, body: { queued: true } });
+      // fromConvo is the caller's JOURNAL convo id (journalConvoIdFor stub → 'convo-sess'),
+      // NOT the roomId '!sess' (F2) and NOT the model-forged value (spoof ignored).
       expect(calls).toEqual([{
         call: 'sendPeerMessage',
-        args: { targetConvo: 'convo-remote', fromConvo: '!sess', body: 'coordinate this' },
+        args: { targetConvo: 'convo-remote', fromConvo: 'convo-sess', body: 'coordinate this' },
       }]);
+    });
+
+    it('409s when the session has no journal convo bound yet (F2 fail-loud)', async () => {
+      const { handlers, sessions } = makeFixture();
+      sessions.set('!nocvo', { busy: false, alive: true }); // no convoId → journalConvoIdFor null
+      const res = await handlers.agentMessage({ roomId: '!nocvo', target_convo: 'convo-remote', body: 'x' });
+      expect(res.status).toBe(409);
     });
 
     it('surfaces transport-horizon exhaustion as uncertain', async () => {
@@ -119,7 +128,9 @@ describe('createAgentChatHandlers', () => {
   describe('agentSessions', () => {
     it('lists same-box and cross-box sessions with state, raw kind, and only the caller flagged as self', async () => {
       const conversations = [
-        { id: '!sess', title: 'This session', session_state: 'running', agent_device_id: 1, agent_kind: 'claude' },
+        // caller's own JOURNAL convo id is 'convo-sess' (journalConvoIdFor stub → s.convoId),
+        // NOT the roomId '!sess' — is_self must key on the journal convo id (F2).
+        { id: 'convo-sess', title: 'This session', session_state: 'running', agent_device_id: 1, agent_kind: 'claude' },
         { id: 'convo-same-box', title: 'Same box peer', session_state: 'waiting', agent_device_id: 1, agent_kind: null },
         { id: 'convo-cross-box', title: 'Cross box peer', session_state: 'done', agent_device_id: 7, agent_kind: 'codex' },
       ];
@@ -133,7 +144,7 @@ describe('createAgentChatHandlers', () => {
         status: 200,
         body: {
           sessions: [
-            { convo_id: '!sess', title: 'This session', session_state: 'running', agent_kind: 'claude', is_self: true },
+            { convo_id: 'convo-sess', title: 'This session', session_state: 'running', agent_kind: 'claude', is_self: true },
             { convo_id: 'convo-same-box', title: 'Same box peer', session_state: 'waiting', agent_kind: null, is_self: false },
             { convo_id: 'convo-cross-box', title: 'Cross box peer', session_state: 'done', agent_kind: 'codex', is_self: false },
           ],
