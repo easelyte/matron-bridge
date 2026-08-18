@@ -8778,6 +8778,12 @@ const apiServer = createServer(async (req, res) => {
         return;
       }
 
+      if (url.pathname === '/agent-message') {
+        await respondAgentChatRoute(res, data, agentChatHandlers.agentMessage,
+          (status, b) => debug(`agent-message ${status} ${b.error || 'ok'}`));
+        return;
+      }
+
       if (url.pathname === '/agent-chat-start') {
         await respondAgentChatRoute(res, data, agentChatHandlers.chatStart,
           (status, b) => debug(`agent-chat-start ${status} ${b.room_id || ''} ${b.status || b.error || ''}`));

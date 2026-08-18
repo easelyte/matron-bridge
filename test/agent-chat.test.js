@@ -64,7 +64,7 @@ describe('createAgentChatHandlers', () => {
   describe('caller-session gate (all handlers)', () => {
     it('rejects a missing or non-string roomId with 400', async () => {
       const { handlers } = makeFixture();
-      for (const h of ['roster', 'agentSessions', 'chatStart', 'chatSend', 'chatAccept', 'chatRefuse', 'chatJoin', 'chatLeave', 'chatRead']) {
+      for (const h of ['roster', 'agentSessions', 'agentMessage', 'chatStart', 'chatSend', 'chatAccept', 'chatRefuse', 'chatJoin', 'chatLeave', 'chatRead']) {
         expect((await handlers[h]({})).status).toBe(400);
         expect((await handlers[h]({ roomId: 42 })).status).toBe(400);
       }
@@ -75,6 +75,24 @@ describe('createAgentChatHandlers', () => {
       const res = await handlers.roster({ roomId: '!nope' });
       expect(res.status).toBe(404);
       expect(res.body.error).toMatch(/no active session/i);
+    });
+  });
+
+  describe('agentMessage', () => {
+    it('rejects a missing target or empty body before the transport emit exists', async () => {
+      const { handlers, calls } = makeFixture();
+
+      expect((await handlers.agentMessage({ roomId: '!sess', body: 'coordinate this' })).status).toBe(400);
+      expect((await handlers.agentMessage({ roomId: '!sess', target_convo: 'convo-remote', body: '' })).status).toBe(400);
+      expect((await handlers.agentMessage({ roomId: '!sess', target_convo: 'convo-remote', body: '   ' })).status).toBe(400);
+      expect(calls).toEqual([]);
+    });
+
+    it('fails loudly for a valid request until the peer-message transport task lands', async () => {
+      const { handlers, calls } = makeFixture();
+      const res = await handlers.agentMessage({ roomId: '!sess', target_convo: 'convo-remote', body: 'coordinate this' });
+      expect(res).toEqual({ status: 501, body: { error: 'agent_message transport is not implemented yet' } });
+      expect(calls).toEqual([]);
     });
   });
 
@@ -989,6 +1007,7 @@ describe('index.js routes + ask-user.js tools (source inspection)', () => {
   const ROUTES = [
     ['/agent-roster', 'roster'],
     ['/agent-sessions', 'agentSessions'],
+    ['/agent-message', 'agentMessage'],
     ['/agent-chat-start', 'chatStart'],
     ['/agent-chat-send', 'chatSend'],
     ['/agent-chat-accept', 'chatAccept'],
@@ -998,7 +1017,7 @@ describe('index.js routes + ask-user.js tools (source inspection)', () => {
     ['/agent-chat-read', 'chatRead'],
   ];
   const TOOLS = [
-    'agent_roster', 'agent_sessions', 'agent_chat_start', 'agent_chat_send', 'agent_chat_accept',
+    'agent_roster', 'agent_sessions', 'agent_message', 'agent_chat_start', 'agent_chat_send', 'agent_chat_accept',
     'agent_chat_refuse', 'agent_chat_join', 'agent_chat_leave', 'agent_chat_read',
   ];
   const indexSrc = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
@@ -1104,6 +1123,7 @@ describe('index.js routes + ask-user.js tools (source inspection)', () => {
   const TOOL_WIRING = [
     ['agent_roster', '/agent-roster', ['roomId: ROOM_ID']],
     ['agent_sessions', '/agent-sessions', ['roomId: ROOM_ID']],
+    ['agent_message', '/agent-message', ['roomId: ROOM_ID', 'target_convo', 'body']],
     ['agent_chat_start', '/agent-chat-start', ['roomId: ROOM_ID', 'target_convo_id', 'topic', 'justification', 'message']],
     ['agent_chat_send', '/agent-chat-send', ['roomId: ROOM_ID', 'room_id', 'message', 'wait_seconds']],
     ['agent_chat_accept', '/agent-chat-accept', ['roomId: ROOM_ID', 'room_id']],
@@ -1124,6 +1144,16 @@ describe('index.js routes + ask-user.js tools (source inspection)', () => {
       expect(block, `${name} fetches ${path}`).toContain('${BRIDGE_API}' + path + '`');
       for (const key of keys) expect(block, `${name} body carries ${key}`).toContain(key);
     }
+  });
+
+  it('agent_message exposes exactly target_convo and body as model-facing parameters', () => {
+    const block = toolBlock('agent_message');
+    const schema = block.slice(block.indexOf('{'), block.indexOf('async ('));
+    expect(schema).toMatch(/target_convo: z\.string\(\)\.min\(1\)/);
+    expect(schema).toMatch(/body: z\.string\(\)\.min\(1\)/);
+    expect(schema).not.toMatch(/\bfrom_convo\b|\broomId\b/);
+    expect((schema.match(/^\s+[a-z_]+:/gm) || []).map((line) => line.trim().split(':')[0]))
+      .toEqual(['target_convo', 'body']);
   });
 
   it('keeps the no-polling etiquette in the tool descriptions', () => {
