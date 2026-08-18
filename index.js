@@ -7994,7 +7994,15 @@ function journalOnPeerMessage(frame) {
   }, { failLoud: true });
   session.peerHandledWatermark = frame.seq;
 
-  // Enqueue/inject delivery is added by the following peer handoff tasks.
+  // Peer handoff must use the same four-state occupied gate as room delivery:
+  // in particular, prompt-surfacing paths deliberately clear `busy`, so a
+  // busy-only check could type peer text as the answer to a live prompt.
+  if (sessionOccupiedForRoomDelivery(session)) {
+    // Peer enqueue/coalescing is added by the following handoff task.
+    return;
+  }
+
+  // Peer idle injection is added by the following handoff task.
 }
 
 // Router seam: a journal frame in an active room convo lands here instead of
