@@ -753,9 +753,18 @@ function journalStartSessionForRpc({ workdir, mcpExtras }) {
   return session;
 }
 
+// Guarded file-edit backend (loop #548 backend slice). Scope the edit surface
+// to the same root set show_file already trusts — the default workdir plus any
+// configured artifact roots — pinned ONCE here at the trusted boundary (same
+// pinAllowedRootsSync the per-session show_file path uses), never rebuilt from
+// client-supplied strings. The client-facing edit affordance is separate work;
+// this makes the backend live and reachable.
+const editAllowedRoots = pinAllowedRootsSync([DEFAULT_WORKDIR, ...SHOW_FILE_ARTIFACT_ROOTS]);
+
 const journalRpcHandler = createRpcRequestHandler({
   respondRpc: (args) => journalPublisher.respondRpc(args),
   startSession: journalStartSessionForRpc,
+  getEditAllowedRoots: () => editAllowedRoots,
   // The !stop teardown for the unsupported_mode orphan: kill, drop from the
   // sessions map (keyed by room id — scan, this path is rare), evict input.
   stopSession: (session) => {
