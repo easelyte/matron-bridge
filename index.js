@@ -113,7 +113,7 @@ import {
   PERMISSION_DECISION_TIMEOUT_MS,
 } from './lib/permission-registry.js';
 import { createJournalMediaRouter } from './lib/journal-media.js';
-import { markJournalOrigin, planQueueFlush } from './lib/queue-flush.js';
+import { attachQueuedCleanup, markJournalOrigin, planQueueFlush, runQueuedCleanup } from './lib/queue-flush.js';
 import { isCompactCommand, compactBatchSize, hasQueuedCompact } from './lib/compact-priority.js';
 import { attachPendingMediaMirror, pendingMediaMirror } from './lib/media-mirror.js';
 import { seedJournalTitle, applyFallbackTitle, formatRoomTitle } from './lib/journal-title-seed.js';
@@ -5045,6 +5045,9 @@ function flushQueue(session, queued, releaseSnapshot = null) {
     //      against, so retain the batch for a later flush rather than dropping.
     if (!session.alive || session._autoStopped) {
       console.log(`[QUEUE] dropped queued message(s) (room ${session.roomId})`);
+      // Unlink any saved-media files these dropped entries wrote to disk — the
+      // batch is never dispatched, so nothing else will consume or clean them.
+      if (Array.isArray(queued)) for (const entry of queued) runQueuedCleanup(entry);
       // journalPublishNotice already no-ops on a falsy convo id and fails
       // open like every journal call.
       const count = Array.isArray(queued) ? queued.length : 0;
@@ -5639,6 +5642,10 @@ function sessionUploadsDir(session) {
 // the pending-media mirror always carry the full-resolution original.
 function buildSavedMediaBlocks(session, { buffer, mime, dims, isImage, ivFilename, caption, workdirName, inline }) {
   const blocks = [];
+  // The absolute path this function wrote to disk (null if it wrote nothing —
+  // e.g. an upload-dir failure). Returned so a caller that ends up dropping the
+  // media (session torn down before delivery) can unlink the orphaned file.
+  let savedPath = null;
   if (session.iv) {
     // iv-mode: the PTY is text-only. Save the file OUTSIDE the repo and type
     // only an absolute-path annotation; Claude reads it with its Read tool.
@@ -5646,6 +5653,7 @@ function buildSavedMediaBlocks(session, { buffer, mime, dims, isImage, ivFilenam
     const dir = ivUploadDir(session.roomId);
     const savePath = deduplicateFilename(dir, ivFilename);
     fs.writeFileSync(savePath, buffer);
+    savedPath = savePath;
     blocks.push({ type: 'text', text: ivUploadAnnotation({ msgtype: isImage ? 'm.image' : 'm.file', savePath, caption }) });
     // Journal mirror (upload + publish + markRead) is deferred to actual
     // dispatch time — see lib/media-mirror.js. Attaching it here (rather
@@ -5655,7 +5663,7 @@ function buildSavedMediaBlocks(session, { buffer, mime, dims, isImage, ivFilenam
     // journal media path never reads these back — its blob is already in the
     // journal — so the tag is simply inert there.)
     attachPendingMediaMirror(blocks, { buffer, mime, name: ivFilename, dims });
-    return { blocks, ivHandled: true };
+    return { blocks, ivHandled: true, savedPath };
   }
   // SDK mode: lead with the caption so claude reads the user's words before
   // the "Image saved to …" bookkeeping and the image itself — the order a
@@ -5668,6 +5676,7 @@ function buildSavedMediaBlocks(session, { buffer, mime, dims, isImage, ivFilenam
     try { imgPath = deduplicateFilename(sessionUploadsDir(session), workdirName); }
     catch (err) { blocks.push({ type: 'text', text: `[Upload failed: ${err.message}]` }); return { blocks, ivHandled: false }; }
     fs.writeFileSync(imgPath, buffer);
+    savedPath = imgPath;
     blocks.push({ type: 'text', text: `Image saved to ${imgPath}` });
     appendInlineImageBlocks(blocks, { buffer, mime, inline, savePath: imgPath });
     attachPendingMediaMirror(blocks, { buffer, mime, name: workdirName, dims });
@@ -5677,6 +5686,7 @@ function buildSavedMediaBlocks(session, { buffer, mime, dims, isImage, ivFilenam
     try { savePath = deduplicateFilename(sessionUploadsDir(session), workdirName); }
     catch (err) { blocks.push({ type: 'text', text: `[Upload failed: ${err.message}]` }); return { blocks, ivHandled: false }; }
     fs.writeFileSync(savePath, buffer);
+    savedPath = savePath;
     blocks.push({ type: 'text', text: `File saved to ${savePath}` });
     attachPendingMediaMirror(blocks, { buffer, mime, name: workdirName, dims });
 
@@ -5693,7 +5703,7 @@ function buildSavedMediaBlocks(session, { buffer, mime, dims, isImage, ivFilenam
       blocks.push({ type: 'text', text: `Binary file (${mime}) saved to ${savePath}. Use the Read tool to inspect it if needed.` });
     }
   }
-  return { blocks, ivHandled: false };
+  return { blocks, ivHandled: false, savedPath };
 }
 
 // --- Command Handler ---
@@ -7503,10 +7513,20 @@ const journalMediaRouter = createJournalMediaRouter({
         console.warn(`[journal-media] inline image skipped (${inline.reason}); full file still saved for Read`);
       }
     }
-    return buildSavedMediaBlocks(session, {
+    const { blocks, savedPath } = buildSavedMediaBlocks(session, {
       buffer, mime, dims: dims || undefined, isImage,
       ivFilename: safeName, caption, workdirName: safeName, inline,
-    }).blocks;
+    });
+    // Hand the router a cleanup closure so a drop AFTER the disk write (session
+    // torn down mid-prep, or unavailable at inject) doesn't orphan the saved
+    // file. The router only calls this on drop paths, never once the blocks are
+    // queued/injected.
+    return {
+      blocks,
+      cleanup: savedPath
+        ? () => { try { fs.unlinkSync(savedPath); } catch { /* already gone / never written */ } }
+        : null,
+    };
   },
   injectText: (session, text) => sendTextToSession(session, text),
   injectBlocks: (session, blocks) => sendToSession(session, blocks, { skipJournalMirror: true }),
@@ -7535,10 +7555,14 @@ const journalMediaRouter = createJournalMediaRouter({
 // immediate sendTextToSession); a saved file/image is marked journal-origin so
 // it never re-mirrors. Async: notifyQueuedMessage awaits the tile send, exactly
 // like the text path.
-async function journalQueueMedia(session, { blocks, mirrorToJournal, preview, fullText }) {
+async function journalQueueMedia(session, { blocks, mirrorToJournal, preview, fullText, cleanup }) {
   if (!session.queuedMessages) session.queuedMessages = [];
   const entry = [...blocks];
   if (!mirrorToJournal) markJournalOrigin(entry);
+  // Carry the saved-file cleanup with the entry so a later cancel/eviction/
+  // dead-drop of THIS queued upload unlinks the file it wrote to disk. A
+  // successful flush never runs it (the dispatched file is consumed).
+  if (typeof cleanup === 'function') attachQueuedCleanup(entry, cleanup);
   session.queuedMessages.push(entry);
   const ctx = journalSessionCommandCtx(session);
   // The queued tile is cosmetic: the entry above IS queued and will flush at
@@ -8491,6 +8515,11 @@ function journalEvictConvoInput(session) {
     permissionSeams.finalizePendingPermissionsForConvo(convoId, 'session ended');
     journalInputConsumer.evictConvo(convoId, {
       clearQueue: () => {
+        // Unlink any saved-media files still queued at eviction — the queue is
+        // being discarded wholesale, so these uploads are never dispatched.
+        if (Array.isArray(session.queuedMessages)) {
+          for (const entry of session.queuedMessages) runQueuedCleanup(entry);
+        }
         session.queuedMessages = null;
         session.queueNotifications = [];
       },
@@ -9374,7 +9403,12 @@ function hydrateAgentState(session, persisted, fromAgent = otherAgent(session.ag
 
 async function switchAgentSession(roomId, targetAgent, { sendReply }) {
   const existing = sessions.get(roomId);
-  const decision = canSwitchAgent(existing, targetAgent);
+  // Block the switch while an attachment for this conversation is still being
+  // prepared: tearing the session down mid-prep would make the media router
+  // drop the in-flight file at its delivery-time canonicality guard.
+  const decision = canSwitchAgent(existing, targetAgent, {
+    hasInflightMedia: !!journalMediaRouter.hasInflightMedia?.(existing),
+  });
   if (!decision.ok) {
     await sendReply(decision.message);
     return null;
