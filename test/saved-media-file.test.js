@@ -47,19 +47,51 @@ describe('writeSavedMediaFile — temp-then-rename durability', () => {
     expect(fs.readdirSync(dir)).toEqual([]);
   });
 
-  it('removes a partially-written temp file when the rename fails', () => {
+  it('removes the temp file and rethrows when the install (link) fails non-recoverably', () => {
     const finalPath = path.join(dir, 'x.bin');
-    const failRename = Object.assign(new Error('cross-device'), { code: 'EXDEV' });
+    const failLink = Object.assign(new Error('cross-device'), { code: 'EXDEV' });
+    const real = fs;
     const fsImpl = {
-      writeFileSync: fs.writeFileSync.bind(fs),
-      renameSync: () => { throw failRename; },
-      unlinkSync: fs.unlinkSync.bind(fs),
-      statSync: fs.statSync.bind(fs),
+      writeFileSync: real.writeFileSync.bind(real),
+      openSync: real.openSync.bind(real),
+      fsyncSync: real.fsyncSync.bind(real),
+      closeSync: real.closeSync.bind(real),
+      linkSync: () => { throw failLink; },
+      unlinkSync: real.unlinkSync.bind(real),
+      statSync: real.statSync.bind(real),
     };
     expect(() => writeSavedMediaFile(finalPath, Buffer.from('data'), { fsImpl })).toThrow(/cross-device/);
     expect(fs.existsSync(finalPath)).toBe(false);
-    // Temp cleaned — directory empty.
+    // Temp cleaned — directory empty (only the temp existed and was removed).
     expect(fs.readdirSync(dir)).toEqual([]);
+  });
+
+  it('does NOT clobber a file that raced onto the target — reselects a fresh name (no-replace install)', () => {
+    // The whole point of no-replace: another writer created `wanted` after
+    // dedup chose it. linkSync must NOT replace it; instead the helper asks for
+    // a fresh path and installs there, leaving the racer's file intact.
+    const wanted = path.join(dir, 'race.txt');
+    fs.writeFileSync(wanted, 'the racer — an unrelated legitimate file');
+    const reselected = path.join(dir, 'race-1.txt');
+    let reselectCalls = 0;
+    const { path: installed } = writeSavedMediaFile(wanted, Buffer.from('our upload'), {
+      reselectPath: () => { reselectCalls += 1; return reselected; },
+    });
+    expect(reselectCalls).toBe(1);
+    expect(installed).toBe(reselected);
+    // Racer's file is untouched…
+    expect(fs.readFileSync(wanted).toString()).toContain('the racer');
+    // …and our upload landed at the reselected path.
+    expect(fs.readFileSync(reselected).toString()).toBe('our upload');
+    // No leftover temp files.
+    expect(fs.readdirSync(dir).sort()).toEqual(['race-1.txt', 'race.txt']);
+  });
+
+  it('throws EEXIST on collision when no reselect is provided (never clobbers)', () => {
+    const wanted = path.join(dir, 'c.txt');
+    fs.writeFileSync(wanted, 'existing');
+    expect(() => writeSavedMediaFile(wanted, Buffer.from('new'))).toThrow(/EEXIST|exist/i);
+    expect(fs.readFileSync(wanted).toString()).toBe('existing'); // untouched
   });
 });
 
@@ -108,11 +140,15 @@ describe('makeIdentityAwareCleanup — name-reuse race', () => {
     expect(() => cleanup()).not.toThrow();
   });
 
-  it('degrades to unlink-by-path when no identity was captured', () => {
+  it('FAILS CLOSED when no identity was captured (leaks rather than delete the wrong file)', () => {
+    // With no captured identity the cleanup can't prove the on-disk file is the
+    // one it saved, so it must NOT unlink — leaking an orphan is safer than
+    // risking deletion of an unrelated legitimate file.
     const finalPath = path.join(dir, 'noid.txt');
     fs.writeFileSync(finalPath, 'x');
-    const cleanup = makeIdentityAwareCleanup(finalPath, null);
-    cleanup();
-    expect(fs.existsSync(finalPath)).toBe(false);
+    makeIdentityAwareCleanup(finalPath, null)();
+    expect(fs.existsSync(finalPath)).toBe(true);
+    makeIdentityAwareCleanup(finalPath, undefined)();
+    expect(fs.existsSync(finalPath)).toBe(true);
   });
 });

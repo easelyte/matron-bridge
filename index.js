@@ -5727,8 +5727,12 @@ function buildSavedMediaBlocks(session, { buffer, mime, dims, isImage, ivFilenam
     // No base64 blocks and no inline content dump (SDK mode keeps those).
     const dir = ivUploadDir(session.roomId);
     const savePath = deduplicateFilename(dir, ivFilename);
-    ({ path: savedPath, identity: savedIdentity } = writeSavedMediaFile(savePath, buffer));
-    blocks.push({ type: 'text', text: ivUploadAnnotation({ msgtype: isImage ? 'm.image' : 'm.file', savePath, caption }) });
+    // Install no-replace; on a name collision reselect a fresh deduplicated
+    // name. Annotate with the ACTUAL saved path (may differ after a reselect).
+    ({ path: savedPath, identity: savedIdentity } = writeSavedMediaFile(savePath, buffer, {
+      reselectPath: () => deduplicateFilename(dir, ivFilename),
+    }));
+    blocks.push({ type: 'text', text: ivUploadAnnotation({ msgtype: isImage ? 'm.image' : 'm.file', savePath: savedPath, caption }) });
     // Journal mirror (upload + publish + markRead) is deferred to actual
     // dispatch time — see lib/media-mirror.js. Attaching it here (rather
     // than calling journalMirrorUserMedia now) is what stops a queued
@@ -5749,17 +5753,21 @@ function buildSavedMediaBlocks(session, { buffer, mime, dims, isImage, ivFilenam
     let imgPath;
     try { imgPath = deduplicateFilename(sessionUploadsDir(session), workdirName); }
     catch (err) { blocks.push({ type: 'text', text: `[Upload failed: ${err.message}]` }); return { blocks, ivHandled: false }; }
-    ({ path: savedPath, identity: savedIdentity } = writeSavedMediaFile(imgPath, buffer));
-    blocks.push({ type: 'text', text: `Image saved to ${imgPath}` });
-    appendInlineImageBlocks(blocks, { buffer, mime, inline, savePath: imgPath });
+    ({ path: savedPath, identity: savedIdentity } = writeSavedMediaFile(imgPath, buffer, {
+      reselectPath: () => deduplicateFilename(sessionUploadsDir(session), workdirName),
+    }));
+    blocks.push({ type: 'text', text: `Image saved to ${savedPath}` });
+    appendInlineImageBlocks(blocks, { buffer, mime, inline, savePath: savedPath });
     attachPendingMediaMirror(blocks, { buffer, mime, name: workdirName, dims });
   } else {
     // Save file to the session uploads dir
     let savePath;
     try { savePath = deduplicateFilename(sessionUploadsDir(session), workdirName); }
     catch (err) { blocks.push({ type: 'text', text: `[Upload failed: ${err.message}]` }); return { blocks, ivHandled: false }; }
-    ({ path: savedPath, identity: savedIdentity } = writeSavedMediaFile(savePath, buffer));
-    blocks.push({ type: 'text', text: `File saved to ${savePath}` });
+    ({ path: savedPath, identity: savedIdentity } = writeSavedMediaFile(savePath, buffer, {
+      reselectPath: () => deduplicateFilename(sessionUploadsDir(session), workdirName),
+    }));
+    blocks.push({ type: 'text', text: `File saved to ${savedPath}` });
     attachPendingMediaMirror(blocks, { buffer, mime, name: workdirName, dims });
 
     if (mime === 'application/pdf') {
@@ -5768,11 +5776,11 @@ function buildSavedMediaBlocks(session, { buffer, mime, dims, isImage, ivFilenam
         source: { type: 'base64', media_type: 'application/pdf', data: buffer.toString('base64') }
       });
     } else if (mime.startsWith('image/')) {
-      appendInlineImageBlocks(blocks, { buffer, mime, inline, savePath });
+      appendInlineImageBlocks(blocks, { buffer, mime, inline, savePath: savedPath });
     } else if (mime.startsWith('text/') || ['application/json', 'application/xml', 'application/javascript', 'application/csv'].includes(mime)) {
       blocks.push({ type: 'text', text: `Contents of ${workdirName}:\n${buffer.toString('utf-8')}` });
     } else {
-      blocks.push({ type: 'text', text: `Binary file (${mime}) saved to ${savePath}. Use the Read tool to inspect it if needed.` });
+      blocks.push({ type: 'text', text: `Binary file (${mime}) saved to ${savedPath}. Use the Read tool to inspect it if needed.` });
     }
   }
   return { blocks, ivHandled: false, savedPath, savedIdentity };
