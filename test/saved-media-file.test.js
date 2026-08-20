@@ -113,6 +113,32 @@ describe('writeSavedMediaFile — temp-then-rename durability', () => {
     expect(fs.readdirSync(dir)).toEqual([]);
   });
 
+  it('does NOT fail the write (or orphan the file) when the directory fsync errors', () => {
+    // The dir fsync is a SECONDARY barrier that runs after the file is already
+    // fsync'd and installed. A storage-class error there must be swallowed —
+    // propagating it would fail an upload whose bytes are durable and leave the
+    // installed target orphaned behind a failure notice (round-3 F2).
+    const finalPath = path.join(dir, 'd.bin');
+    const real = fs;
+    let fsyncCalls = 0;
+    const fsImpl = {
+      writeFileSync: real.writeFileSync.bind(real),
+      openSync: real.openSync.bind(real),
+      fsyncSync: (fd) => {
+        fsyncCalls += 1;
+        if (fsyncCalls >= 2) throw Object.assign(new Error('dir eio'), { code: 'EIO' }); // dir barrier
+        return real.fsyncSync(fd); // file barrier succeeds
+      },
+      closeSync: real.closeSync.bind(real),
+      linkSync: real.linkSync.bind(real),
+      unlinkSync: real.unlinkSync.bind(real),
+      statSync: real.statSync.bind(real),
+    };
+    const { path: p } = writeSavedMediaFile(finalPath, Buffer.from('payload'), { fsImpl });
+    expect(p).toBe(finalPath);
+    expect(fs.readFileSync(finalPath).toString()).toBe('payload'); // installed, not failed
+  });
+
   it('returns the unguessable temp path so cleanup can sweep a residual link', () => {
     const finalPath = path.join(dir, 't.txt');
     const { tmpPath } = writeSavedMediaFile(finalPath, Buffer.from('x'));

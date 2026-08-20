@@ -29,7 +29,7 @@ import {
 } from './lib/mcp-config.js';
 import { modelFromEvent, VALID_ALIAS_HINT } from './lib/model-aliases.js';
 import { switchModelInSession, modelButtons, planPrintModelSwitch } from './lib/model-command.js';
-import { inflightMediaReplaceRefusal } from './lib/session-replace-guard.js';
+import { inflightMediaReplaceRefusal, INFLIGHT_MEDIA_REPLACE_REFUSAL } from './lib/session-replace-guard.js';
 import { writeSavedMediaFile, makeIdentityAwareCleanup } from './lib/saved-media-file.js';
 import {
   resolveInteractive,
@@ -6013,7 +6013,13 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         return;
       }
       await sendReply(`🔄 Restarting ${agentLabel(existing.agent)} session...`);
-      recreateSession(roomId, { mcpExtras: effectiveRestartExtras }, { sendReply, sendHtml });
+      const restarted = recreateSession(roomId, { mcpExtras: effectiveRestartExtras }, { sendReply, sendHtml });
+      if (!restarted) {
+        // recreateSession backstopped the teardown (media raced in during the
+        // ack await, or the session vanished) and already notified — don't
+        // claim a restart that didn't happen.
+        break;
+      }
       const extrasLine = effectiveRestartExtras.length > 0
         ? `\nExtras: ${effectiveRestartExtras.join(', ')}`
         : '';
@@ -9724,6 +9730,21 @@ function applyModeSwitch(roomId, session, wantInteractive, { sendReply, sendHtml
 function recreateSession(roomId, overrides, { sendReply, sendHtml }) {
   const existing = sessions.get(roomId);
   if (!existing) return null;
+  // Synchronous backstop for the in-flight-media drain gate. The per-command
+  // pre-checks (/restart's inline guard, planModeSwitch / planPrintModelSwitch)
+  // all run BEFORE the caller's `await sendReply(...)` ack, so an attachment can
+  // begin routing during that await and be mid-prep when we tear down here — the
+  // media router would then drop it at its delivery-time canonicality guard.
+  // Re-check now, with NO async boundary before the teardown below, closing the
+  // await-race for /restart, /mode, and /model uniformly at their shared choke
+  // point. routeMedia marks in-flight synchronously on enqueue, so a frame that
+  // arrived during the await is visible here. Age-bounded upstream, so a stalled
+  // prep can't wedge replacement. Returns null (like the no-session case); the
+  // callers already handle a null replacement, and this path also notifies.
+  if (journalMediaRouter.hasInflightMedia?.(existing)) {
+    sendReply(INFLIGHT_MEDIA_REPLACE_REFUSAL);
+    return null;
+  }
   const sessionId = existing.claudeSessionId;
   // PR #151's pre-init resume gate, extended to this shared teardown path:
   // --resume only a session Claude actually persisted (confirmed on init,
