@@ -31,6 +31,21 @@ describe('canSwitchAgent', () => {
     expect(canSwitchAgent({ ...idleClaude, _pendingPromptAnswerDelivery: true }, 'codex').message).toContain('pending question');
     expect(canSwitchAgent({ ...idleClaude, pendingPlan: 'plan' }, 'codex').message).toContain('pending plan');
   });
+
+  it('blocks a switch while an attachment is still being prepared (in-flight media drain)', () => {
+    // A /switch can otherwise proceed while journal-media prep (fetch /
+    // transcribe / save-to-disk) is still running for this conversation. The
+    // switch tears the old session down, the router's canonicality guard then
+    // drops the in-flight attachment — the media is silently lost from the
+    // user's perspective. Gate the switch on in-flight media the same way it
+    // gates on a busy turn or a non-empty queue, so the operator retries once
+    // prep has drained.
+    const res = canSwitchAgent(idleClaude, 'codex', { hasInflightMedia: true });
+    expect(res.ok).toBe(false);
+    expect(res.message).toMatch(/attachment/i);
+    // The default (no in-flight media) must not regress the idle handoff.
+    expect(canSwitchAgent(idleClaude, 'codex', { hasInflightMedia: false })).toEqual({ ok: true, target: 'codex' });
+  });
 });
 
 describe('agent handoff persistence', () => {

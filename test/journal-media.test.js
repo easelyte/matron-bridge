@@ -388,3 +388,172 @@ describe('createJournalMediaRouter — session torn down during async prep (#537
     })).toThrow(/isCanonicalSession/);
   });
 });
+
+describe('createJournalMediaRouter — remaining teardown windows past the delivery-time canonicality guard', () => {
+  const busySession = { claudeSessionId: 'convo-1', roomId: '!r:s', busy: true };
+
+  // WINDOW: post-transcribe echo. The transcript is echoed to the room BEFORE
+  // liveness is rechecked. A session torn down DURING transcription must not
+  // have its transcript echoed into a dead/detached room — the recheck belongs
+  // ahead of the echo, not only ahead of the enqueue/inject.
+  it('a voice note torn down DURING transcription is NOT echoed to the room and drops with a notice', async () => {
+    // Live at fetch (early guard passes), non-canonical by the time transcribe
+    // resolves — so exactly one isCanonicalSession call succeeds (the early
+    // one) and the delivery-side recheck fails.
+    const isCanonicalSession = vi.fn().mockReturnValueOnce(true).mockReturnValue(false);
+    const { route, deps } = makeRouter({
+      fetchMedia: vi.fn(async () => ({ buffer: Buffer.from('ogg'), contentType: 'audio/ogg' })),
+      transcribe: vi.fn(async () => 'buy milk'),
+      isCanonicalSession,
+    });
+    await route(session, { type: 'file', blobRef: 'v', contentType: 'audio/ogg', name: 'voice.ogg' }, ctx);
+
+    expect(deps.transcribe).toHaveBeenCalledTimes(1);
+    // Only the top "sent a voice note" echo fires — NOT the "🎤 …transcript" echo.
+    expect(deps.echoToRoom).toHaveBeenCalledTimes(1);
+    expect(deps.echoToRoom.mock.calls.every(([, plain]) => !String(plain).includes('buy milk'))).toBe(true);
+    expect(deps.injectText).not.toHaveBeenCalled();
+    expect(deps.queueMedia).not.toHaveBeenCalled();
+    expect(deps.publishNotice).toHaveBeenCalledTimes(1);
+    expect(deps.publishNotice.mock.calls[0][1]).toMatch(/voice note/);
+    expect(deps.publishNotice.mock.calls[0][1]).toMatch(/session ended/);
+  });
+
+  // WINDOW: orphan saved files. buildSavedBlocks writes the file to disk as a
+  // side effect. When the delivery-time guard drops the media AFTER the build,
+  // the saved file must be cleaned up, or it lingers in the session uploads dir
+  // forever. buildSavedBlocks may return { blocks, cleanup }; the router calls
+  // cleanup on every post-build drop path.
+  it('cleans up the saved file when a session is torn down DURING the build (no orphan on disk)', async () => {
+    const cleanup = vi.fn();
+    const isCanonicalSession = vi.fn().mockReturnValueOnce(true).mockReturnValue(false);
+    const { route, deps } = makeRouter({
+      buildSavedBlocks: vi.fn(async () => ({ blocks: [{ type: 'text', text: 'File saved to /w/x.pdf' }], cleanup })),
+      isCanonicalSession,
+    });
+    await route(busySession, { type: 'file', blobRef: 'b', contentType: 'application/pdf', name: 'x.pdf' }, ctx);
+
+    expect(deps.buildSavedBlocks).toHaveBeenCalledTimes(1);
+    expect(cleanup).toHaveBeenCalledTimes(1);         // orphan removed
+    expect(deps.queueMedia).not.toHaveBeenCalled();
+    expect(deps.injectBlocks).not.toHaveBeenCalled();
+    expect(deps.publishNotice).toHaveBeenCalledTimes(1);
+    expect(deps.publishNotice.mock.calls[0][1]).toMatch(/session ended/);
+  });
+
+  it('cleans up the saved file when the session is unavailable at inject (injectBlocks false)', async () => {
+    const cleanup = vi.fn();
+    const { route, deps } = makeRouter({
+      buildSavedBlocks: vi.fn(async () => ({ blocks: [{ type: 'text', text: 'File saved to /w/x.pdf' }], cleanup })),
+      injectBlocks: vi.fn(() => false),
+    });
+    await route(session, { type: 'file', blobRef: 'b', contentType: 'application/pdf', name: 'x.pdf' }, ctx);
+
+    expect(cleanup).toHaveBeenCalledTimes(1);
+    expect(deps.publishNotice).toHaveBeenCalledWith('convo-1', expect.stringMatching(/isn't available/));
+  });
+
+  it('does NOT clean up the saved file on the happy path — the file is referenced by the delivered blocks', async () => {
+    const cleanup = vi.fn();
+    const blocks = [{ type: 'text', text: 'File saved to /w/x.pdf' }];
+    const { route, deps } = makeRouter({
+      buildSavedBlocks: vi.fn(async () => ({ blocks, cleanup })),
+    });
+    await route(session, { type: 'file', blobRef: 'b', contentType: 'application/pdf', name: 'x.pdf' }, ctx);
+
+    expect(deps.injectBlocks).toHaveBeenCalledWith(session, blocks);
+    expect(cleanup).not.toHaveBeenCalled();
+  });
+
+  it('hands cleanup to the QUEUE (not called now) when a still-canonical busy session queues the saved file', async () => {
+    const cleanup = vi.fn();
+    const { route, deps } = makeRouter({
+      buildSavedBlocks: vi.fn(async () => ({ blocks: [{ type: 'text', text: 'File saved to /w/x.pdf' }], cleanup })),
+    });
+    await route(busySession, { type: 'file', blobRef: 'b', contentType: 'application/pdf', name: 'x.pdf' }, ctx);
+
+    expect(deps.queueMedia).toHaveBeenCalledTimes(1);
+    // The queue owns the cleanup — it fires only if the entry is later
+    // cancelled/evicted/dropped, so the file survives to be read on flush.
+    expect(deps.queueMedia.mock.calls[0][1].cleanup).toBe(cleanup);
+    expect(cleanup).not.toHaveBeenCalled();
+  });
+
+  // WINDOW: handoff drain. The router exposes in-flight media tracking keyed by
+  // the STABLE journal conversation id, so the /switch gate can refuse while an
+  // attachment for this conversation is still mid-prep (see agent-handoff test).
+  it('exposes in-flight media tracking keyed by the stable conversation id', async () => {
+    let resolveFetch;
+    const fetchMedia = vi.fn(() => new Promise((r) => { resolveFetch = r; }));
+    const { route } = makeRouter({ fetchMedia });
+    const sess = { claudeSessionId: 'native-new', journalConvoId: 'stable-convo', roomId: '!r:s' };
+
+    expect(route.hasInflightMedia(sess)).toBe(false);
+    const p = route(sess, { type: 'file', blobRef: 'b', contentType: 'application/pdf', name: 'x.pdf' }, ctx);
+    // The counter increments SYNCHRONOUSLY at enqueue time — the switch gate
+    // must see the in-flight frame before the chain even reaches fetchMedia.
+    expect(route.hasInflightMedia(sess)).toBe(true);            // prep in flight
+    // Same stable convo, different native id (post-switch shape) still tracked.
+    expect(route.hasInflightMedia({ journalConvoId: 'stable-convo' })).toBe(true);
+
+    // Let the per-convo chain reach fetchMedia (runs on a microtask) so its
+    // resolver is captured, then complete the fetch.
+    await new Promise((r) => setTimeout(r, 5));
+    resolveFetch({ buffer: Buffer.from('x'), contentType: 'application/pdf' });
+    await p;
+    expect(route.hasInflightMedia(sess)).toBe(false);           // drained
+  });
+
+  it('the in-flight gate is age-bounded so a stalled prep cannot wedge /switch forever', async () => {
+    // A hung fetch (no application timeout) would otherwise pin the counter and
+    // block every handoff. Past inflightGateMs the entry stops gating.
+    let t = 1_000;
+    const fetchMedia = vi.fn(() => new Promise(() => {})); // never resolves
+    const deps = {
+      fetchMedia,
+      transcribe: vi.fn(),
+      buildSavedBlocks: vi.fn(),
+      injectText: vi.fn(),
+      injectBlocks: vi.fn(),
+      queueMedia: vi.fn(async () => {}),
+      isCanonicalSession: vi.fn(() => true),
+      echoToRoom: vi.fn(),
+      publishNotice: vi.fn(),
+      escapeHtml: (s) => String(s),
+      log: silentLog,
+      inflightGateMs: 5_000,
+      now: () => t,
+    };
+    const route = createJournalMediaRouter(deps);
+    const sess = { claudeSessionId: 'convo-1', journalConvoId: 'stable', roomId: '!r:s' };
+
+    route(sess, { type: 'file', blobRef: 'b', contentType: 'application/pdf', name: 'x.pdf' }, ctx);
+    expect(route.hasInflightMedia(sess)).toBe(true);   // fresh — gates the switch
+    t += 4_999;
+    expect(route.hasInflightMedia(sess)).toBe(true);   // still within the window
+    t += 2;                                            // now past inflightGateMs
+    expect(route.hasInflightMedia(sess)).toBe(false);  // stops gating — no wedge
+  });
+
+  it('a fresh attachment does NOT inherit an older frame\'s expiry (gate anchored to the newest frame)', async () => {
+    let t = 0;
+    const fetchMedia = vi.fn(() => new Promise(() => {})); // both frames hang
+    const deps = {
+      fetchMedia,
+      transcribe: vi.fn(), buildSavedBlocks: vi.fn(), injectText: vi.fn(), injectBlocks: vi.fn(),
+      queueMedia: vi.fn(async () => {}), isCanonicalSession: vi.fn(() => true),
+      echoToRoom: vi.fn(), publishNotice: vi.fn(), escapeHtml: (s) => String(s), log: silentLog,
+      inflightGateMs: 5_000, now: () => t,
+    };
+    const route = createJournalMediaRouter(deps);
+    const sess = { claudeSessionId: 'convo-1', journalConvoId: 'stable', roomId: '!r:s' };
+
+    route(sess, { type: 'file', blobRef: 'a', contentType: 'application/pdf', name: 'a.pdf' }, ctx); // frame 1 @ t=0
+    t = 4_999;
+    route(sess, { type: 'file', blobRef: 'b', contentType: 'application/pdf', name: 'b.pdf' }, ctx); // frame 2 @ t=4999
+    t = 5_001; // past frame 1's window, but frame 2 is only 2ms old
+    expect(route.hasInflightMedia(sess)).toBe(true);   // fresh frame keeps the gate — not dropped
+    t = 10_000; // past frame 2's window too, nothing newer arrived
+    expect(route.hasInflightMedia(sess)).toBe(false);  // now genuinely stalled — stops gating
+  });
+});

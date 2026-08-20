@@ -132,6 +132,19 @@ describe('planModeSwitch', () => {
     const d = planModeSwitch({ iv: { alive: true }, busy: false, claudeSessionId: 'abc' }, false);
     expect(d.ok).toBe(true);
   });
+  it('refuses an otherwise-clean switch while media is in flight (drain gate)', () => {
+    // A /mode switch recreates the session; doing it mid-media-prep makes the
+    // media router drop the in-flight attachment at its canonicality guard, the
+    // same hazard /switch and /restart now gate on. Checked last, so it only
+    // blocks a switch that would otherwise succeed.
+    const clean = { iv: null, busy: false, claudeSessionId: 'abc', _sessionConfirmed: true };
+    const d = planModeSwitch(clean, true, { hasInflightMedia: true });
+    expect(d.ok).toBe(false);
+    expect(d.message).toMatch(/attachment/i);
+    // No regression when nothing is in flight.
+    expect(planModeSwitch(clean, true, { hasInflightMedia: false }).ok).toBe(true);
+    expect(planModeSwitch(clean, true).ok).toBe(true);
+  });
 });
 
 describe('planSessionIdentity', () => {

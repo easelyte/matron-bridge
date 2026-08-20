@@ -1,5 +1,8 @@
-import { describe, it, expect } from 'vitest';
-import { markJournalOrigin, isJournalOrigin, planQueueFlush } from '../lib/queue-flush.js';
+import { describe, it, expect, vi } from 'vitest';
+import {
+  markJournalOrigin, isJournalOrigin, planQueueFlush,
+  attachQueuedCleanup, runQueuedCleanup,
+} from '../lib/queue-flush.js';
 import { attachPendingMediaMirror, pendingMediaMirror } from '../lib/media-mirror.js';
 
 const text = (t) => [{ type: 'text', text: t }];
@@ -16,6 +19,44 @@ describe('markJournalOrigin / isJournalOrigin', () => {
   it('is safe on null/undefined', () => {
     expect(isJournalOrigin(null)).toBe(false);
     expect(isJournalOrigin(undefined)).toBe(false);
+  });
+});
+
+describe('attachQueuedCleanup / runQueuedCleanup', () => {
+  it('runs the attached cleanup once, then is idempotent (no double-unlink on double-discard)', () => {
+    const cleanup = vi.fn();
+    const blocks = text('File saved to /w/x.pdf');
+    expect(attachQueuedCleanup(blocks, cleanup)).toBe(blocks); // same array
+    // Non-enumerable: never leaks into iteration / JSON.
+    expect(Object.keys(blocks)).toEqual(['0']);
+    expect(runQueuedCleanup(blocks)).toBe(true);
+    expect(cleanup).toHaveBeenCalledTimes(1);
+    expect(runQueuedCleanup(blocks)).toBe(false); // tag cleared after firing
+    expect(cleanup).toHaveBeenCalledTimes(1);
+  });
+
+  it('is a no-op on an untagged entry or null', () => {
+    expect(runQueuedCleanup(text('hi'))).toBe(false);
+    expect(runQueuedCleanup(null)).toBe(false);
+    expect(runQueuedCleanup(undefined)).toBe(false);
+  });
+
+  it('ignores a non-function cleanup and never throws when the cleanup throws', () => {
+    const blocks = text('hi');
+    expect(attachQueuedCleanup(blocks, null)).toBe(blocks);
+    expect(runQueuedCleanup(blocks)).toBe(false);
+
+    const boom = attachQueuedCleanup(text('x'), () => { throw new Error('unlink failed'); });
+    expect(() => runQueuedCleanup(boom)).not.toThrow();
+  });
+
+  it('rides along with the same array object across a queue carry', () => {
+    const cleanup = vi.fn();
+    const entry = attachQueuedCleanup(media('x.png'), cleanup);
+    // A cross-restart/switch carry copies the entry REFERENCES, not the arrays.
+    const carried = [entry];
+    expect(runQueuedCleanup(carried[0])).toBe(true);
+    expect(cleanup).toHaveBeenCalledTimes(1);
   });
 });
 
