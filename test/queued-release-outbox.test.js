@@ -111,6 +111,32 @@ describe('queued-release-outbox', () => {
     expect(store.remove('nope')).toBe(true);
   });
 
+  it('abort() drops a record IN MEMORY even when the disk persist throws (rollback is retry-safe)', () => {
+    store.put(KEY, rec());
+    expect(store.pendingCount()).toBe(1);
+    // Same faulting disk that would trigger a send rollback: the persist of the
+    // removal fails, but the record must still leave the in-memory pending set
+    // so republishPendingReleases (retry driver) can never republish it.
+    const spy = vi.spyOn(fs, 'writeFileSync').mockImplementation(() => { throw new Error('ENOSPC'); });
+    try {
+      store.abort(KEY);
+      expect(store.list()).toEqual([]);      // gone from memory (authoritative)
+      expect(store.pendingCount()).toBe(0);  // no longer retry-eligible
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('abort() persists the removal when the disk is healthy; no-op on an absent key', () => {
+    store.put(KEY, rec());
+    store.abort(KEY);
+    expect(store.list()).toEqual([]);
+    // Durable: a fresh instance sees nothing.
+    const reopened = createQueuedReleaseOutbox({ file, log: { warn() {} } });
+    expect(reopened.list()).toEqual([]);
+    expect(() => store.abort('nope')).not.toThrow();
+  });
+
   it('sweepAcked drops acked records older than retention, keeps fresh + non-acked (fake clock)', () => {
     store.put(KEY, rec());
     store.put('pr_2\0pr_2::0\0send', rec({ promptId: 'pr_2', itemId: 'pr_2::0', action: 'send' }));
