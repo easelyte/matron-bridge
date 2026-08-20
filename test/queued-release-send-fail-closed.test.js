@@ -35,6 +35,10 @@ function loadFlushQueue(overrides = {}) {
     journalInputConsumer: { queueRelease: { dropItem: () => {} } },
     journalConvoIdFor: () => 'c',
     journalPublishNotice: () => {},
+    // Orphan-media cleanup dep introduced by the media-teardown work; the
+    // drop path sweeps queued entries through it. No-op here — this suite
+    // asserts fail-closed rollback/no-publish, not media cleanup.
+    runQueuedCleanup: () => {},
     ...overrides,
   };
   runInNewContext(src.slice(start, end), sandbox);
