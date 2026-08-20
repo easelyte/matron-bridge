@@ -5721,6 +5721,7 @@ function buildSavedMediaBlocks(session, { buffer, mime, dims, isImage, ivFilenam
   // unlinks only THIS file, never a later upload that recycled the same name.
   let savedPath = null;
   let savedIdentity = null;
+  let savedTmpPath = null;
   if (session.iv) {
     // iv-mode: the PTY is text-only. Save the file OUTSIDE the repo and type
     // only an absolute-path annotation; Claude reads it with its Read tool.
@@ -5729,7 +5730,7 @@ function buildSavedMediaBlocks(session, { buffer, mime, dims, isImage, ivFilenam
     const savePath = deduplicateFilename(dir, ivFilename);
     // Install no-replace; on a name collision reselect a fresh deduplicated
     // name. Annotate with the ACTUAL saved path (may differ after a reselect).
-    ({ path: savedPath, identity: savedIdentity } = writeSavedMediaFile(savePath, buffer, {
+    ({ path: savedPath, identity: savedIdentity, tmpPath: savedTmpPath } = writeSavedMediaFile(savePath, buffer, {
       reselectPath: () => deduplicateFilename(dir, ivFilename),
     }));
     blocks.push({ type: 'text', text: ivUploadAnnotation({ msgtype: isImage ? 'm.image' : 'm.file', savePath: savedPath, caption }) });
@@ -5741,7 +5742,7 @@ function buildSavedMediaBlocks(session, { buffer, mime, dims, isImage, ivFilenam
     // journal media path never reads these back — its blob is already in the
     // journal — so the tag is simply inert there.)
     attachPendingMediaMirror(blocks, { buffer, mime, name: ivFilename, dims });
-    return { blocks, ivHandled: true, savedPath, savedIdentity };
+    return { blocks, ivHandled: true, savedPath, savedIdentity, savedTmpPath };
   }
   // SDK mode: lead with the caption so claude reads the user's words before
   // the "Image saved to …" bookkeeping and the image itself — the order a
@@ -5753,7 +5754,7 @@ function buildSavedMediaBlocks(session, { buffer, mime, dims, isImage, ivFilenam
     let imgPath;
     try { imgPath = deduplicateFilename(sessionUploadsDir(session), workdirName); }
     catch (err) { blocks.push({ type: 'text', text: `[Upload failed: ${err.message}]` }); return { blocks, ivHandled: false }; }
-    ({ path: savedPath, identity: savedIdentity } = writeSavedMediaFile(imgPath, buffer, {
+    ({ path: savedPath, identity: savedIdentity, tmpPath: savedTmpPath } = writeSavedMediaFile(imgPath, buffer, {
       reselectPath: () => deduplicateFilename(sessionUploadsDir(session), workdirName),
     }));
     blocks.push({ type: 'text', text: `Image saved to ${savedPath}` });
@@ -5764,7 +5765,7 @@ function buildSavedMediaBlocks(session, { buffer, mime, dims, isImage, ivFilenam
     let savePath;
     try { savePath = deduplicateFilename(sessionUploadsDir(session), workdirName); }
     catch (err) { blocks.push({ type: 'text', text: `[Upload failed: ${err.message}]` }); return { blocks, ivHandled: false }; }
-    ({ path: savedPath, identity: savedIdentity } = writeSavedMediaFile(savePath, buffer, {
+    ({ path: savedPath, identity: savedIdentity, tmpPath: savedTmpPath } = writeSavedMediaFile(savePath, buffer, {
       reselectPath: () => deduplicateFilename(sessionUploadsDir(session), workdirName),
     }));
     blocks.push({ type: 'text', text: `File saved to ${savedPath}` });
@@ -5783,7 +5784,7 @@ function buildSavedMediaBlocks(session, { buffer, mime, dims, isImage, ivFilenam
       blocks.push({ type: 'text', text: `Binary file (${mime}) saved to ${savedPath}. Use the Read tool to inspect it if needed.` });
     }
   }
-  return { blocks, ivHandled: false, savedPath, savedIdentity };
+  return { blocks, ivHandled: false, savedPath, savedIdentity, savedTmpPath };
 }
 
 // --- Command Handler ---
@@ -7608,7 +7609,7 @@ const journalMediaRouter = createJournalMediaRouter({
         console.warn(`[journal-media] inline image skipped (${inline.reason}); full file still saved for Read`);
       }
     }
-    const { blocks, savedPath, savedIdentity } = buildSavedMediaBlocks(session, {
+    const { blocks, savedPath, savedIdentity, savedTmpPath } = buildSavedMediaBlocks(session, {
       buffer, mime, dims: dims || undefined, isImage,
       ivFilename: safeName, caption, workdirName: safeName, inline,
     });
@@ -7616,10 +7617,11 @@ const journalMediaRouter = createJournalMediaRouter({
     // torn down mid-prep, or unavailable at inject) doesn't orphan the saved
     // file. The router only calls this on drop paths, never once the blocks are
     // queued/injected. Identity-aware: it unlinks only the exact file we saved
-    // (matched by dev+ino), never a later upload that recycled the same path.
+    // (matched by dev+ino), never a later upload that recycled the same path;
+    // it also sweeps a residual temp link (savedTmpPath) if the install couldn't.
     return {
       blocks,
-      cleanup: savedPath ? makeIdentityAwareCleanup(savedPath, savedIdentity) : null,
+      cleanup: savedPath ? makeIdentityAwareCleanup(savedPath, savedIdentity, { tmpPath: savedTmpPath }) : null,
     };
   },
   injectText: (session, text) => sendTextToSession(session, text),

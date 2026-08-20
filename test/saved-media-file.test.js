@@ -93,6 +93,60 @@ describe('writeSavedMediaFile — temp-then-rename durability', () => {
     expect(() => writeSavedMediaFile(wanted, Buffer.from('new'))).toThrow(/EEXIST|exist/i);
     expect(fs.readFileSync(wanted).toString()).toBe('existing'); // untouched
   });
+
+  it('PROPAGATES a file-fsync failure (EIO) rather than advertising unpersisted bytes', () => {
+    const finalPath = path.join(dir, 'f.bin');
+    const eio = Object.assign(new Error('io error'), { code: 'EIO' });
+    const real = fs;
+    const fsImpl = {
+      writeFileSync: real.writeFileSync.bind(real),
+      openSync: real.openSync.bind(real),
+      fsyncSync: () => { throw eio; }, // data barrier fails
+      closeSync: real.closeSync.bind(real),
+      linkSync: real.linkSync.bind(real),
+      unlinkSync: real.unlinkSync.bind(real),
+      statSync: real.statSync.bind(real),
+    };
+    expect(() => writeSavedMediaFile(finalPath, Buffer.from('x'), { fsImpl })).toThrow(/io error/);
+    // The install never happened and the temp was removed.
+    expect(fs.existsSync(finalPath)).toBe(false);
+    expect(fs.readdirSync(dir)).toEqual([]);
+  });
+
+  it('returns the unguessable temp path so cleanup can sweep a residual link', () => {
+    const finalPath = path.join(dir, 't.txt');
+    const { tmpPath } = writeSavedMediaFile(finalPath, Buffer.from('x'));
+    expect(typeof tmpPath).toBe('string');
+    expect(path.dirname(tmpPath)).toBe(dir);
+    expect(path.basename(tmpPath)).toMatch(/^\.t\.txt\.tmp-/);
+  });
+});
+
+describe('makeIdentityAwareCleanup — residual temp sweep', () => {
+  let dir;
+  beforeEach(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'smf-')); });
+  afterEach(() => { fs.rmSync(dir, { recursive: true, force: true }); });
+
+  it('removes a residual temp hard link alongside the identity-matched target', () => {
+    const finalPath = path.join(dir, 'g.txt');
+    const tmpPath = path.join(dir, '.g.txt.tmp-resid');
+    fs.writeFileSync(finalPath, 'data');
+    fs.writeFileSync(tmpPath, 'leaked'); // simulate an install whose temp unlink failed
+    const st = fs.statSync(finalPath);
+    makeIdentityAwareCleanup(finalPath, { dev: st.dev, ino: st.ino }, { tmpPath })();
+    expect(fs.existsSync(finalPath)).toBe(false);
+    expect(fs.existsSync(tmpPath)).toBe(false);
+  });
+
+  it('sweeps the temp even when the target fails closed (unknown identity)', () => {
+    const finalPath = path.join(dir, 'h.txt');
+    const tmpPath = path.join(dir, '.h.tmp');
+    fs.writeFileSync(finalPath, 'keep');
+    fs.writeFileSync(tmpPath, 'leaked');
+    makeIdentityAwareCleanup(finalPath, null, { tmpPath })();
+    expect(fs.existsSync(finalPath)).toBe(true);  // target fail-closed
+    expect(fs.existsSync(tmpPath)).toBe(false);   // temp still swept
+  });
 });
 
 describe('makeIdentityAwareCleanup — name-reuse race', () => {
