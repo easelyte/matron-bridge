@@ -260,13 +260,19 @@ server.tool(
   {
     target_convo: z.string().min(1).describe('Conversation id of the target session, from agent_sessions'),
     body: z.string().min(1).describe('The coordination line to send'),
+    priority: z
+      .boolean()
+      .optional()
+      .describe(
+        'Mark this as a priority message — the target session surfaces it with a louder in-timeline marker, without stealing focus or interrupting a reply in progress. Use sparingly, for time-sensitive coordination.',
+      ),
   },
-  async ({ target_convo, body }) => {
+  async ({ target_convo, body, priority }) => {
     try {
       const postRes = await fetch(`${BRIDGE_API}/agent-message`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ roomId: ROOM_ID, target_convo, body }),
+        body: JSON.stringify({ roomId: ROOM_ID, target_convo, body, priority }),
       });
       const data = await postRes.json().catch(() => ({}));
       if (!postRes.ok) {
