@@ -18,7 +18,10 @@ import { createQueuedReleaseOutbox } from '../lib/queued-release-outbox.js';
 // arms, clearTimeout resets it.
 function loadSeam({ releaseOutbox, journalPublisher, env = {} }) {
   const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
-  const start = src.indexOf('function emitRelease(convoId, { promptId, action, releasedIds }');
+  // The seam now leads with the two extracted release phases (writeAheadRelease
+  // + publishReleaseRecord) that emitRelease composes; slice from the first of
+  // them so all three land in the sandbox.
+  const start = src.indexOf('function writeAheadRelease(convoId, { promptId, action, releasedIds }');
   const end = src.indexOf('\nfunction journalUpsertConvo', start);
   expect(start).toBeGreaterThan(-1);
   expect(end).toBeGreaterThan(start);
@@ -40,18 +43,6 @@ function loadSeam({ releaseOutbox, journalPublisher, env = {} }) {
   runInNewContext(src.slice(start, end), sandbox);
   sandbox.__timers = timers;
   return sandbox; // exposes emitRelease, republishPendingReleases, reconcileReleaseOutbox, scheduleReleaseReconcile
-}
-
-// finalizeSentQueue lives outside the emitRelease seam; extract it on its own.
-function loadFinalize({ emitRelease, journalInputConsumer }) {
-  const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
-  const start = src.indexOf('function finalizeSentQueue(convoId, flushedSnapshot)');
-  const end = src.indexOf('\nfunction restoreQueuedBatch', start);
-  expect(start).toBeGreaterThan(-1);
-  expect(end).toBeGreaterThan(start);
-  const sandbox = { emitRelease, journalInputConsumer, Map, console };
-  runInNewContext(src.slice(start, end), sandbox);
-  return sandbox;
 }
 
 const SEND_IDEM = 'qr\0pr_1\0pr_1::0\0send';
@@ -238,39 +229,11 @@ describe('index.js boot-reconcile deferral (F1 timing fix)', () => {
   });
 });
 
-// F2 CRITICAL: the SEND path must fail-closed like the cancel paths — never drop
-// the live entry when the durable write-ahead failed.
-describe('index.js finalizeSentQueue (F2 fail-closed send path)', () => {
-  function consumerStub(dropItem) {
-    return {
-      queueRelease: {
-        listLive: () => [{ itemId: 'i1', promptId: 'pr_1' }],
-        dropItem,
-      },
-    };
-  }
-
-  it('keeps the live entry (dropItem NOT called) when the write-ahead fails', () => {
-    const dropItem = vi.fn();
-    const emitRelease = vi.fn(() => false); // write-ahead failed (ENOSPC etc.)
-    const seam = loadFinalize({ emitRelease, journalInputConsumer: consumerStub(dropItem) });
-
-    seam.finalizeSentQueue('c', [{ itemId: 'i1' }]);
-
-    expect(emitRelease).toHaveBeenCalledWith('c', expect.objectContaining({ action: 'send', promptId: 'pr_1' }));
-    expect(dropItem).not.toHaveBeenCalled(); // live entry survives for reconcile
-  });
-
-  it('drops the live entry on a durable emit', () => {
-    const dropItem = vi.fn();
-    const emitRelease = vi.fn(() => true);
-    const seam = loadFinalize({ emitRelease, journalInputConsumer: consumerStub(dropItem) });
-
-    seam.finalizeSentQueue('c', [{ itemId: 'i1' }]);
-
-    expect(dropItem).toHaveBeenCalledWith('c', 'i1');
-  });
-});
+// The SEND path's fail-closed ordering (durable write-ahead BEFORE the merged
+// delivery, roll back on fault) is covered end-to-end in
+// queued-release-send-fail-closed.test.js. finalizeSentQueue (the old
+// post-delivery write-ahead) was removed when that ordering moved into
+// flushQueue.
 
 describe('journal-input-router — release echo-ack wiring', () => {
   function consumer(onReleaseEcho) {
