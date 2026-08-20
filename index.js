@@ -29,6 +29,8 @@ import {
 } from './lib/mcp-config.js';
 import { modelFromEvent, VALID_ALIAS_HINT } from './lib/model-aliases.js';
 import { switchModelInSession, modelButtons, planPrintModelSwitch } from './lib/model-command.js';
+import { inflightMediaReplaceRefusal } from './lib/session-replace-guard.js';
+import { writeSavedMediaFile, makeIdentityAwareCleanup } from './lib/saved-media-file.js';
 import {
   resolveInteractive,
   resolveModel,
@@ -5715,15 +5717,17 @@ function buildSavedMediaBlocks(session, { buffer, mime, dims, isImage, ivFilenam
   // The absolute path this function wrote to disk (null if it wrote nothing —
   // e.g. an upload-dir failure). Returned so a caller that ends up dropping the
   // media (session torn down before delivery) can unlink the orphaned file.
+  // savedIdentity is the file's captured { dev, ino } so the drop-path cleanup
+  // unlinks only THIS file, never a later upload that recycled the same name.
   let savedPath = null;
+  let savedIdentity = null;
   if (session.iv) {
     // iv-mode: the PTY is text-only. Save the file OUTSIDE the repo and type
     // only an absolute-path annotation; Claude reads it with its Read tool.
     // No base64 blocks and no inline content dump (SDK mode keeps those).
     const dir = ivUploadDir(session.roomId);
     const savePath = deduplicateFilename(dir, ivFilename);
-    fs.writeFileSync(savePath, buffer);
-    savedPath = savePath;
+    ({ path: savedPath, identity: savedIdentity } = writeSavedMediaFile(savePath, buffer));
     blocks.push({ type: 'text', text: ivUploadAnnotation({ msgtype: isImage ? 'm.image' : 'm.file', savePath, caption }) });
     // Journal mirror (upload + publish + markRead) is deferred to actual
     // dispatch time — see lib/media-mirror.js. Attaching it here (rather
@@ -5733,7 +5737,7 @@ function buildSavedMediaBlocks(session, { buffer, mime, dims, isImage, ivFilenam
     // journal media path never reads these back — its blob is already in the
     // journal — so the tag is simply inert there.)
     attachPendingMediaMirror(blocks, { buffer, mime, name: ivFilename, dims });
-    return { blocks, ivHandled: true, savedPath };
+    return { blocks, ivHandled: true, savedPath, savedIdentity };
   }
   // SDK mode: lead with the caption so claude reads the user's words before
   // the "Image saved to …" bookkeeping and the image itself — the order a
@@ -5745,8 +5749,7 @@ function buildSavedMediaBlocks(session, { buffer, mime, dims, isImage, ivFilenam
     let imgPath;
     try { imgPath = deduplicateFilename(sessionUploadsDir(session), workdirName); }
     catch (err) { blocks.push({ type: 'text', text: `[Upload failed: ${err.message}]` }); return { blocks, ivHandled: false }; }
-    fs.writeFileSync(imgPath, buffer);
-    savedPath = imgPath;
+    ({ path: savedPath, identity: savedIdentity } = writeSavedMediaFile(imgPath, buffer));
     blocks.push({ type: 'text', text: `Image saved to ${imgPath}` });
     appendInlineImageBlocks(blocks, { buffer, mime, inline, savePath: imgPath });
     attachPendingMediaMirror(blocks, { buffer, mime, name: workdirName, dims });
@@ -5755,8 +5758,7 @@ function buildSavedMediaBlocks(session, { buffer, mime, dims, isImage, ivFilenam
     let savePath;
     try { savePath = deduplicateFilename(sessionUploadsDir(session), workdirName); }
     catch (err) { blocks.push({ type: 'text', text: `[Upload failed: ${err.message}]` }); return { blocks, ivHandled: false }; }
-    fs.writeFileSync(savePath, buffer);
-    savedPath = savePath;
+    ({ path: savedPath, identity: savedIdentity } = writeSavedMediaFile(savePath, buffer));
     blocks.push({ type: 'text', text: `File saved to ${savePath}` });
     attachPendingMediaMirror(blocks, { buffer, mime, name: workdirName, dims });
 
@@ -5773,7 +5775,7 @@ function buildSavedMediaBlocks(session, { buffer, mime, dims, isImage, ivFilenam
       blocks.push({ type: 'text', text: `Binary file (${mime}) saved to ${savePath}. Use the Read tool to inspect it if needed.` });
     }
   }
-  return { blocks, ivHandled: false, savedPath };
+  return { blocks, ivHandled: false, savedPath, savedIdentity };
 }
 
 // --- Command Handler ---
@@ -5986,6 +5988,21 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         : (carriedExtras || []);
       const restartSessionId = existing.claudeSessionId;
       const restartWorkdir = existing.workdir;
+      // Refuse the restart (even --force) while a journal-media attachment for
+      // this conversation is still being prepared — recreateSession tears the
+      // session down and the media router would drop the in-flight file at its
+      // delivery-time canonicality guard, silently losing the upload. Same gate
+      // as /switch (canSwitchAgent) and /mode//model (their planners); checked
+      // AFTER the busy-defer above, so a mid-turn restart still parks and only a
+      // restart that would recreate the session right now is blocked. The
+      // router's gate is age-bounded, so a stalled prep can't wedge /restart.
+      const restartMediaRefusal = inflightMediaReplaceRefusal(
+        !!journalMediaRouter.hasInflightMedia?.(existing),
+      );
+      if (restartMediaRefusal.refuse) {
+        await sendReply(restartMediaRefusal.message);
+        return;
+      }
       await sendReply(`🔄 Restarting ${agentLabel(existing.agent)} session...`);
       recreateSession(roomId, { mcpExtras: effectiveRestartExtras }, { sendReply, sendHtml });
       const extrasLine = effectiveRestartExtras.length > 0
@@ -7583,19 +7600,18 @@ const journalMediaRouter = createJournalMediaRouter({
         console.warn(`[journal-media] inline image skipped (${inline.reason}); full file still saved for Read`);
       }
     }
-    const { blocks, savedPath } = buildSavedMediaBlocks(session, {
+    const { blocks, savedPath, savedIdentity } = buildSavedMediaBlocks(session, {
       buffer, mime, dims: dims || undefined, isImage,
       ivFilename: safeName, caption, workdirName: safeName, inline,
     });
     // Hand the router a cleanup closure so a drop AFTER the disk write (session
     // torn down mid-prep, or unavailable at inject) doesn't orphan the saved
     // file. The router only calls this on drop paths, never once the blocks are
-    // queued/injected.
+    // queued/injected. Identity-aware: it unlinks only the exact file we saved
+    // (matched by dev+ino), never a later upload that recycled the same path.
     return {
       blocks,
-      cleanup: savedPath
-        ? () => { try { fs.unlinkSync(savedPath); } catch { /* already gone / never written */ } }
-        : null,
+      cleanup: savedPath ? makeIdentityAwareCleanup(savedPath, savedIdentity) : null,
     };
   },
   injectText: (session, text) => sendTextToSession(session, text),
@@ -9627,7 +9643,9 @@ function applyModelSwitch(roomId, session, arg, { sendReply, sendHtml }) {
     switchModelInSession(session, arg, sendReply);
     return;
   }
-  const decision = planPrintModelSwitch(session, arg);
+  const decision = planPrintModelSwitch(session, arg, {
+    hasInflightMedia: !!journalMediaRouter.hasInflightMedia?.(session),
+  });
   if (decision.defer) {
     // Mid-turn: park the switch on the shared deferred-command stash (see
     // dispatchDeferredCommand). The turn-end seam replays `!model <alias>`
@@ -9666,7 +9684,9 @@ function applyModeSwitch(roomId, session, wantInteractive, { sendReply, sendHtml
     sendReply('Interactive Codex mode is not part of this first integration.');
     return;
   }
-  const decision = planModeSwitch(session, wantInteractive);
+  const decision = planModeSwitch(session, wantInteractive, {
+    hasInflightMedia: !!journalMediaRouter.hasInflightMedia?.(session),
+  });
   if (!decision.ok) {
     // `refusalAnnouncement` replaces planModeSwitch's message for flows the
     // user didn't initiate as a mode switch (the /login auto-return): a bare
