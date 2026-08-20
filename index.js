@@ -8101,7 +8101,10 @@ const PEER_UNTRUSTED_MARKER =
 function formatPeerDelivery(messages, { droppedCount = 0 } = {}) {
   const lines = messages.map((message) => {
     const kind = message.from_kind == null ? '' : ` (${oneLine(message.from_kind)})`;
-    return `[peer «${oneLine(message.from_name)}»${kind} · ${PEER_UNTRUSTED_MARKER}] ${oneLine(message.body)}`;
+    // A priority peer message (loop #688) is marked in the injected line so the receiving
+    // agent can weigh it — the label rides inside the existing bracket, never a barge-in.
+    const priorityMark = message.priority === true ? 'PRIORITY ' : '';
+    return `[${priorityMark}peer «${oneLine(message.from_name)}»${kind} · ${PEER_UNTRUSTED_MARKER}] ${oneLine(message.body)}`;
   });
   if (droppedCount) lines.unshift(`↑ ${droppedCount} earlier peer messages dropped`);
   return lines.join('\n');
@@ -8188,6 +8191,7 @@ function journalOnPeerMessage(frame) {
     from_name: payload.from_name,
     from_kind: payload.from_kind,
     body: payload.body,
+    priority: payload.priority === true,
   });
   logPeerMessageDelivery(frame.convo_id, frame.seq, decision);
 }

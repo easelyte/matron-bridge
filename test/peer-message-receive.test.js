@@ -167,6 +167,20 @@ describe('journalOnPeerMessage receive behavior', () => {
     assert.deepEqual(runtime.persistCalls[0].at(-1), { failLoud: true });
   });
 
+  it('labels a priority peer message with PRIORITY inside the injected line, and leaves a normal one unmarked', () => {
+    const priority = makeRuntime();
+    priority.journalOnPeerMessage(peerFrame({ payload: { priority: true } }));
+    assert.equal(priority.injectCalls.length, 1);
+    assert.equal(
+      priority.injectCalls[0][1],
+      `[PRIORITY peer «Sender Session» (codex) · ${marker}] Coordinate on the release checklist.`,
+    );
+
+    const normal = makeRuntime();
+    normal.journalOnPeerMessage(peerFrame());
+    assert.equal(normal.injectCalls[0][1].startsWith('[PRIORITY'), false);
+  });
+
   it('omits a null from_kind on both idle and coalesced framing paths', () => {
     const idle = makeRuntime();
     idle.journalOnPeerMessage(peerFrame({ payload: { from_kind: null } }));

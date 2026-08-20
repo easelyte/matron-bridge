@@ -114,6 +114,17 @@ describe('journal publisher peer messages', () => {
     expect(peerMessageIdemKey('from', 'target', 'body')).toBe(peerMessageIdemKey('from', 'target', 'body'));
   });
 
+  it('makes priority part of the semantic key so an escalation is not deduped', () => {
+    // A same-body priority resend must get a DISTINCT key from the prior normal send.
+    expect(peerMessageIdemKey('from', 'target', 'body', true)).not.toBe(
+      peerMessageIdemKey('from', 'target', 'body', false),
+    );
+    // Absent priority defaults to non-priority — unchanged from the 3-arg call.
+    expect(peerMessageIdemKey('from', 'target', 'body')).toBe(
+      peerMessageIdemKey('from', 'target', 'body', false),
+    );
+  });
+
   it('emits the agent op with a deterministic content-derived key', async () => {
     FakeWebSocket.instances.length = 0;
     const pub = createJournalPublisher({

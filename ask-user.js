@@ -272,7 +272,8 @@ server.tool(
       const postRes = await fetch(`${BRIDGE_API}/agent-message`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ roomId: ROOM_ID, target_convo, body, priority }),
+        // Only serialize priority when true — a normal message carries no priority at any hop.
+        body: JSON.stringify({ roomId: ROOM_ID, target_convo, body, ...(priority === true ? { priority: true } : {}) }),
       });
       const data = await postRes.json().catch(() => ({}));
       if (!postRes.ok) {
