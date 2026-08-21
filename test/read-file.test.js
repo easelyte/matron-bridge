@@ -120,6 +120,25 @@ describe('readFileGuarded — path-safety rejections (same vocabulary as edit_fi
   });
 });
 
+describe('readFileGuarded — utf8 round-trip guard (F2)', () => {
+  it('refuses a file with invalid utf-8 bytes (would not round-trip -> not_text)', async () => {
+    const file = path.join(root, 'binary.dat');
+    // 0xff is not valid utf-8; decoding -> U+FFFD -> re-encodes to DIFFERENT bytes.
+    writeFileSync(file, Buffer.from([0x41, 0xff, 0x42]));
+    await expect(readFileGuarded({ path: file }, { allowedRoots: roots }))
+      .rejects.toMatchObject({ name: 'ReadFileError', code: 'not_text' });
+  });
+
+  it('accepts multi-byte utf-8 that DOES round-trip (emoji, accents, CJK)', async () => {
+    const file = path.join(root, 'unicode.txt');
+    const body = 'cafe accents, CJK, rocket emoji: é 日本語 🚀\n';
+    writeFileSync(file, body);
+    const res = await readFileGuarded({ path: file }, { allowedRoots: roots });
+    expect(res.content).toBe(body);
+    expect(res.sha256).toBe(createHash('sha256').update(Buffer.from(body, 'utf8')).digest('hex'));
+  });
+});
+
 describe('readFileGuarded — size guard', () => {
   it('rejects a file over the max-size guard (too_large)', async () => {
     const file = path.join(root, 'big.txt');
