@@ -3,7 +3,7 @@ import { mkdtempSync, writeFileSync, symlinkSync, mkdirSync, rmSync } from 'node
 import { createHash } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { readFileGuarded, MAX_READ_BYTES } from '../lib/read-file.js';
+import { readFileGuarded, MAX_READ_BYTES, MAX_RESPONSE_BODY_BYTES } from '../lib/read-file.js';
 import { applyFileEdit } from '../lib/edit-file.js';
 import { pinAllowedRootsSync } from '../lib/file-link-guard.js';
 
@@ -128,8 +128,23 @@ describe('readFileGuarded — size guard', () => {
       .rejects.toMatchObject({ code: 'too_large' });
   });
 
-  it('MAX_READ_BYTES mirrors edit_file\'s cap (5 MiB)', () => {
-    expect(MAX_READ_BYTES).toBe(5 * 1024 * 1024);
+  it('is bounded to the 16 KiB relay frame cap, NOT edit_file\'s 5 MiB (content is returned inline)', () => {
+    // read_file returns content inline in an agent_response frame, so it is
+    // bounded to the relay's 16 KiB cap, not edit_file's 5 MiB raw budget.
+    expect(MAX_RESPONSE_BODY_BYTES).toBe(15 * 1024);
+    expect(MAX_READ_BYTES).toBe(MAX_RESPONSE_BODY_BYTES);
+    expect(MAX_READ_BYTES).toBeLessThan(16 * 1024);
+  });
+
+  it('rejects a file whose SERIALIZED response would exceed the frame budget (F3), even under the raw cap', async () => {
+    // A file just under the raw read cap but whose JSON-escaped body exceeds the
+    // response budget must fail loud as too_large, not produce a droppable frame.
+    // Control chars expand ~6x under JSON escaping (\u00XX), so a modest raw file
+    // blows the encoded budget.
+    const file = path.join(root, 'ctrl.txt');
+    writeFileSync(file, String.fromCharCode(1).repeat(4 * 1024)); // 4 KiB raw -> ~24 KiB encoded (6 bytes each)
+    await expect(readFileGuarded({ path: file }, { allowedRoots: roots }))
+      .rejects.toMatchObject({ code: 'too_large' });
   });
 });
 
