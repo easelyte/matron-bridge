@@ -112,7 +112,7 @@ describe('processShowFile', () => {
       deps,
     });
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ ok: true, media_id: 'media-123', kind: 'image' });
+    expect(res.body).toEqual({ ok: true, media_id: 'media-123', kind: 'image', deduped: false });
     // shareAgentMedia got the session's pinned roots and a publish() closure.
     expect(deps.shareAgentMedia).toHaveBeenCalledWith(expect.objectContaining({
       filePath: '/work/chart.png',

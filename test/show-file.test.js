@@ -258,16 +258,34 @@ describe('shareAgentMedia dedup ledger', () => {
     expect(result).toEqual(expect.objectContaining({ deduped: false }));
   });
 
-  it('does not dedup when sha256 is absent from upload metadata (cannot key)', async () => {
+  it('still dedups via a locally-computed hash when the journal omits sha256 (F2 version skew)', async () => {
     const dedupLedger = makeLedger();
-    const deps = makeDeps();
-    deps.uploadMedia.mockResolvedValue({ media_id: 'media-partial' }); // no sha256
+    const content = Buffer.from('same-bytes');
 
-    const result = await share(deps, { token: 'tok-1', deps: { ...deps, dedupLedger } });
+    const first = makeDeps({ content });
+    first.uploadMedia.mockResolvedValue({ media_id: 'media-partial-1' }); // no sha256
+    const r1 = await share(first, { token: 'tok-1', deps: { ...first, dedupLedger } });
+    expect(first.publish).toHaveBeenCalledTimes(1);
+    expect(dedupLedger.set).toHaveBeenCalledTimes(1); // recorded via local content hash
+    expect(r1).toEqual(expect.objectContaining({ deduped: false }));
 
-    expect(deps.publish).toHaveBeenCalledTimes(1);
-    expect(dedupLedger.set).not.toHaveBeenCalled();
-    expect(result).toEqual(expect.objectContaining({ ok: true, deduped: false }));
+    const second = makeDeps({ content });
+    second.uploadMedia.mockResolvedValue({ media_id: 'media-partial-2' }); // no sha256, same bytes
+    const r2 = await share(second, { token: 'tok-1', deps: { ...second, dedupLedger } });
+    expect(second.publish).not.toHaveBeenCalled(); // suppressed on identical bytes
+    expect(r2).toEqual(expect.objectContaining({ media_id: 'media-partial-1', deduped: true }));
+  });
+
+  it('dedups an empty-string caption against an absent caption (F5 payload-equivalent)', async () => {
+    const dedupLedger = makeLedger();
+    const first = makeDeps();
+    await share(first, { token: 'tok-1', caption: '', deps: { ...first, dedupLedger } });
+
+    const second = makeDeps();
+    const result = await share(second, { token: 'tok-1', caption: undefined, deps: { ...second, dedupLedger } });
+
+    expect(second.publish).not.toHaveBeenCalled(); // '' and absent publish identically → one identity
+    expect(result).toEqual(expect.objectContaining({ media_id: 'media-123', deduped: true }));
   });
 
   it('fails open and publishes normally when the ledger throws', async () => {
