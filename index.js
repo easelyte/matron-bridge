@@ -90,6 +90,7 @@ import {
   shareAgentMedia,
 } from './lib/show-file.js';
 import { processShowFile } from './lib/show-file-handler.js';
+import { createMediaDedupLedger } from './lib/media-dedup-ledger.js';
 import { createJournalPublisher, FLUSH_TIMEOUT_MS } from './lib/journal-publisher.js';
 import { createRpcRequestHandler } from './lib/journal-rpc.js';
 import { buildActivity, buildLimits } from './lib/spawn-capacity.js';
@@ -296,6 +297,11 @@ const SHOW_FILE_GLOBAL_BYTE_BUDGET = SHOW_FILE_MAX_IN_FLIGHT * SHOW_FILE_MAX_BYT
 // reserves before an upload and releases in its finally). An object so the
 // extracted handler can mutate it by reference.
 const showFileBudget = { inFlight: 0, reservedBytes: 0 };
+// Content-identity dedup ledger for show_file (loop #667): a repeat publish of the
+// same file within the TTL window (typically an LLM agent re-calling show_file
+// after an error) returns the prior media_id instead of re-publishing a duplicate
+// bubble. Process-lifetime singleton; bounded by TTL + LRU cap; fail-open.
+const showFileDedupLedger = createMediaDedupLedger();
 const SHOW_FILE_UPLOAD_TIMEOUT_MS = parseShowFileUploadTimeoutMs(
   process.env.SHOW_FILE_UPLOAD_TIMEOUT_MS,
 );
@@ -9054,6 +9060,7 @@ const apiServer = createServer(async (req, res) => {
           uploadMedia: journalPublisher.uploadMedia,
           journalPublish,
           denialToStatus,
+          dedupLedger: showFileDedupLedger,
         },
       });
       res.writeHead(status, { 'Content-Type': 'application/json', ...(headers || {}) });
