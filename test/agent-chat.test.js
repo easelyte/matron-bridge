@@ -114,6 +114,19 @@ describe('createAgentChatHandlers', () => {
       }]);
     });
 
+    it('forwards priority to the transport only when the sender set it true, never otherwise', async () => {
+      const { handlers, calls } = makeFixture();
+      await handlers.agentMessage({ roomId: '!sess', target_convo: 'convo-remote', body: 'urgent', priority: true });
+      await handlers.agentMessage({ roomId: '!sess', target_convo: 'convo-remote', body: 'calm', priority: false });
+      await handlers.agentMessage({ roomId: '!sess', target_convo: 'convo-remote', body: 'also calm' });
+      // priority:true carries the key; false/absent carry no key at all (base shape unchanged).
+      expect(calls).toEqual([
+        { call: 'sendPeerMessage', args: { targetConvo: 'convo-remote', fromConvo: 'convo-sess', body: 'urgent', priority: true } },
+        { call: 'sendPeerMessage', args: { targetConvo: 'convo-remote', fromConvo: 'convo-sess', body: 'calm' } },
+        { call: 'sendPeerMessage', args: { targetConvo: 'convo-remote', fromConvo: 'convo-sess', body: 'also calm' } },
+      ]);
+    });
+
     it('409s when the session has no journal convo bound yet (F2 fail-loud)', async () => {
       const { handlers, sessions } = makeFixture();
       sessions.set('!nocvo', { busy: false, alive: true }); // no convoId → journalConvoIdFor null
@@ -1227,14 +1240,16 @@ describe('index.js routes + ask-user.js tools (source inspection)', () => {
     }
   });
 
-  it('agent_message exposes exactly target_convo and body as model-facing parameters', () => {
+  it('exposes target_convo, body, and an optional priority as the model-facing parameters', () => {
     const block = toolBlock('agent_message');
     const schema = block.slice(block.indexOf('{'), block.indexOf('async ('));
     expect(schema).toMatch(/target_convo: z\.string\(\)\.min\(1\)/);
     expect(schema).toMatch(/body: z\.string\(\)\.min\(1\)/);
+    expect(schema).toMatch(/priority: z\s*\.boolean\(\)\s*\.optional\(\)/);
+    // Attribution stays server-stamped — never model-supplied.
     expect(schema).not.toMatch(/\bfrom_convo\b|\broomId\b/);
     expect((schema.match(/^\s+[a-z_]+:/gm) || []).map((line) => line.trim().split(':')[0]))
-      .toEqual(['target_convo', 'body']);
+      .toEqual(['target_convo', 'body', 'priority']);
   });
 
   it('keeps the no-polling etiquette in the tool descriptions', () => {

@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
 import { describe, expect, it } from 'vitest';
 import WebSocket from 'ws';
@@ -112,6 +113,30 @@ describe('journal publisher peer messages', () => {
   it('hashes canonical tuples without plain-concatenation collisions', () => {
     expect(peerMessageIdemKey('ab', 'c', 'd')).not.toBe(peerMessageIdemKey('a', 'bc', 'd'));
     expect(peerMessageIdemKey('from', 'target', 'body')).toBe(peerMessageIdemKey('from', 'target', 'body'));
+  });
+
+  it('makes priority part of the semantic key so an escalation is not deduped', () => {
+    // A same-body priority resend must get a DISTINCT key from the prior normal send.
+    expect(peerMessageIdemKey('from', 'target', 'body', true)).not.toBe(
+      peerMessageIdemKey('from', 'target', 'body', false),
+    );
+    // Absent priority defaults to non-priority — unchanged from the 3-arg call.
+    expect(peerMessageIdemKey('from', 'target', 'body')).toBe(
+      peerMessageIdemKey('from', 'target', 'body', false),
+    );
+  });
+
+  it('keeps a normal message byte-identical to the legacy 3-element digest (rollout dedup safety)', () => {
+    // The pre-priority producer hashed exactly [from, target, body]. A normal message must
+    // still produce THAT key, or a retry straddling the bridge upgrade would inject a duplicate.
+    const legacy = createHash('sha256').update(JSON.stringify(['from', 'target', 'body'])).digest('hex');
+    expect(peerMessageIdemKey('from', 'target', 'body')).toBe(legacy);
+    expect(peerMessageIdemKey('from', 'target', 'body', false)).toBe(legacy);
+    // Priority appends the discriminator, so it is a 4-element digest — distinct from legacy.
+    const priorityDigest = createHash('sha256')
+      .update(JSON.stringify(['from', 'target', 'body', true]))
+      .digest('hex');
+    expect(peerMessageIdemKey('from', 'target', 'body', true)).toBe(priorityDigest);
   });
 
   it('emits the agent op with a deterministic content-derived key', async () => {
