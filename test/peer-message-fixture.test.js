@@ -4,9 +4,12 @@ import { describe, expect, it } from 'vitest';
 
 const fixturePath = new URL('./fixtures/peer_message.fixture.json', import.meta.url);
 const fixture = JSON.parse(readFileSync(fixturePath, 'utf8'));
+const priorityFixturePath = new URL('./fixtures/peer_message.priority.fixture.json', import.meta.url);
+const priorityFixture = JSON.parse(readFileSync(priorityFixturePath, 'utf8'));
 
 const EVENT_KEYS = ['convo_id', 'payload', 'sender', 'seq', 'ts', 'type'];
 const PAYLOAD_KEYS = ['body', 'from_convo', 'from_kind', 'from_name'];
+const PRIORITY_PAYLOAD_KEYS = ['body', 'from_convo', 'from_kind', 'from_name', 'priority'];
 
 function keys(value) {
   return Object.keys(value).sort();
@@ -42,5 +45,18 @@ describe('peer_message wire fixture', () => {
     }
 
     expect(JSON.stringify(fixture)).not.toContain('idem_key');
+  });
+
+  it('matches the exact PRIORITY variant shape (5-key payload) the bridge receives', () => {
+    // The bridge vendors this file byte-for-byte from the journal (producer-owned). A priority
+    // peer message adds exactly one payload key, priority:true, which the terminal-injection
+    // path (journalOnPeerMessage / formatPeerDelivery) reads to mark the line.
+    expect(keys(priorityFixture)).toEqual(['event', 'fixtureVersion']);
+    expect(keys(priorityFixture.event)).toEqual(EVENT_KEYS);
+    expect(keys(priorityFixture.event.payload)).toEqual(PRIORITY_PAYLOAD_KEYS);
+    expect(priorityFixture.event.payload.priority).toBe(true);
+    expect(priorityFixture.event.type).toBe('peer_message');
+    expect(priorityFixture.fixtureVersion).toBe(fixtureVersion(priorityFixture.event));
+    expect(JSON.stringify(priorityFixture)).not.toContain('idem_key');
   });
 });
