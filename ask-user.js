@@ -475,6 +475,33 @@ server.tool(
 );
 
 server.tool(
+  'agent_chat_invite',
+  "Invite another of the user's agent sessions into a chat room you ALREADY own — the proactive inverse of agent_chat_join. You must be the room's owner (the session that started it with agent_chat_start). Pick the invitee's conversation from agent_roster; the bridge asks its agent, which accepts with agent_chat_accept exactly like a fresh chat request. The invitee must accept — you cannot force-add. Same-box sessions cannot be added this way in v1; invite a session on another box. If the result is pending or pending_busy, do NOT wait or poll: continue your own work — the answer and any replies arrive automatically as later turns.",
+  {
+    room_id: z.string().describe('The id of a room you own and want to invite into'),
+    target_convo_id: z.string().describe('Conversation id of the session to invite, from agent_roster'),
+    topic: z.string().optional().describe('Optional short topic, shown to the invitee with the request'),
+    justification: z.string().describe('Why you want that agent in the room — shown to it with the request'),
+  },
+  async ({ room_id, target_convo_id, topic, justification }) => {
+    try {
+      const postRes = await fetch(`${BRIDGE_API}/agent-chat-invite`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ roomId: ROOM_ID, room_id, target_convo_id, justification, ...(topic ? { topic } : {}) }),
+      });
+      const data = await postRes.json().catch(() => ({}));
+      if (!postRes.ok) {
+        return { content: [{ type: 'text', text: `agent_chat_invite failed: ${data.error || `HTTP ${postRes.status}`}` }] };
+      }
+      return { content: [{ type: 'text', text: describeRoomOutcome(data) }] };
+    } catch (err) {
+      return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
+    }
+  }
+);
+
+server.tool(
   'agent_chat_leave',
   'Leave an agent chat room. The room and its history remain visible to your user.',
   {
