@@ -6,6 +6,7 @@ import {
   normalizeModelArg,
   aliasLabel,
   modelFromEvent,
+  modelOptions,
 } from '../lib/model-aliases.js';
 
 describe('SWITCHABLE_ALIASES', () => {
@@ -14,6 +15,21 @@ describe('SWITCHABLE_ALIASES', () => {
       'default', 'opus', 'opus[1m]', 'sonnet', 'sonnet[1m]', 'haiku', 'opusplan', 'fable',
     ]);
     for (const m of SWITCHABLE_ALIASES) expect(typeof m.label).toBe('string');
+  });
+});
+
+describe('modelOptions', () => {
+  it('offers the switchable aliases as {value,label} pairs for the status frame', () => {
+    const options = modelOptions();
+    expect(options).toHaveLength(SWITCHABLE_ALIASES.length);
+    expect(options[0]).toEqual({ value: 'default', label: 'Default' });
+    expect(options.find(o => o.value === 'opus[1m]')).toEqual({ value: 'opus[1m]', label: 'Opus 1M' });
+    expect(options.every(o => Object.keys(o).sort().join(',') === 'label,value')).toBe(true);
+  });
+
+  it("omits 'best' — valid to type, never offered (matches the buttons)", () => {
+    expect(modelOptions().some(o => o.value === 'best')).toBe(false);
+    expect(isValidModelArg('best')).toBe(true);
   });
 });
 

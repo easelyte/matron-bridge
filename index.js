@@ -22,12 +22,13 @@ import { extractUrls, isIdleReadyScreen, extractPreamble, preambleMatchesText, c
 import {
   buildMcpServers,
   effectiveExtras,
+  extractBypassFlag,
   extractMcpExtraFlags,
   extractPromptFlag,
   knownMcpExtras,
   resolveDefaultExtras,
 } from './lib/mcp-config.js';
-import { modelFromEvent, VALID_ALIAS_HINT } from './lib/model-aliases.js';
+import { modelFromEvent, modelOptions, VALID_ALIAS_HINT } from './lib/model-aliases.js';
 import { switchModelInSession, modelButtons, planPrintModelSwitch } from './lib/model-command.js';
 import { inflightMediaReplaceRefusal, INFLIGHT_MEDIA_REPLACE_REFUSAL } from './lib/session-replace-guard.js';
 import { writeSavedMediaFile, makeIdentityAwareCleanup } from './lib/saved-media-file.js';
@@ -42,7 +43,15 @@ import {
   eventConfirmsSession,
   shouldRunAccountFlowReturn,
 } from './lib/session-mode.js';
-import { switchEffortInSession, effortButtons, VALID_EFFORT_HINT } from './lib/effort-command.js';
+import { switchEffortInSession, effortButtons, effortOptions, VALID_EFFORT_HINT } from './lib/effort-command.js';
+import {
+  noteEffortWrite,
+  noteEffortConfirmationPrompt,
+  noteEffortConfirmationAnswer,
+  noteEffortIdle,
+  resetEffortTracking,
+  trackedEffort,
+} from './lib/effort-tracker.js';
 // formatDuration aliased: index.js has its own uptime formatDuration (no
 // day unit); timer feedback uses the lib's day-aware one so "/timer 7d"
 // reads "7d", not "168h".
@@ -93,16 +102,17 @@ import { processShowFile } from './lib/show-file-handler.js';
 import { createMediaDedupLedger } from './lib/media-dedup-ledger.js';
 import { createJournalPublisher, FLUSH_TIMEOUT_MS } from './lib/journal-publisher.js';
 import { createRpcRequestHandler } from './lib/journal-rpc.js';
-import { buildActivity, buildLimits } from './lib/spawn-capacity.js';
+import { buildActivity, buildLimits, buildDisk } from './lib/spawn-capacity.js';
 import { createAgentSpawnHandlers } from './lib/agent-spawn.js';
 import { createRecentFolders } from './lib/recent-folders.js';
 import { atomicWriteFileSync } from './lib/atomic-write.js';
 import { createInflightMarker } from './lib/inflight-marker.js';
 import { cancelQueuedItem, dispatchBusyQueueMagicWord, notifyQueuedMessage, resolveQueueReleaseTap } from './lib/busy-queue.js';
 import { handlePickerValue, isResumeConvoId } from './lib/picker-dispatch.js';
+import { createPermissionRegistry, renderPermissionCard, permissionButtons, permissionSpawnArgs, resolveBypassMode, resolvePermissionTimeoutMs } from './lib/permission-prompt.js';
 import { createJournalInputConsumer, resolvePromptChoice } from './lib/journal-input-router.js';
 import { createAgentRooms, INVITE_TTL_MS } from './lib/agent-rooms.js';
-import { createAgentInvites, formatInviteRequestNotice } from './lib/agent-invites.js';
+import { createAgentInvites, formatInviteRequestNotice, INVITE_WAKE_NOTICE } from './lib/agent-invites.js';
 import { resolveInviteTarget } from './lib/invite-target.js';
 import { createRoomDelivery, formatRoomMessageNotice, formatRoomDeliveredNotice, formatRoomDeliveryFailedNotice, ROOM_MESSAGE_QUEUED_NOTICE } from './lib/room-delivery.js';
 import { oneLine } from './lib/peer-text.js';
@@ -118,6 +128,7 @@ import {
 } from './lib/permission-registry.js';
 import { createJournalMediaRouter } from './lib/journal-media.js';
 import { attachQueuedCleanup, markJournalOrigin, planQueueFlush, runQueuedCleanup } from './lib/queue-flush.js';
+import { queueFlushNotice } from './lib/queue-flush-notice.js';
 import { isCompactCommand, compactBatchSize, hasQueuedCompact } from './lib/compact-priority.js';
 import { attachPendingMediaMirror, pendingMediaMirror } from './lib/media-mirror.js';
 import { seedJournalTitle, applyFallbackTitle, formatRoomTitle } from './lib/journal-title-seed.js';
@@ -128,7 +139,7 @@ import { SUMMARY_MIN_NEW } from './lib/summary-pass.js';
 import { activityStateChanged, truncateActivityDetail, shouldResumeThinkingAfterTool } from './lib/journal-activity.js';
 import { streamRefFor } from './lib/journal-stream.js';
 import { contextFullToNative, briefContextReport } from './lib/context-command.js';
-import { buildSessionStatus, contextTokensFromAssistantEvent, postCompactContextTokens, compactTriggerFrom, contextGaugeText, emailFromClaudeConfig, isSidechainEvent, reconcileModelForWindow, hostVitalLimits, startCpuSampler, stopCpuSampler, cpuPercent, ramPercent, cpuSampledAtMs, statusRepaintDue } from './lib/session-status.js';
+import { buildSessionStatus, contextTokensFromAssistantEvent, postCompactContextTokens, compactTriggerFrom, contextGaugeText, emailFromClaudeConfig, isSidechainEvent, reconcileModelForWindow, hostVitals, startCpuSampler, stopCpuSampler, cpuPercent, ramPercent, cpuSampledAtMs, statusRepaintDue } from './lib/session-status.js';
 import {
   AGENT_CLAUDE,
   AGENT_CODEX,
@@ -173,6 +184,16 @@ if (process.env.MATRON_DEFAULT_AGENT && !normalizeAgent(process.env.MATRON_DEFAU
   console.warn(`[agent] Unknown MATRON_DEFAULT_AGENT=${JSON.stringify(process.env.MATRON_DEFAULT_AGENT)}; defaulting to claude.`);
 }
 const CODEX_SANDBOX_MODE = normalizeCodexSandbox(process.env.CODEX_SANDBOX_MODE || 'workspace-write');
+// Box-wide default for print-mode Claude sessions: 'bypass' spawns with
+// --dangerously-skip-permissions, 'auto' with Claude Code's auto permission
+// mode + the Matron permission-card prompt tool. Bypass is the default —
+// auto mode blocks too much routine work to impose on every session — so
+// auto is opt-in, per box here or per session via --auto.
+const MATRON_PERMISSION_MODE = process.env.MATRON_PERMISSION_MODE || 'bypass';
+if (!['bypass', 'auto'].includes(MATRON_PERMISSION_MODE)) {
+  console.warn(`[permissions] Unknown MATRON_PERMISSION_MODE=${JSON.stringify(process.env.MATRON_PERMISSION_MODE)}; defaulting to bypass.`);
+}
+const DEFAULT_BYPASS_MODE = MATRON_PERMISSION_MODE !== 'auto';
 // Idle reaping: a session is killed if no activity (incoming user message OR
 // outgoing assistant text posted to Matrix) is observed within this window.
 // Sessions are resumable, so the next user message will respawn claude with
@@ -599,6 +620,7 @@ function persistSession(roomId, sessionId, workdir, originRoomId, extra, { failL
   const live = sessions.get(roomId);
   const derived = {};
   if (live && Array.isArray(live.mcpExtras)) derived.mcpExtras = live.mcpExtras;
+  if (typeof live?.bypassMode === 'boolean') derived.bypassMode = live.bypassMode;
   if (live?.agent) derived.agent = live.agent;
   if (live?.journalConvoId) derived.journalConvoId = live.journalConvoId;
   if (live && Number.isInteger(live.peerHandledWatermark)) {
@@ -792,6 +814,9 @@ const journalRpcHandler = createRpcRequestHandler({
   // from whatever usageLimitsCache holds right now.
   getActivity: () => buildActivity({ sessions, persisted: loadPersistedSessions() }),
   getLimits: () => { refreshUsageLimits(DEFAULT_WORKDIR); return buildLimits(usageLimitsCache); },
+  // Free space on the default-workdir filesystem — a full box is a bad spawn
+  // target however idle it looks. One statfs syscall, answered inline.
+  getDisk: () => buildDisk({ path: DEFAULT_WORKDIR }),
   // Which account a new session here would burn quota against, so the chooser
   // can tell boxes on different logins apart. Same cache as the status frames.
   getAccountEmail: () => getAccountEmail(),
@@ -1136,6 +1161,13 @@ function journalActivity(session, state, detail) {
   if (!convoId) return;
   if (!activityStateChanged(session._journalActivityState, state)) return;
   session._journalActivityState = state;
+  // A pending `/effort` write with no confirmation in sight settles here:
+  // this is the bridge's existing "claude stopped and is waiting on the user"
+  // seam, the one a TUI prompt would have preceded. Deliberately AFTER the
+  // dedup guard, so only a real transition INTO idle settles a write — the
+  // unconditional idle re-publishes (iv.on('prompt'),
+  // handleInteractiveScreenUpdate) must not. See lib/effort-tracker.js.
+  if (state === 'idle') noteEffortIdle(session);
   journalPublisher.publishActivity(convoId, state, detail);
 }
 
@@ -1260,24 +1292,42 @@ function journalStatus(session) {
   if (!JOURNAL_ENABLED) return;
   const convoId = journalConvoIdFor(session);
   if (!convoId) return;
-  // Host CPU/RAM vitals (#526) are host-global, not account- or agent-specific,
-  // so they ride on every frame (Claude and Codex). Sampled once per turn end
-  // here so consecutive CPU samples bracket real wall-clock time (no blocking
-  // sleep). The account rate limits, by contrast, are Claude-account-specific.
-  const hostVitals = hostVitalLimits();
+  // Host CPU/RAM vitals are host-global, not account- or agent-specific, so
+  // they ride on every frame (Claude and Codex) at TOP LEVEL (status.vitals) —
+  // NOT in limits[], which clients render as Claude-account subscription
+  // meters. hostVitals() only READS the sampler cache (the 15s interval owns
+  // sampling); it never samples here.
+  const vitals = hostVitals();
   const isCodex = session.agent === AGENT_CODEX;
   const status = buildSessionStatus({
     model: session.currentModel || session.initData?.model,
     contextTokens: session._lastContextTokens,
-    // Codex frames carry only host vitals; Claude frames carry the account
-    // rate limits followed by host vitals.
-    limits: isCodex ? hostVitals : [...(usageLimitsCache.lines || []), ...hostVitals],
+    // Account rate limits are Claude-account-specific; Codex frames carry none,
+    // keeping the Codex limits array empty (buildSessionStatus omits it).
+    limits: isCodex ? [] : (usageLimitsCache.lines || []),
+    // Composer argument offers for /model and /effort, session-scoped. Codex
+    // states EMPTY rather than staying silent: its model id is free text passed
+    // straight to `codex --model` (the bridge validates nothing and holds no id
+    // list) and effort isn't exposed for it at all — see the '!effort' handler.
+    // Silence would merge stickily, so a mid-session /switch claude→codex would
+    // leave Claude's offers standing on a session that refuses them.
+    modelOptions: isCodex ? [] : modelOptions(),
+    effortLevels: isCodex ? [] : effortOptions(),
+    // Optimistically tracked, never read back (lib/effort-tracker.js). Null for
+    // Codex (not applicable) and for a Claude session whose level is unknown;
+    // either way it publishes as an EXPLICIT null, so a sticky client clears a
+    // level this session no longer stands behind (e.g. after a restart).
+    effort: isCodex ? null : trackedEffort(session),
     email: getAccountEmail(),
-    workdir: session.workdir,
+    // Absolute path for the client's header workdir segment: session.workdir
+    // can be relative (it is passed through from the resume/start args), so
+    // resolve it here rather than shipping a bare relative fragment.
+    workdir: session.workdir ? path.resolve(session.workdir) : undefined,
+    vitals,
   });
   // The shared account email cache is Claude-specific — strip it from Codex
   // frames. (Rate limits are already excluded from the Codex limits array
-  // above; host vitals intentionally remain.)
+  // above; host vitals live at top-level status.vitals and stay on both.)
   if (isCodex) {
     delete status.email;
   }
@@ -1532,6 +1582,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   const mcpExtras = Array.isArray(options.mcpExtras)
     ? options.mcpExtras
     : (Array.isArray(persistedForRoom?.mcpExtras) ? persistedForRoom.mcpExtras : []);
+  const bypassMode = resolveBypassMode(options.bypass, persistedForRoom?.bypassMode, DEFAULT_BYPASS_MODE);
   const effectiveMcpExtras = effectiveExtras(mcpExtras, DEFAULT_MCP_EXTRAS);
   const shareEnabled = effectiveMcpExtras.includes('share');
   const permissionToken = randomUUID();
@@ -1563,6 +1614,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     '--verbose',
     '--input-format', 'stream-json',
     '--output-format', 'stream-json',
+    ...permissionSpawnArgs(bypassMode),
     '--disallowed-tools', 'AskUserQuestion',
     '--append-system-prompt', BRIDGE_SYSTEM_PROMPT,
     '--include-partial-messages',
@@ -1574,6 +1626,14 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     : resolveModel({ option: options.model, persisted: persistedMode?.model });
   if (printModel) {
     args.push('--model', printModel);
+  }
+  // Auto mode needs Opus 4.6+/Sonnet 4.6+/Fable-class models; Haiku-class
+  // sessions fall back to `default` permission mode and prompt for far more.
+  if (!bypassMode && printModel && /haiku/i.test(printModel)) {
+    const hw = notice('warning',
+      `Model ${printModel} doesn't support auto permission mode — the session may fall back to default mode and prompt frequently. Use --bypass to run without permission gating instead.`,
+      `Model <code>${escapeHtml(printModel)}</code> doesn't support auto permission mode — the session may fall back to default mode and prompt frequently. Use <code>--bypass</code> to run without permission gating instead.`);
+    Promise.resolve(sendToRoom(roomId, hw.plain, hw.html)).catch(() => {});
   }
   args.push(...identity.cliArgs);
 
@@ -1643,6 +1703,8 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     _showFileInFlight: 0,
     mcpExtras,
     permissionSnapshot,
+    bypassMode,
+    permAllowedTools: new Set(),
     responseBuffer: '',
     sendCallback: null,
     pendingPlan: null,
@@ -1789,6 +1851,11 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
             agent: session.agent,
             model: session.currentModel || undefined,
             mcpExtras: session.mcpExtras,
+            // Same not-yet-persisted rationale as mcpExtras above: carry the
+            // live --bypass/--auto choice explicitly so a crash restart can't
+            // silently flip the permission mode. (Absent on codex/iv sessions,
+            // which never set bypassMode.)
+            ...(typeof session.bypassMode === 'boolean' ? { bypass: session.bypassMode } : {}),
             journalConvoId: session.journalConvoId,
             // Carry the prior title so the re-seed adopts the good Gemini title
             // instead of publishing the repo basename over it (title-revert bug).
@@ -2127,22 +2194,22 @@ function flushPendingSessionQueue(session) {
   // exactly what the batch is.
   const releaseSnapshot = snapshotQueuedReleaseBatch(session, queued);
   session.queuedMessages = deferred.length ? deferred : null;
-  const summary = formatQueueSummary(queued);
   // Nothing deferred: the familiar "sending N queued messages" list. Deferred:
   // say WHY the rest didn't go, or the held messages read as swallowed. They
   // need no nudge to be delivered — the compaction run is its own print-mode
   // turn, and its `result` event lands right back here (see the result handler
-  // and onTurnEnd, both of which call this function once busy clears).
-  const plainMsg = deferred.length
-    ? `📬 Sending /compact first — the other ${deferred.length} queued message${deferred.length > 1 ? 's' : ''} will be sent once compaction finishes.`
-    : `📬 Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''}:\n${summary.plain}`;
-  const htmlMsg = deferred.length
-    ? `<b>📬 Sending /compact first</b> — the other ${deferred.length} queued message${deferred.length > 1 ? 's' : ''} will be sent once compaction finishes.`
-    : `<b>📬 Sending ${queued.length} queued message${queued.length > 1 ? 's' : ''}:</b>${summary.html}`;
+  // and onTurnEnd, both of which call this function once busy clears). Both
+  // shapes are worded in lib/queue-flush-notice.js, shared with the three
+  // explicit-flush paths so the four cannot drift apart.
+  const notice = queueFlushNotice('turnEnd', {
+    queued: queued.length,
+    deferred: deferred.length,
+    summary: formatQueueSummary(queued),
+  });
   if (session.sendHtml) {
-    session.sendHtml(plainMsg, htmlMsg);
+    session.sendHtml(notice.plain, notice.html);
   } else if (session.sendCallback) {
-    session.sendCallback(plainMsg);
+    session.sendCallback(notice.plain);
   }
   const sent = flushQueue(session, queued, releaseSnapshot);
   // Only the flushed batch's notifications retire; the deferred entries keep
@@ -2422,6 +2489,10 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     // A real structured prompt supersedes any best-effort unclassified-prompt
     // notice we may have surfaced for an earlier render of this screen.
     session.pendingUnclassifiedPrompt = false;
+    // Arm a pending /effort write against its "Change effort level?"
+    // confirmation BEFORE the idle activity below: that idle transition would
+    // otherwise settle the very write this menu is asking about.
+    noteEffortConfirmationPrompt(session, prompt);
     // A TUI prompt means claude has stopped processing and is awaiting
     // user input. The Stop hook is unreliable for these states (e.g.
     // first-run modals, /login, unauthenticated "please run /login"
@@ -2492,6 +2563,10 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
           agent: session.agent,
           model: session.currentModel || undefined,
           mcpExtras: session.mcpExtras,
+          // Carry the live --bypass/--auto choice for the same reason as
+          // mcpExtras: a session that dies before its first persist would
+          // otherwise silently flip back to the default permission mode.
+          ...(typeof session.bypassMode === 'boolean' ? { bypass: session.bypassMode } : {}),
           journalConvoId: session.journalConvoId,
           // Carry the prior title so the re-seed adopts the good Gemini title
           // instead of publishing the repo basename over it (title-revert bug).
@@ -2892,6 +2967,7 @@ function maybeResolveInteractivePrompt(session, userText, { mirrorToJournal = tr
         : { kind: p.kind, key: opt.key };
       console.log(`[IV-DEBUG] Resolving prompt reply="${userText}" → option ${optIdx + 1} (remark dropped: no free-text slot)`);
       if (session.iv.respondToPrompt(response) !== true) return false;
+      noteEffortConfirmationAnswer(session, p, opt.label);
       session.pendingInteractivePrompt = null;
       mirrorAnswer(`${numberPrefix}${opt.label}`);
       ack(opt.label, { numberPrefix, note: "— couldn't attach your note to this menu; send it as a separate message" });
@@ -2903,6 +2979,9 @@ function maybeResolveInteractivePrompt(session, userText, { mirrorToJournal = tr
       : { kind: p.kind, key: opt.key };
     console.log(`[IV-DEBUG] Resolving prompt reply="${userText}" → kind=${response.kind} key=${response.key} label="${opt.label}"`);
     if (session.iv.respondToPrompt(response) !== true) return false;
+    // An answered "Change effort level?" menu is the only confirmation the
+    // effort tracker gets — accept commits the pending write, decline drops it.
+    noteEffortConfirmationAnswer(session, p, opt.label);
     session.pendingInteractivePrompt = null;
     mirrorAnswer(`${numberPrefix}${opt.label}`);
     ack(opt.label, { numberPrefix });
@@ -5856,7 +5935,10 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const initialPrompt = promptFlag.prompt;
       const afterPromptTokens = promptFlag.rest.split(/\s+/).filter(Boolean);
 
-      const { extras: mcpExtras, rest: afterMcp } = extractMcpExtraFlags(afterPromptTokens);
+      // Opt-in permission mode (#211): --bypass / --auto ride before the mcp
+      // extras, parsed off the post-prompt tokens.
+      const { bypass: startBypass, rest: afterBypass } = extractBypassFlag(afterPromptTokens);
+      const { extras: mcpExtras, rest: afterMcp } = extractMcpExtraFlags(afterBypass);
       const agentFlags = extractAgentFlag(afterMcp);
       if (agentFlags.error) {
         await sendReply(agentFlags.error);
@@ -5894,7 +5976,10 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const sessionSendButtons = (prompt, buttons, mode, plainText, html, payload) =>
         sendButtonMessage(sessionRoomId, prompt, buttons, mode, plainText, html, payload);
 
-      const session = createSession(sessionRoomId, workdir, undefined, { agent: selectedAgent, mcpExtras });
+      const session = createSession(sessionRoomId, workdir, undefined, {
+        agent: selectedAgent, mcpExtras,
+        ...(startBypass != null ? { bypass: startBypass } : {}),
+      });
       session.originRoomId = roomId;
       session.sendCallback = sessionSendReply;
       session.sendHtml = sessionSendHtml;
@@ -5911,7 +5996,8 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       // a Matrix room URL is just a dead link there.
       const extrasNote = mcpExtras.length > 0 ? ` (extras: ${mcpExtras.join(', ')})` : '';
       const promptNote = initialPrompt ? ' with your prompt' : '';
-      await sendReply(`${agentLabel(selectedAgent)} session started in a new conversation${promptNote}${extrasNote}.`);
+      const permNote = permissionNote(session);
+      await sendReply(`${agentLabel(selectedAgent)} session started in a new conversation${promptNote}${extrasNote}${permNote}.`);
 
       // Deliver the initial prompt (from --prompt) as the session's first user
       // message. For iv sessions the TUI isn't input-ready at spawn, so arm the
@@ -5961,7 +6047,8 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       // already has — set in-memory and falling back to the persisted
       // value if the bridge was restarted in between.
       const { force: restartForced, rest: restartArgs } = extractForceFlag(parts.slice(1));
-      const { extras: restartFlagExtras, rest: restartAfterMcp } = extractMcpExtraFlags(restartArgs);
+      const { bypass: restartBypass, rest: restartAfterBypass } = extractBypassFlag(restartArgs);
+      const { extras: restartFlagExtras, rest: restartAfterMcp } = extractMcpExtraFlags(restartAfterBypass);
       const restartAgentFlags = extractAgentFlag(restartAfterMcp);
       if (restartAgentFlags.error) {
         await sendReply(restartAgentFlags.error);
@@ -6019,7 +6106,14 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         return;
       }
       await sendReply(`🔄 Restarting ${agentLabel(existing.agent)} session...`);
-      const restarted = recreateSession(roomId, { mcpExtras: effectiveRestartExtras }, { sendReply, sendHtml });
+      const restarted = recreateSession(roomId, {
+        mcpExtras: effectiveRestartExtras,
+        // Pass undefined (not a coerced false) when nothing was persisted, so
+        // a pre-feature session falls through to the box default instead of
+        // being forced into auto mode by the coercion.
+        bypass: restartBypass != null ? restartBypass
+          : (typeof existing.bypassMode === 'boolean' ? existing.bypassMode : undefined),
+      }, { sendReply, sendHtml });
       if (!restarted) {
         // recreateSession backstopped the teardown (media raced in during the
         // ack await, or the session vanished) and already notified — don't
@@ -6029,8 +6123,9 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const extrasLine = effectiveRestartExtras.length > 0
         ? `\nExtras: ${effectiveRestartExtras.join(', ')}`
         : '';
+      const restartPermNote = permissionNote(restarted);
       await sendReply(
-        `${agentLabel(existing.agent)} session restarted.\nSession: ${restartSessionId ? restartSessionId.slice(0, 8) + '...' : '(new)'}\nWorkdir: ${restartWorkdir}${extrasLine}`
+        `${agentLabel(existing.agent)} session restarted.\nSession: ${restartSessionId ? restartSessionId.slice(0, 8) + '...' : '(new)'}\nWorkdir: ${restartWorkdir}${extrasLine}${restartPermNote}`
       );
       break;
     }
@@ -6041,7 +6136,8 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         return;
       }
 
-      const { extras: resumeExtras, rest: resumeAfterMcp } = extractMcpExtraFlags(parts.slice(1));
+      const { bypass: resumeBypass, rest: resumeAfterBypass } = extractBypassFlag(parts.slice(1));
+      const { extras: resumeExtras, rest: resumeAfterMcp } = extractMcpExtraFlags(resumeAfterBypass);
       const resumeAgentFlags = extractAgentFlag(resumeAfterMcp);
       if (resumeAgentFlags.error) {
         await sendReply(resumeAgentFlags.error);
@@ -6244,6 +6340,9 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         ...(selectedAgent === AGENT_CLAUDE
           ? { interactive: resumeState.interactiveMode }
           : {}),
+        // Same undefined-not-false rule as the /restart site above.
+        bypass: resumeBypass != null ? resumeBypass
+          : (typeof resumePersisted?.bypassMode === 'boolean' ? resumePersisted.bypassMode : undefined),
       });
       // Restore + normalize the activity-inferred repo signal BEFORE titling so
       // a rehydrated session names its journal from prior activity, not a bare
@@ -6304,11 +6403,12 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         turnCount: session.turnCount,
       });
 
-      await sendReply(`Resuming ${agentLabel(selectedAgent)} session ${shortId}… in a new conversation.`);
-      const resumePlain = `Resuming ${agentLabel(selectedAgent)} session ${shortId}…\nWorkdir: ${session.workdir}\n\nSend any message to continue.`;
+      const resumePermNote = permissionNote(session);
+      await sendReply(`Resuming ${agentLabel(selectedAgent)} session ${shortId}… in a new conversation${resumePermNote}.`);
+      const resumePlain = `Resuming ${agentLabel(selectedAgent)} session ${shortId}…\nWorkdir: ${session.workdir}${resumePermNote}\n\nSend any message to continue.`;
       const resumeHtml =
         `<b>Resuming ${escapeHtml(agentLabel(selectedAgent))} session <code>${shortId}</code>…</b><br/>` +
-        `Workdir: <code>${escapeHtml(session.workdir)}</code><br/><br/>` +
+        `Workdir: <code>${escapeHtml(session.workdir)}</code>${escapeHtml(resumePermNote)}<br/><br/>` +
         `<i>Send any message to continue.</i>`;
       await sessionSendHtml(resumePlain, resumeHtml);
       break;
@@ -6320,7 +6420,8 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         return;
       }
 
-      const { extras: workdirExtras, rest: workdirAfterMcp } = extractMcpExtraFlags(parts.slice(1));
+      const { bypass: workdirBypass, rest: workdirAfterBypass } = extractBypassFlag(parts.slice(1));
+      const { extras: workdirExtras, rest: workdirAfterMcp } = extractMcpExtraFlags(workdirAfterBypass);
       const workdirAgentFlags = extractAgentFlag(workdirAfterMcp);
       if (workdirAgentFlags.error) {
         await sendReply(workdirAgentFlags.error);
@@ -6360,7 +6461,10 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const sessionSendButtons = (prompt, buttons, mode, plainText, html, payload) =>
         sendButtonMessage(sessionRoomId, prompt, buttons, mode, plainText, html, payload);
 
-      const session = createSession(sessionRoomId, resolved, undefined, { agent: selectedAgent, mcpExtras: workdirExtras });
+      const session = createSession(sessionRoomId, resolved, undefined, {
+        agent: selectedAgent, mcpExtras: workdirExtras,
+        ...(workdirBypass != null ? { bypass: workdirBypass } : {}),
+      });
       session.originRoomId = roomId;
       session.sendCallback = sessionSendReply;
       session.sendHtml = sessionSendHtml;
@@ -6369,11 +6473,12 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         persistSession(sessionRoomId, session.claudeSessionId, session.workdir, roomId);
       }
 
-      await sendReply(`${agentLabel(selectedAgent)} session started in a new conversation.\nWorkdir: ${resolved}`);
-      const wdPlain = `${agentLabel(selectedAgent)} session started.\nWorkdir: ${resolved}\n\nSend any message to interact with ${agentLabel(selectedAgent)}.`;
+      const workdirPermNote = permissionNote(session);
+      await sendReply(`${agentLabel(selectedAgent)} session started in a new conversation${workdirPermNote}.\nWorkdir: ${resolved}`);
+      const wdPlain = `${agentLabel(selectedAgent)} session started.\nWorkdir: ${resolved}${workdirPermNote}\n\nSend any message to interact with ${agentLabel(selectedAgent)}.`;
       const wdHtml =
         `<b>${escapeHtml(agentLabel(selectedAgent))} session started</b><br/>` +
-        `Workdir: <code>${escapeHtml(resolved)}</code><br/><br/>` +
+        `Workdir: <code>${escapeHtml(resolved)}</code>${escapeHtml(workdirPermNote)}<br/><br/>` +
         `<i>Send any message to interact with ${escapeHtml(agentLabel(selectedAgent))}.</i>`;
       await sessionSendHtml(wdPlain, wdHtml);
       break;
@@ -6522,8 +6627,9 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         `/start [--claude|--codex] — Start a new session (creates a new room)\n` +
         `/start [--claude|--codex] <workdir> — Start in a specific directory\n` +
         `/start --browser [workdir] — Add the chrome-devtools MCP (browser tools); off by default to save ~400M\n` +
+        `/start --auto [workdir] — Run with auto permission mode + Matron permission cards instead of the default --dangerously-skip-permissions (--bypass switches back); also accepted by /restart, /resume, /workdir\n` +
         `/stop — Stop the current session\n` +
-        `/restart — Restart the session once the current turn finishes; --force restarts immediately (--browser also accepted)\n` +
+        `/restart — Restart the session once the current turn finishes; --force restarts immediately (--browser/--bypass/--auto also accepted)\n` +
         `/resume [--claude|--codex] <n|id> — Resume a session from that agent\n` +
         `/sessions [--claude|--codex] — List past sessions for an agent\n` +
         `/workdir [--claude|--codex] <path> — Start a session in a different directory\n` +
@@ -6540,7 +6646,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         `/cost — Show session cost\n` +
         `/usage — Show token usage\n` +
         `/limits — Show subscription usage limits (session & weekly)\n` +
-        `/timer <duration> <message> — Send a message to this chat later (e.g. /timer 2h hey, /timer 30m /compact); /timer lists, /timer cancel <id|all> cancels\n` +
+        `/timer <duration|time> <message> — Send a message to this chat later (e.g. /timer 2h hey, /timer 30m /compact, /timer 09:00 standup, /timer 12:10am ping); /timer lists, /timer cancel <id|all> cancels\n` +
         `/tools — List available tools\n` +
         `/help — Show this help message\n\n` +
         `Each /start, /resume, and /workdir creates a new session.\n` +
@@ -6562,8 +6668,9 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
           ['/start [--claude|--codex]', 'Start a new session (creates a new room)'],
           ['/start [--claude|--codex] &lt;workdir&gt;', 'Start in a specific directory'],
           ['/start --browser [workdir]', 'Also enable chrome-devtools MCP (off by default to save ~400M)'],
+          ['/start --auto [workdir]', 'Run with auto permission mode + Matron permission cards instead of the default --dangerously-skip-permissions (--bypass switches back); also accepted by /restart, /resume, /workdir'],
           ['/stop', 'Stop the current session'],
-          ['/restart', 'Restart the session once the current turn finishes; --force restarts immediately (--browser also accepted)'],
+          ['/restart', 'Restart the session once the current turn finishes; --force restarts immediately (--browser/--bypass/--auto also accepted)'],
           ['/resume [--claude|--codex] &lt;n|id&gt;', 'Resume a session from that agent'],
           ['/sessions [--claude|--codex]', 'List past sessions for an agent'],
           ['/workdir [--claude|--codex] &lt;path&gt;', 'Start a session in a different directory'],
@@ -6582,7 +6689,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
           ['/cost', 'Show session cost'],
           ['/usage', 'Show token usage'],
           ['/limits', 'Show subscription usage limits (session &amp; weekly)'],
-          ['/timer &lt;duration&gt; &lt;message&gt;', 'Send a message to this chat later (e.g. /timer 2h hey, /timer 30m /compact); /timer lists, /timer cancel &lt;id|all&gt; cancels'],
+          ['/timer &lt;duration|time&gt; &lt;message&gt;', 'Send a message to this chat later (e.g. /timer 2h hey, /timer 30m /compact, /timer 09:00 standup, /timer 12:10am ping); /timer lists, /timer cancel &lt;id|all&gt; cancels'],
           ['/tools', 'List available tools'],
           ['/help', 'Show this help message'],
         ]) +
@@ -6896,7 +7003,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       }
       const arg = parts[1];
       if (arg) {
-        switchEffortInSession(session, arg, sendReply);
+        switchEffortAndTrack(session, arg, sendReply);
         break;
       }
       // No-arg: offer buttons. Bare /effort in the TUI opens a "Change effort
@@ -7025,10 +7132,16 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         const record = timerStore.add({ convoId, roomId, text: parsed.message, delayMs: parsed.delayMs });
         // Wall-clock rendering includes the timezone name ("12:26 AM UTC") —
         // the server's clock is rarely the user's, so a bare time is
-        // ambiguous. Same-day timers show just the time; >=24h adds the date.
-        const at = parsed.delayMs >= 24 * 3600 * 1000
-          ? new Date(record.fireAt).toLocaleString([], { year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZoneName: 'short' })
-          : new Date(record.fireAt).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', timeZoneName: 'short' });
+        // ambiguous, and echoing the resolved moment is the only thing that
+        // catches a host/phone timezone mismatch on `/timer 00:10 <message>`.
+        // Same-day timers show just the time; anything landing on another
+        // local day adds the date. Keyed on the calendar day rather than
+        // ">=24h" because a clock time that rolled to tomorrow is under 24h
+        // away yet still not today — "at 12:10 AM" alone would read as tonight.
+        const fireAt = new Date(record.fireAt);
+        const at = fireAt.toDateString() === new Date(record.createdAt).toDateString()
+          ? fireAt.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', timeZoneName: 'short' })
+          : fireAt.toLocaleString([], { year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZoneName: 'short' });
         const summary =
           `⏰ Timer #${record.id} set — will send "${parsed.message}" in ${formatTimerDuration(parsed.delayMs)} (at ${at}). ` +
           `It survives session restarts and idle reaping.`;
@@ -7062,7 +7175,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       // 'list'
       const active = timerStore.listForConvo(convoId);
       if (!active.length) {
-        await sendReply('No timers set. Usage: /timer <duration> <message> — e.g. /timer 2h hey, or /timer 30m /compact.');
+        await sendReply('No timers set. Usage: /timer <duration|time> <message> — e.g. /timer 2h hey, /timer 30m /compact, or /timer 09:00 standup.');
         break;
       }
       const lines = active.map(t => `#${t.id} — in ${formatTimerDuration(t.fireAt - Date.now())}: "${t.text}"`);
@@ -7471,6 +7584,11 @@ async function journalRouteTextToSession(session, body) {
       convoId: journalConvoIdFor(session),
       fullText: trimmed,
       compactJump,
+      // Codex can't be handed a single queued message while a turn is live:
+      // flushQueue interrupts and returns 'deferred', then the turn-end flush
+      // sends the whole queue — so "send just this one" would silently mean
+      // "send all". Withhold the action rather than offer one that lies.
+      allowSendOne: session.agent !== AGENT_CODEX,
     });
     return;
   }
@@ -7501,6 +7619,8 @@ function journalRoutePromptReply(session, { choice, text }) {
         const resp = promptResponseForButton(p, resolved.index);
         if (resp) {
           if (session.iv.respondToPrompt(resp) !== true) return null;
+          // Same effort-confirmation settle as the typed-reply path.
+          noteEffortConfirmationAnswer(session, p, resolved.option.label);
           session.pendingInteractivePrompt = null;
           session.pendingUnclassifiedPrompt = false;
           recordUserAnswer(session, resolved.option.label, { mirrorToJournal: false });
@@ -7684,6 +7804,8 @@ async function journalQueueMedia(session, { blocks, mirrorToJournal, preview, fu
       queueRelease: journalInputConsumer.queueRelease,
       convoId: journalConvoIdFor(session),
       fullText,
+      // Same capability gate as the text path above.
+      allowSendOne: session.agent !== AGENT_CODEX,
     });
   } catch (e) {
     console.warn(`[journal-media] queued-tile notify failed (media is queued): ${e.message}`);
@@ -7743,10 +7865,11 @@ function journalOnPromptReply(session, answer, { username }) {
   // A picker answers no pending prompt, so (like the queue-action block above)
   // it emits no "answered:" echo.
   if (answer?.picker) {
-    // Timer-cancel taps skip the alive gate: like the !timer command itself
-    // (PR #171), cancelling only needs the convo-scoped store, and the timer
-    // may well outlive the session process it was set from.
-    const isTimerTap = typeof answer.choice === 'string' && answer.choice.startsWith('timer:');
+    // Timer-cancel and permission taps skip the alive gate: like the !timer
+    // command itself (PR #171), cancelling only needs the convo-scoped
+    // store, and the timer may well outlive the session process it was set
+    // from; a permission tap needs only the registry, and an expired-card
+    // tap may outlive the session too.
     // Restart carry-on taps skip the alive gate for the same reason timer taps
     // do, only more so: the card is published at boot into a convo whose
     // session is dead BY CONSTRUCTION, and reviving it is the entire point of
@@ -7759,18 +7882,20 @@ function journalOnPromptReply(session, answer, { username }) {
     // on value shape is safe inside this branch: `answer.picker` already proves
     // the router verified the choice against the offered values of a picker
     // frame this bridge published.
-    const isCarryOnTap = typeof answer.choice === 'string' && answer.choice.startsWith('resume:');
-    if (!session.alive && !isTimerTap && !isCarryOnTap) {
+    const skipsAliveGate = typeof answer.choice === 'string'
+      && (answer.choice.startsWith('timer:') || answer.choice.startsWith('perm:') || answer.choice.startsWith('resume:'));
+    if (!session.alive && !skipsAliveGate) {
       journalPublishNotice(journalConvoIdFor(session), 'No active session — start one before switching model, effort, or mode.');
       return;
     }
     const ctx = journalSessionCommandCtx(session);
     handlePickerValue(answer.choice, session.roomId, session, {
       applyModelSwitch,
-      switchEffortInSession,
+      switchEffortInSession: switchEffortAndTrack,
       applyModeSwitch,
       cancelTimer: cancelTimerFromButton,
       sendTimerNow: sendTimerNowFromButton,
+      answerPermission: answerPermissionFromButton,
       carryOnConvo,
       sendReply: ctx.sendReply,
       sendHtml: ctx.sendHtml,
@@ -7849,6 +7974,31 @@ async function journalHandleControlCommand(body) {
     (plainText) => reply(plainText), sender);
 }
 
+// The default resume announcement, in the voice of the path that produced
+// every resume until agent chat: the user just sent something into a sleeping
+// convo, so "your message" is exactly what is being waited on. The inbound
+// agent-chat wake overrides it — nobody sent that one a message.
+const JOURNAL_RESUME_NOTICE = '⏳ Session was idle — auto-resuming it now. Your message will be delivered as soon as it\'s ready.';
+
+// Shared body of the two resume-by-address helpers below: they differ only in
+// how they find the persisted record (by convo id, by room id), and must not
+// drift on what they then DO with it.
+//
+// noticeConvoId/noticeText are the journal's own resume announcement. When one
+// is published, resumePersistedSession is told to skip its room-facing
+// "Auto-resuming session…" mirror, or Matron users see both; with no convo to
+// announce into, that mirror is the only announcement and stays on.
+function resumeSleepingSession(roomId, prev, noticeConvoId, noticeText) {
+  const existing = sessions.get(roomId);
+  // A live session in this room under a DIFFERENT claude session id means
+  // this convo is stale history (the room has moved on) — don't hijack it.
+  if (existing && existing.alive) return null;
+  if (existing) sessions.delete(roomId);
+  console.log(`[journal-input] auto-resuming reaped session in ${roomId}`);
+  if (noticeConvoId) journalPublishNotice(noticeConvoId, noticeText);
+  return resumePersistedSession(roomId, prev, { skipJournalMirror: !!noticeConvoId });
+}
+
 // Journal-side auto-resume (the router's resumeSessionForConvo seam): the
 // idle reaper kills sessions on the assumption that "the next user message
 // auto-resumes" them — which the Matrix room path does, but the journal path
@@ -7860,21 +8010,11 @@ async function journalHandleControlCommand(body) {
 // sendToSession holds input in _resumeOutbox until the resumed TUI is ready,
 // and print mode's stdin buffers), or null to fall back to the unknown-convo
 // notice.
-function journalResumeConvo(convoId) {
+function journalResumeConvo(convoId, noticeText = JOURNAL_RESUME_NOTICE) {
   const data = loadPersistedSessions();
   for (const [roomId, prev] of Object.entries(data)) {
     if (!prev || (prev.journalConvoId !== convoId && prev.sessionId !== convoId)) continue;
-    const existing = sessions.get(roomId);
-    // A live session in this room under a DIFFERENT claude session id means
-    // this convo is stale history (the room has moved on) — don't hijack it.
-    if (existing && existing.alive) return null;
-    if (existing) sessions.delete(roomId);
-    console.log(`[journal-input] auto-resuming reaped session ${convoId} in ${roomId}`);
-    journalPublishNotice(convoId, '⏳ Session was idle — auto-resuming it now. Your message will be delivered as soon as it\'s ready.');
-    // This notice IS the journal's resume announcement — tell the shared
-    // helper not to also mirror its room-facing "Auto-resuming session…"
-    // notice into the journal, or Matron users see both.
-    return resumePersistedSession(roomId, prev, { skipJournalMirror: true });
+    return resumeSleepingSession(roomId, prev, convoId, noticeText);
   }
   return null;
 }
@@ -7900,6 +8040,17 @@ function resolveJournalPermissionReply(key, decision, { username } = {}) {
 // declaration wired into createJournalPublisher near the top of this file —
 // hoisted, so that forward reference is safe). Permission registry operations
 // come from the same factory exercised by the router contract tests.
+
+// The same wake, addressed by ROOM rather than by convo — what an inbound
+// join_request has to work with, since a room record names its owning session
+// by sessionRoomId and carries no convo id of its own. The announcement goes
+// to whichever convo the persisted record remembers, or falls back to
+// resumePersistedSession's own room notice when it remembers none.
+function journalResumeRoom(roomId, noticeText = JOURNAL_RESUME_NOTICE) {
+  const prev = loadPersistedSessions()[roomId];
+  if (!prev) return null;
+  return resumeSleepingSession(roomId, prev, prev.journalConvoId || prev.sessionId || null, noticeText);
+}
 
 // A "Carry on" tap. The router has already auto-resumed the session for a
 // verified resume tap (lib/journal-input-router.js), so `session` is live by
@@ -8022,6 +8173,48 @@ function sendTimerNowFromButton(session, timerId, sendReply) {
   const fired = convoId ? timerStore.fireNow(convoId, timerId) : null;
   if (!fired) {
     sendReply(`No timer #${timerId} in this conversation — it may have already fired or been cancelled. /timer lists the active ones.`);
+  }
+}
+
+// The " · ⚠️ permissions bypassed" / " · 🛡 auto permissions" suffix used by
+// every session-confirmation reply (/start, /restart, /resume, /workdir).
+// Shown only when the session deviates from the box default
+// (MATRON_PERMISSION_MODE): the norm needs no badge — on a default-bypass
+// box, stamping every session "permissions bypassed" is noise, and on an
+// opted-in auto box the same goes for the auto badge — but running counter
+// to the box's posture is worth a line. bypassMode is undefined for
+// provider sessions (codex, interactive) that don't route through the
+// print-mode permission flow, which is the '' case. Optional chaining lets
+// a possibly-null/undefined session (e.g. a failed /restart) fall through
+// to the same '' result as the old inline ternaries.
+function permissionNote(session) {
+  if (typeof session?.bypassMode !== 'boolean' || session.bypassMode === DEFAULT_BYPASS_MODE) return '';
+  return session.bypassMode ? ' · ⚠️ permissions bypassed' : ' · 🛡 auto permissions';
+}
+
+// A perm:<id>:<verdict> tap (permission card). The registry is the source of
+// truth — a tap on an expired or already-answered card is an informative
+// no-op, never a crash. "Always" allowlists the tool for the SESSION (in
+// memory only; not persisted — a restart re-prompts, by design).
+function answerPermissionFromButton(session, requestId, verdict, sendReply) {
+  // Room affinity is enforced INSIDE answer(), before any state changes: a
+  // permission card is only ever rendered into the room that raised the
+  // request, so a tap arriving via another room's session (e.g. a copied
+  // button value) is refused outright — the entry stays pending and only the
+  // originating room can still answer it.
+  const result = permissionRegistry.answer(requestId, verdict, session.roomId);
+  if (!result) {
+    sendReply('That permission request has expired or was already answered.');
+    return;
+  }
+  if (verdict === 'always') {
+    if (!session.permAllowedTools) session.permAllowedTools = new Set();
+    session.permAllowedTools.add(result.toolName);
+    sendReply(`✅ Always allowing ${result.toolName} for this session.`);
+  } else if (verdict === 'deny') {
+    sendReply(`⛔ Denied: ${result.toolName}`);
+  } else {
+    sendReply(`✅ Allowed once: ${result.toolName}`);
   }
 }
 
@@ -8302,7 +8495,31 @@ function resolveInviteTargetSession(frame, room) {
   return resolveInviteTarget(frame, room, {
     sessions,
     findSessionByConvoId: findSessionByClaudeSessionId,
+    // The same predicate answerInvite gates an owner's accept on, so a room
+    // wake is never offered for a room the woken agent would then be refused
+    // permission to admit anyone into (Bugbot, #220).
+    roomIsActive: (roomId) => agentRooms.isActive(roomId),
   });
+}
+
+// Respawn the sleeping session an inbound invite/join request is addressed to,
+// from the wake candidate resolveInviteTarget named. Returns the live session,
+// or null when the id has no persisted record to resume (never spawned here,
+// or its record has since been dropped) — the caller refuses the peer then.
+//
+// Never throws: this runs inside journalInjectInviteRequest, itself called
+// fire-and-forget from the invites manager's frame handler, so an escaping
+// error would lose the refusal too and leave the peer waiting out its full
+// window for an answer that is never coming.
+function wakeSessionForInvite(wake) {
+  try {
+    return (wake.kind === 'room'
+      ? journalResumeRoom(wake.id, INVITE_WAKE_NOTICE)
+      : journalResumeConvo(wake.id, INVITE_WAKE_NOTICE)) || null;
+  } catch (e) {
+    console.warn(`[agent-invites] could not wake ${wake.kind} ${wake.id} for an inbound request: ${e.message}`);
+    return null;
+  }
 }
 
 // Inbound invite/join request -> record the room as pending, ack with the
@@ -8313,9 +8530,30 @@ function journalInjectInviteRequest(frame) {
   // join_request -> a peer asks to join a room THIS bridge owns
   const isJoin = frame.event === 'join_request';
   const room = agentRooms.get(frame.room_id);
-  const { session, addressed } = resolveInviteTargetSession(frame, room);
+  const { session: liveSession, addressed, wake } = resolveInviteTargetSession(frame, room);
+  // Asleep is not gone. The idle reaper kills sessions precisely BECAUSE they
+  // are resumable, so an exactly-addressed request whose target was reaped is
+  // woken through the same helper an inbound Matron message or a fired /timer
+  // uses, and then proceeds as if the session had been live all along. Only
+  // when there is nothing on disk to resume — the genuinely-gone case — does
+  // the refusal below still fire.
+  //
+  // Doing this unprompted is safe: an inbound request has already cleared the
+  // user's consent card on the asking side, so it is not an arbitrary stranger
+  // spawning processes here. resolveInviteTarget withholds a wake candidate on
+  // the unaddressed (guessed) path for the same reason it withholds the user's
+  // copy of the request further down.
+  //
+  // The peer does not wait on the wake: resumePersistedSession is synchronous,
+  // so the ack below still lands well inside the peer's window. It reports
+  // 'busy' (a resuming session sets _awaitingInputReady), the peer gets
+  // pending_busy and stops waiting, and the request itself coalesces into the
+  // room-delivery inbox until the resume hold's own flush seam (the
+  // maybeFlushRoomDelivery call in startResumeReadyWatcher's nothing-sent
+  // branch) drains it into the ready TUI.
+  const session = liveSession || (wake && wakeSessionForInvite(wake));
   if (!session) {
-    debug(`invite ${frame.event} for ${frame.room_id} — no live session to ask`);
+    debug(`invite ${frame.event} for ${frame.room_id} — no live session to ask${wake ? ' and nothing resumable to wake' : ''}`);
     // No session ⇒ nobody will ever answer. Refuse immediately instead of
     // letting the peer burn its full wait down to pending_quiet. An
     // ADDRESSED request that finds nothing says so specifically: the target
@@ -8784,6 +9022,15 @@ function resumePersistedSession(roomId, prev, { skipJournalMirror = false } = {}
 const pendingSecrets = new Map();
 const pendingSensitiveData = new Map(); // Map<sensitiveId, { label, content, viewed, expiresAt }>
 
+// Pending print-mode permission prompts (spec 2026-08-10-auto-permission-mode).
+// The ask-user permission_request tool POSTs + polls; taps answer via the
+// journal prompt_reply perm: path. The TTL resolves from the same env var the
+// tool's poll deadline uses, so an unanswered card expires exactly when the
+// tool fail-closes to deny — a stale tap can't record a verdict afterwards.
+const permissionRegistry = createPermissionRegistry({
+  ttlMs: resolvePermissionTimeoutMs(process.env.PERMISSION_PROMPT_TIMEOUT_MS),
+});
+
 // Map<tool_use_id, { resolve(decision), plan }> — open ExitPlanMode hook
 // requests waiting for a user decision in interactive mode. The hook script
 // (hooks/exit-plan-decision.sh) holds an HTTP request open against
@@ -8939,6 +9186,20 @@ const apiServer = createServer(async (req, res) => {
     if (s.answered) {
       pendingSecrets.delete(secretId);
     }
+    return;
+  }
+
+  // GET /permission-request/:id — permission_request MCP tool polls for a tap
+  if (req.method === 'GET' && url.pathname.startsWith('/permission-request/')) {
+    const permId = url.pathname.split('/')[2];
+    const entry = permissionRegistry.read(permId);
+    if (!entry) {
+      res.writeHead(404);
+      res.end(JSON.stringify({ error: 'Permission request not found' }));
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(entry));
     return;
   }
 
@@ -9102,6 +9363,44 @@ const apiServer = createServer(async (req, res) => {
 
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ secretId }));
+        return;
+      } else if (url.pathname === '/permission-request') {
+        const { roomId, toolName, input } = data;
+        if (!roomId || typeof toolName !== 'string' || toolName === '') {
+          res.writeHead(400);
+          res.end(JSON.stringify({ error: 'roomId and toolName are required' }));
+          return;
+        }
+        const permSession = sessions.get(roomId);
+        if (!permSession) {
+          res.writeHead(404);
+          res.end(JSON.stringify({ error: 'No session for roomId' }));
+          return;
+        }
+        // Session-allowlisted (an earlier "Always allow" tap): short-circuit,
+        // no card.
+        if (permSession.permAllowedTools?.has(toolName)) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ behavior: 'allow' }));
+          return;
+        }
+        const { id: permRequestId } = permissionRegistry.create({ roomId, toolName });
+        const card = renderPermissionCard({ toolName, input });
+        const { buttons: permBtns, mode: permMode } = permissionButtons(permRequestId, toolName);
+        try {
+          await sendButtonMessage(roomId, card.plain, permBtns, permMode, card.plain, card.html);
+        } catch (err) {
+          // Card never reached the user — withdraw the request and answer
+          // non-OK so the tool denies immediately instead of polling for five
+          // minutes on a card nobody can see.
+          permissionRegistry.cancel(permRequestId);
+          debug(`permission-request card delivery failed for ${roomId}: ${err.message}`);
+          res.writeHead(502);
+          res.end(JSON.stringify({ error: 'Could not deliver the permission card to the room' }));
+          return;
+        }
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ requestId: permRequestId }));
         return;
       }
 
@@ -9338,6 +9637,112 @@ const apiServer = createServer(async (req, res) => {
         sendTextToSession(session, message);
         res.writeHead(200);
         res.end(JSON.stringify({ ok: true }));
+
+      } else if (url.pathname === '/interrupt') {
+        const { roomId } = data;
+        if (!roomId) {
+          res.writeHead(400);
+          res.end(JSON.stringify({ error: 'roomId required' }));
+          return;
+        }
+        const session = sessions.get(roomId);
+        if (!session || !session.alive) {
+          res.writeHead(404);
+          res.end(JSON.stringify({ error: 'No active session for this room' }));
+          return;
+        }
+        // Same compact-first split as every other flush path (see
+        // flushPendingSessionQueue): a leading /compact goes out alone even
+        // though this endpoint asked for the whole queue.
+        const queue = session.queuedMessages || [];
+        const notifications = session.queueNotifications || [];
+        const batchSize = compactBatchSize(queue);
+        const queued = queue.slice(0, batchSize);
+        const deferred = queue.slice(batchSize);
+        const releaseSnapshot = snapshotQueuedReleaseBatch(session, queued);
+        session.queuedMessages = deferred.length ? deferred : null;
+        let sent = true;
+        if (queued.length > 0) {
+          const notice = queueFlushNotice('sendNow', {
+            queued: queued.length,
+            deferred: deferred.length,
+            summary: formatQueueSummary(queued),
+          });
+          if (session.sendHtml) {
+            session.sendHtml(notice.plain, notice.html);
+          } else if (session.sendCallback) {
+            session.sendCallback(notice.plain);
+          }
+          sent = flushQueue(session, queued, releaseSnapshot);
+          if (sent === true) session.queueNotifications = notifications.slice(batchSize);
+        }
+        if (sent === true) {
+          res.writeHead(200);
+          res.end(JSON.stringify({ ok: true, flushed: queued.length }));
+        } else {
+          const retained = Array.isArray(session.queuedMessages)
+            ? session.queuedMessages.length
+            : queued.length;
+          res.writeHead(409);
+          res.end(JSON.stringify({ ok: false, flushed: 0, retained }));
+        }
+
+
+      } else if (url.pathname === '/cancel-queued') {
+        const { roomId, index } = data;
+        if (!roomId || typeof index !== 'number') {
+          res.writeHead(400);
+          res.end(JSON.stringify({ error: 'roomId and index required' }));
+          return;
+        }
+        const session = sessions.get(roomId);
+        if (!session || !session.alive) {
+          res.writeHead(404);
+          res.end(JSON.stringify({ error: 'No active session for this room' }));
+          return;
+        }
+        const queue = session.queuedMessages;
+        if (!queue || index < 0 || index >= queue.length) {
+          res.writeHead(404);
+          res.end(JSON.stringify({ error: 'No queued message at that index' }));
+          return;
+        }
+        // Preserve Array#splice's historical coercion for numeric indexes
+        // while resolving the exact slot it will remove to a stable id.
+        const queueIndex = Math.trunc(index);
+        const notifs = session.queueNotifications || [];
+        const itemId = notifs[queueIndex]?.id;
+        const convoId = journalConvoIdFor(session);
+        const releaseEntry = itemId
+          ? journalInputConsumer.queueRelease.listLive(convoId)
+            .find(entry => entry.itemId === itemId)
+          : null;
+        const cancelled = releaseEntry
+          ? cancelQueuedItem(session, {
+              itemId,
+              promptId: releaseEntry.promptId,
+              convoId,
+              queueRelease: journalInputConsumer.queueRelease,
+              emitRelease,
+            })
+          : false;
+        if (!cancelled) {
+          // Legacy queue entries have no durable item id. Preserve their
+          // positional cancellation behavior while keeping both arrays in
+          // lockstep.
+          queue.splice(queueIndex, 1);
+          if (queueIndex < notifs.length) notifs.splice(queueIndex, 1);
+        }
+        const remaining = queue.length;
+        if (remaining === 0) session.queuedMessages = null;
+        if (session.sendCallback) {
+          const msg = remaining === 0
+            ? '✕ Cancelled queued message (queue empty)'
+            : `✕ Cancelled queued message (${remaining} remaining)`;
+          session.sendCallback(msg);
+        }
+        res.writeHead(200);
+        res.end(JSON.stringify({ ok: true, remaining }));
 
       } else if (url.pathname === '/message') {
         const { roomId, text } = data;
@@ -9639,6 +10044,18 @@ async function switchAgentSession(roomId, targetAgent, { sendReply }) {
   return next;
 }
 
+// Drive an /effort write and record it as PENDING for the status frame's
+// `effort` field. The record is taken only when switchEffortInSession reports
+// the write actually reached the PTY, so a refused or failed write never
+// shows up as the session's effort. Every path that writes /effort goes
+// through here (the !effort command and the effort: picker button) — see
+// lib/effort-tracker.js for what turns a pending write into a published one.
+function switchEffortAndTrack(session, arg, send) {
+  const written = switchEffortInSession(session, arg, send);
+  if (written) noteEffortWrite(session, arg);
+  return written;
+}
+
 // Apply a /model switch for either mode. Interactive sessions type /model into
 // the live TUI (immediate); print sessions restart the claude -p process with
 // --model <alias> --resume (history preserved). Used by the !model command and
@@ -9722,6 +10139,12 @@ function applyModeSwitch(roomId, session, wantInteractive, { sendReply, sendHtml
     sendReply(refusalAnnouncement || decision.message);
     return null;
   }
+  // iv-mode has no auto-permission support yet (spec 2026-08-10 out-of-scope):
+  // switching an auto session to interactive silently widens permissions, so
+  // say it out loud rather than refusing the switch.
+  if (wantInteractive && session.bypassMode === false) {
+    sendReply('Heads-up: interactive mode currently runs with permissions bypassed (auto permission mode support is coming).');
+  }
   // `announcement` replaces the generic "Switching to … mode" line on SUCCESS
   // only. Used by flows where the switch is an implementation detail the user
   // didn't ask for (/login//logout from print mode) to say what's actually
@@ -9786,6 +10209,10 @@ function recreateSession(roomId, overrides, { sendReply, sendHtml }) {
   const next = createSession(roomId, workdir, preInitPrint ? null : sessionId, {
     agent: existing.agent,
     mcpExtras: existing.mcpExtras,
+    // Carry the live --bypass/--auto choice across the swap (same rationale
+    // as mcpExtras: it may not be persisted yet). An explicit override from
+    // the caller still wins via the ...overrides spread below.
+    ...(typeof existing.bypassMode === 'boolean' ? { bypass: existing.bypassMode } : {}),
     journalConvoId: existing.journalConvoId,
     // Carry the good title across the swap so the re-seed adopts it instead of
     // clobbering it with the repo basename (title-revert bug).
@@ -9837,6 +10264,12 @@ function recreateSession(roomId, overrides, { sendReply, sendHtml }) {
   next._journalState = existing._journalState;
   next._journalActivityState = existing._journalActivityState;
   next._journalConvoEstablished = existing._journalConvoEstablished;
+  // Effort tracking is deliberately NOT carried across the swap: the
+  // replacement session's effort comes from Claude Code's own default, so a
+  // carried value would publish something false. The replacement is a fresh
+  // session object, so this only pins the contract against a future addition
+  // to the carry-forward list above.
+  resetEffortTracking(next);
   if (sessionId) {
     persistSession(roomId, sessionId, workdir, originRoomId, {
       agentSessions: existing._agentSessions,
@@ -10095,7 +10528,7 @@ async function main() {
   // many-per-tick reads never corrupt it; .unref()'d so it doesn't hold the
   // process open. host_cpu appears once the first interval has a valid diff.
   // Sample at the fast vitals cadence so a published CPU value is always fresh.
-  startCpuSampler(HOST_VITALS_SAMPLE_MS);
+  if (JOURNAL_ENABLED) startCpuSampler(HOST_VITALS_SAMPLE_MS);
   // Host-vitals gauge: a single convo-less frame, published ON CHANGE. The timer
   // only EVALUATES every HOST_VITALS_SAMPLE_MS; pushHostVitals emits a frame only
   // on a meaningful CPU/RAM delta or the heartbeat interval, so an idle bridge
@@ -10120,7 +10553,7 @@ async function main() {
 
 // Read cached CPU + instant RAM and emit one host_vitals frame (no convo_id).
 // cpu is omitted until the sampler has a first valid reading (matches the
-// hostVitalLimits shape); ram is always present when the OS reports memory.
+// host-vitals frame shape); ram is always present when the OS reports memory.
 function pushHostVitals() {
   const cpu = cpuPercent();
   const ram = ramPercent();

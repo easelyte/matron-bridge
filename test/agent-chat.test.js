@@ -1184,7 +1184,7 @@ describe('index.js routes + ask-user.js tools (source inspection)', () => {
     // The AGENT's copy is a different text and keeps the tool syntax…
     expect(body).toMatch(/Accept with agent_chat_accept\(/);
     // …which the user's copy must not inherit (it lives in lib, pinned there).
-    expect(indexSrc).toMatch(/import \{ createAgentInvites, formatInviteRequestNotice \} from '\.\/lib\/agent-invites\.js';/);
+    expect(indexSrc).toMatch(/import \{ createAgentInvites, formatInviteRequestNotice[^}]*\} from '\.\/lib\/agent-invites\.js';/);
   });
 
   it('terminal teardown leaves joined rooms before dropping the inbox (I4)', () => {

@@ -222,6 +222,7 @@ Codex can inspect the saved file with its normal local tools when the sandbox pe
 | `/mode` | Can switch print/interactive | Reports programmatic mode; interactive Codex is not implemented |
 | `/effort` | Bridge command where supported | Configure `model_reasoning_effort` in Codex config |
 | `--browser` bridge extra | Supported for Claude sessions | Not supported; configure Codex MCP servers locally |
+| Permission mode | Print-mode sessions default to `auto` (rare prompts arrive as cards in Matron); `--bypass`/`--auto` toggle it | Always runs with the equivalent of `--dangerously-skip-permissions`; no permission-mode flag |
 | `/mcp` | Live/configured status where available | Uses local Codex config; live status is not present in JSONL events |
 | `/tools` | Lists tools when the CLI exposes them | No authoritative inventory in JSONL; tools come from Codex, skills, sandbox, and MCP config |
 | `/usage` | Tokens and bridge-reported cost | Token counts only |

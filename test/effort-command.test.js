@@ -4,6 +4,8 @@ import {
   effortButtons,
   isValidEffortArg,
   effortLabel,
+  effortOptions,
+  EFFORT_LEVELS,
 } from '../lib/effort-command.js';
 
 function fakeSession({ iv = null } = {}) {
@@ -96,6 +98,16 @@ describe('effortButtons', () => {
     expect(buttons.find(b => b.label === 'Ultracode')).toEqual({
       id: 'effort-ultracode', label: 'Ultracode', value: 'effort:ultracode',
     });
+  });
+});
+
+describe('effortOptions', () => {
+  it('offers every effort level as a {value,label} pair for the status frame', () => {
+    const options = effortOptions();
+    expect(options).toHaveLength(EFFORT_LEVELS.length);
+    expect(options[0]).toEqual({ value: 'low', label: 'Low' });
+    expect(options.find(o => o.value === 'ultracode')).toEqual({ value: 'ultracode', label: 'Ultracode' });
+    expect(options.every(o => Object.keys(o).sort().join(',') === 'label,value')).toBe(true);
   });
 });
 

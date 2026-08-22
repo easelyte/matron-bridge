@@ -98,6 +98,46 @@ describe('formatBox', () => {
     expect(text).toBe('bad-box (device 6) — (unavailable)');
   });
 
+  it('renders a disk line with humanised sizes and percent free', () => {
+    const box = {
+      device_id: 7, name: 'box7', online: true, folders: [],
+      disk: { free_bytes: 44_254_953_472, total_bytes: 244_813_135_872 }, // ~41.2G of ~228G
+    };
+    const text = formatBox(box);
+    expect(text).toBe('box7 (device 7) — online\n  disk: 41G free of 228G (18% free)');
+  });
+
+  it('carries into the next unit when rounding would render a bare 1024', () => {
+    const box = {
+      device_id: 7, name: 'box7', online: true, folders: [],
+      // 1 TiB - 1 byte free: picks G, but rounds to 1024 — must read 1.0T.
+      disk: { free_bytes: 1_099_511_627_775, total_bytes: 1_099_511_627_776 },
+    };
+    expect(formatBox(box)).toContain('  disk: 1.0T free of 1T (100% free)');
+  });
+
+  it('renders small free space with one decimal so a nearly-full box reads precisely', () => {
+    const box = {
+      device_id: 7, name: 'box7', online: true, folders: [],
+      disk: { free_bytes: 1_610_612_736, total_bytes: 244_813_135_872 }, // 1.5G of ~228G
+    };
+    expect(formatBox(box)).toContain('  disk: 1.5G free of 228G (1% free)');
+  });
+
+  it('skips the disk line (not the box) for malformed disk figures — an old journal relays them unvalidated', () => {
+    for (const disk of [
+      { free_bytes: -1, total_bytes: 100 },
+      { free_bytes: 200, total_bytes: 100 },
+      { free_bytes: 1, total_bytes: 0 },
+      { free_bytes: NaN, total_bytes: 100 },
+      { free_bytes: '41G', total_bytes: 100 },
+      'full',
+    ]) {
+      const text = formatBox({ device_id: 8, name: 'box8', online: true, folders: [], disk });
+      expect(text).toBe('box8 (device 8) — online');
+    }
+  });
+
   it('a box list with one malformed box renders the other boxes normally plus a degraded line for the bad one', () => {
     const good1 = { device_id: 1, name: 'eric', online: true, folders: [] };
     const bad = { device_id: 6, name: 'bad-box', online: true, folders: [], limits: { as_of: 1e16, lines: [] } };
