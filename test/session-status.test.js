@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
-import { readFileSync } from 'fs';
+import { readFileSync, readdirSync } from 'fs';
+import { join, basename } from 'path';
 import { fileURLToPath } from 'url';
 import {
   contextWindowFor,
@@ -11,7 +12,9 @@ import {
   contextGaugeText,
   buildSessionStatus,
   emailFromClaudeConfig,
-  hostVitalLimits,
+  statusRepaintDue,
+  STATUS_REPAINT_MS,
+  hostVitals,
   sampleCpuOnce,
   cpuPercent,
   cpuSampledAtMs,
@@ -21,22 +24,15 @@ import {
 } from '../lib/session-status.js';
 
 describe('contextWindowFor', () => {
-  it('gives 1m-default session models their full window', () => {
+  it('gives 1m-class models their full window', () => {
     expect(contextWindowFor('claude-fable-5')).toBe(1_000_000);
     expect(contextWindowFor('claude-mythos-5')).toBe(1_000_000);
     expect(contextWindowFor('claude-sonnet-4-5[1m]')).toBe(1_000_000);
-    // Current Opus + Sonnet 5 default their SESSIONS to 1m (measured via
-    // `claude -p /context`), even with no [1m] marker on the bare API id.
-    expect(contextWindowFor('claude-opus-4-8')).toBe(1_000_000);
-    expect(contextWindowFor('claude-opus-4-7')).toBe(1_000_000);
-    expect(contextWindowFor('claude-sonnet-5')).toBe(1_000_000);
   });
 
-  it('defaults older / smaller models to 200k unless [1m] is appended', () => {
-    expect(contextWindowFor('claude-opus-4-6')).toBe(200_000);
-    expect(contextWindowFor('claude-sonnet-4-6')).toBe(200_000);
+  it('defaults everything else to 200k', () => {
+    expect(contextWindowFor('claude-opus-4-8')).toBe(200_000);
     expect(contextWindowFor('claude-haiku-4-5-20251001')).toBe(200_000);
-    expect(contextWindowFor('claude-opus-4-6[1m]')).toBe(1_000_000);
     expect(contextWindowFor('<synthetic>')).toBe(200_000);
   });
 
@@ -54,7 +50,7 @@ describe('reconcileModelForWindow', () => {
     expect(reconcileModelForWindow('claude-sonnet-4-5[1m]', 'claude-sonnet-4-5')).toBe('claude-sonnet-4-5[1m]');
     // Widen-only also refuses a genuine downgrade in the event path (a real
     // /model switch flows through its own path, not this reconcile).
-    expect(reconcileModelForWindow('claude-opus-4-8', 'claude-haiku-4-5')).toBe('claude-opus-4-8');
+    expect(reconcileModelForWindow('claude-opus-4-6[1m]', 'claude-haiku-4-5')).toBe('claude-opus-4-6[1m]');
   });
 
   it('adopts the new model when it widens or matches the window', () => {
@@ -157,8 +153,7 @@ describe('compactTriggerFrom', () => {
 
 describe('contextGaugeText', () => {
   it('formats tokens over the model window ("24k/200k")', () => {
-    expect(contextGaugeText(24_313, 'claude-opus-4-6')).toBe('24k/200k');
-    expect(contextGaugeText(24_313, 'claude-opus-4-8')).toBe('24k/1m');
+    expect(contextGaugeText(24_313, 'claude-opus-4-8')).toBe('24k/200k');
   });
 
   it('keeps one decimal under 10k and formats 1m-class windows', () => {
@@ -166,7 +161,7 @@ describe('contextGaugeText', () => {
   });
 
   it('passes sub-1k counts through raw', () => {
-    expect(contextGaugeText(950, 'claude-opus-4-8')).toBe('950/1m');
+    expect(contextGaugeText(950, 'claude-opus-4-8')).toBe('950/200k');
   });
 
   it('returns null without a usable token count so callers fall back to non-numeric wording', () => {
@@ -201,12 +196,11 @@ describe('buildSessionStatus', () => {
   });
 
   it('rounds pct and clamps it to 100', () => {
-    // 200k-window model so the clamp path is exercised at realistic token counts.
-    expect(buildSessionStatus({ model: 'claude-opus-4-6', contextTokens: 1_000 }).context.pct).toBe(1);
-    expect(buildSessionStatus({ model: 'claude-opus-4-6', contextTokens: 300_000 }).context.pct).toBe(100);
+    expect(buildSessionStatus({ model: 'claude-opus-4-8', contextTokens: 1_000 }).context.pct).toBe(1);
+    expect(buildSessionStatus({ model: 'claude-opus-4-8', contextTokens: 300_000 }).context.pct).toBe(100);
   });
 
-  it('includes the session workdir when known, omits it otherwise (#521)', () => {
+  it('includes the session workdir when known, omits it otherwise', () => {
     expect(buildSessionStatus({ model: 'claude-fable-5', workdir: '/opt/matron/web-journal' })).toEqual({
       model: 'claude-fable-5',
       workdir: '/opt/matron/web-journal',
@@ -223,6 +217,80 @@ describe('buildSessionStatus', () => {
     });
     expect(buildSessionStatus({ model: 'claude-fable-5', email: null })).toEqual({ model: 'claude-fable-5' });
     expect(buildSessionStatus({ model: 'claude-fable-5', email: '' })).toEqual({ model: 'claude-fable-5' });
+  });
+
+  it('carries host vitals at top level (status.vitals), never inside limits', () => {
+    const vitals = { cpu_pct: 12, ram_pct: 47, sampled_at_ms: 1_753_000_000_000 };
+    const status = buildSessionStatus({
+      model: 'claude-fable-5',
+      limits: [{ id: 'session', label: 'Session', percent: 39 }],
+      vitals,
+    });
+    expect(status.vitals).toEqual(vitals);
+    // limits[] stays the account-meter list — vitals must not leak into it.
+    expect(status.limits).toEqual([{ id: 'session', label: 'Session', percent: 39 }]);
+  });
+
+  it('omits status.vitals when vitals is null/absent', () => {
+    expect('vitals' in buildSessionStatus({ model: 'claude-fable-5', vitals: null })).toBe(false);
+    expect('vitals' in buildSessionStatus({ model: 'claude-fable-5' })).toBe(false);
+  });
+
+  it('carries the composer argument lists as model_options / effort_levels', () => {
+    const status = buildSessionStatus({
+      model: 'claude-fable-5',
+      modelOptions: [{ value: 'opus', label: 'Opus' }],
+      effortLevels: [{ value: 'high', label: 'High' }],
+    });
+    expect(status.model_options).toEqual([{ value: 'opus', label: 'Opus' }]);
+    expect(status.effort_levels).toEqual([{ value: 'high', label: 'High' }]);
+  });
+
+  it('publishes EMPTY lists as empties — "this agent offers nothing", not "no opinion"', () => {
+    // Codex says this. Under a sticky merge, omitting the lists after a
+    // mid-session /switch claude→codex would leave Claude's seven effort
+    // levels offered on a session whose /effort refuses them.
+    const status = buildSessionStatus({ model: 'gpt-5.6-codex', modelOptions: [], effortLevels: [] });
+    expect(status.model_options).toEqual([]);
+    expect(status.effort_levels).toEqual([]);
+  });
+
+  it('omits the lists only when the caller has no opinion at all (old bridges, subagent frames)', () => {
+    const status = buildSessionStatus({ model: 'claude-fable-5' });
+    expect('model_options' in status).toBe(false);
+    expect('effort_levels' in status).toBe(false);
+    const explicit = buildSessionStatus({ model: 'claude-fable-5', modelOptions: undefined, effortLevels: undefined });
+    expect('model_options' in explicit).toBe(false);
+    expect('effort_levels' in explicit).toBe(false);
+  });
+
+  it('carries the current effort level as a string when tracked', () => {
+    expect(buildSessionStatus({ model: 'claude-fable-5', effort: 'xhigh' })).toEqual({
+      model: 'claude-fable-5',
+      effort: 'xhigh',
+    });
+  });
+
+  it('publishes an EXPLICIT null while effort is unknown — clients merge stickily, so absent means "unchanged"', () => {
+    const status = buildSessionStatus({ model: 'claude-fable-5', effort: null });
+    expect('effort' in status).toBe(true);
+    expect(status.effort).toBeNull();
+    // An empty string is unknown too, and must not publish as "".
+    expect(buildSessionStatus({ model: 'claude-fable-5', effort: '' }).effort).toBeNull();
+  });
+
+  it('omits effort entirely when the caller passes no opinion (Codex sessions, subagent frames)', () => {
+    expect('effort' in buildSessionStatus({ model: 'gpt-5.6-codex' })).toBe(false);
+    expect('effort' in buildSessionStatus({ model: 'gpt-5.6-codex', effort: undefined })).toBe(false);
+  });
+
+  it('re-publishes null on EVERY frame while unknown, so a client that missed one clear still converges', () => {
+    // Not a one-shot clear: three consecutive frames of an untracked session
+    // all carry the null, so a dropped/throttled frame cannot strand a client
+    // on a stale level.
+    for (let i = 0; i < 3; i++) {
+      expect(buildSessionStatus({ model: 'claude-fable-5', effort: null }).effort).toBeNull();
+    }
   });
 });
 
@@ -241,9 +309,17 @@ describe('emailFromClaudeConfig', () => {
   });
 });
 
-describe('host vitals (#526)', () => {
-  // Burn real CPU so two sampleCpuOnce() calls bracket a non-zero tick window
-  // (jiffy resolution is ~10ms, so ~40ms guarantees accumulated ticks).
+describe('host vitals', () => {
+  // Injected os.cpus()-style tick snapshots so the CPU-diff tests are fully
+  // deterministic instead of racing real jiffy accumulation between two live
+  // os.cpus() reads (the old busyWait approach flaked ~50% on the zero-tick
+  // preservation check — expected 96, got 100). BASE→VALID is a 50%-busy
+  // window: idleDelta 400 / totalDelta 800 → busy 0.5 → 50.
+  const BASE = { idle: 1000, total: 4000 };
+  const VALID = { idle: 1400, total: 4800 };
+
+  // Burn real CPU so two live sampleCpuOnce() calls bracket a non-zero tick
+  // window — used only by the real-path smoke test below.
   const busyWait = (ms) => {
     const end = Date.now() + ms;
     // eslint-disable-next-line no-empty
@@ -258,88 +334,85 @@ describe('host vitals (#526)', () => {
     expect(p).toBeLessThanOrEqual(100);
   });
 
-  it('cpuPercent stays null until a scheduled sample produces a valid diff', () => {
+  it('cpuPercent stays null until a scheduled sample produces a valid diff (deterministic)', () => {
     stopCpuSampler(); // reset module state (clears baseline + cache)
     expect(cpuPercent()).toBeNull();
-    sampleCpuOnce(); // establishes the baseline only — no cached value yet
+    sampleCpuOnce(BASE); // establishes the baseline only — no cached value yet
     expect(cpuPercent()).toBeNull();
+    sampleCpuOnce(VALID); // a real diff populates the cache
+    expect(cpuPercent()).toBe(50);
+  });
+
+  it('cpuPercent populates over a real live sampling window (default snapshot path)', () => {
+    stopCpuSampler();
+    sampleCpuOnce(); // live baseline (default cpuTicks())
     busyWait(40);
-    sampleCpuOnce(); // now a real diff populates the cache
+    sampleCpuOnce(); // live diff
     const v = cpuPercent();
     expect(Number.isInteger(v)).toBe(true);
     expect(v).toBeGreaterThanOrEqual(0);
     expect(v).toBeLessThanOrEqual(100);
   });
 
-  it('hostVitalLimits always includes host_ram with an integer percent', () => {
-    const entries = hostVitalLimits();
-    const ram = entries.find((e) => e.id === 'host_ram');
-    expect(ram).toBeDefined();
-    expect(ram.label).toBe('RAM');
-    expect(Number.isInteger(ram.percent)).toBe(true);
-    // Age metadata: host_ram stamps sampled_at_ms inline at read time.
-    expect(typeof ram.sampled_at_ms).toBe('number');
-    expect(ram.sampled_at_ms).toBeGreaterThan(0);
-    // Host vitals never reset — no resets_at/resets fields.
-    expect('resets_at' in ram).toBe(false);
-    expect('resets' in ram).toBe(false);
+  it('hostVitals is a flat snapshot with an integer ram_pct and no limit/reset fields', () => {
+    const v = hostVitals();
+    expect(v).not.toBeNull();
+    expect(Number.isInteger(v.ram_pct)).toBe(true);
+    expect(v.ram_pct).toBeGreaterThanOrEqual(0);
+    expect(v.ram_pct).toBeLessThanOrEqual(100);
+    // It is a top-level object, NOT a limit entry: no id/label/percent/resets.
+    expect('id' in v).toBe(false);
+    expect('label' in v).toBe(false);
+    expect('resets' in v).toBe(false);
+    expect('resets_at' in v).toBe(false);
   });
 
-  it('host_cpu + host_ram carry a numeric sampled_at_ms age stamp', () => {
+  it('hostVitals carries a numeric sampled_at_ms so clients can expire stale replays', () => {
+    // The publisher replays the last status frame to new viewers, so an idle
+    // convo would show an arbitrarily old reading as current without an age
+    // stamp. sampled_at_ms is the CPU cache-stamp once the sampler has warmed.
     stopCpuSampler();
-    expect(cpuSampledAtMs()).toBeNull(); // reset clears the stamp
-    sampleCpuOnce();        // baseline only — no valid sample, no stamp
-    expect(cpuSampledAtMs()).toBeNull();
-    busyWait(40);
+    sampleCpuOnce(BASE);
+    sampleCpuOnce(VALID); // cache a valid cpu reading + stamp its sample time
+    const v = hostVitals();
+    expect(v.cpu_pct).toBe(50);
+    expect(typeof v.sampled_at_ms).toBe('number');
+    expect(v.sampled_at_ms).toBeGreaterThan(0);
+    expect(v.sampled_at_ms).toBe(cpuSampledAtMs());
+  });
+
+  it('hostVitals falls back to now for sampled_at_ms before the cpu sampler warms', () => {
+    stopCpuSampler(); // cpu_pct + cpuSampledAtMs both null
     const before = Date.now();
-    sampleCpuOnce();        // valid diff → stamps sampled_at_ms
-    const after = Date.now();
-    const stamp = cpuSampledAtMs();
-    expect(typeof stamp).toBe('number');
-    expect(stamp).toBeGreaterThanOrEqual(before);
-    expect(stamp).toBeLessThanOrEqual(after);
-
-    const entries = hostVitalLimits();
-    const cpu = entries.find((e) => e.id === 'host_cpu');
-    const ram = entries.find((e) => e.id === 'host_ram');
-    expect(cpu).toBeDefined();
-    expect(cpu.sampled_at_ms).toBe(stamp); // host_cpu uses the sampler's stamp
-    expect(ram).toBeDefined();
-    expect(typeof ram.sampled_at_ms).toBe('number');
-    expect(ram.sampled_at_ms).toBeGreaterThan(0);
+    const v = hostVitals();
+    expect(v.cpu_pct).toBeNull();
+    expect(typeof v.ram_pct).toBe('number'); // still emits RAM
+    expect(v.sampled_at_ms).toBeGreaterThanOrEqual(before);
   });
 
-  it('host_cpu is STABLE across two reads in the same tick (no 0/100 collapse)', () => {
-    // Reproduces the re-entrancy blocker: journalStatus fires >1x per tick.
-    // The reader must not mutate the baseline, so a 2nd read in the same tick
-    // returns the same cached value rather than collapsing to a 0-interval
-    // reading of 0 or 100.
+  it('cpu_pct is STABLE across two reads in the same tick (no 0/100 collapse)', () => {
+    // journalStatus fires >1x per tick; the reader (hostVitals) must not mutate
+    // the baseline, so back-to-back reads return the same cached value rather
+    // than collapsing to a 0-interval reading of 0 or 100.
     stopCpuSampler();
-    sampleCpuOnce();        // baseline
-    busyWait(40);
-    sampleCpuOnce();        // cache a real value
+    sampleCpuOnce(BASE);
+    sampleCpuOnce(VALID);
     const cached = cpuPercent();
-    expect(Number.isInteger(cached)).toBe(true);
-
+    expect(cached).toBe(50);
     // Two reads with NO intervening scheduled sample — the many-per-tick case.
-    const a = hostVitalLimits().find((e) => e.id === 'host_cpu');
-    const b = hostVitalLimits().find((e) => e.id === 'host_cpu');
-    expect(a).toBeDefined();
-    expect(b).toBeDefined();
-    expect(a.label).toBe('CPU');
-    expect(a.percent).toBe(cached);
-    expect(b.percent).toBe(cached); // stable, not recomputed to 0/100
+    expect(hostVitals().cpu_pct).toBe(cached);
+    expect(hostVitals().cpu_pct).toBe(cached); // stable, not recomputed to 0/100
   });
 
-  it('a degenerate (zero-tick) sample preserves the prior cached value', () => {
+  it('a degenerate (zero-tick) sample preserves the prior cached value (deterministic)', () => {
     stopCpuSampler();
-    sampleCpuOnce();
-    busyWait(40);
-    sampleCpuOnce();
+    sampleCpuOnce(BASE);
+    sampleCpuOnce(VALID);
     const good = cpuPercent();
-    expect(Number.isInteger(good)).toBe(true);
-    // Back-to-back call in the same tick: ~0 elapsed ticks → must NOT overwrite.
-    sampleCpuOnce();
+    expect(good).toBe(50);
+    // Re-feed the SAME ticks as the last sample: idleDelta = totalDelta = 0 →
+    // the sampler must preserve the cached value, not overwrite with 0/100.
+    sampleCpuOnce(VALID);
     expect(cpuPercent()).toBe(good);
   });
 
@@ -366,10 +439,13 @@ describe('index.js wiring', () => {
     expect(src).toMatch(/import \{[^}]*postCompactContextTokens[^}]*\} from '\.\/lib\/session-status\.js'/);
   });
 
-  it('starts the CPU sampler at boot and stops it on shutdown (#526)', () => {
+  it('starts the CPU sampler at boot (gated on journal-enabled) and stops it on shutdown', () => {
     // main() owns the fixed-cadence sampler so journalStatus only ever reads it.
     const main = src.slice(src.indexOf('async function main('));
     expect(main).toContain('startCpuSampler(');
+    // The sampler only feeds journal frames, so it's gated on JOURNAL_ENABLED —
+    // no os.cpus() polling when nothing consumes it.
+    expect(main).toMatch(/if \(JOURNAL_ENABLED\) startCpuSampler\(/);
     // Shutdown now runs through the async gracefulShutdown() settle path (#536);
     // it tears down the sampler so the interval doesn't leak, and both signal
     // handlers delegate to it.
@@ -381,6 +457,48 @@ describe('index.js wiring', () => {
     expect(sigterm).toContain("gracefulShutdown('SIGTERM')");
   });
 
+  it('journalStatus wires host vitals to top-level status.vitals, never into limits[]', () => {
+    const start = src.indexOf('function journalStatus(');
+    const end = src.indexOf('\nfunction ', start + 1);
+    const body = src.slice(start, end);
+    // vitals ride at top level via the buildSessionStatus vitals param.
+    expect(body).toContain('hostVitals()');
+    expect(body).toMatch(/vitals[,\n]/);
+    // The Codex path passes an empty limits array (no account rate limits) and
+    // never spreads vitals into limits.
+    expect(body).not.toContain('hostVitalLimits');
+    expect(body).toMatch(/limits:\s*isCodex\s*\?\s*\[\]/);
+  });
+
+  it('every status publisher in the tree builds its frame with buildSessionStatus', () => {
+    // Replace-not-merge replay means a partial frame is not merely incomplete
+    // — it REPLACES a good one for any client that cold-starts after it. So
+    // the invariant is per-publisher, not per-call-site: every module that
+    // calls publishStatus must build the frame through buildSessionStatus.
+    // If this fails, a new publisher appeared — route it through
+    // buildSessionStatus rather than widening the list.
+    const libDir = fileURLToPath(new URL('../lib', import.meta.url));
+    const roots = [
+      fileURLToPath(new URL('../index.js', import.meta.url)),
+      ...readdirSync(libDir).filter(f => f.endsWith('.js')).map(f => join(libDir, f)),
+    ];
+    const publishers = [];
+    for (const file of roots) {
+      const body = readFileSync(file, 'utf-8');
+      // The publisher module DEFINES publishStatus; it doesn't call one.
+      if (file.endsWith('journal-publisher.js')) continue;
+      if (/publishStatus\??\.?\(/.test(body)) publishers.push([basename(file), body]);
+    }
+    expect(publishers.map(([name]) => name).sort()).toEqual([
+      'codex-event-format.js',
+      'index.js',
+      'subagent-convos.js',
+    ]);
+    for (const [name, body] of publishers) {
+      expect(body, `${name} publishes status frames`).toContain('buildSessionStatus(');
+    }
+  });
+
   it('defines a journalStatus helper that publishes via publishStatus', () => {
     const start = src.indexOf('function journalStatus(');
     expect(start).toBeGreaterThan(-1);
@@ -390,11 +508,37 @@ describe('index.js wiring', () => {
     expect(body).toContain('publishStatus(');
   });
 
-  it('journalStatus threads the session workdir into the frame (#521)', () => {
+  it('journalStatus scopes model_options / effort_levels / effort to Claude sessions', () => {
     const start = src.indexOf('function journalStatus(');
     const end = src.indexOf('\nfunction ', start + 1);
     const body = src.slice(start, end);
-    expect(body).toContain('workdir: session.workdir');
+    // Codex takes a free-text model id (`codex --model <id>`) the bridge never
+    // validates, so it has nothing to offer; /effort isn't exposed for Codex at
+    // all. It says so with EMPTY lists and a null effort rather than by staying
+    // silent — under a sticky merge, silence would leave a Claude session's
+    // offers (and a stale "· xhigh") standing after a mid-session switch.
+    expect(body).toMatch(/modelOptions:\s*isCodex\s*\?\s*\[\]\s*:\s*modelOptions\(\)/);
+    expect(body).toMatch(/effortLevels:\s*isCodex\s*\?\s*\[\]\s*:\s*effortOptions\(\)/);
+    expect(body).toMatch(/effort:\s*isCodex\s*\?\s*null\s*:\s*trackedEffort\(session\)/);
+  });
+
+  it('journalStatus has exactly ONE frame-building path, so no branch can emit a partial repaint', () => {
+    // The journal's replay cache is replace-not-merge (last frame wins
+    // verbatim). A second, leaner buildSessionStatus call for some fast path
+    // would therefore be able to strand a cold-starting client without the
+    // composer's argument lists.
+    const start = src.indexOf('function journalStatus(');
+    const body = src.slice(start, src.indexOf('\nfunction ', start + 1));
+    expect(body.match(/buildSessionStatus\(/g)).toHaveLength(1);
+  });
+
+  it('journalStatus threads the resolved session workdir into the frame', () => {
+    const start = src.indexOf('function journalStatus(');
+    const end = src.indexOf('\nfunction ', start + 1);
+    const body = src.slice(start, end);
+    // Resolved to an absolute path (session.workdir can be relative) before it
+    // ships on the status frame.
+    expect(body).toContain('workdir: session.workdir ? path.resolve(session.workdir) : undefined');
   });
 
   it("the print-mode result handler publishes status WITHOUT deriving context from result usage (it's cumulative across the turn's API calls, not a context footprint)", () => {
@@ -477,5 +621,85 @@ describe('index.js wiring', () => {
     const jEnd = src.indexOf('\nfunction ', jStart + 1);
     const jBody = src.slice(jStart, jEnd);
     expect(jBody).toContain('email: getAccountEmail()');
+  });
+});
+
+// Header liveness (Dan, 2026-08-02): the status frame used to publish at turn
+// end only, so a brand-new chat showed a bare header until its first turn
+// completed — and a long tool-heavy turn left the gauge stale for its whole
+// duration. Now the frame is seeded at spawn (whatever is known pre-turn) and
+// repainted mid-turn from assistant-event usage, throttled by wall clock.
+describe('statusRepaintDue', () => {
+  it('is due when nothing was ever published', () => {
+    expect(statusRepaintDue(undefined, 1000)).toBe(true);
+    expect(statusRepaintDue(null, 1000)).toBe(true);
+  });
+  it('suppresses repaints inside the throttle window', () => {
+    expect(statusRepaintDue(10_000, 10_000 + STATUS_REPAINT_MS - 1)).toBe(false);
+  });
+  it('is due once the window has elapsed', () => {
+    expect(statusRepaintDue(10_000, 10_000 + STATUS_REPAINT_MS)).toBe(true);
+  });
+  it('honors a custom interval', () => {
+    expect(statusRepaintDue(10_000, 10_500, 1000)).toBe(false);
+    expect(statusRepaintDue(10_000, 11_000, 1000)).toBe(true);
+  });
+});
+
+describe('index.js header-liveness wiring', () => {
+  const src = readFileSync(fileURLToPath(new URL('../index.js', import.meta.url)), 'utf-8');
+
+  it('journalStatus stamps _statusPublishedAt only when a frame actually goes out', () => {
+    const start = src.indexOf('function journalStatus(');
+    const end = src.indexOf('\nfunction ', start + 1);
+    const body = src.slice(start, end);
+    // The stamp must sit after every early return (no convo id / empty
+    // status) AND be gated on publishStatus's return value, so throttled
+    // callers aren't starved by frames that never went out — including
+    // frames the socket layer dropped (journal down, unserializable).
+    const stampAt = body.indexOf('session._statusPublishedAt');
+    expect(stampAt).toBeGreaterThan(-1);
+    expect(stampAt).toBeGreaterThan(body.lastIndexOf('return;'));
+    expect(body).toMatch(/if \(journalPublisher\.publishStatus\(convoId, status\)\) \{\s*\n\s*session\._statusPublishedAt = Date\.now\(\);/);
+  });
+
+  it('publishStatus reports whether the frame actually went out', () => {
+    // The throttle fix above only works if the publisher tells the truth:
+    // every drop path (closed socket, unserializable payload, send throw,
+    // noop publisher) must return an explicit false and the send path an
+    // explicit true — a bare `return` on a new drop path would still be
+    // falsy today, but the explicit contract keeps future edits honest.
+    const pubSrc = readFileSync(fileURLToPath(new URL('../lib/journal-publisher.js', import.meta.url)), 'utf-8');
+    expect(pubSrc).toContain('publishStatus() { return false; }'); // noop publisher
+    const start = pubSrc.indexOf('publishStatus(convoId, status)');
+    // Our fork inserts publishHostVitals between publishStatus and respondRpc,
+    // so bound the slice at it to read publishStatus's body alone.
+    const bodyEnd = pubSrc.indexOf('publishHostVitals(', start);
+    const pubBody = pubSrc.slice(start, bodyEnd);
+    expect(pubBody).toContain('return true;');
+    expect(pubBody).toContain('return false;');
+    expect(pubBody).not.toMatch(/^\s*return;\s*$/m);
+  });
+
+  it('all three spawn branches seed the header via journalSpawnStatus', () => {
+    // Definition + print + iv + codex call sites.
+    const calls = src.match(/journalSpawnStatus\(/g) || [];
+    expect(calls.length).toBe(4);
+    // The helper publishes now and repaints when the limits refresh lands.
+    const start = src.indexOf('function journalSpawnStatus(');
+    const end = src.indexOf('\nfunction ', start + 1);
+    const body = src.slice(start, end);
+    expect(body).toContain('journalStatus(session)');
+    expect(body).toContain('refreshUsageLimits(');
+  });
+
+  it('the assistant-event context capture repaints the header, throttled', () => {
+    expect(src).toMatch(/statusRepaintDue\(session\._statusPublishedAt, Date\.now\(\)\)/);
+  });
+
+  it('the print init capture repaints so the model lands before the first turn ends', () => {
+    const at = src.indexOf('session.initData = event;');
+    expect(at).toBeGreaterThan(-1);
+    expect(src.slice(at, at + 600)).toContain('journalStatus(session);');
   });
 });

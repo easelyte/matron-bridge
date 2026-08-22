@@ -150,8 +150,22 @@ describe('formatAndRoute', () => {
     }
 
     expect(expectedByFixtureItem).toHaveLength(events.length);
+    // A COMPLETE frame, not a bare { model }: the journal's replay cache is
+    // replace-not-merge, so if this happens to be the last frame before a
+    // client cold-starts, a partial one would strand it without the composer's
+    // argument lists. Codex states its own offer — empty lists and a null
+    // effort — so a client switched mid-session from Claude clears that
+    // session's levels instead of keeping them stickily.
     expect(calls.filter(call => call.method === 'publishStatus')).toEqual([
-      { method: 'publishStatus', args: [ctx.convoId, { model: 'gpt-5.6-sol' }] },
+      {
+        method: 'publishStatus',
+        args: [ctx.convoId, {
+          model: 'gpt-5.6-sol',
+          model_options: [],
+          effort_levels: [],
+          effort: null,
+        }],
+      },
     ]);
     expect(calls.filter(call => call.method === 'publishDiff')).toHaveLength(0);
     expect(ctx.state.terminalSeen).toBe(true);

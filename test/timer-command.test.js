@@ -1,8 +1,16 @@
 import { describe, it, expect, vi } from 'vitest';
 import {
-  parseDuration, formatDuration, parseTimerCommand, createTimerStore,
+  parseDuration, parseClockTime, formatDuration, parseTimerCommand, createTimerStore,
   timerCancelButton, timerSendNowButton, MIN_TIMER_MS, MAX_TIMER_MS, OVERDUE_GRACE_MS,
 } from '../lib/timer-command.js';
+
+// Local-time epoch builder: clock parsing is defined in the HOST's local
+// timezone, so every fixture is constructed the same way rather than from a
+// UTC literal — these assertions must hold in any TZ the suite runs under.
+const HOUR = 3_600_000;
+const MINUTE = 60_000;
+const DAY = 86_400_000;
+const at = (h, m = 0, s = 0, day = 15) => new Date(2026, 7, day, h, m, s, 0).getTime();
 
 describe('parseDuration', () => {
   it('parses single units', () => {
@@ -30,6 +38,75 @@ describe('parseDuration', () => {
     expect(parseDuration('soon')).toBeNull();
     expect(parseDuration('')).toBeNull();
     expect(parseDuration(null)).toBeNull();
+  });
+});
+
+describe('parseClockTime', () => {
+  it('parses 24h H:MM / HH:MM as a delay to that time today', () => {
+    expect(parseClockTime('14:30', at(9))).toBe(5 * HOUR + 30 * MINUTE);
+    expect(parseClockTime('9:05', at(9))).toBe(5 * MINUTE);
+    expect(parseClockTime('00:10', at(0))).toBe(10 * MINUTE);
+    expect(parseClockTime('23:59', at(0))).toBe(23 * HOUR + 59 * MINUTE);
+  });
+
+  it('parses 12h forms with a meridiem, including hour-only', () => {
+    expect(parseClockTime('9:30am', at(9))).toBe(30 * MINUTE);
+    expect(parseClockTime('9pm', at(9))).toBe(12 * HOUR);
+    expect(parseClockTime('11:45pm', at(9))).toBe(14 * HOUR + 45 * MINUTE);
+    expect(parseClockTime('1am', at(0))).toBe(1 * HOUR);
+  });
+
+  it('maps 12am to midnight and 12pm to noon', () => {
+    expect(parseClockTime('12pm', at(9))).toBe(3 * HOUR);
+    expect(parseClockTime('12:10am', at(0))).toBe(10 * MINUTE);
+    // 12am today is already past at 00:30 -> tomorrow's midnight.
+    expect(parseClockTime('12am', at(0, 30))).toBe(23 * HOUR + 30 * MINUTE);
+    expect(parseClockTime('12:30pm', at(0))).toBe(12 * HOUR + 30 * MINUTE);
+  });
+
+  it('is case-insensitive and whitespace tolerant', () => {
+    expect(parseClockTime(' 9PM ', at(9))).toBe(12 * HOUR);
+    expect(parseClockTime('9Am', at(0))).toBe(9 * HOUR);
+  });
+
+  it('rolls to tomorrow when the time today has already passed', () => {
+    expect(parseClockTime('08:00', at(9))).toBe(23 * HOUR);
+    // Exactly now -> tomorrow, never a zero delay.
+    expect(parseClockTime('09:00', at(9))).toBe(DAY);
+  });
+
+  it('rolls to tomorrow when today is within MIN_TIMER_MS, but keeps the boundary', () => {
+    // 3s away — under the minimum, so it means tomorrow, not "instantly".
+    expect(parseClockTime('09:00', at(8, 59, 57))).toBe(DAY + 3_000);
+    // Exactly MIN_TIMER_MS away — still today.
+    expect(parseClockTime('09:00', at(8, 59, 55))).toBe(MIN_TIMER_MS);
+  });
+
+  it('rejects out-of-range and non-clock tokens', () => {
+    expect(parseClockTime('24:00', at(9))).toBeNull();
+    expect(parseClockTime('25:00', at(9))).toBeNull();
+    expect(parseClockTime('12:60', at(9))).toBeNull();
+    expect(parseClockTime('25:70', at(9))).toBeNull();
+    expect(parseClockTime('13pm', at(9))).toBeNull();
+    expect(parseClockTime('0pm', at(9))).toBeNull();
+    expect(parseClockTime('9:5', at(9))).toBeNull(); // minutes must be 2 digits
+    expect(parseClockTime('9', at(9))).toBeNull(); // bare number is a duration's problem
+    expect(parseClockTime('12:10 am', at(9))).toBeNull(); // spaced form is unreachable anyway
+    expect(parseClockTime('2h', at(9))).toBeNull();
+    expect(parseClockTime('soon', at(9))).toBeNull();
+    expect(parseClockTime('', at(9))).toBeNull();
+    expect(parseClockTime(null, at(9))).toBeNull();
+  });
+
+  it('is pure — it reads the injected now, never the real clock', () => {
+    const spy = vi.spyOn(Date, 'now');
+    try {
+      expect(parseClockTime('9pm', at(9))).toBe(12 * HOUR);
+      expect(parseClockTime('9pm', at(10))).toBe(11 * HOUR);
+      expect(spy).not.toHaveBeenCalled();
+    } finally {
+      spy.mockRestore();
+    }
   });
 });
 
@@ -79,6 +156,79 @@ describe('parseTimerCommand', () => {
     expect(parseTimerCommand('30d hello').kind).toBe('error');
     expect(parseTimerCommand('2h').kind).toBe('error');
     expect(MIN_TIMER_MS).toBeLessThan(MAX_TIMER_MS);
+  });
+
+  it('duration forms parse identically whatever now is injected', () => {
+    const spy = vi.spyOn(Date, 'now');
+    try {
+      for (const now of [at(0), at(9), at(23, 59)]) {
+        expect(parseTimerCommand('1h30m ping', now)).toEqual({
+          kind: 'set', delayMs: 5_400_000, message: 'ping',
+        });
+      }
+      expect(parseTimerCommand('cancel 3', at(9))).toEqual({ kind: 'cancel', which: 3 });
+      expect(parseTimerCommand('', at(9))).toEqual({ kind: 'list' });
+      expect(spy).not.toHaveBeenCalled(); // pure when now is supplied
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it('sets from a clock time in both 24h and 12h forms', () => {
+    expect(parseTimerCommand('00:10 stand up', at(0))).toEqual({
+      kind: 'set', delayMs: 10 * MINUTE, message: 'stand up',
+    });
+    expect(parseTimerCommand('12:10am stand up', at(0))).toEqual({
+      kind: 'set', delayMs: 10 * MINUTE, message: 'stand up',
+    });
+    expect(parseTimerCommand('9pm /compact', at(9))).toEqual({
+      kind: 'set', delayMs: 12 * HOUR, message: '/compact',
+    });
+    expect(parseTimerCommand("14:30 hey  what's up", at(9))).toEqual({
+      kind: 'set', delayMs: 5 * HOUR + 30 * MINUTE, message: "hey  what's up",
+    });
+  });
+
+  it('rolls a past clock time to tomorrow rather than refusing it', () => {
+    expect(parseTimerCommand('00:10 morning', at(9))).toEqual({
+      kind: 'set', delayMs: 15 * HOUR + 10 * MINUTE, message: 'morning',
+    });
+    // Under MIN_TIMER_MS today -> tomorrow, so the min guard never trips.
+    expect(parseTimerCommand('09:00 morning', at(8, 59, 57))).toEqual({
+      kind: 'set', delayMs: DAY + 3_000, message: 'morning',
+    });
+  });
+
+  it('only reads the first token, so a spaced meridiem lands in the message', () => {
+    // Documented non-support: "12:10 am hi" reads the token as the 24h form
+    // (12:10 = ten past NOON, not past midnight) and sends "am hi" — which is
+    // exactly why the spaced meridiem isn't part of the grammar.
+    expect(parseTimerCommand('12:10 am hi', at(0))).toEqual({
+      kind: 'set', delayMs: 12 * HOUR + 10 * MINUTE, message: 'am hi',
+    });
+  });
+
+  it('needs a message for a clock time too', () => {
+    expect(parseTimerCommand('00:10', at(0)).kind).toBe('error');
+    expect(parseTimerCommand('9pm', at(0)).kind).toBe('error');
+  });
+
+  it('errors on clock-shaped but out-of-range tokens, naming the clock forms', () => {
+    for (const bad of ['25:70', '24:00', '12:60', '13pm', '0pm', '9:5']) {
+      const parsed = parseTimerCommand(`${bad} hi`, at(9));
+      expect(parsed.kind).toBe('error');
+      expect(parsed.message).toContain(bad);
+      expect(parsed.message).toMatch(/clock time/i);
+    }
+  });
+
+  it('teaches both forms when the token is neither', () => {
+    const parsed = parseTimerCommand('soon hello', at(9));
+    expect(parsed.kind).toBe('error');
+    expect(parsed.message).toMatch(/duration/i);
+    expect(parsed.message).toMatch(/clock time/i);
+    // Bare numbers stay ambiguous-and-refused, not read as an hour.
+    expect(parseTimerCommand('5 hello', at(9)).kind).toBe('error');
   });
 });
 

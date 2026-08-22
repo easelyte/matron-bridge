@@ -124,3 +124,25 @@ describe('handlePickerValue', () => {
     });
   });
 });
+
+describe('perm: dispatch', () => {
+  const UUID = '01234567-89ab-cdef-0123-456789abcdef';
+
+  it('dispatches a valid perm tap to answerPermission', () => {
+    const answerPermission = vi.fn();
+    const sendReply = vi.fn();
+    const session = {};
+    const handled = handlePickerValue(`perm:${UUID}:always`, 'room-1', session, {
+      answerPermission, sendReply,
+    });
+    expect(handled).toBe(true);
+    expect(answerPermission).toHaveBeenCalledWith(session, UUID, 'always', sendReply);
+  });
+
+  it('rejects malformed perm values', () => {
+    const answerPermission = vi.fn();
+    expect(handlePickerValue('perm:nope:allow', 'r', {}, { answerPermission })).toBe(false);
+    expect(handlePickerValue(`perm:${UUID}:sudo`, 'r', {}, { answerPermission })).toBe(false);
+    expect(answerPermission).not.toHaveBeenCalled();
+  });
+});

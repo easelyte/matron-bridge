@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import {
   buildMcpServers,
   effectiveExtras,
+  extractBypassFlag,
   extractMcpExtraFlags,
   extractPromptFlag,
   knownMcpExtras,
@@ -320,5 +321,40 @@ describe('extractPromptFlag', () => {
   it('handles a bare empty arg string (plain !start)', () => {
     expect(extractPromptFlag(''))
       .toEqual({ prompt: null, rest: '', error: null });
+  });
+});
+
+describe('extractBypassFlag', () => {
+  it('extracts --bypass and preserves positional args', () => {
+    expect(extractBypassFlag(['--bypass', '/some/dir']))
+      .toEqual({ bypass: true, rest: ['/some/dir'] });
+    expect(extractBypassFlag(['/some/dir', '--bypass']))
+      .toEqual({ bypass: true, rest: ['/some/dir'] });
+  });
+
+  it('extracts --auto as explicit false (returns a bypassed session to auto mode)', () => {
+    expect(extractBypassFlag(['--auto'])).toEqual({ bypass: false, rest: [] });
+  });
+
+  it('returns null when neither flag is present', () => {
+    expect(extractBypassFlag(['/dir'])).toEqual({ bypass: null, rest: ['/dir'] });
+    expect(extractBypassFlag([])).toEqual({ bypass: null, rest: [] });
+  });
+
+  it('last flag wins when both appear', () => {
+    expect(extractBypassFlag(['--bypass', '--auto']).bypass).toBe(false);
+    expect(extractBypassFlag(['--auto', '--bypass']).bypass).toBe(true);
+  });
+
+  it('normalizes unicode dashes (mobile autocorrect)', () => {
+    expect(extractBypassFlag(['—bypass'])).toEqual({ bypass: true, rest: [] });
+    expect(extractBypassFlag(['–auto', '/dir'])).toEqual({ bypass: false, rest: ['/dir'] });
+    expect(extractBypassFlag(['—notaflag'])).toEqual({ bypass: null, rest: ['—notaflag'] });
+  });
+
+  it('composes with extractMcpExtraFlags (bypass first, then extras)', () => {
+    const { bypass, rest } = extractBypassFlag(['--bypass', '--browser', '/dir']);
+    expect(bypass).toBe(true);
+    expect(extractMcpExtraFlags(rest)).toEqual({ extras: ['browser'], rest: ['/dir'] });
   });
 });
