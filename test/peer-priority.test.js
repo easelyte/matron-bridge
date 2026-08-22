@@ -4,6 +4,7 @@ import {
   TIER_RANK,
   tierRank,
   peerBatchTier,
+  roomBatchTier,
   shouldPreemptForPriorityPeer,
 } from '../lib/peer-priority.js';
 
@@ -61,6 +62,41 @@ describe('peerBatchTier', () => {
   it('defaults an empty/absent batch to peer-coalesced', () => {
     expect(peerBatchTier([])).toBe('peer-coalesced');
     expect(peerBatchTier(undefined)).toBe('peer-coalesced');
+  });
+});
+
+describe('roomBatchTier', () => {
+  it('is peer-coalesced for a purely agent-origin room batch (preemptable coordinating turn)', () => {
+    expect(roomBatchTier([{ fromAgent: true }])).toBe('peer-coalesced');
+    expect(roomBatchTier([{ fromAgent: true }, { fromAgent: true }])).toBe('peer-coalesced');
+  });
+
+  it('is operator-protected (null) when any message is operator-origin', () => {
+    // The operator typing into a room must never be preemptable — one operator
+    // message in the batch protects the whole turn.
+    expect(roomBatchTier([{ fromAgent: false }])).toBeNull();
+    expect(roomBatchTier([{ fromAgent: true }, { fromAgent: false }])).toBeNull();
+    expect(roomBatchTier([{}])).toBeNull();
+  });
+
+  it('is operator-protected (null) for an empty/absent batch', () => {
+    expect(roomBatchTier([])).toBeNull();
+    expect(roomBatchTier(undefined)).toBeNull();
+  });
+
+  it('only treats fromAgent === true as agent-origin', () => {
+    expect(roomBatchTier([{ fromAgent: 1 }])).toBeNull();
+    expect(roomBatchTier([{ fromAgent: 'true' }])).toBeNull();
+  });
+
+  it('a peer-coalesced room turn is outranked by a priority peer (end-to-end precedence)', () => {
+    const runningTier = roomBatchTier([{ fromAgent: true }]);
+    expect(shouldPreemptForPriorityPeer({ priority: true, busy: true, runningTier })).toBe(true);
+  });
+
+  it('an operator room turn is NOT preempted by a priority peer', () => {
+    const runningTier = roomBatchTier([{ fromAgent: false }]);
+    expect(shouldPreemptForPriorityPeer({ priority: true, busy: true, runningTier })).toBe(false);
   });
 });
 

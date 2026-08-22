@@ -545,6 +545,19 @@ describe('journalOnPeerMessage priority preemption (loop #688 consumer half)', (
     assert.equal(runtime.decisionLogs().at(-1).decision, 'coalesced');
   });
 
+  it('does NOT auto-preempt an iv-mode turn (no generation-correlated Stop hook); it coalesces', () => {
+    // iv PTY turns lack a turn-generation-correlated Stop hook, so cancelling
+    // and clearing busy could let the canceled turn's late hook corrupt a
+    // replacement turn. iv priority peers therefore coalesce and deliver at the
+    // natural turn end instead of interrupting.
+    const target = session({ busy: true, turnTier: 'autonomous', iv: { alive: true } });
+    const runtime = makeRuntime({ target });
+    runtime.journalOnPeerMessage(priorityFrame());
+    assert.equal(runtime.preemptCalls.length, 0);
+    assert.equal(runtime.peerDelivery.pendingCount(target.roomId), 1);
+    assert.equal(runtime.decisionLogs().at(-1).decision, 'coalesced');
+  });
+
   it('logs preempt-failed (not preempted) when the interrupt is refused (F6)', () => {
     const target = session({ busy: true, turnTier: 'autonomous' });
     const runtime = makeRuntime({ target, preemptResult: false });

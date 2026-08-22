@@ -106,7 +106,7 @@ import { createAgentInvites, formatInviteRequestNotice } from './lib/agent-invit
 import { resolveInviteTarget } from './lib/invite-target.js';
 import { createRoomDelivery, formatRoomMessageNotice, formatRoomDeliveredNotice, formatRoomDeliveryFailedNotice, ROOM_MESSAGE_QUEUED_NOTICE } from './lib/room-delivery.js';
 import { oneLine } from './lib/peer-text.js';
-import { peerBatchTier, shouldPreemptForPriorityPeer } from './lib/peer-priority.js';
+import { peerBatchTier, roomBatchTier, shouldPreemptForPriorityPeer } from './lib/peer-priority.js';
 import { createRoomReplyWaiters } from './lib/room-reply-waiters.js';
 import { createAgentChatHandlers } from './lib/agent-chat.js';
 import {
@@ -8110,7 +8110,15 @@ function maybeFlushRoomDelivery(session) {
 // room convo — mirroring it into the session convo would duplicate it.
 const roomDelivery = createRoomDelivery({
   isBusy: sessionOccupiedForRoomDelivery,
-  injectTurn: (session, text) => sendTextToSession(session, text, { skipJournalMirror: true }),
+  // Tag the injected turn's tier by sender provenance (loop #688 F2): a purely
+  // agent-origin room batch is a coordinating peer turn (peer-coalesced,
+  // preemptable by a priority peer), while any operator (user:) message in the
+  // batch keeps it operator-protected (null). deliverRoomFrameTo stamps
+  // fromAgent on each message.
+  injectTurn: (session, text, messages) => sendTextToSession(session, text, {
+    skipJournalMirror: true,
+    turnTier: roomBatchTier(messages),
+  }),
   log: console,
 });
 
@@ -8235,11 +8243,20 @@ function journalOnPeerMessage(frame) {
   // interrupting would kill the running turn with nothing left to inject (F5).
   // The busy branch always coalesced above, so pendingCount > 0 means the
   // priority message (or peers coalesced with it) survived and is deliverable.
+  //
+  // iv-mode is excluded from auto-preemption (F2 round-2 / F1): its PTY turn
+  // lifecycle has no turn-generation-correlated Stop hook, so cancelling a turn
+  // and clearing busy could let the canceled turn's late, session-id-keyed hook
+  // end a replacement turn and paste input over it. Print-mode Claude and Codex
+  // keep busy=true through the interrupt (the result / process-exit seam is the
+  // interrupted turn's own end), so no replacement turn can start in the window.
+  // In iv the priority peer still coalesces with its PRIORITY marker and is
+  // delivered at the natural turn end.
   if (shouldPreemptForPriorityPeer({
     priority: payload.priority === true,
     busy: session.busy === true,
     runningTier: session.turnTier,
-  }) && peerDelivery.pendingCount(session.roomId) > 0) {
+  }) && !(session.iv && session.iv.alive) && peerDelivery.pendingCount(session.roomId) > 0) {
     // Report the real interrupt outcome, not merely that we decided to preempt
     // (F6): a dead child / wedged process / failed write leaves the message
     // queued for the eventual turn end, and the log must say so.
@@ -8334,6 +8351,10 @@ function deliverRoomFrameTo(room, frame) {
   const queuedBefore = roomDelivery.pendingCount(session.roomId);
   roomDelivery.deliver(session, session.roomId, {
     roomId: frame.convo_id, roomTitle: room.title || room.topic || null, from, body, at: frame.ts,
+    // Sender provenance for turn-tier classification (loop #688 F2): an agent
+    // room turn is peer-coalesced (preemptable), a user (operator) room turn
+    // stays operator-protected.
+    fromAgent: isPeerAgent,
   });
   if (isPeerAgent && queuedBefore === 0 && roomDelivery.pendingCount(session.roomId) > 0) {
     journalPublishNotice(journalConvoIdFor(session), ROOM_MESSAGE_QUEUED_NOTICE);
@@ -9927,36 +9948,20 @@ const PRIORITY_PEER_PREEMPT_NOTICE =
 // `preempted` vs `preempt-failed` honestly and never claims an interrupt that
 // a dead child / wedged process / failed stdin write refused (F6).
 //
-// Mode dispatch:
-//   - iv-mode: send Esc and clear busy exactly like the !esc rescue. It does
-//     NOT synchronously flush the priority inbox: the canceled turn's async
-//     Stop hook (or the next inbound frame) drives maybeFlushRoomDelivery, and
-//     forcing a flush here would let that late, session-id-keyed hook end the
-//     freshly-started priority turn and paste more input on top of it (F2).
-//   - print-mode Claude / Codex: reuse printModeInterrupt (its state mutations
-//     run synchronously before its first await, so acceptance is known
-//     immediately); the eventual result / finishCodexTurn seam clears busy and
-//     flushes the inbox. No synchronous flush, so no race with that seam.
+// Only print-mode Claude and Codex reach here: both keep busy=true through the
+// interrupt (the result / finishCodexTurn seam is the interrupted turn's own
+// end and clears busy + flushes the inbox), so no replacement turn can start in
+// the interrupt window and there is no synchronous flush to race that seam. The
+// caller excludes iv-mode from auto-preemption; this guard is defensive.
+//
+// printModeInterrupt sets _codexInterrupted / pendingInterrupt synchronously
+// before it first awaits, so the post-call state is the acceptance signal.
 // Idempotent: re-entry while an interrupt is already in flight is a no-op that
 // still reports success, so a burst of priority peers interrupts once.
 function preemptForPriorityPeer(session) {
   if (!session || !session.alive || !session.busy) return false;
+  if (session.iv && session.iv.alive) return false;
   const convoId = journalConvoIdFor(session);
-  if (session.iv && session.iv.alive) {
-    try {
-      session.iv.sendKeystroke('esc');
-    } catch (err) {
-      debug(`priority-peer preempt: iv esc failed: ${err.message}`);
-      return false;
-    }
-    session.pendingUnclassifiedPrompt = false;
-    session.busy = false;
-    inflightMarker.noteTurnEnd(convoId);
-    journalSessionState(session, 'waiting');
-    journalActivity(session, 'idle');
-    journalPublishNotice(convoId, PRIORITY_PEER_PREEMPT_NOTICE);
-    return true;
-  }
   // Already interrupting this turn (a prior priority peer in the same burst):
   // idempotent success, don't fire a second SIGINT.
   if ((session.agent === AGENT_CODEX && session._codexInterrupted)
