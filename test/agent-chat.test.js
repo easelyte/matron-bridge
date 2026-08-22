@@ -1431,4 +1431,133 @@ describe('local (same-bridge) rooms', () => {
       expect((await f.handlers.chatRead({ roomId: '!guest', room_id: id })).status).toBe(404);
     });
   });
+
+  // agent_chat_invite — the OWNER pulls another session into a room it already
+  // owns, reusing the SAME invites.invite() data layer chatStart uses (against
+  // an existing room id) with no new journal RPC.
+  describe('chatInvite', () => {
+    // A room this bridge OWNS and is joined into, ready to invite a third
+    // party. peerDeviceId 9 is an already-present, DIFFERENT participant, so
+    // inviting device 7 is a genuine additional-participant case.
+    const ownerRoom = (rooms, over = {}) =>
+      rooms.record('room-1', { role: 'owner', state: 'joined', sessionRoomId: '!sess', peerDeviceId: 9, ...over });
+
+    it('happy path: owner invites a remote session, reusing invites.invite() against the EXISTING room', async () => {
+      const { handlers, rooms, invites } = makeFixture();
+      ownerRoom(rooms);
+      const res = await handlers.chatInvite({ roomId: '!sess', room_id: 'room-1', target_convo_id: 'convo-remote', topic: 'triage', justification: 'need eyes' });
+      expect(res).toEqual({ status: 200, body: { room_id: 'room-1', status: 'accepted' } });
+      // The exact reuse the ticket asks for: the existing invite data layer,
+      // an EXISTING room id, the target device resolved off the roster, and
+      // from_convo_id naming the asking session.
+      expect(invites.invite).toHaveBeenCalledTimes(1);
+      expect(invites.invite).toHaveBeenCalledWith({
+        roomId: 'room-1', targetDeviceId: 7, targetConvoId: 'convo-remote',
+        fromConvoId: 'convo-sess', topic: 'triage', justification: 'need eyes',
+      });
+      // The pre-existing room is UNCHANGED — nothing recorded/torn down.
+      expect(rooms.get('room-1')).toMatchObject({ role: 'owner', state: 'joined', peerDeviceId: 9 });
+    });
+
+    it('maps a refusal to status refused and leaves the room untouched', async () => {
+      const { handlers, rooms } = makeFixture({ inviteOutcome: { kind: 'refused', reason: 'heads-down', peerDeviceId: 7 } });
+      ownerRoom(rooms);
+      const res = await handlers.chatInvite({ roomId: '!sess', room_id: 'room-1', target_convo_id: 'convo-remote', justification: 'j' });
+      expect(res).toEqual({ status: 200, body: { room_id: 'room-1', status: 'refused', reason: 'heads-down' } });
+      expect(rooms.get('room-1').state).toBe('joined');
+    });
+
+    it('maps a pending_busy invite outcome without waiting', async () => {
+      const { handlers, rooms } = makeFixture({ inviteOutcome: { kind: 'pending_busy' } });
+      ownerRoom(rooms);
+      const res = await handlers.chatInvite({ roomId: '!sess', room_id: 'room-1', target_convo_id: 'convo-remote', justification: 'j' });
+      expect(res.status).toBe(200);
+      expect(res.body.status).toBe('pending_busy');
+    });
+
+    it('rejects a caller who is NOT a participant of the room (404, no invite sent)', async () => {
+      const { handlers, invites } = makeFixture(); // room-1 never recorded
+      const res = await handlers.chatInvite({ roomId: '!sess', room_id: 'room-1', target_convo_id: 'convo-remote', justification: 'j' });
+      expect(res.status).toBe(404);
+      expect(invites.invite).not.toHaveBeenCalled();
+    });
+
+    it('rejects a joined GUEST caller — only the owner may invite (403, no invite sent)', async () => {
+      const { handlers, rooms, invites } = makeFixture();
+      // '!sess' is a guest of room-1, not its owner.
+      rooms.record('room-1', { role: 'guest', state: 'joined', sessionRoomId: '!sess', peerDeviceId: 9 });
+      const res = await handlers.chatInvite({ roomId: '!sess', room_id: 'room-1', target_convo_id: 'convo-remote', justification: 'j' });
+      expect(res.status).toBe(403);
+      expect(res.body.error).toMatch(/only the owner/i);
+      expect(invites.invite).not.toHaveBeenCalled();
+    });
+
+    it('rejects inviting a device that is ALREADY the room participant (409, no invite sent)', async () => {
+      const { handlers, rooms, invites } = makeFixture();
+      ownerRoom(rooms, { peerDeviceId: 7 }); // device 7 (convo-remote's agent) already in
+      const res = await handlers.chatInvite({ roomId: '!sess', room_id: 'room-1', target_convo_id: 'convo-remote', justification: 'j' });
+      expect(res.status).toBe(409);
+      expect(res.body.error).toMatch(/already a participant/i);
+      expect(invites.invite).not.toHaveBeenCalled();
+    });
+
+    it('refuses inviting the caller\'s own conversation (self-invite, 400)', async () => {
+      const { handlers, rooms, sessions } = makeFixture();
+      sessions.set('!self', { busy: false, alive: true, convoId: 'convo-self' });
+      rooms.record('room-1', { role: 'owner', state: 'joined', sessionRoomId: '!self', peerDeviceId: 9 });
+      const res = await handlers.chatInvite({ roomId: '!self', room_id: 'room-1', target_convo_id: 'convo-self', justification: 'j' });
+      expect(res.status).toBe(400);
+      expect(res.body.error).toMatch(/yourself/i);
+    });
+
+    it('refuses a same-bridge target — v1 multi-party rooms are remote-only (400)', async () => {
+      const { handlers, rooms, invites } = makeFixture();
+      ownerRoom(rooms); // caller convo is 'convo-sess'; target convo-self is device 1 = self
+      const res = await handlers.chatInvite({ roomId: '!sess', room_id: 'room-1', target_convo_id: 'convo-self', justification: 'j' });
+      expect(res.status).toBe(400);
+      expect(res.body.error).toMatch(/same-bridge|another box/i);
+      expect(invites.invite).not.toHaveBeenCalled();
+    });
+
+    it('rejects a target conversation with no owning agent (409)', async () => {
+      const { handlers, rooms } = makeFixture();
+      ownerRoom(rooms);
+      const res = await handlers.chatInvite({ roomId: '!sess', room_id: 'room-1', target_convo_id: 'convo-orphan', justification: 'j' });
+      expect(res.status).toBe(409);
+      expect(res.body.error).toMatch(/no owning agent/i);
+    });
+
+    it('rejects an unknown target conversation (404)', async () => {
+      const { handlers, rooms } = makeFixture();
+      ownerRoom(rooms);
+      const res = await handlers.chatInvite({ roomId: '!sess', room_id: 'room-1', target_convo_id: 'nope', justification: 'j' });
+      expect(res.status).toBe(404);
+      expect(res.body.error).toMatch(/no conversation/i);
+    });
+
+    it('validates room_id, target_convo_id, justification and topic type before any side effect', async () => {
+      const { handlers, rooms, invites, publisher } = makeFixture();
+      ownerRoom(rooms);
+      const fetchSpy = vi.spyOn(publisher, 'fetchRoster');
+      // missing room_id
+      expect((await handlers.chatInvite({ roomId: '!sess', target_convo_id: 'convo-remote', justification: 'j' })).status).toBe(400);
+      // non-string room_id
+      expect((await handlers.chatInvite({ roomId: '!sess', room_id: 42, target_convo_id: 'convo-remote', justification: 'j' })).status).toBe(400);
+      // missing target
+      expect((await handlers.chatInvite({ roomId: '!sess', room_id: 'room-1', justification: 'j' })).status).toBe(400);
+      // missing justification
+      expect((await handlers.chatInvite({ roomId: '!sess', room_id: 'room-1', target_convo_id: 'convo-remote' })).status).toBe(400);
+      // non-string topic
+      expect((await handlers.chatInvite({ roomId: '!sess', room_id: 'room-1', target_convo_id: 'convo-remote', justification: 'j', topic: 5 })).status).toBe(400);
+      expect(invites.invite).not.toHaveBeenCalled();
+      expect(fetchSpy).not.toHaveBeenCalled();
+    });
+
+    it('surfaces an unreachable journal roster as 502', async () => {
+      const { handlers, rooms } = makeFixture({ publisher: { fetchRoster: async () => null } });
+      ownerRoom(rooms);
+      const res = await handlers.chatInvite({ roomId: '!sess', room_id: 'room-1', target_convo_id: 'convo-remote', justification: 'j' });
+      expect(res.status).toBe(502);
+    });
+  });
 });

@@ -9168,6 +9168,12 @@ const apiServer = createServer(async (req, res) => {
         return;
       }
 
+      if (url.pathname === '/agent-chat-invite') {
+        await respondAgentChatRoute(res, data, agentChatHandlers.chatInvite,
+          (status, b) => debug(`agent-chat-invite ${status} ${data?.room_id} ${b.status || b.error || ''}`));
+        return;
+      }
+
       if (url.pathname === '/agent-chat-leave') {
         await respondAgentChatRoute(res, data, agentChatHandlers.chatLeave,
           (status, b) => debug(`agent-chat-leave ${status} ${data?.room_id} ${b.error || 'ok'}`));
