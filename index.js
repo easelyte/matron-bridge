@@ -106,6 +106,7 @@ import { createAgentInvites, formatInviteRequestNotice } from './lib/agent-invit
 import { resolveInviteTarget } from './lib/invite-target.js';
 import { createRoomDelivery, formatRoomMessageNotice, formatRoomDeliveredNotice, formatRoomDeliveryFailedNotice, ROOM_MESSAGE_QUEUED_NOTICE } from './lib/room-delivery.js';
 import { oneLine } from './lib/peer-text.js';
+import { peerBatchTier, shouldPreemptForPriorityPeer } from './lib/peer-priority.js';
 import { createRoomReplyWaiters } from './lib/room-reply-waiters.js';
 import { createAgentChatHandlers } from './lib/agent-chat.js';
 import {
@@ -4602,7 +4603,7 @@ function flushResponse(session) {
 // again here as an agent-sourced echo would duplicate it. Every other caller
 // (Matrix messages, which have no other route into the journal) leaves this
 // false, unchanged from before.
-function sendToSession(session, contentBlocks, { skipJournalMirror = false } = {}) {
+function sendToSession(session, contentBlocks, { skipJournalMirror = false, turnTier = null } = {}) {
   if (!session.alive || session._autoStopped) return false;
 
   const historyText = contentBlocks
@@ -4658,6 +4659,13 @@ function sendToSession(session, contentBlocks, { skipJournalMirror = false } = {
   session.responseBuffer = '';
   session.toolCalls = [];
   session.busy = true;
+  // Record the tier of the turn now starting (loop #688 consumer half). Peer
+  // injections tag 'peer-priority'/'peer-coalesced'; an unmarked turn leaves
+  // this null, which the precedence gate treats as operator-rank (protected) —
+  // so a priority peer never preempts a turn we did not positively classify as
+  // lower-tier. Stale between turns is harmless: the gate only reads it while
+  // session.busy is true.
+  session.turnTier = turnTier;
   inflightMarker.noteTurnStart(journalConvoIdFor(session), session.roomId);
   journalSessionState(session, 'running');
   journalActivity(session, 'thinking');
@@ -8131,7 +8139,17 @@ const peerDelivery = createRoomDelivery({
   // turn as hostile-by-default, while the deployment-conditional downstream
   // MATRON_PERMISSION_CARDS gate covers tool calls. When that gate is off, the
   // in-band marker is the sole control; peers gain no capability or elevation.
-  injectTurn: (session, text) => sendTextToSession(session, text, { skipJournalMirror: true }),
+  //
+  // The injected turn is tagged with its priority tier (loop #688 consumer
+  // half): a batch carrying any priority peer message runs as a 'peer-priority'
+  // turn, otherwise 'peer-coalesced'. sendToSession stamps this onto
+  // session.turnTier so a LATER inbound priority peer can decide, by the
+  // operator > peer-priority > peer-coalesced > autonomous precedence, whether
+  // it outranks and preempts this turn.
+  injectTurn: (session, text, messages) => sendTextToSession(session, text, {
+    skipJournalMirror: true,
+    turnTier: peerBatchTier(messages),
+  }),
   formatter: formatPeerDelivery,
   maxPendingBytes: 16 * 1024,
   pendingBytesOf: (message) => Buffer.byteLength(oneLine(message.body), 'utf8'),
@@ -8189,7 +8207,7 @@ function journalOnPeerMessage(frame) {
   session.peerHandledWatermark = frame.seq;
 
   const payload = frame.payload || {};
-  const decision = sessionOccupiedForRoomDelivery(session) ? 'coalesced' : 'injected';
+  let decision = sessionOccupiedForRoomDelivery(session) ? 'coalesced' : 'injected';
   peerDelivery.deliver(session, session.roomId, {
     roomId: payload.from_convo,
     convo: frame.convo_id,
@@ -8199,6 +8217,21 @@ function journalOnPeerMessage(frame) {
     body: payload.body,
     priority: payload.priority === true,
   });
+  // Consumer half (loop #688): a priority peer that arrives MID-TURN preempts
+  // the running turn ONLY IF it outranks it by the operator > peer-priority >
+  // peer-coalesced > autonomous precedence. It was just coalesced into the
+  // pending inbox above; interrupting the running turn makes the turn-end seam
+  // flush that inbox and inject it as its own turn. At a live prompt (busy
+  // false) shouldPreempt returns false — the message defers and injects
+  // normally, and an open prompt (occupied but not busy) is never interrupted.
+  if (shouldPreemptForPriorityPeer({
+    priority: payload.priority === true,
+    busy: session.busy === true,
+    runningTier: session.turnTier,
+  })) {
+    decision = 'preempted';
+    preemptForPriorityPeer(session);
+  }
   logPeerMessageDelivery(frame.convo_id, frame.seq, decision);
 }
 
@@ -9859,6 +9892,51 @@ function recreateSession(roomId, overrides, { sendReply, sendHtml }) {
     flushPendingSessionQueue(next);
   }
   return next;
+}
+
+const PRIORITY_PEER_PREEMPT_NOTICE =
+  '⚡ Priority peer message — interrupting the current turn to deliver it.';
+
+// Loop #688 consumer half: interrupt the turn currently running so a
+// just-coalesced PRIORITY peer-message is delivered as its own turn. Called
+// only after shouldPreemptForPriorityPeer confirmed the priority peer outranks
+// the running turn (operator > peer-priority > peer-coalesced > autonomous), so
+// this never fires against an operator turn. It does not inject into the live
+// turn (that would corrupt a running generation or answer an open prompt) —
+// it interrupts, and the turn-end seam then flushes the pending peer inbox.
+//
+// Mode dispatch mirrors the !esc / print-interrupt rescue paths:
+//   - iv-mode: send Esc, clear busy, note the turn end, then flush the pending
+//     peer inbox — the Esc path does not itself pass through a turn-end flush.
+//   - print-mode Claude / Codex: printModeInterrupt sends the interrupt and the
+//     eventual result / finishCodexTurn seam clears busy and flushes the inbox.
+// Idempotent: re-entry while an interrupt is already in flight is a no-op, so a
+// burst of priority peers interrupts the running turn exactly once.
+function preemptForPriorityPeer(session) {
+  if (!session || !session.alive || !session.busy) return;
+  const convoId = journalConvoIdFor(session);
+  if (session.iv && session.iv.alive) {
+    try {
+      session.iv.sendKeystroke('esc');
+    } catch (err) {
+      debug(`priority-peer preempt: iv esc failed: ${err.message}`);
+      return;
+    }
+    session.pendingUnclassifiedPrompt = false;
+    session.busy = false;
+    inflightMarker.noteTurnEnd(convoId);
+    journalSessionState(session, 'waiting');
+    journalActivity(session, 'idle');
+    journalPublishNotice(convoId, PRIORITY_PEER_PREEMPT_NOTICE);
+    maybeFlushRoomDelivery(session);
+    return;
+  }
+  // Codex + print-mode Claude both interrupt through printModeInterrupt. Skip
+  // if an interrupt is already pending/sent for this turn so a burst preempts
+  // once rather than firing SIGINT repeatedly.
+  if (session.pendingInterrupt || session._codexInterrupted) return;
+  journalPublishNotice(convoId, PRIORITY_PEER_PREEMPT_NOTICE);
+  Promise.resolve(printModeInterrupt(session, () => {})).catch(() => {});
 }
 
 // Print-mode turn interrupt — the print-mode counterpart of iv-mode's Esc
