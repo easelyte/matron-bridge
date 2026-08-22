@@ -2,9 +2,9 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { describe, it } from 'vitest';
 import { createAgentChatHandlers } from '../lib/agent-chat.js';
-import { createRoomDelivery } from '../lib/room-delivery.js';
+import { createRoomDelivery, formatRoomDeliveredNotice, formatRoomDeliveryFailedNotice } from '../lib/room-delivery.js';
 import { oneLine } from '../lib/peer-text.js';
-import { peerBatchTier, shouldPreemptForPriorityPeer } from '../lib/peer-priority.js';
+import { peerBatchTier, roomBatchTier, shouldPreemptForPriorityPeer } from '../lib/peer-priority.js';
 
 const indexSource = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
 const fixture = JSON.parse(readFileSync(
@@ -32,8 +32,12 @@ const buildPeerRuntime = new Function(
   'sendTextToSession',
   'console',
   'peerBatchTier',
+  'roomBatchTier',
   'shouldPreemptForPriorityPeer',
   'preemptForPriorityPeer',
+  'journalPublishNotice',
+  'formatRoomDeliveredNotice',
+  'formatRoomDeliveryFailedNotice',
   `${sourceBetween('function journalConvoIdFor(', '// Reverse lookup for the journal return path:')}
    ${sourceBetween('function findSessionByClaudeSessionId(', '// --- Journal dual-post mirroring ---')}
    ${sourceBetween('function sessionOccupiedForRoomDelivery(', '// Per-room once-listener registry')}
@@ -44,6 +48,7 @@ const buildPeerRuntime = new Function(
      journalOnPeerMessage,
      maybeFlushRoomDelivery,
      peerDelivery,
+     roomDelivery,
      sessionOccupiedForRoomDelivery,
    };`,
 );
@@ -100,8 +105,12 @@ function makeRuntime({ target = session(), persistImpl, markBusyOnInject = false
     sendTextToSession,
     { info: (line) => infoLines.push(line), warn: () => {} },
     peerBatchTier,
+    roomBatchTier,
     shouldPreemptForPriorityPeer,
     preemptForPriorityPeer,
+    () => {}, // journalPublishNotice
+    formatRoomDeliveredNotice,
+    formatRoomDeliveryFailedNotice,
   );
   return {
     ...runtime,
@@ -589,6 +598,38 @@ describe('journalOnPeerMessage priority preemption (loop #688 consumer half)', (
     const priority = makeRuntime();
     priority.journalOnPeerMessage(priorityFrame());
     assert.deepEqual(priority.injectCalls[0][2], { skipJournalMirror: true, turnTier: 'peer-priority' });
+  });
+
+  it('flushes a pending priority peer BEFORE a lower-tier room batch at turn end (F3)', () => {
+    // A lower-tier turn is running with a queued agent-room (peer-coalesced)
+    // batch; a priority peer then arrives and preempts. At turn end the priority
+    // peer must be delivered first, not left behind the room batch.
+    const target = session({ busy: true, turnTier: 'autonomous' });
+    const runtime = makeRuntime({ target, markBusyOnInject: true });
+    // A room message coalesces while busy (agent-origin, peer-coalesced tier).
+    runtime.roomDelivery.deliver(target, target.roomId, {
+      roomId: 'room-x', roomTitle: 'coord', from: 'peer (agent)', body: 'room work', fromAgent: true,
+    });
+    // A priority peer arrives: preempts and marks the priority-pending flag.
+    runtime.journalOnPeerMessage(priorityFrame({ payload: { body: 'urgent' } }));
+    assert.equal(runtime.preemptCalls.length, 1);
+    assert.equal(target._priorityPreemptPending, true);
+
+    // Turn ends: the priority peer flushes first (busy set on inject stops the
+    // room batch flushing in the same turn).
+    target.busy = false;
+    runtime.maybeFlushRoomDelivery(target);
+    assert.equal(runtime.injectCalls.length, 1);
+    assert.equal(runtime.injectCalls[0][1].includes('[PRIORITY peer'), true);
+    assert.equal(runtime.injectCalls[0][1].includes('urgent'), true);
+    assert.equal(target._priorityPreemptPending, false);
+    assert.equal(runtime.roomDelivery.pendingCount(target.roomId), 1); // room batch still waiting
+
+    // Next turn end delivers the room batch.
+    target.busy = false;
+    runtime.maybeFlushRoomDelivery(target);
+    assert.equal(runtime.injectCalls.length, 2);
+    assert.equal(runtime.injectCalls[1][1].includes('room work'), true);
   });
 
   it('tags a coalesced flush as peer-priority when the batch contains any priority peer', () => {

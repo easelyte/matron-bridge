@@ -381,7 +381,9 @@ describe('index.js + ask-user.js spawn wiring (source inspection)', () => {
     expect(args).toMatch(/getLimits: \(\) => \{ refreshUsageLimits\(DEFAULT_WORKDIR\); return buildLimits\(usageLimitsCache\); \}/);
     expect(args).toMatch(/bindSpawnRoom: \(roomId, session\) => \{[\s\S]{0,200}agentRooms\.record\(roomId, \{ role: 'guest', state: 'joined', sessionRoomId: session\.roomId \}\)/);
     expect(args).toMatch(/unbindSpawnRoom: \(roomId\) => agentRooms\.remove\(roomId\)/);
-    expect(args).toMatch(/injectTurn: \(session, text\) => sendTextToSession\(session, text, \{ skipJournalMirror: true \}\)/);
+    // The spawned task's opening turn is tagged autonomous (loop #688) so a
+    // priority peer can preempt it.
+    expect(args).toMatch(/injectTurn: \(session, text\) => sendTextToSession\(session, text, \{ skipJournalMirror: true, turnTier: 'autonomous' \}\)/);
     expect(args).toMatch(/serverLabel: SERVER_LABEL,/);
     expect(indexSrc).toMatch(/import \{ buildActivity, buildLimits \} from '\.\/lib\/spawn-capacity\.js';/);
   });

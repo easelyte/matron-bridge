@@ -804,7 +804,10 @@ const journalRpcHandler = createRpcRequestHandler({
     agentRooms.record(roomId, { role: 'guest', state: 'joined', sessionRoomId: session.roomId });
   },
   unbindSpawnRoom: (roomId) => agentRooms.remove(roomId),
-  injectTurn: (session, text) => sendTextToSession(session, text, { skipJournalMirror: true }),
+  // A spawned task's opening turn is autonomous work (loop #688): tag it the
+  // lowest tier so a priority peer can preempt it, per the operator >
+  // peer-priority > peer-coalesced > autonomous precedence.
+  injectTurn: (session, text) => sendTextToSession(session, text, { skipJournalMirror: true, turnTier: 'autonomous' }),
   serverLabel: SERVER_LABEL,
   log: console,
 });
@@ -8086,6 +8089,17 @@ function sessionOccupiedForRoomDelivery(session) {
 // deliver()'s busy/idle branches — so the two can never disagree.
 function maybeFlushRoomDelivery(session) {
   if (sessionOccupiedForRoomDelivery(session)) return;
+  // A priority peer is awaiting delivery (loop #688 F3): it outranks any pending
+  // peer-coalesced room batch, so flush the peer inbox FIRST. Each flush injects
+  // a turn (busy=true), and only one can go per turn-end; without this the
+  // ordinary path below flushes a pending room batch first when one exists,
+  // leaving the priority peer — the very message that caused the preemption —
+  // behind for another whole turn, inverting peer-priority > peer-coalesced.
+  if (session._priorityPreemptPending) {
+    session._priorityPreemptPending = false;
+    peerDelivery.flush(session, session.roomId);
+    if (sessionOccupiedForRoomDelivery(session)) return; // peer turn started; room batch waits
+  }
   // Counted BEFORE the flush, which clears the inbox either way — this is the
   // number the ⏳ line left outstanding, and the number Dan is owed an outcome
   // for. Zero means there was no queued batch, so there is nothing to close
@@ -8230,6 +8244,13 @@ function journalOnPeerMessage(frame) {
     body: payload.body,
     priority: payload.priority === true,
   });
+  // A priority peer queued behind a running turn (coalesced, not injected idle)
+  // must be delivered ahead of any lower-tier room batch at the turn-end flush
+  // (loop #688 F3) — whether or not it also preempts (iv coalesces without
+  // interrupting). maybeFlushRoomDelivery reads and clears this flag.
+  if (payload.priority === true && decision === 'coalesced') {
+    session._priorityPreemptPending = true;
+  }
   // Consumer half (loop #688): a priority peer that arrives MID-TURN preempts
   // the running turn ONLY IF it outranks it by the operator > peer-priority >
   // peer-coalesced > autonomous precedence. It was just coalesced into the
