@@ -106,6 +106,7 @@ import { createAgentInvites, formatInviteRequestNotice } from './lib/agent-invit
 import { resolveInviteTarget } from './lib/invite-target.js';
 import { createRoomDelivery, formatRoomMessageNotice, formatRoomDeliveredNotice, formatRoomDeliveryFailedNotice, ROOM_MESSAGE_QUEUED_NOTICE } from './lib/room-delivery.js';
 import { oneLine } from './lib/peer-text.js';
+import { peerBatchTier, roomBatchTier, shouldPreemptForPriorityPeer } from './lib/peer-priority.js';
 import { createRoomReplyWaiters } from './lib/room-reply-waiters.js';
 import { createAgentChatHandlers } from './lib/agent-chat.js';
 import {
@@ -803,7 +804,10 @@ const journalRpcHandler = createRpcRequestHandler({
     agentRooms.record(roomId, { role: 'guest', state: 'joined', sessionRoomId: session.roomId });
   },
   unbindSpawnRoom: (roomId) => agentRooms.remove(roomId),
-  injectTurn: (session, text) => sendTextToSession(session, text, { skipJournalMirror: true }),
+  // A spawned task's opening turn is autonomous work (loop #688): tag it the
+  // lowest tier so a priority peer can preempt it, per the operator >
+  // peer-priority > peer-coalesced > autonomous precedence.
+  injectTurn: (session, text) => sendTextToSession(session, text, { skipJournalMirror: true, turnTier: 'autonomous' }),
   serverLabel: SERVER_LABEL,
   log: console,
 });
@@ -3343,6 +3347,11 @@ function submitAnswer(session, answerText, { mirrorToJournal = true } = {}) {
       return;
     }
     session.busy = true;
+    // Operator turn (answering a prompt): reset the tier so a stale peer tier
+    // left by a previous turn can never let a priority peer preempt this
+    // operator work (loop #688 — the turnTier leak F1). null = operator-rank,
+    // protected. This is a direct busy=true seam that bypasses sendToSession.
+    session.turnTier = null;
     inflightMarker.noteTurnStart(journalConvoIdFor(session), session.roomId);
     journalSessionState(session, 'running');
     journalActivity(session, 'thinking');
@@ -4602,7 +4611,7 @@ function flushResponse(session) {
 // again here as an agent-sourced echo would duplicate it. Every other caller
 // (Matrix messages, which have no other route into the journal) leaves this
 // false, unchanged from before.
-function sendToSession(session, contentBlocks, { skipJournalMirror = false } = {}) {
+function sendToSession(session, contentBlocks, { skipJournalMirror = false, turnTier = null } = {}) {
   if (!session.alive || session._autoStopped) return false;
 
   const historyText = contentBlocks
@@ -4658,6 +4667,13 @@ function sendToSession(session, contentBlocks, { skipJournalMirror = false } = {
   session.responseBuffer = '';
   session.toolCalls = [];
   session.busy = true;
+  // Record the tier of the turn now starting (loop #688 consumer half). Peer
+  // injections tag 'peer-priority'/'peer-coalesced'; an unmarked turn leaves
+  // this null, which the precedence gate treats as operator-rank (protected) —
+  // so a priority peer never preempts a turn we did not positively classify as
+  // lower-tier. Stale between turns is harmless: the gate only reads it while
+  // session.busy is true.
+  session.turnTier = turnTier;
   inflightMarker.noteTurnStart(journalConvoIdFor(session), session.roomId);
   journalSessionState(session, 'running');
   journalActivity(session, 'thinking');
@@ -8073,6 +8089,17 @@ function sessionOccupiedForRoomDelivery(session) {
 // deliver()'s busy/idle branches — so the two can never disagree.
 function maybeFlushRoomDelivery(session) {
   if (sessionOccupiedForRoomDelivery(session)) return;
+  // A priority peer is awaiting delivery (loop #688 F3): it outranks any pending
+  // peer-coalesced room batch, so flush the peer inbox FIRST. Each flush injects
+  // a turn (busy=true), and only one can go per turn-end; without this the
+  // ordinary path below flushes a pending room batch first when one exists,
+  // leaving the priority peer — the very message that caused the preemption —
+  // behind for another whole turn, inverting peer-priority > peer-coalesced.
+  if (session._priorityPreemptPending) {
+    session._priorityPreemptPending = false;
+    peerDelivery.flush(session, session.roomId);
+    if (sessionOccupiedForRoomDelivery(session)) return; // peer turn started; room batch waits
+  }
   // Counted BEFORE the flush, which clears the inbox either way — this is the
   // number the ⏳ line left outstanding, and the number Dan is owed an outcome
   // for. Zero means there was no queued batch, so there is nothing to close
@@ -8097,7 +8124,15 @@ function maybeFlushRoomDelivery(session) {
 // room convo — mirroring it into the session convo would duplicate it.
 const roomDelivery = createRoomDelivery({
   isBusy: sessionOccupiedForRoomDelivery,
-  injectTurn: (session, text) => sendTextToSession(session, text, { skipJournalMirror: true }),
+  // Tag the injected turn's tier by sender provenance (loop #688 F2): a purely
+  // agent-origin room batch is a coordinating peer turn (peer-coalesced,
+  // preemptable by a priority peer), while any operator (user:) message in the
+  // batch keeps it operator-protected (null). deliverRoomFrameTo stamps
+  // fromAgent on each message.
+  injectTurn: (session, text, messages) => sendTextToSession(session, text, {
+    skipJournalMirror: true,
+    turnTier: roomBatchTier(messages),
+  }),
   log: console,
 });
 
@@ -8131,7 +8166,17 @@ const peerDelivery = createRoomDelivery({
   // turn as hostile-by-default, while the deployment-conditional downstream
   // MATRON_PERMISSION_CARDS gate covers tool calls. When that gate is off, the
   // in-band marker is the sole control; peers gain no capability or elevation.
-  injectTurn: (session, text) => sendTextToSession(session, text, { skipJournalMirror: true }),
+  //
+  // The injected turn is tagged with its priority tier (loop #688 consumer
+  // half): a batch carrying any priority peer message runs as a 'peer-priority'
+  // turn, otherwise 'peer-coalesced'. sendToSession stamps this onto
+  // session.turnTier so a LATER inbound priority peer can decide, by the
+  // operator > peer-priority > peer-coalesced > autonomous precedence, whether
+  // it outranks and preempts this turn.
+  injectTurn: (session, text, messages) => sendTextToSession(session, text, {
+    skipJournalMirror: true,
+    turnTier: peerBatchTier(messages),
+  }),
   formatter: formatPeerDelivery,
   maxPendingBytes: 16 * 1024,
   pendingBytesOf: (message) => Buffer.byteLength(oneLine(message.body), 'utf8'),
@@ -8189,7 +8234,7 @@ function journalOnPeerMessage(frame) {
   session.peerHandledWatermark = frame.seq;
 
   const payload = frame.payload || {};
-  const decision = sessionOccupiedForRoomDelivery(session) ? 'coalesced' : 'injected';
+  let decision = sessionOccupiedForRoomDelivery(session) ? 'coalesced' : 'injected';
   peerDelivery.deliver(session, session.roomId, {
     roomId: payload.from_convo,
     convo: frame.convo_id,
@@ -8199,6 +8244,45 @@ function journalOnPeerMessage(frame) {
     body: payload.body,
     priority: payload.priority === true,
   });
+  // A priority peer queued behind a running turn (coalesced, not injected idle)
+  // must be delivered ahead of any lower-tier room batch at the turn-end flush
+  // (loop #688 F3) — whether or not it also preempts (iv coalesces without
+  // interrupting). maybeFlushRoomDelivery reads and clears this flag.
+  if (payload.priority === true && decision === 'coalesced') {
+    session._priorityPreemptPending = true;
+  }
+  // Consumer half (loop #688): a priority peer that arrives MID-TURN preempts
+  // the running turn ONLY IF it outranks it by the operator > peer-priority >
+  // peer-coalesced > autonomous precedence. It was just coalesced into the
+  // pending inbox above; interrupting the running turn makes the turn-end seam
+  // flush that inbox and inject it as its own turn. At a live prompt (busy
+  // false) shouldPreempt returns false — the message defers and injects
+  // normally, and an open prompt (occupied but not busy) is never interrupted.
+  //
+  // Guard on the message still being queued: a priority body over the peer
+  // inbox's byte cap self-evicts on delivery (room-delivery's while-loop), so
+  // interrupting would kill the running turn with nothing left to inject (F5).
+  // The busy branch always coalesced above, so pendingCount > 0 means the
+  // priority message (or peers coalesced with it) survived and is deliverable.
+  //
+  // iv-mode is excluded from auto-preemption (F2 round-2 / F1): its PTY turn
+  // lifecycle has no turn-generation-correlated Stop hook, so cancelling a turn
+  // and clearing busy could let the canceled turn's late, session-id-keyed hook
+  // end a replacement turn and paste input over it. Print-mode Claude and Codex
+  // keep busy=true through the interrupt (the result / process-exit seam is the
+  // interrupted turn's own end), so no replacement turn can start in the window.
+  // In iv the priority peer still coalesces with its PRIORITY marker and is
+  // delivered at the natural turn end.
+  if (shouldPreemptForPriorityPeer({
+    priority: payload.priority === true,
+    busy: session.busy === true,
+    runningTier: session.turnTier,
+  }) && !(session.iv && session.iv.alive) && peerDelivery.pendingCount(session.roomId) > 0) {
+    // Report the real interrupt outcome, not merely that we decided to preempt
+    // (F6): a dead child / wedged process / failed write leaves the message
+    // queued for the eventual turn end, and the log must say so.
+    decision = preemptForPriorityPeer(session) ? 'preempted' : 'preempt-failed';
+  }
   logPeerMessageDelivery(frame.convo_id, frame.seq, decision);
 }
 
@@ -8288,6 +8372,10 @@ function deliverRoomFrameTo(room, frame) {
   const queuedBefore = roomDelivery.pendingCount(session.roomId);
   roomDelivery.deliver(session, session.roomId, {
     roomId: frame.convo_id, roomTitle: room.title || room.topic || null, from, body, at: frame.ts,
+    // Sender provenance for turn-tier classification (loop #688 F2): an agent
+    // room turn is peer-coalesced (preemptable), a user (operator) room turn
+    // stays operator-protected.
+    fromAgent: isPeerAgent,
   });
   if (isPeerAgent && queuedBefore === 0 && roomDelivery.pendingCount(session.roomId) > 0) {
     journalPublishNotice(journalConvoIdFor(session), ROOM_MESSAGE_QUEUED_NOTICE);
@@ -8698,6 +8786,10 @@ async function approvePlanBuild(session, { sendHtml }) {
       persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { pendingPlanDenialId: null });
     }
     session.busy = true;
+    // Operator turn (approving a plan): reset the tier for the same reason as
+    // the prompt-answer seam above — a stale lower tier must not let a priority
+    // peer preempt operator work (loop #688 F1). null = operator-rank, protected.
+    session.turnTier = null;
     inflightMarker.noteTurnStart(journalConvoIdFor(session), session.roomId);
     const jsonMsg = JSON.stringify({
       type: 'user',
@@ -9859,6 +9951,52 @@ function recreateSession(roomId, overrides, { sendReply, sendHtml }) {
     flushPendingSessionQueue(next);
   }
   return next;
+}
+
+const PRIORITY_PEER_PREEMPT_NOTICE =
+  '⚡ Priority peer message — interrupting the current turn to deliver it.';
+
+// Loop #688 consumer half: interrupt the turn currently running so a
+// just-coalesced PRIORITY peer-message is delivered as its own turn. Called
+// only after shouldPreemptForPriorityPeer confirmed the priority peer outranks
+// the running turn (operator > peer-priority > peer-coalesced > autonomous), so
+// this never fires against an operator turn. It does not inject into the live
+// turn (that would corrupt a running generation or answer an open prompt) — it
+// interrupts, and the EXISTING turn-end seam then flushes the pending peer
+// inbox as its own turn.
+//
+// Returns true only if the interrupt was actually accepted, so the caller logs
+// `preempted` vs `preempt-failed` honestly and never claims an interrupt that
+// a dead child / wedged process / failed stdin write refused (F6).
+//
+// Only print-mode Claude and Codex reach here: both keep busy=true through the
+// interrupt (the result / finishCodexTurn seam is the interrupted turn's own
+// end and clears busy + flushes the inbox), so no replacement turn can start in
+// the interrupt window and there is no synchronous flush to race that seam. The
+// caller excludes iv-mode from auto-preemption; this guard is defensive.
+//
+// printModeInterrupt sets _codexInterrupted / pendingInterrupt synchronously
+// before it first awaits, so the post-call state is the acceptance signal.
+// Idempotent: re-entry while an interrupt is already in flight is a no-op that
+// still reports success, so a burst of priority peers interrupts once.
+function preemptForPriorityPeer(session) {
+  if (!session || !session.alive || !session.busy) return false;
+  if (session.iv && session.iv.alive) return false;
+  const convoId = journalConvoIdFor(session);
+  // Already interrupting this turn (a prior priority peer in the same burst):
+  // idempotent success, don't fire a second SIGINT.
+  if ((session.agent === AGENT_CODEX && session._codexInterrupted)
+    || (session.agent !== AGENT_CODEX && session.pendingInterrupt)) {
+    return true;
+  }
+  // printModeInterrupt sets _codexInterrupted / pendingInterrupt synchronously
+  // before it first awaits, so the post-call state is the acceptance signal.
+  Promise.resolve(printModeInterrupt(session, () => {})).catch(() => {});
+  const accepted = session.agent === AGENT_CODEX
+    ? session._codexInterrupted === true
+    : !!session.pendingInterrupt;
+  if (accepted) journalPublishNotice(convoId, PRIORITY_PEER_PREEMPT_NOTICE);
+  return accepted;
 }
 
 // Print-mode turn interrupt — the print-mode counterpart of iv-mode's Esc
