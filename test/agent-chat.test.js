@@ -1096,12 +1096,13 @@ describe('index.js routes + ask-user.js tools (source inspection)', () => {
     ['/agent-chat-accept', 'chatAccept'],
     ['/agent-chat-refuse', 'chatRefuse'],
     ['/agent-chat-join', 'chatJoin'],
+    ['/agent-chat-invite', 'chatInvite'],
     ['/agent-chat-leave', 'chatLeave'],
     ['/agent-chat-read', 'chatRead'],
   ];
   const TOOLS = [
     'agent_roster', 'agent_sessions', 'agent_message', 'agent_chat_start', 'agent_chat_send', 'agent_chat_accept',
-    'agent_chat_refuse', 'agent_chat_join', 'agent_chat_leave', 'agent_chat_read',
+    'agent_chat_refuse', 'agent_chat_join', 'agent_chat_invite', 'agent_chat_leave', 'agent_chat_read',
   ];
   const indexSrc = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
   const askUserSrc = readFileSync(new URL('../ask-user.js', import.meta.url), 'utf-8');
@@ -1223,6 +1224,7 @@ describe('index.js routes + ask-user.js tools (source inspection)', () => {
     ['agent_chat_accept', '/agent-chat-accept', ['roomId: ROOM_ID', 'room_id']],
     ['agent_chat_refuse', '/agent-chat-refuse', ['roomId: ROOM_ID', 'room_id', 'reason']],
     ['agent_chat_join', '/agent-chat-join', ['roomId: ROOM_ID', 'room_id', 'justification']],
+    ['agent_chat_invite', '/agent-chat-invite', ['roomId: ROOM_ID', 'room_id', 'target_convo_id', 'justification']],
     ['agent_chat_leave', '/agent-chat-leave', ['roomId: ROOM_ID', 'room_id']],
     ['agent_chat_read', '/agent-chat-read', ['roomId: ROOM_ID', 'room_id', 'limit']],
   ];
@@ -1479,6 +1481,16 @@ describe('local (same-bridge) rooms', () => {
       const { handlers, invites } = makeFixture(); // room-1 never recorded
       const res = await handlers.chatInvite({ roomId: '!sess', room_id: 'room-1', target_convo_id: 'convo-remote', justification: 'j' });
       expect(res.status).toBe(404);
+      expect(invites.invite).not.toHaveBeenCalled();
+    });
+
+    it('rejects inviting into a still-PENDING owner room — must be joined first (409, no invite sent)', async () => {
+      const { handlers, rooms, invites } = makeFixture();
+      // Owner started the room but the first guest has not accepted yet.
+      rooms.record('room-1', { role: 'owner', state: 'pending', sessionRoomId: '!sess', peerDeviceId: 9 });
+      const res = await handlers.chatInvite({ roomId: '!sess', room_id: 'room-1', target_convo_id: 'convo-remote', justification: 'j' });
+      expect(res.status).toBe(409);
+      expect(res.body.error).toMatch(/not joined/i);
       expect(invites.invite).not.toHaveBeenCalled();
     });
 
