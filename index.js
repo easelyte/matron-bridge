@@ -3344,6 +3344,11 @@ function submitAnswer(session, answerText, { mirrorToJournal = true } = {}) {
       return;
     }
     session.busy = true;
+    // Operator turn (answering a prompt): reset the tier so a stale peer tier
+    // left by a previous turn can never let a priority peer preempt this
+    // operator work (loop #688 — the turnTier leak F1). null = operator-rank,
+    // protected. This is a direct busy=true seam that bypasses sendToSession.
+    session.turnTier = null;
     inflightMarker.noteTurnStart(journalConvoIdFor(session), session.roomId);
     journalSessionState(session, 'running');
     journalActivity(session, 'thinking');
@@ -8224,13 +8229,21 @@ function journalOnPeerMessage(frame) {
   // flush that inbox and inject it as its own turn. At a live prompt (busy
   // false) shouldPreempt returns false — the message defers and injects
   // normally, and an open prompt (occupied but not busy) is never interrupted.
+  //
+  // Guard on the message still being queued: a priority body over the peer
+  // inbox's byte cap self-evicts on delivery (room-delivery's while-loop), so
+  // interrupting would kill the running turn with nothing left to inject (F5).
+  // The busy branch always coalesced above, so pendingCount > 0 means the
+  // priority message (or peers coalesced with it) survived and is deliverable.
   if (shouldPreemptForPriorityPeer({
     priority: payload.priority === true,
     busy: session.busy === true,
     runningTier: session.turnTier,
-  })) {
-    decision = 'preempted';
-    preemptForPriorityPeer(session);
+  }) && peerDelivery.pendingCount(session.roomId) > 0) {
+    // Report the real interrupt outcome, not merely that we decided to preempt
+    // (F6): a dead child / wedged process / failed write leaves the message
+    // queued for the eventual turn end, and the log must say so.
+    decision = preemptForPriorityPeer(session) ? 'preempted' : 'preempt-failed';
   }
   logPeerMessageDelivery(frame.convo_id, frame.seq, decision);
 }
@@ -8731,6 +8744,10 @@ async function approvePlanBuild(session, { sendHtml }) {
       persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { pendingPlanDenialId: null });
     }
     session.busy = true;
+    // Operator turn (approving a plan): reset the tier for the same reason as
+    // the prompt-answer seam above — a stale lower tier must not let a priority
+    // peer preempt operator work (loop #688 F1). null = operator-rank, protected.
+    session.turnTier = null;
     inflightMarker.noteTurnStart(journalConvoIdFor(session), session.roomId);
     const jsonMsg = JSON.stringify({
       type: 'user',
@@ -9902,25 +9919,35 @@ const PRIORITY_PEER_PREEMPT_NOTICE =
 // only after shouldPreemptForPriorityPeer confirmed the priority peer outranks
 // the running turn (operator > peer-priority > peer-coalesced > autonomous), so
 // this never fires against an operator turn. It does not inject into the live
-// turn (that would corrupt a running generation or answer an open prompt) —
-// it interrupts, and the turn-end seam then flushes the pending peer inbox.
+// turn (that would corrupt a running generation or answer an open prompt) — it
+// interrupts, and the EXISTING turn-end seam then flushes the pending peer
+// inbox as its own turn.
 //
-// Mode dispatch mirrors the !esc / print-interrupt rescue paths:
-//   - iv-mode: send Esc, clear busy, note the turn end, then flush the pending
-//     peer inbox — the Esc path does not itself pass through a turn-end flush.
-//   - print-mode Claude / Codex: printModeInterrupt sends the interrupt and the
-//     eventual result / finishCodexTurn seam clears busy and flushes the inbox.
-// Idempotent: re-entry while an interrupt is already in flight is a no-op, so a
-// burst of priority peers interrupts the running turn exactly once.
+// Returns true only if the interrupt was actually accepted, so the caller logs
+// `preempted` vs `preempt-failed` honestly and never claims an interrupt that
+// a dead child / wedged process / failed stdin write refused (F6).
+//
+// Mode dispatch:
+//   - iv-mode: send Esc and clear busy exactly like the !esc rescue. It does
+//     NOT synchronously flush the priority inbox: the canceled turn's async
+//     Stop hook (or the next inbound frame) drives maybeFlushRoomDelivery, and
+//     forcing a flush here would let that late, session-id-keyed hook end the
+//     freshly-started priority turn and paste more input on top of it (F2).
+//   - print-mode Claude / Codex: reuse printModeInterrupt (its state mutations
+//     run synchronously before its first await, so acceptance is known
+//     immediately); the eventual result / finishCodexTurn seam clears busy and
+//     flushes the inbox. No synchronous flush, so no race with that seam.
+// Idempotent: re-entry while an interrupt is already in flight is a no-op that
+// still reports success, so a burst of priority peers interrupts once.
 function preemptForPriorityPeer(session) {
-  if (!session || !session.alive || !session.busy) return;
+  if (!session || !session.alive || !session.busy) return false;
   const convoId = journalConvoIdFor(session);
   if (session.iv && session.iv.alive) {
     try {
       session.iv.sendKeystroke('esc');
     } catch (err) {
       debug(`priority-peer preempt: iv esc failed: ${err.message}`);
-      return;
+      return false;
     }
     session.pendingUnclassifiedPrompt = false;
     session.busy = false;
@@ -9928,15 +9955,22 @@ function preemptForPriorityPeer(session) {
     journalSessionState(session, 'waiting');
     journalActivity(session, 'idle');
     journalPublishNotice(convoId, PRIORITY_PEER_PREEMPT_NOTICE);
-    maybeFlushRoomDelivery(session);
-    return;
+    return true;
   }
-  // Codex + print-mode Claude both interrupt through printModeInterrupt. Skip
-  // if an interrupt is already pending/sent for this turn so a burst preempts
-  // once rather than firing SIGINT repeatedly.
-  if (session.pendingInterrupt || session._codexInterrupted) return;
-  journalPublishNotice(convoId, PRIORITY_PEER_PREEMPT_NOTICE);
+  // Already interrupting this turn (a prior priority peer in the same burst):
+  // idempotent success, don't fire a second SIGINT.
+  if ((session.agent === AGENT_CODEX && session._codexInterrupted)
+    || (session.agent !== AGENT_CODEX && session.pendingInterrupt)) {
+    return true;
+  }
+  // printModeInterrupt sets _codexInterrupted / pendingInterrupt synchronously
+  // before it first awaits, so the post-call state is the acceptance signal.
   Promise.resolve(printModeInterrupt(session, () => {})).catch(() => {});
+  const accepted = session.agent === AGENT_CODEX
+    ? session._codexInterrupted === true
+    : !!session.pendingInterrupt;
+  if (accepted) journalPublishNotice(convoId, PRIORITY_PEER_PREEMPT_NOTICE);
+  return accepted;
 }
 
 // Print-mode turn interrupt — the print-mode counterpart of iv-mode's Esc

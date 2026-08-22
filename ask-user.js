@@ -264,7 +264,7 @@ server.tool(
       .boolean()
       .optional()
       .describe(
-        'Mark this as a priority message — the target session surfaces it with a louder in-timeline marker, without stealing focus or interrupting a reply in progress. Use sparingly, for time-sensitive coordination.',
+        "Mark this as a priority message. The target surfaces it with a louder in-timeline marker, and while the target is mid-turn on lower-priority work (a coordinating peer turn, or autonomous work) a priority message may interrupt that turn so it is handled sooner. It never interrupts the operator's own in-progress turn or an equal-priority peer turn, and when the target is idle at a prompt it is delivered normally without interrupting. Use sparingly, for time-sensitive coordination.",
       ),
   },
   async ({ target_convo, body, priority }) => {

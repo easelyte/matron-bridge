@@ -71,7 +71,7 @@ function session(overrides = {}) {
   };
 }
 
-function makeRuntime({ target = session(), persistImpl, markBusyOnInject = false } = {}) {
+function makeRuntime({ target = session(), persistImpl, markBusyOnInject = false, preemptResult = true } = {}) {
   const sessions = new Map(target ? [[target.roomId, target]] : []);
   const persistCalls = [];
   const injectCalls = [];
@@ -88,8 +88,10 @@ function makeRuntime({ target = session(), persistImpl, markBusyOnInject = false
   };
   // The real precedence gate is exercised end-to-end; only the side-effecting
   // interrupt is stubbed to a spy so the receive path can be tested without a
-  // live PTY / Codex process.
-  const preemptForPriorityPeer = (session) => { preemptCalls.push(session); };
+  // live PTY / Codex process. It returns the accepted/failed boolean the real
+  // preemptForPriorityPeer returns, which drives the preempted/preempt-failed
+  // decision (F6).
+  const preemptForPriorityPeer = (session) => { preemptCalls.push(session); return preemptResult; };
   const runtime = buildPeerRuntime(
     sessions,
     persistSession,
@@ -539,6 +541,29 @@ describe('journalOnPeerMessage priority preemption (loop #688 consumer half)', (
     const target = session({ busy: true, turnTier: 'autonomous' });
     const runtime = makeRuntime({ target });
     runtime.journalOnPeerMessage(peerFrame());
+    assert.equal(runtime.preemptCalls.length, 0);
+    assert.equal(runtime.decisionLogs().at(-1).decision, 'coalesced');
+  });
+
+  it('logs preempt-failed (not preempted) when the interrupt is refused (F6)', () => {
+    const target = session({ busy: true, turnTier: 'autonomous' });
+    const runtime = makeRuntime({ target, preemptResult: false });
+    runtime.journalOnPeerMessage(priorityFrame());
+    assert.equal(runtime.preemptCalls.length, 1);
+    assert.equal(runtime.decisionLogs().at(-1).decision, 'preempt-failed');
+    // The message stays queued for the eventual turn end — never lost.
+    assert.equal(runtime.peerDelivery.pendingCount(target.roomId), 1);
+  });
+
+  it('does NOT interrupt when the priority body self-evicts past the byte cap (F5)', () => {
+    // A single body over the 16 KiB peer-inbox cap is appended then evicted by
+    // room-delivery's while-loop, so nothing is left to inject; interrupting
+    // the running turn would kill it with no replacement. 5000 × 4-byte glyph
+    // = 20000 bytes > 16384.
+    const target = session({ busy: true, turnTier: 'autonomous' });
+    const runtime = makeRuntime({ target });
+    runtime.journalOnPeerMessage(priorityFrame({ payload: { body: '💥'.repeat(5000) } }));
+    assert.equal(runtime.peerDelivery.pendingCount(target.roomId), 0);
     assert.equal(runtime.preemptCalls.length, 0);
     assert.equal(runtime.decisionLogs().at(-1).decision, 'coalesced');
   });
