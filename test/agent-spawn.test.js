@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'fs';
 import { createAgentSpawnHandlers } from '../lib/agent-spawn.js';
+import { createAgentRooms } from '../lib/agent-rooms.js';
 
 // Fake publisher + recording rooms/notifyParent, modeled on agent-chat.test.js's
 // fake-publisher style. `sent` records every sendRoomOp frame in order so
@@ -13,12 +14,22 @@ function mk(overrides = {}) {
     sendRoomOp: overrides.sendRoomOp ?? ((frame) => { sent.push(frame); return true; }),
   };
   const roomsCalls = [];
-  const rooms = {
-    record: (roomId, fields) => { roomsCalls.push({ roomId, fields }); },
+  // Stateful fake: record() both logs the call (existing assertions read
+  // `calls`) AND merges into a store so get() can observe a pre-existing
+  // binding — the same-box path relies on rooms.get(). A test can pass its own
+  // `rooms` (e.g. a real createAgentRooms) via overrides.rooms.
+  const roomsStore = new Map();
+  const rooms = overrides.rooms ?? {
+    record: (roomId, fields) => {
+      roomsCalls.push({ roomId, fields });
+      roomsStore.set(roomId, { ...(roomsStore.get(roomId) || {}), ...fields });
+      return { ...roomsStore.get(roomId) };
+    },
+    get: (roomId) => { const r = roomsStore.get(roomId); return r ? { ...r } : null; },
     isActive: () => true,
     calls: roomsCalls,
   };
-  const sessions = new Map([['sess-1', { roomId: 'sess-1' }]]);
+  const sessions = overrides.sessions ?? new Map([['sess-1', { roomId: 'sess-1' }]]);
   const notifyParent = vi.fn((args) => notices.push(args));
   const handlers = createAgentSpawnHandlers({
     sessions,
@@ -274,6 +285,125 @@ describe('createAgentSpawnHandlers', () => {
       ctx3.handlers.onSpawnFrame({ kind: 'spawn', event: 'outcome', request_id: 'row-1', outcome: 'started' });
       expect(ctx3.notices[0].text).not.toMatch(/undefined/);
       expect(ctx3.notices[0].text).toMatch(/unknown/);
+    });
+  });
+
+  // #690 F1 — same-box spawn room binding. When the parent spawns a session on
+  // its OWN box, this bridge is BOTH the parent's bridge and the target bridge,
+  // so the target-side `start` handler (index.js bindSpawnRoom) has already
+  // bound the CHILD session as the primary binding on THIS registry before the
+  // journal emits the outcome frame. The outcome handler must PROMOTE that child
+  // binding into the guest slot (the same-bridge local-room field) rather than
+  // clobbering sessionRoomId with the parent — otherwise the room is no longer a
+  // local room and the child cannot route its report back to the parent.
+  describe('same-box spawn room binding (#690 F1)', () => {
+    // Arm a pending spawn against a caller-supplied handler context (so the test
+    // can wire a real createAgentRooms), then resolve the started outcome.
+    async function armStartedWith(overrides) {
+      const ctx = mk(overrides);
+      const p = ctx.handlers.sessionStart({ roomId: 'sess-1', device_id: 2, workdir: '/w', task: 'do the thing', topic: 'T' });
+      const rid = ctx.sent[0].request_id;
+      ctx.handlers.onSpawnFrame({ kind: 'spawn', event: 'pending', request_id: rid, spawn_id: 'row-1' });
+      await p;
+      return ctx;
+    }
+
+    // A sessions map with the parent AND a LIVE child session — bindSpawnRoom
+    // starts the child (sessions.set) during the start RPC, so by outcome time
+    // the child is live on this bridge. The promotion requires that liveness.
+    const childKey = 'child-session-room-key';
+    const sameBoxSessions = () => new Map([
+      ['sess-1', { roomId: 'sess-1' }],
+      [childKey, { roomId: childKey }],
+    ]);
+
+    it('promotes the pre-bound local child binding into guestSessionRoomId; parent becomes owner; child can route', async () => {
+      const rooms = createAgentRooms();
+      // Simulate the target-side bindSpawnRoom (index.js:827): on a same-box
+      // spawn it bound the CHILD session as the primary binding, keyed by the
+      // child's BRIDGE session key (NOT its journal convo id).
+      rooms.record('room-9', { role: 'guest', state: 'joined', sessionRoomId: childKey });
+
+      const ctx = await armStartedWith({ rooms, sessions: sameBoxSessions() });
+      ctx.handlers.onSpawnFrame({ kind: 'spawn', event: 'outcome', request_id: 'row-1', outcome: 'started', room_id: 'room-9', child_convo_id: 'child-convo-distinct' });
+
+      const room = rooms.get('room-9');
+      // Owner binding is the parent; the child binding was NOT clobbered — it
+      // moved to the guest slot, so the room is now a local (same-bridge) room.
+      expect(room.role).toBe('owner');
+      expect(room.state).toBe('joined');
+      expect(room.sessionRoomId).toBe('sess-1');
+      expect(room.guestSessionRoomId).toBe(childKey);
+      expect(room.guestState).toBe('joined');
+
+      // The child routes its report through the guest binding, keyed by its
+      // bridge session key — proving end-to-end the report channel resolves.
+      expect(rooms.bindingFor('room-9', childKey)).toEqual({ role: 'guest', state: 'joined', binding: 'guest' });
+      // …and the parent still holds the primary owner binding.
+      expect(rooms.bindingFor('room-9', 'sess-1')).toEqual({ role: 'owner', state: 'joined', binding: 'primary' });
+      // The child's session key is discoverable for this room (teardown/routing).
+      expect(rooms.forSession(childKey).some((r) => r.roomId === 'room-9')).toBe(true);
+    });
+
+    it('uses the key bindSpawnRoom stored, NOT frame.child_convo_id (a fresh session key differs from its journal convo id)', async () => {
+      const rooms = createAgentRooms();
+      rooms.record('room-9', { role: 'guest', state: 'joined', sessionRoomId: childKey });
+
+      const ctx = await armStartedWith({ rooms, sessions: sameBoxSessions() });
+      // child_convo_id is deliberately distinct from the child's session key.
+      ctx.handlers.onSpawnFrame({ kind: 'spawn', event: 'outcome', request_id: 'row-1', outcome: 'started', room_id: 'room-9', child_convo_id: 'child-convo-distinct' });
+
+      const room = rooms.get('room-9');
+      expect(room.guestSessionRoomId).toBe(childKey);
+      expect(room.guestSessionRoomId).not.toBe('child-convo-distinct');
+    });
+
+    it('cross-box outcome is unchanged — no pre-existing local record, so owner-only, guestSessionRoomId stays null', async () => {
+      const rooms = createAgentRooms();
+      const ctx = await armStartedWith({ rooms });
+      ctx.handlers.onSpawnFrame({ kind: 'spawn', event: 'outcome', request_id: 'row-1', outcome: 'started', room_id: 'room-cross', child_convo_id: 'child-remote' });
+
+      const room = rooms.get('room-cross');
+      expect(room.role).toBe('owner');
+      expect(room.state).toBe('joined');
+      expect(room.sessionRoomId).toBe('sess-1');
+      // Remote child — NOT a local session on this box; the local-room field
+      // must stay null so routing never misroutes to a non-existent local session.
+      expect(room.guestSessionRoomId).toBeNull();
+      // bindingFor for a stranger key returns null (nothing to misroute to).
+      expect(rooms.bindingFor('room-cross', 'child-remote')).toBeNull();
+    });
+
+    // Provenance hardening (#690 F1, Codex review): the promotion must not fire
+    // on any single-ended record that merely happens to sit at the room id.
+    it('does NOT promote a single-ended record whose session is not live on this bridge', async () => {
+      const rooms = createAgentRooms();
+      // A guest/joined record whose session key is NOT in the sessions map —
+      // a stale persisted binding, not the child bindSpawnRoom just started.
+      rooms.record('room-9', { role: 'guest', state: 'joined', sessionRoomId: 'ghost-key' });
+      // sessions holds only the parent — 'ghost-key' is not live.
+      const ctx = await armStartedWith({ rooms });
+      ctx.handlers.onSpawnFrame({ kind: 'spawn', event: 'outcome', request_id: 'row-1', outcome: 'started', room_id: 'room-9', child_convo_id: 'child-1' });
+
+      const room = rooms.get('room-9');
+      expect(room.sessionRoomId).toBe('sess-1');
+      expect(room.guestSessionRoomId).toBeNull();
+      // The stale binding gained no routing.
+      expect(rooms.bindingFor('room-9', 'ghost-key')).toBeNull();
+    });
+
+    it('does NOT promote a record that is not a joined guest (wrong role/state)', async () => {
+      const rooms = createAgentRooms();
+      // An owner/pending record at this room id — does not match bindSpawnRoom's
+      // {role:'guest', state:'joined'} write, so it is not treated as the child
+      // even though its session is live.
+      rooms.record('room-9', { role: 'owner', state: 'pending', sessionRoomId: childKey });
+      const ctx = await armStartedWith({ rooms, sessions: sameBoxSessions() });
+      ctx.handlers.onSpawnFrame({ kind: 'spawn', event: 'outcome', request_id: 'row-1', outcome: 'started', room_id: 'room-9', child_convo_id: 'child-1' });
+
+      const room = rooms.get('room-9');
+      expect(room.sessionRoomId).toBe('sess-1');
+      expect(room.guestSessionRoomId).toBeNull();
     });
   });
 
