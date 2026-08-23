@@ -111,28 +111,33 @@ describe('recent_folders', () => {
     );
   });
 
-  it('includes activity and limits verbatim alongside folders when the thunks return them', () => {
+  it('includes activity, limits, and disk verbatim alongside folders when the thunks return them', () => {
     const activity = { live_sessions: 1, last_hour: [{ path: '/w', sessions: 1 }] };
     const limits = { as_of: 5, lines: [{ id: 'session', label: 'Session', percent: 1 }] };
+    const disk = { free_bytes: 1024, total_bytes: 2048 };
     const { handler, responses } = harness({
       getActivity: () => activity,
       getLimits: () => limits,
+      getDisk: () => disk,
     });
     handler(REQ('recent_folders', {}));
     expect(responses[0].result.activity).toEqual(activity);
     expect(responses[0].result.limits).toEqual(limits);
+    expect(responses[0].result.disk).toEqual(disk);
     expect(responses[0].result.folders).toBeDefined();
   });
 
-  it('omits activity and limits when the thunks return null', () => {
+  it('omits activity, limits, and disk when the thunks return null', () => {
     const { handler, responses } = harness({
       getActivity: () => null,
       getLimits: () => null,
+      getDisk: () => null,
     });
     handler(REQ('recent_folders', {}));
     const { result } = responses[0];
     expect('activity' in result).toBe(false);
     expect('limits' in result).toBe(false);
+    expect('disk' in result).toBe(false);
     expect(result.folders).toBeDefined();
   });
 
@@ -140,6 +145,7 @@ describe('recent_folders', () => {
     const { handler, responses } = harness({
       getActivity: () => { throw new Error('cache cold'); },
       getLimits: () => { throw new Error('cache cold'); },
+      getDisk: () => { throw new Error('statfs unsupported'); },
       listPersistedSessions: () => [{ workdir: '/w/a', lastUsed: 1 }],
     });
     handler(REQ('recent_folders', {}));
@@ -147,6 +153,7 @@ describe('recent_folders', () => {
     expect(ok).toBe(true);
     expect('activity' in result).toBe(false);
     expect('limits' in result).toBe(false);
+    expect('disk' in result).toBe(false);
     expect(result.folders.map((f) => f.path)).toEqual(['/w/a', '/home/dan']);
   });
 

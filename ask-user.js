@@ -5,6 +5,7 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
+import { resolvePermissionTimeoutMs } from './lib/permission-prompt.js';
 import { formatBox } from './lib/agent-boxes-format.js';
 
 // Route to whichever bridge spawned us: explicit BRIDGE_API_URL wins, else the
@@ -17,6 +18,13 @@ const BRIDGE_API = process.env.BRIDGE_API_URL
 const ROOM_ID = process.env.BRIDGE_ROOM_ID || null;
 const POLL_INTERVAL_MS = 500;
 const SECRET_TIMEOUT_MS = 300000;    // 5 min max wait for secret submission
+// Max wait for a permission tap — the bridge's registry TTL resolves from the
+// same env var through the same validation, keeping one expiry for the whole
+// request lifecycle (default 5 min; out-of-range overrides fall back).
+const PERMISSION_TIMEOUT_MS = resolvePermissionTimeoutMs(process.env.PERMISSION_PROMPT_TIMEOUT_MS);
+// Per-request cap on any single bridge round-trip: the deny-on-timeout
+// guarantee only holds if no individual fetch can hang past the deadline.
+const BRIDGE_FETCH_TIMEOUT_MS = 10000;
 
 const server = new McpServer({
   name: 'ask-user',
@@ -61,6 +69,65 @@ server.tool(
       return { content: [{ type: 'text', text: 'Secret request timed out — no input received within 5 minutes.' }] };
     } catch (err) {
       return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
+    }
+  }
+);
+
+server.tool(
+  'permission_request',
+  'Internal: Claude Code invokes this automatically (via --permission-prompt-tool) to ask the user for tool permission through Matron. Never call it yourself.',
+  {
+    tool_name: z.string().describe('Name of the tool Claude wants to use'),
+    input: z.any().describe('The input Claude wants to pass to the tool'),
+    tool_use_id: z.string().optional().describe('The tool use id this permission request is for'),
+    permission_suggestions: z.any().optional().describe('Permission rule suggestions from Claude Code (accepted and ignored)'),
+  },
+  async ({ tool_name, input }) => {
+    // The return text IS the protocol: Claude Code JSON-parses it. Fail
+    // CLOSED — any relay failure denies rather than silently allowing.
+    const deny = (message) => ({ content: [{ type: 'text', text: JSON.stringify({ behavior: 'deny', message }) }] });
+    const allow = () => ({ content: [{ type: 'text', text: JSON.stringify({ behavior: 'allow', updatedInput: input ?? {} }) }] });
+    try {
+      const postRes = await fetch(`${BRIDGE_API}/permission-request`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ roomId: ROOM_ID, toolName: tool_name, input: input ?? {} }),
+        signal: AbortSignal.timeout(BRIDGE_FETCH_TIMEOUT_MS),
+      });
+      if (!postRes.ok) {
+        return deny(`Matron bridge rejected the permission request (HTTP ${postRes.status}).`);
+      }
+      const data = await postRes.json();
+      if (data.behavior === 'allow') return allow(); // session-allowlisted tool, no card
+
+      const { requestId } = data;
+      if (typeof requestId !== 'string' || requestId === '') {
+        return deny('Matron bridge returned an invalid permission request id.');
+      }
+      const deadline = Date.now() + PERMISSION_TIMEOUT_MS;
+      while (Date.now() < deadline) {
+        await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
+        // Transient poll failures (bridge restart, timeout) retry until the
+        // deadline; only the deadline itself resolves the request (→ deny).
+        let status;
+        try {
+          const pollRes = await fetch(`${BRIDGE_API}/permission-request/${requestId}`, {
+            signal: AbortSignal.timeout(BRIDGE_FETCH_TIMEOUT_MS),
+          });
+          if (!pollRes.ok) continue;
+          status = await pollRes.json();
+        } catch {
+          continue;
+        }
+        if (status.answered) {
+          return status.behavior === 'allow'
+            ? allow()
+            : deny(status.message || 'The user denied this tool use from Matron.');
+        }
+      }
+      return deny(`The user did not answer the permission prompt within ${Math.round(PERMISSION_TIMEOUT_MS / 60000)} minutes. You may continue other work that does not need this permission.`);
+    } catch (err) {
+      return deny(`Permission relay error: ${err.message}`);
     }
   }
 );

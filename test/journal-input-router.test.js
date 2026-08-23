@@ -736,11 +736,24 @@ describe('index.js journal input consumer — auto-resume wiring (source inspect
     // it must tell the shared helper NOT to also mirror the room-facing
     // "Auto-resuming session…" notice into the journal — Matron users were
     // getting both.
+    //
+    // The suppression itself now lives one level down, in resumeSleepingSession
+    // — the body journalResumeConvo shares with the by-room wake the inbound
+    // agent-chat path uses. So this pins the pair: the shared body suppresses
+    // the mirror exactly when it published a notice of its own, and
+    // journalResumeConvo always hands it a convo id to publish into (so its
+    // own branch is unconditionally the one-message one).
+    const sStart = src.indexOf('function resumeSleepingSession(');
+    expect(sStart).toBeGreaterThan(-1);
+    const shared = src.slice(sStart, src.indexOf('\nfunction ', sStart + 1));
+    expect(shared).toMatch(/if \(noticeConvoId\) journalPublishNotice\(noticeConvoId, noticeText\);/);
+    expect(shared).toMatch(/resumePersistedSession\(roomId, prev, \{ skipJournalMirror: !!noticeConvoId \}\)/);
+
     const start = src.indexOf('function journalResumeConvo(');
     expect(start).toBeGreaterThan(-1);
     const end = src.indexOf('\nfunction ', start + 1);
     const body = src.slice(start, end);
-    expect(body).toMatch(/resumePersistedSession\(roomId, prev, \{ skipJournalMirror: true \}\)/);
+    expect(body).toMatch(/resumeSleepingSession\(roomId, prev, convoId, noticeText\)/);
 
     // …and the helper threads that flag into the sendToRoom carrying the
     // notice (the session's own sendCallback/sendHtml stay mirrored). Bound
@@ -820,6 +833,20 @@ describe('promptExpectsReply', () => {
   it('a mixed set with any answerable-looking option stays guarded', () => {
     expect(promptExpectsReply({ options: [{ id: 'model-sonnet' }, { id: 'opt_a' }] })).toBe(true);
   });
+
+  it('classifies a permission card as a non-answerable picker frame', () => {
+    const payload = {
+      question: '🔐 Permission: Claude wants to run Bash',
+      options: [
+        { id: 'perm-allow', label: 'Allow once', value: 'perm:01234567-89ab-cdef-0123-456789abcdef:allow' },
+        { id: 'perm-always', label: 'Always allow Bash (session)', value: 'perm:01234567-89ab-cdef-0123-456789abcdef:always' },
+        { id: 'perm-deny', label: 'Deny', value: 'perm:01234567-89ab-cdef-0123-456789abcdef:deny' },
+      ],
+      mode: 'pick_one',
+    };
+    expect(isPickerFrame(payload)).toBe(true);
+    expect(promptExpectsReply(payload)).toBe(false);
+  });
 });
 
 // Client-sent media (file/image/voice-note) events: a `type:'file'|'image'`
@@ -860,7 +887,7 @@ describe('createJournalInputConsumer — media (file/image) routing', () => {
     expect(session).toEqual({ claudeSessionId: 'convo-1' });
     expect(media).toEqual({
       type: 'file', blobRef: 'blob-1', contentType: 'application/pdf',
-      name: 'report.pdf', size: 1234, dims: null, caption: null,
+      name: 'report.pdf', size: 1234, dims: null, caption: null, batch: null,
     });
     expect(ctx).toEqual({ username: 'dan' });
     expect(deps.routeTextToSession).not.toHaveBeenCalled();
@@ -905,8 +932,40 @@ describe('createJournalInputConsumer — media (file/image) routing', () => {
     const [, media] = deps.routeMediaToSession.mock.calls[0];
     expect(media).toEqual({
       type: 'image', blobRef: 'img-9', contentType: 'image/png',
-      name: 'shot.png', size: 55, dims: { w: 800, h: 600 }, caption: null,
+      name: 'shot.png', size: 55, dims: { w: 800, h: 600 }, caption: null, batch: null,
     });
+  });
+
+  it('folds the composer batch tag off the payload into media.batch', () => {
+    const deps = makeDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(baseFrame({
+      type: 'image',
+      payload: {
+        blob_ref: 'img-9', content_type: 'image/png', name: 'shot.png',
+        batch_id: 'B1', batch_index: 2, batch_total: 3,
+      },
+    }));
+    expect(deps.routeMediaToSession.mock.calls[0][1].batch)
+      .toEqual({ id: 'B1', index: 2, total: 3 });
+  });
+
+  it('treats a malformed batch tag as absent (non-integer index, missing id)', () => {
+    // The tag gates gathering only — anything off pattern must degrade to
+    // the per-frame path, never drop the media.
+    const deps = makeDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(baseFrame({
+      type: 'image',
+      payload: { blob_ref: 'a', batch_id: 'B1', batch_index: 'two', batch_total: 3 },
+    }));
+    consumer(baseFrame({
+      type: 'image',
+      payload: { blob_ref: 'b', batch_index: 1, batch_total: 3 },
+    }));
+    expect(deps.routeMediaToSession).toHaveBeenCalledTimes(2);
+    expect(deps.routeMediaToSession.mock.calls[0][1].batch).toBeNull();
+    expect(deps.routeMediaToSession.mock.calls[1][1].batch).toBeNull();
   });
 
   it('falls back to a top-level frame.blob_ref when the payload has none', () => {
@@ -1359,9 +1418,19 @@ describe('createJournalInputConsumer — queued_release end-to-end', () => {
     });
     expect(deps.noticeStalePromptReply).not.toHaveBeenCalled();
 
+    // 'send_one' ("send just this one, keep the rest queued") is a wire action
+    // in its own right — a card offering it is dead if the router refuses the
+    // reply as invalid, which is exactly what happens to any value not in
+    // QUEUED_RELEASE_ACTIONS.
+    consumer(tap('send_one'));
+    expect(deps.routePromptReply).toHaveBeenCalledTimes(2);
+    expect(deps.routePromptReply.mock.calls[1][1]).toEqual({
+      target_seq: CARD_SEQ, choice: 'send_one', text: null,
+    });
+
     // Unknown action on a known card → warn + user notice, no route.
     consumer(tap('frobnicate'));
-    expect(deps.routePromptReply).toHaveBeenCalledTimes(1); // unchanged
+    expect(deps.routePromptReply).toHaveBeenCalledTimes(2); // unchanged
     expect(deps.noticeQueuedReleaseIgnored).toHaveBeenCalledWith(CONVO, expect.objectContaining({ reason: 'invalid-action' }));
     expect(warnings.some(w => /invalid queued_release action/.test(w))).toBe(true);
 
@@ -1372,7 +1441,7 @@ describe('createJournalInputConsumer — queued_release end-to-end', () => {
     // never falling through to the ordinary answer path.
     deps.noticeQueuedReleaseIgnored.mockClear();
     consumer(tap('send'));
-    expect(deps.routePromptReply).toHaveBeenCalledTimes(1); // still unchanged
+    expect(deps.routePromptReply).toHaveBeenCalledTimes(2); // still unchanged
     expect(deps.noticeQueuedReleaseIgnored).toHaveBeenCalledWith(CONVO, expect.objectContaining({ reason: 'tombstoned' }));
   });
 });

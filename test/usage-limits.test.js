@@ -151,6 +151,27 @@ describe('resetsAtMs', () => {
     expect(resetsAtMs('Jul 9, 12:59am (UTC)', now)).toBe(Date.parse('2026-07-09T00:59:00.000Z'));
   });
 
+  it('parses on-the-hour text with no minutes — the weekly-line format', () => {
+    // Real /usage output 2026-08-15: "Current week (all models): 32% used ·
+    // resets Aug 20 at 10am (Europe/Istanbul)". Requiring ":MM" dropped
+    // resets_at for every such line, so clients showed no reset date.
+    const aug = new Date('2026-08-15T00:00:00Z');
+    expect(resetsAtMs('Aug 20 at 10am (Europe/Istanbul)', aug))
+      .toBe(Date.parse('2026-08-20T07:00:00.000Z'));
+    expect(resetsAtMs('Aug 16 at 12am (UTC)', aug))
+      .toBe(Date.parse('2026-08-16T00:00:00.000Z'));
+    expect(resetsAtMs('Aug 16 at 12pm (UTC)', aug))
+      .toBe(Date.parse('2026-08-16T12:00:00.000Z'));
+    // Comma separator takes the minute-less form too.
+    expect(resetsAtMs('Aug 16, 5pm (UTC)', aug))
+      .toBe(Date.parse('2026-08-16T17:00:00.000Z'));
+  });
+
+  it('still parses with-minutes text identically after the minutes went optional', () => {
+    expect(resetsAtMs('Jul 15 at 12:19am (Europe/London)', new Date('2026-07-14T00:00:00Z')))
+      .toBe(Date.parse('2026-07-14T23:19:00.000Z'));
+  });
+
   it('returns null on unparseable input, matching parseResetsAt', () => {
     expect(resetsAtMs('soon', now)).toBeNull();
     expect(resetsAtMs('', now)).toBeNull();
