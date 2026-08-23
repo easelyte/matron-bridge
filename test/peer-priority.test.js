@@ -100,6 +100,79 @@ describe('roomBatchTier', () => {
   });
 });
 
+describe('roomBatchTier — explicit per-message tier + coalescing precedence (loop #688 seam-tiering, R3 F2)', () => {
+  // The room-delivery inbox is a SINGLE per-session inbox that coalesces every
+  // room-flavoured injection — real peer room frames, invite/join requests,
+  // room-lifecycle FYIs, and spawn outcomes — into one turn. Seams that are not
+  // ordinary peer frames tag their message with an explicit `tier` so the
+  // classifier can place the coalesced turn correctly by provenance while the
+  // batch still adopts its MOST-PROTECTED member.
+  it('honors an explicit autonomous tier (spawn-outcome turn)', () => {
+    expect(roomBatchTier([{ tier: 'autonomous' }])).toBe('autonomous');
+  });
+
+  it('honors an explicit peer-coalesced tier (invite / room-lifecycle turn)', () => {
+    expect(roomBatchTier([{ tier: 'peer-coalesced' }])).toBe('peer-coalesced');
+  });
+
+  it('adopts the most-protected member: any operator message protects the whole coalesced turn', () => {
+    // A spawn outcome or invite that coalesces with a real operator (user:)
+    // room frame must NOT become preemptable — the operator content wins.
+    expect(roomBatchTier([{ tier: 'autonomous' }, { fromAgent: false }])).toBeNull();
+    expect(roomBatchTier([{ tier: 'peer-coalesced' }, {}])).toBeNull();
+    expect(roomBatchTier([{ fromAgent: true }, { tier: 'autonomous' }, {}])).toBeNull();
+  });
+
+  it('a mix of autonomous and peer-coalesced takes the higher, more-protected tier (peer-coalesced)', () => {
+    expect(roomBatchTier([{ tier: 'autonomous' }, { fromAgent: true }])).toBe('peer-coalesced');
+    expect(roomBatchTier([{ tier: 'autonomous' }, { tier: 'peer-coalesced' }])).toBe('peer-coalesced');
+  });
+
+  it('falls back to fromAgent provenance when no explicit tier is set (unchanged legacy behavior)', () => {
+    expect(roomBatchTier([{ fromAgent: true }])).toBe('peer-coalesced');
+    expect(roomBatchTier([{ fromAgent: false }])).toBeNull();
+    expect(roomBatchTier([{}])).toBeNull();
+  });
+
+  it('ignores an unknown/garbage explicit tier and falls back to provenance (safe default)', () => {
+    expect(roomBatchTier([{ tier: 'nonsense', fromAgent: true }])).toBe('peer-coalesced');
+    expect(roomBatchTier([{ tier: 'nonsense' }])).toBeNull();
+    expect(roomBatchTier([{ tier: 'nonsense', fromAgent: false }])).toBeNull();
+    // Only the string wire values are honored — a truthy non-string never tiers.
+    expect(roomBatchTier([{ tier: 1 }])).toBeNull();
+  });
+
+  it('operator provenance is DOMINANT: an explicit lower tier can never downgrade a fromAgent:false operator frame (Codex F1)', () => {
+    // A contradictory { fromAgent: false, tier: <lower> } shape must stay
+    // operator-protected — the classifier enforces the invariant, not producer
+    // discipline. No producer builds this shape today; this pins it total.
+    expect(roomBatchTier([{ fromAgent: false, tier: 'autonomous' }])).toBeNull();
+    expect(roomBatchTier([{ fromAgent: false, tier: 'peer-coalesced' }])).toBeNull();
+    expect(
+      shouldPreemptForPriorityPeer({
+        priority: true,
+        busy: true,
+        runningTier: roomBatchTier([{ fromAgent: false, tier: 'autonomous' }]),
+      }),
+    ).toBe(false);
+  });
+
+  it('an autonomous spawn-outcome turn is preempted by a priority peer (end-to-end)', () => {
+    const runningTier = roomBatchTier([{ tier: 'autonomous' }]);
+    expect(shouldPreemptForPriorityPeer({ priority: true, busy: true, runningTier })).toBe(true);
+  });
+
+  it('a peer-coalesced invite/lifecycle turn is preempted by a priority peer (end-to-end)', () => {
+    const runningTier = roomBatchTier([{ tier: 'peer-coalesced' }]);
+    expect(shouldPreemptForPriorityPeer({ priority: true, busy: true, runningTier })).toBe(true);
+  });
+
+  it('an operator-protected coalesced turn (spawn/invite + operator mix) is NOT preempted', () => {
+    const runningTier = roomBatchTier([{ tier: 'autonomous' }, { fromAgent: false }]);
+    expect(shouldPreemptForPriorityPeer({ priority: true, busy: true, runningTier })).toBe(false);
+  });
+});
+
 describe('shouldPreemptForPriorityPeer', () => {
   // A priority peer preempts the running turn ONLY IF it strictly outranks it.
   it('preempts a running autonomous turn', () => {

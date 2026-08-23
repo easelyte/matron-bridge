@@ -4,7 +4,7 @@ import { describe, it } from 'vitest';
 import { createAgentChatHandlers } from '../lib/agent-chat.js';
 import { createRoomDelivery, formatRoomDeliveredNotice, formatRoomDeliveryFailedNotice } from '../lib/room-delivery.js';
 import { oneLine } from '../lib/peer-text.js';
-import { peerBatchTier, roomBatchTier, shouldPreemptForPriorityPeer } from '../lib/peer-priority.js';
+import { TURN_TIER, peerBatchTier, roomBatchTier, shouldPreemptForPriorityPeer } from '../lib/peer-priority.js';
 
 const indexSource = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
 const fixture = JSON.parse(readFileSync(
@@ -676,5 +676,90 @@ describe('agent_sessions peer metadata', () => {
         ],
       },
     });
+  });
+});
+
+// Loop #688 R3 F2 — seam-tiering completeness. Every room-flavoured injection
+// seam that can carry a genuinely agent/peer/autonomous-origin turn must stamp
+// an explicit tier so a priority peer can preempt it per the operator >
+// peer-priority > peer-coalesced > autonomous precedence — while any seam that
+// can carry a real OPERATOR turn stays operator-protected (never preemptable).
+describe('injection-seam tier classification (loop #688 R3 F2)', () => {
+  // End-to-end compile of the room-lifecycle FYI seam with the REAL roomBatchTier
+  // wired into a fake roomDelivery exactly as production's injectTurn does. Proves
+  // the injected turn is peer-coalesced (an agent-origin FYI is preemptable).
+  const buildNotifyRuntime = new Function(
+    'agentRooms',
+    'sessions',
+    'roomDelivery',
+    'TURN_TIER',
+    `${sourceBetween('function journalNotifyRoomEvent(', 'function routeLocalRoomMessage(')}
+     return { journalNotifyRoomEvent };`,
+  );
+
+  function notifyRuntime() {
+    let captured = null;
+    const target = { alive: true, roomId: 'r1' };
+    const roomDelivery = {
+      // Mirror production roomDelivery.injectTurn tiering with the real helper.
+      deliver: (_session, _key, message) => {
+        captured = { message, turnTier: roomBatchTier([message]) };
+      },
+    };
+    const agentRooms = { get: (id) => (id === 'room-x' ? { sessionRoomId: 'r1', title: 'T' } : null) };
+    const sessions = new Map([['r1', target]]);
+    const { journalNotifyRoomEvent } = buildNotifyRuntime(agentRooms, sessions, roomDelivery, TURN_TIER);
+    return { journalNotifyRoomEvent, getCaptured: () => captured };
+  }
+
+  it('room-lifecycle FYI (journalNotifyRoomEvent) injects a peer-coalesced, preemptable turn', () => {
+    const { journalNotifyRoomEvent, getCaptured } = notifyRuntime();
+    journalNotifyRoomEvent('room-x', 'left');
+    const captured = getCaptured();
+    assert.equal(captured.message.tier, 'peer-coalesced');
+    assert.equal(captured.turnTier, 'peer-coalesced');
+    assert.equal(
+      shouldPreemptForPriorityPeer({ priority: true, busy: true, runningTier: captured.turnTier }),
+      true,
+    );
+  });
+
+  // The invite/join-request and spawn-outcome seams have large dependency graphs
+  // (resolveInviteTargetSession, agentInvites, agent-spawn tombstones) that make
+  // a standalone compile impractical, so their wiring is pinned by source: each
+  // roomDelivery.deliver payload must carry the correct explicit tier.
+  const inviteSeam = sourceBetween('function journalInjectInviteRequest(', 'function journalNotifyRoomEvent(');
+  const spawnSeam = sourceBetween('agentSpawnHandlers = createAgentSpawnHandlers(', '// Adapter wrapper for the agent-chat loopback');
+
+  it('invite/join-request seam stamps a peer-coalesced tier (agent-origin, preemptable)', () => {
+    // The request is delivered via roomDelivery.deliver — assert the payload
+    // carries the peer-coalesced tier so roomBatchTier classifies it correctly.
+    assert.match(inviteSeam, /roomDelivery\.deliver\([\s\S]*tier: TURN_TIER\.PEER_COALESCED[\s\S]*\)/);
+    // And that peer-coalesced is in fact preemptable by a priority peer.
+    assert.equal(
+      shouldPreemptForPriorityPeer({ priority: true, busy: true, runningTier: roomBatchTier([{ tier: TURN_TIER.PEER_COALESCED }]) }),
+      true,
+    );
+  });
+
+  it('spawn-outcome seam (notifyParent) stamps an autonomous tier (spawned-task origin, preemptable)', () => {
+    assert.match(spawnSeam, /roomId: 'spawn'/);
+    assert.match(spawnSeam, /roomDelivery\.deliver\([\s\S]*tier: TURN_TIER\.AUTONOMOUS[\s\S]*\)/);
+    assert.equal(
+      shouldPreemptForPriorityPeer({ priority: true, busy: true, runningTier: roomBatchTier([{ tier: TURN_TIER.AUTONOMOUS }]) }),
+      true,
+    );
+  });
+
+  it('operator-capable seams stay operator-protected: no invite/lifecycle/spawn seam is left preemptable when its batch carries operator content', () => {
+    // The safety invariant under coalescing — an operator (user:) room frame in
+    // the same batch protects the whole turn regardless of the agent/autonomous
+    // members alongside it.
+    assert.equal(roomBatchTier([{ tier: TURN_TIER.PEER_COALESCED }, { fromAgent: false }]), null);
+    assert.equal(roomBatchTier([{ tier: TURN_TIER.AUTONOMOUS }, { fromAgent: false }]), null);
+    assert.equal(
+      shouldPreemptForPriorityPeer({ priority: true, busy: true, runningTier: roomBatchTier([{ tier: TURN_TIER.AUTONOMOUS }, { fromAgent: false }]) }),
+      false,
+    );
   });
 });
