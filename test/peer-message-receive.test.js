@@ -2,8 +2,9 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { describe, it } from 'vitest';
 import { createAgentChatHandlers } from '../lib/agent-chat.js';
-import { createRoomDelivery } from '../lib/room-delivery.js';
+import { createRoomDelivery, formatRoomDeliveredNotice, formatRoomDeliveryFailedNotice } from '../lib/room-delivery.js';
 import { oneLine } from '../lib/peer-text.js';
+import { peerBatchTier, roomBatchTier, shouldPreemptForPriorityPeer } from '../lib/peer-priority.js';
 
 const indexSource = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
 const fixture = JSON.parse(readFileSync(
@@ -30,6 +31,13 @@ const buildPeerRuntime = new Function(
   'oneLine',
   'sendTextToSession',
   'console',
+  'peerBatchTier',
+  'roomBatchTier',
+  'shouldPreemptForPriorityPeer',
+  'preemptForPriorityPeer',
+  'journalPublishNotice',
+  'formatRoomDeliveredNotice',
+  'formatRoomDeliveryFailedNotice',
   `${sourceBetween('function journalConvoIdFor(', '// Reverse lookup for the journal return path:')}
    ${sourceBetween('function findSessionByClaudeSessionId(', '// --- Journal dual-post mirroring ---')}
    ${sourceBetween('function sessionOccupiedForRoomDelivery(', '// Per-room once-listener registry')}
@@ -40,6 +48,7 @@ const buildPeerRuntime = new Function(
      journalOnPeerMessage,
      maybeFlushRoomDelivery,
      peerDelivery,
+     roomDelivery,
      sessionOccupiedForRoomDelivery,
    };`,
 );
@@ -67,10 +76,11 @@ function session(overrides = {}) {
   };
 }
 
-function makeRuntime({ target = session(), persistImpl, markBusyOnInject = false } = {}) {
+function makeRuntime({ target = session(), persistImpl, markBusyOnInject = false, preemptResult = true } = {}) {
   const sessions = new Map(target ? [[target.roomId, target]] : []);
   const persistCalls = [];
   const injectCalls = [];
+  const preemptCalls = [];
   const infoLines = [];
   const persistSession = (...args) => {
     persistCalls.push(args);
@@ -81,6 +91,12 @@ function makeRuntime({ target = session(), persistImpl, markBusyOnInject = false
     if (markBusyOnInject) args[0].busy = true;
     return true;
   };
+  // The real precedence gate is exercised end-to-end; only the side-effecting
+  // interrupt is stubbed to a spy so the receive path can be tested without a
+  // live PTY / Codex process. It returns the accepted/failed boolean the real
+  // preemptForPriorityPeer returns, which drives the preempted/preempt-failed
+  // decision (F6).
+  const preemptForPriorityPeer = (session) => { preemptCalls.push(session); return preemptResult; };
   const runtime = buildPeerRuntime(
     sessions,
     persistSession,
@@ -88,6 +104,13 @@ function makeRuntime({ target = session(), persistImpl, markBusyOnInject = false
     oneLine,
     sendTextToSession,
     { info: (line) => infoLines.push(line), warn: () => {} },
+    peerBatchTier,
+    roomBatchTier,
+    shouldPreemptForPriorityPeer,
+    preemptForPriorityPeer,
+    () => {}, // journalPublishNotice
+    formatRoomDeliveredNotice,
+    formatRoomDeliveryFailedNotice,
   );
   return {
     ...runtime,
@@ -95,6 +118,7 @@ function makeRuntime({ target = session(), persistImpl, markBusyOnInject = false
     target,
     persistCalls,
     injectCalls,
+    preemptCalls,
     infoLines,
     decisionLogs: () => infoLines.map((line) => JSON.parse(line)),
   };
@@ -161,7 +185,7 @@ describe('journalOnPeerMessage receive behavior', () => {
     assert.deepEqual(runtime.injectCalls[0], [
       runtime.target,
       `[peer «Sender Session» (codex) · ${marker}] Coordinate on the release checklist.`,
-      { skipJournalMirror: true },
+      { skipJournalMirror: true, turnTier: 'peer-coalesced' },
     ]);
     assert.equal(runtime.persistCalls.length, 1);
     assert.deepEqual(runtime.persistCalls[0].at(-1), { failLoud: true });
@@ -436,6 +460,191 @@ describe('journalOnPeerMessage receive behavior', () => {
     assert.equal(lines[0], '↑ 1 earlier peer messages dropped');
     assert.equal(lines.filter((line) => line.includes('earlier peer messages dropped')).length, 1);
     assert.equal(lines.at(-1).endsWith('] x'), true);
+  });
+});
+
+describe('journalOnPeerMessage priority preemption (loop #688 consumer half)', () => {
+  // Operator-approved precedence, highest to lowest:
+  //   operator > peer-priority > peer-coalesced > autonomous
+  // A priority peer arriving MID-TURN preempts the running turn only if it
+  // outranks it; at a live prompt it defers and injects normally.
+
+  function priorityFrame({ payload = {}, ...overrides } = {}) {
+    return peerFrame({ ...overrides, payload: { ...payload, priority: true } });
+  }
+
+  it('preempts a running autonomous turn, coalescing the priority peer and interrupting', () => {
+    const target = session({ busy: true, turnTier: 'autonomous' });
+    const runtime = makeRuntime({ target });
+    runtime.journalOnPeerMessage(priorityFrame());
+
+    // Coalesced (not injected inline) — the interrupt lets the turn-end flush
+    // deliver it as its own turn.
+    assert.equal(runtime.injectCalls.length, 0);
+    assert.equal(runtime.peerDelivery.pendingCount(target.roomId), 1);
+    assert.equal(runtime.preemptCalls.length, 1);
+    assert.equal(runtime.preemptCalls[0], target);
+    assert.equal(
+      runtime.decisionLogs().at(-1).decision,
+      'preempted',
+    );
+  });
+
+  it('preempts a running peer-coalesced (normal-peer) turn', () => {
+    const target = session({ busy: true, turnTier: 'peer-coalesced' });
+    const runtime = makeRuntime({ target });
+    runtime.journalOnPeerMessage(priorityFrame());
+    assert.equal(runtime.preemptCalls.length, 1);
+    assert.equal(runtime.decisionLogs().at(-1).decision, 'preempted');
+  });
+
+  it('does NOT preempt a running peer-priority turn (equal tier)', () => {
+    const target = session({ busy: true, turnTier: 'peer-priority' });
+    const runtime = makeRuntime({ target });
+    runtime.journalOnPeerMessage(priorityFrame());
+    assert.equal(runtime.preemptCalls.length, 0);
+    assert.equal(runtime.peerDelivery.pendingCount(target.roomId), 1);
+    assert.equal(runtime.decisionLogs().at(-1).decision, 'coalesced');
+  });
+
+  it('does NOT preempt an in-flight OPERATOR turn (operator outranks peer-priority)', () => {
+    const target = session({ busy: true, turnTier: 'operator' });
+    const runtime = makeRuntime({ target });
+    runtime.journalOnPeerMessage(priorityFrame());
+    assert.equal(runtime.preemptCalls.length, 0);
+    assert.equal(runtime.decisionLogs().at(-1).decision, 'coalesced');
+  });
+
+  it('does NOT preempt an unclassified running turn (null tier is treated as operator)', () => {
+    const target = session({ busy: true, turnTier: null });
+    const runtime = makeRuntime({ target });
+    runtime.journalOnPeerMessage(priorityFrame());
+    assert.equal(runtime.preemptCalls.length, 0);
+    assert.equal(runtime.decisionLogs().at(-1).decision, 'coalesced');
+  });
+
+  it('does NOT preempt at a live prompt (idle): defers and injects the priority peer normally', () => {
+    const target = session({ busy: false, turnTier: 'autonomous' });
+    const runtime = makeRuntime({ target });
+    runtime.journalOnPeerMessage(priorityFrame());
+    assert.equal(runtime.preemptCalls.length, 0);
+    assert.equal(runtime.injectCalls.length, 1);
+    assert.equal(runtime.injectCalls[0][1].startsWith('[PRIORITY peer'), true);
+    assert.equal(runtime.decisionLogs().at(-1).decision, 'injected');
+  });
+
+  it('does NOT preempt while a prompt is open (occupied but not busy)', () => {
+    // waitingForAnswer keeps the session occupied-for-delivery but not busy, so
+    // the priority peer coalesces and the open prompt is never interrupted.
+    const target = session({ busy: false, waitingForAnswer: true, turnTier: 'autonomous' });
+    const runtime = makeRuntime({ target });
+    runtime.journalOnPeerMessage(priorityFrame());
+    assert.equal(runtime.sessionOccupiedForRoomDelivery(target), true);
+    assert.equal(runtime.preemptCalls.length, 0);
+    assert.equal(runtime.injectCalls.length, 0);
+    assert.equal(runtime.peerDelivery.pendingCount(target.roomId), 1);
+    assert.equal(runtime.decisionLogs().at(-1).decision, 'coalesced');
+  });
+
+  it('never preempts for a NON-priority peer, whatever the running tier', () => {
+    const target = session({ busy: true, turnTier: 'autonomous' });
+    const runtime = makeRuntime({ target });
+    runtime.journalOnPeerMessage(peerFrame());
+    assert.equal(runtime.preemptCalls.length, 0);
+    assert.equal(runtime.decisionLogs().at(-1).decision, 'coalesced');
+  });
+
+  it('does NOT auto-preempt an iv-mode turn (no generation-correlated Stop hook); it coalesces', () => {
+    // iv PTY turns lack a turn-generation-correlated Stop hook, so cancelling
+    // and clearing busy could let the canceled turn's late hook corrupt a
+    // replacement turn. iv priority peers therefore coalesce and deliver at the
+    // natural turn end instead of interrupting.
+    const target = session({ busy: true, turnTier: 'autonomous', iv: { alive: true } });
+    const runtime = makeRuntime({ target });
+    runtime.journalOnPeerMessage(priorityFrame());
+    assert.equal(runtime.preemptCalls.length, 0);
+    assert.equal(runtime.peerDelivery.pendingCount(target.roomId), 1);
+    assert.equal(runtime.decisionLogs().at(-1).decision, 'coalesced');
+  });
+
+  it('logs preempt-failed (not preempted) when the interrupt is refused (F6)', () => {
+    const target = session({ busy: true, turnTier: 'autonomous' });
+    const runtime = makeRuntime({ target, preemptResult: false });
+    runtime.journalOnPeerMessage(priorityFrame());
+    assert.equal(runtime.preemptCalls.length, 1);
+    assert.equal(runtime.decisionLogs().at(-1).decision, 'preempt-failed');
+    // The message stays queued for the eventual turn end — never lost.
+    assert.equal(runtime.peerDelivery.pendingCount(target.roomId), 1);
+  });
+
+  it('does NOT interrupt when the priority body self-evicts past the byte cap (F5)', () => {
+    // A single body over the 16 KiB peer-inbox cap is appended then evicted by
+    // room-delivery's while-loop, so nothing is left to inject; interrupting
+    // the running turn would kill it with no replacement. 5000 × 4-byte glyph
+    // = 20000 bytes > 16384.
+    const target = session({ busy: true, turnTier: 'autonomous' });
+    const runtime = makeRuntime({ target });
+    runtime.journalOnPeerMessage(priorityFrame({ payload: { body: '💥'.repeat(5000) } }));
+    assert.equal(runtime.peerDelivery.pendingCount(target.roomId), 0);
+    assert.equal(runtime.preemptCalls.length, 0);
+    assert.equal(runtime.decisionLogs().at(-1).decision, 'coalesced');
+  });
+
+  it('tags an idle-injected peer turn with its priority tier so a later priority peer can outrank it', () => {
+    const normal = makeRuntime();
+    normal.journalOnPeerMessage(peerFrame());
+    assert.deepEqual(normal.injectCalls[0][2], { skipJournalMirror: true, turnTier: 'peer-coalesced' });
+
+    const priority = makeRuntime();
+    priority.journalOnPeerMessage(priorityFrame());
+    assert.deepEqual(priority.injectCalls[0][2], { skipJournalMirror: true, turnTier: 'peer-priority' });
+  });
+
+  it('flushes a pending priority peer BEFORE a lower-tier room batch at turn end (F3)', () => {
+    // A lower-tier turn is running with a queued agent-room (peer-coalesced)
+    // batch; a priority peer then arrives and preempts. At turn end the priority
+    // peer must be delivered first, not left behind the room batch.
+    const target = session({ busy: true, turnTier: 'autonomous' });
+    const runtime = makeRuntime({ target, markBusyOnInject: true });
+    // A room message coalesces while busy (agent-origin, peer-coalesced tier).
+    runtime.roomDelivery.deliver(target, target.roomId, {
+      roomId: 'room-x', roomTitle: 'coord', from: 'peer (agent)', body: 'room work', fromAgent: true,
+    });
+    // A priority peer arrives: preempts and marks the priority-pending flag.
+    runtime.journalOnPeerMessage(priorityFrame({ payload: { body: 'urgent' } }));
+    assert.equal(runtime.preemptCalls.length, 1);
+    assert.equal(target._priorityPreemptPending, true);
+
+    // Turn ends: the priority peer flushes first (busy set on inject stops the
+    // room batch flushing in the same turn).
+    target.busy = false;
+    runtime.maybeFlushRoomDelivery(target);
+    assert.equal(runtime.injectCalls.length, 1);
+    assert.equal(runtime.injectCalls[0][1].includes('[PRIORITY peer'), true);
+    assert.equal(runtime.injectCalls[0][1].includes('urgent'), true);
+    assert.equal(target._priorityPreemptPending, false);
+    assert.equal(runtime.roomDelivery.pendingCount(target.roomId), 1); // room batch still waiting
+
+    // Next turn end delivers the room batch.
+    target.busy = false;
+    runtime.maybeFlushRoomDelivery(target);
+    assert.equal(runtime.injectCalls.length, 2);
+    assert.equal(runtime.injectCalls[1][1].includes('room work'), true);
+  });
+
+  it('tags a coalesced flush as peer-priority when the batch contains any priority peer', () => {
+    const target = session({ busy: true, turnTier: 'operator' });
+    const runtime = makeRuntime({ target });
+    // Operator turn: neither peer preempts; both coalesce into one batch.
+    runtime.journalOnPeerMessage(peerFrame({ seq: 1, payload: { body: 'first' } }));
+    runtime.journalOnPeerMessage(priorityFrame({ seq: 2, payload: { body: 'second' } }));
+    assert.equal(runtime.preemptCalls.length, 0);
+    assert.equal(runtime.peerDelivery.pendingCount(target.roomId), 2);
+
+    target.busy = false;
+    assert.equal(runtime.peerDelivery.flush(target, target.roomId), true);
+    // The mixed batch flushes as a peer-priority turn (any priority present).
+    assert.deepEqual(runtime.injectCalls[0][2], { skipJournalMirror: true, turnTier: 'peer-priority' });
   });
 });
 
