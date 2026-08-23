@@ -102,4 +102,120 @@ describe('sendPrintInterrupt', () => {
     const stdin = { write: () => { throw new Error('EPIPE'); } };
     expect(sendPrintInterrupt({ stdin, onWedge: () => {} })).toBeNull();
   });
+
+  // Turn-generation correlation (loop #688 R3 F1). The wedge timer is armed for
+  // one specific turn; if that turn has ended and a newer turn is now running
+  // when the timer fires, the wedge must be SUPPRESSED — clearing busy then
+  // would falsely end the newer (possibly operator or higher-priority) turn.
+  describe('shouldFireWedge generation guard', () => {
+    it('suppresses onWedge when shouldFireWedge returns false (turn changed under us)', () => {
+      vi.useFakeTimers();
+      try {
+        const { stdin } = collect();
+        const onWedge = vi.fn();
+        // Simulate the armed turn ending and a newer turn starting before the
+        // timer fires: the generation the interrupt was armed for no longer matches.
+        sendPrintInterrupt({ stdin, onWedge, onError: () => {}, timeoutMs: 5000, shouldFireWedge: () => false });
+        vi.advanceTimersByTime(5000);
+        expect(onWedge).not.toHaveBeenCalled();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('fires onWedge when shouldFireWedge returns true (still the armed turn)', () => {
+      vi.useFakeTimers();
+      try {
+        const { stdin } = collect();
+        const onWedge = vi.fn();
+        // Same turn still running (genuinely wedged): the defensive unstick must
+        // still fire so busy is cleared instead of queueing messages forever.
+        sendPrintInterrupt({ stdin, onWedge, onError: () => {}, timeoutMs: 5000, shouldFireWedge: () => true });
+        vi.advanceTimersByTime(5000);
+        expect(onWedge).toHaveBeenCalledTimes(1);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('evaluates shouldFireWedge at fire time, not arm time', () => {
+      vi.useFakeTimers();
+      try {
+        const { stdin } = collect();
+        const onWedge = vi.fn();
+        let sameGeneration = true;
+        sendPrintInterrupt({ stdin, onWedge, onError: () => {}, timeoutMs: 5000, shouldFireWedge: () => sameGeneration });
+        // The armed turn ends and a newer turn starts after arming but before the timeout.
+        sameGeneration = false;
+        vi.advanceTimersByTime(5000);
+        expect(onWedge).not.toHaveBeenCalled();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('fires onWedge when shouldFireWedge is omitted (operator !esc path / backward compat unchanged)', () => {
+      vi.useFakeTimers();
+      try {
+        const { stdin } = collect();
+        const onWedge = vi.fn();
+        sendPrintInterrupt({ stdin, onWedge, onError: () => {}, timeoutMs: 5000 });
+        vi.advanceTimersByTime(5000);
+        expect(onWedge).toHaveBeenCalledTimes(1);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
+
+  // onSettle retires the caller's handle at fire time (Codex R1 F1). A
+  // suppressed wedge must still release session.pendingInterrupt, or the next
+  // interrupt on the current turn is rejected as already-in-flight.
+  describe('onSettle handle retirement', () => {
+    it('calls onSettle before onWedge when the wedge fires', () => {
+      vi.useFakeTimers();
+      try {
+        const { stdin } = collect();
+        const order = [];
+        const onSettle = vi.fn(() => order.push('settle'));
+        const onWedge = vi.fn(() => order.push('wedge'));
+        sendPrintInterrupt({ stdin, onWedge, onError: () => {}, timeoutMs: 5000, onSettle, shouldFireWedge: () => true });
+        vi.advanceTimersByTime(5000);
+        expect(onSettle).toHaveBeenCalledTimes(1);
+        expect(onWedge).toHaveBeenCalledTimes(1);
+        expect(order).toEqual(['settle', 'wedge']);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('calls onSettle even when the wedge is suppressed (stale-handle retirement)', () => {
+      vi.useFakeTimers();
+      try {
+        const { stdin } = collect();
+        const onSettle = vi.fn();
+        const onWedge = vi.fn();
+        sendPrintInterrupt({ stdin, onWedge, onError: () => {}, timeoutMs: 5000, onSettle, shouldFireWedge: () => false });
+        vi.advanceTimersByTime(5000);
+        expect(onSettle).toHaveBeenCalledTimes(1);
+        expect(onWedge).not.toHaveBeenCalled();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('does not call onSettle when cancelled (the canceller retires its own handle)', () => {
+      vi.useFakeTimers();
+      try {
+        const { stdin } = collect();
+        const onSettle = vi.fn();
+        const handle = sendPrintInterrupt({ stdin, onWedge: () => {}, onError: () => {}, timeoutMs: 5000, onSettle });
+        handle.cancel();
+        vi.advanceTimersByTime(10000);
+        expect(onSettle).not.toHaveBeenCalled();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
 });

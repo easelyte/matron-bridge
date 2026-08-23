@@ -3426,6 +3426,7 @@ function submitAnswer(session, answerText, { mirrorToJournal = true } = {}) {
       return;
     }
     session.busy = true;
+    bumpTurnGeneration(session);
     // Operator turn (answering a prompt): reset the tier so a stale peer tier
     // left by a previous turn can never let a priority peer preempt this
     // operator work (loop #688 — the turnTier leak F1). null = operator-rank,
@@ -4746,6 +4747,7 @@ function sendToSession(session, contentBlocks, { skipJournalMirror = false, turn
   session.responseBuffer = '';
   session.toolCalls = [];
   session.busy = true;
+  bumpTurnGeneration(session);
   // Record the tier of the turn now starting (loop #688 consumer half). Peer
   // injections tag 'peer-priority'/'peer-coalesced'; an unmarked turn leaves
   // this null, which the precedence gate treats as operator-rank (protected) —
@@ -9033,6 +9035,7 @@ async function approvePlanBuild(session, { sendHtml }) {
       persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { pendingPlanDenialId: null });
     }
     session.busy = true;
+    bumpTurnGeneration(session);
     // Operator turn (approving a plan): reset the tier for the same reason as
     // the prompt-answer seam above — a stale lower tier must not let a priority
     // peer preempt operator work (loop #688 F1). null = operator-rank, protected.
@@ -10487,10 +10490,26 @@ async function printModeInterrupt(session, sendReply) {
     await sendReply('Interrupt already sent — still waiting for claude to stop this turn.');
     return;
   }
-  session.pendingInterrupt = sendPrintInterrupt({
+  // Correlate the wedge timer with the turn it is armed for (loop #688 R3 F1).
+  // Several seams clear busy without clearPendingInterrupt (a prompt surfaces,
+  // esc-cancel), after which a NEWER turn can start inside the 10s window. The
+  // generation snapshot lets the wedge fire ONLY while the same turn is still
+  // running; if a newer turn has started (bumpTurnGeneration ran at its
+  // busy=true seam), the stale timer is suppressed instead of clearing the new
+  // turn's busy — which #44 made peer-triggerable (a priority peer arming a
+  // wedge that would otherwise false-clear a later operator/higher-tier turn).
+  const armedGeneration = session.turnGeneration;
+  const interruptHandle = sendPrintInterrupt({
     stdin: session.proc.stdin,
+    shouldFireWedge: () => session.turnGeneration === armedGeneration,
+    // Retire the handle when the timer fires, even if the wedge is suppressed
+    // (Codex R1 F1). Identity-checked so a newer interrupt's handle is never
+    // erased; a suppressed wedge must not leave a stale pendingInterrupt that
+    // rejects the next interrupt on the current turn as already-in-flight.
+    onSettle: () => {
+      if (session.pendingInterrupt === interruptHandle) session.pendingInterrupt = null;
+    },
     onWedge: () => {
-      session.pendingInterrupt = null;
       if (!session.busy) return;
       session.busy = false;
       // Deliberately NO noteTurnEnd: this is a defensive unstick after an
@@ -10506,9 +10525,20 @@ async function printModeInterrupt(session, sendReply) {
       Promise.resolve(sendReply(`Could not send interrupt: ${err.message}`)).catch(() => {});
     },
   });
+  session.pendingInterrupt = interruptHandle;
   if (session.pendingInterrupt) {
     await sendReply('⏹ Interrupt sent — waiting for claude to stop this turn.');
   }
+}
+
+// Monotonic per-session turn counter (loop #688 R3 F1). Bumped at EVERY
+// busy=true transition — the same complete set of seams that #44's F1 fix
+// treats as a turn start (sendToSession + the two direct prompt-answer /
+// plan-approval seams). printModeInterrupt snapshots this when it arms the
+// wedge timer so the timer can tell "still the turn I was armed for" from "a
+// newer turn is running now", and suppress itself in the latter case.
+function bumpTurnGeneration(session) {
+  session.turnGeneration = (session.turnGeneration || 0) + 1;
 }
 
 // Cancels a pending interrupt's wedge timer. Called wherever busy state
