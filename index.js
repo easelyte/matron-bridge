@@ -116,7 +116,7 @@ import { createAgentInvites, formatInviteRequestNotice, INVITE_WAKE_NOTICE } fro
 import { resolveInviteTarget } from './lib/invite-target.js';
 import { createRoomDelivery, formatRoomMessageNotice, formatRoomDeliveredNotice, formatRoomDeliveryFailedNotice, ROOM_MESSAGE_QUEUED_NOTICE } from './lib/room-delivery.js';
 import { oneLine } from './lib/peer-text.js';
-import { peerBatchTier, roomBatchTier, shouldPreemptForPriorityPeer } from './lib/peer-priority.js';
+import { TURN_TIER, peerBatchTier, roomBatchTier, shouldPreemptForPriorityPeer } from './lib/peer-priority.js';
 import { createRoomReplyWaiters } from './lib/room-reply-waiters.js';
 import { createAgentChatHandlers } from './lib/agent-chat.js';
 import {
@@ -8731,7 +8731,13 @@ function journalInjectInviteRequest(frame) {
   } else {
     console.warn(`[agent-invites] request for ${frame.room_id} carried no target_convo_id — routed to the most recently active session as a guess; the user's copy is suppressed (peer bridge predates target_convo_id)`);
   }
-  roomDelivery.deliver(session, session.roomId, { roomId: frame.room_id, roomTitle: room?.title || frame.topic || null, from: 'bridge', body: text, at: Date.now() });
+  // An inbound invite/join request is agent/peer-origin coordination (a remote
+  // agent asking to chat), never operator input — tier it peer-coalesced (loop
+  // #688 R3 F2) so a priority peer can preempt the resulting notification turn,
+  // matching how an ordinary peer room frame is tiered. If this coalesces with a
+  // real operator (user:) room frame in the same inbox, roomBatchTier's
+  // most-protected rule still keeps the whole turn operator-protected.
+  roomDelivery.deliver(session, session.roomId, { roomId: frame.room_id, roomTitle: room?.title || frame.topic || null, from: 'bridge', body: text, at: Date.now(), tier: TURN_TIER.PEER_COALESCED });
 }
 
 // Room-lifecycle FYI (late answers, peer left) surfaced to the bound session
@@ -8744,7 +8750,10 @@ function journalNotifyRoomEvent(roomId, text, { sessionKey } = {}) {
   if (!room) return;
   const session = sessions.get(sessionKey || room.sessionRoomId);
   if (!session || !session.alive) return;
-  roomDelivery.deliver(session, session.roomId, { roomId, roomTitle: room.title || null, from: 'bridge', body: `Room ${roomId}: the peer ${text}.`, at: Date.now() });
+  // A room-lifecycle FYI (peer left, late answer) is a peer/room-origin event,
+  // never operator input — tier it peer-coalesced (loop #688 R3 F2) so a
+  // priority peer can preempt the resulting turn.
+  roomDelivery.deliver(session, session.roomId, { roomId, roomTitle: room.title || null, from: 'bridge', body: `Room ${roomId}: the peer ${text}.`, at: Date.now(), tier: TURN_TIER.PEER_COALESCED });
 }
 
 // A local room's message hop: the journal's echo of an own-device agent
@@ -9240,7 +9249,13 @@ agentSpawnHandlers = createAgentSpawnHandlers({
   notifyParent: ({ session, convoId, text }) => {
     if (convoId) journalPublishNotice(convoId, text);
     if (session) {
-      roomDelivery.deliver(session, session.roomId, { roomId: 'spawn', roomTitle: 'spawn', from: 'bridge', body: text, at: Date.now() });
+      // A spawn outcome (started/declined/expired/failed) is autonomous-origin
+      // work — a task THIS session spawned reporting back, not a peer or the
+      // operator — so tier the wake turn 'autonomous' (loop #688 R3 F2), the
+      // lowest tier, matching the spawn-room injectTurn that tags a spawned
+      // task's OPENING turn. A priority peer preempts it; if it coalesces with a
+      // real operator room frame, roomBatchTier keeps the batch protected.
+      roomDelivery.deliver(session, session.roomId, { roomId: 'spawn', roomTitle: 'spawn', from: 'bridge', body: text, at: Date.now(), tier: TURN_TIER.AUTONOMOUS });
     } else if (!convoId) {
       journalPublishNotice(JOURNAL_CONTROL_CONVO_ID, text);
     }
