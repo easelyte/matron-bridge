@@ -1,7 +1,10 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   __resetConcurrency,
+  JOURNAL_SUMMARY_MAX_CHARS,
+  makeJournalSummaryPublisher,
   parseMaxConcurrent,
+  summaryForJournal,
   updatePinnedSummary,
 } from '../lib/pinned-summary.js';
 
@@ -45,6 +48,7 @@ function deps(overrides = {}) {
     applyFallbackTitle: vi.fn(),
     persistSession: vi.fn(),
     updateRoomName: vi.fn(),
+    publishSummary: vi.fn(),
     debug: vi.fn(),
     warn: vi.fn(),
     serverLabel: 'VPS',
@@ -456,5 +460,240 @@ describe('production dependency-wiring contract', () => {
     expect(d.warn).toHaveBeenCalledWith('[summary] failed', expect.objectContaining({
       reason: 'no-output',
     }));
+  });
+});
+
+
+// --- loop #554 phase 1: journal publish ---
+
+describe('summaryForJournal', () => {
+  const bullets = (count, size = 100) =>
+    Array.from({ length: count }, (_, i) => `• bullet ${i} ${'x'.repeat(size)}`).join('\n');
+
+  it.each([['empty string', ''], ['null', null], ['undefined', undefined], ['whitespace', '   \n  ']])(
+    'returns an empty string for %s',
+    (_label, value) => {
+      expect(summaryForJournal(value)).toBe('');
+    },
+  );
+
+  it('exposes the journal cap as 1000 chars, matching matron-journal SUMMARY_MAX_CHARS', () => {
+    expect(JOURNAL_SUMMARY_MAX_CHARS).toBe(1000);
+  });
+
+  it('is the identity (modulo trim) for text under the cap', () => {
+    const text = '• one\n• two\n• three';
+    expect(summaryForJournal(text)).toBe(text);
+    expect(summaryForJournal(`\n${text}\n  `)).toBe(text);
+  });
+
+  it('passes a summary exactly at the cap through untouched', () => {
+    const exact = `• ${'x'.repeat(998)}`;
+    expect(exact).toHaveLength(1000);
+    expect(summaryForJournal(exact)).toBe(exact);
+  });
+
+  // The measured live worst case: 2082 chars / 13 bullets. Publishing this raw
+  // would bad_request the whole convo_upsert frame and silently drop the title.
+  it('clamps a >2000-char live-shaped digest to the cap, keeping the newest bullets', () => {
+    const raw = bullets(13, 150);
+    expect(raw.length).toBeGreaterThan(2000);
+
+    const out = summaryForJournal(raw);
+
+    expect(out.length).toBeLessThanOrEqual(JOURNAL_SUMMARY_MAX_CHARS);
+    expect(out).toContain('bullet 12');
+    expect(out).not.toContain('bullet 0 ');
+    // Oldest dropped first: the retained set is a contiguous suffix.
+    const kept = out.split('\n').map(l => Number(l.match(/bullet (\d+)/)[1]));
+    expect(kept).toEqual(Array.from({ length: kept.length }, (_, i) => 13 - kept.length + i));
+  });
+
+  it('keeps at least the newest bullet rather than returning nothing', () => {
+    const out = summaryForJournal(bullets(6, 400));
+    expect(out.length).toBeLessThanOrEqual(JOURNAL_SUMMARY_MAX_CHARS);
+    expect(out).toContain('bullet 5');
+  });
+
+  it('hard-cuts a single oversize bullet with an ellipsis instead of rejecting', () => {
+    const out = summaryForJournal(`• ${'y'.repeat(3000)}`);
+    expect(out).toHaveLength(JOURNAL_SUMMARY_MAX_CHARS);
+    expect(out.endsWith('…')).toBe(true);
+    expect(out.startsWith('• yyy')).toBe(true);
+  });
+
+  it('respects a caller-supplied budget', () => {
+    expect(summaryForJournal('• one\n• two\n• three', 12)).toBe('• three');
+  });
+
+  it('keeps a wrapped bullet with its continuation lines rather than orphaning one', () => {
+    const raw = `• old ${'a'.repeat(1200)}\n• new first line\ncontinued second line`;
+    const out = summaryForJournal(raw);
+    expect(out).toBe('• new first line\ncontinued second line');
+  });
+
+  it('clamps non-bullet prose as a single block', () => {
+    const out = summaryForJournal('z'.repeat(1500));
+    expect(out).toHaveLength(JOURNAL_SUMMARY_MAX_CHARS);
+    expect(out.endsWith('…')).toBe(true);
+  });
+});
+
+describe('makeJournalSummaryPublisher', () => {
+  it('upserts the summary and records the hint', () => {
+    const upsertConvo = vi.fn();
+    const publish = makeJournalSummaryPublisher({ upsertConvo, env: {} });
+    const s = session();
+
+    expect(publish(s, '• work')).toBe(true);
+
+    expect(upsertConvo).toHaveBeenCalledWith(s, { summary: '• work' });
+    expect(s._journalSummaryHint).toBe('• work');
+  });
+
+  it('skips an unchanged summary', () => {
+    const upsertConvo = vi.fn();
+    const publish = makeJournalSummaryPublisher({ upsertConvo, env: {} });
+    const s = session();
+
+    publish(s, '• work');
+    expect(publish(s, '• work')).toBe(false);
+    expect(upsertConvo).toHaveBeenCalledTimes(1);
+
+    expect(publish(s, '• work\n• more')).toBe(true);
+    expect(upsertConvo).toHaveBeenCalledTimes(2);
+  });
+
+  it.each([['empty', ''], ['null', null], ['undefined', undefined]])(
+    'skips a %s summary without clobbering the recorded hint',
+    (_label, value) => {
+      const upsertConvo = vi.fn();
+      const publish = makeJournalSummaryPublisher({ upsertConvo, env: {} });
+      const s = session({ _journalSummaryHint: '• prior' });
+
+      expect(publish(s, value)).toBe(false);
+      expect(upsertConvo).not.toHaveBeenCalled();
+      expect(s._journalSummaryHint).toBe('• prior');
+    },
+  );
+
+  it('publishes by default and stops when SUMMARY_JOURNAL_PUBLISH=0', () => {
+    const upsertConvo = vi.fn();
+    const env = {};
+    const publish = makeJournalSummaryPublisher({ upsertConvo, env });
+
+    publish(session(), '• work');
+    expect(upsertConvo).toHaveBeenCalledTimes(1);
+
+    // Read per call, not captured: a restart with a changed unit env flips it.
+    env.SUMMARY_JOURNAL_PUBLISH = '0';
+    const s = session();
+    expect(publish(s, '• other')).toBe(false);
+    expect(upsertConvo).toHaveBeenCalledTimes(1);
+    expect(s._journalSummaryHint).toBeUndefined();
+  });
+});
+
+describe('updatePinnedSummary journal publish seam', () => {
+  const longSummary = Array.from({ length: 16 }, (_, index) => `• item ${index}`).join('\n');
+
+  it('publishes the accreted summary on the first pass', async () => {
+    const d = deps();
+    const s = session();
+
+    await updatePinnedSummary(s, d);
+
+    expect(d.publishSummary).toHaveBeenCalledTimes(1);
+    expect(d.publishSummary).toHaveBeenCalledWith(s, '• Work is complete.');
+    expect(s.pinnedSummaryText).toBe('• Work is complete.');
+  });
+
+  it('publishes the clamped digest, never the raw accumulator', async () => {
+    const priorBullets = Array.from({ length: 12 }, (_, i) => `• prior ${i} ${'x'.repeat(150)}`).join('\n');
+    const d = deps({
+      codexOneShot: vi.fn().mockResolvedValue(success('TITLE: Ongoing\nNEW: Newest milestone.')),
+    });
+    // _compactionFailures latches compaction off, so the accumulator accretes
+    // past the cap — the steady state the live 2082-char record came from.
+    const s = session({ pinnedSummaryText: priorBullets, _compactionFailures: 2 });
+
+    await updatePinnedSummary(s, d);
+
+    expect(s.pinnedSummaryText.length).toBeGreaterThan(JOURNAL_SUMMARY_MAX_CHARS);
+    const published = d.publishSummary.mock.calls.at(-1)[1];
+    expect(published.length).toBeLessThanOrEqual(JOURNAL_SUMMARY_MAX_CHARS);
+    expect(published).not.toBe(s.pinnedSummaryText);
+    expect(published).toContain('Newest milestone.');
+  });
+
+  it('publishes on the compaction write as well as the accretion write', async () => {
+    const d = deps({
+      codexOneShot: vi.fn()
+        .mockResolvedValueOnce(success('• compacted one\n• compacted two\n• compacted three'))
+        .mockResolvedValueOnce(success('TITLE: Compact result\nNEW: Another milestone.')),
+    });
+    const s = session({ pinnedSummaryText: longSummary, _compactionFailures: 1 });
+
+    await updatePinnedSummary(s, d);
+
+    expect(d.publishSummary).toHaveBeenCalledTimes(2);
+    expect(d.publishSummary.mock.calls[0][1]).toBe('• compacted one\n• compacted two\n• compacted three');
+    expect(d.publishSummary.mock.calls[1][1]).toContain('Another milestone.');
+  });
+
+  it('does not publish when the kill switch disables the generator', async () => {
+    const d = deps({ env: { SUMMARY_CODEX_ENABLED: '0' } });
+
+    await updatePinnedSummary(session(), d);
+
+    expect(d.publishSummary).not.toHaveBeenCalled();
+    expect(d.codexOneShot).not.toHaveBeenCalled();
+  });
+
+  it('does not publish when codex fails and no summary was produced', async () => {
+    const d = deps({ codexOneShot: vi.fn().mockResolvedValue(failure()) });
+
+    await updatePinnedSummary(session(), d);
+
+    expect(d.publishSummary).not.toHaveBeenCalled();
+  });
+
+  it('keeps titling and persistence working when the publisher throws', async () => {
+    const d = deps({
+      publishSummary: vi.fn(() => { throw new Error('journal down'); }),
+    });
+    const s = session();
+
+    await updatePinnedSummary(s, d);
+
+    expect(d.updateRoomName).toHaveBeenCalledTimes(1);
+    expect(d.persistSession).toHaveBeenCalledTimes(1);
+    expect(s.pinnedSummaryText).toBe('• Work is complete.');
+    expect(d.warn).toHaveBeenCalledWith('[summary] journal publish failed',
+      expect.objectContaining({ error: 'journal down' }));
+  });
+
+  it('runs unchanged when no publishSummary dep is wired', async () => {
+    const d = deps();
+    delete d.publishSummary;
+    const s = session();
+
+    await updatePinnedSummary(s, d);
+
+    expect(s.pinnedSummaryText).toBe('• Work is complete.');
+    expect(d.updateRoomName).toHaveBeenCalledTimes(1);
+  });
+
+  it('leaves the bridge-local accumulator uncapped', async () => {
+    const priorBullets = Array.from({ length: 12 }, (_, i) => `• prior ${i} ${'x'.repeat(150)}`).join('\n');
+    const d = deps({
+      codexOneShot: vi.fn().mockResolvedValue(success('TITLE: Ongoing\nNEW: Newest milestone.')),
+    });
+    const s = session({ pinnedSummaryText: priorBullets, _compactionFailures: 2 });
+
+    await updatePinnedSummary(s, d);
+
+    expect(s.pinnedSummaryText.startsWith('• prior 0 ')).toBe(true);
+    expect(d.persistSession.mock.calls[0][4].pinnedSummaryText).toBe(s.pinnedSummaryText);
   });
 });

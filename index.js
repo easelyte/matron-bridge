@@ -151,7 +151,7 @@ import { attachPendingMediaMirror, pendingMediaMirror } from './lib/media-mirror
 import { seedJournalTitle, applyFallbackTitle, formatRoomTitle } from './lib/journal-title-seed.js';
 import { toolRepoSignals, commitRepoSignals, dominantRepo, emptyRepoScores, normalizeRepoScores } from './lib/repo-infer.js';
 import { codexOneShot } from './lib/codex-oneshot.js';
-import { updatePinnedSummary } from './lib/pinned-summary.js';
+import { makeJournalSummaryPublisher, summaryForJournal, updatePinnedSummary } from './lib/pinned-summary.js';
 import { SUMMARY_MIN_NEW } from './lib/summary-pass.js';
 import { activityStateChanged, truncateActivityDetail, shouldResumeThinkingAfterTool } from './lib/journal-activity.js';
 import { streamRefFor } from './lib/journal-stream.js';
@@ -572,6 +572,20 @@ function handleJournalReconnect() {
   journalOnReconnect();
 }
 
+// Fail-loud backstop for the summary clamp (loop #554 §5.3). summaryForJournal
+// is supposed to make the journal's SUMMARY_MAX_CHARS unreachable; if a
+// convo_upsert is rejected anyway the server drops the WHOLE frame — title,
+// agent_kind and session_state with it — and the publisher's own logging is
+// warn-once-per-code-per-connection, so a recurring rejection goes silent after
+// the first. Warn here every time: this should never fire, so a repeat is
+// signal, not noise. Observational only — it never consumes the ref.
+function warnRejectedConvoUpsert(e) {
+  if (e?.code !== 'bad_request' || e?.ref !== 'convo_upsert') return;
+  console.warn('[journal] convo_upsert REJECTED — frame dropped (title/summary/state lost)', {
+    detail: e.detail ?? null, roomId: e.roomId ?? null,
+  });
+}
+
 const journalPublisher = createJournalPublisher({
   url: JOURNAL_WS_URL,
   token: _journalToken,
@@ -604,7 +618,7 @@ const journalPublisher = createJournalPublisher({
   // and consumed the ref, so the invite manager never sees it. Op-error refs
   // are never shared between the two managers, so this ordering is not a
   // race, just "ask the spawn side first."
-  onOpError: (e) => { if (agentSpawnHandlers?.onOpError?.(e)) return; agentInvites?.onOpError(e); },
+  onOpError: (e) => { warnRejectedConvoUpsert(e); if (agentSpawnHandlers?.onOpError?.(e)) return; agentInvites?.onOpError(e); },
   ...(JOURNAL_STREAM_INTERVAL_MS ? { streamIntervalMs: JOURNAL_STREAM_INTERVAL_MS } : {}),
 });
 // Used to skip the per-session buffering/bookkeeping entirely when the
@@ -6050,6 +6064,14 @@ async function updateRoomName(roomId, name) {
   if (journalSession) journalUpsertConvo(journalSession, { title: name });
 }
 
+// Publishes the CLAMPED digest onto the conversation row (loop #554 B3).
+// Kill switch SUMMARY_JOURNAL_PUBLISH=0 and the don't-re-send-unchanged rule
+// live in lib/pinned-summary.js so they are testable without this entrypoint.
+// Values reaching here are already clamped — by the publish seam inside
+// updatePinnedSummary on the live path, and by the caller on the resume
+// backfill path.
+const publishJournalSummary = makeJournalSummaryPublisher({ upsertConvo: journalUpsertConvo });
+
 async function maybeUpdatePinnedSummary(session) {
   await updatePinnedSummary(session, {
     codexOneShot,
@@ -6057,6 +6079,7 @@ async function maybeUpdatePinnedSummary(session) {
     applyFallbackTitle,
     persistSession,
     updateRoomName,
+    publishSummary: publishJournalSummary,
     debug,
     warn: (...args) => console.warn(...args),
     serverLabel: SERVER_LABEL,
@@ -6903,6 +6926,12 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       // Rename after the session exists (not before) so updateRoomName's
       // roomId -> session lookup — used to journal-mirror the title — finds it.
       await updateRoomName(sessionRoomId, roomName);
+      // Backfill the restored digest onto the journal row (loop #554 B5).
+      // Without this a resumed session's already-earned summary would not
+      // reach the server until the next 5-message summary pass — and for the
+      // 24 sessions that already carry text on this box, not until each one is
+      // spoken to again. Same kill switch and same clamp as the live path.
+      publishJournalSummary(session, summaryForJournal(session.pinnedSummaryText));
 
       // Persist immediately — we already know the agent session ID.
       // session.workdir, not actualWorkdir: createSession may have degraded a

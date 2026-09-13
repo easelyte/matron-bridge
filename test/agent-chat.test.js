@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'fs';
-import { createAgentChatHandlers } from '../lib/agent-chat.js';
+import { createAgentChatHandlers, rosterBlurb, rosterSummaryEnabled } from '../lib/agent-chat.js';
 import { createAgentRooms } from '../lib/agent-rooms.js';
 
 const SELF = { deviceId: 1, name: 'mac' };
@@ -80,6 +80,9 @@ function makeFixture(overrides = {}) {
     deliverLocalInvite, localAnswer, routeLocalRoomMessage, notifyRoomPeer,
     publishSessionNotice, publishMuteCard, retireMuteCard, dropPendingRoomMessages,
     log,
+    // Explicit {} rather than the process.env default, so an ambient
+    // AGENT_ROSTER_SUMMARY_ENABLED on the test box cannot flip these assertions.
+    env: overrides.env ?? {},
   });
   return { handlers, calls, publisher, rooms, invites, sessions, pendingJoin, log, deliverLocalInvite, localAnswer, routeLocalRoomMessage, notifyRoomPeer, publishSessionNotice, publishMuteCard, retireMuteCard, dropPendingRoomMessages };
 }
@@ -201,7 +204,8 @@ describe('createAgentChatHandlers', () => {
       expect(res.body.self).toEqual({ device_id: 1, name: 'mac' });
       expect(res.body.agents).toEqual([{ device_id: 7, name: 'dev-2' }]);
       expect(res.body.conversations).toEqual([
-        { id: 'convo-remote', title: 'Remote work', session_state: 'running', summary: 'porting the app', agent_device_id: 7, last_ts: 111, agent_kind: 'codex' },
+        // summary blanked by default — AGENT_ROSTER_SUMMARY_ENABLED is off (loop #554 B4).
+        { id: 'convo-remote', title: 'Remote work', session_state: 'running', summary: '', agent_device_id: 7, last_ts: 111, agent_kind: 'codex' },
         { id: 'convo-self', title: 'Local work', session_state: 'running', summary: '', agent_device_id: 1, last_ts: 222, agent_kind: 'claude' },
         { id: 'convo-orphan', title: 'No agent', session_state: 'ended', summary: '', agent_device_id: null, last_ts: 333, agent_kind: null }, // #619 T-1.3: forwarded, null when journal omits it
       ]);
@@ -224,6 +228,94 @@ describe('createAgentChatHandlers', () => {
       const res = await handlers.roster({ roomId: '!sess' });
       expect(res.status).toBe(502);
       expect(res.body.error).toMatch(/journal unreachable/i);
+    });
+
+    // loop #554 B4: phase 1 starts writing a 20-bullet digest into
+    // conversations.summary. Whether PEER agents should see the operator's
+    // session digest is an open product/privacy call, so the roster stays
+    // empty — today's observed behaviour, 0 of 2056 rows populated — until
+    // AGENT_ROSTER_SUMMARY_ENABLED is set.
+    it('blanks every conversation summary by default', async () => {
+      const { handlers } = makeFixture({
+        publisher: { fetchRoster: async () => ({
+          agents: ROSTER.agents,
+          conversations: [{ ...ROSTER.conversations[0], summary: '• one\n• two\n• three\n• four' }],
+        }) },
+      });
+      const res = await handlers.roster({ roomId: '!sess' });
+      expect(res.body.conversations[0].summary).toBe('');
+    });
+
+    it.each([['1', true], ['true', true], ['TRUE', true], ['0', false], ['', false], ['yes', false]])(
+      'honours AGENT_ROSTER_SUMMARY_ENABLED=%j',
+      async (value, expected) => {
+        const { handlers } = makeFixture({
+          env: { AGENT_ROSTER_SUMMARY_ENABLED: value },
+          publisher: { fetchRoster: async () => ({
+            agents: ROSTER.agents,
+            conversations: [{ ...ROSTER.conversations[0], summary: '• one\n• two\n• three\n• four' }],
+          }) },
+        });
+        const res = await handlers.roster({ roomId: '!sess' });
+        expect(res.body.conversations[0].summary).toBe(expected ? 'two three four' : '');
+      },
+    );
+
+    it('trims an enabled summary to the newest 3 bullets with the markers stripped', async () => {
+      const digest = Array.from({ length: 13 }, (_, i) => `• bullet ${i}`).join('\n');
+      const { handlers } = makeFixture({
+        env: { AGENT_ROSTER_SUMMARY_ENABLED: '1' },
+        publisher: { fetchRoster: async () => ({
+          agents: ROSTER.agents,
+          conversations: [{ ...ROSTER.conversations[0], summary: digest }],
+        }) },
+      });
+      const res = await handlers.roster({ roomId: '!sess' });
+      expect(res.body.conversations[0].summary).toBe('bullet 10 bullet 11 bullet 12');
+    });
+  });
+
+  describe('rosterSummaryEnabled', () => {
+    it.each([['1', true], ['true', true], [' True ', true], ['0', false], ['', false], ['no', false]])(
+      'reads %j as %s', (value, expected) => {
+        expect(rosterSummaryEnabled({ AGENT_ROSTER_SUMMARY_ENABLED: value })).toBe(expected);
+      },
+    );
+
+    it('is off when the variable is unset', () => {
+      expect(rosterSummaryEnabled({})).toBe(false);
+      expect(rosterSummaryEnabled(undefined)).toBe(rosterSummaryEnabled(process.env));
+    });
+  });
+
+  describe('rosterBlurb', () => {
+    it.each([['empty', ''], ['whitespace', '  \n '], ['null', null], ['undefined', undefined]])(
+      'returns an empty string for %s', (_label, value) => {
+        expect(rosterBlurb(value)).toBe('');
+      },
+    );
+
+    it('keeps the newest 3 bullets, strips the markers, and stays under 300 chars', () => {
+      const digest = Array.from({ length: 13 }, (_, i) => `• bullet number ${i}`).join('\n');
+      const out = rosterBlurb(digest);
+      expect(out).toBe('bullet number 10 bullet number 11 bullet number 12');
+      expect(out).not.toContain('•');
+      expect(out.length).toBeLessThanOrEqual(300);
+    });
+
+    it('passes non-bullet prose through, trimmed', () => {
+      expect(rosterBlurb('  porting the app  ')).toBe('porting the app');
+      expect(rosterBlurb('line one\nline two')).toBe('line one line two');
+    });
+
+    it('caps an oversize blurb at 300 chars with an ellipsis', () => {
+      const out = rosterBlurb(`• ${'x'.repeat(500)}`);
+      expect(out).toHaveLength(300);
+      expect(out.endsWith('…')).toBe(true);
+    });
+
+    it('drops empty bullets rather than emitting stray spaces', () => {
+      expect(rosterBlurb('• \n• real one\n•  ')).toBe('real one');
     });
   });
 

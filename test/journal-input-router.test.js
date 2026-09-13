@@ -2170,7 +2170,10 @@ describe('index.js agent-chat room wiring (source inspection)', () => {
     // agentSpawnHandlers; onOpError tries the spawn side FIRST (its `true`
     // return means it consumed the ref) before falling through to invites.
     expect(args).toMatch(/onSpawnFrame: \(frame\) => agentSpawnHandlers\?\.onSpawnFrame\(frame\)/);
-    expect(args).toMatch(/onOpError: \(e\) => \{ if \(agentSpawnHandlers\?\.onOpError\?\.\(e\)\) return; agentInvites\?\.onOpError\(e\); \}/);
+    // warnRejectedConvoUpsert runs first and is observational only (loop #554
+    // §5.3) — it never consumes the ref, so the spawn-then-invites ordering
+    // below is unchanged.
+    expect(args).toMatch(/onOpError: \(e\) => \{ warnRejectedConvoUpsert\(e\); if \(agentSpawnHandlers\?\.onOpError\?\.\(e\)\) return; agentInvites\?\.onOpError\(e\); \}/);
   });
 });
 
