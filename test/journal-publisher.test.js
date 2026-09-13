@@ -372,6 +372,84 @@ describe('createJournalPublisher', () => {
     pub.close();
   });
 
+  // loop #554: the summary reconnect repair uses the best-effort path
+  // specifically because it must not evict the outage backlog.
+  it('carries summary on the best-effort upsert without evicting queued traffic', async () => {
+    const port = await getFreePort();
+    const warnings = [];
+    const log = { warn: (...a) => warnings.push(a.join(' ')), error: () => {} };
+    const pub = createJournalPublisher({
+      url: `ws://127.0.0.1:${port}/ws`, token: 'tok', log, queueLimit: 1, ...FAST_BACKOFF,
+    });
+    let evicted = 0;
+
+    // Fill the bounded queue with real user traffic while disconnected.
+    expect(pub.publishPermissionRequest('c1', { tool_use_id: 't0' }, {
+      onEvicted: () => { evicted += 1; },
+    })).toBe(true);
+
+    // Best-effort is REFUSED rather than evicting the backlog…
+    expect(pub.upsertConvoBestEffort('c1', { summary: '• repaired' })).toBe(false);
+    expect(evicted).toBe(0);
+
+    // …and the ordinary path is what would have evicted it.
+    pub.publishText('c1', { body: 'newer', from: 'user' });
+    expect(evicted).toBe(1);
+    pub.close();
+  });
+
+  // loop #554 R3-F2: a RETAINED repair drains at the queue tail, so it can land
+  // after a newer ordinary update of the same field and roll it back. Derived
+  // state opts out of retention and is re-offered from live state instead.
+  it('retain:false refuses instead of holding a stale repair behind the backlog', async () => {
+    const port = await getFreePort();
+    const pub = createJournalPublisher({
+      url: `ws://127.0.0.1:${port}/ws`, token: 'tok', log: silentLog, queueLimit: 1, ...FAST_BACKOFF,
+    });
+
+    // Disconnected: nothing pumps, so the bounded queue fills deterministically.
+    pub.publishText('c1', { body: 'backlog', from: 'user' });
+    expect(pub.upsertConvoBestEffort('c1', { summary: '• held' }, { retain: true })).toBe(false);
+    expect(pub.upsertConvoBestEffort('c1', { summary: '• refused' }, { retain: false })).toBe(false);
+
+    // Bring the journal up and let everything drain.
+    const fake = await startFakeServer({}, port);
+    await waitFor(() => fake.received.some(f => f.summary === '• held'));
+    await delay(100);
+
+    // The retained repair arrived — but only AFTER the backlog it was held
+    // behind. That tail position is exactly what would overwrite a newer
+    // ordinary update of the same field, which is why the summary repair does
+    // not use it.
+    const bodies = fake.received.map(f => f.summary ?? f.payload?.body);
+    expect(bodies.indexOf('• held')).toBeGreaterThan(bodies.indexOf('backlog'));
+    expect(fake.received.some(f => f.summary === '• refused')).toBe(false);
+
+    pub.close();
+    await fake.close();
+  });
+
+  it('sends summary on a best-effort upsert when the queue has headroom', async () => {
+    const fake = await startFakeServer();
+    const pub = createJournalPublisher({
+      url: fake.url, token: 'tok', log: silentLog, queueLimit: 10, ...FAST_BACKOFF,
+    });
+
+    await waitFor(() => fake.connections.length > 0);
+    pub.upsertConvoBestEffort('c1', { title: 't', summary: '• repaired' });
+
+    await waitFor(() => fake.received.some(f => f.op === 'convo_upsert' && f.convo_id === 'c1'));
+    const frame = fake.received.find(f => f.op === 'convo_upsert' && f.convo_id === 'c1');
+    expect(frame.summary).toBe('• repaired');
+    // Omit-don't-null: a caller that passes no summary must not clear the row.
+    pub.upsertConvoBestEffort('c2', { title: 't2' });
+    await waitFor(() => fake.received.some(f => f.convo_id === 'c2'));
+    expect('summary' in fake.received.find(f => f.convo_id === 'c2')).toBe(false);
+
+    pub.close();
+    await fake.close();
+  });
+
   it('disabled mode (no url/token): every method is a safe no-op, nothing throws', async () => {
     const warnings = [];
     const log = { warn: (...a) => warnings.push(a.join(' ')), error: () => {} };

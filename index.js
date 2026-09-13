@@ -151,7 +151,7 @@ import { attachPendingMediaMirror, pendingMediaMirror } from './lib/media-mirror
 import { seedJournalTitle, applyFallbackTitle, formatRoomTitle } from './lib/journal-title-seed.js';
 import { toolRepoSignals, commitRepoSignals, dominantRepo, emptyRepoScores, normalizeRepoScores } from './lib/repo-infer.js';
 import { codexOneShot } from './lib/codex-oneshot.js';
-import { updatePinnedSummary } from './lib/pinned-summary.js';
+import { makeJournalSummaryPublisher, summaryForJournal, summaryJournalPublishEnabled, updatePinnedSummary } from './lib/pinned-summary.js';
 import { SUMMARY_MIN_NEW } from './lib/summary-pass.js';
 import { activityStateChanged, truncateActivityDetail, shouldResumeThinkingAfterTool } from './lib/journal-activity.js';
 import { streamRefFor } from './lib/journal-stream.js';
@@ -570,6 +570,73 @@ function handleJournalReconnect() {
   // reemit lives in journalOnReconnect, so it is NOT duplicated here.
   reconcileStrandedSubagents('reconnect');
   journalOnReconnect();
+  republishSessionSummaries({ clearHints: true });
+}
+
+// Repair the summary publish hint across a connection epoch (loop #554 F3).
+// makeJournalSummaryPublisher records "already sent" on ENQUEUE, not on
+// acceptance — so a frame evicted by queue overflow during an outage would be
+// suppressed forever on a session that then went quiet (the next pass produces
+// the same digest and is deduped away). The outage IS the failure window, so
+// clearing the hints on every accepted hello_ok and re-offering is the matching
+// repair. Idempotent: the server COALESCEs, and (once the journal lands
+// summary_updated_at) only advances freshness on an actual content change, so a
+// re-send of an unchanged digest is inert rather than a false "just updated".
+// Bounded by the number of LIVE in-memory sessions; empty and already-published
+// digests are skipped.
+//
+// Always recomputed from session.pinnedSummaryText at CALL time, and offered
+// with retain:false, so a repair is never held as a stale snapshot behind the
+// outage backlog — a held snapshot drains at the queue tail and would land
+// AFTER a newer ordinary update, rolling the digest backwards. A refused offer
+// is remembered as a flag, not as content, and retried from live state.
+let _summaryRepairPending = false;
+let _summaryRepairRunning = false;
+
+function republishSessionSummaries({ clearHints = false } = {}) {
+  // Re-entrancy latch. A successful enqueue can pump, confirm and fire
+  // onSendCapacity synchronously on an injected transport, which lands right
+  // back here mid-loop. Same coalescing discipline as republishPendingReleases.
+  if (_summaryRepairRunning) return;
+  if (!JOURNAL_ENABLED || !summaryJournalPublishEnabled()) {
+    _summaryRepairPending = false;
+    return;
+  }
+  _summaryRepairRunning = true;
+  // Cleared up front, re-armed by any refusal publishJournalSummary reports
+  // during the sweep — so a pass that places everything leaves nothing pending.
+  _summaryRepairPending = false;
+  try {
+    for (const session of sessions.values()) {
+      if (clearHints) session._journalSummaryHint = undefined;
+      const digest = summaryForJournal(session.pinnedSummaryText);
+      if (!digest || digest === session._journalSummaryHint) continue;
+      publishJournalSummary(session, digest);
+    }
+  } finally {
+    _summaryRepairRunning = false;
+  }
+}
+
+// Send-completion retry (the trigger that does NOT need another reconnect).
+// Gated on the flag so the common case — nothing outstanding — costs one
+// boolean test per confirmed send rather than a clamp per live session.
+function retrySessionSummaryRepairs() {
+  if (_summaryRepairPending) republishSessionSummaries();
+}
+
+// Fail-loud backstop for the summary clamp (loop #554 §5.3). summaryForJournal
+// is supposed to make the journal's SUMMARY_MAX_CHARS unreachable; if a
+// convo_upsert is rejected anyway the server drops the WHOLE frame — title,
+// agent_kind and session_state with it — and the publisher's own logging is
+// warn-once-per-code-per-connection, so a recurring rejection goes silent after
+// the first. Warn here every time: this should never fire, so a repeat is
+// signal, not noise. Observational only — it never consumes the ref.
+function warnRejectedConvoUpsert(e) {
+  if (e?.code !== 'bad_request' || e?.ref !== 'convo_upsert') return;
+  console.warn('[journal] convo_upsert REJECTED — frame dropped (title/summary/state lost)', {
+    detail: e.detail ?? null, roomId: e.roomId ?? null,
+  });
 }
 
 const journalPublisher = createJournalPublisher({
@@ -587,7 +654,7 @@ const journalPublisher = createJournalPublisher({
   onReconnect: handleJournalReconnect,
   // Send-completion retry trigger (the mandatory one): re-publishes an
   // overflow-evicted release frame on a healthy socket that never reconnects.
-  onSendCapacity: () => republishPendingReleases(),
+  onSendCapacity: () => { republishPendingReleases(); retrySessionSummaryRepairs(); },
   // Agent-RPC dispatch. Arrow + late-bound const (journalRpcHandler is
   // defined below): safe for the same reason onEvent's forward reference
   // is — the callback only ever fires once the socket is live, long after
@@ -604,7 +671,7 @@ const journalPublisher = createJournalPublisher({
   // and consumed the ref, so the invite manager never sees it. Op-error refs
   // are never shared between the two managers, so this ordering is not a
   // race, just "ask the spawn side first."
-  onOpError: (e) => { if (agentSpawnHandlers?.onOpError?.(e)) return; agentInvites?.onOpError(e); },
+  onOpError: (e) => { warnRejectedConvoUpsert(e); if (agentSpawnHandlers?.onOpError?.(e)) return; agentInvites?.onOpError(e); },
   ...(JOURNAL_STREAM_INTERVAL_MS ? { streamIntervalMs: JOURNAL_STREAM_INTERVAL_MS } : {}),
 });
 // Used to skip the per-session buffering/bookkeeping entirely when the
@@ -724,11 +791,18 @@ function savePersistedSessionsOrThrow(data) {
   atomicWriteFileSync(SESSIONS_FILE, JSON.stringify(data, null, 2));
 }
 
+// Returns whether the write actually landed. Still fail-OPEN (a full disk must
+// not take the bridge down mid-turn), but no longer fail-SILENT to its caller:
+// persistSession forwards this so a caller that is about to publish derived
+// state elsewhere can decline to let the remote copy get ahead of the durable
+// one (loop #554 F2).
 function savePersistedSessions(data) {
   try {
     savePersistedSessionsOrThrow(data);
+    return true;
   } catch (e) {
     console.error('Failed to save sessions file:', e.message);
+    return false;
   }
 }
 
@@ -825,8 +899,11 @@ function persistSession(roomId, sessionId, workdir, originRoomId, extra, { failL
     ...(activeAgent ? { agent: activeAgent } : {}),
     agentSessions,
   };
-  if (failLoud) savePersistedSessionsOrThrow(data);
-  else savePersistedSessions(data);
+  // true = durably written. failLoud throws instead of returning false, so
+  // reaching the `true` below means the same thing on both paths.
+  if (!failLoud) return savePersistedSessions(data);
+  savePersistedSessionsOrThrow(data);
+  return true;
 }
 
 function getPersistedSession(roomId) {
@@ -6050,6 +6127,37 @@ async function updateRoomName(roomId, name) {
   if (journalSession) journalUpsertConvo(journalSession, { title: name });
 }
 
+// Publishes the CLAMPED digest onto the conversation row (loop #554 B3).
+// Kill switch SUMMARY_JOURNAL_PUBLISH=0 and the don't-re-send-unchanged rule
+// live in lib/pinned-summary.js so they are testable without this entrypoint.
+// Values reaching here are already clamped — by the publish seam inside
+// updatePinnedSummary on the live path, and by the caller on the resume
+// backfill path.
+// ONE transport for every summary write — live pass, resume backfill and
+// reconnect repair alike. upsertConvoBestEffort with retain:false neither
+// evicts (an outage-time digest must not cost a queued user message) nor
+// retains (a held snapshot drains at the tail and can roll back a newer
+// digest). It simply refuses when there is no room, and _publishSummaryFrame's
+// 'refused' outcome arms the capacity retry. A session with no journal convo id
+// has published nothing and has nothing to repair, so refuse rather than buffer
+// — journalUpsertConvo's buffering path is for traffic that must not be lost,
+// which a recomputable digest is not.
+const _publishSummaryFrame = makeJournalSummaryPublisher({
+  upsertConvo: (session, opts) => {
+    const convoId = journalConvoIdFor(session);
+    if (!JOURNAL_ENABLED || !convoId) return false;
+    return journalPublisher.upsertConvoBestEffort(convoId, opts, { retain: false });
+  },
+});
+
+function publishJournalSummary(session, summary) {
+  const outcome = _publishSummaryFrame(session, summary);
+  // 'skipped' is nothing-to-do (kill switch, or already published). Only a
+  // genuine refusal is worth coming back for.
+  if (outcome === 'refused') _summaryRepairPending = true;
+  return outcome;
+}
+
 async function maybeUpdatePinnedSummary(session) {
   await updatePinnedSummary(session, {
     codexOneShot,
@@ -6057,6 +6165,7 @@ async function maybeUpdatePinnedSummary(session) {
     applyFallbackTitle,
     persistSession,
     updateRoomName,
+    publishSummary: publishJournalSummary,
     debug,
     warn: (...args) => console.warn(...args),
     serverLabel: SERVER_LABEL,
@@ -6903,6 +7012,12 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       // Rename after the session exists (not before) so updateRoomName's
       // roomId -> session lookup — used to journal-mirror the title — finds it.
       await updateRoomName(sessionRoomId, roomName);
+      // Backfill the restored digest onto the journal row (loop #554 B5).
+      // Without this a resumed session's already-earned summary would not
+      // reach the server until the next 5-message summary pass — and for the
+      // 24 sessions that already carry text on this box, not until each one is
+      // spoken to again. Same kill switch and same clamp as the live path.
+      publishJournalSummary(session, summaryForJournal(session.pinnedSummaryText));
 
       // Persist immediately — we already know the agent session ID.
       // session.workdir, not actualWorkdir: createSession may have degraded a

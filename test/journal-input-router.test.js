@@ -2170,7 +2170,107 @@ describe('index.js agent-chat room wiring (source inspection)', () => {
     // agentSpawnHandlers; onOpError tries the spawn side FIRST (its `true`
     // return means it consumed the ref) before falling through to invites.
     expect(args).toMatch(/onSpawnFrame: \(frame\) => agentSpawnHandlers\?\.onSpawnFrame\(frame\)/);
-    expect(args).toMatch(/onOpError: \(e\) => \{ if \(agentSpawnHandlers\?\.onOpError\?\.\(e\)\) return; agentInvites\?\.onOpError\(e\); \}/);
+    // warnRejectedConvoUpsert runs first and is observational only (loop #554
+    // §5.3) — it never consumes the ref, so the spawn-then-invites ordering
+    // below is unchanged.
+    expect(args).toMatch(/onOpError: \(e\) => \{ warnRejectedConvoUpsert\(e\); if \(agentSpawnHandlers\?\.onOpError\?\.\(e\)\) return; agentInvites\?\.onOpError\(e\); \}/);
+  });
+
+  // loop #554 F3: the publish hint records ENQUEUE, not acceptance, so a frame
+  // lost to queue overflow during an outage would be deduped away forever on a
+  // session that then went quiet. The outage is the failure window, so the
+  // reconnect is the repair point.
+  describe('summary publish repair on reconnect', () => {
+    const body = src.slice(
+      src.indexOf('function handleJournalReconnect('),
+      src.indexOf('\n}', src.indexOf('function handleJournalReconnect(')),
+    );
+
+    it('republishes session summaries from handleJournalReconnect', () => {
+      expect(body).toMatch(/republishSessionSummaries\(\{ clearHints: true \}\);/);
+    });
+
+    // Reconnect alone is not enough: a repair refused because the backlog still
+    // fills the queue must be retried when confirmations create headroom, not
+    // only on the next disconnect.
+    it('retries refused repairs from onSendCapacity, gated on a pending flag', () => {
+      const start = src.indexOf('createJournalPublisher({');
+      const args = src.slice(start, src.indexOf('log: console,', start) + 2000);
+      expect(args).toMatch(/onSendCapacity: \(\) => \{ republishPendingReleases\(\); retrySessionSummaryRepairs\(\); \}/);
+      const retryStart = src.indexOf('function retrySessionSummaryRepairs(');
+      expect(retryStart).toBeGreaterThan(-1);
+      expect(src.slice(retryStart, src.indexOf('\n}', retryStart)))
+        .toMatch(/if \(_summaryRepairPending\) republishSessionSummaries\(\);/);
+    });
+
+    it('recomputes the digest at call time rather than reusing a snapshot', () => {
+      const start = src.indexOf('function republishSessionSummaries(');
+      const fn = src.slice(start, src.indexOf('\n}', start));
+      expect(fn).toMatch(/const digest = summaryForJournal\(session\.pinnedSummaryText\);/);
+      // Already-published and empty digests cost nothing.
+      expect(fn).toMatch(/if \(!digest \|\| digest === session\._journalSummaryHint\) continue;/);
+      // A refusal is remembered as a FLAG, never as retained content: cleared
+      // up front, re-armed by publishJournalSummary during the sweep.
+      expect(fn).toMatch(/_summaryRepairPending = false;/);
+      // A synchronous transport can pump -> confirm -> onSendCapacity -> back
+      // here mid-loop; the latch coalesces that instead of recursing.
+      expect(fn).toMatch(/if \(_summaryRepairRunning\) return;/);
+      expect(fn).toMatch(/_summaryRepairRunning = false;/);
+    });
+
+    it('clears the hint before republishing, and clamps what it sends', () => {
+      const start = src.indexOf('function republishSessionSummaries(');
+      expect(start).toBeGreaterThan(-1);
+      const fn = src.slice(start, src.indexOf('\n}', start));
+      const clear = fn.indexOf('session._journalSummaryHint = undefined;');
+      const publish = fn.indexOf('publishJournalSummary(session, digest);');
+      expect(clear).toBeGreaterThan(-1);
+      // Without the clear first, the publisher's own dedupe would swallow the
+      // very republish that exists to undo a dropped frame.
+      expect(publish).toBeGreaterThan(clear);
+      expect(fn).toMatch(/for \(const session of sessions\.values\(\)\)/);
+    });
+
+    // EVERY summary write — live pass, resume backfill, reconnect repair — uses
+    // the non-evicting, non-retaining transport. Evicting would cost a queued
+    // user message to publish a digest (R4-F1); retaining would let a held
+    // snapshot drain at the tail and roll back a newer digest (R3-F2).
+    it('routes every summary write through the non-evicting best-effort path', () => {
+      const start = src.indexOf('makeJournalSummaryPublisher({');
+      expect(start).toBeGreaterThan(-1);
+      const wiring = src.slice(start, src.indexOf('\n});', start));
+      expect(wiring).toMatch(/journalPublisher\.upsertConvoBestEffort\(convoId, opts, \{ retain: false \}\)/);
+      // The evicting transport must not appear on this path at all.
+      expect(wiring).not.toMatch(/journalUpsertConvo/);
+      expect(src).not.toMatch(/upsertConvoRepair/);
+    });
+
+    it('arms the retry only on a genuine refusal, not on a skip', () => {
+      const start = src.indexOf('function publishJournalSummary(');
+      const fn = src.slice(start, src.indexOf('\n}', start));
+      expect(fn).toMatch(/if \(outcome === 'refused'\) _summaryRepairPending = true;/);
+    });
+  });
+
+  // loop #554 F2: persistSession is fail-open. It must still REPORT, so the
+  // summary publish can decline to get ahead of the durable copy.
+  describe('persistSession reports durability', () => {
+    const fn = src.slice(
+      src.indexOf('function savePersistedSessions('),
+      src.indexOf('\n}', src.indexOf('function savePersistedSessions(')),
+    );
+
+    it('returns true on a successful write and false on a caught failure', () => {
+      expect(fn).toMatch(/savePersistedSessionsOrThrow\(data\);\n\s*return true;/);
+      expect(fn).toMatch(/return false;/);
+    });
+
+    it('persistSession forwards the result on both the fail-open and fail-loud paths', () => {
+      const start = src.indexOf('function persistSession(');
+      const persist = src.slice(start, src.indexOf('\nfunction getPersistedSession(', start));
+      expect(persist).toMatch(/if \(!failLoud\) return savePersistedSessions\(data\);/);
+      expect(persist).toMatch(/savePersistedSessionsOrThrow\(data\);\n\s*return true;/);
+    });
   });
 });
 
