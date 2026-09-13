@@ -156,7 +156,7 @@ import { SUMMARY_MIN_NEW } from './lib/summary-pass.js';
 import { activityStateChanged, truncateActivityDetail, shouldResumeThinkingAfterTool } from './lib/journal-activity.js';
 import { streamRefFor } from './lib/journal-stream.js';
 import { contextFullToNative, briefContextReport } from './lib/context-command.js';
-import { buildSessionStatus, contextTokensFromAssistantEvent, postCompactContextTokens, compactTriggerFrom, contextGaugeText, emailFromClaudeConfig, isSidechainEvent, reconcileModelForWindow, hostVitals, startCpuSampler, stopCpuSampler, cpuPercent, ramPercent, cpuSampledAtMs, statusRepaintDue } from './lib/session-status.js';
+import { buildSessionStatus, contextTokensFromAssistantEvent, postCompactContextTokens, compactTriggerFrom, contextGaugeText, emailFromClaudeConfig, isSidechainEvent, reconcileModelForWindow, hostVitals, hostVitalLimits, startCpuSampler, stopCpuSampler, cpuPercent, ramPercent, cpuSampledAtMs, statusRepaintDue } from './lib/session-status.js';
 import {
   AGENT_CLAUDE,
   AGENT_CODEX,
@@ -1519,6 +1519,12 @@ function journalStatus(session) {
   // meters. hostVitals() only READS the sampler cache (the 15s interval owns
   // sampling); it never samples here.
   const vitals = hostVitals();
+  // Host CPU/RAM as synthetic limit entries (ids host_cpu/host_ram) — the ONLY
+  // surface clients render host vitals from (they spread status.limits; the
+  // top-level status.vitals object is unread). Host-global, so carried on both
+  // Claude and Codex frames. Restored 2026-09-13 (regressed when #156 moved
+  // vitals to status.vitals only).
+  const hostLimits = hostVitalLimits();
   const isCodex = session.agent === AGENT_CODEX;
   const codexOptions = isCodex ? codexSessionOptions(session) : null;
   const status = buildSessionStatus({
@@ -1526,7 +1532,7 @@ function journalStatus(session) {
     contextTokens: session._lastContextTokens,
     // Codex supplies its real window; an unknown window must not use Claude's fallback.
     contextWindow: isCodex ? session._codexContextWindow || null : undefined,
-    limits: isCodex ? (session._codexMetadata?.limits || []) : (usageLimitsCache.lines || []),
+    limits: isCodex ? [...(session._codexMetadata?.limits || []), ...hostLimits] : [...(usageLimitsCache.lines || []), ...hostLimits],
     modelOptions: isCodex ? codexOptions.modelOptions : modelOptions(),
     effortLevels: isCodex ? codexOptions.effortLevels : effortOptions(),
     effort: isCodex ? codexOptions.effort : trackedEffort(session),
@@ -1541,8 +1547,9 @@ function journalStatus(session) {
   // frames. Codex supplies its own limits; host vitals stay on both.
   if (isCodex) {
     delete status.email;
-    // Explicitly clear a prior provider's limits, including on fetch failure.
-    status.limits = session._codexMetadata?.limits || [];
+    // Explicitly clear a prior provider's limits, including on fetch failure —
+    // but keep the host CPU/RAM synthetic entries (host-global, on both).
+    status.limits = [...(session._codexMetadata?.limits || []), ...hostLimits];
   }
   if (Object.keys(status).length === 0) return;
   // Stamp only when the frame actually left the bridge — a publish dropped

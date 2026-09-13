@@ -457,16 +457,21 @@ describe('index.js wiring', () => {
     expect(sigterm).toContain("gracefulShutdown('SIGTERM')");
   });
 
-  it('journalStatus wires host vitals to top-level status.vitals, never into limits[]', () => {
+  it('journalStatus injects host vitals as host_cpu/host_ram synthetic limits (what clients render), on both providers, and retains status.vitals', () => {
     const start = src.indexOf('function journalStatus(');
     const end = src.indexOf('\nfunction ', start + 1);
     const body = src.slice(start, end);
-    // vitals ride at top level via the buildSessionStatus vitals param.
+    // status.vitals is retained (top-level object) for any future client use.
     expect(body).toContain('hostVitals()');
     expect(body).toMatch(/vitals[,\n]/);
-    // Each provider supplies its own account limits, never host vitals.
-    expect(body).not.toContain('hostVitalLimits');
-    expect(body).toContain('limits: isCodex ? (session._codexMetadata?.limits || []) : (usageLimitsCache.lines || [])');
+    // Restored 2026-09-13: host vitals ALSO ride the limits[] array as
+    // host_cpu/host_ram synthetic entries — the surface every client renders
+    // from (buildUsageMeters spreads status.limits; status.vitals is unread).
+    expect(body).toContain('hostVitalLimits()');
+    // Both providers carry the host entries appended to their own limits.
+    expect(body).toContain('[...(session._codexMetadata?.limits || []), ...hostLimits] : [...(usageLimitsCache.lines || []), ...hostLimits]');
+    // The Codex post-call override keeps the host entries too (host-global).
+    expect(body).toContain('status.limits = [...(session._codexMetadata?.limits || []), ...hostLimits]');
   });
 
   it('every status publisher in the tree builds its frame with buildSessionStatus', () => {
