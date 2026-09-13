@@ -655,8 +655,26 @@ function generateFileLink(filePath, workdir) {
     console.log(`file-link denied (${gate.reason}): ${absTarget}`);
     return null;
   }
+  // Pin the workdir's filesystem IDENTITY (realPath + dev/ino) into the signed
+  // token, not just its name. A pathname is not an authorization boundary: a
+  // workdir renamed and replaced by a symlink after the link is minted would
+  // otherwise relocate the boundary with the attacker, and the viewer's
+  // serve-time re-resolve of that name cannot tell the difference. The guard
+  // re-stats the pinned identity on every serve and rejects a dev/ino change.
+  let roots = null;
+  if (absWorkdir) {
+    try {
+      roots = pinAllowedRootsSync([absWorkdir]).roots
+        .map(({ realPath, dev, ino }) => ({ realPath, dev, ino }));
+    } catch {
+      // An unresolvable workdir cannot be pinned, and a link we cannot scope
+      // is a link we do not mint.
+      console.log(`file-link denied (bad-workdir): ${absTarget}`);
+      return null;
+    }
+  }
   const exp = Math.floor((Date.now() + LINK_EXPIRY_MS) / 1000);
-  const payload = Buffer.from(JSON.stringify({ path: absTarget, exp, workdir: absWorkdir })).toString('base64url');
+  const payload = Buffer.from(JSON.stringify({ path: absTarget, exp, workdir: absWorkdir, roots })).toString('base64url');
   const sig = createHmac('sha256', HMAC_SECRET).update(payload).digest('base64url');
   return `${VIEWER_BASE_URL}/view?token=${payload}.${sig}`;
 }

@@ -3,7 +3,7 @@ import { rateLimit } from 'express-rate-limit';
 import { watch as fsWatch, existsSync, readFileSync, statSync, openSync, readSync, closeSync } from 'fs';
 import path from 'path';
 import { WebSocketServer } from 'ws';
-import { generateSignedUrl, verifyToken } from '../lib/viewer-tokens.js';
+import { generateSignedUrl, verifyToken, scopeFromToken } from '../lib/viewer-tokens.js';
 import { validateAndOpen, FileLinkDenied, MAX_DOWNLOAD_BYTES } from '../lib/file-link-guard.js';
 export { generateSignedUrl, verifyToken };
 
@@ -313,11 +313,13 @@ app.get('/view', async (req, res) => {
 
   try {
     // Serve-time boundary (lib/file-link-guard.js): fd-pinned symlink,
-    // sensitivity, workdir-containment, and size checks. Legacy tokens
-    // without a workdir still get everything but containment. Every
-    // rejection — denied, missing, oversize — is a uniform 404 so the
-    // response leaks nothing about why.
-    const { content, realPath } = await validateAndOpen(data.path, { workdir: data.workdir });
+    // sensitivity, scope-containment, and size checks. scopeFromToken prefers
+    // the token's PINNED root identity over its bare workdir pathname, so a
+    // workdir swapped out after the link was minted is rejected rather than
+    // followed. Legacy tokens without a workdir still get everything but
+    // containment. Every rejection — denied, missing, oversize — is a uniform
+    // 404 so the response leaks nothing about why.
+    const { content, realPath } = await validateAndOpen(data.path, scopeFromToken(data));
     res.type('html').send(renderHtml(path.basename(realPath), content.toString('utf-8')));
   } catch (err) {
     if (!(err instanceof FileLinkDenied)) console.error('Error reading file:', err);
@@ -349,7 +351,7 @@ app.get('/download', downloadLimiter, async (req, res) => {
 
   try {
     const { content, realPath } = await validateAndOpen(data.path, {
-      workdir: data.workdir,
+      ...scopeFromToken(data),
       maxBytes: MAX_DOWNLOAD_BYTES,
     });
     // Keep the header a plain quoted ASCII token: strip anything that could

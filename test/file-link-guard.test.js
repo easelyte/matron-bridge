@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import {
   isSensitivePath, checkFileLink, validateAndOpen, pinAllowedRoots, pinAllowedRootsSync,
-  FileLinkDenied, MAX_VIEW_BYTES,
+  pinAllowedRootIdentities, FileLinkDenied, MAX_VIEW_BYTES,
 } from '../lib/file-link-guard.js';
 
 describe('isSensitivePath', () => {
@@ -490,6 +490,82 @@ describe('fdRealPath (non-procfs platforms)', () => {
       expect(realpathSpy).not.toHaveBeenCalled();
     } finally {
       realpathSpy.mockRestore();
+    }
+  });
+});
+
+// A pathname is not an authorization boundary. pinAllowedRoots{,Sync} resolve
+// one at a trusted moment and RETAIN the identity they approved; these tests
+// pin the third constructor, which rebuilds that capability from an identity
+// that travelled across a boundary (a signed viewer token).
+describe('pinAllowedRootIdentities', () => {
+  let dir, outside;
+  beforeAll(() => {
+    dir = mkdtempSync(path.join(tmpdir(), 'flg-ident-work-'));
+    outside = mkdtempSync(path.join(tmpdir(), 'flg-ident-outside-'));
+    writeFileSync(path.join(dir, 'ok.txt'), 'in scope\n');
+    writeFileSync(path.join(outside, 'ok.txt'), 'OUT OF SCOPE\n');
+  });
+  afterAll(() => {
+    for (const d of [dir, outside]) {
+      try { rmSync(d, { recursive: true, force: true }); } catch {}
+    }
+  });
+
+  const identitiesFor = (p) => pinAllowedRootsSync([p]).roots
+    .map(({ realPath, dev, ino }) => ({ realPath, dev, ino }));
+
+  it('is interchangeable with pinAllowedRootsSync for an unchanged root', async () => {
+    const allowedRoots = pinAllowedRootIdentities(identitiesFor(dir));
+    const { content, realPath } = await validateAndOpen(path.join(dir, 'ok.txt'), { allowedRoots });
+    expect(content.toString('utf-8')).toBe('in scope\n');
+    expect(realPath).toBe(path.join(dir, 'ok.txt'));
+  });
+
+  it('survives a JSON round-trip, which is the point of carrying identities', async () => {
+    const carried = JSON.parse(JSON.stringify(identitiesFor(dir)));
+    const allowedRoots = pinAllowedRootIdentities(carried);
+    const { content } = await validateAndOpen(path.join(dir, 'ok.txt'), { allowedRoots });
+    expect(content.toString('utf-8')).toBe('in scope\n');
+  });
+
+  it('rejects the root once its directory is replaced by a different one', async () => {
+    const swapRoot = mkdtempSync(path.join(tmpdir(), 'flg-ident-swap-'));
+    const realDir = path.join(swapRoot, 'work');
+    mkdirSync(realDir);
+    writeFileSync(path.join(realDir, 'ok.txt'), 'in scope\n');
+    const allowedRoots = pinAllowedRootIdentities(identitiesFor(realDir));
+
+    // Rename the pinned directory away and drop a symlink to elsewhere in its
+    // place — the classic move that a bare pathname boundary follows.
+    renameSync(realDir, path.join(swapRoot, 'work.bak'));
+    symlinkSync(outside, realDir);
+
+    try {
+      let denial;
+      try {
+        await validateAndOpen(path.join(realDir, 'ok.txt'), { allowedRoots });
+      } catch (err) {
+        denial = err;
+      }
+      expect(denial).toBeInstanceOf(FileLinkDenied);
+      expect(denial.reason).toBe('bad-workdir');
+    } finally {
+      rmSync(swapRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('fails closed on a malformed identity rather than degrading to no scope', () => {
+    const malformed = [
+      [{}],
+      [{ realPath: 'relative/path', dev: 1, ino: 2 }],
+      [{ realPath: '/abs', dev: 'one', ino: 2 }],
+      [{ realPath: '/abs', dev: 1 }],
+      [null],
+    ];
+    for (const identities of malformed) {
+      expect(() => pinAllowedRootIdentities(identities))
+        .toThrowError(expect.objectContaining({ reason: 'bad-workdir' }));
     }
   });
 });
