@@ -124,14 +124,93 @@ describe('viewer scope pinning', () => {
   });
 });
 
-describe('index.js mints pinned roots', () => {
-  it('signs the workdir identity into every file link', async () => {
+// index.js boots the bridge on import, so its wiring is pinned by source
+// inspection — the same pattern the context-command and session-status tests
+// use. WHEN the root is pinned is the security property here, not just THAT
+// it is: pinning at tool-event time would capture whatever the agent had
+// already moved into the workdir's place.
+describe('index.js pins the viewer root at session creation', () => {
+  let src;
+  beforeAll(async () => {
     const { readFileSync } = await import('node:fs');
     const { fileURLToPath } = await import('node:url');
-    const src = readFileSync(fileURLToPath(new URL('../index.js', import.meta.url)), 'utf-8');
-    // The link payload must carry roots, and they must come from the SYNC
-    // pinning helper (generateFileLink is synchronous).
-    expect(src).toMatch(/pinAllowedRootsSync\(\[absWorkdir\]\)/);
+    src = readFileSync(fileURLToPath(new URL('../index.js', import.meta.url)), 'utf-8');
+  });
+
+  it('pins at every session-creation site, next to the show_file pin', () => {
+    const pins = src.match(/const viewerRootIdentities = pinViewerRootIdentities\(cwd\);/g) || [];
+    const showFilePins = src.match(/showFilePinnedRoots = pinAllowedRootsSync\(/g) || [];
+    expect(pins.length).toBe(showFilePins.length);
+    expect(pins.length).toBeGreaterThanOrEqual(3);
+    // ...and each pinned identity reaches the session object.
+    const carried = src.match(/^ {4}viewerRootIdentities,$/gm) || [];
+    expect(carried.length).toBe(pins.length);
+  });
+
+  it('signs the session-pinned identity into the link, resolving nothing itself', () => {
     expect(src).toMatch(/JSON\.stringify\(\{ path: absTarget, exp, workdir: absWorkdir, roots \}\)/);
+    expect(src).toMatch(/generateFileLink\(absPath, session\.workdir, session\.viewerRootIdentities\)/);
+    // generateFileLink runs synchronously per Edit/Write/MultiEdit event: no
+    // filesystem call may appear in its body, or a stalled mount wedges the
+    // whole bridge.
+    const body = src.slice(
+      src.indexOf('function generateFileLink('),
+      src.indexOf('// The secure-input link.'),
+    );
+    expect(body).not.toMatch(/pinAllowedRootsSync|realpathSync|statSync|readFileSync/);
+  });
+});
+
+describe('token scope fails closed', () => {
+  it('refuses a token asserting a null roots scope rather than falling back to the pathname', async () => {
+    const url = await viewUrl({
+      path: path.join(work, 'report.txt'),
+      workdir: work,
+      roots: null,
+    });
+    const res = await fetch(url);
+    expect(res.status).toBe(404);
+  });
+
+  it('refuses a token asserting an empty roots scope', async () => {
+    const url = await viewUrl({
+      path: path.join(work, 'report.txt'),
+      workdir: work,
+      roots: [],
+    });
+    const res = await fetch(url);
+    expect(res.status).toBe(404);
+  });
+
+  it('generateDownloadUrl cannot mint a pathname-only scope even when roots is omitted', async () => {
+    const { generateDownloadUrl } = await import('../lib/viewer-tokens.js');
+    // The five-argument form — a workdir and no roots — must still produce a
+    // pinned scope, not the weaker pathname one.
+    const url = generateDownloadUrl(
+      `http://127.0.0.1:${port}`, path.join(work, 'report.txt'), undefined, 60, work,
+    );
+    const token = url.split('token=')[1];
+    const { verifyToken } = await import('../lib/viewer-tokens.js');
+    const payload = verifyToken(token);
+    expect(Array.isArray(payload.roots)).toBe(true);
+    expect(payload.roots[0]).toMatchObject({ realPath: work });
+    expect(typeof payload.roots[0].ino).toBe('number');
+
+    swapWorkdir();
+    try {
+      expect((await fetch(url)).status).toBe(404);
+    } finally {
+      restoreWorkdir();
+    }
+  });
+
+  it('leaves an unscoped download token free of a roots assertion', async () => {
+    const { generateDownloadUrl, verifyToken } = await import('../lib/viewer-tokens.js');
+    const url = generateDownloadUrl(
+      `http://127.0.0.1:${port}`, path.join(work, 'report.txt'), undefined, 60,
+    );
+    const payload = verifyToken(url.split('token=')[1]);
+    expect('roots' in payload).toBe(false);
+    expect((await fetch(url)).status).toBe(200);
   });
 });

@@ -640,7 +640,30 @@ function expandHome(p) {
   return p;
 }
 
-function generateFileLink(filePath, workdir) {
+// Pin the viewer's authorization root ONCE, at session creation, BEFORE the
+// agent process exists — the same trusted-boundary rule pinAllowedRootsSync
+// documents and that showFilePinnedRoots already follows. Resolving
+// session.workdir later, at tool-event time, would pin whatever the agent had
+// already moved into its place, so the token would carry a VALID identity for
+// the WRONG directory. Returns the serializable identity triples the signed
+// token carries, or null (no viewer links) if the workdir cannot be pinned.
+function pinViewerRootIdentities(cwd) {
+  if (!cwd) return null;
+  try {
+    return pinAllowedRootsSync([cwd]).roots
+      .map(({ realPath, dev, ino }) => ({ realPath, dev, ino }));
+  } catch (error) {
+    console.warn(`[file-link] viewer links disabled for ${cwd}: failed to pin workdir (${error.message})`);
+    return null;
+  }
+}
+
+// `rootIdentities` is the session's pinned viewer root (above). Deliberately a
+// PARAMETER and not a fresh resolve: this runs synchronously on the bridge's
+// event loop for every Edit/Write/MultiEdit event, so it must do no filesystem
+// I/O at all — a workdir on a stalled NFS/FUSE mount would otherwise wedge
+// every session, HTTP route and WebSocket in the process.
+function generateFileLink(filePath, workdir, rootIdentities) {
   if (!HMAC_SECRET || !VIEWER_BASE_URL) return null;
   // Normalize BEFORE gating and signing: a relative session.workdir (or
   // target) would otherwise resolve against the wrong process cwd in the
@@ -655,20 +678,17 @@ function generateFileLink(filePath, workdir) {
     console.log(`file-link denied (${gate.reason}): ${absTarget}`);
     return null;
   }
-  // Pin the workdir's filesystem IDENTITY (realPath + dev/ino) into the signed
+  // Carry the workdir's filesystem IDENTITY (realPath + dev/ino) in the signed
   // token, not just its name. A pathname is not an authorization boundary: a
   // workdir renamed and replaced by a symlink after the link is minted would
   // otherwise relocate the boundary with the attacker, and the viewer's
   // serve-time re-resolve of that name cannot tell the difference. The guard
   // re-stats the pinned identity on every serve and rejects a dev/ino change.
+  // A scoped link we cannot pin is a link we do not mint.
   let roots = null;
   if (absWorkdir) {
-    try {
-      roots = pinAllowedRootsSync([absWorkdir]).roots
-        .map(({ realPath, dev, ino }) => ({ realPath, dev, ino }));
-    } catch {
-      // An unresolvable workdir cannot be pinned, and a link we cannot scope
-      // is a link we do not mint.
+    roots = Array.isArray(rootIdentities) && rootIdentities.length ? rootIdentities : null;
+    if (!roots) {
       console.log(`file-link denied (bad-workdir): ${absTarget}`);
       return null;
     }
@@ -1394,7 +1414,7 @@ function buildEditDiffPayload(session, toolName, input, label) {
   return {
     file_path: absPath,
     display_path: input.file_path,
-    viewer_url: generateFileLink(absPath, session.workdir),
+    viewer_url: generateFileLink(absPath, session.workdir, session.viewerRootIdentities),
     tool: toolName,
     label: label || null,
     diff: result.diff,
@@ -1829,6 +1849,10 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   const effectiveMcpExtras = effectiveExtras(mcpExtras, DEFAULT_MCP_EXTRAS);
   const shareEnabled = effectiveMcpExtras.includes('share');
   const permissionToken = randomUUID();
+  // Pinned here, at the trusted boundary, for the same reason as
+  // showFilePinnedRoots below — but scoped to the workdir alone, since a
+  // viewer link's scope is the session's workdir, not the artifact roots.
+  const viewerRootIdentities = pinViewerRootIdentities(cwd);
   let showFileToken;
   let showFilePinnedRoots = null;
   if (shareEnabled) {
@@ -1966,6 +1990,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     codexSpawnEnv: spawnEnv,
     ...(showFileToken ? { showFileToken } : {}),
     showFilePinnedRoots,
+    viewerRootIdentities,
     permissionToken,
     _showFileInFlight: 0,
     mcpExtras,
@@ -2245,6 +2270,10 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
     : (options.model ?? persistedCodexState.model ?? undefined);
   const mcpExtras = options.mcpExtras ?? persistedCodexState.mcpExtras ?? persisted?.mcpExtras ?? [];
   const extras = effectiveExtras(mcpExtras, DEFAULT_MCP_EXTRAS);
+  // Pinned here, at the trusted boundary, for the same reason as
+  // showFilePinnedRoots below — but scoped to the workdir alone, since a
+  // viewer link's scope is the session's workdir, not the artifact roots.
+  const viewerRootIdentities = pinViewerRootIdentities(cwd);
   let showFileToken;
   let showFilePinnedRoots = null;
   if (CODEX_APP_SERVER && extras.includes('share')) {
@@ -2279,6 +2308,7 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
     mcpExtras,
     ...(showFileToken ? { showFileToken } : {}),
     showFilePinnedRoots,
+    viewerRootIdentities,
     responseBuffer: '',
     sendCallback: null,
     pendingPlan: null,
@@ -2692,6 +2722,10 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     : (Array.isArray(persistedForRoom?.mcpExtras) ? persistedForRoom.mcpExtras : []);
   const effectiveMcpExtras = effectiveExtras(mcpExtras, DEFAULT_MCP_EXTRAS);
   const shareEnabled = effectiveMcpExtras.includes('share');
+  // Pinned here, at the trusted boundary, for the same reason as
+  // showFilePinnedRoots below — but scoped to the workdir alone, since a
+  // viewer link's scope is the session's workdir, not the artifact roots.
+  const viewerRootIdentities = pinViewerRootIdentities(cwd);
   let showFileToken;
   let showFilePinnedRoots = null;
   if (shareEnabled) {
@@ -2795,6 +2829,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     codexSpawnEnv: interactiveEnv,
     ...(showFileToken ? { showFileToken } : {}),
     showFilePinnedRoots,
+    viewerRootIdentities,
     _showFileInFlight: 0,
     mcpExtras,
     responseBuffer: '',
