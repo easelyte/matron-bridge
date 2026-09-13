@@ -96,7 +96,7 @@ import {
   JOURNAL_CONTROL_HELP,
   JOURNAL_CONTROL_HELP_NOTE,
 } from './lib/command-dispatch.js';
-import { sendPrintInterrupt, applyInterruptAck, interruptAckSubtype, INTERRUPT_FALLBACK_MS, INTERRUPT_ACK_BACKSTOP_MS } from './lib/print-interrupt.js';
+import { sendPrintInterrupt, isInterruptAck, applyInterruptAck, interruptAckSubtype, INTERRUPT_FALLBACK_MS, INTERRUPT_ACK_BACKSTOP_MS } from './lib/print-interrupt.js';
 import {
   checkFileLink,
   validateAndOpen,
@@ -4845,10 +4845,30 @@ function handleClaudeEvent(session, event) {
     // request_id counts, and it is a no-op once the handle has fired, been
     // cancelled, or been acked already. Nothing else about the turn changes.
     case 'control_response': {
-      if (applyInterruptAck(session.pendingInterrupt, event)) {
+      const pending = session.pendingInterrupt;
+      if (!pending) break;
+      if (applyInterruptAck(pending, event)) {
+        // Routine, and deliberately NOT the `[wedge]` prefix (Codex R1 F2):
+        // `[wedge]` is the alertable "the overlap window opened" signal, and a
+        // successful ack is the opposite of that. Tagging both the same would
+        // make every ordinary interrupt look like an incident to a grep or an
+        // alert rule.
         console.log(
-          '[wedge] interrupt acked by claude (subtype %s), room %s — 10s unstick replaced with %dms backstop',
-          interruptAckSubtype(event), session.roomId, INTERRUPT_ACK_BACKSTOP_MS,
+          '[interrupt] acked by claude (subtype %s), room %s — %dms unstick replaced with %dms backstop',
+          interruptAckSubtype(event), session.roomId, INTERRUPT_FALLBACK_MS, INTERRUPT_ACK_BACKSTOP_MS,
+        );
+      } else if (!isInterruptAck(event, pending.requestId)) {
+        // A control_response arrived while OUR interrupt is still pending but
+        // it does not carry our request_id. Either a foreign control request
+        // (we send none today) or the CLI changed the envelope shape — in which
+        // case the ack silently stops matching and the 10s path quietly comes
+        // back. Cheap drift detector for the external contract this whole case
+        // depends on (Codex R1 F3, narrow part). The already-acked duplicate is
+        // NOT logged here: applyInterruptAck returns false for it too, but it
+        // does match, so it falls through both branches.
+        console.warn(
+          '[interrupt] control_response did not match the pending interrupt, room %s — wedge deadline unchanged; check the CLI control_response shape',
+          session.roomId,
         );
       }
       break;
@@ -11640,23 +11660,22 @@ async function printModeInterrupt(session, sendReply) {
       // Tripwire (loop #701 option A). Nothing in this path logged before, so
       // "has the wedge ever actually fired?" could only be answered by querying
       // the journal DB for the chat notice below (52 days, 65 interrupts, zero
-      // firings). Stable greppable prefix, on purpose — it is the alertable
-      // signal that the turn-overlap window has opened for real:
+      // firings). Stable greppable prefix, on purpose, and reserved for THIS —
+      // an actual firing, i.e. the turn-overlap window opening for real:
       //   journalctl -u matron-bridge-journal | grep '[wedge]'
-      // Two distinct firings, kept distinguishable: the CLI never answered at
-      // all (the original designed case), versus it acked and then never ended
-      // the turn (the backstop). They mean different things operationally.
-      if (interruptHandle?.acknowledged) {
-        console.warn(
-          '[wedge] interrupt acked but turn never ended after %dms, room %s gen %d — clearing busy',
-          INTERRUPT_ACK_BACKSTOP_MS, session.roomId, armedGeneration,
-        );
-      } else {
-        console.warn(
-          '[wedge] interrupt unacknowledged after %dms, room %s gen %d — clearing busy',
-          INTERRUPT_FALLBACK_MS, session.roomId, armedGeneration,
-        );
-      }
+      // Two distinct firings, kept distinguishable in BOTH the log and the
+      // operator notice (Codex R1 F2): the CLI never answered at all (the
+      // original designed case, 10s), versus it acked and then never ended the
+      // turn (the backstop, 60s). They mean different things operationally, and
+      // quoting the 10s deadline to the operator when the CLI did respond and we
+      // then waited out the 60s backstop is misleading recovery evidence.
+      const acked = interruptHandle?.acknowledged === true;
+      console.warn(
+        '[wedge] interrupt %s after %dms, room %s gen %d — clearing busy',
+        acked ? 'acked but turn never ended' : 'unacknowledged',
+        acked ? INTERRUPT_ACK_BACKSTOP_MS : INTERRUPT_FALLBACK_MS,
+        session.roomId, armedGeneration,
+      );
       session.busy = false;
       // Deliberately NO noteTurnEnd: this is a defensive unstick after an
       // interrupt got no acknowledgement, and the reply below says so — "the
@@ -11665,7 +11684,10 @@ async function printModeInterrupt(session, sendReply) {
       // here would drop a card for a turn that really was interrupted.
       journalSessionState(session, 'waiting');
       journalActivity(session, 'idle');
-      Promise.resolve(sendReply('⚠️ No response to the interrupt after 10s — cleared busy state. The turn may still be running; !stop kills the session if it stays stuck.')).catch(() => {});
+      const wedgeNotice = acked
+        ? `⚠️ claude acknowledged the interrupt but the turn has not ended after ${Math.round(INTERRUPT_ACK_BACKSTOP_MS / 1000)}s — cleared busy state. The turn may still be running; !stop kills the session if it stays stuck.`
+        : `⚠️ No response to the interrupt after ${Math.round(INTERRUPT_FALLBACK_MS / 1000)}s — cleared busy state. The turn may still be running; !stop kills the session if it stays stuck.`;
+      Promise.resolve(sendReply(wedgeNotice)).catch(() => {});
     },
     onError: (err) => {
       Promise.resolve(sendReply(`Could not send interrupt: ${err.message}`)).catch(() => {});

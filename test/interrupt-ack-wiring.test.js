@@ -29,8 +29,10 @@ describe('interrupt-ack backstop wiring (loop #701)', () => {
   it('imports the ack helpers from lib/print-interrupt.js', () => {
     const importLine = src.match(/import \{[^}]*\} from '\.\/lib\/print-interrupt\.js';/);
     expect(importLine, 'index.js must import from lib/print-interrupt.js').not.toBeNull();
+    expect(importLine[0]).toContain('isInterruptAck');
     expect(importLine[0]).toContain('applyInterruptAck');
     expect(importLine[0]).toContain('INTERRUPT_ACK_BACKSTOP_MS');
+    expect(importLine[0]).toContain('INTERRUPT_FALLBACK_MS');
   });
 
   it('handles control_response in handleClaudeEvent and routes it through applyInterruptAck', () => {
@@ -53,7 +55,33 @@ describe('interrupt-ack backstop wiring (loop #701)', () => {
       + 'the already-fired / already-cancelled / already-acked guards live. Inlining a looser match '
       + 'here (e.g. any control_response, or a top-level id compare) would let an unrelated control '
       + 'response disarm a live wedge.',
-    ).toContain('applyInterruptAck(session.pendingInterrupt, event)');
+    ).toContain('applyInterruptAck(pending, event)');
+    expect(body).toContain('const pending = session.pendingInterrupt;');
+  });
+
+  // Codex R1 F2. The whole value of the tripwire is that `[wedge]` means one
+  // thing: the unstick actually fired and the turn-overlap window is open. A
+  // routine interrupt ack is the OPPOSITE outcome and happens on every single
+  // interrupt (~1/day), so tagging it `[wedge]` too would make the grep — and
+  // any future alert rule on it — report normal operation as an incident.
+  it('reserves the [wedge] prefix for real firings; the ack logs under [interrupt]', () => {
+    const ackCase = bodyOf("case 'control_response': {", '\n    default:');
+
+    expect(
+      ackCase,
+      'the control_response case must NOT log under the [wedge] prefix — that prefix is the '
+      + 'alertable "the overlap window opened" signal, and an ack is proof it did not. '
+      + '(Asserted on the console.* call form so the explanatory comment naming the prefix does '
+      + 'not trip it.)',
+    ).not.toMatch(/console\.(log|warn|error|info)\(\s*'\[wedge\]/);
+    expect(ackCase).toContain("'[interrupt] acked by claude");
+
+    // Drift detector for the external contract this case depends on: a
+    // control_response that arrives while our interrupt is pending but does not
+    // carry our request_id means the CLI changed the envelope, and the ack
+    // silently stops matching (the 10s path quietly returns).
+    expect(ackCase).toContain('isInterruptAck(event, pending.requestId)');
+    expect(ackCase).toMatch(/console\.warn\(\s*'\[interrupt\] control_response did not match/);
   });
 
   it('arms the ack backstop on the interrupt it sends', () => {
@@ -96,12 +124,29 @@ describe('interrupt-ack backstop wiring (loop #701)', () => {
     // the wedge path, which is why answering "has this ever fired?" required a
     // journal DB query over 52 days of events. The prefix must stay stable and
     // greppable: `journalctl -u matron-bridge-journal | grep '\[wedge\]'`.
-    expect(body).toMatch(/console\.warn\(\s*'\[wedge\]/);
+    expect(body).toMatch(/console\.warn\(\s*'\[wedge\] interrupt %s after %dms/);
     expect(
       body,
       'the tripwire must carry the room id and the armed generation — without them a firing is '
       + 'unattributable to a session or a turn.',
     ).toContain('armedGeneration');
     expect(body).toContain('session.roomId');
+  });
+
+  // Codex R1 F2, second half. The wedge now has two deadlines. Telling the
+  // operator "No response after 10s" when the CLI DID respond and we then
+  // waited 60s is misleading recovery evidence — it points them at the wrong
+  // failure. Both the log line and the chat notice must be derived from the
+  // acknowledged state.
+  it('derives the operator notice from the deadline that actually elapsed', () => {
+    const body = bodyOf('async function printModeInterrupt(', '\nfunction bumpTurnGeneration(');
+
+    expect(body).toContain('const acked = interruptHandle?.acknowledged === true;');
+    expect(
+      body,
+      'the wedge notice must not hardcode "10s" — the acked firing waits INTERRUPT_ACK_BACKSTOP_MS.',
+    ).not.toContain('after 10s');
+    expect(body).toContain('claude acknowledged the interrupt but the turn has not ended after');
+    expect(body).toContain('No response to the interrupt after');
   });
 });
