@@ -2195,12 +2195,25 @@ describe('index.js agent-chat room wiring (source inspection)', () => {
       expect(start).toBeGreaterThan(-1);
       const fn = src.slice(start, src.indexOf('\n}', start));
       const clear = fn.indexOf('session._journalSummaryHint = undefined;');
-      const publish = fn.indexOf('publishJournalSummary(session, summaryForJournal(session.pinnedSummaryText));');
+      const publish = fn.indexOf('publishJournalSummary(session, summaryForJournal(session.pinnedSummaryText), { repair: true });');
       expect(clear).toBeGreaterThan(-1);
       // Without the clear first, the publisher's own dedupe would swallow the
       // very republish that exists to undo a dropped frame.
       expect(publish).toBeGreaterThan(clear);
       expect(fn).toMatch(/for \(const session of sessions\.values\(\)\)/);
+    });
+
+    // The repair must NOT ride the evicting enqueue: at hello_ok the queue can
+    // still hold the whole outage backlog, and dropping the oldest frame to make
+    // room for a digest re-send trades real user traffic for a nicety.
+    it('routes the repair transport through the non-evicting best-effort path', () => {
+      const start = src.indexOf('makeJournalSummaryPublisher({');
+      expect(start).toBeGreaterThan(-1);
+      const wiring = src.slice(start, src.indexOf('\n});', start));
+      expect(wiring).toMatch(/upsertConvo: journalUpsertConvo,/);
+      expect(wiring).toMatch(/upsertConvoRepair: \(session, opts\) =>/);
+      expect(wiring).toMatch(/journalPublisher\.upsertConvoBestEffort\(convoId, opts\)/);
+      expect(wiring).not.toMatch(/upsertConvoRepair[\s\S]*journalUpsertConvo\(/);
     });
   });
 

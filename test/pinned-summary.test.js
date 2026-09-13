@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   __resetConcurrency,
+  summaryBlocks,
   JOURNAL_SUMMARY_MAX_CHARS,
   makeJournalSummaryPublisher,
   parseMaxConcurrent,
@@ -539,6 +540,26 @@ describe('summaryForJournal', () => {
   });
 });
 
+describe('summaryBlocks', () => {
+  it('keeps a bullet and its continuation lines together', () => {
+    expect(summaryBlocks('• one\ncontinued\n• two')).toEqual(['• one\ncontinued', '• two']);
+  });
+
+  it('treats leading non-bullet lines as their own block', () => {
+    expect(summaryBlocks('preamble\n• one')).toEqual(['preamble', '• one']);
+  });
+
+  it('drops blank lines and trims', () => {
+    expect(summaryBlocks('  • one  \n\n   \n • two ')).toEqual(['• one', '• two']);
+  });
+
+  it.each([['empty', ''], ['null', null], ['undefined', undefined]])(
+    'returns an empty list for %s', (_label, value) => {
+      expect(summaryBlocks(value)).toEqual([]);
+    },
+  );
+});
+
 describe('makeJournalSummaryPublisher', () => {
   it('upserts the summary and records the hint', () => {
     const upsertConvo = vi.fn();
@@ -576,6 +597,48 @@ describe('makeJournalSummaryPublisher', () => {
       expect(s._journalSummaryHint).toBe('• prior');
     },
   );
+
+  // loop #554 R2-F1: the reconnect fan-out must not evict the outage backlog.
+  it('uses the repair transport only when asked, defaulting to the ordinary one', () => {
+    const upsertConvo = vi.fn();
+    const upsertConvoRepair = vi.fn();
+    const publish = makeJournalSummaryPublisher({ upsertConvo, upsertConvoRepair, env: {} });
+
+    publish(session(), '• live');
+    expect(upsertConvo).toHaveBeenCalledTimes(1);
+    expect(upsertConvoRepair).not.toHaveBeenCalled();
+
+    publish(session(), '• repaired', { repair: true });
+    expect(upsertConvoRepair).toHaveBeenCalledTimes(1);
+    expect(upsertConvo).toHaveBeenCalledTimes(1);
+  });
+
+  it('falls back to the ordinary transport when no repair transport is wired', () => {
+    const upsertConvo = vi.fn();
+    const publish = makeJournalSummaryPublisher({ upsertConvo, env: {} });
+
+    publish(session(), '• work', { repair: true });
+
+    expect(upsertConvo).toHaveBeenCalledTimes(1);
+  });
+
+  // A best-effort enqueue that returns false was neither sent nor retained.
+  // Recording the hint there would suppress the retry meant to recover it.
+  it('does not record the hint when the transport refuses the frame', () => {
+    const upsertConvoRepair = vi.fn(() => false);
+    const publish = makeJournalSummaryPublisher({
+      upsertConvo: vi.fn(), upsertConvoRepair, env: {},
+    });
+    const s = session();
+
+    expect(publish(s, '• work', { repair: true })).toBe(false);
+    expect(s._journalSummaryHint).toBeUndefined();
+
+    // …and the same digest is retried rather than deduped away.
+    upsertConvoRepair.mockReturnValue(true);
+    expect(publish(s, '• work', { repair: true })).toBe(true);
+    expect(s._journalSummaryHint).toBe('• work');
+  });
 
   it('publishes by default and stops when SUMMARY_JOURNAL_PUBLISH=0', () => {
     const upsertConvo = vi.fn();

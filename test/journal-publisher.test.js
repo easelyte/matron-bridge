@@ -372,6 +372,53 @@ describe('createJournalPublisher', () => {
     pub.close();
   });
 
+  // loop #554: the summary reconnect repair uses the best-effort path
+  // specifically because it must not evict the outage backlog.
+  it('carries summary on the best-effort upsert without evicting queued traffic', async () => {
+    const port = await getFreePort();
+    const warnings = [];
+    const log = { warn: (...a) => warnings.push(a.join(' ')), error: () => {} };
+    const pub = createJournalPublisher({
+      url: `ws://127.0.0.1:${port}/ws`, token: 'tok', log, queueLimit: 1, ...FAST_BACKOFF,
+    });
+    let evicted = 0;
+
+    // Fill the bounded queue with real user traffic while disconnected.
+    expect(pub.publishPermissionRequest('c1', { tool_use_id: 't0' }, {
+      onEvicted: () => { evicted += 1; },
+    })).toBe(true);
+
+    // Best-effort is REFUSED rather than evicting the backlog…
+    expect(pub.upsertConvoBestEffort('c1', { summary: '• repaired' })).toBe(false);
+    expect(evicted).toBe(0);
+
+    // …and the ordinary path is what would have evicted it.
+    pub.publishText('c1', { body: 'newer', from: 'user' });
+    expect(evicted).toBe(1);
+    pub.close();
+  });
+
+  it('sends summary on a best-effort upsert when the queue has headroom', async () => {
+    const fake = await startFakeServer();
+    const pub = createJournalPublisher({
+      url: fake.url, token: 'tok', log: silentLog, queueLimit: 10, ...FAST_BACKOFF,
+    });
+
+    await waitFor(() => fake.connections.length > 0);
+    pub.upsertConvoBestEffort('c1', { title: 't', summary: '• repaired' });
+
+    await waitFor(() => fake.received.some(f => f.op === 'convo_upsert' && f.convo_id === 'c1'));
+    const frame = fake.received.find(f => f.op === 'convo_upsert' && f.convo_id === 'c1');
+    expect(frame.summary).toBe('• repaired');
+    // Omit-don't-null: a caller that passes no summary must not clear the row.
+    pub.upsertConvoBestEffort('c2', { title: 't2' });
+    await waitFor(() => fake.received.some(f => f.convo_id === 'c2'));
+    expect('summary' in fake.received.find(f => f.convo_id === 'c2')).toBe(false);
+
+    pub.close();
+    await fake.close();
+  });
+
   it('disabled mode (no url/token): every method is a safe no-op, nothing throws', async () => {
     const warnings = [];
     const log = { warn: (...a) => warnings.push(a.join(' ')), error: () => {} };

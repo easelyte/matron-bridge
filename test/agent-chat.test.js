@@ -314,6 +314,18 @@ describe('createAgentChatHandlers', () => {
       expect(out.endsWith('…')).toBe(true);
     });
 
+    // loop #554 R2-F3: a continuation line is where "…but it is blocked on X"
+    // lands. Dropping it hands peers a blurb that reads like plain success.
+    it('keeps a wrapped bullet whole instead of dropping its continuation', () => {
+      expect(rosterBlurb('• Deployment attempted\nBlocked: credentials unavailable'))
+        .toBe('Deployment attempted Blocked: credentials unavailable');
+    });
+
+    it('counts a wrapped bullet as ONE of the newest three', () => {
+      const digest = '• a\n• b\n• c\ncontinued c\n• d';
+      expect(rosterBlurb(digest)).toBe('b c continued c d');
+    });
+
     it('drops empty bullets rather than emitting stray spaces', () => {
       expect(rosterBlurb('• \n• real one\n•  ')).toBe('real one');
     });

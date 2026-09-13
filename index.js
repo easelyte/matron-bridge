@@ -587,7 +587,7 @@ function handleJournalReconnect() {
 function republishSessionSummaries() {
   for (const session of sessions.values()) {
     session._journalSummaryHint = undefined;
-    publishJournalSummary(session, summaryForJournal(session.pinnedSummaryText));
+    publishJournalSummary(session, summaryForJournal(session.pinnedSummaryText), { repair: true });
   }
 }
 
@@ -6099,7 +6099,22 @@ async function updateRoomName(roomId, name) {
 // Values reaching here are already clamped — by the publish seam inside
 // updatePinnedSummary on the live path, and by the caller on the resume
 // backfill path.
-const publishJournalSummary = makeJournalSummaryPublisher({ upsertConvo: journalUpsertConvo });
+const publishJournalSummary = makeJournalSummaryPublisher({
+  upsertConvo: journalUpsertConvo,
+  // Reconnect repair rides upsertConvoBestEffort — the established non-evicting
+  // fan-out path (same as the stranded-subagent reconcile). At hello_ok the
+  // outbound queue may still hold the entire outage backlog, and an ordinary
+  // enqueue would drop the OLDEST frame to make room: real user traffic
+  // sacrificed for a digest re-send. Best-effort retains the repair in FIFO
+  // pending order and admits it as confirmations create headroom instead.
+  // A session with no journal convo id yet has nothing to repair — it has not
+  // published anything — so refuse rather than buffer.
+  upsertConvoRepair: (session, opts) => {
+    const convoId = journalConvoIdFor(session);
+    if (!JOURNAL_ENABLED || !convoId) return false;
+    return journalPublisher.upsertConvoBestEffort(convoId, opts);
+  },
+});
 
 async function maybeUpdatePinnedSummary(session) {
   await updatePinnedSummary(session, {
