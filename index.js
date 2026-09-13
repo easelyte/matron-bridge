@@ -96,7 +96,7 @@ import {
   JOURNAL_CONTROL_HELP,
   JOURNAL_CONTROL_HELP_NOTE,
 } from './lib/command-dispatch.js';
-import { sendPrintInterrupt } from './lib/print-interrupt.js';
+import { sendPrintInterrupt, applyInterruptAck, interruptAckSubtype, INTERRUPT_FALLBACK_MS, INTERRUPT_ACK_BACKSTOP_MS } from './lib/print-interrupt.js';
 import {
   checkFileLink,
   validateAndOpen,
@@ -4827,6 +4827,29 @@ function handleClaudeEvent(session, event) {
             debug(`Auto tool_result: tool_use_id=${block.tool_use_id}, content=${JSON.stringify(block.content).slice(0, 100)}`);
           }
         }
+      }
+      break;
+    }
+
+    // The CLI's acknowledgement of an interrupt we sent (loop #701). Before
+    // this case these lines fell through to `default: break` and were dropped,
+    // so the bridge's only signal was "did a `result` arrive within 10s" — and
+    // that 10s wedge is the sole door into the turn-overlap window (busy
+    // cleared while the CLI is still running the turn; the operator sees an
+    // idle session, sends a message, the CLI folds it into the dying turn and
+    // it is lost with the abort).
+    //
+    // An ack proves the CLI is responsive, which is precisely what the wedge
+    // exists to test for, so it pushes the deadline out to a long backstop.
+    // applyInterruptAck owns the matching: only the PENDING interrupt's own
+    // request_id counts, and it is a no-op once the handle has fired, been
+    // cancelled, or been acked already. Nothing else about the turn changes.
+    case 'control_response': {
+      if (applyInterruptAck(session.pendingInterrupt, event)) {
+        console.log(
+          '[wedge] interrupt acked by claude (subtype %s), room %s — 10s unstick replaced with %dms backstop',
+          interruptAckSubtype(event), session.roomId, INTERRUPT_ACK_BACKSTOP_MS,
+        );
       }
       break;
     }
@@ -11597,6 +11620,13 @@ async function printModeInterrupt(session, sendReply) {
   const armedGeneration = session.turnGeneration;
   const interruptHandle = sendPrintInterrupt({
     stdin: session.proc.stdin,
+    // Loop #701: the CLI's control_response ack replaces the 10s unstick below
+    // with this backstop (handleClaudeEvent's `control_response` case). It is a
+    // replacement, not a cancellation — a CLI that acks and then never delivers
+    // a result must still unstick, or every later message queues behind a busy
+    // flag nothing will clear. The no-ack path keeps the 10s deadline
+    // unchanged, which is the case this wedge was designed for.
+    backstopMs: INTERRUPT_ACK_BACKSTOP_MS,
     shouldFireWedge: () => session.turnGeneration === armedGeneration,
     // Retire the handle when the timer fires, even if the wedge is suppressed
     // (Codex R1 F1). Identity-checked so a newer interrupt's handle is never
@@ -11607,6 +11637,26 @@ async function printModeInterrupt(session, sendReply) {
     },
     onWedge: () => {
       if (!session.busy) return;
+      // Tripwire (loop #701 option A). Nothing in this path logged before, so
+      // "has the wedge ever actually fired?" could only be answered by querying
+      // the journal DB for the chat notice below (52 days, 65 interrupts, zero
+      // firings). Stable greppable prefix, on purpose — it is the alertable
+      // signal that the turn-overlap window has opened for real:
+      //   journalctl -u matron-bridge-journal | grep '[wedge]'
+      // Two distinct firings, kept distinguishable: the CLI never answered at
+      // all (the original designed case), versus it acked and then never ended
+      // the turn (the backstop). They mean different things operationally.
+      if (interruptHandle?.acknowledged) {
+        console.warn(
+          '[wedge] interrupt acked but turn never ended after %dms, room %s gen %d — clearing busy',
+          INTERRUPT_ACK_BACKSTOP_MS, session.roomId, armedGeneration,
+        );
+      } else {
+        console.warn(
+          '[wedge] interrupt unacknowledged after %dms, room %s gen %d — clearing busy',
+          INTERRUPT_FALLBACK_MS, session.roomId, armedGeneration,
+        );
+      }
       session.busy = false;
       // Deliberately NO noteTurnEnd: this is a defensive unstick after an
       // interrupt got no acknowledgement, and the reply below says so — "the
