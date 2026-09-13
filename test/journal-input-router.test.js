@@ -2175,6 +2175,55 @@ describe('index.js agent-chat room wiring (source inspection)', () => {
     // below is unchanged.
     expect(args).toMatch(/onOpError: \(e\) => \{ warnRejectedConvoUpsert\(e\); if \(agentSpawnHandlers\?\.onOpError\?\.\(e\)\) return; agentInvites\?\.onOpError\(e\); \}/);
   });
+
+  // loop #554 F3: the publish hint records ENQUEUE, not acceptance, so a frame
+  // lost to queue overflow during an outage would be deduped away forever on a
+  // session that then went quiet. The outage is the failure window, so the
+  // reconnect is the repair point.
+  describe('summary publish repair on reconnect', () => {
+    const body = src.slice(
+      src.indexOf('function handleJournalReconnect('),
+      src.indexOf('\n}', src.indexOf('function handleJournalReconnect(')),
+    );
+
+    it('republishes session summaries from handleJournalReconnect', () => {
+      expect(body).toMatch(/republishSessionSummaries\(\);/);
+    });
+
+    it('clears the hint before republishing, and clamps what it sends', () => {
+      const start = src.indexOf('function republishSessionSummaries(');
+      expect(start).toBeGreaterThan(-1);
+      const fn = src.slice(start, src.indexOf('\n}', start));
+      const clear = fn.indexOf('session._journalSummaryHint = undefined;');
+      const publish = fn.indexOf('publishJournalSummary(session, summaryForJournal(session.pinnedSummaryText));');
+      expect(clear).toBeGreaterThan(-1);
+      // Without the clear first, the publisher's own dedupe would swallow the
+      // very republish that exists to undo a dropped frame.
+      expect(publish).toBeGreaterThan(clear);
+      expect(fn).toMatch(/for \(const session of sessions\.values\(\)\)/);
+    });
+  });
+
+  // loop #554 F2: persistSession is fail-open. It must still REPORT, so the
+  // summary publish can decline to get ahead of the durable copy.
+  describe('persistSession reports durability', () => {
+    const fn = src.slice(
+      src.indexOf('function savePersistedSessions('),
+      src.indexOf('\n}', src.indexOf('function savePersistedSessions(')),
+    );
+
+    it('returns true on a successful write and false on a caught failure', () => {
+      expect(fn).toMatch(/savePersistedSessionsOrThrow\(data\);\n\s*return true;/);
+      expect(fn).toMatch(/return false;/);
+    });
+
+    it('persistSession forwards the result on both the fail-open and fail-loud paths', () => {
+      const start = src.indexOf('function persistSession(');
+      const persist = src.slice(start, src.indexOf('\nfunction getPersistedSession(', start));
+      expect(persist).toMatch(/if \(!failLoud\) return savePersistedSessions\(data\);/);
+      expect(persist).toMatch(/savePersistedSessionsOrThrow\(data\);\n\s*return true;/);
+    });
+  });
 });
 
 describe('isResumePickerTap', () => {

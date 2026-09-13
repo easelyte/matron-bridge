@@ -570,6 +570,25 @@ function handleJournalReconnect() {
   // reemit lives in journalOnReconnect, so it is NOT duplicated here.
   reconcileStrandedSubagents('reconnect');
   journalOnReconnect();
+  republishSessionSummaries();
+}
+
+// Repair the summary publish hint across a connection epoch (loop #554 F3).
+// makeJournalSummaryPublisher records "already sent" on ENQUEUE, not on
+// acceptance — so a frame evicted by queue overflow during an outage, or one
+// the server rejected, would be suppressed forever on a session that then went
+// quiet (the next pass produces the same digest and is deduped away). The
+// outage IS the failure window, so clearing the hints on every accepted
+// hello_ok and re-publishing is the matching repair. Idempotent: the server
+// COALESCEs, and (once the journal lands summary_updated_at) only advances
+// freshness on an actual content change, so a re-send of an unchanged digest
+// is inert rather than a false "just updated". Bounded by the number of LIVE
+// in-memory sessions, and empty digests are skipped.
+function republishSessionSummaries() {
+  for (const session of sessions.values()) {
+    session._journalSummaryHint = undefined;
+    publishJournalSummary(session, summaryForJournal(session.pinnedSummaryText));
+  }
 }
 
 // Fail-loud backstop for the summary clamp (loop #554 §5.3). summaryForJournal
@@ -738,11 +757,18 @@ function savePersistedSessionsOrThrow(data) {
   atomicWriteFileSync(SESSIONS_FILE, JSON.stringify(data, null, 2));
 }
 
+// Returns whether the write actually landed. Still fail-OPEN (a full disk must
+// not take the bridge down mid-turn), but no longer fail-SILENT to its caller:
+// persistSession forwards this so a caller that is about to publish derived
+// state elsewhere can decline to let the remote copy get ahead of the durable
+// one (loop #554 F2).
 function savePersistedSessions(data) {
   try {
     savePersistedSessionsOrThrow(data);
+    return true;
   } catch (e) {
     console.error('Failed to save sessions file:', e.message);
+    return false;
   }
 }
 
@@ -839,8 +865,11 @@ function persistSession(roomId, sessionId, workdir, originRoomId, extra, { failL
     ...(activeAgent ? { agent: activeAgent } : {}),
     agentSessions,
   };
-  if (failLoud) savePersistedSessionsOrThrow(data);
-  else savePersistedSessions(data);
+  // true = durably written. failLoud throws instead of returning false, so
+  // reaching the `true` below means the same thing on both paths.
+  if (!failLoud) return savePersistedSessions(data);
+  savePersistedSessionsOrThrow(data);
+  return true;
 }
 
 function getPersistedSession(roomId) {

@@ -684,6 +684,68 @@ describe('updatePinnedSummary journal publish seam', () => {
     expect(d.updateRoomName).toHaveBeenCalledTimes(1);
   });
 
+  // loop #554 F2: persistSession is fail-OPEN (index.js savePersistedSessions
+  // logs and returns rather than throwing), so a publish that ran first could
+  // leave the journal holding text the session store never recorded — and the
+  // next resume would back-fill the older persisted digest over it.
+  it('persists before it publishes', async () => {
+    const order = [];
+    const d = deps({
+      persistSession: vi.fn(() => { order.push('persist'); return true; }),
+      publishSummary: vi.fn(() => order.push('publish')),
+    });
+
+    await updatePinnedSummary(session(), d);
+
+    expect(order).toEqual(['persist', 'publish']);
+  });
+
+  it('persists before it publishes on the compaction write too', async () => {
+    const order = [];
+    const d = deps({
+      codexOneShot: vi.fn()
+        .mockResolvedValueOnce(success('• compacted one\n• compacted two'))
+        .mockResolvedValueOnce(success('TITLE: Compact result\nNEW: Another milestone.')),
+      persistSession: vi.fn(() => { order.push('persist'); return true; }),
+      publishSummary: vi.fn(() => order.push('publish')),
+    });
+
+    await updatePinnedSummary(session({ pinnedSummaryText: longSummary, _compactionFailures: 1 }), d);
+
+    expect(order).toEqual(['persist', 'publish', 'persist', 'publish']);
+  });
+
+  it('does not publish a summary the session store failed to record', async () => {
+    const d = deps({ persistSession: vi.fn(() => false) });
+    const s = session();
+
+    await updatePinnedSummary(s, d);
+
+    expect(d.publishSummary).not.toHaveBeenCalled();
+    expect(d.warn).toHaveBeenCalledWith('[summary] journal publish skipped: summary not persisted',
+      expect.objectContaining({ roomId: s.roomId }));
+    // The pass still completes: the title lands and the in-memory digest stands.
+    expect(d.updateRoomName).toHaveBeenCalledTimes(1);
+    expect(s.pinnedSummaryText).toBe('• Work is complete.');
+  });
+
+  it('still publishes when persistSession reports nothing (legacy/unwired callers)', async () => {
+    const d = deps({ persistSession: vi.fn(() => undefined) });
+
+    await updatePinnedSummary(session(), d);
+
+    expect(d.publishSummary).toHaveBeenCalledTimes(1);
+  });
+
+  it('publishes for a session with no id to persist', async () => {
+    const d = deps();
+
+    await updatePinnedSummary(session({ claudeSessionId: null }), d);
+
+    expect(d.persistSession).not.toHaveBeenCalled();
+    expect(d.publishSummary).toHaveBeenCalledWith(expect.anything(), '• Work is complete.');
+  });
+
   it('leaves the bridge-local accumulator uncapped', async () => {
     const priorBullets = Array.from({ length: 12 }, (_, i) => `• prior ${i} ${'x'.repeat(150)}`).join('\n');
     const d = deps({
