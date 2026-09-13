@@ -93,6 +93,90 @@ describe('createJournalInputConsumer', () => {
     };
   }
 
+  it('routes a user item marker to routeItemToSession when the seam is wired, and ignores it otherwise', () => {
+    const payload = { item_id: 'it_1', num: 1, kind: 'question', title: 'Q', action: 'commented', by: 'user', awaiting: 'agent', resolution: null, comment: { id: 'ic', body: 'x', attachments: [] } };
+    const deps = makeDeps({ routeItemToSession: vi.fn() });
+    const consumer = createJournalInputConsumer(deps);
+    consumer(baseFrame({ type: 'item', seq: 7, payload }));
+    expect(deps.routeItemToSession).toHaveBeenCalledTimes(1);
+    const [session, item, ctx] = deps.routeItemToSession.mock.calls[0];
+    expect(session).toEqual({ claudeSessionId: 'convo-1' });
+    expect(item).toEqual({ payload, seq: 7 });
+    expect(ctx).toEqual({ username: 'dan' });
+    // agent-authored marker (the bridge's own API write echo): dropped
+    consumer(baseFrame({ type: 'item', sender: 'agent:dev-2', payload }));
+    expect(deps.routeItemToSession).toHaveBeenCalledTimes(1);
+    // unwired seam: pass-through, and nothing else in the pipeline reacts
+    const bareDeps = makeDeps();
+    const bare = createJournalInputConsumer(bareDeps);
+    bare(baseFrame({ type: 'item', payload }));
+    expect(bareDeps.findSessionByConvoId).not.toHaveBeenCalled();
+    expect(bareDeps.routeTextToSession).not.toHaveBeenCalled();
+  });
+
+  it('an item marker wakes a reaped session, exactly as text does', () => {
+    // Spec: a reply "wakes the box if asleep". Answering the agent's question
+    // hours later — after the idle reaper took the session — is the case the
+    // tracker exists for, so the marker must auto-resume and then route into
+    // the resumed session, not hit the unknown-convo notice.
+    const payload = { item_id: 'it_1', num: 1, kind: 'question', title: 'Q', action: 'commented', by: 'user', awaiting: 'agent', resolution: null, comment: { id: 'ic', body: 'x', attachments: [] } };
+    const resumed = { claudeSessionId: 'convo-1', resumed: true };
+    const deps = makeDeps({
+      routeItemToSession: vi.fn(),
+      findSessionByConvoId: vi.fn(() => null),
+      resumeSessionForConvo: vi.fn(() => resumed),
+    });
+    const consumer = createJournalInputConsumer(deps);
+    consumer(baseFrame({ type: 'item', payload }));
+    expect(deps.resumeSessionForConvo).toHaveBeenCalledWith('convo-1', { username: 'dan' });
+    expect(deps.routeItemToSession).toHaveBeenCalledTimes(1);
+    expect(deps.routeItemToSession.mock.calls[0][0]).toBe(resumed);
+    expect(deps.noticeUnknownConvo).not.toHaveBeenCalled();
+  });
+
+  it('a marker that can never become a turn is dropped outright — no wake, no route, no notice', () => {
+    // Backlog housekeeping produces no turn (lib/items-turn.js isTurnWorthy),
+    // so respawning a whole agent session for it would be pure cost. Same for
+    // a field edit, an unknown action and a malformed marker. And because it
+    // is not input at all, a sessionless convo must stay SILENT: publishing
+    // the unknown-convo notice would answer a backlog drag on an idle box
+    // with "no active session" — a complaint about something the user never
+    // asked the agent to do.
+    const deps = makeDeps({
+      routeItemToSession: vi.fn(),
+      findSessionByConvoId: vi.fn(() => null),
+      resumeSessionForConvo: vi.fn(() => ({ claudeSessionId: 'convo-1' })),
+    });
+    const consumer = createJournalInputConsumer(deps);
+    for (const payload of [
+      { item_id: 'it_1', num: 1, kind: 'task', title: 'Q', action: 'reordered', by: 'user', awaiting: null, resolution: null },
+      { item_id: 'it_1', num: 1, kind: 'task', title: 'Q', action: 'updated', by: 'user', awaiting: null, resolution: null },
+      { item_id: 'it_1', num: 1, kind: 'task', title: 'Q', action: 'archived', by: 'user', awaiting: null, resolution: null },
+      { action: 'commented' },
+    ]) {
+      consumer(baseFrame({ type: 'item', payload }));
+    }
+    expect(deps.resumeSessionForConvo).not.toHaveBeenCalled();
+    expect(deps.routeItemToSession).not.toHaveBeenCalled();
+    expect(deps.noticeUnknownConvo).not.toHaveBeenCalled();
+  });
+
+  it('an item marker for a dead session on a bridge with no resume seam notices instead of routing', () => {
+    const payload = { item_id: 'it_1', num: 1, kind: 'question', title: 'Q', action: 'commented', by: 'user', awaiting: 'agent', resolution: null, comment: { id: 'ic', body: 'x', attachments: [] } };
+    const deps = makeDeps({ routeItemToSession: vi.fn(), findSessionByConvoId: vi.fn(() => null) });
+    const consumer = createJournalInputConsumer(deps);
+    consumer(baseFrame({ type: 'item', payload }));
+    expect(deps.routeItemToSession).not.toHaveBeenCalled();
+    expect(deps.noticeUnknownConvo).toHaveBeenCalledTimes(1);
+  });
+
+  it('a routeItemToSession that throws never breaks the consumer', () => {
+    const payload = { item_id: 'it_1', num: 1, kind: 'question', title: 'Q', action: 'commented', by: 'user', awaiting: 'agent', resolution: null, comment: { id: 'ic', body: 'x', attachments: [] } };
+    const deps = makeDeps({ routeItemToSession: vi.fn(() => { throw new Error('boom'); }) });
+    const consumer = createJournalInputConsumer(deps);
+    expect(() => consumer(baseFrame({ type: 'item', payload }))).not.toThrow();
+  });
+
   it('ignores frames whose sender is not user:* (agent echoes — the loop-prevention filter)', () => {
     const deps = makeDeps();
     const consumer = createJournalInputConsumer(deps);
@@ -133,6 +217,36 @@ describe('createJournalInputConsumer', () => {
     expect(() => consumer(baseFrame({ payload: null }))).not.toThrow();
     expect(deps.routeTextToSession).not.toHaveBeenCalled();
     expect(warnings.length).toBeGreaterThan(0);
+  });
+
+  it('ignores a flagged fallback text (journal mirror of an item marker) for a live session — no route, no warn', () => {
+    // Spec: docs/superpowers/specs/2026-09-08-task-decision-tracker-design.md
+    // "Old-client fallback" — the journal mirrors an item marker as a plain
+    // `text` event for pre-tracker clients. The marker path already
+    // delivered the turn, so this frame must be silence: no routeTextToSession
+    // call, and (being an ordinary, expected frame, not an anomaly) no warn.
+    const deps = makeDeps();
+    const warnings = [];
+    deps.log = { warn: (...a) => warnings.push(a.join(' ')), error: () => {} };
+    const consumer = createJournalInputConsumer(deps);
+    consumer(baseFrame({
+      payload: { body: '📌 Task #1 "x" — dan commented:\nhi', fallback_for: 'item', item_id: 'it_1', num: 1, action: 'commented' },
+    }));
+    expect(deps.routeTextToSession).not.toHaveBeenCalled();
+    expect(warnings.length).toBe(0);
+  });
+
+  it('routes the same text frame as usual when it carries no fallback_for flag', () => {
+    const deps = makeDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(baseFrame({
+      payload: { body: '📌 Task #1 "x" — dan commented:\nhi', item_id: 'it_1', num: 1, action: 'commented' },
+    }));
+    expect(deps.routeTextToSession).toHaveBeenCalledTimes(1);
+    const [session, body, ctx] = deps.routeTextToSession.mock.calls[0];
+    expect(session).toEqual({ claudeSessionId: 'convo-1' });
+    expect(body).toBe('📌 Task #1 "x" — dan commented:\nhi');
+    expect(ctx).toEqual({ username: 'dan' });
   });
 
   it('routes a prompt_reply event for a known session to routePromptReply with target_seq/choice/text', () => {
@@ -693,6 +807,125 @@ describe('createJournalInputConsumer — auto-resume of reaped sessions (resumeS
       expect(deps.noticeUnknownConvo).toHaveBeenCalledWith('convo-b', { type: 'prompt_reply', username: 'dan' });
     });
   });
+
+  // /sleep card taps outlive the session that published the card: the buttons
+  // act on the host, and the idle reaper removes the session (immediately for
+  // Codex, on process close for Claude) long before a walk-away user taps.
+  describe('sleep card: verified sleep taps route without a session', () => {
+    const sleepCard = (seq, convoId = 'convo-1') => baseFrame({
+      seq, convo_id: convoId, sender: 'agent:dev-2', type: 'prompt',
+      payload: {
+        question: 'Sleep this box now?',
+        options: [
+          { id: 'sleep-confirm', value: 'sleep:confirm' },
+          { id: 'sleep-cancel', value: 'sleep:cancel' },
+        ],
+      },
+    });
+    const sleepReply = (targetSeq, choice, convoId = 'convo-1') => baseFrame({
+      seq: 300, convo_id: convoId, type: 'prompt_reply',
+      payload: { target_seq: targetSeq, choice, text: null },
+    });
+    const sessionlessDeps = () => ({ ...makeDeps(), routeSessionlessPickerTap: vi.fn() });
+
+    it('a sleep:confirm tap on the card it targets, with no session, goes to routeSessionlessPickerTap', () => {
+      const deps = sessionlessDeps();
+      const consumer = createJournalInputConsumer(deps);
+      consumer(sleepCard(20));
+      consumer(sleepReply(20, 'sleep:confirm'));
+      expect(deps.routeSessionlessPickerTap).toHaveBeenCalledWith('convo-1', { target_seq: 20, choice: 'sleep:confirm' }, { username: 'dan' });
+      expect(deps.resumeSessionForConvo).not.toHaveBeenCalled();
+      expect(deps.routePromptReply).not.toHaveBeenCalled();
+      expect(deps.noticeUnknownConvo).not.toHaveBeenCalled();
+    });
+
+    it('a sleep:cancel tap routes the same way', () => {
+      const deps = sessionlessDeps();
+      const consumer = createJournalInputConsumer(deps);
+      consumer(sleepCard(20));
+      consumer(sleepReply(20, 'sleep:cancel'));
+      expect(deps.routeSessionlessPickerTap).toHaveBeenCalledWith('convo-1', { target_seq: 20, choice: 'sleep:cancel' }, { username: 'dan' });
+    });
+
+    it('a sleep: choice with no registered frame is NOT routed — unknown-convo notice as before', () => {
+      const deps = sessionlessDeps();
+      const consumer = createJournalInputConsumer(deps);
+      consumer(sleepReply(20, 'sleep:confirm'));
+      expect(deps.routeSessionlessPickerTap).not.toHaveBeenCalled();
+      expect(deps.noticeUnknownConvo).toHaveBeenCalledWith('convo-1', { type: 'prompt_reply', username: 'dan' });
+    });
+
+    it('a sleep: choice the targeted frame never offered is NOT routed', () => {
+      const deps = sessionlessDeps();
+      const consumer = createJournalInputConsumer(deps);
+      consumer(sleepCard(20));
+      consumer(sleepReply(20, 'sleep:now'));
+      expect(deps.routeSessionlessPickerTap).not.toHaveBeenCalled();
+      expect(deps.noticeUnknownConvo).toHaveBeenCalled();
+    });
+
+    it('still routes after evictConvo (session teardown), which is exactly when a walk-away tap arrives', () => {
+      const deps = sessionlessDeps();
+      const consumer = createJournalInputConsumer(deps);
+      consumer(sleepCard(20));
+      consumer.evictConvo('convo-1');
+      consumer(sleepReply(20, 'sleep:confirm'));
+      expect(deps.routeSessionlessPickerTap).toHaveBeenCalledWith('convo-1', { target_seq: 20, choice: 'sleep:confirm' }, { username: 'dan' });
+      expect(deps.noticeUnknownConvo).not.toHaveBeenCalled();
+    });
+
+    it('is single-use: a second tap (double-tap, client retry) does not run the host command again', () => {
+      const deps = sessionlessDeps();
+      const consumer = createJournalInputConsumer(deps);
+      consumer(sleepCard(20));
+      consumer(sleepReply(20, 'sleep:confirm'));
+      consumer(sleepReply(20, 'sleep:confirm'));
+      expect(deps.routeSessionlessPickerTap).toHaveBeenCalledTimes(1);
+      expect(deps.noticeUnknownConvo).toHaveBeenCalledTimes(1);
+    });
+
+    it('a tap answered while the session was live consumes the frame for the sessionless path too', () => {
+      let live = { alive: true, roomId: '!room' };
+      const deps = { ...sessionlessDeps(), findSessionByConvoId: () => live };
+      const consumer = createJournalInputConsumer(deps);
+      consumer(sleepCard(20));
+      consumer(sleepReply(20, 'sleep:cancel'));
+      expect(deps.routePromptReply).toHaveBeenCalledTimes(1);
+      expect(deps.routePromptReply.mock.calls[0][1]).toMatchObject({ choice: 'sleep:cancel', picker: true });
+      live = null;
+      consumer(sleepReply(20, 'sleep:cancel'));
+      expect(deps.routeSessionlessPickerTap).not.toHaveBeenCalled();
+      expect(deps.noticeUnknownConvo).toHaveBeenCalledTimes(1);
+    });
+
+    it('still dispatches as a picker tap when the session was respawned after teardown (pickerFrames evicted)', () => {
+      let live = null;
+      const deps = { ...sessionlessDeps(), findSessionByConvoId: () => live };
+      const consumer = createJournalInputConsumer(deps);
+      consumer(sleepCard(20));
+      consumer.evictConvo('convo-1');       // reaper tore the session down
+      live = { alive: true, roomId: '!room' }; // something respawned it before the tap
+      consumer(sleepReply(20, 'sleep:confirm'));
+      expect(deps.routePromptReply).toHaveBeenCalledTimes(1);
+      expect(deps.routePromptReply.mock.calls[0][1]).toMatchObject({ choice: 'sleep:confirm', picker: true });
+      expect(deps.routeSessionlessPickerTap).not.toHaveBeenCalled();
+      // ...and it was consumed: a retry is an ordinary (non-picker) answer at
+      // most, never a second picker dispatch, and never a sessionless route.
+      consumer(sleepReply(20, 'sleep:confirm'));
+      expect(deps.routePromptReply.mock.calls.filter(c => c[1]?.picker)).toHaveLength(1);
+      live = null;
+      consumer(sleepReply(20, 'sleep:confirm'));
+      expect(deps.routeSessionlessPickerTap).not.toHaveBeenCalled();
+    });
+
+    it('without the dep, a sessionless sleep tap falls back to the unknown-convo notice', () => {
+      const deps = makeDeps();
+      const consumer = createJournalInputConsumer(deps);
+      consumer(sleepCard(20));
+      consumer(sleepReply(20, 'sleep:confirm'));
+      expect(deps.noticeUnknownConvo).toHaveBeenCalledWith('convo-1', { type: 'prompt_reply', username: 'dan' });
+    });
+  });
 });
 
 // The wiring half of the auto-resume seam: index.js can't be imported
@@ -802,6 +1035,8 @@ describe('promptExpectsReply', () => {
     // Load-bearing for /timer: the set card must not advance the staleness
     // guard, or setting a timer would make the NEXT genuine reply "stale".
     expect(promptExpectsReply({ options: [{ id: 'timer-cancel-5', label: '🚫 Cancel timer' }] })).toBe(false);
+    // Same for the /sleep confirmation card.
+    expect(promptExpectsReply({ options: [{ id: 'sleep-confirm', label: '😴 Sleep now' }] })).toBe(false);
   });
 
   it('is false for queue-notification action buttons (cancel/interrupt)', () => {
@@ -1222,6 +1457,9 @@ describe('createJournalInputConsumer — picker replies bypass the staleness gua
     ['mode:print', [{ id: 'mode-print', value: 'mode:print' }]],
     // The /timer set-confirmation card's Cancel button rides the same path.
     ['timer:cancel:5', [{ id: 'timer-cancel-5', value: 'timer:cancel:5' }]],
+    // The /sleep confirmation card too — a tap that fell through to
+    // pending-prompt routing would silently fail to stop the box.
+    ['sleep:confirm', [{ id: 'sleep-confirm', value: 'sleep:confirm' }, { id: 'sleep-cancel', value: 'sleep:cancel' }]],
   ])(
     'a %s tap whose target_seq identifies its picker frame routes (flagged picker) even past a later answerable prompt',
     (choice, opts) => {
@@ -1837,12 +2075,39 @@ describe('index.js agent-chat room wiring (source inspection)', () => {
       expect(queued).toBeGreaterThan(resolve);
     });
 
-    it('gates ⏳ to peer agents, like the 💬 notice it follows', () => {
-      // A `user:` frame is Dan typing into the room convo himself; he gets no
-      // 💬 line for it, so a bare ⏳ would have nothing to attach to.
-      expect(frame).toMatch(/const isPeerAgent = sender\.startsWith\('agent:'\)/);
-      expect(frame).toMatch(/if \(isPeerAgent\) \{/);
-      expect(frame).toMatch(/if \(isPeerAgent && queuedBefore === 0/);
+    it('gates ⏳ on the SAME label that gates the 💬 notice it follows', () => {
+      // One decision, one gate: a bare ⏳ with no 💬 above it would have
+      // nothing to attach to, and a 💬 with no ⏳ under it would leave a
+      // queued message looking delivered. The label (and the withholding of
+      // it for an unrecognised sender) is roomEchoLabel's call — pinned
+      // behaviourally in test/room-delivery.test.js.
+      expect(frame).toMatch(/const echoFrom = roomEchoLabel\(sender, from\)/);
+      expect(frame).toMatch(/if \(echoFrom\) \{/);
+      expect(frame).toMatch(/if \(echoFrom && queuedBefore === 0/);
+    });
+
+    it("echoes Dan's OWN room messages into the member chats too", () => {
+      // Dan, 2026-08-19: a `user:` frame used to be suppressed here ("he can
+      // already see it in the room"), which hid the thing the room convo
+      // can't show — WHICH member chats took the message straight away and
+      // which queued it behind a running turn. The echo's job is that
+      // receipt, not the content.
+      expect(frame).not.toMatch(/isPeerAgent/);
+      const notice = frame.indexOf('journalPublishNotice(');
+      const queued = frame.indexOf('ROOM_MESSAGE_QUEUED_NOTICE');
+      expect(notice).toBeGreaterThan(-1);
+      expect(queued).toBeGreaterThan(notice);
+    });
+
+    it('publishes the 💬 echo BEFORE the reply-waiter short-circuit', () => {
+      // A message that resolves an agent's `wait_seconds` waiter never
+      // becomes a turn at all — it returns as the tool result. Publishing
+      // the echo first is what keeps that exchange visible to Dan (and it
+      // correctly gets no ⏳: nothing was queued).
+      const notice = frame.indexOf('formatRoomMessageNotice(');
+      const resolve = frame.indexOf('roomReplyWaiters.resolve(');
+      expect(notice).toBeGreaterThan(-1);
+      expect(resolve).toBeGreaterThan(notice);
     });
 
     it('drains an older batch BEFORE publishing this message\'s notice', () => {
@@ -1936,5 +2201,151 @@ describe('isResumePickerTap', () => {
 describe('isPickerFrame with resume options', () => {
   it('classifies a resume- option frame as a picker', () => {
     expect(isPickerFrame({ options: [{ id: 'resume-abc123def456', value: 'resume:abc123def456' }] })).toBe(true);
+  });
+});
+
+// The 🔊 Unmute card (2026-08-19). agent_chat_mute publishes a prompt card
+// into the muting agent's own conversation; the user's tap is the way back.
+// Classified by target_seq like a queued_release card and for the same reason:
+// the choice value alone proves nothing (an AskUserQuestion option may be
+// labelled literally `unmute:whatever`), so only a seq the bridge itself
+// reserved and published may be actioned.
+describe('room mute card taps', () => {
+  const CONVO = 'convo-mute';
+  const CARD_SEQ = 91;
+  const PROMPT = 'pr_mute_1';
+  const ROOM = 'room-abc';
+
+  function makeDeps(overrides = {}) {
+    const warnings = [];
+    return {
+      deps: {
+        isControlConvo: () => false,
+        handleControlCommand: vi.fn(),
+        findSessionByConvoId: vi.fn(() => ({ claudeSessionId: CONVO })),
+        routeTextToSession: vi.fn(),
+        routePromptReply: vi.fn(),
+        noticeUnknownConvo: vi.fn(),
+        noticeStalePromptReply: vi.fn(),
+        noticeRoomMuteIgnored: vi.fn(),
+        log: { warn: (m) => warnings.push(m), error: () => {} },
+        ...overrides,
+      },
+      warnings,
+    };
+  }
+
+  const cardEcho = () => baseFrame({
+    seq: CARD_SEQ, sender: 'agent:mac', type: 'prompt', convo_id: CONVO,
+    payload: {
+      kind: 'room_mute', prompt_id: PROMPT, question: 'Unmute this chat?',
+      options: [{ id: 'unmute', label: '🔊 Unmute', value: `unmute:${ROOM}` }],
+      mode: 'pick_one',
+    },
+  });
+
+  const tap = (choice, targetSeq = CARD_SEQ) => baseFrame({
+    seq: 300, sender: 'user:dan', type: 'prompt_reply', convo_id: CONVO,
+    payload: { target_seq: targetSeq, choice, text: null },
+  });
+
+  function armed(overrides) {
+    const made = makeDeps(overrides);
+    const consumer = createJournalInputConsumer(made.deps);
+    consumer.roomMuteCards.note(CONVO, { promptId: PROMPT, roomId: ROOM, sessionKey: '!sess' });
+    consumer(cardEcho());
+    return { ...made, consumer };
+  }
+
+  it('a mute card never advances the answerable-prompt staleness guard', () => {
+    expect(promptExpectsReply({
+      kind: 'room_mute', question: 'Unmute this chat?',
+      options: [{ id: 'unmute', label: '🔊 Unmute', value: `unmute:${ROOM}` }],
+    })).toBe(false);
+  });
+
+  it('routes the tap with the card entry attached, then retires it', () => {
+    const { deps, consumer } = armed();
+    consumer(tap(`unmute:${ROOM}`));
+    expect(deps.routePromptReply).toHaveBeenCalledTimes(1);
+    expect(deps.routePromptReply.mock.calls[0][1]).toMatchObject({
+      target_seq: CARD_SEQ,
+      choice: `unmute:${ROOM}`,
+      roomMute: { roomId: ROOM, sessionKey: '!sess', promptId: PROMPT },
+    });
+    // Not an ordinary answer: no staleness refusal, no "answered:" echo path.
+    expect(deps.noticeStalePromptReply).not.toHaveBeenCalled();
+  });
+
+  it('a double tap is a no-op with an honest message, never a second unmute', () => {
+    const { deps, consumer } = armed();
+    consumer(tap(`unmute:${ROOM}`));
+    deps.routePromptReply.mockClear();
+    consumer(tap(`unmute:${ROOM}`));
+    expect(deps.routePromptReply).not.toHaveBeenCalled();
+    expect(deps.noticeRoomMuteIgnored).toHaveBeenCalledWith(CONVO, expect.objectContaining({ reason: 'retired' }));
+  });
+
+  it('a tap on a card the AGENT already retired (agent_chat_unmute) is refused, not honoured', () => {
+    const { deps, consumer } = armed();
+    consumer.roomMuteCards.retire(ROOM, '!sess');
+    consumer(tap(`unmute:${ROOM}`));
+    expect(deps.routePromptReply).not.toHaveBeenCalled();
+    expect(deps.noticeRoomMuteIgnored).toHaveBeenCalledWith(CONVO, expect.objectContaining({ reason: 'retired' }));
+  });
+
+  it('accepts the bare action id as well as the option value (I2)', () => {
+    // The apps send the option VALUE, but the card also carries
+    // `actions: [{id:'unmute'}]` for clients with structured handling. Two
+    // hand-kept lists is exactly how lib/busy-queue.js documents an action
+    // going dead on one client — provenance is already proven by target_seq,
+    // so accepting both costs nothing.
+    const { deps, consumer } = armed();
+    consumer(tap('unmute'));
+    expect(deps.routePromptReply).toHaveBeenCalledTimes(1);
+    expect(deps.routePromptReply.mock.calls[0][1].roomMute).toMatchObject({ roomId: ROOM });
+    expect(deps.noticeRoomMuteIgnored).not.toHaveBeenCalled();
+  });
+
+  it('refuses a choice the card never offered — the value must name THIS card\'s room', () => {
+    const { deps, consumer, warnings } = armed();
+    consumer(tap('unmute:some-other-room'));
+    consumer(tap('yes'));
+    expect(deps.routePromptReply).not.toHaveBeenCalled();
+    expect(deps.noticeRoomMuteIgnored).toHaveBeenCalledWith(CONVO, expect.objectContaining({ reason: 'invalid-action' }));
+    expect(warnings.some(w => /invalid room_mute action/.test(w))).toBe(true);
+  });
+
+  it('a seq the bridge never reserved stays an ordinary reply (provenance, not value shape)', () => {
+    const { deps, consumer } = armed();
+    // Same-looking choice, different (unregistered) target seq: it must flow
+    // through the normal answer path, not silently unmute anything.
+    consumer(tap(`unmute:${ROOM}`, 555));
+    expect(deps.noticeRoomMuteIgnored).not.toHaveBeenCalled();
+    expect(deps.routePromptReply.mock.calls[0][1].roomMute).toBeUndefined();
+  });
+
+  it('a card frame published by a CLIENT cannot register itself as tappable', () => {
+    const { deps } = makeDeps();
+    const consumer = createJournalInputConsumer(deps);
+    // No note() reservation, and a user: sender: neither half is satisfied.
+    consumer(baseFrame({
+      seq: CARD_SEQ, sender: 'user:dan', type: 'prompt', convo_id: CONVO,
+      payload: {
+        kind: 'room_mute', prompt_id: PROMPT,
+        options: [{ id: 'unmute', label: '🔊 Unmute', value: `unmute:${ROOM}` }],
+      },
+    }));
+    consumer(tap(`unmute:${ROOM}`));
+    expect(deps.noticeRoomMuteIgnored).not.toHaveBeenCalled();
+    expect(deps.routePromptReply.mock.calls[0][1].roomMute).toBeUndefined();
+  });
+
+  it('session teardown evicts the card registry with the rest of the convo state', () => {
+    const { deps, consumer } = armed();
+    consumer.evictConvo(CONVO);
+    consumer(tap(`unmute:${ROOM}`));
+    expect(deps.noticeRoomMuteIgnored).not.toHaveBeenCalled();
+    expect(deps.routePromptReply.mock.calls[0][1].roomMute).toBeUndefined();
   });
 });

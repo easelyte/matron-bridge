@@ -6,8 +6,13 @@ import {
   extractMcpExtraFlags,
   extractPromptFlag,
   knownMcpExtras,
+  mergeMcpConfigs,
+  parseDefaultExtras,
   resolveDefaultExtras,
 } from '../lib/mcp-config.js';
+
+// What index.js passes: the mcpExtras keys of the merged config.
+const KNOWN = ['browser', 'share'];
 
 const BASE = Object.freeze({
   mcpServers: {
@@ -44,36 +49,36 @@ const BASE = Object.freeze({
 
 describe('extractMcpExtraFlags', () => {
   it('pulls --browser out of the token list', () => {
-    expect(extractMcpExtraFlags(['--browser', '/some/dir']))
+    expect(extractMcpExtraFlags(['--browser', '/some/dir'], KNOWN))
       .toEqual({ extras: ['browser'], rest: ['/some/dir'] });
-    expect(extractMcpExtraFlags(['/some/dir', '--browser']))
+    expect(extractMcpExtraFlags(['/some/dir', '--browser'], KNOWN))
       .toEqual({ extras: ['browser'], rest: ['/some/dir'] });
   });
 
   it('leaves unknown flags alone', () => {
-    expect(extractMcpExtraFlags(['--browser', '--not-a-flag', '/dir']))
+    expect(extractMcpExtraFlags(['--browser', '--not-a-flag', '/dir'], KNOWN))
       .toEqual({ extras: ['browser'], rest: ['--not-a-flag', '/dir'] });
   });
 
   it('accepts em-dash / en-dash auto-corrected forms of --browser', () => {
     // Matrix/mobile clients auto-correct a leading "--" into "—" (em-dash),
     // so the user's "--browser" arrives as "—browser".
-    expect(extractMcpExtraFlags(['—browser']))
+    expect(extractMcpExtraFlags(['—browser'], KNOWN))
       .toEqual({ extras: ['browser'], rest: [] });
-    expect(extractMcpExtraFlags(['–browser', '/dir']))
+    expect(extractMcpExtraFlags(['–browser', '/dir'], KNOWN))
       .toEqual({ extras: ['browser'], rest: ['/dir'] });
     // A unicode-dash token that isn't a known flag is preserved unchanged.
-    expect(extractMcpExtraFlags(['—notaflag']))
+    expect(extractMcpExtraFlags(['—notaflag'], KNOWN))
       .toEqual({ extras: [], rest: ['—notaflag'] });
   });
 
   it('returns empty extras when none requested', () => {
-    expect(extractMcpExtraFlags(['/dir'])).toEqual({ extras: [], rest: ['/dir'] });
-    expect(extractMcpExtraFlags([])).toEqual({ extras: [], rest: [] });
+    expect(extractMcpExtraFlags(['/dir'], KNOWN)).toEqual({ extras: [], rest: ['/dir'] });
+    expect(extractMcpExtraFlags([], KNOWN)).toEqual({ extras: [], rest: [] });
   });
 
   it('exposes the recognised extras list for sanity checks', () => {
-    expect(knownMcpExtras()).toContain('browser');
+    expect(knownMcpExtras(BASE)).toContain('browser');
   });
 
   // Regression: a plain-object lookup table would silently consume tokens
@@ -81,10 +86,10 @@ describe('extractMcpExtraFlags', () => {
   // "__proto__") because bracket access falls through the prototype chain
   // and returns a truthy function. The Map-backed table avoids this.
   it('does not consume positional args that share Object.prototype names', () => {
-    expect(extractMcpExtraFlags(['constructor'])).toEqual({ extras: [], rest: ['constructor'] });
-    expect(extractMcpExtraFlags(['toString'])).toEqual({ extras: [], rest: ['toString'] });
-    expect(extractMcpExtraFlags(['__proto__'])).toEqual({ extras: [], rest: ['__proto__'] });
-    expect(extractMcpExtraFlags(['hasOwnProperty', '--browser']))
+    expect(extractMcpExtraFlags(['constructor'], KNOWN)).toEqual({ extras: [], rest: ['constructor'] });
+    expect(extractMcpExtraFlags(['toString'], KNOWN)).toEqual({ extras: [], rest: ['toString'] });
+    expect(extractMcpExtraFlags(['__proto__'], KNOWN)).toEqual({ extras: [], rest: ['__proto__'] });
+    expect(extractMcpExtraFlags(['hasOwnProperty', '--browser'], KNOWN))
       .toEqual({ extras: ['browser'], rest: ['hasOwnProperty'] });
   });
 });
@@ -355,6 +360,66 @@ describe('extractBypassFlag', () => {
   it('composes with extractMcpExtraFlags (bypass first, then extras)', () => {
     const { bypass, rest } = extractBypassFlag(['--bypass', '--browser', '/dir']);
     expect(bypass).toBe(true);
-    expect(extractMcpExtraFlags(rest)).toEqual({ extras: ['browser'], rest: ['/dir'] });
+    expect(extractMcpExtraFlags(rest, KNOWN)).toEqual({ extras: ['browser'], rest: ['/dir'] });
+  });
+});
+
+describe('knownMcpExtras', () => {
+  it('returns the mcpExtras keys of the supplied (merged) config', () => {
+    const cfg = { mcpServers: {}, mcpExtras: { browser: {}, circleci: {} } };
+    expect(knownMcpExtras(cfg).sort()).toEqual(['browser', 'circleci']);
+  });
+  it('returns [] when there are no extras', () => {
+    expect(knownMcpExtras({ mcpServers: {} })).toEqual([]);
+    expect(knownMcpExtras(undefined)).toEqual([]);
+  });
+  it('makes an overlay-defined extra a recognised flag', () => {
+    const merged = mergeMcpConfigs(BASE, { mcpExtras: { circleci: { circleci: { command: 'node' } } } });
+    expect(extractMcpExtraFlags(['--circleci', '/dir'], knownMcpExtras(merged)))
+      .toEqual({ extras: ['circleci'], rest: ['/dir'] });
+    expect(extractMcpExtraFlags(['--__proto__'], knownMcpExtras(merged)))
+      .toEqual({ extras: [], rest: ['--__proto__'] });
+  });
+});
+
+describe('mergeMcpConfigs', () => {
+  const base = { mcpServers: { 'ask-user': { command: 'node' } }, mcpExtras: { browser: { 'chrome-devtools': {} } } };
+
+  it('returns base unchanged (but a fresh object) when overlay is null/undefined', () => {
+    expect(mergeMcpConfigs(base, null)).toEqual(base);
+    expect(mergeMcpConfigs(base, undefined)).toEqual(base);
+    expect(mergeMcpConfigs(base, null)).not.toBe(base);
+  });
+
+  it('merges overlay mcpExtras into base by key', () => {
+    const overlay = { mcpExtras: { circleci: { circleci: { command: 'node', args: ['/x/server.js'] } } } };
+    const out = mergeMcpConfigs(base, overlay);
+    expect(Object.keys(out.mcpExtras).sort()).toEqual(['browser', 'circleci']);
+    expect(out.mcpExtras.circleci.circleci.args).toEqual(['/x/server.js']);
+  });
+
+  it('merges overlay mcpServers too', () => {
+    const out = mergeMcpConfigs(base, { mcpServers: { extra: { command: 'node' } } });
+    expect(Object.keys(out.mcpServers).sort()).toEqual(['ask-user', 'extra']);
+  });
+
+  it('does not mutate base', () => {
+    const snap = JSON.parse(JSON.stringify(base));
+    mergeMcpConfigs(base, { mcpExtras: { circleci: {} } });
+    expect(base).toEqual(snap);
+  });
+});
+
+describe('parseDefaultExtras', () => {
+  it('splits a comma list and trims', () => {
+    expect(parseDefaultExtras('circleci, browser')).toEqual(['circleci', 'browser']);
+  });
+  it('returns [] for empty/undefined', () => {
+    expect(parseDefaultExtras('')).toEqual([]);
+    expect(parseDefaultExtras(undefined)).toEqual([]);
+    expect(parseDefaultExtras('  ')).toEqual([]);
+  });
+  it('drops empty segments', () => {
+    expect(parseDefaultExtras('circleci,,')).toEqual(['circleci']);
   });
 });

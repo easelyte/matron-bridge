@@ -1,9 +1,30 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import path from 'path';
 import { mkdtempSync, writeFileSync, mkdirSync, symlinkSync } from 'fs';
 import { realpath } from 'fs/promises';
 import { tmpdir } from 'os';
-import { classifyContentType, createSendAttachmentHandler } from '../lib/send-attachment.js';
+import { classifyContentType, createSendAttachmentHandler, resolveAndUploadLocalFile } from '../lib/send-attachment.js';
+
+// Shared by the handler tests (via makeFixture) and the resolveAndUploadLocalFile
+// tests below: a temp workdir with a small real PNG plus a fake publisher whose
+// uploadMedia/publishImage/publishFile match the exact method names the handler
+// (and now the extracted helper) call.
+function makeUploadFixture() {
+  const dir = mktempWorkdir();
+  const publisher = {
+    uploadMedia: vi.fn(async ({ contentType }) => ({ media_id: 'blob-1', content_type: contentType, size: 4 })),
+    publishImage: vi.fn(),
+    publishFile: vi.fn(),
+  };
+  return { dir, publisher };
+}
+
+function mktempWorkdir() {
+  const dir = mkdtempSync(path.join(tmpdir(), 'send-attach-'));
+  writeFileSync(path.join(dir, 'shot.png'), Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+  writeFileSync(path.join(dir, 'report.pdf'), 'pdf-bytes');
+  return dir;
+}
 
 describe('classifyContentType', () => {
   it('classifies common image extensions as images', () => {
@@ -305,5 +326,33 @@ describe('createSendAttachmentHandler', () => {
       expect(res.status).toBe(403);
       expect(res.body.error).toMatch(/outside/i);
     });
+  });
+});
+
+describe('resolveAndUploadLocalFile', () => {
+  it('uploads a file inside the workdir and returns the media descriptor', async () => {
+    const { dir, publisher } = makeUploadFixture();
+    const r = await resolveAndUploadLocalFile({ session: { workdir: dir }, reqPath: 'shot.png', publisher });
+    expect(r.ok).toBe(true);
+    expect(r.media).toMatchObject({ blob_ref: expect.any(String), mime: 'image/png', name: 'shot.png', isImage: true });
+    expect(publisher.uploadMedia).toHaveBeenCalledTimes(1);
+  });
+
+  it('returns the guard error shape for a path outside the workdir', async () => {
+    const { dir, publisher } = makeUploadFixture();
+    const r = await resolveAndUploadLocalFile({ session: { workdir: dir }, reqPath: '/etc/hosts', publisher });
+    expect(r.ok).toBe(false);
+    expect(r.status).toBe(403);
+    expect(publisher.uploadMedia).not.toHaveBeenCalled();
+  });
+
+  it('returns a 502 failure shape without touching the publish surface when uploadMedia fails open', async () => {
+    const { dir } = makeUploadFixture();
+    const publisher = { uploadMedia: vi.fn(async () => null), publishImage: vi.fn(), publishFile: vi.fn() };
+    const r = await resolveAndUploadLocalFile({ session: { workdir: dir }, reqPath: 'shot.png', publisher });
+    expect(r.ok).toBe(false);
+    expect(r.status).toBe(502);
+    expect(publisher.publishImage).not.toHaveBeenCalled();
+    expect(publisher.publishFile).not.toHaveBeenCalled();
   });
 });

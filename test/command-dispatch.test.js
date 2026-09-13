@@ -51,6 +51,14 @@ describe('classifyBridgeCommand (journal command classification pin)', () => {
     expect(classifyBridgeCommand('/switch codex')).toBe('!switch codex');
   });
 
+  it('classifies /sleep', () => {
+    // Registered here rather than only in index.js's switch so BOTH
+    // transports intercept it — a /sleep that reached the agent as ordinary
+    // text would be a prompt, not a shutdown.
+    expect(classifyBridgeCommand('/sleep')).toBe('!sleep');
+    expect(BRIDGE_COMMAND_NAMES.has('sleep')).toBe(true);
+  });
+
   it('classifies every bridge command name', () => {
     for (const name of BRIDGE_COMMAND_NAMES) {
       expect(classifyBridgeCommand('/' + name)).toBe('!' + name);

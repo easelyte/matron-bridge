@@ -32,6 +32,30 @@ describe('resolveModel', () => {
     expect(resolveModel({ option: undefined, persisted: 'opus' })).toBe('opus');
     expect(resolveModel({ option: undefined, persisted: undefined })).toBeUndefined();
   });
+
+  it('falls back to the box default only when nothing was picked or persisted', () => {
+    expect(resolveModel({ option: undefined, persisted: undefined, fallback: 'fable' })).toBe('fable');
+    expect(resolveModel({ option: 'sonnet', persisted: undefined, fallback: 'fable' })).toBe('sonnet');
+    expect(resolveModel({ option: undefined, persisted: 'opus', fallback: 'fable' })).toBe('opus');
+    expect(resolveModel({ option: undefined, persisted: undefined, fallback: null })).toBeUndefined();
+  });
+
+  it('never adds the box default to a resume (a --model on --resume changes the conversation)', () => {
+    expect(resolveModel({ option: undefined, persisted: undefined, fallback: 'fable', resumed: true })).toBeUndefined();
+    // Persisted and explicit picks still apply on a resume.
+    expect(resolveModel({ option: undefined, persisted: 'claude-opus-5', fallback: 'fable', resumed: true })).toBe('claude-opus-5');
+    expect(resolveModel({ option: 'sonnet', persisted: undefined, fallback: 'fable', resumed: true })).toBe('sonnet');
+    expect(resolveModel({ option: 'default', persisted: undefined, fallback: 'fable', resumed: true })).toBe('fable');
+    // A demoted resume (missing transcript -> fresh --session-id spawn) is a fresh start.
+    expect(resolveModel({ option: undefined, persisted: undefined, fallback: 'fable', resumed: false })).toBe('fable');
+  });
+
+  it("resolves the 'default' alias to the box default when one is configured", () => {
+    expect(resolveModel({ option: 'default', persisted: undefined, fallback: 'fable' })).toBe('fable');
+    expect(resolveModel({ option: undefined, persisted: 'default', fallback: 'fable' })).toBe('fable');
+    // No box default: 'default' passes through to Claude Code as-is.
+    expect(resolveModel({ option: 'default', persisted: undefined })).toBe('default');
+  });
 });
 
 describe('normalizeModeArg', () => {

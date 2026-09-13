@@ -5,6 +5,9 @@ import {
   formatRoomTitle,
   repoLabel,
   extractRepoOverride,
+  withSessionShort,
+  sessionShortFromTitle,
+  titleMarkerFor,
 } from '../lib/journal-title-seed.js';
 
 describe('seedJournalTitle (workdir-sourced)', () => {
@@ -417,5 +420,111 @@ describe('applyFallbackTitle (repo-aware first-user-message naming)', () => {
     const d = deps();
     expect(applyFallbackTitle(session, d)).toBe(true);
     expect(d.updateRoomName).toHaveBeenCalledWith('!abc', '[f0] proj · the real prompt');
+  });
+});
+
+describe('withSessionShort (2-char session-id title prefix)', () => {
+  it('prefixes the first two characters of the id in brackets', () => {
+    expect(withSessionShort('b53e6542', 'css token migration')).toBe('[b5] css token migration');
+  });
+
+  it('leaves the title bare when there is no id to short', () => {
+    expect(withSessionShort(undefined, 'untagged')).toBe('untagged');
+    expect(withSessionShort('', 'untagged')).toBe('untagged');
+    expect(withSessionShort('   ', 'untagged')).toBe('untagged');
+  });
+
+  it('puts a marker ahead of the short, and ahead of a bare title', () => {
+    expect(withSessionShort('b53e6542', 'port the tests', '🐣')).toBe('🐣 [b5] port the tests');
+    expect(withSessionShort(undefined, 'port the tests', '🐣')).toBe('🐣 port the tests');
+  });
+});
+
+// withSessionShort's inverse: reading a short back OUT of a title another
+// bridge published (agent-chat room titles name the peer by its session
+// tag). The two must share one boundary rule, or a title this bridge minted
+// would fail to parse on the box that reads it — hence the round trips.
+describe('sessionShortFromTitle', () => {
+  it('peels the short off a published title', () => {
+    expect(sessionShortFromTitle('[2h] Remote work')).toBe('2h');
+  });
+
+  it('reads THROUGH every marker the bridge puts ahead of the short', () => {
+    // ↔️ = agent-chat room (#225), 🔗 = its pre-#228 legacy twin, 🐣 = a
+    // session another agent spawned (#227).
+    expect(sessionShortFromTitle('↔️ [2h] mac ↔️ dev-2 — ci triage')).toBe('2h');
+    expect(sessionShortFromTitle('🔗 [2h] mac ↔ dev-2')).toBe('2h');
+    expect(sessionShortFromTitle('🐣 [2h] port the tests')).toBe('2h');
+  });
+
+  it('round-trips whatever withSessionShort wrote', () => {
+    expect(sessionShortFromTitle(withSessionShort('b53e6542', 'css token migration'))).toBe('b5');
+    expect(sessionShortFromTitle(withSessionShort('b53e6542', 'port the tests', '🐣'))).toBe('b5');
+    // …and a title that never earned a short comes back empty, not '[u'.
+    expect(sessionShortFromTitle(withSessionShort('', 'untagged'))).toBe('');
+  });
+
+  it('returns nothing for bracketed text that is not a short', () => {
+    // Same closed set as the apps' splitTitle: exactly two alphanumerics,
+    // a trailing space, and a non-empty title after it. Anything else is
+    // ordinary title text that happens to start with a bracket.
+    expect(sessionShortFromTitle('Remote work')).toBe('');
+    expect(sessionShortFromTitle('[abc] three chars')).toBe('');
+    expect(sessionShortFromTitle('[a] one char')).toBe('');
+    expect(sessionShortFromTitle('[a ] space')).toBe('');
+    expect(sessionShortFromTitle('[2h]no space')).toBe('');
+    expect(sessionShortFromTitle('[2h] ')).toBe('');
+    expect(sessionShortFromTitle('[2h]')).toBe('');
+    expect(sessionShortFromTitle('🐣 no short here')).toBe('');
+  });
+
+  it('never throws on a missing or non-string title', () => {
+    expect(sessionShortFromTitle(undefined)).toBe('');
+    expect(sessionShortFromTitle(null)).toBe('');
+    expect(sessionShortFromTitle(42)).toBe('');
+  });
+});
+
+describe('spawned-session titles (🐣 marker + task-derived fallback)', () => {
+  const deps = () => ({ serverLabel: '2', updateRoomName: vi.fn() });
+
+  it('names a spawned session from the approved task, not the boilerplate opening turn', () => {
+    const session = {
+      roomId: '!abc',
+      claudeSessionId: 'f0aa1234',
+      spawnedByAgent: true,
+      spawnTask: 'port the flaky auth tests to the new harness',
+      chatHistory: [
+        { role: 'user', text: '[spawned session] You were started by the user\'s agent session on "mac".' },
+      ],
+    };
+    const d = deps();
+    expect(applyFallbackTitle(session, d)).toBe(true);
+    expect(d.updateRoomName).toHaveBeenCalledWith('!abc', '🐣 [f0] port the flaky auth tests to the new harness');
+  });
+
+  it('cleans and truncates the task exactly like a first-message title', () => {
+    const session = {
+      roomId: '!abc',
+      claudeSessionId: 'f0aa',
+      spawnedByAgent: true,
+      spawnTask: `<task>  ${'x'.repeat(80)}  </task>`,
+      chatHistory: [],
+    };
+    const d = deps();
+    expect(applyFallbackTitle(session, d)).toBe(true);
+    const [, title] = d.updateRoomName.mock.calls[0];
+    expect(title.startsWith('🐣 [f0] xxx')).toBe(true);
+    expect(title.endsWith('…')).toBe(true);
+    expect(title).not.toContain('<');
+  });
+
+  it('titleMarkerFor keeps the marker for a live spawned session and infers it from a persisted title', () => {
+    expect(titleMarkerFor({ spawnedByAgent: true })).toBe('🐣');
+    // After a bridge restart the flag is gone; the current title carries it.
+    expect(titleMarkerFor({ _journalTitleHint: '🐣 [f0] port the tests' })).toBe('🐣');
+    expect(titleMarkerFor({ _journalTitleHint: '[f0] a chat about 🐣 emoji' })).toBe('');
+    expect(titleMarkerFor({})).toBe('');
+    expect(titleMarkerFor(undefined)).toBe('');
   });
 });

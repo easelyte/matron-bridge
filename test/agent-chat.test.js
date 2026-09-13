@@ -48,7 +48,10 @@ function makeFixture(overrides = {}) {
     leave: vi.fn(async () => overrides.leaveOutcome ?? { kind: 'left' }),
     ...overrides.invites,
   };
-  const sessions = new Map([['!sess', { busy: false, alive: true, convoId: 'convo-sess' }]]);
+  // claudeSessionId, because the room title's self tag shorts the SAME id
+  // withSessionShort puts on ordinary session titles (index.js passes
+  // `session.claudeSessionId || session.roomId`).
+  const sessions = new Map([['!sess', { busy: false, alive: true, convoId: 'convo-sess', claudeSessionId: 'ab12cd34', ...overrides.session }]]);
   // The index.js pendingJoinRequests seam: who is join-requesting a room
   // this bridge owns — held OUTSIDE the rooms registry (C1).
   const pendingJoin = new Map();
@@ -58,6 +61,15 @@ function makeFixture(overrides = {}) {
   const localAnswer = vi.fn((roomId, args) => calls.push({ call: 'localAnswer', roomId, args }));
   const routeLocalRoomMessage = vi.fn((roomId, fromKey, body) => calls.push({ call: 'routeLocalRoomMessage', roomId, fromKey, body }));
   const notifyRoomPeer = vi.fn((roomId, sessionKey, text) => calls.push({ call: 'notifyRoomPeer', roomId, sessionKey, text }));
+  // Mute seams (2026-08-19): the loud announcement into the other member's
+  // own chat, and the 🔊 Unmute card / its retirement.
+  const publishSessionNotice = vi.fn((sessionKey, text) => calls.push({ call: 'publishSessionNotice', sessionKey, text }));
+  const publishMuteCard = vi.fn((args) => { calls.push({ call: 'publishMuteCard', ...args }); return true; });
+  const retireMuteCard = vi.fn((roomId, sessionKey) => calls.push({ call: 'retireMuteCard', roomId, sessionKey }));
+  const dropPendingRoomMessages = vi.fn((sessionKey, roomId) => {
+    calls.push({ call: 'dropPendingRoomMessages', sessionKey, roomId });
+    return overrides.droppedCount ?? 0;
+  });
   const handlers = createAgentChatHandlers({
     sessions, publisher, rooms, invites,
     awaitRoomMessage: overrides.awaitRoomMessage,
@@ -66,9 +78,10 @@ function makeFixture(overrides = {}) {
     journalConvoIdFor: (s) => s.convoId || null,
     serverLabel: '2',
     deliverLocalInvite, localAnswer, routeLocalRoomMessage, notifyRoomPeer,
+    publishSessionNotice, publishMuteCard, retireMuteCard, dropPendingRoomMessages,
     log,
   });
-  return { handlers, calls, publisher, rooms, invites, sessions, pendingJoin, log, deliverLocalInvite, localAnswer, routeLocalRoomMessage, notifyRoomPeer };
+  return { handlers, calls, publisher, rooms, invites, sessions, pendingJoin, log, deliverLocalInvite, localAnswer, routeLocalRoomMessage, notifyRoomPeer, publishSessionNotice, publishMuteCard, retireMuteCard, dropPendingRoomMessages };
 }
 
 describe('createAgentChatHandlers', () => {
@@ -271,7 +284,7 @@ describe('createAgentChatHandlers', () => {
       // then the local inject — a request delivered before the waiters exist
       // can settle into the void.
       expect(calls.map((c) => c.call)).toEqual(['upsertConvo', 'publishText', 'record', 'inviteLocal', 'deliverLocalInvite']);
-      expect(calls[0].opts.title).toBe('mac ↔ Local work — ci triage');
+      expect(calls[0].opts.title).toBe('M:ab ↔️ Local work — ci triage');
       expect(calls[2].fields).toMatchObject({ role: 'owner', state: 'pending', sessionRoomId: '!sess', peerDeviceId: 1, peerName: 'Local work' });
       expect(invites.invite).not.toHaveBeenCalled();
       expect(deliverLocalInvite).toHaveBeenCalledWith(expect.objectContaining({
@@ -291,11 +304,13 @@ describe('createAgentChatHandlers', () => {
       expect(chatRoomId).toMatch(/^[0-9a-f-]{36}$/);
 
       expect(calls.map((c) => c.call)).toEqual(['upsertConvo', 'publishText', 'record', 'invite']);
-      expect(calls[0]).toEqual({ call: 'upsertConvo', convoId: chatRoomId, opts: { title: 'mac ↔ dev-2 — ci triage', sessionState: 'waiting' } });
+      // The peer's conversation title ('Remote work') never earned a session
+      // short, so that half of the tag falls back to its plain device name.
+      expect(calls[0]).toEqual({ call: 'upsertConvo', convoId: chatRoomId, opts: { title: 'M:ab ↔️ dev-2 — ci triage', sessionState: 'waiting' } });
       expect(calls[1]).toEqual({ call: 'publishText', convoId: chatRoomId, payload: { body: 'hi, seen the red build?', from: 'agent' } });
       expect(calls[2].fields).toEqual({
-        role: 'owner', state: 'pending', sessionRoomId: '!sess',
-        peerDeviceId: 7, peerName: 'dev-2', topic: 'ci triage', title: 'mac ↔ dev-2 — ci triage',
+        role: 'owner', state: 'pending', sessionRoomId: '!sess', targetConvoId: 'convo-remote',
+        peerDeviceId: 7, peerName: 'dev-2', topic: 'ci triage', title: 'M:ab ↔️ dev-2 — ci triage',
       });
       // targetConvoId rides along with the device: the caller picked a
       // specific conversation, and without it the receiving bridge is left
@@ -315,7 +330,144 @@ describe('createAgentChatHandlers', () => {
     it('omits the topic suffix from the title when no topic given', async () => {
       const { handlers, calls } = makeFixture();
       await handlers.chatStart({ ...good, topic: undefined });
-      expect(calls[0].opts.title).toBe('mac ↔ dev-2');
+      expect(calls[0].opts.title).toBe('M:ab ↔️ dev-2');
+    });
+
+    // The title is what the apps render in the chat list, and the two tags in
+    // it are the same `Letter:short` pair the apps put beside every other
+    // chat (MatronShared SessionTag). A room called "mac ↔ dev-2" said which
+    // BOXES were talking but not which of the four sessions on them — Dan,
+    // 2026-08-19. The title is now ONLY the two tags and the topic: the
+    // `↔️ [xx] ` machine prefix is gone (the apps gate the room tag on
+    // participant count, not the marker, and a per-pair singleton room has no
+    // twin for the room short to disambiguate it from).
+    describe('per-session tags in the room title', () => {
+      const withPeerTitle = (title) => ({ publisher: { fetchRoster: async () => ({
+        ...ROSTER,
+        conversations: ROSTER.conversations.map((c) => (c.id === 'convo-remote' ? { ...c, title } : c)),
+      }) } });
+      const titleOf = (calls) => calls[0].opts.title;
+
+      it('is EXACTLY the two tags and the topic — no ↔️ marker, no room short', async () => {
+        // The prefix `↔️ [xx] ` is gone (2026-08-19). Pinned explicitly rather
+        // than only implied by the toBe assertions below, because re-adding it
+        // would be an app-visible change: SessionTag.splitTitle would read the
+        // bracket as a session short and put `:xx` on the room tag again.
+        const { handlers, calls } = makeFixture(withPeerTitle('[2h] Remote work'));
+        await handlers.chatStart(good);
+        expect(titleOf(calls)).toBe('M:ab ↔️ D:2h — ci triage');
+        expect(titleOf(calls)).not.toMatch(/^↔️ /);
+        expect(titleOf(calls)).not.toMatch(/^\S*\s*\[/);
+        // …and the room id no longer leaks into the title at all.
+        expect(titleOf(calls)).not.toContain(calls[0].convoId.slice(0, 2) + ']');
+      });
+
+      it('tags the peer from the short baked into its conversation title', async () => {
+        const { handlers, calls } = makeFixture(withPeerTitle('[2h] Remote work'));
+        await handlers.chatStart(good);
+        expect(titleOf(calls)).toBe('M:ab ↔️ D:2h — ci triage');
+      });
+
+      it('reads the peer short from behind a leading marker', async () => {
+        // A session another agent spawned carries 🐣 ahead of its short; a
+        // room the peer itself owns carries ↔️ or the legacy 🔗.
+        for (const marker of ['🐣', '↔️', '🔗']) {
+          const { handlers, calls } = makeFixture(withPeerTitle(`${marker} [2h] Remote work`));
+          await handlers.chatStart(good);
+          expect(titleOf(calls)).toBe('M:ab ↔️ D:2h — ci triage');
+        }
+      });
+
+      it('falls back to the plain device name when the peer has no short', async () => {
+        // Seed titles never earned one, and a bare "D:" says nothing.
+        const { handlers, calls } = makeFixture(withPeerTitle('Remote work'));
+        await handlers.chatStart(good);
+        expect(titleOf(calls)).toBe('M:ab ↔️ dev-2 — ci triage');
+      });
+
+      it('falls back to our own device name when THIS session has no short', async () => {
+        const { handlers, calls } = makeFixture({
+          ...withPeerTitle('[2h] Remote work'), session: { claudeSessionId: undefined },
+        });
+        await handlers.chatStart(good);
+        expect(titleOf(calls)).toBe('mac ↔️ D:2h — ci triage');
+      });
+
+      it('shorts the room id when the native session id is not known yet', async () => {
+        // Same input as withSessionShort on an ordinary title: a session that
+        // has not reported a Claude session id still has its room id.
+        const { handlers, calls } = makeFixture({
+          ...withPeerTitle('[2h] Remote work'), session: { claudeSessionId: undefined, roomId: 'zz9' },
+        });
+        await handlers.chatStart(good);
+        expect(titleOf(calls)).toBe('M:zz ↔️ D:2h — ci triage');
+      });
+
+      it('derives both letters against the whole roster, not from initials', async () => {
+        // Two boxes called dev-y and dev-z must come out Y and Z, exactly as
+        // the apps colour them — both would otherwise be D.
+        const { handlers, calls } = makeFixture({ publisher: {
+          identity: () => ({ deviceId: 1, name: 'dev-y' }),
+          fetchRoster: async () => ({
+            agents: [{ device_id: 1, name: 'dev-y' }, { device_id: 7, name: 'dev-z' }],
+            conversations: ROSTER.conversations.map((c) => (c.id === 'convo-remote' ? { ...c, title: '[2h] Remote work' } : c)),
+          }),
+        } });
+        await handlers.chatStart(good);
+        expect(titleOf(calls)).toBe('Y:ab ↔️ Z:2h — ci triage');
+      });
+
+      it('derives our own letter even when the roster omits us', async () => {
+        const { handlers, calls } = makeFixture({ publisher: {
+          identity: () => ({ deviceId: 1, name: 'dev-y' }),
+          fetchRoster: async () => ({
+            agents: [{ device_id: 7, name: 'dev-z' }],
+            conversations: ROSTER.conversations.map((c) => (c.id === 'convo-remote' ? { ...c, title: '[2h] Remote work' } : c)),
+          }),
+        } });
+        await handlers.chatStart(good);
+        expect(titleOf(calls)).toBe('Y:ab ↔️ Z:2h — ci triage');
+      });
+
+      it('prefers a tag character the journal supplies for a box', async () => {
+        // tag_char is the app's per-device override (Settings → Devices →
+        // Tag Character). The journal does not send it yet, so the field is
+        // read defensively and never required.
+        const { handlers, calls } = makeFixture({ publisher: {
+          fetchRoster: async () => ({
+            agents: [{ device_id: 1, name: 'mac', tag_char: '🍎' }, { device_id: 7, name: 'dev-2', tag_char: '2' }],
+            conversations: ROSTER.conversations.map((c) => (c.id === 'convo-remote' ? { ...c, title: '[2h] Remote work' } : c)),
+          }),
+        } });
+        await handlers.chatStart(good);
+        expect(titleOf(calls)).toBe('🍎:ab ↔️ 2:2h — ci triage');
+      });
+
+      it('tags BOTH ends of a same-bridge room, one box letter twice', async () => {
+        const { handlers, calls } = makeFixture({ publisher: { fetchRoster: async () => ({
+          ...ROSTER,
+          conversations: ROSTER.conversations.map((c) => (c.id === 'convo-self' ? { ...c, title: '[2h] Local work' } : c)),
+        }) } });
+        await handlers.chatStart({ ...good, target_convo_id: 'convo-self' });
+        expect(titleOf(calls)).toBe('M:ab ↔️ M:2h — ci triage');
+      });
+
+      it('falls back to the peer CONVO title on a same-bridge room with no short', async () => {
+        // "mac ↔️ mac" names nobody: the two ends of a local room share one
+        // device name, so the fallback side keeps the conversation title.
+        const { handlers, calls } = makeFixture();
+        await handlers.chatStart({ ...good, target_convo_id: 'convo-self' });
+        expect(titleOf(calls)).toBe('M:ab ↔️ Local work — ci triage');
+      });
+
+      it('names an unknown peer device rather than tagging a nameless box', async () => {
+        const { handlers, calls } = makeFixture({ publisher: { fetchRoster: async () => ({
+          agents: [{ device_id: 1, name: 'mac' }],
+          conversations: ROSTER.conversations,
+        }) } });
+        await handlers.chatStart(good);
+        expect(titleOf(calls)).toBe('M:ab ↔️ device 7 — ci triage');
+      });
     });
 
     it('fails CLOSED on a null identity: no room minted, no side effects', async () => {
@@ -329,7 +481,7 @@ describe('createAgentChatHandlers', () => {
     it('caps the title at 120 chars', async () => {
       const { handlers, calls } = makeFixture();
       await handlers.chatStart({ ...good, topic: 'x'.repeat(300) });
-      expect(calls[0].opts.title.startsWith('mac ↔ dev-2 — xxx')).toBe(true);
+      expect(calls[0].opts.title.startsWith('M:ab ↔️ dev-2 — xxx')).toBe(true);
       expect(calls[0].opts.title).toHaveLength(120);
     });
 
@@ -1097,17 +1249,22 @@ describe('index.js routes + ask-user.js tools (source inspection)', () => {
     ['/agent-chat-refuse', 'chatRefuse'],
     ['/agent-chat-join', 'chatJoin'],
     ['/agent-chat-invite', 'chatInvite'],
+    // The leave ROUTE stays mounted even though the tool is gone: session
+    // eviction still closes a dead session's rooms through chatLeave.
     ['/agent-chat-leave', 'chatLeave'],
+    ['/agent-chat-mute', 'chatMute'],
+    ['/agent-chat-unmute', 'chatUnmute'],
     ['/agent-chat-read', 'chatRead'],
   ];
   const TOOLS = [
     'agent_roster', 'agent_sessions', 'agent_message', 'agent_chat_start', 'agent_chat_send', 'agent_chat_accept',
-    'agent_chat_refuse', 'agent_chat_join', 'agent_chat_invite', 'agent_chat_leave', 'agent_chat_read',
+    'agent_chat_refuse', 'agent_chat_join', 'agent_chat_invite', 'agent_chat_read',
+    'agent_chat_mute', 'agent_chat_unmute',
   ];
   const indexSrc = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
   const askUserSrc = readFileSync(new URL('../ask-user.js', import.meta.url), 'utf-8');
 
-  it('mounts all agent-chat loopback routes on their handlers via the throw-isolating adapter', () => {
+  it('mounts every loopback route on its handler via the throw-isolating adapter', () => {
     for (const [route, handler] of ROUTES) {
       expect(indexSrc).toMatch(new RegExp(
         `url\\.pathname === '${route}'[\\s\\S]{0,120}respondAgentChatRoute\\(res, data, agentChatHandlers\\.${handler},`));
@@ -1206,10 +1363,19 @@ describe('index.js routes + ask-user.js tools (source inspection)', () => {
     expect(body).toMatch(/r\.guestSessionRoomId != null[\s\S]{0,600}setGuestState\(r\.roomId, 'left'\)/);
   });
 
-  it('declares all agent-chat MCP tools in ask-user.js', () => {
+  it('declares every agent-chat MCP tool in ask-user.js', () => {
     for (const name of TOOLS) {
       expect(askUserSrc).toMatch(new RegExp(`server\\.tool\\(\\s*\\n\\s*'${name}',`));
     }
+  });
+
+  it('declares NO agent_chat_leave tool — a room is not the agent\'s to close', () => {
+    // Rooms live for the life of the two sessions (2026-08-19). The tool is
+    // what agents reached for constantly, so it is gone from the surface
+    // entirely; mute is the escape hatch. The ROUTE stays (session eviction),
+    // which is exactly why this pin is on the tool declaration and not on the
+    // string appearing anywhere in the file.
+    expect(askUserSrc).not.toMatch(/server\.tool\(\s*\n\s*'agent_chat_leave',/);
   });
 
   // Task 8 review, finding 8b: pin each tool's loopback path and body keys,
@@ -1225,7 +1391,8 @@ describe('index.js routes + ask-user.js tools (source inspection)', () => {
     ['agent_chat_refuse', '/agent-chat-refuse', ['roomId: ROOM_ID', 'room_id', 'reason']],
     ['agent_chat_join', '/agent-chat-join', ['roomId: ROOM_ID', 'room_id', 'justification']],
     ['agent_chat_invite', '/agent-chat-invite', ['roomId: ROOM_ID', 'room_id', 'target_convo_id', 'justification']],
-    ['agent_chat_leave', '/agent-chat-leave', ['roomId: ROOM_ID', 'room_id']],
+    ['agent_chat_mute', '/agent-chat-mute', ['roomId: ROOM_ID', 'room_id', 'reason']],
+    ['agent_chat_unmute', '/agent-chat-unmute', ['roomId: ROOM_ID', 'room_id']],
     ['agent_chat_read', '/agent-chat-read', ['roomId: ROOM_ID', 'room_id', 'limit']],
   ];
   function toolBlock(name) {
@@ -1571,5 +1738,548 @@ describe('local (same-bridge) rooms', () => {
       const res = await handlers.chatInvite({ roomId: '!sess', room_id: 'room-1', target_convo_id: 'convo-remote', justification: 'j' });
       expect(res.status).toBe(502);
     });
+  });
+});
+
+// Reuse-first chatStart (2026-08-19). agent_chat_leave used to be the way out
+// of a room, so agents closed rooms and opened new ones constantly and the
+// user's chat list filled with one-exchange ghosts. A pair now keeps ONE open
+// chat for the life of the two sessions, and mute is the escape hatch.
+describe('chatStart reuse (one room per session pair)', () => {
+  const good = { roomId: '!sess', target_convo_id: 'convo-remote', justification: 'need eyes', message: 'hi' };
+
+  it('a second start at the same target returns the SAME room and creates nothing', async () => {
+    const { handlers, calls, invites } = makeFixture();
+    const first = await handlers.chatStart(good);
+    const roomId = first.body.room_id;
+    expect(roomId).toBeTruthy();
+    calls.length = 0;
+    invites.invite.mockClear();
+    const again = await handlers.chatStart({ ...good, message: 'me again' });
+    expect(again.status).toBe(200);
+    expect(again.body).toEqual({
+      ok: true, room_id: roomId,
+      note: 'existing room reused — this pair keeps one open chat',
+    });
+    // No second convo, no second registry record, no second invite: reuse is
+    // reuse, not a quiet re-create.
+    expect(calls.filter((c) => c.call === 'upsertConvo')).toHaveLength(0);
+    expect(calls.filter((c) => c.call === 'record')).toHaveLength(0);
+    expect(invites.invite).not.toHaveBeenCalled();
+    // …but the opening message is NOT swallowed. chatStart means "say this to
+    // that agent"; reuse must not turn it into "say nothing" while reporting
+    // success, or the caller believes it spoke and the peer heard nothing.
+    expect(calls.filter((c) => c.call === 'publishText')).toEqual([
+      { call: 'publishText', convoId: roomId, payload: { body: 'me again', from: 'agent' } },
+    ]);
+  });
+
+  it('reuses a still-PENDING room too — a peer that has not answered yet is not a reason to open a second one', async () => {
+    const { handlers } = makeFixture({ inviteOutcome: { kind: 'pending_idle' } });
+    const first = await handlers.chatStart(good);
+    const again = await handlers.chatStart(good);
+    expect(again.body.room_id).toBe(first.body.room_id);
+    expect(again.body.note).toMatch(/existing room reused/);
+  });
+
+  it('a TERMINAL room is never resurrected — a fresh start creates a fresh room', async () => {
+    const { handlers, rooms } = makeFixture();
+    const first = await handlers.chatStart(good);
+    rooms.setState(first.body.room_id, 'left');
+    const again = await handlers.chatStart(good);
+    expect(again.body.room_id).not.toBe(first.body.room_id);
+    expect(again.body.note).toBeUndefined();
+    expect(again.body.status).toBe('accepted');
+  });
+
+  it('a refused room is dead, not reusable (chatStart marks it so)', async () => {
+    const { handlers, rooms } = makeFixture({ inviteOutcome: { kind: 'refused', reason: 'busy' } });
+    const first = await handlers.chatStart(good);
+    rooms.setState(first.body.room_id, 'refused');
+    const again = await handlers.chatStart(good);
+    expect(again.body.room_id).not.toBe(first.body.room_id);
+  });
+
+  it('distinct targets get distinct rooms', async () => {
+    const { handlers, sessions } = makeFixture();
+    sessions.set('!other', { busy: false, alive: true, convoId: 'convo-other', claudeSessionId: 'zz99' });
+    const a = await handlers.chatStart(good);
+    const b = await handlers.chatStart({ ...good, target_convo_id: 'convo-self' });
+    expect(b.body.room_id).not.toBe(a.body.room_id);
+  });
+
+  it('another SESSION starting at the same target gets its own room', async () => {
+    const { handlers, sessions } = makeFixture();
+    sessions.set('!sess2', { busy: false, alive: true, convoId: 'convo-sess2', claudeSessionId: 'cd34' });
+    const a = await handlers.chatStart(good);
+    const b = await handlers.chatStart({ ...good, roomId: '!sess2' });
+    expect(b.body.room_id).not.toBe(a.body.room_id);
+  });
+
+  it('the target still has to exist — reuse never skips validation', async () => {
+    const { handlers } = makeFixture();
+    await handlers.chatStart(good);
+    expect((await handlers.chatStart({ ...good, target_convo_id: 'convo-ghost' })).status).toBe(404);
+  });
+
+  it('records the target conversation on the room, which is what keys the reuse', async () => {
+    const { handlers, rooms } = makeFixture();
+    const res = await handlers.chatStart(good);
+    expect(rooms.get(res.body.room_id).targetConvoId).toBe('convo-remote');
+  });
+
+  // A roster that also lists the OWNER's own conversation, so the guest end
+  // has something to aim back at.
+  const BOTH_ENDS = { ...ROSTER, conversations: [
+    ...ROSTER.conversations,
+    { id: 'convo-sess', title: 'Owner work', session_state: 'running', summary: '', agent_device_id: 1, last_ts: 444 },
+  ] };
+
+  it('a LOCAL (same-bridge) room reuses on the two session keys', async () => {
+    const { handlers, rooms, sessions, routeLocalRoomMessage } = makeFixture({ publisher: { fetchRoster: async () => BOTH_ENDS } });
+    sessions.set('!guest', { busy: false, alive: true, convoId: 'convo-self', claudeSessionId: 'gg11' });
+    const first = await handlers.chatStart({ ...good, target_convo_id: 'convo-self' });
+    // index.js binds the guest side when it delivers the local invite.
+    rooms.record(first.body.room_id, { guestSessionRoomId: '!guest', guestState: 'joined' });
+    const again = await handlers.chatStart({ ...good, target_convo_id: 'convo-self' });
+    expect(again.body.room_id).toBe(first.body.room_id);
+    expect(again.body.note).toMatch(/existing room reused/);
+    // A same-bridge peer never hears the journal echo of an own-device agent
+    // frame, so the reused-room publish has to take the local hop too.
+    expect(routeLocalRoomMessage).toHaveBeenCalledWith(first.body.room_id, '!sess', good.message);
+    // …and from the guest's side too: the pair keeps one chat, whichever end
+    // asks. The guest names the OWNER's conversation as its target, which is a
+    // different targetConvoId — so a local room can only be keyed on the two
+    // session keys, never on the convo id one side happened to record.
+    const fromGuest = await handlers.chatStart({ ...good, roomId: '!guest', target_convo_id: 'convo-sess' });
+    expect(fromGuest.body.room_id).toBe(first.body.room_id);
+  });
+
+  it('a LOCAL room whose OTHER end has left is not reusable', async () => {
+    const { handlers, rooms, sessions } = makeFixture();
+    sessions.set('!guest', { busy: false, alive: true, convoId: 'convo-self', claudeSessionId: 'gg11' });
+    const first = await handlers.chatStart({ ...good, target_convo_id: 'convo-self' });
+    rooms.record(first.body.room_id, { guestSessionRoomId: '!guest', guestState: 'joined' });
+    rooms.setGuestState(first.body.room_id, 'left');
+    const again = await handlers.chatStart({ ...good, target_convo_id: 'convo-self' });
+    expect(again.body.room_id).not.toBe(first.body.room_id);
+  });
+});
+
+// agent_chat_mute / agent_chat_unmute (2026-08-19) — the escape hatch that
+// replaced agent_chat_leave. Per-side, bridge-local, loud.
+describe('chatMute / chatUnmute', () => {
+  function muted(f, { state = 'joined' } = {}) {
+    f.rooms.record('room-1', {
+      role: 'owner', state, sessionRoomId: '!sess',
+      peerDeviceId: 7, peerName: 'dev-2', title: 'M:ab ↔️ dev-2', targetConvoId: 'convo-remote',
+    });
+  }
+
+  it('404s a room this session is not in', async () => {
+    const { handlers } = makeFixture();
+    expect((await handlers.chatMute({ roomId: '!sess', room_id: 'nope', reason: 'looping' })).status).toBe(404);
+    expect((await handlers.chatUnmute({ roomId: '!sess', room_id: 'nope' })).status).toBe(404);
+  });
+
+  it('requires a reason — a silent mute leaves the user with no idea why', async () => {
+    const { handlers, rooms } = makeFixture();
+    muted({ rooms });
+    for (const reason of [undefined, '', 42, '   ']) {
+      const res = await handlers.chatMute({ roomId: '!sess', room_id: 'room-1', reason });
+      expect(res.status).toBe(400);
+      expect(res.body.error).toMatch(/reason is required/i);
+    }
+    expect(rooms.isMuted('room-1', '!sess')).toBe(false);
+  });
+
+  it('mutes the caller\'s own side and says so in the room, the peer\'s chat, and a card', async () => {
+    const f = makeFixture();
+    muted(f);
+    // Make it a local room so the "other member" notice has somewhere to go.
+    f.sessions.set('!guest', { busy: false, alive: true, convoId: 'convo-guest' });
+    f.rooms.record('room-1', { guestSessionRoomId: '!guest', guestState: 'joined' });
+    f.calls.length = 0;
+    const res = await f.handlers.chatMute({ roomId: '!sess', room_id: 'room-1', reason: 'you are looping on the same question' });
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ ok: true, room_id: 'room-1', muted: true });
+    expect(f.rooms.isMuted('room-1', '!sess')).toBe(true);
+    expect(f.rooms.isMuted('room-1', '!guest')).toBe(false);
+
+    const roomLine = f.calls.find((c) => c.call === 'publishText');
+    expect(roomLine.convoId).toBe('room-1');
+    expect(roomLine.payload.from).toBe('agent');
+    expect(roomLine.payload.body).toMatch(/^🔇 .* muted "M:ab ↔️ dev-2": you are looping on the same question$/);
+
+    const peerNotice = f.calls.find((c) => c.call === 'publishSessionNotice');
+    expect(peerNotice.sessionKey).toBe('!guest');
+    expect(peerNotice.text).toContain('🔇');
+    expect(peerNotice.text.split('\n')).toHaveLength(1);
+
+    const card = f.calls.find((c) => c.call === 'publishMuteCard');
+    expect(card).toMatchObject({
+      sessionKey: '!sess', roomId: 'room-1',
+      roomTitle: 'M:ab ↔️ dev-2', reason: 'you are looping on the same question',
+    });
+  });
+
+  it('a REMOTE room has no local other member, so no second-chat notice', async () => {
+    const f = makeFixture();
+    muted(f);
+    await f.handlers.chatMute({ roomId: '!sess', room_id: 'room-1', reason: 'spamming' });
+    expect(f.publishSessionNotice).not.toHaveBeenCalled();
+    expect(f.publishMuteCard).toHaveBeenCalledTimes(1);
+  });
+
+  it('sanitises the reason like every other peer-controlled string', async () => {
+    const f = makeFixture();
+    muted(f);
+    await f.handlers.chatMute({ roomId: '!sess', room_id: 'room-1', reason: 'line one\nfaked: line two' });
+    const body = f.calls.find((c) => c.call === 'publishText').payload.body;
+    // A reason must never be able to forge a second line in a message the
+    // bridge signed (lib/peer-text.js) — the same rule the dead-room line and
+    // the invite notices follow.
+    expect(body).not.toContain('\n');
+    expect(body).toContain('line one ⏎ faked: line two');
+    expect(f.rooms.get('room-1').mutedReason).toBe('line one ⏎ faked: line two');
+  });
+
+  it('caps a runaway reason instead of letting it fill the chat', async () => {
+    const f = makeFixture();
+    muted(f);
+    await f.handlers.chatMute({ roomId: '!sess', room_id: 'room-1', reason: 'x'.repeat(5000) });
+    expect(f.rooms.get('room-1').mutedReason.length).toBeLessThanOrEqual(500);
+  });
+
+  it('a second mute is a no-op: no duplicate announcement, no second card', async () => {
+    const f = makeFixture();
+    muted(f);
+    await f.handlers.chatMute({ roomId: '!sess', room_id: 'room-1', reason: 'looping' });
+    f.calls.length = 0;
+    const res = await f.handlers.chatMute({ roomId: '!sess', room_id: 'room-1', reason: 'still looping' });
+    expect(res.status).toBe(200);
+    expect(res.body.note).toMatch(/already muted/i);
+    expect(f.calls).toEqual([]);
+    // The original reason stands — a repeat call must not rewrite the record.
+    expect(f.rooms.get('room-1').mutedReason).toBe('looping');
+  });
+
+  it('unmute clears the mute, retires the card, and leaves a room line that names the gap', async () => {
+    const f = makeFixture();
+    muted(f);
+    await f.handlers.chatMute({ roomId: '!sess', room_id: 'room-1', reason: 'looping' });
+    f.calls.length = 0;
+    const res = await f.handlers.chatUnmute({ roomId: '!sess', room_id: 'room-1' });
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ ok: true, room_id: 'room-1', muted: false });
+    expect(f.rooms.isMuted('room-1', '!sess')).toBe(false);
+    expect(f.retireMuteCard).toHaveBeenCalledWith('room-1', '!sess');
+    const line = f.calls.find((c) => c.call === 'publishText');
+    expect(line.payload.body).toMatch(/^🔊 /);
+    // Frames that arrived while muted are NOT replayed — say so, or the agent
+    // assumes it has seen everything.
+    expect(line.payload.body).toMatch(/agent_chat_read/);
+  });
+
+  it('the card is retired BEFORE the mute is cleared, so no tap can land in between', async () => {
+    const f = makeFixture();
+    muted(f);
+    await f.handlers.chatMute({ roomId: '!sess', room_id: 'room-1', reason: 'looping' });
+    let mutedWhenRetired = null;
+    f.retireMuteCard.mockImplementation(() => { mutedWhenRetired = f.rooms.isMuted('room-1', '!sess'); });
+    await f.handlers.chatUnmute({ roomId: '!sess', room_id: 'room-1' });
+    expect(mutedWhenRetired).toBe(true);
+  });
+
+  it('unmuting an unmuted room is an honest no-op that still clears any stray card', async () => {
+    const f = makeFixture();
+    muted(f);
+    const res = await f.handlers.chatUnmute({ roomId: '!sess', room_id: 'room-1' });
+    expect(res.status).toBe(200);
+    expect(res.body.note).toMatch(/not muted/i);
+    expect(f.retireMuteCard).toHaveBeenCalledWith('room-1', '!sess');
+    expect(f.calls.filter((c) => c.call === 'publishText')).toHaveLength(0);
+  });
+
+  it('a muted session may still SEND — with a note that its own inbound is off', async () => {
+    const f = makeFixture();
+    muted(f);
+    await f.handlers.chatMute({ roomId: '!sess', room_id: 'room-1', reason: 'looping' });
+    const res = await f.handlers.chatSend({ roomId: '!sess', room_id: 'room-1', message: 'one last thing' });
+    expect(res.status).toBe(200);
+    expect(res.body.ok).toBe(true);
+    expect(res.body.note).toMatch(/muted/i);
+    expect(res.body.note).toMatch(/agent_chat_unmute/);
+    // The message really did go out.
+    expect(f.calls.some((c) => c.call === 'publishText' && c.payload.body === 'one last thing')).toBe(true);
+  });
+
+  it('an unmuted session\'s send note is unchanged', async () => {
+    const f = makeFixture();
+    muted(f);
+    const res = await f.handlers.chatSend({ roomId: '!sess', room_id: 'room-1', message: 'hi' });
+    expect(res.body.note).toBe('sent — any reply will arrive as a later turn');
+  });
+});
+
+// index.js wiring for the mute feature. deliverRoomFrameTo / the card
+// publisher / the tap resolver all live in index.js, which can't be imported
+// (it boots the bridge), so the RULES are unit-tested in their libs
+// (roomFrameDisposition in room-delivery.test.js, the card registry in
+// room-mute-cards.test.js) and only the wiring is pinned here.
+describe('mute wiring (source inspection)', () => {
+  const indexSrc = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
+  const askUserSrc = readFileSync(new URL('../ask-user.js', import.meta.url), 'utf-8');
+  const bridgeMd = readFileSync(new URL('../BRIDGE_CLAUDE.md', import.meta.url), 'utf-8');
+
+  function fnBody(name) {
+    const start = indexSrc.indexOf(`\nfunction ${name}(`);
+    expect(start, `function ${name} defined`).toBeGreaterThan(-1);
+    const end = indexSrc.indexOf('\nfunction ', start + 1);
+    return indexSrc.slice(start, end === -1 ? undefined : end);
+  }
+
+  it('deliverRoomFrameTo gates on the muted binding ABOVE the echo, the waiter and the queue', () => {
+    const body = fnBody('deliverRoomFrameTo');
+    const gate = body.indexOf('roomFrameDisposition({');
+    expect(gate).toBeGreaterThan(-1);
+    expect(body).toMatch(/muted: agentRooms\.isMuted\(frame\.convo_id, room\.sessionRoomId\)/);
+    // Everything a delivery does must sit BELOW the gate, or a muted session
+    // still gets the turn / still grows a pending batch.
+    for (const after of ['roomReplyWaiters.resolve(', 'roomDelivery.deliver(', 'ROOM_MESSAGE_QUEUED_NOTICE']) {
+      expect(body.indexOf(after), `${after} is below the mute gate`).toBeGreaterThan(gate);
+    }
+    // The user-frame branch publishes the 💬 echo and then the 🔇 line.
+    expect(body).toMatch(/disposition === 'muted-user'[\s\S]{0,600}formatRoomMessageNotice\([\s\S]{0,400}ROOM_MUTED_NOT_DELIVERED_NOTICE/);
+    // …and the branch RETURNS. Without this the ordering assertions above all
+    // still hold while a muted session receives everything anyway — the notices
+    // publish, execution falls through, and the user gets a 🔇 line followed by
+    // the delivery it just denied. The whole gate is that one keyword.
+    expect(body).toMatch(/if \(disposition !== 'deliver'\) \{[\s\S]{0,900}\n {4}return;\n {2}\}/);
+    // The pre-mute backlog drain stays ABOVE the gate: those messages were
+    // accepted before the mute, and agent_chat_mute discards this room's share
+    // of them explicitly (roomDelivery.dropRoom) rather than stranding them.
+    expect(body.indexOf('maybeFlushRoomDelivery(session);')).toBeLessThan(gate);
+  });
+
+  it('gives the mute handler a seam to drop what the room already had queued', () => {
+    const wiring = indexSrc.slice(indexSrc.indexOf('const agentChatHandlers = createAgentChatHandlers({'));
+    const block = wiring.slice(0, wiring.indexOf('});'));
+    expect(block).toMatch(/dropPendingRoomMessages: \(sessionKey, roomId\) => roomDelivery\.dropRoom\(sessionKey, roomId\)/);
+  });
+
+  it('the unmute tap takes the local hop so a same-bridge peer AGENT hears it', () => {
+    const body = fnBody('resolveRoomMuteTap');
+    expect(body).toMatch(/room\.guestSessionRoomId != null[\s\S]{0,300}routeLocalRoomMessage\(roomId, sessionKey, line\)/);
+  });
+
+  it('reserves the card identity BEFORE publishing it, and offers the room-scoped value', () => {
+    const body = fnBody('publishRoomMuteCard');
+    const note = body.indexOf('roomMuteCards.note(');
+    const publish = body.indexOf("journalPublish(session, 'publishPrompt'");
+    expect(note).toBeGreaterThan(-1);
+    expect(publish).toBeGreaterThan(note);
+    // `options` is the load-bearing half: the apps render prompt cards
+    // generically off it and reply with the option VALUE. A card with only
+    // `actions` would render as a free-text box and its reply would be
+    // refused, leaving a dead button.
+    expect(body).toMatch(/options: \[\{ id: ROOM_MUTE_ACTION_ID, label: '🔊 Unmute', value: unmuteChoiceValue\(roomId\) \}\]/);
+    // The action id and the option value are the SAME constant + its derived
+    // form (lib/room-mute-cards.js roomMuteChoices), not two hand-kept lists —
+    // which is how lib/busy-queue.js records an action going dead on a client.
+    expect(body).toMatch(/actions: \[\{ id: ROOM_MUTE_ACTION_ID,/);
+    expect(body).toMatch(/mode: 'pick_one'/);
+    expect(body).toMatch(/kind: ROOM_MUTE_KIND/);
+  });
+
+  it('the tap resolver re-checks the mute before claiming it unmuted anything', () => {
+    const body = fnBody('resolveRoomMuteTap');
+    const guard = body.indexOf('!agentRooms.isMuted(roomId, sessionKey)');
+    const clear = body.indexOf('agentRooms.setMuted(roomId, sessionKey, false)');
+    expect(guard).toBeGreaterThan(-1);
+    expect(clear).toBeGreaterThan(guard);
+    // Both audiences are told, and both are told that nothing is replayed.
+    expect(body).toMatch(/journalPublishNotice\(convoId,[\s\S]{0,300}agent_chat_read/);
+    expect(body).toMatch(/const line = `🔊 [\s\S]{0,300}agent_chat_read[\s\S]{0,200}journalPublisher\.publishText\(roomId, \{ body: line/);
+  });
+
+  it('routes a verified tap through the roomMute flag, never by value shape', () => {
+    const start = indexSrc.indexOf('function journalOnPromptReply(');
+    const body = indexSrc.slice(start, indexSrc.indexOf('\nfunction ', start + 1));
+    expect(body).toMatch(/if \(answer\?\.roomMute\) \{[\s\S]{0,120}resolveRoomMuteTap\(session, answer\.roomMute\)/);
+  });
+
+  it('hands the chat handlers the mute seams', () => {
+    const wiring = indexSrc.slice(indexSrc.indexOf('const agentChatHandlers = createAgentChatHandlers({'));
+    const block = wiring.slice(0, wiring.indexOf('});'));
+    expect(block).toMatch(/publishSessionNotice: \(sessionKey, text\) =>/);
+    expect(block).toMatch(/publishMuteCard: publishRoomMuteCard/);
+    expect(block).toMatch(/retireMuteCard: \(roomId, sessionKey\) => journalInputConsumer\.roomMuteCards\.retire\(roomId, sessionKey\)/);
+  });
+
+  it('the agent-facing instructions tell agents rooms stay open and mute is the way out', () => {
+    // This block is read verbatim into every Claude session's system prompt
+    // (BRIDGE_CLAUDE_MD_PATH), so it is the actual behavioural lever — the
+    // tool descriptions alone were not enough to stop agents closing rooms.
+    expect(bridgeMd).toMatch(/stays open for the life of the sessions\. Do not try to close it\./);
+    expect(bridgeMd).toMatch(/There is no leave tool\./);
+    expect(bridgeMd).toMatch(/looping, spamming[\s\S]{0,120}agent_chat_mute\(room_id, reason\)/);
+    expect(bridgeMd).not.toMatch(/agent_chat_leave/);
+    // …and the reuse promise, so an agent doesn't open a second room by hand.
+    expect(bridgeMd).toMatch(/returns the room you already have/);
+  });
+
+  it('agent_chat_start tells the agent it will get the room it already has', () => {
+    const start = askUserSrc.indexOf("'agent_chat_start',");
+    const block = askUserSrc.slice(start, askUserSrc.indexOf('server.tool(', start));
+    expect(block).toMatch(/ONE room for the life of both sessions/);
+    expect(block).toMatch(/returns that existing room \(and posts your message into it\)/);
+    expect(block).toMatch(/there is no way to close a room/);
+  });
+
+  it('the mute tool description names the symptoms it is for', () => {
+    const start = askUserSrc.indexOf("'agent_chat_mute',");
+    const block = askUserSrc.slice(start, askUserSrc.indexOf('server.tool(', start));
+    expect(block).toMatch(/looping, spamming, or malfunctioning/);
+    expect(block).toMatch(/you cannot: a room stays open for the life of both sessions/);
+  });
+});
+
+// Findings from the whole-branch review of the mute/persistent-rooms work.
+// Each is a silent-failure seam: the caller was told the thing worked.
+describe('review findings (mute + reuse seams)', () => {
+  const good = { roomId: '!sess', target_convo_id: 'convo-remote', justification: 'need eyes', message: 'hi' };
+  const BOTH_ENDS = { ...ROSTER, conversations: [
+    ...ROSTER.conversations,
+    { id: 'convo-sess', title: 'Owner work', session_state: 'running', summary: '', agent_device_id: 1, last_ts: 444 },
+  ] };
+
+  // C1. findLivePair counts a PENDING binding as live, but posting into a room
+  // needs more than that: roomAccessError('send') admits 'joined', or an OWNER
+  // still 'pending'. The reuse branch skipped that gate entirely.
+  it('REGRESSION (C1): a guest that has not accepted yet cannot post by re-starting the chat', async () => {
+    const f = makeFixture({ publisher: { fetchRoster: async () => BOTH_ENDS }, inviteLocalOutcome: { kind: 'pending_idle' } });
+    f.sessions.set('!guest', { busy: false, alive: true, convoId: 'convo-self', claudeSessionId: 'gg' });
+    const first = await f.handlers.chatStart({ ...good, target_convo_id: 'convo-self' });
+    // index.js binds the guest side when it delivers the local invite.
+    f.rooms.record(first.body.room_id, { guestSessionRoomId: '!guest', guestState: 'pending' });
+    f.calls.length = 0;
+
+    const res = await f.handlers.chatStart({ ...good, roomId: '!guest', target_convo_id: 'convo-sess', message: 'hi A' });
+    // Not ok:true. routeLocalRoomFrame drops a non-'joined' recipient and the
+    // journal drops the own-device echo, so "sent" would have been a lie — and
+    // the owner would have gone on waiting for an answer to its invite.
+    expect(res.status).toBe(409);
+    expect(res.body.room_id).toBe(first.body.room_id);
+    expect(res.body.note).toMatch(/agent_chat_accept/);
+    expect(f.calls.filter((c) => c.call === 'publishText')).toHaveLength(0);
+    expect(f.routeLocalRoomMessage).not.toHaveBeenCalled();
+    // …and emphatically NOT a second room.
+    expect(f.calls.filter((c) => c.call === 'upsertConvo')).toHaveLength(0);
+  });
+
+  it('the OWNER may still post into its own not-yet-accepted room (unchanged)', async () => {
+    const f = makeFixture({ inviteOutcome: { kind: 'pending_idle' } });
+    const first = await f.handlers.chatStart(good);
+    f.calls.length = 0;
+    const again = await f.handlers.chatStart({ ...good, message: 'still there?' });
+    expect(again.body.room_id).toBe(first.body.room_id);
+    expect(again.body.ok).toBe(true);
+    expect(f.calls.filter((c) => c.call === 'publishText')).toHaveLength(1);
+  });
+
+  // C2. The gate only stops NEW frames. A peer that floods while the agent is
+  // mid-turn fills the pending inbox; the agent can only call mute during that
+  // same turn, and the turn-end flush then injected the whole flood anyway.
+  it('REGRESSION (C2): muting drops what the room already has queued for this session', async () => {
+    const f = makeFixture({ droppedCount: 4 });
+    f.rooms.record('room-1', { role: 'owner', state: 'joined', sessionRoomId: '!sess', peerDeviceId: 7, title: 'M:ab ↔️ dev-2' });
+    const res = await f.handlers.chatMute({ roomId: '!sess', room_id: 'room-1', reason: 'flooding' });
+    expect(f.dropPendingRoomMessages).toHaveBeenCalledWith('!sess', 'room-1');
+    // The ⏳ those messages published is owed an outcome — silently dropping
+    // them would leave it hanging forever.
+    const notice = f.calls.find((c) => c.call === 'publishSessionNotice' && /4 queued/.test(c.text));
+    expect(notice.sessionKey).toBe('!sess');
+    expect(res.body.dropped).toBe(4);
+  });
+
+  it('says nothing about a dropped backlog when there was none', async () => {
+    const f = makeFixture();
+    f.rooms.record('room-1', { role: 'owner', state: 'joined', sessionRoomId: '!sess', peerDeviceId: 7 });
+    await f.handlers.chatMute({ roomId: '!sess', room_id: 'room-1', reason: 'looping' });
+    expect(f.calls.filter((c) => c.call === 'publishSessionNotice' && /queued/.test(c.text))).toHaveLength(0);
+  });
+
+  // C3. publisher.publishText alone never reaches a SAME-BRIDGE peer: the
+  // journal drops the own-device echo. The announcement has to take the local
+  // hop like every other room post, or the peer agent is left talking into a
+  // void — the exact state BRIDGE_CLAUDE.md tells agents not to create.
+  it('REGRESSION (C3): the mute and unmute lines reach a same-bridge peer AGENT, not just its user', async () => {
+    const f = makeFixture();
+    f.sessions.set('!guest', { busy: false, alive: true, convoId: 'convo-guest' });
+    f.rooms.record('room-l', {
+      role: 'owner', state: 'joined', sessionRoomId: '!sess',
+      guestSessionRoomId: '!guest', guestState: 'joined', peerDeviceId: 1, title: 'M:ab ↔️ M:cd',
+    });
+    await f.handlers.chatMute({ roomId: '!sess', room_id: 'room-l', reason: 'looping' });
+    expect(f.routeLocalRoomMessage).toHaveBeenCalledWith('room-l', '!sess', expect.stringMatching(/^🔇 /));
+    f.routeLocalRoomMessage.mockClear();
+    await f.handlers.chatUnmute({ roomId: '!sess', room_id: 'room-l' });
+    expect(f.routeLocalRoomMessage).toHaveBeenCalledWith('room-l', '!sess', expect.stringMatching(/^🔊 /));
+  });
+
+  it('mutes from the GUEST binding of a local room, announcing to the owner', async () => {
+    const f = makeFixture();
+    f.sessions.set('!guest', { busy: false, alive: true, convoId: 'convo-guest', claudeSessionId: 'cd' });
+    f.rooms.record('room-l', {
+      role: 'owner', state: 'joined', sessionRoomId: '!sess',
+      guestSessionRoomId: '!guest', guestState: 'joined', peerDeviceId: 1, title: 'M:ab ↔️ M:cd',
+    });
+    const res = await f.handlers.chatMute({ roomId: '!guest', room_id: 'room-l', reason: 'owner is spamming' });
+    expect(res.status).toBe(200);
+    expect(f.rooms.isMuted('room-l', '!guest')).toBe(true);
+    expect(f.rooms.isMuted('room-l', '!sess')).toBe(false);
+    // The "other member" is the OWNER when the guest is the one muting.
+    expect(f.publishSessionNotice).toHaveBeenCalledWith('!sess', expect.stringMatching(/^🔇 /));
+    expect(f.publishMuteCard).toHaveBeenCalledWith(expect.objectContaining({ sessionKey: '!guest', roomId: 'room-l' }));
+    expect(f.dropPendingRoomMessages).toHaveBeenCalledWith('!guest', 'room-l');
+  });
+
+  // C4. "This chat is broken, I'll start a fresh one" is the natural recovery,
+  // and it hands back the very room whose replies are being dropped.
+  it('REGRESSION (C4): reusing a room the caller has MUTED says so', async () => {
+    const f = makeFixture();
+    const first = await f.handlers.chatStart(good);
+    await f.handlers.chatMute({ roomId: '!sess', room_id: first.body.room_id, reason: 'looping' });
+    const again = await f.handlers.chatStart({ ...good, message: 'fresh start?' });
+    expect(again.body.room_id).toBe(first.body.room_id);
+    expect(again.body.note).toMatch(/MUTED/);
+    expect(again.body.note).toMatch(/agent_chat_unmute/);
+  });
+
+  // I4. The card is best-effort (no live session convo, or a throwing seam),
+  // but the tool result promised the user could tap it either way.
+  it('does not promise an Unmute card that was never published', async () => {
+    const f = makeFixture();
+    f.rooms.record('room-1', { role: 'owner', state: 'joined', sessionRoomId: '!sess', peerDeviceId: 7 });
+    f.publishMuteCard.mockReturnValue(false);
+    const res = await f.handlers.chatMute({ roomId: '!sess', room_id: 'room-1', reason: 'looping' });
+    expect(res.body.note).not.toMatch(/taps Unmute/);
+    expect(res.body.card).toBe(false);
+  });
+
+  // A muted sender's waiter can never be resolved (deliverRoomFrameTo returns
+  // above roomReplyWaiters.resolve), so the wait is pure dead time.
+  it('does not burn a wait_seconds a mute guarantees will time out', async () => {
+    const awaitRoomMessage = vi.fn(async () => null);
+    const f = makeFixture({ awaitRoomMessage });
+    f.rooms.record('room-1', { role: 'owner', state: 'joined', sessionRoomId: '!sess', peerDeviceId: 7 });
+    await f.handlers.chatMute({ roomId: '!sess', room_id: 'room-1', reason: 'looping' });
+    await f.handlers.chatSend({ roomId: '!sess', room_id: 'room-1', message: 'hi', wait_seconds: 60 });
+    expect(awaitRoomMessage).not.toHaveBeenCalled();
+    // …but an unmuted send still waits exactly as before.
+    await f.handlers.chatUnmute({ roomId: '!sess', room_id: 'room-1' });
+    await f.handlers.chatSend({ roomId: '!sess', room_id: 'room-1', message: 'hi', wait_seconds: 5 });
+    expect(awaitRoomMessage).toHaveBeenCalledWith('room-1', 5000, '!sess');
   });
 });

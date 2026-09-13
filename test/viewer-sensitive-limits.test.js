@@ -38,6 +38,7 @@ beforeAll(async () => {
   process.env.MATRON_BRIDGE_API_PORT = String(apiPort);
   process.env.DOWNLOAD_RATE_LIMIT = '2';
   process.env.REVEAL_RATE_LIMIT = '2';
+  process.env.SECRET_RATE_LIMIT = '2';
   const { startServer } = await import('../viewer/server.js');
   server = startServer(0);
   await new Promise(r => server.on('listening', r));
@@ -70,6 +71,21 @@ describe('sensitive-link rate limits', () => {
 
     // The POST has its own window and is untouched by any of that.
     expect((await postReveal()).status).toBe(200);
+  });
+
+  it('caps the secure-input POST on a budget of its own', async () => {
+    // A 24 h secret link is a far longer guessing window than a 15 min file
+    // link, so the submit POST must be bounded too — and on its own counter,
+    // for the same reason the reveal POST has one.
+    const secretToken = sensitiveToken({ secretId: 'abc', label: 'x' });
+    const post = () => fetch(`http://127.0.0.1:${port}/secret`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ token: secretToken, value: 'dummy' }).toString(),
+    });
+    expect((await post()).status).toBe(200);
+    expect((await post()).status).toBe(200);
+    expect((await post()).status).toBe(429);
   });
 
   it('still caps the reveal POST on its own budget', async () => {

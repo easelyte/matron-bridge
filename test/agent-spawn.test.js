@@ -140,6 +140,37 @@ describe('createAgentSpawnHandlers', () => {
       expect(sent).toHaveLength(0);
     });
 
+    // Wire contract: the optional `model` field the journal relays to the
+    // target bridge's RPC `start`. Field name is exactly `model`.
+    it('carries a valid model alias in the spawn_request frame, normalized', async () => {
+      const { handlers, sent } = mk();
+      handlers.sessionStart({ ...good, model: 'Opus[1M]' });
+      expect(sent).toHaveLength(1);
+      expect(sent[0].model).toBe('opus[1m]');
+    });
+
+    it('a full claude-* model name is accepted', async () => {
+      const { handlers, sent } = mk();
+      handlers.sessionStart({ ...good, model: 'claude-opus-4-8' });
+      expect(sent[0].model).toBe('claude-opus-4-8');
+    });
+
+    it('omits the model key entirely when none was asked for', async () => {
+      const { handlers, sent } = mk();
+      handlers.sessionStart(good);
+      expect('model' in sent[0]).toBe(false);
+    });
+
+    it('rejects an unknown or non-string model before sending any frame, listing the aliases', async () => {
+      const { handlers, sent } = mk();
+      for (const model of ['gpt-5', 'opus sonnet', 42, {}]) {
+        const res = await handlers.sessionStart({ ...good, model });
+        expect(res.status).toBe(400);
+        expect(res.body.error).toMatch(/sonnet/);
+      }
+      expect(sent).toHaveLength(0);
+    });
+
     it('journal op error: conflict maps to 409 with detail; unknown ref returns false', async () => {
       const { handlers, sent } = mk();
       const p = handlers.sessionStart(good);

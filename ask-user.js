@@ -7,6 +7,9 @@ import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js'
 import { z } from 'zod';
 import { resolvePermissionTimeoutMs } from './lib/permission-prompt.js';
 import { formatBox } from './lib/agent-boxes-format.js';
+import { itemLine, formatItemList, formatItemDetail, formatCommentAck } from './lib/items-format.js';
+import { formatStartAck, formatMilestoneAck, formatMissionDetail, missionLine, formatBlocked, formatJournalError } from './lib/missions-format.js';
+import { missionIdemKey } from './lib/missions-idem.js';
 
 // Route to whichever bridge spawned us: explicit BRIDGE_API_URL wins, else the
 // per-session MATRON_BRIDGE_API_PORT exported by the bridge at spawn (journal=9812,
@@ -17,7 +20,6 @@ const BRIDGE_API = process.env.BRIDGE_API_URL
   || 'http://127.0.0.1:9802';
 const ROOM_ID = process.env.BRIDGE_ROOM_ID || null;
 const POLL_INTERVAL_MS = 500;
-const SECRET_TIMEOUT_MS = 300000;    // 5 min max wait for secret submission
 // Max wait for a permission tap — the bridge's registry TTL resolves from the
 // same env var through the same validation, keeping one expiry for the whole
 // request lifecycle (default 5 min; out-of-range overrides fall back).
@@ -33,40 +35,40 @@ const server = new McpServer({
 
 server.tool(
   'request_secret',
-  'Request a secret from the user via a secure web form. The secret is written to a file and the file path is returned. Use this for API keys, tokens, passwords — anything that should not appear in chat.',
+  'Request a secret from the user via a secure web form: API keys, tokens, passwords, or whole key files (multiline: true) — anything that must not appear in chat. This tool does NOT block and returns nothing secret: it files the request in the user\'s tracker (their Decisions list) alongside a chat link, then returns immediately. The user has 24 hours. When they submit, you receive a turn telling you the local file path to read the value from — so carry on with other work in the meantime and never poll for it.',
   {
     label: z.string().describe('A short label describing what secret is needed, e.g. "AWS access key" or "database password"'),
+    multiline: z.boolean().optional().describe('Render a multi-line box instead of a masked one-line field. Use for PEM keys, certificates and JSON service-account files, whose newlines a one-line field would destroy.'),
   },
-  async ({ label }) => {
+  async ({ label, multiline }) => {
     try {
       const postRes = await fetch(`${BRIDGE_API}/secret`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ label, roomId: ROOM_ID }),
+        body: JSON.stringify({ label, roomId: ROOM_ID, multiline: multiline === true }),
       });
 
       if (!postRes.ok) {
-        const err = await postRes.text();
+        // The bridge answers JSON (a 429 is the per-session pending cap) —
+        // show its sentence, not the raw envelope.
+        const raw = await postRes.text();
+        let err = raw;
+        try { err = JSON.parse(raw).error || raw; } catch { /* not JSON — show it as-is */ }
         return { content: [{ type: 'text', text: `Error requesting secret: ${err}` }] };
       }
 
-      const { secretId } = await postRes.json();
-
-      // Poll for the secret to be submitted
-      const deadline = Date.now() + SECRET_TIMEOUT_MS;
-      while (Date.now() < deadline) {
-        await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
-
-        const pollRes = await fetch(`${BRIDGE_API}/secret/${secretId}`);
-        if (!pollRes.ok) continue;
-
-        const data = await pollRes.json();
-        if (data.answered) {
-          return { content: [{ type: 'text', text: `Secret written to: ${data.path}` }] };
-        }
-      }
-
-      return { content: [{ type: 'text', text: 'Secret request timed out — no input received within 5 minutes.' }] };
+      // No polling: the bridge holds the request for 24 h and delivers the
+      // answer as a turn. The request id is the fallback identifier when the
+      // tracker item could not be filed (no journal on this box).
+      const { secretId, itemNum, itemError } = await postRes.json();
+      const ref = Number.isInteger(itemNum) ? `#${itemNum}` : secretId;
+      const filed = itemError ? ` The tracker item could not be filed (${itemError}) — the chat link still works.` : '';
+      return {
+        content: [{
+          type: 'text',
+          text: `Secret requested (${ref}) — the user has 24 hours; you will receive a turn "🔐 Secret "${label}" submitted — read it from <path>" when it lands. Carry on with other work; do not poll.${filed}`,
+        }],
+      };
     } catch (err) {
       return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
     }
@@ -241,7 +243,12 @@ server.tool(
 
 // Formats a chatStart/chatJoin outcome body ({room_id, status, reason?, note?, error?}).
 function describeRoomOutcome(body) {
-  return `Room ${body.room_id}: ${body.status || body.error || 'unknown'}${body.reason ? ` — ${body.reason}` : ''}${body.note ? `. ${body.note}` : ''}`;
+  // A reused room (chatStart's reuse-first path) answers {ok, room_id, note}
+  // with no `status` — it is not an invite outcome, it is the room the pair
+  // already has. Falling straight through to 'unknown' would read as a
+  // failure, so `ok` speaks for itself.
+  const state = body.status || (body.ok ? 'ok' : null) || body.error || 'unknown';
+  return `Room ${body.room_id}: ${state}${body.reason ? ` — ${body.reason}` : ''}${body.note ? `. ${body.note}` : ''}`;
 }
 
 // formatBox (agent_boxes rendering) lives in lib/agent-boxes-format.js —
@@ -355,7 +362,7 @@ server.tool(
 
 server.tool(
   'agent_chat_start',
-  "Start a chat room with one of the user's other agent sessions: pick a target conversation from agent_roster, and the bridge invites its agent. Sessions on this same bridge are valid targets too (the invite is delivered locally). If the result is pending or pending_busy, do NOT wait or poll: continue your own work — the answer and any replies arrive automatically as later turns.",
+  "Start a chat room with one of the user's other agent sessions: pick a target conversation from agent_roster, and the bridge invites its agent. Sessions on this same bridge are valid targets too (the invite is delivered locally). You and a given peer session share ONE room for the life of both sessions: calling this again at the same target returns that existing room (and posts your message into it) rather than opening a second one — there is no way to close a room, so use agent_chat_mute if one goes wrong. If the result is pending or pending_busy, do NOT wait or poll: continue your own work — the answer and any replies arrive automatically as later turns.",
   {
     target_convo_id: z.string().describe('Conversation id of the target session, from agent_roster'),
     topic: z.string().optional().describe('Optional short topic for the room title'),
@@ -382,7 +389,7 @@ server.tool(
 
 server.tool(
   'agent_boxes',
-  "List the user's other agent boxes (machines) as spawn targets, with recent folders, current activity, and account usage limits. Use this when the user asks to run work on another machine or to find a box with spare capacity: prefer a box whose usage percentages are low and whose activity shows few or no recent sessions. Data may be minutes old; offline boxes cannot be spawned on.",
+  "List the user's agent boxes (machines) as spawn targets — including this one, marked \"this box\" — with recent folders, current activity, and account usage limits. Use this when the user asks to start a new session here or on another machine, or to find a box with spare capacity: prefer a box whose usage percentages are low and whose activity shows few or no recent sessions. Data may be minutes old; offline boxes cannot be spawned on.",
   {},
   async () => {
     try {
@@ -396,7 +403,7 @@ server.tool(
         return { content: [{ type: 'text', text: `agent_boxes failed: ${data.error || `HTTP ${postRes.status}`}` }] };
       }
       const boxes = data.boxes || [];
-      if (!boxes.length) return { content: [{ type: 'text', text: 'No other boxes found.' }] };
+      if (!boxes.length) return { content: [{ type: 'text', text: 'No boxes found.' }] };
       return { content: [{ type: 'text', text: boxes.map(formatBox).join('\n\n') }] };
     } catch (err) {
       return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
@@ -406,25 +413,63 @@ server.tool(
 
 server.tool(
   'agent_session_start',
-  "Ask the user's consent to start a new agent session on another of their boxes, seeded with a task. If the user has not already said which box and directory the work should happen in, ask them before calling this — they usually have a preference, and the consent card can only be approved or declined, it cannot be corrected. The result is pending: do NOT wait or poll — the user's decision and the spawn outcome arrive automatically as later turns. On approval a chat room links you to the new session; its reports arrive there.",
+  "Ask the user's consent to start a new agent session on one of their boxes — this one included, when the work has to happen here — seeded with a task. If the user has not already said which box and directory the work should happen in, ask them before calling this — they usually have a preference, and the consent card can only be approved or declined, it cannot be corrected. The result is pending: do NOT wait or poll — the user's decision and the spawn outcome arrive automatically as later turns. On approval a chat room links you to the new session; its reports arrive there.",
   {
     device_id: z.number().int().describe('Target box device id, from agent_boxes'),
     workdir: z.string().describe('Absolute working directory on the target box, from agent_boxes folders'),
     task: z.string().max(2000).describe('The task prompt. Shown VERBATIM on the user\'s consent card and executed verbatim as the new session\'s first turn — write it for both audiences.'),
     topic: z.string().max(200).optional().describe('Optional short room/session title'),
+    model: z.string().optional().describe('Optional Claude model alias for the new session: default, opus, opus[1m], sonnet, sonnet[1m], haiku, opusplan, fable (or a full claude-* model name). Omit to use the target box\'s own default — only set it if the user asked for a specific model.'),
   },
-  async ({ device_id, workdir, task, topic }) => {
+  async ({ device_id, workdir, task, topic, model }) => {
     try {
       const postRes = await fetch(`${BRIDGE_API}/agent-session-start`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ roomId: ROOM_ID, device_id, workdir, task, ...(topic ? { topic } : {}) }),
+        body: JSON.stringify({ roomId: ROOM_ID, device_id, workdir, task, ...(topic ? { topic } : {}), ...(model ? { model } : {}) }),
       });
       const data = await postRes.json().catch(() => ({}));
       if (!postRes.ok) {
         return { content: [{ type: 'text', text: `agent_session_start failed: ${data.error || `HTTP ${postRes.status}`}` }] };
       }
       return { content: [{ type: 'text', text: `Spawn request ${data.spawn_id} sent — awaiting the user's approval. Continue your own work; the outcome will arrive as a later turn.` }] };
+    } catch (err) {
+      return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
+    }
+  }
+);
+
+server.tool(
+  'restart_session',
+  "Restart THIS session's own agent process — the way to get browser tools (chrome-devtools MCP) mid-conversation, or to move onto a different model, without asking the user to do it. The conversation, workdir and history are kept; only the underlying process is respawned. continue_with is a message the bridge sends back into the restarted session as its first turn, so the work carries on unattended — write it as an instruction to your future self, including whatever context the restart is about to cost you. The restart does NOT happen instantly: it is parked until your current turn ends, so finish up and stop working rather than starting anything new after calling this. There is a small budget of consecutive self-restarts; once it runs out you must ask the user. Never call this in a loop.",
+  {
+    continue_with: z.string().max(2000).describe('The message to send into the restarted session as its first turn. Written for your future self: what you were doing, what to do next.'),
+    browser: z.boolean().optional().describe('Restart with browser tools (chrome-devtools MCP) enabled. Omit to keep the session\'s current MCP servers.'),
+    model: z.string().optional().describe('Optional Claude model alias to restart onto: default, opus, opus[1m], sonnet, sonnet[1m], haiku, opusplan, fable (or a full claude-* name). Omit to keep the current model.'),
+    reason: z.string().max(200).optional().describe('Short reason shown to the user in chat, e.g. "need to screenshot the rendered page".'),
+  },
+  async ({ continue_with, browser, model, reason }) => {
+    try {
+      const postRes = await fetch(`${BRIDGE_API}/restart-session`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          roomId: ROOM_ID,
+          continue_with,
+          ...(browser != null ? { browser } : {}),
+          ...(model ? { model } : {}),
+          ...(reason ? { reason } : {}),
+        }),
+      });
+      const data = await postRes.json().catch(() => ({}));
+      if (!postRes.ok) {
+        // The refusal text is the useful part — a bad model alias or an
+        // exhausted budget is something the agent can act on.
+        return { content: [{ type: 'text', text: `restart_session refused: ${data.error || `HTTP ${postRes.status}`}` }] };
+      }
+      return { content: [{ type: 'text', text: data.parked
+        ? 'Restart parked — it runs the moment this turn ends. Wrap up now: say what you were doing and stop. Do not start new work, and do not call this tool again. Your continuation message will arrive as the first turn of the restarted session.'
+        : 'Restarting now. Your continuation message will arrive as the first turn of the restarted session.' }] };
     } catch (err) {
       return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
     }
@@ -541,6 +586,14 @@ server.tool(
   }
 );
 
+// There is deliberately NO agent_chat_leave tool (2026-08-19). A room lives
+// for the life of the two sessions: agents kept closing rooms and opening new
+// ones for every exchange, which filled the user's chat list with dead
+// single-exchange rooms and lost the thread between two sessions that talk
+// repeatedly. agent_chat_mute below is the escape hatch instead. The
+// /agent-chat-leave route and chatLeave internals still exist — session
+// eviction uses them to close a dead session's rooms out.
+
 server.tool(
   'agent_chat_invite',
   "Invite another of the user's agent sessions into a chat room you ALREADY own — the proactive inverse of agent_chat_join. You must be the room's owner (the session that started it with agent_chat_start). Pick the invitee's conversation from agent_roster; the bridge asks its agent, which accepts with agent_chat_accept exactly like a fresh chat request. The invitee must accept — you cannot force-add. Same-box sessions cannot be added this way in v1; invite a session on another box. If the result is pending or pending_busy, do NOT wait or poll: continue your own work — the answer and any replies arrive automatically as later turns.",
@@ -569,23 +622,48 @@ server.tool(
 );
 
 server.tool(
-  'agent_chat_leave',
-  'Leave an agent chat room. The room and its history remain visible to your user.',
+  'agent_chat_mute',
+  'Mute an agent chat room: its messages stop being delivered to you. Use this when a room has gone wrong — the peer is looping, spamming, or malfunctioning — instead of trying to leave (you cannot: a room stays open for the life of both sessions). The room stays open and readable with agent_chat_read, you can still post into it, and your user sees why you muted it and can unmute you with one tap.',
   {
-    room_id: z.string().describe('The room id to leave'),
+    room_id: z.string().describe('The agent chat room id to mute'),
+    reason: z.string().describe('Why you are muting it, in one line — shown to your user, who decides whether to unmute'),
+  },
+  async ({ room_id, reason }) => {
+    try {
+      const postRes = await fetch(`${BRIDGE_API}/agent-chat-mute`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ roomId: ROOM_ID, room_id, reason }),
+      });
+      const data = await postRes.json().catch(() => ({}));
+      if (!postRes.ok) {
+        return { content: [{ type: 'text', text: `agent_chat_mute failed: ${data.error || `HTTP ${postRes.status}`}` }] };
+      }
+      return { content: [{ type: 'text', text: `Muted room ${room_id}. ${data.note || ''}`.trim() }] };
+    } catch (err) {
+      return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
+    }
+  }
+);
+
+server.tool(
+  'agent_chat_unmute',
+  'Unmute an agent chat room you previously muted: messages are delivered to you again. Nothing that arrived while it was muted is replayed — use agent_chat_read to catch up.',
+  {
+    room_id: z.string().describe('The agent chat room id to unmute'),
   },
   async ({ room_id }) => {
     try {
-      const postRes = await fetch(`${BRIDGE_API}/agent-chat-leave`, {
+      const postRes = await fetch(`${BRIDGE_API}/agent-chat-unmute`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ roomId: ROOM_ID, room_id }),
       });
       const data = await postRes.json().catch(() => ({}));
       if (!postRes.ok) {
-        return { content: [{ type: 'text', text: `agent_chat_leave failed: ${data.error || `HTTP ${postRes.status}`}` }] };
+        return { content: [{ type: 'text', text: `agent_chat_unmute failed: ${data.error || `HTTP ${postRes.status}`}` }] };
       }
-      return { content: [{ type: 'text', text: `Left room ${room_id}.` }] };
+      return { content: [{ type: 'text', text: `Unmuted room ${room_id}. ${data.note || ''}`.trim() }] };
     } catch (err) {
       return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
     }
@@ -618,6 +696,206 @@ server.tool(
       return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
     }
   }
+);
+
+// --- Task & decision tracker (spec 2026-09-08) ---
+//
+// The seven item_* tools share one shape: POST the args to the loopback
+// route, render `data.error` / `HTTP <status>` on failure, and a compact
+// English line on success (the rendering lives in lib/items-format.js so it
+// is testable without a journal). Never isError: a tool result that reads as
+// a sentence keeps the model working instead of retrying blindly.
+async function callItems(name, args, render) {
+  try {
+    const res = await fetch(`${BRIDGE_API}/items/${name}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ roomId: ROOM_ID, ...args }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) return { content: [{ type: 'text', text: `item_${name} failed: ${data.error || `HTTP ${res.status}`}` }] };
+    return { content: [{ type: 'text', text: render(data) }] };
+  } catch (err) {
+    return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
+  }
+}
+
+server.tool(
+  'item_create',
+  "File an item in the user's task & decision tracker — a panel beside the chat, so it survives this session and the user can answer in their own time. Use kind 'question' for EACH decision you need from the user instead of listing questions in prose: the user answers in that item's own thread and their reply reaches you as a 📌 turn, so do not block waiting for it. Use 'decision' to record a choice you made yourself (what and why, in body) and 'task' for work to do later. Markdown body; attach screenshots or files by local path (uploaded and shown inline).",
+  {
+    kind: z.enum(['task', 'question', 'decision']),
+    title: z.string().describe('One line, ≤200 chars'),
+    body: z.string().optional().describe('Markdown. For a question: the options and your recommendation. For a decision: what and why.'),
+    attachments: z.array(z.string()).optional().describe('Local file paths inside the working directory'),
+    labels: z.array(z.string()).optional(),
+    links: z.array(z.object({ url: z.string(), title: z.string().optional() })).optional().describe('e.g. a GitHub issue or PR'),
+    awaiting: z.enum(['user', 'agent']).nullable().optional().describe('Who acts next. Defaults: question→user, task→agent, decision→nobody'),
+    position: z.enum(['top', 'bottom']).optional().describe('Where a task lands in the ordered task list'),
+    supersedes: z.string().optional().describe('Item id of a decision this one replaces'),
+  },
+  async (args) => callItems('create', args, (d) => itemLine(d.item)),
+);
+
+server.tool(
+  'item_list',
+  "List tracker items. By default: THIS conversation's open items, in list order. scope 'all' widens to every conversation of this user (other agents' items too). Worth checking at the start of a session, and before asking the user anything — the answer may already be filed.",
+  {
+    scope: z.enum(['convo', 'all']).default('convo').describe("Only this conversation's items unless set to 'all'"),
+    kind: z.enum(['task', 'question', 'decision']).optional(),
+    state: z.enum(['open', 'closed', 'any']).default('open').describe("'any' includes closed items"),
+    awaiting: z.enum(['user', 'agent']).optional().describe("'user' = blocked on the user; 'agent' = yours to act on"),
+    label: z.string().optional(),
+    since: z.number().int().optional().describe('Only items updated at/after this ms timestamp — cheap polling'),
+    limit: z.number().int().min(1).max(500).optional(),
+  },
+  async (args) => callItems('list', args, formatItemList),
+);
+
+server.tool(
+  'item_get',
+  "Read one item in full: its body and its whole comment thread — the user's answers, attachments, voice-note transcripts and status changes.",
+  { id: z.string().describe("Item id ('it_…') or '#12'") },
+  async (args) => callItems('get', args, formatItemDetail),
+);
+
+server.tool(
+  'item_comment',
+  "Add a comment to an item (text and/or attachments by local path) — progress, findings, or a follow-up question in the same thread. The item is the full record of that piece of work: put follow-up screenshots, images and files in `attachments` here, not in the chat with a note that they are in the conversation. Optionally set `awaiting` to hand the item to the user ('user'), take it back ('agent'), or clear it (null). Prefer `item_close` when the item is actually resolved.",
+  {
+    id: z.string().describe("Item id ('it_…') or '#12'"),
+    body: z.string().optional().describe('Markdown'),
+    attachments: z.array(z.string()).optional().describe('Local file paths inside the working directory'),
+    awaiting: z.enum(['user', 'agent']).nullable().optional().describe('Who acts next after this comment; omit to leave it unchanged'),
+  },
+  async (args) => callItems('comment', args, (d) => formatCommentAck(d, args.awaiting)),
+);
+
+server.tool(
+  'item_close',
+  "Close an item with a resolution: 'answered' (a question you have acted on), 'done' or 'cancelled' (task), 'decided' or 'reversed' (decision). Optional closing comment — say what happened.",
+  {
+    id: z.string().describe("Item id ('it_…') or '#12'"),
+    resolution: z.enum(['done', 'answered', 'decided', 'reversed', 'cancelled']),
+    comment: z.string().optional().describe('Closing note, added to the thread'),
+  },
+  async (args) => callItems('close', args, (d) => itemLine(d.item)),
+);
+
+server.tool(
+  'item_reopen',
+  'Reopen a closed item, with an optional comment explaining why it is back.',
+  {
+    id: z.string().describe("Item id ('it_…') or '#12'"),
+    comment: z.string().optional(),
+  },
+  async (args) => callItems('reopen', args, (d) => itemLine(d.item)),
+);
+
+server.tool(
+  'item_reorder',
+  'Move an item in the ordered list: to the top or bottom, or after/before another item. Exactly one of position, after or before.',
+  {
+    id: z.string().describe("Item id ('it_…') or '#12'"),
+    position: z.enum(['top', 'bottom']).optional(),
+    after: z.string().optional().describe('Item id to place this one after'),
+    before: z.string().optional().describe('Item id to place this one before'),
+  },
+  async (args) => callItems('reorder', args, (d) => itemLine(d.item)),
+);
+
+// --- Missions & milestones (spec 2026-09-10) ---
+//
+// Same shape as callItems. A 409 is the interesting case here: the journal
+// says WHY (blocked_by) and the renderer turns that into the next call the
+// model should make — never isError, never raw JSON. Other errors go
+// through formatJournalError, which turns the journal's machine words into
+// sentences.
+//
+// The two creating ops carry an idempotency key the model never sees or
+// supplies: a retried milestone_post would otherwise mint a second
+// milestone AND a second transcript marker (see lib/missions-idem.js).
+async function callMissions(name, args, render) {
+  const payload = { roomId: ROOM_ID, ...args };
+  if (name === 'start' || name === 'post') {
+    payload.idem_key = missionIdemKey({ op: name, roomId: ROOM_ID, kind: args?.kind, title: args?.title, body: args?.body });
+  }
+  try {
+    const res = await fetch(`${BRIDGE_API}/missions/${name}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.status === 409) return { content: [{ type: 'text', text: `${missionToolName(name)} failed: ${formatBlocked(data)}` }] };
+    if (!res.ok) return { content: [{ type: 'text', text: `${missionToolName(name)} failed: ${formatJournalError(name, data) || `HTTP ${res.status}`}` }] };
+    return { content: [{ type: 'text', text: render(data) }] };
+  } catch (err) {
+    return { content: [{ type: 'text', text: `${missionToolName(name)} failed: ${err.message}` }] };
+  }
+}
+const missionToolName = (op) => ({ start: 'mission_start', post: 'milestone_post', update: 'mission_update', join: 'mission_join', get: 'mission_get', close: 'mission_close' }[op] || `mission_${op}`);
+
+server.tool(
+  'mission_start',
+  "Start the mission for this conversation — the human-readable record of one piece of work, shared by every agent and app of this user. Do this as soon as you know what the work is (usually right after the user's first substantive input): name it and state the goal in body, with the whole conversation as context. Milestones are refused until the conversation has a mission. If it already has one this returns it unchanged.",
+  {
+    title: z.string().describe('One line, ≤200 chars — what the work is'),
+    body: z.string().optional().describe('Markdown ≤32 KiB — the goal and the standing description'),
+  },
+  async (args) => callMissions('start', args, formatStartAck),
+);
+
+server.tool(
+  'milestone_post',
+  "Post a milestone: a checkpoint on this conversation's mission that is also a jump target back to this exact point in the transcript. kind 'user_input' whenever an input from the user starts or redirects work (skip typos, one-word answers, clarifications) — the user's stated purpose is to get back to their last input easily. kind 'progress' as often as useful: a landed PR, a diagnosis, a decision, a phase done. There is no cap. Refused with an instruction if the conversation has no mission yet.",
+  {
+    kind: z.enum(['user_input', 'progress']),
+    title: z.string().describe('One line, ≤200 chars'),
+    body: z.string().optional().describe('Markdown ≤32 KiB — what happened, in a sentence or two'),
+  },
+  async (args) => callMissions('post', args, formatMilestoneAck),
+);
+
+server.tool(
+  'mission_update',
+  "Rename this conversation's mission or rewrite its standing description (title and/or body). Use it when the work changes shape.",
+  {
+    title: z.string().optional().describe('≤200 chars'),
+    body: z.string().optional().describe('Markdown ≤32 KiB'),
+  },
+  async (args) => callMissions('update', args, (d) => missionLine(d.mission)),
+);
+
+server.tool(
+  'mission_join',
+  'Attach this conversation to an existing mission by number (e.g. work handed over from another session). Items filed here from now on belong to that mission.',
+  { num: z.number().int().min(1).describe('The mission number, e.g. 61') },
+  async (args) => callMissions('join', args, (d) => missionLine(d.mission)),
+);
+
+server.tool(
+  'mission_get',
+  "Read a mission: its milestones newest first, open items (awaiting the user first) and conversations. Default: this conversation's mission.",
+  { num: z.number().int().min(1).optional().describe('A mission number; omit for this conversation\'s mission') },
+  async (args) => callMissions('get', args, formatMissionDetail),
+);
+
+server.tool(
+  'mission_close',
+  "Close this conversation's mission when the work is DONE (not when the session ends), with a summary. Refuses while items are open: close each with a real resolution, or item_move it to the mission it belongs to. Items awaiting the user block you outright — only they can clear those.",
+  { summary: z.string().describe('Markdown ≤32 KiB — how it went, what shipped, what is left') },
+  async (args) => callMissions('close', args, (d) => missionLine(d.mission)),
+);
+
+server.tool(
+  'item_move',
+  "Move an item to another mission by number, or detach it (mission: null). The only way an item's mission ever changes.",
+  {
+    id: z.string().describe("Item id ('it_…') or '#12'"),
+    mission: z.number().int().min(1).nullable().describe('Target mission number, or null to detach'),
+  },
+  async (args) => callItems('move', args, (d) => itemLine(d.item)),
 );
 
 const transport = new StdioServerTransport();

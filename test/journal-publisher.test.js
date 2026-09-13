@@ -1103,6 +1103,40 @@ describe('createJournalPublisher', () => {
     await httpServer.close();
   });
 
+  it('fetchMedia: a body that never arrives is aborted at the deadline and resolves null', async () => {
+    // Headers written, body never sent, socket held open — a half-dead
+    // connection. Without an armed abort the await on the body hangs forever,
+    // and every caller (the journal media router holds a batch slot across
+    // this call) hangs with it.
+    const sockets = new Set();
+    const server = http.createServer((_req, res) => {
+      res.writeHead(200, { 'content-type': 'image/png' });
+      // deliberately no res.end()
+    });
+    server.on('connection', (s) => { sockets.add(s); s.on('close', () => sockets.delete(s)); });
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const { port } = server.address();
+    const warnings = [];
+    const log = { warn: (...a) => warnings.push(a.join(' ')), error: () => {} };
+    const pub = createJournalPublisher({
+      url: `ws://127.0.0.1:${port}/ws`,
+      token: 'tok',
+      log,
+      ...FAST_BACKOFF,
+      fetchMediaTimeoutMs: 150,
+    });
+
+    warnings.length = 0;
+    const started = Date.now();
+    expect(await pub.fetchMedia('stalled-blob')).toBeNull();
+    expect(Date.now() - started).toBeLessThan(3000);
+    expect(warnings.some(w => /fetchMedia failed/.test(w))).toBe(true);
+
+    pub.close();
+    for (const s of sockets) s.destroy();
+    await new Promise((resolve) => server.close(resolve));
+  });
+
   it('fetchMedia: a network failure (nothing listening) resolves null, never throws, warns once', async () => {
     const port = await getFreePort();
     const wsUrl = `ws://127.0.0.1:${port}/ws`;

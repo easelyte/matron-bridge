@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { createRpcRequestHandler, composeSpawnOpeningTurn } from '../lib/journal-rpc.js';
+import { modelOptions, isValidModelArg } from '../lib/model-aliases.js';
 
 const silentLog = { warn: () => {}, error: () => {} };
 const REQ = (method, params, id = 'r1') => ({ request_id: id, from_device_id: 7, method, params });
@@ -12,6 +13,10 @@ function harness(overrides = {}) {
     stopSession: () => {},
     listPersistedSessions: () => [],
     defaultWorkdir: '/home/dan',
+    // index.js wires the real DEFAULT_AGENT here. Model selection is offered
+    // only when this says claude, so the harness has to state it — see the
+    // "codex-default box" tests for what an unwired/codex value does.
+    defaultAgent: 'claude',
     expandHome: (p) => p.replace(/^~(?=\/|$)/, '/home/dan'),
     statSync: () => ({ isDirectory: () => true }),
     log: silentLog,
@@ -127,6 +132,21 @@ describe('recent_folders', () => {
     expect(responses[0].result.folders).toBeDefined();
   });
 
+  it('reports default_model when the box has one and the agent is claude', () => {
+    const { handler, responses } = harness({ defaultModel: 'fable' });
+    handler(REQ('recent_folders', {}));
+    expect(responses[0].result.default_model).toBe('fable');
+    expect(responses[0].result.model_options).toEqual(modelOptions());
+  });
+
+  it('omits default_model when unset, invalid, or on a codex-default box', () => {
+    for (const overrides of [{}, { defaultModel: null }, { defaultModel: 'gpt-5' }, { defaultModel: 'fable', defaultAgent: 'codex' }]) {
+      const { handler, responses } = harness(overrides);
+      handler(REQ('recent_folders', {}));
+      expect(responses[0].result).not.toHaveProperty('default_model');
+    }
+  });
+
   it('omits activity, limits, and disk when the thunks return null', () => {
     const { handler, responses } = harness({
       getActivity: () => null,
@@ -155,6 +175,85 @@ describe('recent_folders', () => {
     expect('limits' in result).toBe(false);
     expect('disk' in result).toBe(false);
     expect(result.folders.map((f) => f.path)).toEqual(['/w/a', '/home/dan']);
+  });
+
+  // model_options is what fills the apps' New Chat model picker BEFORE a
+  // session exists (a status frame's model_options only arrives once one
+  // does). Always present, stable order, default first.
+  it('always carries model_options: {value,label} pairs, default first', () => {
+    const { handler, responses } = harness();
+    handler(REQ('recent_folders', {}));
+    const options = responses[0].result.model_options;
+    expect(Array.isArray(options)).toBe(true);
+    expect(options[0]).toEqual({ value: 'default', label: 'Default' });
+    expect(options).toEqual(modelOptions());
+    for (const o of options) {
+      expect(Object.keys(o).sort()).toEqual(['label', 'value']);
+      expect(typeof o.value).toBe('string');
+      expect(typeof o.label).toBe('string');
+    }
+    // Every offered value must survive the `start` handler's own validation,
+    // or the picker offers a model that answers bad_model.
+    for (const o of options) expect(isValidModelArg(o.value)).toBe(true);
+  });
+
+  // A Codex-default box cannot start a session on a Claude alias, so the New
+  // Chat picker must not offer one (CodeRabbit, PR #243). Fails CLOSED: an
+  // unwired defaultAgent offers nothing rather than offering aliases that
+  // can never start.
+  it('omits model_options on a codex-default box, and when defaultAgent is unwired', () => {
+    for (const defaultAgent of ['codex', 'CODEX', undefined, null, 'nonsense']) {
+      const { handler, responses } = harness({ defaultAgent });
+      handler(REQ('recent_folders', {}));
+      expect(responses[0].ok).toBe(true);
+      expect('model_options' in responses[0].result).toBe(false);
+      // The rest of the reply is unaffected.
+      expect(responses[0].result.folders).toEqual([{ path: '/home/dan', last_used: null }]);
+    }
+  });
+
+  // agent_options feeds the New Chat Claude/Codex switch. Claude is always
+  // on offer (it is what the bridge is); Codex only when the box can spawn
+  // it — a picker that offers an agent which answers ENOENT helps no one.
+  describe('agent_options', () => {
+    it('lists Claude alone when the box has no codex binary', () => {
+      const { handler, responses } = harness({ codexAvailable: () => false });
+      handler(REQ('recent_folders', {}));
+      expect(responses[0].result.agent_options).toEqual([{ value: 'claude', label: 'Claude Code' }]);
+    });
+
+    it('adds Codex when the box can spawn it', () => {
+      const { handler, responses } = harness({ codexAvailable: () => true });
+      handler(REQ('recent_folders', {}));
+      expect(responses[0].result.agent_options).toEqual([
+        { value: 'claude', label: 'Claude Code' },
+        { value: 'codex', label: 'Codex' },
+      ]);
+    });
+
+    it('treats an unwired or throwing availability check as no Codex', () => {
+      for (const codexAvailable of [undefined, () => { throw new Error('boom'); }]) {
+        const { handler, responses } = harness({ codexAvailable });
+        handler(REQ('recent_folders', {}));
+        expect(responses[0].result.agent_options.map((o) => o.value)).toEqual(['claude']);
+      }
+    });
+
+    it('reports default_agent as the box default the picker should open on', () => {
+      for (const [defaultAgent, expected] of [['claude', 'claude'], ['codex', 'codex'], ['CODEX', 'codex']]) {
+        const { handler, responses } = harness({ defaultAgent, codexAvailable: () => true });
+        handler(REQ('recent_folders', {}));
+        expect(responses[0].result.default_agent).toBe(expected);
+      }
+    });
+
+    it('omits default_agent when the box default is unwired or junk', () => {
+      for (const defaultAgent of [undefined, null, 'nonsense']) {
+        const { handler, responses } = harness({ defaultAgent });
+        handler(REQ('recent_folders', {}));
+        expect('default_agent' in responses[0].result).toBe(false);
+      }
+    });
   });
 
   it('attaches the account block when an email is known', () => {
@@ -355,6 +454,187 @@ describe('start', () => {
       expect(stopped).toEqual([session]);
       expect(responses[0]).toEqual({ requestId: 'r1', toDeviceId: 7, ok: false, error: { code: 'unsupported_mode', detail: 'spawn-room wiring absent' } });
     });
+  });
+
+  // Wire contract: `model` is an optional Claude model alias (or full
+  // claude-* name), validated here so a typo can't reach the spawn as a
+  // bogus --model argument.
+  describe('model param', () => {
+    it('a valid alias reaches startSession, normalized', () => {
+      const calls = [];
+      const { handler, responses } = harness({
+        startSession: (args) => { calls.push(args); return { claudeSessionId: 'c1' }; },
+      });
+      handler(REQ('start', { workdir: '~/yearbook-app', model: 'Opus[1M]' }));
+      expect(calls).toEqual([{ workdir: '/home/dan/yearbook-app', mcpExtras: [], model: 'opus[1m]' }]);
+      expect(responses[0].ok).toBe(true);
+    });
+
+    it('a full claude-* model name is accepted', () => {
+      const calls = [];
+      const { handler } = harness({
+        startSession: (args) => { calls.push(args); return { claudeSessionId: 'c1' }; },
+      });
+      handler(REQ('start', { model: 'claude-opus-4-8' }));
+      expect(calls[0].model).toBe('claude-opus-4-8');
+    });
+
+    it('an omitted model leaves the key off the startSession call entirely', () => {
+      const calls = [];
+      const { handler } = harness({
+        startSession: (args) => { calls.push(args); return { claudeSessionId: 'c1' }; },
+      });
+      handler(REQ('start', {}));
+      expect('model' in calls[0]).toBe(false);
+    });
+
+    it('bad_model on an unknown alias — and no session is spawned', () => {
+      const calls = [];
+      const { handler, responses } = harness({
+        startSession: (args) => { calls.push(args); return { claudeSessionId: 'c1' }; },
+      });
+      handler(REQ('start', { model: 'gpt-5' }));
+      expect(calls).toEqual([]);
+      expect(responses[0]).toEqual({ requestId: 'r1', toDeviceId: 7, ok: false, error: { code: 'bad_model', detail: 'gpt-5' } });
+    });
+
+    it('bad_model on a non-string model, reporting the type rather than [object Object]', () => {
+      for (const model of [42, {}, true]) {
+        const { handler, responses } = harness();
+        handler(REQ('start', { model }));
+        expect(responses[0].ok).toBe(false);
+        expect(responses[0].error.code).toBe('bad_model');
+        expect(responses[0].error.detail).toBe(typeof model);
+      }
+    });
+
+    // A fresh RPC start has no persisted room state, so its agent IS the
+    // box default — a Claude alias would reach a Codex spawn as
+    // `--model opus` (CodeRabbit, PR #243). Refused whether or not the alias
+    // is a valid Claude one, and refused when defaultAgent is unwired.
+    it('refuses any model on a codex-default box, before alias validation, spawning nothing', () => {
+      for (const defaultAgent of ['codex', undefined, 'nonsense']) {
+        const calls = [];
+        const { handler, responses } = harness({
+          defaultAgent,
+          startSession: (args) => { calls.push(args); return { claudeSessionId: 'c1' }; },
+        });
+        handler(REQ('start', { model: 'opus' }));
+        expect(calls).toEqual([]);
+        expect(responses[0].ok).toBe(false);
+        expect(responses[0].error.code).toBe('bad_model');
+        expect(responses[0].error.detail).toMatch(/codex/i);
+      }
+    });
+
+    it('a codex-default box still starts fine with no model', () => {
+      const calls = [];
+      const { handler, responses } = harness({
+        defaultAgent: 'codex',
+        startSession: (args) => { calls.push(args); return { claudeSessionId: 'c1' }; },
+      });
+      handler(REQ('start', { workdir: '~/yearbook-app' }));
+      expect(responses[0].ok).toBe(true);
+      expect(calls).toEqual([{ workdir: '/home/dan/yearbook-app', mcpExtras: [] }]);
+    });
+
+    // JSON's two spellings of "the user picked nothing" (and the empty
+    // string a bound text field sends) read as absent — the same rule the
+    // prompt/from_name params above use. Bricking New Chat over an
+    // explicit null would be a poor trade for strictness.
+    it('null and empty string mean "no pick", not an error', () => {
+      for (const model of [null, '']) {
+        const calls = [];
+        const { handler, responses } = harness({
+          startSession: (args) => { calls.push(args); return { claudeSessionId: 'c1' }; },
+        });
+        handler(REQ('start', { model }));
+        expect(responses[0].ok).toBe(true);
+        expect('model' in calls[0]).toBe(false);
+      }
+    });
+  });
+});
+
+describe('start agent param', () => {
+  const spawning = (calls) => ({ startSession: (args) => { calls.push(args); return { claudeSessionId: 'c1' }; } });
+
+  it('passes an explicit agent through to startSession, normalized', () => {
+    for (const [agent, expected] of [['codex', 'codex'], ['Codex', 'codex'], ['claude', 'claude']]) {
+      const calls = [];
+      const { handler, responses } = harness({ ...spawning(calls), codexAvailable: () => true });
+      handler(REQ('start', { workdir: '~/yearbook-app', agent }));
+      expect(responses[0].ok).toBe(true);
+      expect(calls).toEqual([{ workdir: '/home/dan/yearbook-app', mcpExtras: [], agent: expected }]);
+    }
+  });
+
+  it('an omitted, null, or empty agent leaves the key off entirely — the box default applies', () => {
+    for (const params of [{}, { agent: null }, { agent: '' }]) {
+      const calls = [];
+      const { handler, responses } = harness(spawning(calls));
+      handler(REQ('start', params));
+      expect(responses[0].ok).toBe(true);
+      expect('agent' in calls[0]).toBe(false);
+    }
+  });
+
+  it('bad_agent on an unknown or non-string agent, spawning nothing', () => {
+    for (const agent of ['gemini', 42, {}]) {
+      const calls = [];
+      const { handler, responses } = harness(spawning(calls));
+      handler(REQ('start', { agent }));
+      expect(calls).toEqual([]);
+      expect(responses[0].ok).toBe(false);
+      expect(responses[0].error.code).toBe('bad_agent');
+    }
+  });
+
+  it('bad_agent when Codex is asked for on a box that cannot spawn it', () => {
+    const calls = [];
+    const { handler, responses } = harness({ ...spawning(calls), codexAvailable: () => false });
+    handler(REQ('start', { agent: 'codex' }));
+    expect(calls).toEqual([]);
+    expect(responses[0].error.code).toBe('bad_agent');
+    expect(responses[0].error.detail).toMatch(/codex/i);
+  });
+
+  // The model gate keys on the agent the session WILL run as, not the box
+  // default: an explicit Claude pick on a codex-default box may carry a
+  // model, and an explicit Codex pick on a claude-default box may not.
+  it('accepts a model with an explicit claude agent on a codex-default box', () => {
+    const calls = [];
+    const { handler, responses } = harness({ ...spawning(calls), defaultAgent: 'codex', codexAvailable: () => true });
+    handler(REQ('start', { agent: 'claude', model: 'opus' }));
+    expect(responses[0].ok).toBe(true);
+    expect(calls[0]).toEqual({ workdir: '/home/dan', mcpExtras: [], model: 'opus', agent: 'claude' });
+  });
+
+  it('bad_model when a model rides along with an explicit codex agent', () => {
+    const calls = [];
+    const { handler, responses } = harness({ ...spawning(calls), codexAvailable: () => true });
+    handler(REQ('start', { agent: 'codex', model: 'opus' }));
+    expect(calls).toEqual([]);
+    expect(responses[0].error.code).toBe('bad_model');
+    expect(responses[0].error.detail).toMatch(/codex/i);
+  });
+
+  // Mirrors the !start refusal: browser tools are a Claude MCP extra, and a
+  // Codex session on the legacy exec transport has nowhere to load them.
+  it('refuses browser with codex on the legacy exec transport, allows it on app-server', () => {
+    const refused = [];
+    const { handler, responses } = harness({ ...spawning(refused), codexAvailable: () => true, codexAppServer: false });
+    handler(REQ('start', { agent: 'codex', browser: true }));
+    expect(refused).toEqual([]);
+    expect(responses[0].ok).toBe(false);
+    expect(responses[0].error.code).toBe('bad_request');
+    expect(responses[0].error.detail).toMatch(/browser/i);
+
+    const allowed = [];
+    const h2 = harness({ ...spawning(allowed), codexAvailable: () => true, codexAppServer: true });
+    h2.handler(REQ('start', { agent: 'codex', browser: true }));
+    expect(h2.responses[0].ok).toBe(true);
+    expect(allowed[0].mcpExtras).toEqual(['browser']);
   });
 });
 

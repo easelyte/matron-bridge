@@ -41,7 +41,11 @@ if [ ! -f "$WHISPER_BIN" ]; then
   exit 1
 fi
 echo "Binary: $WHISPER_BIN"
-"$WHISPER_BIN" --help 2>&1 | head -1
+# whisper-cli keeps writing after `head -1` closes the pipe, so it dies of
+# SIGPIPE (141) and `set -o pipefail` would abort the install here — right
+# before the model download. The binary check above is the real signal;
+# this line just confirms we can launch it at all.
+"$WHISPER_BIN" --help 2>&1 | head -1 || true
 
 # Download model if not present
 if [ ! -f "$INSTALL_DIR/models/$MODEL_FILE" ]; then

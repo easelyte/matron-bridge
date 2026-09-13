@@ -248,6 +248,25 @@ describe('createJournalMediaRouter — audio (voice note)', () => {
     expect(warnings.some(w => /transcription failed/.test(w))).toBe(true);
   });
 
+  // The generic notice sent the operator hunting through service logs for the
+  // real cause (`spawn ffmpeg ENOENT`), so an uninstalled box now says so and
+  // names the fix.
+  it('an uninstalled transcription stack notices the install gap, not a generic failure', async () => {
+    const { route, deps } = makeRouter({
+      fetchMedia: vi.fn(async () => ({ buffer: Buffer.from('x'), contentType: 'audio/ogg' })),
+      transcribe: vi.fn(async () => {
+        throw Object.assign(new Error('ffmpeg is not installed on this box (not found on PATH)'),
+          { code: 'TRANSCRIBE_UNAVAILABLE', dependency: 'ffmpeg' });
+      }),
+    });
+    await route(session, { type: 'file', blobRef: 'v', contentType: 'audio/ogg' }, ctx);
+    expect(deps.injectText).not.toHaveBeenCalled();
+    const notice = deps.publishNotice.mock.calls[0][1];
+    expect(notice).toMatch(/isn't set up on this box/);
+    expect(notice).toMatch(/ffmpeg/);
+    expect(notice).toMatch(/install-whisper\.sh/);
+  });
+
   it('an empty transcript is dropped (no empty turn injected)', async () => {
     const { route, deps } = makeRouter({
       fetchMedia: vi.fn(async () => ({ buffer: Buffer.from('x'), contentType: 'audio/ogg' })),
@@ -555,5 +574,103 @@ describe('createJournalMediaRouter — remaining teardown windows past the deliv
     expect(route.hasInflightMedia(sess)).toBe(true);   // fresh frame keeps the gate — not dropped
     t = 10_000; // past frame 2's window too, nothing newer arrived
     expect(route.hasInflightMedia(sess)).toBe(false);  // now genuinely stalled — stops gating
+  });
+});
+
+describe('createJournalMediaRouter — video (frame extraction)', () => {
+  const videoFetch = () => vi.fn(async () => ({ buffer: Buffer.from('mov'), contentType: 'video/quicktime' }));
+  const videoBlocks = [{ type: 'text', text: '🎬 Video attached: clip.mov (13s screen recording). 4 key frames…' }];
+
+  it('a video content-type routes through buildVideoBlocks and injects its blocks', async () => {
+    const { route, deps } = makeRouter({
+      fetchMedia: videoFetch(),
+      buildVideoBlocks: vi.fn(async () => videoBlocks),
+    });
+    await route(session, { type: 'file', blobRef: 'vid-1', contentType: 'video/quicktime', name: 'clip.mov', caption: 'find the bug' }, ctx);
+
+    expect(deps.buildVideoBlocks).toHaveBeenCalledTimes(1);
+    const [sess, args] = deps.buildVideoBlocks.mock.calls[0];
+    expect(sess).toBe(session);
+    expect(args).toMatchObject({ mime: 'video/quicktime', name: 'clip.mov', caption: 'find the bug' });
+    expect(deps.injectBlocks).toHaveBeenCalledWith(session, videoBlocks);
+    expect(deps.buildSavedBlocks).not.toHaveBeenCalled();
+    expect(deps.transcribe).not.toHaveBeenCalled();
+  });
+
+  it('room echo says "a video", not "a file"', async () => {
+    const { route, deps } = makeRouter({
+      fetchMedia: videoFetch(),
+      buildVideoBlocks: vi.fn(async () => videoBlocks),
+    });
+    await route(session, { type: 'file', blobRef: 'v', contentType: 'video/quicktime', name: 'clip.mov' }, ctx);
+    expect(deps.echoToRoom.mock.calls[0][1]).toMatch(/sent a video/);
+  });
+
+  it('detects video from the fetched content-type when the frame declared octet-stream', async () => {
+    const { route, deps } = makeRouter({
+      fetchMedia: videoFetch(),
+      buildVideoBlocks: vi.fn(async () => videoBlocks),
+    });
+    await route(session, { type: 'file', blobRef: 'v', contentType: 'application/octet-stream', name: 'clip.mov' }, ctx);
+    expect(deps.buildVideoBlocks).toHaveBeenCalledTimes(1);
+    expect(deps.buildVideoBlocks.mock.calls[0][1].mime).toBe('video/quicktime');
+  });
+
+  it('falls back to the plain file path when extraction throws (raw video still delivered)', async () => {
+    const warnings = [];
+    const { route, deps } = makeRouter({
+      fetchMedia: videoFetch(),
+      buildVideoBlocks: vi.fn(async () => { throw new Error('ffmpeg not found'); }),
+      log: { warn: (...a) => warnings.push(a.join(' ')), error: () => {} },
+    });
+    await route(session, { type: 'file', blobRef: 'v', contentType: 'video/quicktime', name: 'clip.mov' }, ctx);
+
+    expect(deps.buildSavedBlocks).toHaveBeenCalledTimes(1); // raw-file fallback
+    expect(deps.injectBlocks).toHaveBeenCalledTimes(1);
+    expect(warnings.some((w) => /frame extraction failed/.test(w))).toBe(true);
+    // The fallback is otherwise invisible: the user sees a normal "sent a
+    // video" echo and claude gets an unreadable binary. Say so.
+    expect(deps.publishNotice).toHaveBeenCalledWith('convo-1', expect.stringMatching(/raw file/));
+  });
+
+  it('falls back to the plain file path when buildVideoBlocks returns null/empty', async () => {
+    const { route, deps } = makeRouter({
+      fetchMedia: videoFetch(),
+      buildVideoBlocks: vi.fn(async () => null),
+    });
+    await route(session, { type: 'file', blobRef: 'v', contentType: 'video/quicktime', name: 'clip.mov' }, ctx);
+    expect(deps.buildSavedBlocks).toHaveBeenCalledTimes(1);
+    expect(deps.injectBlocks).toHaveBeenCalledTimes(1);
+    // Extraction ran and produced nothing — same user-visible outcome as a
+    // throw, same notice.
+    expect(deps.publishNotice).toHaveBeenCalledWith('convo-1', expect.stringMatching(/raw file/));
+  });
+
+  it('routes video as a plain file when no buildVideoBlocks seam is wired (backwards compatible)', async () => {
+    const { route, deps } = makeRouter({ fetchMedia: videoFetch() });
+    await route(session, { type: 'file', blobRef: 'v', contentType: 'video/quicktime', name: 'clip.mov' }, ctx);
+    expect(deps.buildSavedBlocks).toHaveBeenCalledTimes(1);
+    expect(deps.injectBlocks).toHaveBeenCalledTimes(1);
+    // No extraction was ever attempted here, so there's nothing to apologise
+    // for — the fallback notice belongs to a FAILED extraction only.
+    expect(deps.publishNotice).not.toHaveBeenCalled();
+  });
+
+  it('a busy session QUEUES the video frames entry (mirrorToJournal:false, 🎬 preview)', async () => {
+    const busySession = { claudeSessionId: 'convo-1', roomId: '!r:s', busy: true };
+    const { route, deps } = makeRouter({
+      fetchMedia: videoFetch(),
+      buildVideoBlocks: vi.fn(async () => videoBlocks),
+    });
+    await route(busySession, { type: 'file', blobRef: 'v', contentType: 'video/quicktime', name: 'clip.mov' }, ctx);
+
+    expect(deps.injectBlocks).not.toHaveBeenCalled();
+    expect(deps.queueMedia).toHaveBeenCalledTimes(1);
+    const [, entry] = deps.queueMedia.mock.calls[0];
+    expect(entry).toMatchObject({
+      blocks: videoBlocks,
+      mirrorToJournal: false,
+      preview: '🎬 clip.mov',
+    });
   });
 });

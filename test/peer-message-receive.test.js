@@ -729,7 +729,7 @@ describe('injection-seam tier classification (loop #688 R3 F2)', () => {
   // a standalone compile impractical, so their wiring is pinned by source: each
   // roomDelivery.deliver payload must carry the correct explicit tier.
   const inviteSeam = sourceBetween('function journalInjectInviteRequest(', 'function journalNotifyRoomEvent(');
-  const spawnSeam = sourceBetween('agentSpawnHandlers = createAgentSpawnHandlers(', '// Adapter wrapper for the agent-chat loopback');
+  const spawnSeam = sourceBetween('agentSpawnHandlers = createAgentSpawnHandlers(', '// Adapter wrapper for the eight agent-chat loopback');
 
   it('invite/join-request seam stamps a peer-coalesced tier (agent-origin, preemptable)', () => {
     // The request is delivered via roomDelivery.deliver — assert the payload

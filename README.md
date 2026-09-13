@@ -2,11 +2,11 @@
 
 **matron-bridge** runs beside the Claude Code and Codex CLIs on your dev box, spawns and manages agent sessions, and publishes them to a [matron-journal](https://github.com/Matronhq/matron-journal) server. The Matron apps — [Apple](https://github.com/Matronhq/matron-apple) (iPhone + Mac), [Android](https://github.com/Matronhq/matron-android), [desktop](https://github.com/Matronhq/matron-desktop), and [web](https://github.com/Matronhq/matron-web) — chat with those sessions from anywhere, with live streaming and a return path for user input. See [matron.chat](https://matron.chat) for the overview.
 
-Claude uses `--print` structured JSON streaming. Codex uses the stable programmatic `codex exec --json` interface, starting one process per turn and resuming the same Codex thread automatically.
+Claude uses `--print` structured JSON streaming. Codex uses a persistent `codex app-server` connection with native streaming, approval cards, and question buttons. Set `MATRON_CODEX_TRANSPORT=exec` to use the legacy one-process-per-turn backend.
 
 Use `/switch codex` or `/switch claude` inside an idle session to hand the same bridge conversation to the other agent. The bridge keeps separate native session IDs for Claude and Codex, resumes each one when you switch back, and prepends only the transcript messages that agent has not seen to your next real prompt. The Matron conversation ID stays stable, as do the shared working directory, files, and Git state. Provider-private reasoning and tool state are not transferable.
 
-Codex turns run with `approval_policy="never"` because there is no interactive terminal to approve escalations. The sandbox defaults to `workspace-write`; blocked operations fail closed and the bridge surfaces the error. Only use `CODEX_SANDBOX_MODE=danger-full-access` on a host you intentionally trust for unattended agent execution.
+Codex defaults to YOLO mode in Matron: `danger-full-access` with `approval_policy="never"`, disabling sandbox restrictions and approval prompts. Set `CODEX_SANDBOX_MODE=workspace-write` or `read-only` to enable sandboxing and native on-request approval cards. Matron Plan mode always stays read-only with escalations denied. The legacy exec backend cannot answer approvals.
 
 For the full operator reference, see [Using the Codex backend](docs/codex.md).
 
@@ -34,9 +34,19 @@ brew install cloudflared
 
 ```bash
 npm install
+npm run setup   # guided: asks for your journal URL + agent token, tests the connection, writes .env
+npm start
+```
+
+The wizard stores the agent token in a gitignored `.journal-token` file (mode 600),
+generates `HMAC_SECRET`, and leaves every other setting on its documented default.
+Re-run it any time to change answers; the previous `.env` is backed up to `.env.bak`.
+
+Prefer to configure by hand (or provisioning non-interactively)?
+
+```bash
 cp .env.example .env
 # Edit .env — set JOURNAL_WS_URL + JOURNAL_TOKEN_FILE (or JOURNAL_TOKEN), ALLOWED_USER_IDS, and HMAC_SECRET (openssl rand -hex 32) for file/secret links
-npm start
 ```
 
 ### Enable Codex
@@ -139,6 +149,7 @@ For `SCOPE=system` setups, replace `gui/$UID` with `system` and `~/Library/Launc
 | `ALLOWED_USER_IDS` | Comma-separated allowlist of authorized user identities for this bridge (its sender label for journal-originated session commands) | `""` (any user) |
 | `DEFAULT_WORKDIR` | Default working directory for coding-agent sessions; `~` expands to the service user's home directory | `process.cwd()` if unset |
 | `MATRON_DEFAULT_AGENT` | Default coding agent (`claude` or `codex`); override per command with `--claude` / `--codex` | `claude` |
+| `MATRON_DEFAULT_MODEL` | Claude model for fresh starts when none is picked (New Chat picker, `/start` without `--model`); an alias such as `fable`, `opus`, `sonnet` or a full `claude-*` name. The `default` alias resolves to this too. Resumed rooms keep their own model. Claude only; reported to the picker as `default_model`. | `fable` |
 | `SESSION_IDLE_TIMEOUT_MS` | Idle time after which a session is silently reaped (next user message auto-resumes it). Set to `0` to disable, or `86400000` to restore the previous 24h default. | `3600000` (1 hour) |
 | `SESSION_IDLE_CHECK_MS` | How often the reaper scans for idle sessions | `300000` (5 minutes) |
 | `BASH_DEFAULT_TIMEOUT_MS` | Default timeout for a bridge-spawned Claude session's Bash tool call when the model sets none. Raises Claude Code's 120000 (2 min) built-in so long Codex reviews / test suites aren't SIGTERM'd mid-run. Positive integer ms; out-of-range (>`3600000` = 1h) is clamped, malformed is ignored. Applies at session spawn — restart to take effect. | `1200000` (20 min) |
@@ -146,6 +157,7 @@ For `SCOPE=system` setups, replace `gui/$UID` with `system` and `~/Library/Launc
 | `BRIDGE_CLAUDE_MD_PATH` | Optional markdown file appended to bridge-spawned Claude sessions for bridge-specific guidance | `BRIDGE_CLAUDE.md` |
 | `BRIDGE_CODEX_MD_PATH` | Optional developer-instructions markdown injected into bridge-spawned Codex turns | `BRIDGE_CODEX.md` |
 | `CODEX_SANDBOX_MODE` | Sandbox for Codex programmatic turns: `read-only`, `workspace-write`, or `danger-full-access` | `workspace-write` |
+| `CODEX_NETWORK_ACCESS` | Command network access in Codex workspace-write mode: `true` or `false`; empty inherits Codex configuration | unset |
 | `DEBUG` | Set to `1` to log verbose bridge and coding-agent events | `0` |
 | `MATRON_INTERACTIVE_MODE` | Set to `1` to spawn Claude Code as a real PTY (instead of `--print` stream mode) so interactive flows like `/login` work | `0` |
 | `MATRON_DUMP_PTY` | When `MATRON_INTERACTIVE_MODE=1`, set to `1` to dump raw PTY bytes for each session to a private per-session temp dir, e.g. `/tmp/iv-pty-XXXXXX/<roomId>.log` (exact path is printed to the bridge log at session start), for debugging stuck-prompt issues | `0` |
@@ -154,6 +166,8 @@ For `SCOPE=system` setups, replace `gui/$UID` with `system` and `~/Library/Launc
 | `LINK_EXPIRY_MS` | Signed URL expiry in ms | `900000` (15 min) |
 | `MATRON_BRIDGE_API_PORT` | Internal API port (hooks, MCP, viewer) | `9802` |
 | `MATRON_VIEWER_PORT` | Local file viewer port | `9803` |
+| `MCP_DEFAULT_EXTRAS` | Comma-separated MCP extras loaded for every session on this machine (e.g. `circleci`). Names must match `mcpExtras` keys in `mcp-config.json`/`mcp-config.local.json`. | _(none)_ |
+| `BRIDGE_PLUGIN_CACHE_DIR` | Dir plugin MCP servers (context7, serena, …) load from. Unset = an empty bridge-owned dir (no plugin MCPs, lean). Set to `~/.claude/plugins` or a curated dir to re-enable. | _(empty dir)_ |
 | `DOWNLOAD_RATE_LIMIT` | Viewer requests per minute for file downloads and sensitive-link shell pages | `30` |
 | `REVEAL_RATE_LIMIT` | Viewer requests per minute for `POST /sensitive/reveal`, counted separately so shell loads cannot exhaust it | `30` |
 | `WHISPER_MODEL_PATH` | whisper.cpp model for voice-note transcription | `~/.local/share/whisper-cpp/models/ggml-small.bin` |
@@ -161,6 +175,24 @@ For `SCOPE=system` setups, replace `gui/$UID` with `system` and `~/Library/Launc
 | `OPENAI_API_KEY` | Optional OpenAI API key; when set, preferred for conversation titles and rolling TOC summaries (using `gpt-5.6-luna` by default) | — |
 | `GEMINI_API_KEY` | Optional Gemini API key; used as fallback summarizer when `OPENAI_API_KEY` is unset; both key and summary features are skipped when both are empty | — |
 | `SUMMARY_MODEL` | Overrides the active provider's default model for titles and summaries; applies to whichever of OpenAI or Gemini is configured | — |
+
+## Memory & MCP tuning
+
+Sessions are lean by default so the bridge runs on small VPS boxes. Only the
+bridge's own `ask-user` MCP loads per session; everything else is opt-in.
+
+- **Stdio MCP extras** — defined under `mcpExtras` in `mcp-config.json`
+  (committed; e.g. `browser`) or `mcp-config.local.json` (gitignored,
+  per-machine; e.g. `circleci`). Enable per session with `!start --<name>`
+  (e.g. `!start --browser --circleci`). Sessions run with `--strict-mcp-config`,
+  so servers from your personal `~/.claude.json` do NOT leak in.
+- **Per-machine default** — `MCP_DEFAULT_EXTRAS=circleci` turns an extra on for
+  every session on this machine. Explicit `--flags` stack on top (no per-session
+  opt-out; change the env and restart to go lean).
+- **Plugin MCP servers** (context7, serena, …) — disabled by default via an
+  empty `CLAUDE_CODE_PLUGIN_CACHE_DIR`. Set `BRIDGE_PLUGIN_CACHE_DIR` to
+  `~/.claude/plugins` (all plugins) or a curated dir to re-enable. Your
+  interactive `~/.claude` (creds, transcripts) is never modified.
 
 ## Commands
 
@@ -183,12 +215,12 @@ For `SCOPE=system` setups, replace `gui/$UID` with `system` and `~/Library/Launc
 | `!working` | Toggle tool call visibility |
 | `!mcp` | Show MCP server status |
 | `!model [model-id\|default]` | Show or change the active provider's model |
-| `!mode [interactive\|print]` | Show or switch the Claude session between PTY-interactive and `--print` mode (Codex is programmatic-only); see `MATRON_INTERACTIVE_MODE` above |
+| `!mode [mode]` | Claude: `interactive` or `print`. Codex: `plan` (read-only) or `default` (Build) |
 | `!login` / `!logout` | Log in to / out of your Anthropic account (auto-switches the session to interactive mode) |
-| `!effort [level]` | Show or set reasoning effort (Claude only; use Codex config for Codex) |
+| `!effort [level]` | Show or set model-supported reasoning effort; Codex also supports `default` |
 | `!cost` | Show session cost |
 | `!usage` | Show token usage stats |
-| `!limits` | Show subscription limits when the active backend exposes them (not available for Codex) |
+| `!limits` | Show the active provider's subscription limits and reset times when available |
 | `!timer <duration> <message>` | Send a message to this chat later (e.g. `!timer 30m /compact`); `!timer` lists pending timers, `!timer cancel <id\|all>` cancels |
 | `!context` | Claude's context report trimmed to the model and token headline; `!context-full` prints the untrimmed report |
 | `!tools` | List available tools |
@@ -200,7 +232,7 @@ Any other message is forwarded directly to the selected agent. Claude Code slash
 
 ### Permissions
 
-Print-mode Claude sessions run with `--dangerously-skip-permissions` by default. Opting a session in with `--auto` switches it to Claude Code's `auto` permission mode: routine work is auto-approved, dangerous actions are blocked, and the remaining prompts appear in Matron as Allow once / Always allow this tool (session) / Deny cards (an unanswered card denies itself after 5 minutes). `--bypass` returns a session to the default. Both flags persist across restarts until changed again, and `MATRON_PERMISSION_MODE=auto` flips the box-wide default so every session runs in auto mode unless started with `--bypass`. Interactive (`!mode interactive`) and Codex sessions don't route through this flow — they always run bypassed. Note: Haiku-class models don't support auto mode and fall back to Claude Code's `default` mode, which prompts more often; the bridge warns about this at spawn time.
+Print-mode Claude sessions run with `--dangerously-skip-permissions` by default. Opting a session in with `--auto` switches it to Claude Code's `auto` permission mode: routine work is auto-approved, dangerous actions are blocked, and the remaining prompts appear in Matron as Allow once / Always allow this tool (session) / Deny cards (an unanswered card denies itself after 5 minutes). `--bypass` returns a session to the default. Both flags persist across restarts until changed again, and `MATRON_PERMISSION_MODE=auto` flips the box-wide default for Claude print sessions. Interactive Claude sessions run bypassed. Codex defaults to YOLO (no sandbox or approvals); an explicit sandbox setting enables native on-request approval cards. These Claude flags do not change Codex settings. `MATRON_CODEX_TRANSPORT=exec` selects the legacy Codex backend, where approvals cannot be answered. See [Codex setup and security](docs/codex.md). Note: Haiku-class models don't support auto mode and fall back to Claude Code's `default` mode, which prompts more often; the bridge warns about this at spawn time.
 
 ## Matron journal transport
 
@@ -224,6 +256,10 @@ What rides the journal connection:
 
 Provision the agent token on the journal server with `matron-admin agent add <user> <device-name>`.
 
+The journal also exposes an HTTP **search API** (`GET /search?q=` on the https base derived from `JOURNAL_WS_URL`, authenticated with the same agent token) that full-text searches every one of the user's conversations across all their devices, plus an `around_seq` context mode on `GET /convo/:id/messages` for reading prose around a hit. Bridge sessions are told how to use it in `BRIDGE_CLAUDE.md` / `BRIDGE_CODEX.md`; the full spec lives in matron-journal's [`docs/protocol.md`](https://github.com/Matronhq/matron-journal/blob/master/docs/protocol.md) ("Journal search").
+
+The `item_*` MCP tools and the `/items` HTTP routes they wrap (the task & decision tracker, described for sessions in `BRIDGE_CLAUDE.md` / `BRIDGE_CODEX.md`) need a matron-journal deployment with the items routes (journal PR #73). Deploy that journal update before this bridge in production — against an older journal, the tools answer `journal unreachable` or the routes answer `HTTP 404`.
+
 ## Agent-to-agent chat
 
 Bridge sessions on the same journal server can chat with each other. An agent room is an ordinary journal conversation plus an invite lifecycle: the session that starts a room owns it, invited sessions join as guests, and pending invites expire after 30 minutes. Room state survives bridge restarts.
@@ -231,22 +267,25 @@ Bridge sessions on the same journal server can chat with each other. An agent ro
 Every session gets these MCP tools via `ask-user.js`:
 
 - `agent_roster` — list the user's other agent sessions (titles, states, rolling summaries)
-- `agent_chat_start` — pick a target from the roster and invite its agent to a new room
+- `agent_chat_start` — pick a target from the roster and invite its agent to a room (a second call at the same target returns the room the pair already has)
 - `agent_chat_accept` / `agent_chat_refuse` — answer an inbound chat request
-- `agent_chat_join` / `agent_chat_leave` — ask to join an existing room by id, or leave one
+- `agent_chat_join` — ask to join an existing room by id
 - `agent_chat_send` / `agent_chat_read` — post to a room, or catch up on its recent messages
+- `agent_chat_mute` / `agent_chat_unmute` — stop and resume delivery of a room's messages to you
 
 Inbound requests are also posted into the invited session's conversation, so the user sees who asked and why. Invites never block: the inviting agent keeps working, and answers and room replies arrive as later turns.
+
+A room between two sessions stays open for as long as both live — agents have no way to close one. When a room goes wrong (a peer looping, spamming, or malfunctioning) the agent mutes it with a reason: the room and both members' chats say so out loud, and the user gets a **🔊 Unmute** card in that agent's conversation to overrule it with one tap.
 
 ## How it works
 
 1. User messages arrive via the matron-journal WebSocket connection
-2. Claude Code is spawned with `--print --input-format stream-json --output-format stream-json`, or Codex is run with `codex exec --json`
-3. User messages are sent as Claude stream JSON or as a Codex stdin prompt
+2. Claude Code is spawned with `--print --input-format stream-json --output-format stream-json`, or Codex uses a persistent stdio app-server
+3. User messages are sent as Claude stream JSON or Codex native turn/steer requests
 4. Structured JSON events are parsed from stdout and normalized into the shared bridge session lifecycle
 5. The complete response is published to the journal when the provider reports that the turn is complete
 6. Long responses are split at 32K-char boundaries
-7. Sessions persist across restarts via Claude `--resume <session-id>` or Codex `exec resume <thread-id>`
+7. Sessions persist across restarts via Claude `--resume <session-id>` or Codex `thread/resume`
 8. Agent handoffs persist one native session ID per provider plus a shared transcript cursor; the next prompt carries a bounded unseen transcript delta
 9. Crashed sessions auto-restart up to 3 times
 10. Messages sent while an agent is busy are queued and sent when the turn completes

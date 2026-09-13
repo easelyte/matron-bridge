@@ -5,6 +5,7 @@ import path from 'node:path';
 import {
   codexRunsDirFor,
   configureCodexSinkEnv,
+  detectCodexBinary,
   launchWithCodexSinkEnv,
   pruneStaleCodexSinks,
   SHIPPED_SHIM_DIR,
@@ -297,4 +298,33 @@ describe('Claude spawn-path sink wiring', () => {
       expect(spawnEnv).not.toHaveProperty('MATRON_CODEX_SINK_DIR');
     },
   );
+});
+
+// New Chat's Claude/Codex switch is offered only on boxes that can actually
+// start Codex. The bridge spawns a bare `codex` from its own PATH, so that is
+// what is checked — with the shipped viz shim excluded, because a shim with
+// no real codex behind it forwards to nothing.
+describe('detectCodexBinary', () => {
+  const SHIM = '/opt/bridge/bin/shim/codex';
+  const lookup = (table) => (p) => table[p] ?? null;
+
+  it('is true when a non-shim codex resolves on PATH', () => {
+    const realpath = lookup({ [SHIM]: SHIM, '/usr/local/bin/codex': '/usr/local/lib/node_modules/@openai/codex/bin/codex.js' });
+    expect(detectCodexBinary({ env: { PATH: '/usr/bin:/usr/local/bin' }, shimPath: SHIM, realpath })).toBe(true);
+  });
+
+  it('is false when the only codex on PATH is the shipped shim', () => {
+    const realpath = lookup({ [SHIM]: SHIM, '/opt/bridge/bin/shim/codex': SHIM });
+    expect(detectCodexBinary({ env: { PATH: '/opt/bridge/bin/shim:/usr/bin' }, shimPath: SHIM, realpath })).toBe(false);
+  });
+
+  it('is true when MATRON_CODEX_REAL_BIN resolves, whatever PATH holds', () => {
+    const realpath = lookup({ '/srv/codex-real': '/srv/codex-real' });
+    expect(detectCodexBinary({ env: { PATH: '', MATRON_CODEX_REAL_BIN: '/srv/codex-real' }, shimPath: SHIM, realpath })).toBe(true);
+  });
+
+  it('is false when nothing resolves, including a set-but-missing REAL_BIN', () => {
+    const realpath = lookup({});
+    expect(detectCodexBinary({ env: { PATH: '/usr/bin', MATRON_CODEX_REAL_BIN: '/nope' }, shimPath: SHIM, realpath })).toBe(false);
+  });
 });

@@ -1,0 +1,107 @@
+{
+  "_source": "matron-journal origin/master — test/fixtures/conformance/15_missions_roundtrip.json (response bodies, with its $bind/$ref placeholders resolved to concrete values) and docs/protocol.md '## Missions & milestones' (row shapes, GET /missions counts, GET /missions/:id detail). These are the shapes the renderers in lib/missions-format.js must keep rendering; if the journal changes them, this file and test/missions-format.test.js are what should fail.",
+
+  "start_201": {
+    "mission": {
+      "id": "ms_7Kq2XwvN", "user_id": "u_dan", "num": 1, "state": "open",
+      "title": "Missions & milestones", "body": "Ship it",
+      "close_summary": null, "closed_by": null, "closed_over_open_items": 0,
+      "origin_convo_id": "c1", "origin_device_id": "dv_dev2", "created_by": "agent",
+      "created_at": 1789056000000, "updated_at": 1789056000000,
+      "last_milestone_at": null, "closed_at": null,
+      "open_items": 0, "needs_you": 0, "conversations": 1, "milestones": 0, "last_milestone": null
+    }
+  },
+
+  "start_200_existing": {
+    "existing": true,
+    "mission": {
+      "id": "ms_7Kq2XwvN", "user_id": "u_dan", "num": 1, "state": "open",
+      "title": "Missions & milestones", "body": "Ship it",
+      "close_summary": null, "closed_by": null, "closed_over_open_items": 0,
+      "origin_convo_id": "c1", "origin_device_id": "dv_dev2", "created_by": "agent",
+      "created_at": 1789056000000, "updated_at": 1789056000000,
+      "last_milestone_at": 1789056600000, "closed_at": null,
+      "open_items": 0, "needs_you": 0, "conversations": 1, "milestones": 1,
+      "last_milestone": { "num": 2, "title": "Dan asked for missions", "kind": "user_input", "created_at": 1789056600000 }
+    }
+  },
+
+  "milestone_201": {
+    "milestone": {
+      "id": "ml_3Rt9Bp", "mission_id": "ms_7Kq2XwvN", "user_id": "u_dan", "num": 2,
+      "kind": "user_input", "title": "Dan asked for missions", "body": "the brief",
+      "convo_id": "c1", "seq": 412, "device_id": "dv_dev2", "created_by": "agent",
+      "created_at": 1789056600000
+    },
+    "mission": {
+      "id": "ms_7Kq2XwvN", "user_id": "u_dan", "num": 1, "state": "open",
+      "title": "Missions & milestones", "body": "Ship it",
+      "close_summary": null, "closed_by": null, "closed_over_open_items": 0,
+      "origin_convo_id": "c1", "origin_device_id": "dv_dev2", "created_by": "agent",
+      "created_at": 1789056000000, "updated_at": 1789056600000,
+      "last_milestone_at": 1789056600000, "closed_at": null,
+      "open_items": 0, "needs_you": 0, "conversations": 1, "milestones": 1,
+      "last_milestone": { "num": 2, "title": "Dan asked for missions", "kind": "user_input", "created_at": 1789056600000 }
+    }
+  },
+
+  "detail_200": {
+    "mission": {
+      "id": "ms_7Kq2XwvN", "user_id": "u_dan", "num": 1, "state": "open",
+      "title": "Missions & milestones", "body": "Ship it",
+      "close_summary": null, "closed_by": null, "closed_over_open_items": 0,
+      "origin_convo_id": "c1", "origin_device_id": "dv_dev2", "created_by": "agent",
+      "created_at": 1789056000000, "updated_at": 1789057200000,
+      "last_milestone_at": 1789057200000, "closed_at": null,
+      "open_items": 2, "needs_you": 1, "conversations": 2, "milestones": 2,
+      "last_milestone": { "num": 5, "title": "Journal half deployed", "kind": "progress", "created_at": 1789057200000 }
+    },
+    "milestones": [
+      { "id": "ml_8Wq1Zd", "mission_id": "ms_7Kq2XwvN", "user_id": "u_dan", "num": 5, "kind": "progress",
+        "title": "Journal half deployed", "body": "services-1, 17:11 BST", "convo_id": "c2", "seq": 88,
+        "device_id": "dv_dev2", "created_by": "agent", "created_at": 1789057200000 },
+      { "id": "ml_3Rt9Bp", "mission_id": "ms_7Kq2XwvN", "user_id": "u_dan", "num": 2, "kind": "user_input",
+        "title": "Dan asked for missions", "body": "the brief", "convo_id": "c1", "seq": 412,
+        "device_id": "dv_dev2", "created_by": "agent", "created_at": 1789056600000 }
+    ],
+    "items": [
+      { "id": "it_1", "num": 3, "kind": "question", "title": "Which bucket for idem keys?", "state": "open", "awaiting": "user" },
+      { "id": "it_2", "num": 4, "kind": "task", "title": "Deploy the bridge half", "state": "open", "awaiting": "agent" }
+    ],
+    "conversations": [
+      { "id": "c1", "title": "Session", "box": "dev-2", "state": "running" },
+      { "id": "c2", "title": "Other", "box": "shared-2", "state": "idle" }
+    ]
+  },
+
+  "list_200": {
+    "missions": [
+      {
+        "id": "ms_7Kq2XwvN", "user_id": "u_dan", "num": 1, "state": "open",
+        "title": "Missions & milestones", "body": "Ship it",
+        "close_summary": null, "closed_by": null, "closed_over_open_items": 0,
+        "origin_convo_id": "c1", "origin_device_id": "dv_dev2", "created_by": "agent",
+        "created_at": 1789056000000, "updated_at": 1789057200000,
+        "last_milestone_at": 1789057200000, "closed_at": null,
+        "open_items": 2, "needs_you": 1, "conversations": 2, "milestones": 2,
+        "last_milestone": { "num": 5, "title": "Journal half deployed", "kind": "progress", "created_at": 1789057200000 }
+      },
+      {
+        "id": "ms_0Fh4Ly", "user_id": "u_dan", "num": 6, "state": "closed",
+        "title": "Items tracker", "body": "The panel beside the chat",
+        "close_summary": "Shipped 2026-09-09.", "closed_by": "agent", "closed_over_open_items": 0,
+        "origin_convo_id": "c9", "origin_device_id": "dv_dev2", "created_by": "agent",
+        "created_at": 1788253200000, "updated_at": 1788978600000,
+        "last_milestone_at": 1788976800000, "closed_at": 1788978600000,
+        "open_items": 0, "needs_you": 0, "conversations": 1, "milestones": 4,
+        "last_milestone": { "num": 12, "title": "All PRs merged", "kind": "progress", "created_at": 1788976800000 }
+      }
+    ]
+  },
+
+  "blocked_409_no_mission": { "error": "conflict", "blocked_by": "no_mission" },
+  "blocked_409_user_items": { "error": "conflict", "blocked_by": "user_items", "items": [{ "num": 3, "title": "Which bucket for idem keys?" }] },
+  "error_404_not_found": { "error": "not_found" },
+  "error_400_bad_request": { "error": "bad_request" }
+}

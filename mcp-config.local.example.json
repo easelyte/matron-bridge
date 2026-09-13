@@ -1,0 +1,11 @@
+{
+  "_comment": "Per-machine, gitignored overlay. Copy to mcp-config.local.json. Adds machine-specific opt-in MCP servers as `mcpExtras` (enable a `--<name>` flag) and/or always-on `mcpServers`. Keep secrets out of literals. Edits take effect on the next bridge restart.",
+  "mcpExtras": {
+    "circleci": {
+      "circleci": {
+        "command": "node",
+        "args": ["/absolute/path/to/circleci-mcp/server.js"]
+      }
+    }
+  }
+}

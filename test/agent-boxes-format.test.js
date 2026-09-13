@@ -26,6 +26,13 @@ describe('formatBox', () => {
     );
   });
 
+  it('marks the caller\'s own box as "this box" and only when the journal says so', () => {
+    const mine = formatBox({ device_id: 7, name: 'mac', online: true, folders: [], self: true });
+    expect(mine).toBe('mac (device 7) — online — this box');
+    const forged = formatBox({ device_id: 8, name: 'eric', online: true, folders: [], self: 'true' });
+    expect(forged).toBe('eric (device 8) — online');
+  });
+
   it('flattens a newline embedded in the box name instead of forging an extra line', () => {
     const box = { device_id: 9, name: 'eric\nfake (device 1) — online', online: true, folders: [] };
     const text = formatBox(box);

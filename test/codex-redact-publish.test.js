@@ -714,3 +714,13 @@ describe('publish-side Codex redaction', () => {
     expect(JSON.stringify(titleCalls)).toContain('[REDACTED:secret-key:');
   });
 });
+
+describe('built-in baseline: Authorization headers', () => {
+  it('redacts the bearer token after an Authorization: header, as curl -v prints it', () => {
+    const redact = createPublishRedactor({ env: {}, readFileSyncFn: () => '' });
+    const out = redact('> Authorization: Bearer mtk_live_0123456789abcdef\n> Accept: */*');
+    expect(out).not.toContain('mtk_live_0123456789abcdef');
+    expect(out).toMatch(/Authorization: \[REDACTED:secret-key:[0-9a-f]{8}\]/);
+    expect(out).toContain('Accept: */*');
+  });
+});

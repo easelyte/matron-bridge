@@ -464,10 +464,9 @@ describe('index.js wiring', () => {
     // vitals ride at top level via the buildSessionStatus vitals param.
     expect(body).toContain('hostVitals()');
     expect(body).toMatch(/vitals[,\n]/);
-    // The Codex path passes an empty limits array (no account rate limits) and
-    // never spreads vitals into limits.
+    // Each provider supplies its own account limits, never host vitals.
     expect(body).not.toContain('hostVitalLimits');
-    expect(body).toMatch(/limits:\s*isCodex\s*\?\s*\[\]/);
+    expect(body).toContain('limits: isCodex ? (session._codexMetadata?.limits || []) : (usageLimitsCache.lines || [])');
   });
 
   it('every status publisher in the tree builds its frame with buildSessionStatus', () => {
@@ -508,18 +507,13 @@ describe('index.js wiring', () => {
     expect(body).toContain('publishStatus(');
   });
 
-  it('journalStatus scopes model_options / effort_levels / effort to Claude sessions', () => {
+  it('journalStatus uses provider-specific model and effort options', () => {
     const start = src.indexOf('function journalStatus(');
-    const end = src.indexOf('\nfunction ', start + 1);
-    const body = src.slice(start, end);
-    // Codex takes a free-text model id (`codex --model <id>`) the bridge never
-    // validates, so it has nothing to offer; /effort isn't exposed for Codex at
-    // all. It says so with EMPTY lists and a null effort rather than by staying
-    // silent — under a sticky merge, silence would leave a Claude session's
-    // offers (and a stale "· xhigh") standing after a mid-session switch.
-    expect(body).toMatch(/modelOptions:\s*isCodex\s*\?\s*\[\]\s*:\s*modelOptions\(\)/);
-    expect(body).toMatch(/effortLevels:\s*isCodex\s*\?\s*\[\]\s*:\s*effortOptions\(\)/);
-    expect(body).toMatch(/effort:\s*isCodex\s*\?\s*null\s*:\s*trackedEffort\(session\)/);
+    const body = src.slice(start, src.indexOf('\nfunction ', start + 1));
+    expect(body).toContain('codexSessionOptions(session)');
+    expect(body).toContain('modelOptions: isCodex ? codexOptions.modelOptions : modelOptions()');
+    expect(body).toContain('effortLevels: isCodex ? codexOptions.effortLevels : effortOptions()');
+    expect(body).toContain('effort: isCodex ? codexOptions.effort : trackedEffort(session)');
   });
 
   it('journalStatus has exactly ONE frame-building path, so no branch can emit a partial repaint', () => {
@@ -682,9 +676,10 @@ describe('index.js header-liveness wiring', () => {
   });
 
   it('all three spawn branches seed the header via journalSpawnStatus', () => {
-    // Definition + print + iv + codex call sites.
+    // Definition + print + iv + codex call sites, plus the RPC-start re-seed
+    // for a Codex session whose convo id is minted after the spawn.
     const calls = src.match(/journalSpawnStatus\(/g) || [];
-    expect(calls.length).toBe(4);
+    expect(calls.length).toBe(5);
     // The helper publishes now and repaints when the limits refresh lands.
     const start = src.indexOf('function journalSpawnStatus(');
     const end = src.indexOf('\nfunction ', start + 1);

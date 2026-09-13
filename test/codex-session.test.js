@@ -7,6 +7,7 @@ import {
   buildCodexExecArgs,
   contentBlocksToCodexPrompt,
   normalizeCodexSandbox,
+  normalizeCodexNetworkAccess,
 } from '../lib/codex-session.js';
 
 function fakeChild() {
@@ -36,6 +37,45 @@ describe('Codex programmatic session', () => {
 
   it('falls back to workspace-write for an invalid sandbox', () => {
     expect(normalizeCodexSandbox('root-everything')).toBe('workspace-write');
+  });
+
+  it('inherits network policy unless explicitly configured', () => {
+    expect(normalizeCodexNetworkAccess(undefined)).toBeNull();
+    expect(normalizeCodexNetworkAccess('')).toBeNull();
+    expect(normalizeCodexNetworkAccess('invalid')).toBeNull();
+    expect(normalizeCodexNetworkAccess(' TRUE ')).toBe(true);
+    expect(normalizeCodexNetworkAccess(false)).toBe(false);
+    expect(buildCodexExecArgs().join(' ')).not.toContain('network_access');
+  });
+
+  it('sets network access on initial and resumed turns without widening the filesystem sandbox', () => {
+    for (const threadId of [null, 'thread-1']) {
+      for (const networkAccess of [true, false]) {
+        const args = buildCodexExecArgs({ threadId, networkAccess });
+        expect(args).toContain(`sandbox_workspace_write.network_access=${networkAccess}`);
+        expect(args).toContain('sandbox_mode="workspace-write"');
+        expect(args).toContain('approval_policy="never"');
+      }
+    }
+    for (const sandbox of ['read-only', 'danger-full-access']) {
+      expect(buildCodexExecArgs({ sandbox, networkAccess: true }).join(' ')).not.toContain('network_access');
+    }
+  });
+
+  it('carries the network setting from the session adapter into each spawn', () => {
+    const child = fakeChild();
+    const children = [child, fakeChild()];
+    const spawnImpl = vi.fn(() => children.shift());
+    const session = new CodexExecSession({ cwd: '/repo', networkAccess: true, spawnImpl });
+    session.send([{ type: 'text', text: 'first turn' }]);
+    child.stdout.write('{"type":"thread.started","thread_id":"thread-1"}\n');
+    child.emit('close', 0, null);
+    session.send([{ type: 'text', text: 'resumed turn' }]);
+    expect(spawnImpl).toHaveBeenCalledTimes(2);
+    for (const [, args] of spawnImpl.mock.calls) {
+      expect(args).toContain('sandbox_workspace_write.network_access=true');
+    }
+    expect(spawnImpl.mock.calls[1][1]).toContain('resume');
   });
 
   it('turns only text blocks into the stdin prompt', () => {
@@ -81,6 +121,91 @@ describe('Codex programmatic session', () => {
     expect(child.kill).toHaveBeenCalledWith('SIGINT');
   });
 
+  it('preserves UTF-8 characters split across pipe reads, including the final line', () => {
+    const child = fakeChild();
+    const session = new CodexExecSession({ spawnImpl: () => child });
+    const events = [];
+    const exits = [];
+    session.on('event', event => events.push(event));
+    session.on('turn-exit', event => exits.push(event));
+    session.send([{ type: 'text', text: 'go' }]);
+    const text = 'Checking café — 日本語 🔧';
+    const event = { type: 'item.completed', item: { type: 'agent_message', text } };
+    const bytes = Buffer.from(JSON.stringify(event) + '\n{"type":"turn.completed"}');
+    for (const byte of bytes) child.stdout.write(Buffer.from([byte]));
+    for (const byte of Buffer.from(text)) child.stderr.write(Buffer.from([byte]));
+    expect(events).toEqual([event]);
+    child.emit('close', 0, null);
+    expect(events).toEqual([event, { type: 'turn.completed' }]);
+    expect(exits[0]).toMatchObject({ stderr: text, sawTurnCompleted: true });
+  });
+
+  it('recovers after malformed JSON and holds the process slot until close', () => {
+    const child = fakeChild();
+    const session = new CodexExecSession({ spawnImpl: () => child });
+    const errors = vi.fn();
+    const events = vi.fn();
+    session.on('parse-error', errors);
+    session.on('event', events);
+    session.send([{ type: 'text', text: 'go' }]);
+    child.stdout.write('not json\n{"type":"turn.completed"}\n');
+    expect(errors).toHaveBeenCalledTimes(1);
+    expect(events).toHaveBeenCalledWith({ type: 'turn.completed' });
+    expect(session.busy).toBe(true);
+    expect(session.send([{ type: 'text', text: 'next' }])).toBe(false);
+    child.emit('close', 0, null);
+    expect(session.busy).toBe(false);
+  });
+
+  it('contains a closed input pipe and allows the next turn after child exit', () => {
+    const child = fakeChild();
+    const nextChild = fakeChild();
+    const spawnImpl = vi.fn().mockReturnValueOnce(child).mockReturnValueOnce(nextChild);
+    const session = new CodexExecSession({ spawnImpl });
+    const errors = vi.fn();
+    session.on('spawn-error', errors);
+    session.send([{ type: 'text', text: 'go' }]);
+    const error = Object.assign(new Error('write EPIPE'), { code: 'EPIPE' });
+    expect(() => child.stdin.emit('error', error)).not.toThrow();
+    expect(errors).toHaveBeenCalledWith(error);
+    expect(session.lastError).toBe(error);
+    expect(session.busy).toBe(true);
+    child.emit('close', 1, null);
+    expect(session.send([{ type: 'text', text: 'retry' }])).toBe(true);
+    expect(session.lastError).toBeNull();
+    child.stdin.emit('error', error);
+    expect(session.lastError).toBeNull();
+    expect(errors).toHaveBeenCalledTimes(1);
+  });
+
+  it('terminates a child if writing the prompt throws synchronously', () => {
+    const child = fakeChild();
+    const error = new Error('stdin is closed');
+    child.stdin.end = () => { throw error; };
+    const session = new CodexExecSession({ spawnImpl: () => child });
+    const errors = vi.fn();
+    session.on('spawn-error', errors);
+    expect(session.send([{ type: 'text', text: 'go' }])).toBe(true);
+    expect(errors).toHaveBeenCalledWith(error);
+    expect(child.kill).toHaveBeenCalledWith('SIGTERM');
+    expect(session.busy).toBe(true);
+    child.emit('close', null, 'SIGTERM');
+    expect(session.busy).toBe(false);
+  });
+
+  it('bounds diagnostics while retaining the final error', () => {
+    const child = fakeChild();
+    const session = new CodexExecSession({ spawnImpl: () => child });
+    const exits = vi.fn();
+    session.on('turn-exit', exits);
+    session.send([{ type: 'text', text: 'go' }]);
+    child.stderr.write('x'.repeat(128 * 1024));
+    child.stderr.write('\nCould not authenticate');
+    child.emit('close', 1, null);
+    expect(exits.mock.calls[0][0].stderr).toHaveLength(64 * 1024);
+    expect(exits.mock.calls[0][0].stderr).toMatch(/Could not authenticate$/);
+  });
+
   it('exposes a synchronous spawn failure before returning false', async () => {
     const error = new Error('spawn codex ENOENT');
     const session = new CodexExecSession({
@@ -107,7 +232,7 @@ describe('Codex bridge wiring', () => {
     const body = src.slice(start, end);
 
     expect(body).toMatch(
-      /session\.agent === AGENT_CODEX[\s\S]*return reportSessionSendFailure\([\s\S]*const sent = session\.codex\?\.send/,
+      /session\.agent === AGENT_CODEX[\s\S]*return reportSessionSendFailure\([\s\S]*const sent = [^\n]*session\.codex\?\.send/,
     );
     expect(body).toMatch(/if \(sent\) \{[\s\S]*commitDispatchedUserTurn/);
     expect(body).toMatch(/if \(!sent\) \{[\s\S]*return reportSessionSendFailure/);

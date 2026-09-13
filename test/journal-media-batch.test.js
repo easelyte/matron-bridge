@@ -1,7 +1,50 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
+import http from 'node:http';
 import { createJournalMediaRouter } from '../lib/journal-media.js';
+import { createJournalPublisher } from '../lib/journal-publisher.js';
 
 const silentLog = { warn: () => {}, error: () => {} };
+
+function delay(ms) {
+  return new Promise((resolve) => { setTimeout(resolve, ms); });
+}
+
+// A fake journal blob store that serves the blobs it's given and STALLS on
+// everything else: headers written, body never sent, socket held open. That's
+// the real-world half-dead connection (cellular drop mid-download) the
+// fetchMedia abort deadline exists to bound — no fake can reproduce it from
+// the injected-mock side, so this test drives the router through the real
+// publisher.fetchMedia.
+function startStallingBlobServer(bodies) {
+  const sockets = new Set();
+  const server = http.createServer((req, res) => {
+    const id = decodeURIComponent((req.url || '').replace(/^\/media\//, ''));
+    const body = bodies[id];
+    if (!body) {
+      // Never res.end() — the client hangs in res.arrayBuffer() forever.
+      res.writeHead(200, { 'content-type': 'image/png' });
+      return;
+    }
+    res.writeHead(200, { 'content-type': 'image/png', 'content-length': String(body.length) });
+    res.end(body);
+  });
+  server.on('connection', (s) => {
+    sockets.add(s);
+    s.on('close', () => sockets.delete(s));
+  });
+  return new Promise((resolve, reject) => {
+    server.listen(0, '127.0.0.1', () => {
+      resolve({
+        port: server.address().port,
+        close: () => new Promise((r) => {
+          for (const s of sockets) s.destroy();
+          server.close(r);
+        }),
+      });
+    });
+    server.on('error', reject);
+  });
+}
 
 // Same fully-injected harness as journal-media.test.js — see there for the
 // rationale. These tests cover the multi-attachment batch path: frames
@@ -285,6 +328,68 @@ describe('createJournalMediaRouter — multi-attachment batches', () => {
     expect(deps.injectBlocks).not.toHaveBeenCalled();
   });
 
+  it('the quiet window does NOT finalize while a sibling video is still extracting (slow buildVideoBlocks)', async () => {
+    // The race batching exists to prevent: an image deposits and arms the
+    // quiet timer, then its sibling video spends longer than the window
+    // inside ffmpeg/whisper. The window measures silence in UPLOADS — a
+    // frame already in flight is by definition not silence — so the timer
+    // must be parked until the video settles, and the batch must deliver as
+    // ONE injection.
+    vi.useFakeTimers();
+    const fetchMedia = vi.fn()
+      .mockImplementationOnce(async () => ({ buffer: Buffer.from('img'), contentType: 'image/png' }))
+      .mockImplementationOnce(async () => ({ buffer: Buffer.from('mov'), contentType: 'video/quicktime' }));
+    const buildVideoBlocks = vi.fn(async () => {
+      // Extraction outlives the whole quiet window (fake-timer controlled).
+      await new Promise((resolve) => { setTimeout(resolve, 8_000); });
+      return [{ type: 'text', text: 'frames:clip.mov' }];
+    });
+    const { route, deps } = makeRouter({ batchQuietMs: 5_000, fetchMedia, buildVideoBlocks });
+
+    await route(session, frame('a.png', { id: 'BV1', index: 1, total: 2 }), ctx);
+    expect(deps.injectBlocks).not.toHaveBeenCalled();
+
+    const videoRoute = route(session,
+      frame('clip.mov', { id: 'BV1', index: 2, total: 2 }, { contentType: 'video/quicktime' }), ctx);
+    // Walk time well past the quiet window while extraction is running.
+    await vi.advanceTimersByTimeAsync(8_000);
+    await videoRoute;
+
+    // One combined injection — never a partial flush of a.png at 5s plus the
+    // video arriving later as a separate turn.
+    expect(deps.injectBlocks).toHaveBeenCalledTimes(1);
+    expect(deps.injectBlocks.mock.calls[0][1].map((b) => b.text))
+      .toEqual(['saved:a.png', 'frames:clip.mov']);
+  });
+
+  it('a settled slow frame restarts the quiet window — the parked timer cannot stall an incomplete batch', async () => {
+    // The hold must be a pause, not a hole: once the slow video deposits and
+    // the batch is STILL incomplete (a third frame never uploads), the quiet
+    // window resumes and partial delivery happens as designed.
+    vi.useFakeTimers();
+    const fetchMedia = vi.fn()
+      .mockImplementationOnce(async () => ({ buffer: Buffer.from('img'), contentType: 'image/png' }))
+      .mockImplementationOnce(async () => ({ buffer: Buffer.from('mov'), contentType: 'video/quicktime' }));
+    const buildVideoBlocks = vi.fn(async () => {
+      await new Promise((resolve) => { setTimeout(resolve, 8_000); });
+      return [{ type: 'text', text: 'frames:clip.mov' }];
+    });
+    const { route, deps } = makeRouter({ batchQuietMs: 5_000, fetchMedia, buildVideoBlocks });
+
+    await route(session, frame('a.png', { id: 'BV2', index: 1, total: 3 }), ctx);
+    const videoRoute = route(session,
+      frame('clip.mov', { id: 'BV2', index: 2, total: 3 }, { contentType: 'video/quicktime' }), ctx);
+    await vi.advanceTimersByTimeAsync(8_000);
+    await videoRoute;
+    // Video settled, batch still 2/3 — window restarted, not yet expired.
+    expect(deps.injectBlocks).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(5_000);
+    expect(deps.injectBlocks).toHaveBeenCalledTimes(1);
+    expect(deps.injectBlocks.mock.calls[0][1].map((b) => b.text))
+      .toEqual(['saved:a.png', 'frames:clip.mov']);
+  });
+
   it('busy-ness is read when the batch completes, not when it started gathering', async () => {
     // Turn ends while the batch is still uploading: the batch must inject
     // immediately at completion, not queue against a busy flag that is no
@@ -298,5 +403,50 @@ describe('createJournalMediaRouter — multi-attachment batches', () => {
 
     expect(deps.queueMedia).not.toHaveBeenCalled();
     expect(deps.injectBlocks).toHaveBeenCalledTimes(1);
+  });
+
+  it('a sibling whose download never completes cannot stall the batch forever (fetch abort deadline)', async () => {
+    // The in-flight hold parks the quiet timer for the whole of a frame's
+    // processing, which is only safe because every step of that processing is
+    // itself bounded. A blob fetch that hangs in the body read (server wrote
+    // headers, then the connection went dead) is the one step that used to
+    // have no ceiling: the hold was never released, the quiet timer never
+    // re-armed, and the sibling frame that HAD arrived was never delivered.
+    // Driven through the real publisher.fetchMedia — an injected mock can't
+    // exercise the deadline that lives inside it.
+    const blobs = await startStallingBlobServer({ 'blob-ok.png': Buffer.from('img') });
+    const pub = createJournalPublisher({
+      url: `ws://127.0.0.1:${blobs.port}/ws`,
+      token: 'tok',
+      log: silentLog,
+      backoffBaseMs: 15,
+      backoffCapMs: 60,
+      fetchMediaTimeoutMs: 200,
+    });
+    // A quiet window far longer than the test: delivery here can only come
+    // from the stalled frame settling, never from the partial-batch timer.
+    const { route, deps } = makeRouter({ fetchMedia: pub.fetchMedia, batchQuietMs: 600_000 });
+
+    try {
+      await route(session, frame('ok.png', { id: 'BS1', index: 1, total: 2 }), ctx);
+      expect(deps.injectBlocks).not.toHaveBeenCalled();
+
+      const stalled = route(session, frame('stall.png', { id: 'BS1', index: 2, total: 2 }), ctx);
+      const outcome = await Promise.race([
+        stalled.then(() => 'settled'),
+        delay(3_000).then(() => 'hung'),
+      ]);
+      expect(outcome).toBe('settled');
+
+      // The stalled frame deposited null, which completed the batch: the
+      // frame that did arrive reaches claude, and the user is told about the
+      // one that didn't.
+      expect(deps.injectBlocks).toHaveBeenCalledTimes(1);
+      expect(deps.injectBlocks.mock.calls[0][1].map((b) => b.text)).toEqual(['saved:ok.png']);
+      expect(deps.publishNotice).toHaveBeenCalledWith('convo-1', expect.stringMatching(/fetch/));
+    } finally {
+      pub.close();
+      await blobs.close();
+    }
   });
 });

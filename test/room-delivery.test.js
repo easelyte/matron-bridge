@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
-import { createRoomDelivery, formatRoomMessageNotice, formatRoomDeliveredNotice, formatRoomDeliveryFailedNotice, ROOM_MESSAGE_QUEUED_NOTICE } from '../lib/room-delivery.js';
+import { createRoomDelivery, formatRoomMessageNotice, formatRoomDeliveredNotice, formatRoomDeliveryFailedNotice, roomEchoLabel, roomFrameDisposition, ROOM_MESSAGE_QUEUED_NOTICE, ROOM_MUTED_NOT_DELIVERED_NOTICE, SELF_ECHO_LABEL } from '../lib/room-delivery.js';
 
 function makeDelivery({ injectResult = true } = {}) {
   const injectTurn = vi.fn(() => injectResult);
@@ -456,6 +456,43 @@ describe('formatRoomMessageNotice', () => {
     const out = formatRoomMessageNotice({ from: 'd', body: 'x'.repeat(5000), roomId: 'r1' });
     expect(out.length).toBeLessThan(700);
   });
+
+  it('renders the user\'s own echo in the second person', () => {
+    expect(formatRoomMessageNotice({
+      from: SELF_ECHO_LABEL, body: 'ship it', roomTitle: 'M:cd ↔️ D:ef — ci triage', roomId: 'r1',
+    })).toBe('💬 You in "M:cd ↔️ D:ef — ci triage": ship it');
+  });
+});
+
+// Who the 💬 echo names — the gate that decides whether a room frame gets a
+// user-facing notice at all, and under what name.
+describe('roomEchoLabel', () => {
+  it('names a peer agent by the same label the injected turn uses', () => {
+    expect(roomEchoLabel('agent:dev-2', 'dev-2 (agent)')).toBe('dev-2 (agent)');
+  });
+
+  it('names Dan\'s own room message "You"', () => {
+    // Not his display name: in his OWN session chat this line is a delivery
+    // receipt for something he sent, not a message from a third party.
+    expect(roomEchoLabel('user:dan', 'dan')).toBe('You');
+    expect(SELF_ECHO_LABEL).toBe('You');
+  });
+
+  it('withholds an echo for a sender that is neither agent: nor user:', () => {
+    // Fail CLOSED: an unrecognised sender shape gets no notice rather than a
+    // line attributed to nobody. The input router drops these frames anyway.
+    expect(roomEchoLabel('bridge', 'bridge')).toBeNull();
+    expect(roomEchoLabel('', '')).toBeNull();
+    expect(roomEchoLabel(undefined, 'x')).toBeNull();
+    expect(roomEchoLabel(42, 'x')).toBeNull();
+  });
+
+  it('still names an agent whose label is missing, so the gate never opens on an empty name', () => {
+    // formatRoomMessageNotice's own 'an agent' fallback covers the render;
+    // the label must stay truthy or the caller's `if (echoFrom)` gate would
+    // silently swallow the notice for a nameless peer.
+    expect(roomEchoLabel('agent:', '')).toBe('an agent');
+  });
 });
 
 // The two halves of the queued state. `deliver` parks a message in the
@@ -481,5 +518,76 @@ describe('the queued-state notices', () => {
     // …and the rest of the sentence agrees in number with the count.
     expect(formatRoomDeliveryFailedNotice(1)).toContain("1 queued message to this chat — it's still in the room");
     expect(out).toContain("2 queued messages to this chat — they're still in the room");
+  });
+});
+
+// Mute (2026-08-19): a muted member's session takes NO room frames at all.
+// The decision is pulled out of index.js's deliverRoomFrameTo so it can be
+// tested without booting the bridge — the wiring itself is source-pinned in
+// test/agent-chat.test.js.
+describe('roomFrameDisposition', () => {
+  it('delivers normally when the recipient binding is not muted', () => {
+    expect(roomFrameDisposition({ muted: false, sender: 'user:dan' })).toBe('deliver');
+    expect(roomFrameDisposition({ muted: false, sender: 'agent:dev-2' })).toBe('deliver');
+  });
+
+  it('a muted member still SEES the user\'s own message, marked undelivered', () => {
+    // Dan typed into the room himself: silently swallowing it would look
+    // exactly like the message being lost. He gets the 💬 echo and then the
+    // 🔇 line in place of the ⏳ the busy path would have published.
+    expect(roomFrameDisposition({ muted: true, sender: 'user:dan' })).toBe('muted-user');
+  });
+
+  it('a muted member\'s PEER agent frames are dropped with no notices at all', () => {
+    // The whole point of the mute is that a looping peer stops shouting into
+    // this chat — a notice per dropped frame would reproduce the spam. The
+    // history stays readable with agent_chat_read.
+    expect(roomFrameDisposition({ muted: true, sender: 'agent:dev-2' })).toBe('muted-drop');
+    expect(roomFrameDisposition({ muted: true, sender: 'bridge' })).toBe('muted-drop');
+    expect(roomFrameDisposition({ muted: true, sender: null })).toBe('muted-drop');
+  });
+
+  it('names the non-delivery in the user\'s own words, not a silent gap', () => {
+    expect(ROOM_MUTED_NOT_DELIVERED_NOTICE).toBe('🔇 Not delivered — this chat is muted.');
+  });
+});
+
+// dropRoom (2026-08-19): agent_chat_mute has to act on the backlog, not only
+// on new frames — see the mute gate in index.js deliverRoomFrameTo.
+describe('dropRoom', () => {
+  const msg = (roomId, body) => ({ roomId, roomTitle: roomId, from: 'dev-2', body });
+  const busy = { alive: true, busy: true };
+  const idle = { alive: true, busy: false };
+
+  it("discards only the named room's queued messages and reports the count", () => {
+    const { delivery, injectTurn } = makeDelivery();
+    for (let i = 0; i < 3; i++) delivery.deliver(busy, '!s', msg('spammy', `flood ${i}`));
+    delivery.deliver(busy, '!s', msg('quiet', 'something useful'));
+    expect(delivery.pendingCount('!s')).toBe(4);
+    expect(delivery.dropRoom('!s', 'spammy')).toBe(3);
+    expect(delivery.pendingCount('!s')).toBe(1);
+    // The survivor is the other room's message, and it still flushes.
+    delivery.flush(idle, '!s');
+    const text = injectTurn.mock.calls.at(-1)[1];
+    expect(text).toContain('something useful');
+    expect(text).not.toContain('flood');
+  });
+
+  it('is a no-op for an unknown session or room', () => {
+    const { delivery } = makeDelivery();
+    expect(delivery.dropRoom('!nobody', 'r1')).toBe(0);
+    delivery.deliver(busy, '!s', msg('r1', 'hi'));
+    expect(delivery.dropRoom('!s', 'other')).toBe(0);
+    expect(delivery.pendingCount('!s')).toBe(1);
+  });
+
+  it("clears the room's eviction counter, so no \"earlier messages omitted\" footnote survives it", () => {
+    const { delivery, injectTurn } = makeDelivery();
+    // Overflow MAX_PENDING for one room so its omitted-counter is non-zero…
+    for (let i = 0; i < 60; i++) delivery.deliver(busy, '!s', msg('spammy', `flood ${i}`));
+    delivery.deliver(busy, '!s', msg('quiet', 'useful'));
+    delivery.dropRoom('!s', 'spammy');
+    delivery.flush(idle, '!s');
+    expect(injectTurn.mock.calls.at(-1)[1]).not.toMatch(/omitted/);
   });
 });

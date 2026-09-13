@@ -1,5 +1,8 @@
 import { describe, it, expect, vi } from 'vitest';
 import { atomicWriteFileSync } from '../lib/atomic-write.js';
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 // In-memory fs fake (same shape as test/recent-folders.test.js) modelling
 // POSIX atomic-rename semantics: writeFileSync lands the temp file, renameSync
@@ -96,5 +99,35 @@ describe('atomicWriteFileSync', () => {
     expect(fs.renameSync).not.toHaveBeenCalled();
     // The unconfirmed temp was cleaned up.
     expect(fs.unlinkSync).toHaveBeenCalledWith(`${FILE}.${process.pid}.tmp`);
+  });
+});
+
+describe('atomicWriteFileSync mode', () => {
+  it('creates the temp and the target with the requested permissions', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'aw-mode-'));
+    const target = path.join(dir, 'store.json');
+    const modes = [];
+    const spyFs = {
+      writeFileSync: (f, d, o) => { modes.push({ file: f, mode: o?.mode }); fs.writeFileSync(f, d, o); },
+      renameSync: fs.renameSync,
+      unlinkSync: fs.unlinkSync,
+      chmodSync: fs.chmodSync,
+    };
+    atomicWriteFileSync(target, '{"a":1}', { fs: spyFs, mode: 0o600 });
+    // The mode must ride on the TEMP write: the rename carries it onto the
+    // target, so setting it afterwards would leave a window where the file
+    // is world-readable.
+    expect(modes[0].mode).toBe(0o600);
+    expect(modes[0].file.startsWith(target)).toBe(true);
+    expect(fs.statSync(target).mode & 0o777).toBe(0o600);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('is unchanged when no mode is given', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'aw-nomode-'));
+    const target = path.join(dir, 'store.json');
+    atomicWriteFileSync(target, 'hello');
+    expect(fs.readFileSync(target, 'utf8')).toBe('hello');
+    fs.rmSync(dir, { recursive: true, force: true });
   });
 });

@@ -334,7 +334,9 @@ describe('index.js resume/sessions paths — no sync fs calls (source inspection
     expect(block).toContain('agentSessions: inheritedAgentSessions');
     expect(block).toContain('journalConvoId: resumePersisted?.journalConvoId');
     expect(block).toContain('journalConvoId: session.journalConvoId');
-    expect(block).toContain('model: resumeState.model');
+    // The persisted model is still what a plain /resume spawns on; an
+    // explicit --model on the /resume overrides it.
+    expect(block).toContain('model: resumeModelFlag.model || resumeState.model');
     expect(block).toContain('interactive: resumeState.interactiveMode');
     expect(block).toContain('mcpExtras: effectiveResumeExtras');
   });

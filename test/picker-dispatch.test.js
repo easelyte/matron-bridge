@@ -10,6 +10,8 @@ describe('handlePickerValue', () => {
       cancelTimer: vi.fn(),
       sendTimerNow: vi.fn(),
       carryOnConvo: vi.fn(),
+      confirmSleep: vi.fn(),
+      cancelSleep: vi.fn(),
       sendReply: vi.fn(),
       sendHtml: vi.fn(),
     };
@@ -96,6 +98,35 @@ describe('handlePickerValue', () => {
     expect(s.applyModeSwitch).not.toHaveBeenCalled();
     expect(s.applyModelSwitch).not.toHaveBeenCalled();
     expect(s.switchEffortInSession).not.toHaveBeenCalled();
+  });
+
+  describe('sleep: values', () => {
+    it('dispatches sleep:confirm to confirmSleep(session, sendReply)', () => {
+      const s = seams();
+      const session = { id: 'sess' };
+      expect(handlePickerValue('sleep:confirm', 'room-1', session, s)).toBe(true);
+      expect(s.confirmSleep).toHaveBeenCalledWith(session, s.sendReply);
+      expect(s.cancelSleep).not.toHaveBeenCalled();
+    });
+
+    it('dispatches sleep:cancel to cancelSleep(session, sendReply)', () => {
+      const s = seams();
+      const session = { id: 'sess' };
+      expect(handlePickerValue('sleep:cancel', 'room-1', session, s)).toBe(true);
+      expect(s.cancelSleep).toHaveBeenCalledWith(session, s.sendReply);
+      expect(s.confirmSleep).not.toHaveBeenCalled();
+    });
+
+    it('rejects any other sleep verb without touching a seam', () => {
+      // Defence in depth against a crafted value: the closed set is
+      // confirm|cancel, and anything else must not reach the host command.
+      const s = seams();
+      for (const bad of ['sleep:', 'sleep:now', 'sleep:confirm:1', 'sleep:CONFIRM']) {
+        expect(handlePickerValue(bad, 'room-1', {}, s)).toBe(false);
+      }
+      expect(s.confirmSleep).not.toHaveBeenCalled();
+      expect(s.cancelSleep).not.toHaveBeenCalled();
+    });
   });
 
   describe('resume: values', () => {

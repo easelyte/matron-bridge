@@ -6,6 +6,41 @@ cd "$(dirname "$0")"
 
 PORT=9802
 
+# This script is the non-systemd bounce (launchd/manual installs). Under systemd
+# it is actively harmful: it kills the unit's process, systemd respawns it at
+# RestartSec=5, and the nohup instance started below grabs the port first — so
+# the surviving bridge is unsupervised and systemd's respawn fails to bind.
+#
+# Refuse whenever systemd owns the unit's lifecycle, not just while it is
+# `active`: during the RestartSec hold-off after a crash the state is
+# `activating` (auto-restart), and `is-active` would fail open in exactly the
+# window an operator tends to reach for a manual restart. Also refuse while the
+# unit is enabled-but-stopped, since a nohup bridge would block the next
+# `systemctl start` from binding the port. `command -v systemctl` keeps this a
+# no-op on macOS, and a missing unit reports ActiveState=inactive with an empty
+# UnitFileState, so dev machines fall through unchanged.
+if command -v systemctl >/dev/null 2>&1; then
+  UNIT_STATE=$(systemctl show matron-bridge.service -p ActiveState -p UnitFileState 2>/dev/null)
+  ACTIVE_STATE=$(printf '%s\n' "$UNIT_STATE" | sed -n 's/^ActiveState=//p')
+  UNIT_FILE_STATE=$(printf '%s\n' "$UNIT_STATE" | sed -n 's/^UnitFileState=//p')
+  SYSTEMD_OWNED=""
+  case "$ACTIVE_STATE" in
+    active|activating|reloading|refreshing|deactivating|failed) SYSTEMD_OWNED=1 ;;
+  esac
+  case "$UNIT_FILE_STATE" in
+    enabled|enabled-runtime|linked|linked-runtime) SYSTEMD_OWNED=1 ;;
+  esac
+  if [ -n "$SYSTEMD_OWNED" ]; then
+    echo "ERROR: matron-bridge is systemd-managed (matron-bridge.service:" \
+      "ActiveState=${ACTIVE_STATE:-unknown}, UnitFileState=${UNIT_FILE_STATE:-none})." >&2
+    echo "Running this script would collide with systemd's respawn on port $PORT." >&2
+    echo "Use instead:  sudo systemctl restart matron-bridge" >&2
+    echo "From inside a bridge session (this kills your own session's process):" >&2
+    echo "  sudo systemd-run --on-active=20 --unit=bridge-restart systemctl restart matron-bridge" >&2
+    exit 1
+  fi
+fi
+
 echo "Stopping existing bridge processes..."
 
 # Kill by process pattern
