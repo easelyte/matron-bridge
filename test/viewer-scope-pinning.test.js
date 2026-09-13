@@ -2,6 +2,7 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import { mkdtempSync, mkdirSync, writeFileSync, renameSync, symlinkSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
+import { createHmac } from 'node:crypto';
 
 // A viewer token used to carry its scope as a bare workdir PATHNAME, which the
 // viewer re-resolved on every request. That is not an authorization boundary:
@@ -39,6 +40,14 @@ afterAll(() => {
 const pinnedRootsFor = async (dir) => {
   const { pinAllowedRootsSync } = await import('../lib/file-link-guard.js');
   return pinAllowedRootsSync([dir]).roots.map(({ realPath, dev, ino }) => ({ realPath, dev, ino }));
+};
+
+// Sign an arbitrary payload with the viewer's HMAC, bypassing the minters —
+// the only way to present a token shape the minters refuse to produce.
+const forgedUrl = (payload) => {
+  const body = Buffer.from(JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 60, ...payload })).toString('base64url');
+  const sig = createHmac('sha256', 'test-secret').update(body).digest('base64url');
+  return `http://127.0.0.1:${port}/view?token=${body}.${sig}`;
 };
 
 const viewUrl = async (extra) => {
@@ -103,24 +112,26 @@ describe('viewer scope pinning', () => {
     }
   });
 
-  it('refuses a token whose pinned roots were tampered into a malformed shape', async () => {
-    const url = await viewUrl({
-      path: path.join(work, 'report.txt'),
-      workdir: work,
-      roots: [{ realPath: work }], // dev/ino stripped
-    });
-    const res = await fetch(url);
+  it('refuses a token that claims a workdir scope without pinning it', async () => {
+    // The mutable-pathname scope is GONE, not merely deprecated: a token with
+    // a workdir and no roots is refused rather than served under the weaker
+    // boundary. Forged by hand because both minters now refuse to emit one —
+    // in production this shape only exists in tokens minted by a previous
+    // process, so the cost is a dead link for at most one token lifetime.
+    const res = await fetch(forgedUrl({ path: path.join(work, 'report.txt'), workdir: work }));
     expect(res.status).toBe(404);
   });
 
-  it('still honours a legacy token that predates pinned roots (drains at expiry)', async () => {
-    // Documented residual, not an oversight: tokens minted before this change
-    // carry only the pathname and keep the old identity-free containment until
-    // they expire. Asserting it keeps the compatibility path deliberate.
-    const url = await viewUrl({ path: path.join(work, 'report.txt'), workdir: work });
-    const res = await fetch(url);
-    expect(res.status).toBe(200);
-    expect(await res.text()).toContain('MY OWN FILE');
+  it('mints pinned roots even when the caller only supplies a workdir', async () => {
+    const { generateSignedUrl, verifyToken } = await import('../lib/viewer-tokens.js');
+    const url = generateSignedUrl(`http://127.0.0.1:${port}`, null, undefined, 60, {
+      path: path.join(work, 'report.txt'),
+      workdir: work,
+    });
+    const payload = verifyToken(url.split('token=')[1]);
+    expect(Array.isArray(payload.roots)).toBe(true);
+    expect(payload.roots[0]).toMatchObject({ realPath: work });
+    expect((await fetch(url)).status).toBe(200);
   });
 });
 
@@ -162,23 +173,17 @@ describe('index.js pins the viewer root at session creation', () => {
 });
 
 describe('token scope fails closed', () => {
-  it('refuses a token asserting a null roots scope rather than falling back to the pathname', async () => {
-    const url = await viewUrl({
-      path: path.join(work, 'report.txt'),
-      workdir: work,
-      roots: null,
-    });
-    const res = await fetch(url);
-    expect(res.status).toBe(404);
-  });
-
-  it('refuses a token asserting an empty roots scope', async () => {
-    const url = await viewUrl({
-      path: path.join(work, 'report.txt'),
-      workdir: work,
-      roots: [],
-    });
-    const res = await fetch(url);
+  // These shapes cannot be produced by the minters any more, so they are
+  // signed by hand: the point is that the VERIFIER refuses them, independently
+  // of any minter staying well-behaved.
+  it.each([
+    ['null roots', null],
+    ['empty roots', []],
+    ['roots missing dev/ino', [{ realPath: '/tmp' }]],
+    ['roots with a relative realPath', [{ realPath: 'work', dev: 1, ino: 2 }]],
+    ['roots that is not an array', { realPath: '/tmp', dev: 1, ino: 2 }],
+  ])('refuses a token whose %s cannot be honoured, rather than falling back to the pathname', async (_label, roots) => {
+    const res = await fetch(forgedUrl({ path: path.join(work, 'report.txt'), workdir: work, roots }));
     expect(res.status).toBe(404);
   });
 

@@ -555,6 +555,20 @@ describe('pinAllowedRootIdentities', () => {
     }
   });
 
+  it('refuses an empty capability — no roots is a broken scope, not an open one', async () => {
+    for (const empty of [[], null, undefined]) {
+      expect(() => pinAllowedRootIdentities(empty))
+        .toThrowError(expect.objectContaining({ reason: 'bad-workdir' }));
+    }
+    // The hazard it prevents: an empty branded capability reaches
+    // validateAndOpen's pinned-root branch with nothing to compare, and with
+    // no workdir there is no containment left either.
+    const { content } = await validateAndOpen(path.join(outside, 'ok.txt'), {
+      allowedRoots: pinAllowedRootsSync([]),
+    });
+    expect(content.toString('utf-8')).toBe('OUT OF SCOPE\n');
+  });
+
   it('fails closed on a malformed identity rather than degrading to no scope', () => {
     const malformed = [
       [{}],
