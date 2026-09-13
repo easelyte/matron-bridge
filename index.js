@@ -4560,6 +4560,21 @@ function handleClaudeEvent(session, event) {
         // becomes known, so repaint here rather than making the header wait
         // for the first turn end. Unthrottled: init fires once per spawn.
         journalStatus(session);
+        // Which turn generation the CLI has actually OPENED (Codex R2 F1).
+        // Print mode emits exactly one system/init per TURN — verified against
+        // the live CLI: init, result, init, result across two sequential turns
+        // on one session id. The bridge bumps turnGeneration when it WRITES a
+        // prompt, which is earlier: the first turn's init trailed the write by
+        // ~6.9s in that probe (CLI startup + MCP load), a later turn's by ~27ms.
+        // An interrupt armed inside that gap is dropped by the CLI, which still
+        // returns an ordinary success receipt for it (#429) — so this stamp is
+        // what tells printModeInterrupt whether an ack can be believed. If a CLI
+        // version ever stops emitting per-turn init, the stamp goes stale, acks
+        // are never trusted, and interrupts degrade to their pre-#701 10s
+        // behaviour: a fail-safe direction, never a worse one. Deliberately
+        // placed after journalStatus so the header-repaint wiring assertion in
+        // test/session-status.test.js keeps its adjacency window.
+        session._cliInitGeneration = session.turnGeneration;
       } else if (event.subtype === 'compact' || event.subtype === 'context_compaction') {
         // Cooldown: don't send compaction messages more than once per 60s
         const now = Date.now();
@@ -4856,6 +4871,16 @@ function handleClaudeEvent(session, event) {
         console.log(
           '[interrupt] acked by claude (subtype %s), room %s — %dms unstick replaced with %dms backstop',
           interruptAckSubtype(event), session.roomId, INTERRUPT_FALLBACK_MS, INTERRUPT_ACK_BACKSTOP_MS,
+        );
+      } else if (isInterruptAck(event, pending.requestId) && !pending.ackTrusted) {
+        // Matched, but armed before the CLI opened this turn, so the receipt is
+        // meaningless (#429). Keeping the shorter unstick is the whole point —
+        // extending here would delay recovery for a turn that was never
+        // interrupted. Logged because it is genuinely interesting: it means the
+        // operator hit stop inside the CLI's startup window.
+        console.warn(
+          '[interrupt] ignoring pre-init control_response, room %s gen %d — the CLI acks an interrupt it dropped (claude-agent-sdk-typescript#429); keeping the %dms unstick',
+          session.roomId, session.turnGeneration, INTERRUPT_FALLBACK_MS,
         );
       } else if (!isInterruptAck(event, pending.requestId)) {
         // A control_response arrived while OUR interrupt is still pending but
@@ -11638,6 +11663,12 @@ async function printModeInterrupt(session, sendReply) {
   // turn's busy — which #44 made peer-triggerable (a priority peer arming a
   // wedge that would otherwise false-clear a later operator/higher-tier turn).
   const armedGeneration = session.turnGeneration;
+  // Can this interrupt's acknowledgement be believed? Only if the CLI has
+  // already opened THIS turn (Codex R2 F1). Snapshotted at arm time, not ack
+  // time: if init had not arrived when we wrote the interrupt, the CLI had not
+  // started the turn, so there was nothing for it to interrupt — and its
+  // success receipt says otherwise.
+  const ackTrusted = session._cliInitGeneration === armedGeneration;
   const interruptHandle = sendPrintInterrupt({
     stdin: session.proc.stdin,
     // Loop #701: the CLI's control_response ack replaces the 10s unstick below
@@ -11647,6 +11678,7 @@ async function printModeInterrupt(session, sendReply) {
     // flag nothing will clear. The no-ack path keeps the 10s deadline
     // unchanged, which is the case this wedge was designed for.
     backstopMs: INTERRUPT_ACK_BACKSTOP_MS,
+    ackTrusted,
     shouldFireWedge: () => session.turnGeneration === armedGeneration,
     // Retire the handle when the timer fires, even if the wedge is suppressed
     // (Codex R1 F1). Identity-checked so a newer interrupt's handle is never

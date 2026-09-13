@@ -133,6 +133,32 @@ describe('interrupt-ack backstop wiring (loop #701)', () => {
     expect(body).toContain('session.roomId');
   });
 
+  // Codex R2 F1. The blocker this closes: an interrupt armed before the CLI
+  // emitted this turn's system/init is dropped, but still acked, so promoting
+  // that receipt would defer recovery from 10s to 60s for a turn that was never
+  // interrupted — the only way #701 could be worse than origin/main.
+  it('only trusts an ack for a turn the CLI had actually opened', () => {
+    const initCase = bodyOf("      if (event.subtype === 'init') {", '\n    case ');
+    expect(
+      initCase,
+      'the system/init seam must stamp the turn generation the CLI actually opened. Without it '
+      + 'there is no way to tell a real interrupt receipt from the success receipt the CLI returns '
+      + 'for an interrupt it silently dropped (claude-agent-sdk-typescript#429).',
+    ).toContain('session._cliInitGeneration = session.turnGeneration;');
+
+    const body = bodyOf('async function printModeInterrupt(', '\nfunction bumpTurnGeneration(');
+    expect(
+      body,
+      'the trust decision must be snapshotted at ARM time against the armed generation: if init '
+      + 'had not arrived when the interrupt was written, the CLI had not started the turn, so '
+      + 'there was nothing to interrupt and its receipt is meaningless.',
+    ).toContain('const ackTrusted = session._cliInitGeneration === armedGeneration;');
+    expect(body).toContain('ackTrusted,');
+
+    const ackCase = bodyOf("case 'control_response': {", '\n    default:');
+    expect(ackCase).toContain('!pending.ackTrusted');
+  });
+
   // Codex R1 F2, second half. The wedge now has two deadlines. Telling the
   // operator "No response after 10s" when the CLI DID respond and we then
   // waited 60s is misleading recovery evidence — it points them at the wrong

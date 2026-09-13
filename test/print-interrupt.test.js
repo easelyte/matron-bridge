@@ -485,6 +485,67 @@ describe('interrupt ack backstop', () => {
     expect(applyInterruptAck(undefined, { type: 'control_response', response: { request_id: 'x' } })).toBe(false);
   });
 
+  // Codex R2 F1. An interrupt written before the CLI emitted this turn's
+  // system/init is silently DROPPED, and the CLI answers it with an ordinary
+  // success receipt anyway (open upstream bug claude-agent-sdk-typescript#429,
+  // reproduced on CLI 2.1.241; our own probe measured a ~6.9s first-turn init
+  // window). Promoting that receipt would push recovery from 10s out to 60s for
+  // a turn that was never interrupted — the one way this change could be WORSE
+  // than not consuming the ack at all.
+  describe('untrusted (pre-init) acks', () => {
+    it('ackTrusted:false — a matching ack does not extend, and the 10s unstick still fires', () => {
+      vi.useFakeTimers();
+      try {
+        const { stdin } = collect();
+        const onWedge = vi.fn();
+        const handle = sendPrintInterrupt({
+          stdin, onWedge, onError: () => {},
+          timeoutMs: 10000, backstopMs: 60000, ackTrusted: false, shouldFireWedge: () => true,
+        });
+        expect(handle.ackTrusted).toBe(false);
+        expect(applyInterruptAck(handle, ackFor(handle))).toBe(false);
+        expect(handle.acknowledged).toBe(false);
+        vi.advanceTimersByTime(9_999);
+        expect(onWedge).not.toHaveBeenCalled();
+        vi.advanceTimersByTime(1);
+        expect(onWedge).toHaveBeenCalledTimes(1);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('ackTrusted:false leaves the handle otherwise normal (cancel still works)', () => {
+      vi.useFakeTimers();
+      try {
+        const { stdin } = collect();
+        const onWedge = vi.fn();
+        const handle = sendPrintInterrupt({
+          stdin, onWedge, onError: () => {}, timeoutMs: 10000, ackTrusted: false,
+        });
+        applyInterruptAck(handle, ackFor(handle));
+        handle.cancel();
+        expect(vi.getTimerCount()).toBe(0);
+        vi.advanceTimersByTime(600_000);
+        expect(onWedge).not.toHaveBeenCalled();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('ackTrusted defaults to true (unchanged for every existing caller)', () => {
+      vi.useFakeTimers();
+      try {
+        const { stdin } = collect();
+        const handle = sendPrintInterrupt({ stdin, onWedge: () => {}, onError: () => {} });
+        expect(handle.ackTrusted).toBe(true);
+        expect(applyInterruptAck(handle, ackFor(handle))).toBe(true);
+        handle.cancel();
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+  });
+
   it('defaults backstopMs to INTERRUPT_ACK_BACKSTOP_MS', () => {
     vi.useFakeTimers();
     try {
