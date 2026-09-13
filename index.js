@@ -591,20 +591,31 @@ function handleJournalReconnect() {
 // AFTER a newer ordinary update, rolling the digest backwards. A refused offer
 // is remembered as a flag, not as content, and retried from live state.
 let _summaryRepairPending = false;
+let _summaryRepairRunning = false;
 
 function republishSessionSummaries({ clearHints = false } = {}) {
+  // Re-entrancy latch. A successful enqueue can pump, confirm and fire
+  // onSendCapacity synchronously on an injected transport, which lands right
+  // back here mid-loop. Same coalescing discipline as republishPendingReleases.
+  if (_summaryRepairRunning) return;
   if (!JOURNAL_ENABLED || !summaryJournalPublishEnabled()) {
     _summaryRepairPending = false;
     return;
   }
-  let refused = false;
-  for (const session of sessions.values()) {
-    if (clearHints) session._journalSummaryHint = undefined;
-    const digest = summaryForJournal(session.pinnedSummaryText);
-    if (!digest || digest === session._journalSummaryHint) continue;
-    if (!publishJournalSummary(session, digest, { repair: true })) refused = true;
+  _summaryRepairRunning = true;
+  // Cleared up front, re-armed by any refusal publishJournalSummary reports
+  // during the sweep — so a pass that places everything leaves nothing pending.
+  _summaryRepairPending = false;
+  try {
+    for (const session of sessions.values()) {
+      if (clearHints) session._journalSummaryHint = undefined;
+      const digest = summaryForJournal(session.pinnedSummaryText);
+      if (!digest || digest === session._journalSummaryHint) continue;
+      publishJournalSummary(session, digest);
+    }
+  } finally {
+    _summaryRepairRunning = false;
   }
-  _summaryRepairPending = refused;
 }
 
 // Send-completion retry (the trigger that does NOT need another reconnect).
@@ -6122,25 +6133,30 @@ async function updateRoomName(roomId, name) {
 // Values reaching here are already clamped — by the publish seam inside
 // updatePinnedSummary on the live path, and by the caller on the resume
 // backfill path.
-const publishJournalSummary = makeJournalSummaryPublisher({
-  upsertConvo: journalUpsertConvo,
-  // Reconnect repair rides upsertConvoBestEffort — the established non-evicting
-  // fan-out path (same as the stranded-subagent reconcile). At hello_ok the
-  // outbound queue may still hold the entire outage backlog, and an ordinary
-  // enqueue would drop the OLDEST frame to make room: real user traffic
-  // sacrificed for a digest re-send. Best-effort retains the repair in FIFO
-  // pending order and admits it as confirmations create headroom instead.
-  // A session with no journal convo id yet has nothing to repair — it has not
-  // published anything — so refuse rather than buffer.
-  // retain:false — see republishSessionSummaries. A digest is derived state we
-  // can always recompute, so refusing now and re-offering from live state beats
-  // holding a snapshot that drains after a newer update.
-  upsertConvoRepair: (session, opts) => {
+// ONE transport for every summary write — live pass, resume backfill and
+// reconnect repair alike. upsertConvoBestEffort with retain:false neither
+// evicts (an outage-time digest must not cost a queued user message) nor
+// retains (a held snapshot drains at the tail and can roll back a newer
+// digest). It simply refuses when there is no room, and _publishSummaryFrame's
+// 'refused' outcome arms the capacity retry. A session with no journal convo id
+// has published nothing and has nothing to repair, so refuse rather than buffer
+// — journalUpsertConvo's buffering path is for traffic that must not be lost,
+// which a recomputable digest is not.
+const _publishSummaryFrame = makeJournalSummaryPublisher({
+  upsertConvo: (session, opts) => {
     const convoId = journalConvoIdFor(session);
     if (!JOURNAL_ENABLED || !convoId) return false;
     return journalPublisher.upsertConvoBestEffort(convoId, opts, { retain: false });
   },
 });
+
+function publishJournalSummary(session, summary) {
+  const outcome = _publishSummaryFrame(session, summary);
+  // 'skipped' is nothing-to-do (kill switch, or already published). Only a
+  // genuine refusal is worth coming back for.
+  if (outcome === 'refused') _summaryRepairPending = true;
+  return outcome;
+}
 
 async function maybeUpdatePinnedSummary(session) {
   await updatePinnedSummary(session, {

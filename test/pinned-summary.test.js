@@ -567,7 +567,7 @@ describe('makeJournalSummaryPublisher', () => {
     const publish = makeJournalSummaryPublisher({ upsertConvo, env: {} });
     const s = session();
 
-    expect(publish(s, '• work')).toBe(true);
+    expect(publish(s, '• work')).toBe('sent');
 
     expect(upsertConvo).toHaveBeenCalledWith(s, { summary: '• work' });
     expect(s._journalSummaryHint).toBe('• work');
@@ -579,10 +579,10 @@ describe('makeJournalSummaryPublisher', () => {
     const s = session();
 
     publish(s, '• work');
-    expect(publish(s, '• work')).toBe(false);
+    expect(publish(s, '• work')).toBe('skipped');
     expect(upsertConvo).toHaveBeenCalledTimes(1);
 
-    expect(publish(s, '• work\n• more')).toBe(true);
+    expect(publish(s, '• work\n• more')).toBe('sent');
     expect(upsertConvo).toHaveBeenCalledTimes(2);
   });
 
@@ -593,51 +593,33 @@ describe('makeJournalSummaryPublisher', () => {
       const publish = makeJournalSummaryPublisher({ upsertConvo, env: {} });
       const s = session({ _journalSummaryHint: '• prior' });
 
-      expect(publish(s, value)).toBe(false);
+      expect(publish(s, value)).toBe('skipped');
       expect(upsertConvo).not.toHaveBeenCalled();
       expect(s._journalSummaryHint).toBe('• prior');
     },
   );
 
-  // loop #554 R2-F1: the reconnect fan-out must not evict the outage backlog.
-  it('uses the repair transport only when asked, defaulting to the ordinary one', () => {
-    const upsertConvo = vi.fn();
-    const upsertConvoRepair = vi.fn();
-    const publish = makeJournalSummaryPublisher({ upsertConvo, upsertConvoRepair, env: {} });
-
-    publish(session(), '• live');
-    expect(upsertConvo).toHaveBeenCalledTimes(1);
-    expect(upsertConvoRepair).not.toHaveBeenCalled();
-
-    publish(session(), '• repaired', { repair: true });
-    expect(upsertConvoRepair).toHaveBeenCalledTimes(1);
-    expect(upsertConvo).toHaveBeenCalledTimes(1);
-  });
-
-  it('falls back to the ordinary transport when no repair transport is wired', () => {
-    const upsertConvo = vi.fn();
+  // loop #554 R3/R4: a refused frame was neither sent nor retained. Recording
+  // the hint there would suppress the retry meant to recover it — and the
+  // caller needs 'refused' distinguishable from 'skipped' to know to come back.
+  it('reports a refusal, leaves the hint unset, and retries the same digest', () => {
+    const upsertConvo = vi.fn(() => false);
     const publish = makeJournalSummaryPublisher({ upsertConvo, env: {} });
-
-    publish(session(), '• work', { repair: true });
-
-    expect(upsertConvo).toHaveBeenCalledTimes(1);
-  });
-
-  // A best-effort enqueue that returns false was neither sent nor retained.
-  // Recording the hint there would suppress the retry meant to recover it.
-  it('does not record the hint when the transport refuses the frame', () => {
-    const upsertConvoRepair = vi.fn(() => false);
-    const publish = makeJournalSummaryPublisher({
-      upsertConvo: vi.fn(), upsertConvoRepair, env: {},
-    });
     const s = session();
 
-    expect(publish(s, '• work', { repair: true })).toBe(false);
+    expect(publish(s, '• work')).toBe('refused');
     expect(s._journalSummaryHint).toBeUndefined();
 
-    // …and the same digest is retried rather than deduped away.
-    upsertConvoRepair.mockReturnValue(true);
-    expect(publish(s, '• work', { repair: true })).toBe(true);
+    upsertConvo.mockReturnValue(true);
+    expect(publish(s, '• work')).toBe('sent');
+    expect(s._journalSummaryHint).toBe('• work');
+  });
+
+  it('treats a transport that returns nothing as sent', () => {
+    const publish = makeJournalSummaryPublisher({ upsertConvo: vi.fn(), env: {} });
+    const s = session();
+
+    expect(publish(s, '• work')).toBe('sent');
     expect(s._journalSummaryHint).toBe('• work');
   });
 
@@ -652,7 +634,7 @@ describe('makeJournalSummaryPublisher', () => {
     // Read per call, not captured: a restart with a changed unit env flips it.
     env.SUMMARY_JOURNAL_PUBLISH = '0';
     const s = session();
-    expect(publish(s, '• other')).toBe(false);
+    expect(publish(s, '• other')).toBe('skipped');
     expect(upsertConvo).toHaveBeenCalledTimes(1);
     expect(s._journalSummaryHint).toBeUndefined();
   });

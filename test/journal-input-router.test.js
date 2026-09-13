@@ -2209,8 +2209,13 @@ describe('index.js agent-chat room wiring (source inspection)', () => {
       expect(fn).toMatch(/const digest = summaryForJournal\(session\.pinnedSummaryText\);/);
       // Already-published and empty digests cost nothing.
       expect(fn).toMatch(/if \(!digest \|\| digest === session\._journalSummaryHint\) continue;/);
-      // A refusal is remembered as a FLAG, never as retained content.
-      expect(fn).toMatch(/_summaryRepairPending = refused;/);
+      // A refusal is remembered as a FLAG, never as retained content: cleared
+      // up front, re-armed by publishJournalSummary during the sweep.
+      expect(fn).toMatch(/_summaryRepairPending = false;/);
+      // A synchronous transport can pump -> confirm -> onSendCapacity -> back
+      // here mid-loop; the latch coalesces that instead of recursing.
+      expect(fn).toMatch(/if \(_summaryRepairRunning\) return;/);
+      expect(fn).toMatch(/_summaryRepairRunning = false;/);
     });
 
     it('clears the hint before republishing, and clamps what it sends', () => {
@@ -2218,7 +2223,7 @@ describe('index.js agent-chat room wiring (source inspection)', () => {
       expect(start).toBeGreaterThan(-1);
       const fn = src.slice(start, src.indexOf('\n}', start));
       const clear = fn.indexOf('session._journalSummaryHint = undefined;');
-      const publish = fn.indexOf('publishJournalSummary(session, digest, { repair: true })');
+      const publish = fn.indexOf('publishJournalSummary(session, digest);');
       expect(clear).toBeGreaterThan(-1);
       // Without the clear first, the publisher's own dedupe would swallow the
       // very republish that exists to undo a dropped frame.
@@ -2226,19 +2231,24 @@ describe('index.js agent-chat room wiring (source inspection)', () => {
       expect(fn).toMatch(/for \(const session of sessions\.values\(\)\)/);
     });
 
-    // The repair must NOT ride the evicting enqueue: at hello_ok the queue can
-    // still hold the whole outage backlog, and dropping the oldest frame to make
-    // room for a digest re-send trades real user traffic for a nicety.
-    it('routes the repair transport through the non-evicting best-effort path', () => {
+    // EVERY summary write — live pass, resume backfill, reconnect repair — uses
+    // the non-evicting, non-retaining transport. Evicting would cost a queued
+    // user message to publish a digest (R4-F1); retaining would let a held
+    // snapshot drain at the tail and roll back a newer digest (R3-F2).
+    it('routes every summary write through the non-evicting best-effort path', () => {
       const start = src.indexOf('makeJournalSummaryPublisher({');
       expect(start).toBeGreaterThan(-1);
       const wiring = src.slice(start, src.indexOf('\n});', start));
-      expect(wiring).toMatch(/upsertConvo: journalUpsertConvo,/);
-      expect(wiring).toMatch(/upsertConvoRepair: \(session, opts\) =>/);
-      // retain:false — a held repair drains at the tail and can roll back a
-      // newer ordinary update of the same field (R3-F2).
       expect(wiring).toMatch(/journalPublisher\.upsertConvoBestEffort\(convoId, opts, \{ retain: false \}\)/);
-      expect(wiring).not.toMatch(/upsertConvoRepair[\s\S]*journalUpsertConvo\(/);
+      // The evicting transport must not appear on this path at all.
+      expect(wiring).not.toMatch(/journalUpsertConvo/);
+      expect(src).not.toMatch(/upsertConvoRepair/);
+    });
+
+    it('arms the retry only on a genuine refusal, not on a skip', () => {
+      const start = src.indexOf('function publishJournalSummary(');
+      const fn = src.slice(start, src.indexOf('\n}', start));
+      expect(fn).toMatch(/if \(outcome === 'refused'\) _summaryRepairPending = true;/);
     });
   });
 
