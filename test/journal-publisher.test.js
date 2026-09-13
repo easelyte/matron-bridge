@@ -398,6 +398,37 @@ describe('createJournalPublisher', () => {
     pub.close();
   });
 
+  // loop #554 R3-F2: a RETAINED repair drains at the queue tail, so it can land
+  // after a newer ordinary update of the same field and roll it back. Derived
+  // state opts out of retention and is re-offered from live state instead.
+  it('retain:false refuses instead of holding a stale repair behind the backlog', async () => {
+    const port = await getFreePort();
+    const pub = createJournalPublisher({
+      url: `ws://127.0.0.1:${port}/ws`, token: 'tok', log: silentLog, queueLimit: 1, ...FAST_BACKOFF,
+    });
+
+    // Disconnected: nothing pumps, so the bounded queue fills deterministically.
+    pub.publishText('c1', { body: 'backlog', from: 'user' });
+    expect(pub.upsertConvoBestEffort('c1', { summary: '• held' }, { retain: true })).toBe(false);
+    expect(pub.upsertConvoBestEffort('c1', { summary: '• refused' }, { retain: false })).toBe(false);
+
+    // Bring the journal up and let everything drain.
+    const fake = await startFakeServer({}, port);
+    await waitFor(() => fake.received.some(f => f.summary === '• held'));
+    await delay(100);
+
+    // The retained repair arrived — but only AFTER the backlog it was held
+    // behind. That tail position is exactly what would overwrite a newer
+    // ordinary update of the same field, which is why the summary repair does
+    // not use it.
+    const bodies = fake.received.map(f => f.summary ?? f.payload?.body);
+    expect(bodies.indexOf('• held')).toBeGreaterThan(bodies.indexOf('backlog'));
+    expect(fake.received.some(f => f.summary === '• refused')).toBe(false);
+
+    pub.close();
+    await fake.close();
+  });
+
   it('sends summary on a best-effort upsert when the queue has headroom', async () => {
     const fake = await startFakeServer();
     const pub = createJournalPublisher({

@@ -151,7 +151,7 @@ import { attachPendingMediaMirror, pendingMediaMirror } from './lib/media-mirror
 import { seedJournalTitle, applyFallbackTitle, formatRoomTitle } from './lib/journal-title-seed.js';
 import { toolRepoSignals, commitRepoSignals, dominantRepo, emptyRepoScores, normalizeRepoScores } from './lib/repo-infer.js';
 import { codexOneShot } from './lib/codex-oneshot.js';
-import { makeJournalSummaryPublisher, summaryForJournal, updatePinnedSummary } from './lib/pinned-summary.js';
+import { makeJournalSummaryPublisher, summaryForJournal, summaryJournalPublishEnabled, updatePinnedSummary } from './lib/pinned-summary.js';
 import { SUMMARY_MIN_NEW } from './lib/summary-pass.js';
 import { activityStateChanged, truncateActivityDetail, shouldResumeThinkingAfterTool } from './lib/journal-activity.js';
 import { streamRefFor } from './lib/journal-stream.js';
@@ -570,25 +570,48 @@ function handleJournalReconnect() {
   // reemit lives in journalOnReconnect, so it is NOT duplicated here.
   reconcileStrandedSubagents('reconnect');
   journalOnReconnect();
-  republishSessionSummaries();
+  republishSessionSummaries({ clearHints: true });
 }
 
 // Repair the summary publish hint across a connection epoch (loop #554 F3).
 // makeJournalSummaryPublisher records "already sent" on ENQUEUE, not on
-// acceptance — so a frame evicted by queue overflow during an outage, or one
-// the server rejected, would be suppressed forever on a session that then went
-// quiet (the next pass produces the same digest and is deduped away). The
-// outage IS the failure window, so clearing the hints on every accepted
-// hello_ok and re-publishing is the matching repair. Idempotent: the server
-// COALESCEs, and (once the journal lands summary_updated_at) only advances
-// freshness on an actual content change, so a re-send of an unchanged digest
-// is inert rather than a false "just updated". Bounded by the number of LIVE
-// in-memory sessions, and empty digests are skipped.
-function republishSessionSummaries() {
-  for (const session of sessions.values()) {
-    session._journalSummaryHint = undefined;
-    publishJournalSummary(session, summaryForJournal(session.pinnedSummaryText), { repair: true });
+// acceptance — so a frame evicted by queue overflow during an outage would be
+// suppressed forever on a session that then went quiet (the next pass produces
+// the same digest and is deduped away). The outage IS the failure window, so
+// clearing the hints on every accepted hello_ok and re-offering is the matching
+// repair. Idempotent: the server COALESCEs, and (once the journal lands
+// summary_updated_at) only advances freshness on an actual content change, so a
+// re-send of an unchanged digest is inert rather than a false "just updated".
+// Bounded by the number of LIVE in-memory sessions; empty and already-published
+// digests are skipped.
+//
+// Always recomputed from session.pinnedSummaryText at CALL time, and offered
+// with retain:false, so a repair is never held as a stale snapshot behind the
+// outage backlog — a held snapshot drains at the queue tail and would land
+// AFTER a newer ordinary update, rolling the digest backwards. A refused offer
+// is remembered as a flag, not as content, and retried from live state.
+let _summaryRepairPending = false;
+
+function republishSessionSummaries({ clearHints = false } = {}) {
+  if (!JOURNAL_ENABLED || !summaryJournalPublishEnabled()) {
+    _summaryRepairPending = false;
+    return;
   }
+  let refused = false;
+  for (const session of sessions.values()) {
+    if (clearHints) session._journalSummaryHint = undefined;
+    const digest = summaryForJournal(session.pinnedSummaryText);
+    if (!digest || digest === session._journalSummaryHint) continue;
+    if (!publishJournalSummary(session, digest, { repair: true })) refused = true;
+  }
+  _summaryRepairPending = refused;
+}
+
+// Send-completion retry (the trigger that does NOT need another reconnect).
+// Gated on the flag so the common case — nothing outstanding — costs one
+// boolean test per confirmed send rather than a clamp per live session.
+function retrySessionSummaryRepairs() {
+  if (_summaryRepairPending) republishSessionSummaries();
 }
 
 // Fail-loud backstop for the summary clamp (loop #554 §5.3). summaryForJournal
@@ -620,7 +643,7 @@ const journalPublisher = createJournalPublisher({
   onReconnect: handleJournalReconnect,
   // Send-completion retry trigger (the mandatory one): re-publishes an
   // overflow-evicted release frame on a healthy socket that never reconnects.
-  onSendCapacity: () => republishPendingReleases(),
+  onSendCapacity: () => { republishPendingReleases(); retrySessionSummaryRepairs(); },
   // Agent-RPC dispatch. Arrow + late-bound const (journalRpcHandler is
   // defined below): safe for the same reason onEvent's forward reference
   // is — the callback only ever fires once the socket is live, long after
@@ -6109,10 +6132,13 @@ const publishJournalSummary = makeJournalSummaryPublisher({
   // pending order and admits it as confirmations create headroom instead.
   // A session with no journal convo id yet has nothing to repair — it has not
   // published anything — so refuse rather than buffer.
+  // retain:false — see republishSessionSummaries. A digest is derived state we
+  // can always recompute, so refusing now and re-offering from live state beats
+  // holding a snapshot that drains after a newer update.
   upsertConvoRepair: (session, opts) => {
     const convoId = journalConvoIdFor(session);
     if (!JOURNAL_ENABLED || !convoId) return false;
-    return journalPublisher.upsertConvoBestEffort(convoId, opts);
+    return journalPublisher.upsertConvoBestEffort(convoId, opts, { retain: false });
   },
 });
 

@@ -2187,7 +2187,30 @@ describe('index.js agent-chat room wiring (source inspection)', () => {
     );
 
     it('republishes session summaries from handleJournalReconnect', () => {
-      expect(body).toMatch(/republishSessionSummaries\(\);/);
+      expect(body).toMatch(/republishSessionSummaries\(\{ clearHints: true \}\);/);
+    });
+
+    // Reconnect alone is not enough: a repair refused because the backlog still
+    // fills the queue must be retried when confirmations create headroom, not
+    // only on the next disconnect.
+    it('retries refused repairs from onSendCapacity, gated on a pending flag', () => {
+      const start = src.indexOf('createJournalPublisher({');
+      const args = src.slice(start, src.indexOf('log: console,', start) + 2000);
+      expect(args).toMatch(/onSendCapacity: \(\) => \{ republishPendingReleases\(\); retrySessionSummaryRepairs\(\); \}/);
+      const retryStart = src.indexOf('function retrySessionSummaryRepairs(');
+      expect(retryStart).toBeGreaterThan(-1);
+      expect(src.slice(retryStart, src.indexOf('\n}', retryStart)))
+        .toMatch(/if \(_summaryRepairPending\) republishSessionSummaries\(\);/);
+    });
+
+    it('recomputes the digest at call time rather than reusing a snapshot', () => {
+      const start = src.indexOf('function republishSessionSummaries(');
+      const fn = src.slice(start, src.indexOf('\n}', start));
+      expect(fn).toMatch(/const digest = summaryForJournal\(session\.pinnedSummaryText\);/);
+      // Already-published and empty digests cost nothing.
+      expect(fn).toMatch(/if \(!digest \|\| digest === session\._journalSummaryHint\) continue;/);
+      // A refusal is remembered as a FLAG, never as retained content.
+      expect(fn).toMatch(/_summaryRepairPending = refused;/);
     });
 
     it('clears the hint before republishing, and clamps what it sends', () => {
@@ -2195,7 +2218,7 @@ describe('index.js agent-chat room wiring (source inspection)', () => {
       expect(start).toBeGreaterThan(-1);
       const fn = src.slice(start, src.indexOf('\n}', start));
       const clear = fn.indexOf('session._journalSummaryHint = undefined;');
-      const publish = fn.indexOf('publishJournalSummary(session, summaryForJournal(session.pinnedSummaryText), { repair: true });');
+      const publish = fn.indexOf('publishJournalSummary(session, digest, { repair: true })');
       expect(clear).toBeGreaterThan(-1);
       // Without the clear first, the publisher's own dedupe would swallow the
       // very republish that exists to undo a dropped frame.
@@ -2212,7 +2235,9 @@ describe('index.js agent-chat room wiring (source inspection)', () => {
       const wiring = src.slice(start, src.indexOf('\n});', start));
       expect(wiring).toMatch(/upsertConvo: journalUpsertConvo,/);
       expect(wiring).toMatch(/upsertConvoRepair: \(session, opts\) =>/);
-      expect(wiring).toMatch(/journalPublisher\.upsertConvoBestEffort\(convoId, opts\)/);
+      // retain:false — a held repair drains at the tail and can roll back a
+      // newer ordinary update of the same field (R3-F2).
+      expect(wiring).toMatch(/journalPublisher\.upsertConvoBestEffort\(convoId, opts, \{ retain: false \}\)/);
       expect(wiring).not.toMatch(/upsertConvoRepair[\s\S]*journalUpsertConvo\(/);
     });
   });

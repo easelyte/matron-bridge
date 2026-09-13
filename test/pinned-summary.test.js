@@ -2,6 +2,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 import {
   __resetConcurrency,
   summaryBlocks,
+  summaryJournalPublishEnabled,
   JOURNAL_SUMMARY_MAX_CHARS,
   makeJournalSummaryPublisher,
   parseMaxConcurrent,
@@ -654,6 +655,14 @@ describe('makeJournalSummaryPublisher', () => {
     expect(publish(s, '• other')).toBe(false);
     expect(upsertConvo).toHaveBeenCalledTimes(1);
     expect(s._journalSummaryHint).toBeUndefined();
+  });
+});
+
+describe('summaryJournalPublishEnabled', () => {
+  it('defaults ON and is disabled only by an explicit 0', () => {
+    expect(summaryJournalPublishEnabled({})).toBe(true);
+    expect(summaryJournalPublishEnabled({ SUMMARY_JOURNAL_PUBLISH: '1' })).toBe(true);
+    expect(summaryJournalPublishEnabled({ SUMMARY_JOURNAL_PUBLISH: '0' })).toBe(false);
   });
 });
 
