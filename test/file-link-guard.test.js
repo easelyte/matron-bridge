@@ -350,3 +350,146 @@ describe('validateAndOpen', () => {
     expect(MAX_VIEW_BYTES).toBe(5 * 1024 * 1024);
   });
 });
+
+// The Linux deployment resolves an open descriptor's real path through
+// /proc/self/fd, which the kernel answers from the descriptor itself — no
+// path re-walk, nothing to race. Platforms without procfs (macOS) have to
+// re-resolve the pathname, and that re-walk is what these tests pin: the
+// resolved name must be PROVEN to still name the descriptor we hold.
+describe('fdRealPath (non-procfs platforms)', () => {
+  let dir, outside;
+  const withPlatform = async (value, fn) => {
+    const original = Object.getOwnPropertyDescriptor(process, 'platform');
+    Object.defineProperty(process, 'platform', { value, configurable: true });
+    try {
+      return await fn();
+    } finally {
+      Object.defineProperty(process, 'platform', original);
+    }
+  };
+
+  beforeAll(() => {
+    dir = mkdtempSync(path.join(tmpdir(), 'flg-race-work-'));
+    outside = mkdtempSync(path.join(tmpdir(), 'flg-race-outside-'));
+    mkdirSync(path.join(dir, 'decoy'));
+    writeFileSync(path.join(dir, 'decoy', 'doc.txt'), 'harmless decoy\n');
+    writeFileSync(path.join(outside, 'doc.txt'), 'STOLEN SECRET\n');
+    // `swap` starts out pointing outside the workdir; the race flips it back
+    // in-scope after open() so a bare realpath() would report an in-scope name
+    // for a descriptor that is holding the out-of-scope file.
+    symlinkSync(outside, path.join(dir, 'swap'));
+  });
+  afterAll(() => {
+    for (const d of [dir, outside]) {
+      try { rmSync(d, { recursive: true, force: true }); } catch {}
+    }
+  });
+
+  it('serves a normal in-scope file unchanged when there is no race', async () => {
+    await withPlatform('darwin', async () => {
+      const { content, realPath } = await validateAndOpen(
+        path.join(dir, 'decoy', 'doc.txt'), { workdir: dir },
+      );
+      expect(content.toString('utf-8')).toBe('harmless decoy\n');
+      expect(realPath).toBe(path.join(dir, 'decoy', 'doc.txt'));
+    });
+  });
+
+  it('refuses to serve a descriptor whose parent directory was swapped after open', async () => {
+    const swapLink = path.join(dir, 'swap');
+    const actualOpen = fsp.open.bind(fsp);
+    // Perform the swap INSIDE the open() call so the race is deterministic
+    // rather than timing-dependent: the descriptor is already pinned to the
+    // out-of-scope file, and every later pathname walk sees the in-scope dir.
+    const openSpy = vi.spyOn(fsp, 'open').mockImplementation(async (...args) => {
+      const fd = await actualOpen(...args);
+      rmSync(swapLink, { force: true });
+      symlinkSync(path.join(dir, 'decoy'), swapLink);
+      return fd;
+    });
+    try {
+      await withPlatform('darwin', async () => {
+        let denial;
+        try {
+          await validateAndOpen(path.join(dir, 'swap', 'doc.txt'), { workdir: dir });
+        } catch (err) {
+          denial = err;
+        }
+        expect(denial).toBeInstanceOf(FileLinkDenied);
+        expect(denial.reason).toBe('path-race');
+      });
+    } finally {
+      openSpy.mockRestore();
+      rmSync(swapLink, { force: true });
+      symlinkSync(outside, swapLink);
+    }
+  });
+
+  it('refuses when the resolved name is replaced by a symlink before the identity check', async () => {
+    const victim = path.join(dir, 'victim.txt');
+    writeFileSync(victim, 'victim\n');
+    const actualRealpath = fsp.realpath.bind(fsp);
+    const realpathSpy = vi.spyOn(fsp, 'realpath').mockImplementation(async (...args) => {
+      const resolved = await actualRealpath(...args);
+      if (resolved === victim) {
+        rmSync(victim, { force: true });
+        symlinkSync(path.join(dir, 'decoy', 'doc.txt'), victim);
+      }
+      return resolved;
+    });
+    try {
+      await withPlatform('darwin', async () => {
+        let denial;
+        try {
+          await validateAndOpen(victim, { workdir: dir });
+        } catch (err) {
+          denial = err;
+        }
+        expect(denial).toBeInstanceOf(FileLinkDenied);
+        expect(denial.reason).toBe('path-race');
+      });
+    } finally {
+      realpathSpy.mockRestore();
+      rmSync(victim, { force: true });
+    }
+  });
+
+  it('denies rather than throwing raw when the pathname vanishes before it resolves', async () => {
+    const doomed = path.join(dir, 'doomed.txt');
+    writeFileSync(doomed, 'doomed\n');
+    const actualOpen = fsp.open.bind(fsp);
+    const openSpy = vi.spyOn(fsp, 'open').mockImplementation(async (...args) => {
+      const fd = await actualOpen(...args);
+      rmSync(doomed, { force: true });
+      return fd;
+    });
+    try {
+      await withPlatform('darwin', async () => {
+        let denial;
+        try {
+          await validateAndOpen(doomed, { workdir: dir });
+        } catch (err) {
+          denial = err;
+        }
+        expect(denial).toBeInstanceOf(FileLinkDenied);
+        expect(denial.reason).toBe('unreadable');
+      });
+    } finally {
+      openSpy.mockRestore();
+      rmSync(doomed, { force: true });
+    }
+  });
+
+  it('keeps the procfs answer on Linux — no pathname re-walk, no identity check', async () => {
+    const realpathSpy = vi.spyOn(fsp, 'realpath');
+    try {
+      // workdir containment needs one realpath of the WORKDIR; the point is
+      // that the target's real path never goes through realpath() on Linux.
+      const { realPath } = await validateAndOpen(path.join(dir, 'decoy', 'doc.txt'), {});
+      expect(realPath).toBe(path.join(dir, 'decoy', 'doc.txt'));
+      expect(realpathSpy).not.toHaveBeenCalled();
+    } finally {
+      realpathSpy.mockRestore();
+    }
+  });
+});
