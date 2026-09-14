@@ -4,7 +4,7 @@ import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import { tmpdir } from 'os';
 
-import { selectEpochRepairs } from '../lib/session-state-repair.js';
+import { planTransition, selectEpochRepairs } from '../lib/session-state-repair.js';
 import { createRunStateOutbox } from '../lib/run-state-outbox.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -256,18 +256,66 @@ describe('instance isolation', () => {
   });
 });
 
-describe('a failed write-ahead leaves the transition retryable', () => {
-  it('rolls the session latch back so an identical retry is not suppressed', () => {
-    const source = readFileSync(join(root, 'index.js'), 'utf-8');
-    const start = source.indexOf('function journalSessionState(');
-    const body = source.slice(start, source.indexOf('\n}', start));
-    // Without the rollback, a failed note() leaves _journalState advanced on an unprotected
-    // transition: no durable record, and the change-gate swallows every retry, so the row stays
-    // stale forever.
-    expect(body).toContain('const previous = session._journalState;');
-    expect(body).toContain('runStateOutbox.note(convoId, state)');
-    expect(body).toContain('if (convoId && !token)');
-    expect(body).toContain('session._journalState = previous;');
+describe('planTransition (change-gate + write-ahead)', () => {
+  // Drives the real sequences rather than grepping index.js for them.
+  function run(steps) {
+    let latch;
+    const published = [];
+    for (const [state, note] of steps) {
+      const out = planTransition(latch, state, note);
+      latch = out.latch;
+      if (out.publish) published.push(state);
+    }
+    return { latch, published };
+  }
+
+  const ok = (token = { rev: 1 }) => () => token;
+  const failed = () => null;
+  const nothingToProtect = () => undefined;
+
+  it('suppresses a repeat of the same state', () => {
+    const { published } = run([['running', ok()], ['running', ok()]]);
+    expect(published).toEqual(['running']);
+  });
+
+  it('publishes each genuine flip', () => {
+    const { published } = run([['running', ok()], ['waiting', ok()], ['running', ok()]]);
+    expect(published).toEqual(['running', 'waiting', 'running']);
+  });
+
+  it('a FAILED write-ahead does not gate off the inverse transition', () => {
+    // The sequence that a naive rollback breaks: waiting -> (note fails) running -> the running
+    // frame lands anyway -> the turn ends and must still be able to publish waiting. Restoring the
+    // previous latch would swallow that, leaving the row at running: permanent "Thinking".
+    const { published } = run([
+      ['waiting', ok()],
+      ['running', failed],
+      ['waiting', ok()],
+    ]);
+    expect(published).toEqual(['waiting', 'running', 'waiting']);
+  });
+
+  it('a FAILED write-ahead also leaves an identical retry publishable', () => {
+    const { published } = run([['running', failed], ['running', ok()]]);
+    expect(published).toEqual(['running', 'running']);
+  });
+
+  it('reports no token for an unprotected transition', () => {
+    expect(planTransition(undefined, 'running', failed)).toEqual({
+      publish: true,
+      latch: undefined,
+      token: null,
+    });
+  });
+
+  it('treats "nothing to protect" as a normal transition, NOT a failure', () => {
+    // A session with no convo id yet buffers its payload rather than publishing, so there is
+    // nothing to protect and nothing has failed. Invalidating here would make every transition on
+    // such a session republish.
+    const out = planTransition(undefined, 'running', nothingToProtect);
+    expect(out).toEqual({ publish: true, latch: 'running', token: null });
+    // ...and the latch then dedups as usual.
+    expect(planTransition('running', 'running', nothingToProtect).publish).toBe(false);
   });
 });
 
@@ -296,6 +344,7 @@ describe('index.js wiring', () => {
   it('records to the DURABLE outbox and settles on delivery, not on enqueue', () => {
     const body = sliceFunction('function journalSessionState(');
     expect(body).toContain('runStateOutbox.note(');
+    expect(body).toContain('planTransition(');
     expect(body).toContain('onDelivered');
     expect(body).toContain('runStateOutbox.settle(');
   });

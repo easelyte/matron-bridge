@@ -77,7 +77,7 @@ import { createSubagentConvoTracker } from './lib/subagent-convos.js';
 import { createQueuedReleaseOutbox } from './lib/queued-release-outbox.js';
 import { createSubagentRunningStore } from './lib/subagent-running-store.js';
 import { selectStrandedChildren, strandedRepairFrames } from './lib/subagent-reconcile.js';
-import { selectEpochRepairs } from './lib/session-state-repair.js';
+import { planTransition, selectEpochRepairs } from './lib/session-state-repair.js';
 import { createRunStateOutbox } from './lib/run-state-outbox.js';
 import { journalReemitCodexOutcomes } from './lib/codex-convos.js';
 import { formatSubagentToolBody } from './lib/subagent-tool-format.js';
@@ -1459,26 +1459,25 @@ function journalPublishUserItem(session, method, payload) {
 // Mirror a session_state transition, but only on actual change — busy/prompt/
 // turn-end events fire far more often than the state actually flips.
 function journalSessionState(session, state) {
-  if (session._journalState === state) return;
-  const previous = session._journalState;
-  session._journalState = state;
-  // Track the attempt until the server confirms it. The latch above advances on ENQUEUE, but the
-  // durable queue drops its OLDEST frame on overflow, so without this an evicted transition is
-  // never retried and the convo's row stays at the pre-transition state forever (a stranded
-  // `running` renders as a permanent "Thinking" in every client). Keyed by convo id, not by
-  // session: the terminal paths delete the session from `sessions` immediately BEFORE publishing
-  // `done`, so a session-keyed record would miss exactly the case this repairs.
+  // Track the attempt until the server confirms it. The change-gate above advances on ENQUEUE,
+  // but the durable queue drops its OLDEST frame on overflow, so without a record an evicted
+  // transition is never retried and the convo's row stays at the pre-transition state forever (a
+  // stranded `running` renders as a permanent "Thinking" in every client). Keyed by convo id, not
+  // by session: the terminal paths delete the session from `sessions` immediately BEFORE
+  // publishing `done`, so a session-keyed record would miss exactly the case this repairs.
+  //
+  // The gate + write-ahead + latch decision lives in planTransition so its failure sequences are
+  // testable; see lib/session-state-repair.js.
   const convoId = journalConvoIdFor(session);
-  const token = convoId ? runStateOutbox.note(convoId, state) : null;
-  if (convoId && !token) {
-    // The write-ahead failed (ENOSPC/EIO/unreadable). The frame still goes out — it may well
-    // land — but the latch must NOT stay advanced on an unprotected transition: if the frame is
-    // then evicted or the process restarts, there is no record to repair from and an identical
-    // retry would be suppressed forever, leaving the row permanently stale. Rolling it back keeps
-    // the next attempt at the same state live. Same rollback-on-refusal symmetry the subagent
-    // running store's callers apply.
-    session._journalState = previous;
-  }
+  const { publish, latch, token } = planTransition(
+    session._journalState,
+    state,
+    // undefined (not null) when there is no convo id: the payload is buffered for a later
+    // flush rather than published, so there is nothing to protect and nothing has failed.
+    () => (convoId ? runStateOutbox.note(convoId, state) : undefined),
+  );
+  session._journalState = latch;
+  if (!publish) return;
   journalUpsertConvo(session, { sessionState: state }, {
     onDelivered: token ? () => runStateOutbox.settle(convoId, token) : undefined,
   });
