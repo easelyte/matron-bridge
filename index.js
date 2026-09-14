@@ -4732,6 +4732,21 @@ function handleClaudeEvent(session, event) {
         if (event.task_type === 'local_agent' && event.tool_use_id && event.task_id) {
           session.subagentConvos?.noteBackgroundTaskStarted(event.tool_use_id, event.task_id);
           session.subagentWatcher?.notifyTaskStarted();
+          // RESUME (SendMessage on an existing agent id): the agent comes back
+          // under its ORIGINAL id, so it reuses agent-<task_id>.jsonl — a file
+          // snapshot() already marked "seen" and the burst scan will therefore
+          // never attach. Nothing is re-created, so there is nothing for the
+          // poll to find, and the resumed agent would run to completion with no
+          // tail and no card. task_id names the file exactly, so attach it
+          // explicitly (EOF-anchored so the earlier run isn't replayed;
+          // idempotent; a no-op for a fresh spawn, which keeps the scan path).
+          session.subagentWatcher?.forceAttach(event.task_id);
+          // ...and un-finish its child convo. Unconditional, not gated on the
+          // forceAttach result: when the agent finished and resumed WITHOUT a
+          // bridge restart its tail is still live, so forceAttach no-ops while
+          // the child convo is nonetheless sitting at `done`. revive() itself
+          // no-ops for an unknown or already-running child.
+          session.subagentConvos?.revive(event.task_id);
         }
       } else if (event.subtype === 'task_notification') {
         // A background task actually finished. For a subagent (Agent tool)

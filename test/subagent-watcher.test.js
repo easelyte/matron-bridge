@@ -226,16 +226,29 @@ describe('SubagentWatcher.forceAttach (resumed agent under an already-seen trans
   });
 
   it('does NOT replay a pre-existing agent that was never resumed', async () => {
-    const { w, dir, starts } = mkResumedFixture('resumed5', [assistantLine('old')]);
-    // A second, genuinely-dead prior-instance transcript sitting in the dir.
+    // Two prior-instance transcripts present at snapshot time: one gets resumed,
+    // the other is genuinely dead. Relaxing snapshot() would replay BOTH — that
+    // is the intent forceAttach exists to preserve.
+    const sessionId = `sid-${Math.random().toString(36).slice(2)}`;
+    const workdir = uniqueWorkdir('ghost');
+    const dir = mkSubagentsDir(workdir, sessionId);
+    fs.writeFileSync(path.join(dir, 'agent-resumed5.jsonl'), JSON.stringify(assistantLine('old')) + '\n');
     fs.writeFileSync(path.join(dir, 'agent-deadghost.jsonl'), JSON.stringify(assistantLine('ghost')) + '\n');
-    w.snapshot();          // already taken — the dead file is marked by _scan below
+
+    const w = new SubagentWatcher({ workdir, sessionId });
+    watchers.push(w);
+    w.snapshot();
+    const starts = [];
+    w.on('subagent-start', p => starts.push(p.agentId));
+
     w._scan();
     expect(starts).toEqual([]);
 
     w.forceAttach('resumed5');
 
-    // Only the explicitly-named agent came back. The ghost stays dead.
+    // Only the explicitly-named agent came back. The ghost stays dead — and a
+    // later scan must not resurrect it either.
+    w._scan();
     expect(starts).toEqual(['resumed5']);
     expect(w.tails.has('agent-deadghost.jsonl')).toBe(false);
   });
