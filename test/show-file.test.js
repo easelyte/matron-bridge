@@ -314,6 +314,7 @@ describe('denialToStatus', () => {
   it.each([
     ['sensitive', 403],
     ['outside-scope', 403],
+    ['path-race', 403],
     ['too-large', 413],
     ['not-a-file', 404],
     ['unreadable', 404],

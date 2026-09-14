@@ -4,6 +4,7 @@ import { createShowFileHandler } from '../lib/show-file-mcp-adapter.js';
 const DENIAL_REASONS = [
   'sensitive',
   'outside-scope',
+  'path-race',
   'too-large',
   'not-a-file',
   'unreadable',
