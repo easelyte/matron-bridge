@@ -3,71 +3,101 @@ import { readFileSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 
-import { repairSessionStates } from '../lib/session-state-repair.js';
+import { notePendingState, settlePendingState, repairPendingStates } from '../lib/session-state-repair.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, '..');
 
-describe('repairSessionStates', () => {
-  it('clears the latch BEFORE re-offering, so the change-gate cannot swallow the repair', () => {
-    // The production publisher is journalSessionState, whose first line is
-    // `if (session._journalState === state) return;`. Model it exactly: if the repair left the
-    // latch in place, this stand-in would return early and publish nothing.
-    const published = [];
-    const journalSessionState = (session, state) => {
-      if (session._journalState === state) return;
-      session._journalState = state;
-      published.push([session.id, state]);
-    };
-
-    const sessions = [{ id: 'a', _journalState: 'running' }];
-    expect(repairSessionStates(sessions, journalSessionState)).toBe(1);
-    expect(published).toEqual([['a', 'running']]);
-    // The latch is re-armed by the publish, so the state is still deduped afterwards.
-    expect(sessions[0]._journalState).toBe('running');
+describe('pending run-state tracking', () => {
+  it('keeps only the LATEST state per convo — re-offering a superseded one moves the row backwards', () => {
+    const pending = new Map();
+    notePendingState(pending, 'c1', 'running');
+    notePendingState(pending, 'c1', 'done');
+    expect([...pending.entries()]).toEqual([['c1', 'done']]);
   });
 
-  it('re-offers every live session, not just the first', () => {
-    const published = [];
-    const sessions = [
-      { id: 'a', _journalState: 'running' },
-      { id: 'b', _journalState: 'waiting' },
-      { id: 'c', _journalState: 'done' },
-    ];
-
-    expect(repairSessionStates(sessions, (s, state) => published.push([s.id, state]))).toBe(3);
-    expect(published).toEqual([
-      ['a', 'running'],
-      ['b', 'waiting'],
-      ['c', 'done'],
-    ]);
+  it('ignores a missing convo id or an absent state', () => {
+    const pending = new Map();
+    expect(notePendingState(pending, '', 'done')).toBe(false);
+    expect(notePendingState(pending, 'c1', undefined)).toBe(false);
+    expect(notePendingState(pending, 'c1', null)).toBe(false);
+    expect(pending.size).toBe(0);
   });
 
-  it('skips sessions that never latched a state — an eviction could not have swallowed one', () => {
-    const published = [];
-    const sessions = [{ id: 'a' }, { id: 'b', _journalState: undefined }, { id: 'c', _journalState: null }];
+  it("settles only the state that was confirmed, so a newer pending transition survives", () => {
+    // The in-flight 'running' frame confirms AFTER 'done' superseded it. Clearing on convo id
+    // alone would erase the 'done' record and strand the row at running — the original bug.
+    const pending = new Map();
+    notePendingState(pending, 'c1', 'running');
+    notePendingState(pending, 'c1', 'done');
 
-    expect(repairSessionStates(sessions, (s, state) => published.push([s.id, state]))).toBe(0);
-    expect(published).toEqual([]);
+    expect(settlePendingState(pending, 'c1', 'running')).toBe(false);
+    expect(pending.get('c1')).toBe('done');
+
+    expect(settlePendingState(pending, 'c1', 'done')).toBe(true);
+    expect(pending.has('c1')).toBe(false);
   });
 
-  it('tolerates a null entry and an absent iterable', () => {
-    expect(repairSessionStates([null, undefined], () => { throw new Error('must not publish'); })).toBe(0);
-    expect(repairSessionStates(undefined, () => { throw new Error('must not publish'); })).toBe(0);
-  });
-
-  it('re-offers `running` — the state whose loss is the user-visible stuck-Thinking bug', () => {
-    // Regression anchor for #575. The evicted frame is the terminal transition, so after the
-    // eviction the bridge believes it published a state the journal never recorded. The repair
-    // must re-offer whatever the CURRENT state is, including a still-running one, because the
-    // durable row may be stale in either direction.
-    const published = [];
-    repairSessionStates([{ id: 'live', _journalState: 'running' }], (s, state) => published.push(state));
-    expect(published).toEqual(['running']);
+  it('settling an unknown convo is a no-op', () => {
+    const pending = new Map();
+    expect(settlePendingState(pending, 'nope', 'done')).toBe(false);
   });
 });
 
-describe('handleJournalReconnect wiring', () => {
+describe('repairPendingStates', () => {
+  it('re-offers every unconfirmed transition on a new epoch', () => {
+    const pending = new Map([
+      ['c1', 'done'],
+      ['c2', 'running'],
+    ]);
+    const offers = [];
+
+    expect(repairPendingStates(pending, (id, state) => offers.push([id, state]))).toEqual({
+      offered: 2,
+      refused: 0,
+    });
+    expect(offers).toEqual([
+      ['c1', 'done'],
+      ['c2', 'running'],
+    ]);
+  });
+
+  it('RETAINS a refused offer for the next epoch instead of dropping it', () => {
+    // A full queue refuses the non-evicting best-effort send. Dropping the record there would
+    // reintroduce the very bug: an unconfirmed terminal state with nothing left to retry from.
+    const pending = new Map([['c1', 'done']]);
+
+    expect(repairPendingStates(pending, () => false)).toEqual({ offered: 0, refused: 1 });
+    expect(pending.get('c1')).toBe('done');
+  });
+
+  it('survives a publisher that settles synchronously mid-iteration', () => {
+    // An injected transport can confirm inside the publish call, mutating the map we are
+    // iterating. Without the snapshot, the second entry would be skipped.
+    const pending = new Map([
+      ['c1', 'done'],
+      ['c2', 'done'],
+    ]);
+    const offers = [];
+
+    const result = repairPendingStates(pending, (id, state) => {
+      offers.push(id);
+      settlePendingState(pending, id, state);
+    });
+
+    expect(result).toEqual({ offered: 2, refused: 0 });
+    expect(offers).toEqual(['c1', 'c2']);
+    expect(pending.size).toBe(0);
+  });
+
+  it('is inert with nothing pending or no publisher', () => {
+    expect(repairPendingStates(new Map(), () => true)).toEqual({ offered: 0, refused: 0 });
+    expect(repairPendingStates(null, () => true)).toEqual({ offered: 0, refused: 0 });
+    expect(repairPendingStates(new Map([['c', 'done']]), null)).toEqual({ offered: 0, refused: 0 });
+  });
+});
+
+describe('index.js wiring', () => {
   // index.js starts a server at import time (main() + apiServer.listen at module top level), so
   // it cannot be imported for a behavioral test — the repo's established fallback is a
   // source-level invariant (see summary-latch-separation.test.js).
@@ -89,15 +119,26 @@ describe('handleJournalReconnect wiring', () => {
     throw new Error(`unterminated ${signature}`);
   }
 
+  it('records the pending state and settles it on delivery, not on enqueue', () => {
+    const body = sliceFunction('function journalSessionState(');
+    expect(body).toContain('notePendingState(pendingRunStates');
+    expect(body).toContain('onDelivered');
+    expect(body).toContain('settlePendingState(pendingRunStates');
+  });
+
   it('runs the run-state repair on every accepted reconnect', () => {
     expect(sliceFunction('function handleJournalReconnect(')).toContain('republishSessionStates()');
   });
 
-  it('routes the repair through the pure module rather than re-implementing the loop', () => {
-    expect(sliceFunction('function republishSessionStates(')).toContain('repairSessionStates(');
+  it('repairs through the NON-EVICTING path so it cannot drop the outage backlog', () => {
+    const body = sliceFunction('function republishSessionStates(');
+    expect(body).toContain('upsertConvoBestEffort');
+    expect(body).toContain('retain: false');
+    // The ordinary evicting enqueue must not be reachable from the repair.
+    expect(body).not.toContain('journalUpsertConvo(');
   });
 
-  it('still repairs summaries alongside it — the two latches are independent', () => {
+  it('still repairs summaries and stranded subagents alongside it', () => {
     const body = sliceFunction('function handleJournalReconnect(');
     expect(body).toContain('republishSessionSummaries(');
     expect(body).toContain('reconcileStrandedSubagents(');

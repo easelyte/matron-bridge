@@ -77,7 +77,7 @@ import { createSubagentConvoTracker } from './lib/subagent-convos.js';
 import { createQueuedReleaseOutbox } from './lib/queued-release-outbox.js';
 import { createSubagentRunningStore } from './lib/subagent-running-store.js';
 import { selectStrandedChildren, strandedRepairFrames } from './lib/subagent-reconcile.js';
-import { repairSessionStates } from './lib/session-state-repair.js';
+import { notePendingState, settlePendingState, repairPendingStates } from './lib/session-state-repair.js';
 import { journalReemitCodexOutcomes } from './lib/codex-convos.js';
 import { formatSubagentToolBody } from './lib/subagent-tool-format.js';
 import { ivUploadDir, ivUploadAnnotation } from './lib/iv-uploads.js';
@@ -993,6 +993,11 @@ function findPersistedAgentSession(agent, sessionId) {
 // --- Session Manager ---
 
 const sessions = new Map(); // roomId -> session
+// convoId -> last session_state whose convo_upsert has not been CONFIRMED by the server. Entered
+// before the publish, cleared on delivery, re-offered on every reconnect (republishSessionStates).
+// Keyed by convo rather than session because the terminal paths delete the session before
+// publishing `done` — see journalSessionState.
+const pendingRunStates = new Map();
 
 // Persistent, crash-safe write-ahead outbox for queued_release resolutions
 // (loop #536). Constructed here so it loads + relabels any inherited on-disk
@@ -1182,7 +1187,11 @@ function journalBufferPush(session, method, payload) {
 }
 
 // Send now if the convo_id is known, otherwise buffer for the eventual flush.
-function journalPublish(session, method, payload) {
+// `options` (onDelivered, etc.) reaches the publisher only on the LIVE path: a session whose
+// convo id is not known yet buffers the payload, and journalBufferPush has no slot to carry a
+// delivery callback. Every current options-passing caller (journalSessionState) skips the call
+// entirely when there is no convo id, so nothing is silently dropped here.
+function journalPublish(session, method, payload, options) {
   if (!JOURNAL_ENABLED) return;
   const convoId = journalConvoIdFor(session);
   if (convoId) {
@@ -1202,7 +1211,7 @@ function journalPublish(session, method, payload) {
         journalPublisher.upsertConvo(convoId, { title: session._journalTitleHint, agentKind: session.agent });
       }
     }
-    journalPublisher[method](convoId, payload);
+    journalPublisher[method](convoId, payload, options);
   } else {
     journalBufferPush(session, method, payload);
   }
@@ -1381,7 +1390,7 @@ function scheduleReleaseReconcile() {
   }
 }
 
-function journalUpsertConvo(session, opts) {
+function journalUpsertConvo(session, opts, options) {
   if (opts.title !== undefined && opts.title !== session._journalTitleHint) {
     session._journalTitleHint = opts.title;
     // Mirror the hint into the session record: the in-memory carry
@@ -1400,6 +1409,7 @@ function journalUpsertConvo(session, opts) {
     session,
     'upsertConvo',
     session.agent && opts.agentKind === undefined ? { ...opts, agentKind: session.agent } : opts,
+    options,
   );
 }
 
@@ -1440,7 +1450,17 @@ function journalPublishUserItem(session, method, payload) {
 function journalSessionState(session, state) {
   if (session._journalState === state) return;
   session._journalState = state;
-  journalUpsertConvo(session, { sessionState: state });
+  // Track the attempt until the server confirms it. The latch above advances on ENQUEUE, but the
+  // durable queue drops its OLDEST frame on overflow, so without this an evicted transition is
+  // never retried and the convo's row stays at the pre-transition state forever (a stranded
+  // `running` renders as a permanent "Thinking" in every client). Keyed by convo id, not by
+  // session: the terminal paths delete the session from `sessions` immediately BEFORE publishing
+  // `done`, so a session-keyed record would miss exactly the case this repairs.
+  const convoId = journalConvoIdFor(session);
+  if (convoId) notePendingState(pendingRunStates, convoId, state);
+  journalUpsertConvo(session, { sessionState: state }, {
+    onDelivered: convoId ? () => settlePendingState(pendingRunStates, convoId, state) : undefined,
+  });
 }
 
 // Repair the session_state latch across a connection epoch — the exact analogue of
@@ -1460,7 +1480,20 @@ function journalSessionState(session, state) {
 // one is inert. Bounded by the number of LIVE in-memory sessions.
 function republishSessionStates() {
   if (!JOURNAL_ENABLED) return;
-  repairSessionStates(sessions.values(), journalSessionState);
+  const { offered, refused } = repairPendingStates(pendingRunStates, (convoId, state) =>
+    // NON-EVICTING path, deliberately: the ordinary enqueue drops the oldest queued frame when
+    // the queue is full, and at reconnect that backlog is real user traffic (prompts, permission
+    // replies). retain:false so a refused offer is not held as a snapshot that could later land
+    // on top of a newer transition — it stays in `pendingRunStates` and is re-offered on the next
+    // epoch, recomputed from whatever the state is by then.
+    journalPublisher.upsertConvoBestEffort(convoId, { sessionState: state }, {
+      retain: false,
+      onDelivered: () => settlePendingState(pendingRunStates, convoId, state),
+    }),
+  );
+  if (refused) {
+    console.warn(`[run-state-repair] ${refused} of ${offered + refused} run-state re-offer(s) refused (queue full) — retained for the next epoch`);
+  }
 }
 
 // Mirror the bridge's current activity into an ephemeral typing/activity
