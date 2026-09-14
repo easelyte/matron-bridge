@@ -3,6 +3,9 @@ import { readFileSync, mkdtempSync, rmSync, writeFileSync, existsSync, readdirSy
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
 import { tmpdir } from 'os';
+import { createRequire } from 'module';
+
+const require = createRequire(import.meta.url);
 
 import { planTransition, selectEpochRepairs } from '../lib/session-state-repair.js';
 import { createRunStateOutbox } from '../lib/run-state-outbox.js';
@@ -181,6 +184,32 @@ describe('retirement settles against the RECORDED state (no publish loop)', () =
     sweep(outbox, new Set(), []);
 
     expect(createRunStateOutbox({ file, log: silent }).list()).toEqual([]);
+  });
+});
+
+describe('a failed REPLACEMENT never leaves the superseded state eligible for repair', () => {
+  let dir;
+
+  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'run-state-super-')); });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  it('drops the predecessor rather than re-offering a state it knows is stale', () => {
+    const file = join(dir, 'outbox.json');
+    const outbox = createRunStateOutbox({ file, log: silent });
+    outbox.note('c1', 'running');
+    expect(outbox.list().map((r) => r.state)).toEqual(['running']);
+
+    // Make the next write fail by replacing the file with a directory of the same name.
+    rmSync(file, { force: true });
+    mkdtempSync(join(dir, 'x-'));
+    require('fs').mkdirSync(file);
+
+    expect(outbox.note('c1', 'waiting')).toBe(null);
+
+    // The stale `running` must be gone. Left in place, the sweep would re-offer it behind the
+    // `waiting` frame that was already published, regressing the row to running for good.
+    expect(outbox.list()).toEqual([]);
+    expect(selectEpochRepairs(outbox.list(), new Set(['c1']))).toEqual({ reoffer: [], retire: [] });
   });
 });
 
