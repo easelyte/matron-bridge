@@ -64,7 +64,8 @@ function startFakeServer(port = 0) {
 // Pure — takes the three reader outputs as args (never samples), so the test
 // exercises the branching without touching the shared CPU-sampler module state.
 // cpu is omitted until the sampler has a first valid reading (matches the
-// hostVitalLimits shape); sampled_at_ms uses the sampler stamp, else Date.now().
+// ephemeral host_vitals frame shape); sampled_at_ms uses the sampler stamp,
+// else Date.now().
 function buildVitals(cpu, ram, stamp) {
   const vitals = { sampled_at_ms: cpu !== null ? stamp : Date.now() };
   if (cpu !== null) vitals.cpu = cpu;
