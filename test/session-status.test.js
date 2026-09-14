@@ -367,6 +367,18 @@ describe('host vitals', () => {
     expect('resets_at' in v).toBe(false);
   });
 
+  it('hostVitals keys match the client wire contract exactly (cpu_pct/ram_pct/sampled_at_ms)', () => {
+    // Load-bearing across three repos: matron-web's buildUsageMeters
+    // destructures { cpu_pct, ram_pct, sampled_at_ms } off status.vitals, and
+    // matron-apple's WireModels reads status["vitals"]["cpu_pct"|"ram_pct"].
+    // A rename here silently renders NOTHING on both (Number.isFinite guards
+    // on web, optional decode on iOS) — so the key set is pinned, not sampled.
+    stopCpuSampler();
+    sampleCpuOnce(BASE);
+    sampleCpuOnce(VALID);
+    expect(Object.keys(hostVitals()).sort()).toEqual(['cpu_pct', 'ram_pct', 'sampled_at_ms']);
+  });
+
   it('hostVitals carries a numeric sampled_at_ms so clients can expire stale replays', () => {
     // The publisher replays the last status frame to new viewers, so an idle
     // convo would show an arbitrarily old reading as current without an age
@@ -457,21 +469,22 @@ describe('index.js wiring', () => {
     expect(sigterm).toContain("gracefulShutdown('SIGTERM')");
   });
 
-  it('journalStatus injects host vitals as host_cpu/host_ram synthetic limits (what clients render), on both providers, and retains status.vitals', () => {
+  it('journalStatus wires host vitals to top-level status.vitals, never into limits[]', () => {
     const start = src.indexOf('function journalStatus(');
     const end = src.indexOf('\nfunction ', start + 1);
     const body = src.slice(start, end);
-    // status.vitals is retained (top-level object) for any future client use.
+    // vitals ride at top level via the buildSessionStatus vitals param — the
+    // surface matron-web (buildUsageMeters reads status.vitals) and
+    // matron-apple (WireModels decodes status["vitals"].cpu_pct/ram_pct)
+    // actually render from.
     expect(body).toContain('hostVitals()');
     expect(body).toMatch(/vitals[,\n]/);
-    // Restored 2026-09-13: host vitals ALSO ride the limits[] array as
-    // host_cpu/host_ram synthetic entries — the surface every client renders
-    // from (buildUsageMeters spreads status.limits; status.vitals is unread).
-    expect(body).toContain('hostVitalLimits()');
-    // Both providers carry the host entries appended to their own limits.
-    expect(body).toContain('[...(session._codexMetadata?.limits || []), ...hostLimits] : [...(usageLimitsCache.lines || []), ...hostLimits]');
-    // The Codex post-call override keeps the host entries too (host-global).
-    expect(body).toContain('status.limits = [...(session._codexMetadata?.limits || []), ...hostLimits]');
+    // Each provider supplies its own account limits, never host vitals. A
+    // synthetic host_cpu/host_ram entry here double-renders CPU/RAM on any
+    // upstream-built client (they already synthesise both from status.vitals)
+    // and displaces a real quota bar on iOS's limits.prefix(3).
+    expect(body).not.toContain('hostVitalLimits');
+    expect(body).toContain('limits: isCodex ? (session._codexMetadata?.limits || []) : (usageLimitsCache.lines || [])');
   });
 
   it('every status publisher in the tree builds its frame with buildSessionStatus', () => {
