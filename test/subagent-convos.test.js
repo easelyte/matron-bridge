@@ -519,4 +519,124 @@ describe('createSubagentConvoTracker', () => {
       }).not.toThrow();
     });
   });
+
+  // A subagent RESUMED via SendMessage runs again under the SAME agentId, so it
+  // reuses the SAME deterministic child convo. If the tracker already finished
+  // that child, its card renders `done` for the entire resumed run — a live
+  // agent that looks dead in every client. revive() puts it back to `running`.
+  describe('revive (resumed subagent)', () => {
+    function makeStore() {
+      const map = new Map();
+      return {
+        map,
+        calls: { add: [], remove: [] },
+        add(childConvoId, meta) { this.calls.add.push({ childConvoId, meta }); map.set(childConvoId, meta); return true; },
+        remove(childConvoId) { this.calls.remove.push(childConvoId); map.delete(childConvoId); return true; },
+        list() { return [...map.entries()].map(([childConvoId, meta]) => ({ childConvoId, ...meta })); },
+      };
+    }
+
+    it('flips a finished child back to running and re-arms its write-ahead record', () => {
+      const publisher = makePublisher();
+      const runningStore = makeStore();
+      const tracker = createSubagentConvoTracker({
+        publisher, getParentConvoId: () => 'parent-uuid', runningStore, log: { warn() {} },
+      });
+
+      tracker.noteTaskStarted('toolu_1');
+      tracker.discover('agent-1', { label: 'A', agentType: null });
+      tracker.noteTaskResult('toolu_1');
+      expect(runningStore.list()).toEqual([]);
+
+      const child = tracker.revive('agent-1');
+
+      expect(child).toBeTruthy();
+      expect(child.state).toBe(CHILD_STATE_RUNNING);
+      // Re-published as running, carrying parentage (the row may have been lost).
+      const last = publisher.calls.upsertConvo.at(-1);
+      expect(last.convoId).toBe('parent-uuid:sub:agent-1');
+      expect(last.opts).toMatchObject({ sessionState: CHILD_STATE_RUNNING, parentConvoId: 'parent-uuid' });
+      // Reconciliation can find it again if the bridge dies mid-resume.
+      expect(runningStore.list()).toHaveLength(1);
+    });
+
+    it('lets the resumed run finish normally afterwards', () => {
+      const publisher = makePublisher();
+      const runningStore = makeStore();
+      const tracker = createSubagentConvoTracker({
+        publisher, getParentConvoId: () => 'parent-uuid', runningStore, log: { warn() {} },
+      });
+      tracker.noteBackgroundTaskStarted('toolu_1', 'agent-1');
+      tracker.discover('agent-1', { label: 'A', agentType: null });
+      tracker.noteTaskCompleted('agent-1');
+      tracker.revive('agent-1');
+      tracker.noteTaskCompleted('agent-1');
+
+      expect(publisher.calls.upsertConvo.at(-1).opts.sessionState).toBe(CHILD_STATE_FINISHED);
+      expect(runningStore.list()).toEqual([]);
+    });
+
+    it('is a no-op for an unknown agent and for one already running', () => {
+      const publisher = makePublisher();
+      const tracker = createSubagentConvoTracker({
+        publisher, getParentConvoId: () => 'parent-uuid', log: { warn() {} },
+      });
+
+      expect(tracker.revive('never-seen')).toBeNull();
+      expect(publisher.calls.upsertConvo).toHaveLength(0);
+
+      tracker.discover('agent-1', { label: 'A', agentType: null });
+      const before = publisher.calls.upsertConvo.length;
+      expect(tracker.revive('agent-1')).toBeNull();
+      expect(publisher.calls.upsertConvo).toHaveLength(before);
+    });
+
+    it('does not publish running when the write-ahead record cannot be re-armed', () => {
+      const publisher = makePublisher();
+      const store = {
+        added: 0,
+        add() { this.added += 1; return this.added > 1 ? false : true; },
+        remove() { return true; },
+        list() { return []; },
+      };
+      const tracker = createSubagentConvoTracker({
+        publisher, getParentConvoId: () => 'parent-uuid', runningStore: store, log: { warn() {} },
+      });
+      tracker.noteTaskStarted('toolu_1');
+      tracker.discover('agent-1', { label: 'A', agentType: null });
+      tracker.noteTaskResult('toolu_1');
+      const before = publisher.calls.upsertConvo.length;
+
+      expect(tracker.revive('agent-1')).toBeNull();
+      expect(publisher.calls.upsertConvo).toHaveLength(before);
+    });
+
+    it('a late done-frame delivery must not erase the record the revive just re-armed', () => {
+      // The finish() frame's onDelivered fires AFTER the resume — removing then
+      // would discard the live child's only reconciliation record.
+      const deliveries = [];
+      const publisher = {
+        calls: { upsertConvo: [], publishStatus: [], publishText: [], publishDiff: [] },
+        upsertConvo(convoId, opts, options) {
+          this.calls.upsertConvo.push({ convoId, opts });
+          if (options?.onDelivered) deliveries.push(options.onDelivered);
+        },
+        publishStatus() {}, publishText() {}, publishDiff() {},
+      };
+      const runningStore = makeStore();
+      const tracker = createSubagentConvoTracker({
+        publisher, getParentConvoId: () => 'parent-uuid', runningStore, log: { warn() {} },
+      });
+
+      tracker.noteTaskStarted('toolu_1');
+      tracker.discover('agent-1', { label: 'A', agentType: null });
+      tracker.noteTaskResult('toolu_1');   // done published, delivery pending
+      tracker.revive('agent-1');           // resumed before the ack landed
+      expect(runningStore.list()).toHaveLength(1);
+
+      for (const ack of deliveries) ack();  // the stale ack finally arrives
+
+      expect(runningStore.list()).toHaveLength(1);
+    });
+  });
 });
