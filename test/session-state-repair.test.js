@@ -1,99 +1,145 @@
-import { describe, expect, it } from 'vitest';
-import { readFileSync } from 'fs';
+import { describe, expect, it, beforeEach, afterEach } from 'vitest';
+import { readFileSync, mkdtempSync, rmSync, writeFileSync, existsSync, readdirSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
+import { tmpdir } from 'os';
 
-import { notePendingState, settlePendingState, repairPendingStates } from '../lib/session-state-repair.js';
+import { selectEpochRepairs } from '../lib/session-state-repair.js';
+import { createRunStateOutbox } from '../lib/run-state-outbox.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const root = join(here, '..');
 
-describe('pending run-state tracking', () => {
-  it('keeps only the LATEST state per convo — re-offering a superseded one moves the row backwards', () => {
-    const pending = new Map();
-    notePendingState(pending, 'c1', 'running');
-    notePendingState(pending, 'c1', 'done');
-    expect([...pending.entries()]).toEqual([['c1', 'done']]);
+const silent = { warn() {}, log() {} };
+
+describe('selectEpochRepairs', () => {
+  it('re-offers the recorded state for a convo a live session owns', () => {
+    const out = selectEpochRepairs([{ convoId: 'c1', state: 'running' }], new Set(['c1']));
+    expect(out).toEqual({ reoffer: [{ convoId: 'c1', state: 'running' }], retire: [] });
   });
 
-  it('ignores a missing convo id or an absent state', () => {
-    const pending = new Map();
-    expect(notePendingState(pending, '', 'done')).toBe(false);
-    expect(notePendingState(pending, 'c1', undefined)).toBe(false);
-    expect(notePendingState(pending, 'c1', null)).toBe(false);
-    expect(pending.size).toBe(0);
+  it('RETIRES a stranded running convo with no live session — the permanent-Thinking case', () => {
+    // Nothing owns the convo, so the process that was running it is gone and the row can never be
+    // flipped by the session itself. Every client shows a "Thinking" that can never clear.
+    const out = selectEpochRepairs([{ convoId: 'ghost', state: 'running' }], new Set());
+    expect(out).toEqual({ reoffer: [], retire: ['ghost'] });
   });
 
-  it("settles only the state that was confirmed, so a newer pending transition survives", () => {
-    // The in-flight 'running' frame confirms AFTER 'done' superseded it. Clearing on convo id
-    // alone would erase the 'done' record and strand the row at running — the original bug.
-    const pending = new Map();
-    notePendingState(pending, 'c1', 'running');
-    notePendingState(pending, 'c1', 'done');
-
-    expect(settlePendingState(pending, 'c1', 'running')).toBe(false);
-    expect(pending.get('c1')).toBe('done');
-
-    expect(settlePendingState(pending, 'c1', 'done')).toBe(true);
-    expect(pending.has('c1')).toBe(false);
+  it('re-offers a TERMINAL state whose session is gone rather than retiring it', () => {
+    // The session ended and its `done`/`waiting` frame never landed. Re-sending it is the repair;
+    // retiring would be a no-op at best and could overwrite `waiting` with `done` at worst.
+    const out = selectEpochRepairs(
+      [{ convoId: 'a', state: 'done' }, { convoId: 'b', state: 'waiting' }],
+      new Set(),
+    );
+    expect(out).toEqual({
+      reoffer: [{ convoId: 'a', state: 'done' }, { convoId: 'b', state: 'waiting' }],
+      retire: [],
+    });
   });
 
-  it('settling an unknown convo is a no-op', () => {
-    const pending = new Map();
-    expect(settlePendingState(pending, 'nope', 'done')).toBe(false);
+  it('separates a mixed epoch correctly', () => {
+    const out = selectEpochRepairs(
+      [
+        { convoId: 'live', state: 'running' },
+        { convoId: 'ghost', state: 'running' },
+        { convoId: 'ended', state: 'done' },
+      ],
+      new Set(['live']),
+    );
+    expect(out.reoffer).toEqual([
+      { convoId: 'live', state: 'running' },
+      { convoId: 'ended', state: 'done' },
+    ]);
+    expect(out.retire).toEqual(['ghost']);
+  });
+
+  it('accepts a plain array of live ids and tolerates junk entries', () => {
+    const out = selectEpochRepairs(
+      [null, { convoId: '' }, { convoId: 'x' }, { convoId: 'y', state: 'running' }],
+      ['y'],
+    );
+    expect(out).toEqual({ reoffer: [{ convoId: 'y', state: 'running' }], retire: [] });
+  });
+
+  it('is inert with no entries', () => {
+    expect(selectEpochRepairs(undefined, undefined)).toEqual({ reoffer: [], retire: [] });
   });
 });
 
-describe('repairPendingStates', () => {
-  it('re-offers every unconfirmed transition on a new epoch', () => {
-    const pending = new Map([
-      ['c1', 'done'],
-      ['c2', 'running'],
-    ]);
-    const offers = [];
+describe('run-state outbox', () => {
+  let dir;
+  let file;
 
-    expect(repairPendingStates(pending, (id, state) => offers.push([id, state]))).toEqual({
-      offered: 2,
-      refused: 0,
-    });
-    expect(offers).toEqual([
-      ['c1', 'done'],
-      ['c2', 'running'],
-    ]);
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'run-state-outbox-'));
+    file = join(dir, 'outbox.json');
+  });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  it('SURVIVES a process restart — the whole reason it is on disk', () => {
+    const first = createRunStateOutbox({ file, log: silent });
+    first.note('c1', 'running');
+
+    // A fresh instance models the bridge coming back up: the pending transition is still there.
+    const afterRestart = createRunStateOutbox({ file, log: silent });
+    expect(afterRestart.list()).toEqual([{ convoId: 'c1', state: 'running' }]);
   });
 
-  it('RETAINS a refused offer for the next epoch instead of dropping it', () => {
-    // A full queue refuses the non-evicting best-effort send. Dropping the record there would
-    // reintroduce the very bug: an unconfirmed terminal state with nothing left to retry from.
-    const pending = new Map([['c1', 'done']]);
-
-    expect(repairPendingStates(pending, () => false)).toEqual({ offered: 0, refused: 1 });
-    expect(pending.get('c1')).toBe('done');
+  it('keeps only the LATEST state per convo', () => {
+    const outbox = createRunStateOutbox({ file, log: silent });
+    outbox.note('c1', 'running');
+    outbox.note('c1', 'done');
+    expect(outbox.list()).toEqual([{ convoId: 'c1', state: 'done' }]);
   });
 
-  it('survives a publisher that settles synchronously mid-iteration', () => {
-    // An injected transport can confirm inside the publish call, mutating the map we are
-    // iterating. Without the snapshot, the second entry would be skipped.
-    const pending = new Map([
-      ['c1', 'done'],
-      ['c2', 'done'],
-    ]);
-    const offers = [];
+  it('settles only the state that was confirmed, so a newer transition survives', () => {
+    // The in-flight 'running' frame confirms AFTER 'done' superseded it. Clearing on convo id
+    // alone would erase the 'done' record and re-strand the row.
+    const outbox = createRunStateOutbox({ file, log: silent });
+    outbox.note('c1', 'running');
+    outbox.note('c1', 'done');
 
-    const result = repairPendingStates(pending, (id, state) => {
-      offers.push(id);
-      settlePendingState(pending, id, state);
-    });
+    expect(outbox.settle('c1', 'running')).toBe(false);
+    expect(outbox.list()).toEqual([{ convoId: 'c1', state: 'done' }]);
 
-    expect(result).toEqual({ offered: 2, refused: 0 });
-    expect(offers).toEqual(['c1', 'c2']);
-    expect(pending.size).toBe(0);
+    expect(outbox.settle('c1', 'done')).toBe(true);
+    expect(outbox.list()).toEqual([]);
   });
 
-  it('is inert with nothing pending or no publisher', () => {
-    expect(repairPendingStates(new Map(), () => true)).toEqual({ offered: 0, refused: 0 });
-    expect(repairPendingStates(null, () => true)).toEqual({ offered: 0, refused: 0 });
-    expect(repairPendingStates(new Map([['c', 'done']]), null)).toEqual({ offered: 0, refused: 0 });
+  it('a settled entry stays gone across a restart', () => {
+    const outbox = createRunStateOutbox({ file, log: silent });
+    outbox.note('c1', 'done');
+    outbox.settle('c1', 'done');
+    expect(createRunStateOutbox({ file, log: silent }).list()).toEqual([]);
+  });
+
+  it('ignores a missing convo id or state, and settling an unknown convo', () => {
+    const outbox = createRunStateOutbox({ file, log: silent });
+    expect(outbox.note('', 'done')).toBe(false);
+    expect(outbox.note('c1', '')).toBe(false);
+    expect(outbox.settle('nope', 'done')).toBe(false);
+    expect(outbox.size()).toBe(0);
+  });
+
+  it('quarantines a corrupt file instead of silently starting empty over it', () => {
+    writeFileSync(file, '{not json');
+    const outbox = createRunStateOutbox({ file, log: silent });
+
+    expect(outbox.list()).toEqual([]);
+    // The evidence survives under a .corrupt-* name rather than being overwritten.
+    expect(readdirSync(dir).some((n) => n.includes('.corrupt-'))).toBe(true);
+    // And the store is usable again afterwards.
+    outbox.note('c1', 'done');
+    expect(createRunStateOutbox({ file, log: silent }).list()).toEqual([{ convoId: 'c1', state: 'done' }]);
+  });
+
+  it('writes atomically, leaving no tmp files behind', () => {
+    const outbox = createRunStateOutbox({ file, log: silent });
+    outbox.note('c1', 'running');
+    outbox.settle('c1', 'running');
+    expect(readdirSync(dir).filter((n) => n.endsWith('.tmp'))).toEqual([]);
+    expect(existsSync(file)).toBe(true);
   });
 });
 
@@ -119,11 +165,11 @@ describe('index.js wiring', () => {
     throw new Error(`unterminated ${signature}`);
   }
 
-  it('records the pending state and settles it on delivery, not on enqueue', () => {
+  it('records to the DURABLE outbox and settles on delivery, not on enqueue', () => {
     const body = sliceFunction('function journalSessionState(');
-    expect(body).toContain('notePendingState(pendingRunStates');
+    expect(body).toContain('runStateOutbox.note(');
     expect(body).toContain('onDelivered');
-    expect(body).toContain('settlePendingState(pendingRunStates');
+    expect(body).toContain('runStateOutbox.settle(');
   });
 
   it('runs the run-state repair on every accepted reconnect', () => {
@@ -134,17 +180,21 @@ describe('index.js wiring', () => {
     const body = sliceFunction('function republishSessionStates(');
     expect(body).toContain('upsertConvoBestEffort');
     expect(body).toContain('retain: false');
-    // The ordinary evicting enqueue must not be reachable from the repair.
     expect(body).not.toContain('journalUpsertConvo(');
   });
 
+  it('retires stranded running convos that no live session owns', () => {
+    const body = sliceFunction('function republishSessionStates(');
+    expect(body).toContain('selectEpochRepairs(');
+    expect(body).toContain("offer(convoId, 'done')");
+    // The live set is built from sessions, the same signal the subagent reconcile uses.
+    expect(body).toContain('journalConvoIdFor(session)');
+  });
+
   it('retries on returned send capacity, not only on another reconnect', () => {
-    // hello_ok fires onReconnect BEFORE the backlog pumps, so a connection that comes back with
-    // a full queue refuses every re-offer. Without a capacity-triggered retry, a healthy socket
-    // that never disconnects again would leave those rows stranded forever.
     expect(source).toContain('retryRunStateRepairs()');
     const retry = sliceFunction('function retryRunStateRepairs(');
-    expect(retry).toContain('pendingRunStates.size');
+    expect(retry).toContain('runStateOutbox.size()');
     expect(retry).toContain('republishSessionStates()');
   });
 
