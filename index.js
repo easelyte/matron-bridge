@@ -77,6 +77,7 @@ import { createSubagentConvoTracker } from './lib/subagent-convos.js';
 import { createQueuedReleaseOutbox } from './lib/queued-release-outbox.js';
 import { createSubagentRunningStore } from './lib/subagent-running-store.js';
 import { selectStrandedChildren, strandedRepairFrames } from './lib/subagent-reconcile.js';
+import { repairSessionStates } from './lib/session-state-repair.js';
 import { journalReemitCodexOutcomes } from './lib/codex-convos.js';
 import { formatSubagentToolBody } from './lib/subagent-tool-format.js';
 import { ivUploadDir, ivUploadAnnotation } from './lib/iv-uploads.js';
@@ -567,9 +568,12 @@ function handleJournalReconnect() {
   // Union of the two reconnect wirings (#207 + #536). Stranded-subagent reconcile
   // first, then journalOnReconnect — which reemits codex outcomes, republishes
   // overflow-evicted releases, and arms the deferred boot reconcile. The codex
-  // reemit lives in journalOnReconnect, so it is NOT duplicated here.
+  // reemit lives in journalOnReconnect, so it is NOT duplicated here. The two
+  // latch repairs (run-state, then summary) run last: both re-offer state whose
+  // "already sent" marker advanced on enqueue and so survived an eviction.
   reconcileStrandedSubagents('reconnect');
   journalOnReconnect();
+  republishSessionStates();
   republishSessionSummaries({ clearHints: true });
 }
 
@@ -1437,6 +1441,26 @@ function journalSessionState(session, state) {
   if (session._journalState === state) return;
   session._journalState = state;
   journalUpsertConvo(session, { sessionState: state });
+}
+
+// Repair the session_state latch across a connection epoch — the exact analogue of
+// republishSessionSummaries below, for the same defect (loop #554 F3, now #575's residual).
+//
+// journalSessionState records "already sent" on ENQUEUE, not on acceptance: it advances
+// session._journalState and then hands the frame to the durable queue, which DROPS THE OLDEST
+// frame on overflow (journal-publisher enqueue()). So a terminal transition evicted during an
+// outage backlog is never retried — the latch says it went out — and the conversation's durable
+// row stays `running` forever on a session that then goes quiet.
+//
+// That is unfixable from the client BY CONSTRUCTION: the web reconcile (matron-web#28) prunes a
+// stale activity indicator against the durable session_state, so when the durable state is
+// itself wrong it keeps rendering "Thinking" and is right to. The outage IS the failure window,
+// so clearing the latch on every accepted hello_ok and re-offering the current state is the
+// matching repair. Idempotent: the server COALESCEs an unchanged session_state, so re-sending
+// one is inert. Bounded by the number of LIVE in-memory sessions.
+function republishSessionStates() {
+  if (!JOURNAL_ENABLED) return;
+  repairSessionStates(sessions.values(), journalSessionState);
 }
 
 // Mirror the bridge's current activity into an ephemeral typing/activity
