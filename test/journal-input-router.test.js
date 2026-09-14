@@ -2196,7 +2196,13 @@ describe('index.js agent-chat room wiring (source inspection)', () => {
     it('retries refused repairs from onSendCapacity, gated on a pending flag', () => {
       const start = src.indexOf('createJournalPublisher({');
       const args = src.slice(start, src.indexOf('log: console,', start) + 2000);
-      expect(args).toMatch(/onSendCapacity: \(\) => \{ republishPendingReleases\(\); retrySessionSummaryRepairs\(\); \}/);
+      // Matches the summary retry's PRESENCE in onSendCapacity rather than pinning the whole
+      // line: other repairs share this hook (the run-state repair joined it for #575), and an
+      // exact-line match would fail on an unrelated addition while proving nothing more.
+      const capacity = /onSendCapacity: \(\) => \{([^}]*)\}/.exec(args);
+      expect(capacity).not.toBeNull();
+      expect(capacity[1]).toContain('republishPendingReleases()');
+      expect(capacity[1]).toContain('retrySessionSummaryRepairs()');
       const retryStart = src.indexOf('function retrySessionSummaryRepairs(');
       expect(retryStart).toBeGreaterThan(-1);
       expect(src.slice(retryStart, src.indexOf('\n}', retryStart)))

@@ -77,6 +77,7 @@ import { createSubagentConvoTracker } from './lib/subagent-convos.js';
 import { createQueuedReleaseOutbox } from './lib/queued-release-outbox.js';
 import { createSubagentRunningStore } from './lib/subagent-running-store.js';
 import { selectStrandedChildren, strandedRepairFrames } from './lib/subagent-reconcile.js';
+import { notePendingState, settlePendingState, repairPendingStates } from './lib/session-state-repair.js';
 import { journalReemitCodexOutcomes } from './lib/codex-convos.js';
 import { formatSubagentToolBody } from './lib/subagent-tool-format.js';
 import { ivUploadDir, ivUploadAnnotation } from './lib/iv-uploads.js';
@@ -567,9 +568,12 @@ function handleJournalReconnect() {
   // Union of the two reconnect wirings (#207 + #536). Stranded-subagent reconcile
   // first, then journalOnReconnect — which reemits codex outcomes, republishes
   // overflow-evicted releases, and arms the deferred boot reconcile. The codex
-  // reemit lives in journalOnReconnect, so it is NOT duplicated here.
+  // reemit lives in journalOnReconnect, so it is NOT duplicated here. The two
+  // latch repairs (run-state, then summary) run last: both re-offer state whose
+  // "already sent" marker advanced on enqueue and so survived an eviction.
   reconcileStrandedSubagents('reconnect');
   journalOnReconnect();
+  republishSessionStates();
   republishSessionSummaries({ clearHints: true });
 }
 
@@ -654,7 +658,7 @@ const journalPublisher = createJournalPublisher({
   onReconnect: handleJournalReconnect,
   // Send-completion retry trigger (the mandatory one): re-publishes an
   // overflow-evicted release frame on a healthy socket that never reconnects.
-  onSendCapacity: () => { republishPendingReleases(); retrySessionSummaryRepairs(); },
+  onSendCapacity: () => { republishPendingReleases(); retrySessionSummaryRepairs(); retryRunStateRepairs(); },
   // Agent-RPC dispatch. Arrow + late-bound const (journalRpcHandler is
   // defined below): safe for the same reason onEvent's forward reference
   // is — the callback only ever fires once the socket is live, long after
@@ -989,6 +993,12 @@ function findPersistedAgentSession(agent, sessionId) {
 // --- Session Manager ---
 
 const sessions = new Map(); // roomId -> session
+// convoId -> last session_state whose convo_upsert has not been CONFIRMED by the server. Entered
+// before the publish, cleared on delivery, re-offered on every reconnect (republishSessionStates).
+// Keyed by convo rather than session because the terminal paths delete the session before
+// publishing `done` — see journalSessionState.
+const pendingRunStates = new Map();
+let _runStateRepairRunning = false;
 
 // Persistent, crash-safe write-ahead outbox for queued_release resolutions
 // (loop #536). Constructed here so it loads + relabels any inherited on-disk
@@ -1178,7 +1188,11 @@ function journalBufferPush(session, method, payload) {
 }
 
 // Send now if the convo_id is known, otherwise buffer for the eventual flush.
-function journalPublish(session, method, payload) {
+// `options` (onDelivered, etc.) reaches the publisher only on the LIVE path: a session whose
+// convo id is not known yet buffers the payload, and journalBufferPush has no slot to carry a
+// delivery callback. Every current options-passing caller (journalSessionState) skips the call
+// entirely when there is no convo id, so nothing is silently dropped here.
+function journalPublish(session, method, payload, options) {
   if (!JOURNAL_ENABLED) return;
   const convoId = journalConvoIdFor(session);
   if (convoId) {
@@ -1198,7 +1212,7 @@ function journalPublish(session, method, payload) {
         journalPublisher.upsertConvo(convoId, { title: session._journalTitleHint, agentKind: session.agent });
       }
     }
-    journalPublisher[method](convoId, payload);
+    journalPublisher[method](convoId, payload, options);
   } else {
     journalBufferPush(session, method, payload);
   }
@@ -1377,7 +1391,7 @@ function scheduleReleaseReconcile() {
   }
 }
 
-function journalUpsertConvo(session, opts) {
+function journalUpsertConvo(session, opts, options) {
   if (opts.title !== undefined && opts.title !== session._journalTitleHint) {
     session._journalTitleHint = opts.title;
     // Mirror the hint into the session record: the in-memory carry
@@ -1396,6 +1410,7 @@ function journalUpsertConvo(session, opts) {
     session,
     'upsertConvo',
     session.agent && opts.agentKind === undefined ? { ...opts, agentKind: session.agent } : opts,
+    options,
   );
 }
 
@@ -1436,7 +1451,68 @@ function journalPublishUserItem(session, method, payload) {
 function journalSessionState(session, state) {
   if (session._journalState === state) return;
   session._journalState = state;
-  journalUpsertConvo(session, { sessionState: state });
+  // Track the attempt until the server confirms it. The latch above advances on ENQUEUE, but the
+  // durable queue drops its OLDEST frame on overflow, so without this an evicted transition is
+  // never retried and the convo's row stays at the pre-transition state forever (a stranded
+  // `running` renders as a permanent "Thinking" in every client). Keyed by convo id, not by
+  // session: the terminal paths delete the session from `sessions` immediately BEFORE publishing
+  // `done`, so a session-keyed record would miss exactly the case this repairs.
+  const convoId = journalConvoIdFor(session);
+  if (convoId) notePendingState(pendingRunStates, convoId, state);
+  journalUpsertConvo(session, { sessionState: state }, {
+    onDelivered: convoId ? () => settlePendingState(pendingRunStates, convoId, state) : undefined,
+  });
+}
+
+// Repair the session_state latch across a connection epoch — the exact analogue of
+// republishSessionSummaries below, for the same defect (loop #554 F3, now #575's residual).
+//
+// journalSessionState records "already sent" on ENQUEUE, not on acceptance: it advances
+// session._journalState and then hands the frame to the durable queue, which DROPS THE OLDEST
+// frame on overflow (journal-publisher enqueue()). So a terminal transition evicted during an
+// outage backlog is never retried — the latch says it went out — and the conversation's durable
+// row stays `running` forever on a session that then goes quiet.
+//
+// That is unfixable from the client BY CONSTRUCTION: the web reconcile (matron-web#28) prunes a
+// stale activity indicator against the durable session_state, so when the durable state is
+// itself wrong it keeps rendering "Thinking" and is right to. The outage IS the failure window,
+// so clearing the latch on every accepted hello_ok and re-offering the current state is the
+// matching repair. Idempotent: the server COALESCEs an unchanged session_state, so re-sending
+// one is inert. Bounded by the number of LIVE in-memory sessions.
+function republishSessionStates() {
+  if (!JOURNAL_ENABLED) return;
+  // Re-entrancy latch. A successful best-effort enqueue can pump, confirm and fire
+  // onSendCapacity synchronously on an injected transport, landing right back here mid-sweep.
+  // Same coalescing discipline as republishSessionSummaries / republishPendingReleases.
+  if (_runStateRepairRunning) return;
+  _runStateRepairRunning = true;
+  try {
+    const { offered, refused } = repairPendingStates(pendingRunStates, (convoId, state) =>
+      // NON-EVICTING path, deliberately: the ordinary enqueue drops the oldest queued frame when
+      // the queue is full, and at reconnect that backlog is real user traffic (prompts,
+      // permission replies). retain:false so a refused offer is not held as a snapshot that could
+      // later land on top of a newer transition — it stays in `pendingRunStates` and is re-offered
+      // on the next capacity window, recomputed from whatever the state is by then.
+      journalPublisher.upsertConvoBestEffort(convoId, { sessionState: state }, {
+        retain: false,
+        onDelivered: () => settlePendingState(pendingRunStates, convoId, state),
+      }),
+    );
+    if (refused) {
+      console.warn(`[run-state-repair] ${refused} of ${offered + refused} run-state re-offer(s) refused (queue full) — retained for the next capacity window`);
+    }
+  } finally {
+    _runStateRepairRunning = false;
+  }
+}
+
+// Send-completion retry — the trigger that does NOT need another reconnect. hello_ok fires
+// onReconnect BEFORE the backlog pumps, so on a connection that comes back with the queue still
+// full every re-offer is refused; without this, a healthy socket that never disconnects again
+// would leave those rows stranded forever. Gated on the map being non-empty so the common case
+// (nothing outstanding) costs one size check per confirmed send, not a sweep.
+function retryRunStateRepairs() {
+  if (pendingRunStates.size > 0) republishSessionStates();
 }
 
 // Mirror the bridge's current activity into an ephemeral typing/activity
