@@ -143,6 +143,92 @@ describe('run-state outbox', () => {
   });
 });
 
+describe('retirement settles against the RECORDED state (no publish loop)', () => {
+  let dir;
+  let file;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'run-state-retire-'));
+    file = join(dir, 'outbox.json');
+  });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  // Models index.js's epoch sweep end to end: classify -> publish -> delivery -> capacity retry.
+  // The published state for a retirement ('done') differs from the recorded one ('running'), so
+  // settling on the published value would never match. The record would survive, the capacity
+  // hook would sweep it again, and every confirmed `done` would schedule another one forever.
+  function sweep(outbox, liveConvoIds, sent) {
+    const { reoffer, retire } = selectEpochRepairs(outbox.list(), liveConvoIds);
+    const offer = (convoId, recorded, publish = recorded) => {
+      sent.push([convoId, publish]);
+      outbox.settle(convoId, recorded); // stands in for the publisher's onDelivered
+    };
+    for (const { convoId, state } of reoffer) offer(convoId, state);
+    for (const convoId of retire) offer(convoId, 'running', 'done');
+  }
+
+  it('publishes done ONCE and clears the record', () => {
+    const outbox = createRunStateOutbox({ file, log: silent });
+    outbox.note('ghost', 'running');
+    const sent = [];
+
+    sweep(outbox, new Set(), sent);
+    expect(sent).toEqual([['ghost', 'done']]);
+    expect(outbox.size()).toBe(0);
+
+    // The capacity hook fires on every confirmed send; with the record cleared it finds nothing.
+    sweep(outbox, new Set(), sent);
+    expect(sent).toEqual([['ghost', 'done']]);
+  });
+
+  it('stays cleared across a restart, so the loop cannot resume later', () => {
+    const outbox = createRunStateOutbox({ file, log: silent });
+    outbox.note('ghost', 'running');
+    sweep(outbox, new Set(), []);
+
+    expect(createRunStateOutbox({ file, log: silent }).list()).toEqual([]);
+  });
+});
+
+describe('durable-write failures do not falsely commit', () => {
+  let dir;
+
+  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'run-state-fail-')); });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  it('note() reports failure and does NOT cache a record disk never received', () => {
+    // An unwritable directory stands in for ENOSPC/EIO. If the cache committed anyway, the
+    // session latch and the cache's own idempotency check would both suppress the retry, and a
+    // restart would find nothing to repair from.
+    const outbox = createRunStateOutbox({ file: join(dir, 'missing-dir', 'outbox.json'), log: silent });
+
+    expect(outbox.note('c1', 'running')).toBe(false);
+    expect(outbox.size()).toBe(0);
+    // Not suppressed as a duplicate on the next attempt.
+    expect(outbox.note('c1', 'running')).toBe(false);
+  });
+});
+
+describe('instance isolation', () => {
+  it('honours MATRON_RUN_STATE_OUTBOX_FILE so a dev bridge cannot retire the live one\'s sessions', () => {
+    // A second bridge sharing the file would not have the first's conversations in its own
+    // sessions map, so the epoch sweep would classify those LIVE convos as stranded and publish
+    // `done` against them.
+    const dir = mkdtempSync(join(tmpdir(), 'run-state-iso-'));
+    const override = join(dir, 'custom-outbox.json');
+    const prev = process.env.MATRON_RUN_STATE_OUTBOX_FILE;
+    process.env.MATRON_RUN_STATE_OUTBOX_FILE = override;
+    try {
+      createRunStateOutbox({ log: silent }).note('c1', 'running');
+      expect(existsSync(override)).toBe(true);
+    } finally {
+      if (prev === undefined) delete process.env.MATRON_RUN_STATE_OUTBOX_FILE;
+      else process.env.MATRON_RUN_STATE_OUTBOX_FILE = prev;
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
 describe('index.js wiring', () => {
   // index.js starts a server at import time (main() + apiServer.listen at module top level), so
   // it cannot be imported for a behavioral test — the repo's established fallback is a
@@ -186,7 +272,10 @@ describe('index.js wiring', () => {
   it('retires stranded running convos that no live session owns', () => {
     const body = sliceFunction('function republishSessionStates(');
     expect(body).toContain('selectEpochRepairs(');
-    expect(body).toContain("offer(convoId, 'done')");
+    // Retirement publishes `done` but settles against the RECORDED `running` — settling on the
+    // published value would never match and would loop forever.
+    expect(body).toContain("offer(convoId, 'running', 'done')");
+    expect(body).toContain('onDelivered: () => runStateOutbox.settle(convoId, recorded)');
     // The live set is built from sessions, the same signal the subagent reconcile uses.
     expect(body).toContain('journalConvoIdFor(session)');
   });

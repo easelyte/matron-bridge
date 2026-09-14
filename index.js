@@ -1503,10 +1503,15 @@ function republishSessionStates() {
     // permission replies). retain:false so a refused offer is not held as a snapshot that could
     // later land on top of a newer transition — it stays in the outbox and is re-offered on the
     // next capacity window, recomputed from whatever the state is by then.
-    const offer = (convoId, state) =>
-      journalPublisher.upsertConvoBestEffort(convoId, { sessionState: state }, {
+    // `recorded` is what the OUTBOX holds; `publish` is what goes on the wire. They differ for a
+    // retirement, which publishes `done` against a record that still says `running` — settling on
+    // the published value would never match, so the record would survive, the capacity hook would
+    // re-sweep it, and every confirmed `done` would schedule another one. An endless publish loop
+    // against a row that is already correct.
+    const offer = (convoId, recorded, publish = recorded) =>
+      journalPublisher.upsertConvoBestEffort(convoId, { sessionState: publish }, {
         retain: false,
-        onDelivered: () => runStateOutbox.settle(convoId, state),
+        onDelivered: () => runStateOutbox.settle(convoId, recorded),
       });
 
     let refused = 0;
@@ -1520,7 +1525,7 @@ function republishSessionStates() {
     // will never clear. Retire it to `done` — the same terminal-owner call reconcileStrandedSubagents
     // makes for child convos.
     for (const convoId of retire) {
-      if (offer(convoId, 'done') === false) refused += 1;
+      if (offer(convoId, 'running', 'done') === false) refused += 1;
       else offered += 1;
     }
     if (retire.length) {
