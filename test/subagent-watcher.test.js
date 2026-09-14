@@ -1,4 +1,4 @@
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect, afterEach, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -296,6 +296,65 @@ describe('SubagentWatcher.forceAttach (resumed agent under an already-seen trans
     expect(w.pendingForceAttach.has('gone')).toBe(false);
     expect(warnings.join('\n')).toContain('gone');
     expect(warnings.join('\n')).toContain('will not be shown');
+  });
+
+  // Codex R2 F1: a missing/unreadable subagents dir is one of the conditions a
+  // pending force-attach is waiting out, and the burst timer refuses to stop
+  // while the queue is nonempty — so expiry must not sit behind the directory
+  // enumeration, or the deadline never fires and nothing ever warns.
+  it('still expires (and warns) when the subagents directory itself is gone', () => {
+    const sessionId = `sid-${Math.random().toString(36).slice(2)}`;
+    const workdir = uniqueWorkdir('nodir');
+    const dir = mkSubagentsDir(workdir, sessionId);
+    fs.writeFileSync(path.join(dir, 'agent-vanished.jsonl'), '');
+    const warnings = [];
+    const w = new SubagentWatcher({ workdir, sessionId, log: { warn: m => warnings.push(m) } });
+    watchers.push(w);
+    w.snapshot();
+
+    fs.rmSync(dir, { recursive: true, force: true }); // whole dir gone
+    w.forceAttach('vanished');
+    expect(w.pendingForceAttach.has('vanished')).toBe(true);
+
+    w._scan(); // readdirSync throws here
+    expect(w.pendingForceAttach.has('vanished')).toBe(true); // still inside the window
+
+    w.pendingForceAttach.set('vanished', Date.now() - 1);
+    w._scan();
+
+    expect(w.pendingForceAttach.has('vanished')).toBe(false);
+    expect(warnings.join('\n')).toContain('vanished');
+  });
+
+  // Codex R2 F2: metadata is not readability. Declaring attachment off a stat
+  // registers the filename in `tails` (so nothing can ever attach it again),
+  // drops the retry, and leaves the child running with no output forever —
+  // TranscriptTail swallows the open failure on every tick.
+  it('does not declare attachment for a transcript it cannot open', () => {
+    const { w, file, starts } = mkResumedFixture('resumed-eacces', [assistantLine('old')]);
+    const realOpen = fs.openSync;
+    const spy = vi.spyOn(fs, 'openSync').mockImplementation((p, ...rest) => {
+      if (p === file) {
+        const err = new Error('EACCES: permission denied');
+        err.code = 'EACCES';
+        throw err;
+      }
+      return realOpen(p, ...rest);
+    });
+    try {
+      expect(w.forceAttach('resumed-eacces')).toBe(false);
+      expect(starts).toEqual([]);
+      expect(w.tails.has('agent-resumed-eacces.jsonl')).toBe(false);
+      // Queued, not abandoned — the denial may be transient.
+      expect(w.pendingForceAttach.has('resumed-eacces')).toBe(true);
+    } finally {
+      spy.mockRestore();
+    }
+
+    // Once it opens, the retry attaches it.
+    w._scan();
+    expect(starts).toEqual(['resumed-eacces']);
+    expect(w.pendingForceAttach.has('resumed-eacces')).toBe(false);
   });
 
   it('does not queue a retry for the permanent no-op cases', () => {

@@ -576,6 +576,93 @@ describe('createSubagentConvoTracker', () => {
       expect(runningStore.list()).toEqual([]);
     });
 
+    // Codex R2 F4: a refused write-ahead record must not be terminal. Without a
+    // retry, one transient store hiccup leaves the whole resumed run rendered
+    // `done`, with no durable record either — the worst of both.
+    it('retries a refused revive on the next event, then publishes running', () => {
+      const publisher = makePublisher();
+      let allowAdd = false;
+      const store = {
+        map: new Map(),
+        add(childConvoId, meta) {
+          if (!allowAdd) return false;
+          this.map.set(childConvoId, meta);
+          return true;
+        },
+        remove(childConvoId) { this.map.delete(childConvoId); return true; },
+        list() { return [...this.map.entries()].map(([childConvoId, meta]) => ({ childConvoId, ...meta })); },
+      };
+      const tracker = createSubagentConvoTracker({
+        publisher, getParentConvoId: () => 'parent-uuid', runningStore: store, log: { warn() {} },
+      });
+
+      allowAdd = true;
+      tracker.noteBackgroundTaskStarted('toolu_1', 'agent-1');
+      tracker.discover('agent-1', { label: 'A', agentType: null });
+      tracker.noteTaskCompleted('agent-1');
+
+      allowAdd = false;
+      expect(tracker.revive('agent-1')).toBeNull();
+      const afterRefusal = publisher.calls.upsertConvo.length;
+
+      // The resumed agent's transcript events keep coming; the store recovers.
+      allowAdd = true;
+      const child = tracker.onEvent('agent-1', { label: 'A', event: subagentAssistantEvent({ text: 'hi' }) });
+
+      expect(child.state).toBe(CHILD_STATE_RUNNING);
+      expect(publisher.calls.upsertConvo.length).toBeGreaterThan(afterRefusal);
+      expect(publisher.calls.upsertConvo.at(-1).opts.sessionState).toBe(CHILD_STATE_RUNNING);
+      expect(store.list()).toHaveLength(1);
+    });
+
+    it('does not resurrect a genuinely-done child on a trailing event (no revive was requested)', () => {
+      const publisher = makePublisher();
+      const runningStore = makeStore();
+      const tracker = createSubagentConvoTracker({
+        publisher, getParentConvoId: () => 'parent-uuid', runningStore, log: { warn() {} },
+      });
+      tracker.noteTaskStarted('toolu_1');
+      tracker.discover('agent-1', { label: 'A', agentType: null });
+      tracker.noteTaskResult('toolu_1');
+      const after = publisher.calls.upsertConvo.length;
+
+      // The final answer drains late — normal, and must NOT flip it back.
+      const child = tracker.onEvent('agent-1', { label: 'A', event: subagentAssistantEvent({ text: 'late' }) });
+
+      expect(child.state).toBe(CHILD_STATE_FINISHED);
+      expect(publisher.calls.upsertConvo).toHaveLength(after);
+      expect(runningStore.list()).toEqual([]);
+    });
+
+    it('stops retrying a refused revive once the resumed run has ended anyway', () => {
+      const publisher = makePublisher();
+      const store = {
+        map: new Map(), allow: true,
+        add(id, meta) { if (!this.allow) return false; this.map.set(id, meta); return true; },
+        remove(id) { this.map.delete(id); return true; },
+        list() { return [...this.map.keys()]; },
+      };
+      const tracker = createSubagentConvoTracker({
+        publisher, getParentConvoId: () => 'parent-uuid', runningStore: store, log: { warn() {} },
+      });
+      tracker.noteBackgroundTaskStarted('toolu_1', 'agent-1');
+      tracker.discover('agent-1', { label: 'A', agentType: null });
+      tracker.noteTaskCompleted('agent-1');
+
+      store.allow = false;
+      tracker.revive('agent-1');
+      tracker.noteTaskCompleted('agent-1'); // the resumed run finished regardless
+
+      store.allow = true;
+      const after = publisher.calls.upsertConvo.length;
+      const child = tracker.onEvent('agent-1', { label: 'A', event: subagentAssistantEvent({ text: 'x' }) });
+
+      // `done` is now the truthful state — don't revive it retroactively.
+      expect(child.state).toBe(CHILD_STATE_FINISHED);
+      expect(publisher.calls.upsertConvo).toHaveLength(after);
+      expect(store.list()).toEqual([]);
+    });
+
     it('is a no-op for an unknown agent and for one already running', () => {
       const publisher = makePublisher();
       const tracker = createSubagentConvoTracker({
