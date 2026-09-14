@@ -519,4 +519,249 @@ describe('createSubagentConvoTracker', () => {
       }).not.toThrow();
     });
   });
+
+  // A subagent RESUMED via SendMessage runs again under the SAME agentId, so it
+  // reuses the SAME deterministic child convo. If the tracker already finished
+  // that child, its card renders `done` for the entire resumed run — a live
+  // agent that looks dead in every client. revive() puts it back to `running`.
+  describe('revive (resumed subagent)', () => {
+    function makeStore() {
+      const map = new Map();
+      return {
+        map,
+        calls: { add: [], remove: [] },
+        add(childConvoId, meta) { this.calls.add.push({ childConvoId, meta }); map.set(childConvoId, meta); return true; },
+        remove(childConvoId) { this.calls.remove.push(childConvoId); map.delete(childConvoId); return true; },
+        list() { return [...map.entries()].map(([childConvoId, meta]) => ({ childConvoId, ...meta })); },
+      };
+    }
+
+    it('flips a finished child back to running and re-arms its write-ahead record', () => {
+      const publisher = makePublisher();
+      const runningStore = makeStore();
+      const tracker = createSubagentConvoTracker({
+        publisher, getParentConvoId: () => 'parent-uuid', runningStore, log: { warn() {} },
+      });
+
+      tracker.noteTaskStarted('toolu_1');
+      tracker.discover('agent-1', { label: 'A', agentType: null });
+      tracker.noteTaskResult('toolu_1');
+      expect(runningStore.list()).toEqual([]);
+
+      const child = tracker.revive('agent-1');
+
+      expect(child).toBeTruthy();
+      expect(child.state).toBe(CHILD_STATE_RUNNING);
+      // Re-published as running, carrying parentage (the row may have been lost).
+      const last = publisher.calls.upsertConvo.at(-1);
+      expect(last.convoId).toBe('parent-uuid:sub:agent-1');
+      expect(last.opts).toMatchObject({ sessionState: CHILD_STATE_RUNNING, parentConvoId: 'parent-uuid' });
+      // Reconciliation can find it again if the bridge dies mid-resume.
+      expect(runningStore.list()).toHaveLength(1);
+    });
+
+    it('lets the resumed run finish normally afterwards', () => {
+      const publisher = makePublisher();
+      const runningStore = makeStore();
+      const tracker = createSubagentConvoTracker({
+        publisher, getParentConvoId: () => 'parent-uuid', runningStore, log: { warn() {} },
+      });
+      tracker.noteBackgroundTaskStarted('toolu_1', 'agent-1');
+      tracker.discover('agent-1', { label: 'A', agentType: null });
+      tracker.noteTaskCompleted('agent-1');
+      tracker.revive('agent-1');
+      tracker.noteTaskCompleted('agent-1');
+
+      expect(publisher.calls.upsertConvo.at(-1).opts.sessionState).toBe(CHILD_STATE_FINISHED);
+      expect(runningStore.list()).toEqual([]);
+    });
+
+    // Codex R2 F4: a refused write-ahead record must not be terminal. Without a
+    // retry, one transient store hiccup leaves the whole resumed run rendered
+    // `done`, with no durable record either — the worst of both.
+    it('retries a refused revive on the next event, then publishes running', () => {
+      const publisher = makePublisher();
+      let allowAdd = false;
+      const store = {
+        map: new Map(),
+        add(childConvoId, meta) {
+          if (!allowAdd) return false;
+          this.map.set(childConvoId, meta);
+          return true;
+        },
+        remove(childConvoId) { this.map.delete(childConvoId); return true; },
+        list() { return [...this.map.entries()].map(([childConvoId, meta]) => ({ childConvoId, ...meta })); },
+      };
+      const tracker = createSubagentConvoTracker({
+        publisher, getParentConvoId: () => 'parent-uuid', runningStore: store, log: { warn() {} },
+      });
+
+      allowAdd = true;
+      tracker.noteBackgroundTaskStarted('toolu_1', 'agent-1');
+      tracker.discover('agent-1', { label: 'A', agentType: null });
+      tracker.noteTaskCompleted('agent-1');
+
+      allowAdd = false;
+      expect(tracker.revive('agent-1')).toBeNull();
+      const afterRefusal = publisher.calls.upsertConvo.length;
+
+      // The resumed agent's transcript events keep coming; the store recovers.
+      allowAdd = true;
+      const child = tracker.onEvent('agent-1', { label: 'A', event: subagentAssistantEvent({ text: 'hi' }) });
+
+      expect(child.state).toBe(CHILD_STATE_RUNNING);
+      expect(publisher.calls.upsertConvo.length).toBeGreaterThan(afterRefusal);
+      expect(publisher.calls.upsertConvo.at(-1).opts.sessionState).toBe(CHILD_STATE_RUNNING);
+      expect(store.list()).toHaveLength(1);
+    });
+
+    it('does not resurrect a genuinely-done child on a trailing event (no revive was requested)', () => {
+      const publisher = makePublisher();
+      const runningStore = makeStore();
+      const tracker = createSubagentConvoTracker({
+        publisher, getParentConvoId: () => 'parent-uuid', runningStore, log: { warn() {} },
+      });
+      tracker.noteTaskStarted('toolu_1');
+      tracker.discover('agent-1', { label: 'A', agentType: null });
+      tracker.noteTaskResult('toolu_1');
+      const after = publisher.calls.upsertConvo.length;
+
+      // The final answer drains late — normal, and must NOT flip it back.
+      const child = tracker.onEvent('agent-1', { label: 'A', event: subagentAssistantEvent({ text: 'late' }) });
+
+      expect(child.state).toBe(CHILD_STATE_FINISHED);
+      expect(publisher.calls.upsertConvo).toHaveLength(after);
+      expect(runningStore.list()).toEqual([]);
+    });
+
+    it('stops retrying a refused revive once the resumed run has ended anyway', () => {
+      const publisher = makePublisher();
+      const store = {
+        map: new Map(), allow: true,
+        add(id, meta) { if (!this.allow) return false; this.map.set(id, meta); return true; },
+        remove(id) { this.map.delete(id); return true; },
+        list() { return [...this.map.keys()]; },
+      };
+      const tracker = createSubagentConvoTracker({
+        publisher, getParentConvoId: () => 'parent-uuid', runningStore: store, log: { warn() {} },
+      });
+      tracker.noteBackgroundTaskStarted('toolu_1', 'agent-1');
+      tracker.discover('agent-1', { label: 'A', agentType: null });
+      tracker.noteTaskCompleted('agent-1');
+
+      store.allow = false;
+      tracker.revive('agent-1');
+      tracker.noteTaskCompleted('agent-1'); // the resumed run finished regardless
+
+      store.allow = true;
+      const after = publisher.calls.upsertConvo.length;
+      const child = tracker.onEvent('agent-1', { label: 'A', event: subagentAssistantEvent({ text: 'x' }) });
+
+      // `done` is now the truthful state — don't revive it retroactively.
+      expect(child.state).toBe(CHILD_STATE_FINISHED);
+      expect(publisher.calls.upsertConvo).toHaveLength(after);
+      expect(store.list()).toEqual([]);
+    });
+
+    it('is a no-op for an unknown agent and for one already running', () => {
+      const publisher = makePublisher();
+      const tracker = createSubagentConvoTracker({
+        publisher, getParentConvoId: () => 'parent-uuid', log: { warn() {} },
+      });
+
+      expect(tracker.revive('never-seen')).toBeNull();
+      expect(publisher.calls.upsertConvo).toHaveLength(0);
+
+      tracker.discover('agent-1', { label: 'A', agentType: null });
+      const before = publisher.calls.upsertConvo.length;
+      expect(tracker.revive('agent-1')).toBeNull();
+      expect(publisher.calls.upsertConvo).toHaveLength(before);
+    });
+
+    it('does not publish running when the write-ahead record cannot be re-armed', () => {
+      const publisher = makePublisher();
+      const store = {
+        added: 0,
+        add() { this.added += 1; return this.added > 1 ? false : true; },
+        remove() { return true; },
+        list() { return []; },
+      };
+      const tracker = createSubagentConvoTracker({
+        publisher, getParentConvoId: () => 'parent-uuid', runningStore: store, log: { warn() {} },
+      });
+      tracker.noteTaskStarted('toolu_1');
+      tracker.discover('agent-1', { label: 'A', agentType: null });
+      tracker.noteTaskResult('toolu_1');
+      const before = publisher.calls.upsertConvo.length;
+
+      expect(tracker.revive('agent-1')).toBeNull();
+      expect(publisher.calls.upsertConvo).toHaveLength(before);
+    });
+
+    // Codex R1 F2: state alone cannot separate incarnations. Run 1's ack arriving
+    // after run 2 has ALSO finished sees state === done and would clear run 2's
+    // write-ahead record — which is still gated on run 2's own (unlanded) ack.
+    it('a stale ack from the PREVIOUS run must not erase the resumed run\'s record', () => {
+      const deliveries = [];
+      const publisher = {
+        calls: { upsertConvo: [] },
+        upsertConvo(convoId, opts, options) {
+          this.calls.upsertConvo.push({ convoId, opts });
+          if (options?.onDelivered) deliveries.push(options.onDelivered);
+        },
+        publishStatus() {}, publishText() {}, publishDiff() {},
+      };
+      const runningStore = makeStore();
+      const tracker = createSubagentConvoTracker({
+        publisher, getParentConvoId: () => 'parent-uuid', runningStore, log: { warn() {} },
+      });
+
+      tracker.noteBackgroundTaskStarted('toolu_1', 'agent-1');
+      tracker.discover('agent-1', { label: 'A', agentType: null });
+      tracker.noteTaskCompleted('agent-1');   // run 1 done — ack pending
+      const run1Ack = deliveries.at(-1);
+
+      tracker.revive('agent-1');              // resumed
+      tracker.noteTaskCompleted('agent-1');   // run 2 done — its own ack pending
+      const run2Ack = deliveries.at(-1);
+      expect(run2Ack).not.toBe(run1Ack);
+      expect(runningStore.list()).toHaveLength(1);
+
+      run1Ack(); // the stale one finally lands
+      // Run 2's record survives: its own frame has not been confirmed yet, so
+      // losing it would leave the server `running` with nothing to reconcile.
+      expect(runningStore.list()).toHaveLength(1);
+
+      run2Ack();
+      expect(runningStore.list()).toEqual([]);
+    });
+
+    it('a late done-frame delivery must not erase the record the revive just re-armed', () => {
+      // The finish() frame's onDelivered fires AFTER the resume — removing then
+      // would discard the live child's only reconciliation record.
+      const deliveries = [];
+      const publisher = {
+        calls: { upsertConvo: [], publishStatus: [], publishText: [], publishDiff: [] },
+        upsertConvo(convoId, opts, options) {
+          this.calls.upsertConvo.push({ convoId, opts });
+          if (options?.onDelivered) deliveries.push(options.onDelivered);
+        },
+        publishStatus() {}, publishText() {}, publishDiff() {},
+      };
+      const runningStore = makeStore();
+      const tracker = createSubagentConvoTracker({
+        publisher, getParentConvoId: () => 'parent-uuid', runningStore, log: { warn() {} },
+      });
+
+      tracker.noteTaskStarted('toolu_1');
+      tracker.discover('agent-1', { label: 'A', agentType: null });
+      tracker.noteTaskResult('toolu_1');   // done published, delivery pending
+      tracker.revive('agent-1');           // resumed before the ack landed
+      expect(runningStore.list()).toHaveLength(1);
+
+      for (const ack of deliveries) ack();  // the stale ack finally arrives
+
+      expect(runningStore.list()).toHaveLength(1);
+    });
+  });
 });
