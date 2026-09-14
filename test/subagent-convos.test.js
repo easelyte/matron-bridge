@@ -611,6 +611,44 @@ describe('createSubagentConvoTracker', () => {
       expect(publisher.calls.upsertConvo).toHaveLength(before);
     });
 
+    // Codex R1 F2: state alone cannot separate incarnations. Run 1's ack arriving
+    // after run 2 has ALSO finished sees state === done and would clear run 2's
+    // write-ahead record — which is still gated on run 2's own (unlanded) ack.
+    it('a stale ack from the PREVIOUS run must not erase the resumed run\'s record', () => {
+      const deliveries = [];
+      const publisher = {
+        calls: { upsertConvo: [] },
+        upsertConvo(convoId, opts, options) {
+          this.calls.upsertConvo.push({ convoId, opts });
+          if (options?.onDelivered) deliveries.push(options.onDelivered);
+        },
+        publishStatus() {}, publishText() {}, publishDiff() {},
+      };
+      const runningStore = makeStore();
+      const tracker = createSubagentConvoTracker({
+        publisher, getParentConvoId: () => 'parent-uuid', runningStore, log: { warn() {} },
+      });
+
+      tracker.noteBackgroundTaskStarted('toolu_1', 'agent-1');
+      tracker.discover('agent-1', { label: 'A', agentType: null });
+      tracker.noteTaskCompleted('agent-1');   // run 1 done — ack pending
+      const run1Ack = deliveries.at(-1);
+
+      tracker.revive('agent-1');              // resumed
+      tracker.noteTaskCompleted('agent-1');   // run 2 done — its own ack pending
+      const run2Ack = deliveries.at(-1);
+      expect(run2Ack).not.toBe(run1Ack);
+      expect(runningStore.list()).toHaveLength(1);
+
+      run1Ack(); // the stale one finally lands
+      // Run 2's record survives: its own frame has not been confirmed yet, so
+      // losing it would leave the server `running` with nothing to reconcile.
+      expect(runningStore.list()).toHaveLength(1);
+
+      run2Ack();
+      expect(runningStore.list()).toEqual([]);
+    });
+
     it('a late done-frame delivery must not erase the record the revive just re-armed', () => {
       // The finish() frame's onDelivered fires AFTER the resume — removing then
       // would discard the live child's only reconciliation record.

@@ -170,7 +170,19 @@ describe('SubagentWatcher.forceAttach (resumed agent under an already-seen trans
   const appendLine = (file, obj) => fs.appendFileSync(file, JSON.stringify(obj) + '\n');
 
   // Give the tail's 100ms stat poll a couple of ticks to notice the append.
+  // Used only for NEGATIVE assertions (nothing should arrive) — under load a
+  // fixed sleep can only make those pass spuriously, never fail spuriously.
   const settle = () => new Promise(r => setTimeout(r, 350));
+
+  // Positive assertions poll instead of sleeping: the tail's stat interval plus
+  // a loaded CI worker is not a budget a fixed timeout can be trusted with.
+  const waitForEvents = async (events, n, timeoutMs = 5000) => {
+    const deadline = Date.now() + timeoutMs;
+    while (events.length < n && Date.now() < deadline) {
+      await new Promise(r => setTimeout(r, 25));
+    }
+    return events;
+  };
 
   it('attaches and emits a card for an agent the snapshot already marked seen', async () => {
     const { w, starts } = mkResumedFixture('resumed1', [assistantLine('old work')]);
@@ -197,9 +209,104 @@ describe('SubagentWatcher.forceAttach (resumed agent under an already-seen trans
 
     // ...but the tail IS live: what the resumed agent writes from now on lands.
     appendLine(file, assistantLine('fresh work'));
-    await settle();
+    await waitForEvents(events, 1);
     expect(events).toHaveLength(1);
     expect(events[0].message.content[0].text).toBe('fresh work');
+  });
+
+  // Codex R1 F1: the agent is ALREADY RUNNING by the time task_started reaches
+  // the bridge, so it can append records in that gap. Anchoring the tail at the
+  // file's size NOW discards them — a fast resumed agent renders an empty card.
+  // The boundary has to be the size recorded when the file was marked seen.
+  it('emits output the resumed agent wrote between the snapshot and the attach', async () => {
+    const { w, file, events } = mkResumedFixture('resumed-race', [
+      assistantLine('history line 1'),
+      assistantLine('history line 2'),
+    ]);
+
+    // The resumed run gets going before the bridge processes task_started.
+    appendLine(file, assistantLine('written before the bridge noticed'));
+
+    w.forceAttach('resumed-race');
+    await waitForEvents(events, 1);
+
+    // The in-gap record is the resumed run's output — it must NOT be treated
+    // as history — and the earlier run is still not replayed.
+    expect(events.map(e => e.message.content[0].text)).toEqual(['written before the bridge noticed']);
+
+    appendLine(file, assistantLine('and the rest'));
+    await waitForEvents(events, 2);
+    expect(events.map(e => e.message.content[0].text)).toEqual([
+      'written before the bridge noticed', 'and the rest',
+    ]);
+  });
+
+  it('replays from the top when the same name is a DIFFERENT file than the one snapshotted', async () => {
+    const { w, dir, file, events } = mkResumedFixture('resumed-swap', [assistantLine('history')]);
+    // Rotation / replacement: same path, different file. Staged under a sibling
+    // name and renamed over so the original inode is never freed (and so cannot
+    // be handed straight back), making this a genuine identity change.
+    const staged = path.join(dir, 'staged.jsonl.tmp');
+    fs.writeFileSync(staged, JSON.stringify(assistantLine('all new')) + '\n');
+    fs.renameSync(staged, file);
+
+    w.forceAttach('resumed-swap');
+    await waitForEvents(events, 1);
+
+    expect(events.map(e => e.message.content[0].text)).toEqual(['all new']);
+  });
+
+  // Codex R1 F4: _scan() skips every `seen` name, so a force-attach that could
+  // not read its transcript has no other recovery path. It must be retried, and
+  // fail visibly rather than silently costing the whole resumed run.
+  it('retries a force-attach whose transcript was not readable yet, then attaches it', async () => {
+    const { w, dir, starts } = mkResumedFixture('resumed-late', [assistantLine('old')]);
+    const file = path.join(dir, 'agent-resumed-late.jsonl');
+    const stashed = fs.readFileSync(file);
+    fs.rmSync(file); // transient: mid-rotation when task_started lands
+
+    expect(w.forceAttach('resumed-late')).toBe(false);
+    expect(starts).toEqual([]);
+    expect(w.pendingForceAttach.has('resumed-late')).toBe(true);
+
+    fs.writeFileSync(file, stashed);
+    w._scan(); // the burst poll's retry vehicle
+
+    expect(starts).toEqual(['resumed-late']);
+    expect(w.pendingForceAttach.has('resumed-late')).toBe(false);
+  });
+
+  it('warns and gives up once the retry window expires', async () => {
+    const sessionId = `sid-${Math.random().toString(36).slice(2)}`;
+    const workdir = uniqueWorkdir('expire');
+    const dir = mkSubagentsDir(workdir, sessionId);
+    fs.writeFileSync(path.join(dir, 'agent-gone.jsonl'), '');
+    const warnings = [];
+    const w = new SubagentWatcher({ workdir, sessionId, log: { warn: m => warnings.push(m) } });
+    watchers.push(w);
+    w.snapshot();
+    fs.rmSync(path.join(dir, 'agent-gone.jsonl')); // never comes back
+
+    w.forceAttach('gone');
+    expect(w.pendingForceAttach.has('gone')).toBe(true);
+
+    w.pendingForceAttach.set('gone', Date.now() - 1); // window closed
+    w._scan();
+
+    expect(w.pendingForceAttach.has('gone')).toBe(false);
+    expect(warnings.join('\n')).toContain('gone');
+    expect(warnings.join('\n')).toContain('will not be shown');
+  });
+
+  it('does not queue a retry for the permanent no-op cases', () => {
+    const { w } = mkResumedFixture('resumed-noqueue', [assistantLine('old')]);
+    // Unknown agent (never snapshotted) — a fresh spawn, the scan's job.
+    w.forceAttach('not-seen-at-all');
+    expect(w.pendingForceAttach.size).toBe(0);
+    // Already tailing — a duplicate task_started.
+    w.forceAttach('resumed-noqueue');
+    w.forceAttach('resumed-noqueue');
+    expect(w.pendingForceAttach.size).toBe(0);
   });
 
   it('is idempotent — a duplicate task_started neither double-attaches nor emits a second card', async () => {
