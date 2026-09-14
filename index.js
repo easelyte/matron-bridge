@@ -77,7 +77,8 @@ import { createSubagentConvoTracker } from './lib/subagent-convos.js';
 import { createQueuedReleaseOutbox } from './lib/queued-release-outbox.js';
 import { createSubagentRunningStore } from './lib/subagent-running-store.js';
 import { selectStrandedChildren, strandedRepairFrames } from './lib/subagent-reconcile.js';
-import { notePendingState, settlePendingState, repairPendingStates } from './lib/session-state-repair.js';
+import { planTransition, selectEpochRepairs } from './lib/session-state-repair.js';
+import { createRunStateOutbox } from './lib/run-state-outbox.js';
 import { journalReemitCodexOutcomes } from './lib/codex-convos.js';
 import { formatSubagentToolBody } from './lib/subagent-tool-format.js';
 import { ivUploadDir, ivUploadAnnotation } from './lib/iv-uploads.js';
@@ -525,6 +526,14 @@ const missionsClient = createMissionsClient({
 const JOURNAL_CURSOR_FILE = process.env.JOURNAL_CURSOR_FILE
   ? path.resolve(expandHome(process.env.JOURNAL_CURSOR_FILE))
   : path.join(__dirname, 'journal-cursor.json');
+// Unconfirmed run-state transitions (see lib/run-state-outbox.js). Derived exactly like
+// JOURNAL_CURSOR_FILE above — env override, else a file in the bridge's OWN directory — because
+// the store has a single-writer invariant: a second bridge reading these records would not have
+// those conversations in its `sessions` map and would retire the first bridge's LIVE convos to
+// `done`. The __dirname default makes a dev bridge from another checkout isolated by default.
+const RUN_STATE_OUTBOX_FILE = process.env.MATRON_RUN_STATE_OUTBOX_FILE
+  ? path.resolve(expandHome(process.env.MATRON_RUN_STATE_OUTBOX_FILE))
+  : path.join(__dirname, 'run-state-outbox.json');
 const JOURNAL_CONTROL_CONVO_ID = process.env.JOURNAL_CONTROL_CONVO_ID || `bridge-${os.hostname()}`;
 // Bridge-side coalescing floor for in-progress assistant-text stream frames
 // (per convo+message). Defaults to the server hub's own ~5/s fan-out window;
@@ -993,11 +1002,12 @@ function findPersistedAgentSession(agent, sessionId) {
 // --- Session Manager ---
 
 const sessions = new Map(); // roomId -> session
-// convoId -> last session_state whose convo_upsert has not been CONFIRMED by the server. Entered
-// before the publish, cleared on delivery, re-offered on every reconnect (republishSessionStates).
-// Keyed by convo rather than session because the terminal paths delete the session before
-// publishing `done` — see journalSessionState.
-const pendingRunStates = new Map();
+// DURABLE record of session_state transitions the server has not confirmed. Entered before the
+// publish, cleared on delivery, re-offered on every reconnect (republishSessionStates). Keyed by
+// convo rather than session because the terminal paths delete the session before publishing
+// `done` — see journalSessionState. On disk rather than in memory so a bridge RESTART mid-outage
+// does not lose the record and strand the row at `running` forever.
+const runStateOutbox = createRunStateOutbox({ file: RUN_STATE_OUTBOX_FILE, log: console });
 let _runStateRepairRunning = false;
 
 // Persistent, crash-safe write-ahead outbox for queued_release resolutions
@@ -1449,18 +1459,27 @@ function journalPublishUserItem(session, method, payload) {
 // Mirror a session_state transition, but only on actual change — busy/prompt/
 // turn-end events fire far more often than the state actually flips.
 function journalSessionState(session, state) {
-  if (session._journalState === state) return;
-  session._journalState = state;
-  // Track the attempt until the server confirms it. The latch above advances on ENQUEUE, but the
-  // durable queue drops its OLDEST frame on overflow, so without this an evicted transition is
-  // never retried and the convo's row stays at the pre-transition state forever (a stranded
-  // `running` renders as a permanent "Thinking" in every client). Keyed by convo id, not by
-  // session: the terminal paths delete the session from `sessions` immediately BEFORE publishing
-  // `done`, so a session-keyed record would miss exactly the case this repairs.
+  // Track the attempt until the server confirms it. The change-gate above advances on ENQUEUE,
+  // but the durable queue drops its OLDEST frame on overflow, so without a record an evicted
+  // transition is never retried and the convo's row stays at the pre-transition state forever (a
+  // stranded `running` renders as a permanent "Thinking" in every client). Keyed by convo id, not
+  // by session: the terminal paths delete the session from `sessions` immediately BEFORE
+  // publishing `done`, so a session-keyed record would miss exactly the case this repairs.
+  //
+  // The gate + write-ahead + latch decision lives in planTransition so its failure sequences are
+  // testable; see lib/session-state-repair.js.
   const convoId = journalConvoIdFor(session);
-  if (convoId) notePendingState(pendingRunStates, convoId, state);
+  const { publish, latch, token } = planTransition(
+    session._journalState,
+    state,
+    // undefined (not null) when there is no convo id: the payload is buffered for a later
+    // flush rather than published, so there is nothing to protect and nothing has failed.
+    () => (convoId ? runStateOutbox.note(convoId, state) : undefined),
+  );
+  session._journalState = latch;
+  if (!publish) return;
   journalUpsertConvo(session, { sessionState: state }, {
-    onDelivered: convoId ? () => settlePendingState(pendingRunStates, convoId, state) : undefined,
+    onDelivered: token ? () => runStateOutbox.settle(convoId, token) : undefined,
   });
 }
 
@@ -1487,19 +1506,58 @@ function republishSessionStates() {
   if (_runStateRepairRunning) return;
   _runStateRepairRunning = true;
   try {
-    const { offered, refused } = repairPendingStates(pendingRunStates, (convoId, state) =>
-      // NON-EVICTING path, deliberately: the ordinary enqueue drops the oldest queued frame when
-      // the queue is full, and at reconnect that backlog is real user traffic (prompts,
-      // permission replies). retain:false so a refused offer is not held as a snapshot that could
-      // later land on top of a newer transition — it stays in `pendingRunStates` and is re-offered
-      // on the next capacity window, recomputed from whatever the state is by then.
-      journalPublisher.upsertConvoBestEffort(convoId, { sessionState: state }, {
+    // Convos a LIVE session currently owns — same signal reconcileStrandedSubagents uses.
+    const liveConvoIds = new Set();
+    for (const session of sessions.values()) {
+      if (!session?.alive) continue;
+      const convoId = journalConvoIdFor(session);
+      if (convoId) liveConvoIds.add(convoId);
+    }
+    const { reoffer, retire } = selectEpochRepairs(runStateOutbox.list(), liveConvoIds);
+
+    // NON-EVICTING path throughout, deliberately: the ordinary enqueue drops the oldest queued
+    // frame when the queue is full, and at reconnect that backlog is real user traffic (prompts,
+    // permission replies). retain:false so a refused offer is not held as a snapshot that could
+    // later land on top of a newer transition — it stays in the outbox and is re-offered on the
+    // next capacity window, recomputed from whatever the state is by then.
+    // `recorded` is what the OUTBOX holds; `publish` is what goes on the wire. They differ for a
+    // retirement, which publishes `done` against a record that still says `running` — settling on
+    // the published value would never match, so the record would survive, the capacity hook would
+    // re-sweep it, and every confirmed `done` would schedule another one. An endless publish loop
+    // against a row that is already correct.
+    const offer = (convoId, token, publish) =>
+      journalPublisher.upsertConvoBestEffort(convoId, { sessionState: publish }, {
         retain: false,
-        onDelivered: () => settlePendingState(pendingRunStates, convoId, state),
-      }),
-    );
+        // Settle the exact REVISION this sweep acted on. A retirement publishes `done` against a
+        // record that says `running`, so matching on the published state would never clear it and
+        // the capacity hook would re-publish forever; matching on the revision also means a
+        // conversation that resumed since this offer keeps its newer record.
+        onDelivered: () => runStateOutbox.settle(convoId, token),
+      });
+
+    let refused = 0;
+    let queued = 0;
+    for (const { convoId, state, token } of reoffer) {
+      if (offer(convoId, token, state) === false) refused += 1;
+      else queued += 1;
+    }
+    // Stranded `running` with nothing alive to own it: the process running that convo is gone, so
+    // the row can never be flipped by the session itself and every client shows a "Thinking" that
+    // will never clear. Retire it to `done` — the same terminal-owner call reconcileStrandedSubagents
+    // makes for child convos.
+    let retireQueued = 0;
+    for (const { convoId, token } of retire) {
+      if (offer(convoId, token, 'done') === false) refused += 1;
+      else { queued += 1; retireQueued += 1; }
+    }
+    // Deliberately says QUEUED, not "retired"/"repaired": offer() only puts the frame on the
+    // outbound queue. Reporting success here during the exact outage this diagnoses would be a
+    // false signal to whoever is reading the log to find out what happened.
+    if (retireQueued) {
+      console.log(`[run-state-repair] queued done for ${retireQueued} stranded running convo(s) with no live session`);
+    }
     if (refused) {
-      console.warn(`[run-state-repair] ${refused} of ${offered + refused} run-state re-offer(s) refused (queue full) — retained for the next capacity window`);
+      console.warn(`[run-state-repair] ${refused} of ${queued + refused} run-state re-offer(s) refused (queue full) — retained for the next capacity window`);
     }
   } finally {
     _runStateRepairRunning = false;
@@ -1512,7 +1570,7 @@ function republishSessionStates() {
 // would leave those rows stranded forever. Gated on the map being non-empty so the common case
 // (nothing outstanding) costs one size check per confirmed send, not a sweep.
 function retryRunStateRepairs() {
-  if (pendingRunStates.size > 0) republishSessionStates();
+  if (runStateOutbox.size() > 0) republishSessionStates();
 }
 
 // Mirror the bridge's current activity into an ephemeral typing/activity
