@@ -13,3 +13,4 @@ journal-cursor.json
 .env.bak*
 
 node_modules
+run-state-outbox.json

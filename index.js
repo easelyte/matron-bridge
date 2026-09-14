@@ -526,6 +526,14 @@ const missionsClient = createMissionsClient({
 const JOURNAL_CURSOR_FILE = process.env.JOURNAL_CURSOR_FILE
   ? path.resolve(expandHome(process.env.JOURNAL_CURSOR_FILE))
   : path.join(__dirname, 'journal-cursor.json');
+// Unconfirmed run-state transitions (see lib/run-state-outbox.js). Derived exactly like
+// JOURNAL_CURSOR_FILE above — env override, else a file in the bridge's OWN directory — because
+// the store has a single-writer invariant: a second bridge reading these records would not have
+// those conversations in its `sessions` map and would retire the first bridge's LIVE convos to
+// `done`. The __dirname default makes a dev bridge from another checkout isolated by default.
+const RUN_STATE_OUTBOX_FILE = process.env.MATRON_RUN_STATE_OUTBOX_FILE
+  ? path.resolve(expandHome(process.env.MATRON_RUN_STATE_OUTBOX_FILE))
+  : path.join(__dirname, 'run-state-outbox.json');
 const JOURNAL_CONTROL_CONVO_ID = process.env.JOURNAL_CONTROL_CONVO_ID || `bridge-${os.hostname()}`;
 // Bridge-side coalescing floor for in-progress assistant-text stream frames
 // (per convo+message). Defaults to the server hub's own ~5/s fan-out window;
@@ -999,7 +1007,7 @@ const sessions = new Map(); // roomId -> session
 // convo rather than session because the terminal paths delete the session before publishing
 // `done` — see journalSessionState. On disk rather than in memory so a bridge RESTART mid-outage
 // does not lose the record and strand the row at `running` forever.
-const runStateOutbox = createRunStateOutbox({ log: console });
+const runStateOutbox = createRunStateOutbox({ file: RUN_STATE_OUTBOX_FILE, log: console });
 let _runStateRepairRunning = false;
 
 // Persistent, crash-safe write-ahead outbox for queued_release resolutions
@@ -1452,6 +1460,7 @@ function journalPublishUserItem(session, method, payload) {
 // turn-end events fire far more often than the state actually flips.
 function journalSessionState(session, state) {
   if (session._journalState === state) return;
+  const previous = session._journalState;
   session._journalState = state;
   // Track the attempt until the server confirms it. The latch above advances on ENQUEUE, but the
   // durable queue drops its OLDEST frame on overflow, so without this an evicted transition is
@@ -1460,7 +1469,15 @@ function journalSessionState(session, state) {
   // session: the terminal paths delete the session from `sessions` immediately BEFORE publishing
   // `done`, so a session-keyed record would miss exactly the case this repairs.
   const convoId = journalConvoIdFor(session);
-  if (convoId) runStateOutbox.note(convoId, state);
+  if (convoId && !runStateOutbox.note(convoId, state)) {
+    // The write-ahead failed (ENOSPC/EIO/unreadable). The frame still goes out — it may well
+    // land — but the latch must NOT stay advanced on an unprotected transition: if the frame is
+    // then evicted or the process restarts, there is no record to repair from and an identical
+    // retry would be suppressed forever, leaving the row permanently stale. Rolling it back keeps
+    // the next attempt at the same state live. Same rollback-on-refusal symmetry the subagent
+    // running store's callers apply.
+    session._journalState = previous;
+  }
   journalUpsertConvo(session, { sessionState: state }, {
     onDelivered: convoId ? () => runStateOutbox.settle(convoId, state) : undefined,
   });

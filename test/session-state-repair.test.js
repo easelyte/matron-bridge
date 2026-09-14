@@ -210,22 +210,35 @@ describe('durable-write failures do not falsely commit', () => {
 });
 
 describe('instance isolation', () => {
-  it('honours MATRON_RUN_STATE_OUTBOX_FILE so a dev bridge cannot retire the live one\'s sessions', () => {
-    // A second bridge sharing the file would not have the first's conversations in its own
-    // sessions map, so the epoch sweep would classify those LIVE convos as stranded and publish
-    // `done` against them.
-    const dir = mkdtempSync(join(tmpdir(), 'run-state-iso-'));
-    const override = join(dir, 'custom-outbox.json');
-    const prev = process.env.MATRON_RUN_STATE_OUTBOX_FILE;
-    process.env.MATRON_RUN_STATE_OUTBOX_FILE = override;
-    try {
-      createRunStateOutbox({ log: silent }).note('c1', 'running');
-      expect(existsSync(override)).toBe(true);
-    } finally {
-      if (prev === undefined) delete process.env.MATRON_RUN_STATE_OUTBOX_FILE;
-      else process.env.MATRON_RUN_STATE_OUTBOX_FILE = prev;
-      rmSync(dir, { recursive: true, force: true });
-    }
+  it('REFUSES to construct without an explicit path rather than sharing a default', () => {
+    // A shared default is the failure mode itself: a second bridge reading the first's records
+    // would not have those conversations in its own sessions map, so its epoch sweep would
+    // classify the first bridge's LIVE convos as stranded and publish `done` against them.
+    // Missing config must error, not silently fall back.
+    expect(() => createRunStateOutbox({ log: silent })).toThrow(/instance-scoped/);
+    expect(() => createRunStateOutbox({ file: '', log: silent })).toThrow(/instance-scoped/);
+  });
+
+  it('derives the default from the bridge directory, not the home directory', () => {
+    const source = readFileSync(join(root, 'index.js'), 'utf-8');
+    // Same shape as JOURNAL_CURSOR_FILE: env override, else a file in the bridge's own dir.
+    expect(source).toContain('MATRON_RUN_STATE_OUTBOX_FILE');
+    expect(source).toMatch(/path\.join\(__dirname, 'run-state-outbox\.json'\)/);
+    expect(source).toContain('createRunStateOutbox({ file: RUN_STATE_OUTBOX_FILE');
+  });
+});
+
+describe('a failed write-ahead leaves the transition retryable', () => {
+  it('rolls the session latch back so an identical retry is not suppressed', () => {
+    const source = readFileSync(join(root, 'index.js'), 'utf-8');
+    const start = source.indexOf('function journalSessionState(');
+    const body = source.slice(start, source.indexOf('\n}', start));
+    // Without the rollback, a failed note() leaves _journalState advanced on an unprotected
+    // transition: no durable record, and the change-gate swallows every retry, so the row stays
+    // stale forever.
+    expect(body).toContain('const previous = session._journalState;');
+    expect(body).toContain('!runStateOutbox.note(convoId, state)');
+    expect(body).toContain('session._journalState = previous;');
   });
 });
 
