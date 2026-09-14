@@ -138,6 +138,20 @@ describe('index.js wiring', () => {
     expect(body).not.toContain('journalUpsertConvo(');
   });
 
+  it('retries on returned send capacity, not only on another reconnect', () => {
+    // hello_ok fires onReconnect BEFORE the backlog pumps, so a connection that comes back with
+    // a full queue refuses every re-offer. Without a capacity-triggered retry, a healthy socket
+    // that never disconnects again would leave those rows stranded forever.
+    expect(source).toContain('retryRunStateRepairs()');
+    const retry = sliceFunction('function retryRunStateRepairs(');
+    expect(retry).toContain('pendingRunStates.size');
+    expect(retry).toContain('republishSessionStates()');
+  });
+
+  it('guards the sweep against synchronous re-entry from its own send', () => {
+    expect(sliceFunction('function republishSessionStates(')).toContain('_runStateRepairRunning');
+  });
+
   it('still repairs summaries and stranded subagents alongside it', () => {
     const body = sliceFunction('function handleJournalReconnect(');
     expect(body).toContain('republishSessionSummaries(');

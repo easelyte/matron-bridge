@@ -658,7 +658,7 @@ const journalPublisher = createJournalPublisher({
   onReconnect: handleJournalReconnect,
   // Send-completion retry trigger (the mandatory one): re-publishes an
   // overflow-evicted release frame on a healthy socket that never reconnects.
-  onSendCapacity: () => { republishPendingReleases(); retrySessionSummaryRepairs(); },
+  onSendCapacity: () => { republishPendingReleases(); retrySessionSummaryRepairs(); retryRunStateRepairs(); },
   // Agent-RPC dispatch. Arrow + late-bound const (journalRpcHandler is
   // defined below): safe for the same reason onEvent's forward reference
   // is — the callback only ever fires once the socket is live, long after
@@ -998,6 +998,7 @@ const sessions = new Map(); // roomId -> session
 // Keyed by convo rather than session because the terminal paths delete the session before
 // publishing `done` — see journalSessionState.
 const pendingRunStates = new Map();
+let _runStateRepairRunning = false;
 
 // Persistent, crash-safe write-ahead outbox for queued_release resolutions
 // (loop #536). Constructed here so it loads + relabels any inherited on-disk
@@ -1480,20 +1481,38 @@ function journalSessionState(session, state) {
 // one is inert. Bounded by the number of LIVE in-memory sessions.
 function republishSessionStates() {
   if (!JOURNAL_ENABLED) return;
-  const { offered, refused } = repairPendingStates(pendingRunStates, (convoId, state) =>
-    // NON-EVICTING path, deliberately: the ordinary enqueue drops the oldest queued frame when
-    // the queue is full, and at reconnect that backlog is real user traffic (prompts, permission
-    // replies). retain:false so a refused offer is not held as a snapshot that could later land
-    // on top of a newer transition — it stays in `pendingRunStates` and is re-offered on the next
-    // epoch, recomputed from whatever the state is by then.
-    journalPublisher.upsertConvoBestEffort(convoId, { sessionState: state }, {
-      retain: false,
-      onDelivered: () => settlePendingState(pendingRunStates, convoId, state),
-    }),
-  );
-  if (refused) {
-    console.warn(`[run-state-repair] ${refused} of ${offered + refused} run-state re-offer(s) refused (queue full) — retained for the next epoch`);
+  // Re-entrancy latch. A successful best-effort enqueue can pump, confirm and fire
+  // onSendCapacity synchronously on an injected transport, landing right back here mid-sweep.
+  // Same coalescing discipline as republishSessionSummaries / republishPendingReleases.
+  if (_runStateRepairRunning) return;
+  _runStateRepairRunning = true;
+  try {
+    const { offered, refused } = repairPendingStates(pendingRunStates, (convoId, state) =>
+      // NON-EVICTING path, deliberately: the ordinary enqueue drops the oldest queued frame when
+      // the queue is full, and at reconnect that backlog is real user traffic (prompts,
+      // permission replies). retain:false so a refused offer is not held as a snapshot that could
+      // later land on top of a newer transition — it stays in `pendingRunStates` and is re-offered
+      // on the next capacity window, recomputed from whatever the state is by then.
+      journalPublisher.upsertConvoBestEffort(convoId, { sessionState: state }, {
+        retain: false,
+        onDelivered: () => settlePendingState(pendingRunStates, convoId, state),
+      }),
+    );
+    if (refused) {
+      console.warn(`[run-state-repair] ${refused} of ${offered + refused} run-state re-offer(s) refused (queue full) — retained for the next capacity window`);
+    }
+  } finally {
+    _runStateRepairRunning = false;
   }
+}
+
+// Send-completion retry — the trigger that does NOT need another reconnect. hello_ok fires
+// onReconnect BEFORE the backlog pumps, so on a connection that comes back with the queue still
+// full every re-offer is refused; without this, a healthy socket that never disconnects again
+// would leave those rows stranded forever. Gated on the map being non-empty so the common case
+// (nothing outstanding) costs one size check per confirmed send, not a sweep.
+function retryRunStateRepairs() {
+  if (pendingRunStates.size > 0) republishSessionStates();
 }
 
 // Mirror the bridge's current activity into an ephemeral typing/activity
