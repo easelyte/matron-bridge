@@ -1469,7 +1469,8 @@ function journalSessionState(session, state) {
   // session: the terminal paths delete the session from `sessions` immediately BEFORE publishing
   // `done`, so a session-keyed record would miss exactly the case this repairs.
   const convoId = journalConvoIdFor(session);
-  if (convoId && !runStateOutbox.note(convoId, state)) {
+  const token = convoId ? runStateOutbox.note(convoId, state) : null;
+  if (convoId && !token) {
     // The write-ahead failed (ENOSPC/EIO/unreadable). The frame still goes out — it may well
     // land — but the latch must NOT stay advanced on an unprotected transition: if the frame is
     // then evicted or the process restarts, there is no record to repair from and an identical
@@ -1479,7 +1480,7 @@ function journalSessionState(session, state) {
     session._journalState = previous;
   }
   journalUpsertConvo(session, { sessionState: state }, {
-    onDelivered: convoId ? () => runStateOutbox.settle(convoId, state) : undefined,
+    onDelivered: token ? () => runStateOutbox.settle(convoId, token) : undefined,
   });
 }
 
@@ -1525,31 +1526,39 @@ function republishSessionStates() {
     // the published value would never match, so the record would survive, the capacity hook would
     // re-sweep it, and every confirmed `done` would schedule another one. An endless publish loop
     // against a row that is already correct.
-    const offer = (convoId, recorded, publish = recorded) =>
+    const offer = (convoId, token, publish) =>
       journalPublisher.upsertConvoBestEffort(convoId, { sessionState: publish }, {
         retain: false,
-        onDelivered: () => runStateOutbox.settle(convoId, recorded),
+        // Settle the exact REVISION this sweep acted on. A retirement publishes `done` against a
+        // record that says `running`, so matching on the published state would never clear it and
+        // the capacity hook would re-publish forever; matching on the revision also means a
+        // conversation that resumed since this offer keeps its newer record.
+        onDelivered: () => runStateOutbox.settle(convoId, token),
       });
 
     let refused = 0;
-    let offered = 0;
-    for (const { convoId, state } of reoffer) {
-      if (offer(convoId, state) === false) refused += 1;
-      else offered += 1;
+    let queued = 0;
+    for (const { convoId, state, token } of reoffer) {
+      if (offer(convoId, token, state) === false) refused += 1;
+      else queued += 1;
     }
     // Stranded `running` with nothing alive to own it: the process running that convo is gone, so
     // the row can never be flipped by the session itself and every client shows a "Thinking" that
     // will never clear. Retire it to `done` — the same terminal-owner call reconcileStrandedSubagents
     // makes for child convos.
-    for (const convoId of retire) {
-      if (offer(convoId, 'running', 'done') === false) refused += 1;
-      else offered += 1;
+    let retireQueued = 0;
+    for (const { convoId, token } of retire) {
+      if (offer(convoId, token, 'done') === false) refused += 1;
+      else { queued += 1; retireQueued += 1; }
     }
-    if (retire.length) {
-      console.log(`[run-state-repair] retired ${retire.length} stranded running convo(s) with no live session`);
+    // Deliberately says QUEUED, not "retired"/"repaired": offer() only puts the frame on the
+    // outbound queue. Reporting success here during the exact outage this diagnoses would be a
+    // false signal to whoever is reading the log to find out what happened.
+    if (retireQueued) {
+      console.log(`[run-state-repair] queued done for ${retireQueued} stranded running convo(s) with no live session`);
     }
     if (refused) {
-      console.warn(`[run-state-repair] ${refused} of ${offered + refused} run-state re-offer(s) refused (queue full) — retained for the next capacity window`);
+      console.warn(`[run-state-repair] ${refused} of ${queued + refused} run-state re-offer(s) refused (queue full) — retained for the next capacity window`);
     }
   } finally {
     _runStateRepairRunning = false;
