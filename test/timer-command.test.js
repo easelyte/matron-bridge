@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import {
   parseDuration, parseClockTime, formatDuration, parseTimerCommand, createTimerStore,
-  timerCancelButton, timerSendNowButton, MIN_TIMER_MS, MAX_TIMER_MS, OVERDUE_GRACE_MS,
+  timerCancelButton, timerSendNowButton, keepAwakeMarker, MIN_TIMER_MS, MAX_TIMER_MS, OVERDUE_GRACE_MS,
 } from '../lib/timer-command.js';
 
 // Local-time epoch builder: clock parsing is defined in the HOST's local
@@ -408,5 +408,76 @@ describe('createTimerStore', () => {
       log: vi.fn(),
     });
     expect(throwing.init()).toBe(0);
+  });
+});
+
+describe('hold-awake reminders', () => {
+  it('add carries holdAwake and source only when set, and persists them', () => {
+    const h = makeStore();
+    const plain = h.store.add({ convoId: 'c1', text: 'plain', delayMs: 60_000 });
+    const held = h.store.add({ convoId: 'c1', text: 'held', delayMs: 120_000, holdAwake: true, source: 'agent' });
+    expect(plain).not.toHaveProperty('holdAwake');
+    expect(plain).not.toHaveProperty('source');
+    expect(held).toMatchObject({ holdAwake: true, source: 'agent' });
+    expect(h.saves.at(-1).timers.find(t => t.id === held.id)).toMatchObject({ holdAwake: true, source: 'agent' });
+  });
+
+  it('holdAwakeUntil is the latest held fireAt, convo-scoped or global, null when none', () => {
+    const h = makeStore();
+    expect(h.store.holdAwakeUntil('c1')).toBeNull();
+    h.store.add({ convoId: 'c1', text: 'a', delayMs: 60_000 });
+    expect(h.store.holdAwakeUntil('c1')).toBeNull();
+    h.store.add({ convoId: 'c1', text: 'b', delayMs: 120_000, holdAwake: true });
+    const c = h.store.add({ convoId: 'c2', text: 'c', delayMs: 300_000, holdAwake: true });
+    expect(h.store.holdAwakeUntil('c1')).toBe(1_000_000 + 120_000);
+    expect(h.store.holdAwakeUntil()).toBe(1_000_000 + 300_000);
+    h.store.cancel('c2', c.id);
+    expect(h.store.holdAwakeUntil()).toBe(1_000_000 + 120_000);
+    h.tick(120_000);
+    expect(h.store.holdAwakeUntil()).toBeNull();
+  });
+
+  it('survives a restart: held records re-arm from disk with the flag intact', () => {
+    const persisted = { nextId: 3, timers: [{ id: 2, convoId: 'c1', fireAt: 1_500_000, text: 'held', holdAwake: true, source: 'agent' }] };
+    const h = makeStore({ persisted });
+    h.store.init();
+    expect(h.store.holdAwakeUntil('c1')).toBe(1_500_000);
+    expect(h.store.listForConvo('c1')[0]).toMatchObject({ holdAwake: true, source: 'agent' });
+  });
+});
+
+describe('add({ requirePersist })', () => {
+  const failing = (setTimer) => createTimerStore({
+    load: () => null, save: () => { throw new Error('ENOSPC'); }, now: () => 0,
+    setTimer, clearTimer: () => {}, onFire: () => {}, log: () => {},
+  });
+
+  it('rolls the record back and arms nothing when the save fails', () => {
+    const setTimer = vi.fn(() => 1);
+    const store = failing(setTimer);
+    expect(store.add({ convoId: 'c1', text: 'x', delayMs: 60_000, requirePersist: true })).toBeNull();
+    expect(store.listForConvo('c1')).toEqual([]);
+    expect(setTimer).not.toHaveBeenCalled();
+  });
+
+  it('without it a failed save still arms in memory, as /timer always has', () => {
+    const setTimer = vi.fn(() => 1);
+    const store = failing(setTimer);
+    expect(store.add({ convoId: 'c1', text: 'x', delayMs: 60_000 })).toMatchObject({ id: 1 });
+    expect(setTimer).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('keepAwakeMarker', () => {
+  it('is null without held records and the latest held fireAt otherwise', () => {
+    expect(keepAwakeMarker([])).toBeNull();
+    expect(keepAwakeMarker(null)).toBeNull();
+    expect(keepAwakeMarker([{ id: 1, fireAt: 5, text: 'x' }])).toBeNull();
+    expect(keepAwakeMarker([
+      { id: 1, fireAt: 5, holdAwake: true },
+      { id: 2, fireAt: 9, holdAwake: true },
+      { id: 3, fireAt: 99 },
+      null,
+    ])).toEqual({ until: 9, reminders: 2 });
   });
 });

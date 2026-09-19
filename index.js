@@ -8,6 +8,7 @@ import { createSendAttachmentHandler, resolveAndUploadLocalFile } from './lib/se
 import { bashTimeoutEnv } from './lib/bash-timeout-env.js';
 import { createItemsClient } from './lib/items-client.js';
 import { createItemsHandlers } from './lib/items-tools.js';
+import { createReminderHandlers } from './lib/reminder-tools.js';
 import { createMissionsClient } from './lib/missions-client.js';
 import { createMissionsHandlers } from './lib/missions-tools.js';
 import { createServer } from 'http';
@@ -63,7 +64,7 @@ import {
 // formatDuration aliased: index.js has its own uptime formatDuration (no
 // day unit); timer feedback uses the lib's day-aware one so "/timer 7d"
 // reads "7d", not "168h".
-import { parseTimerCommand, formatDuration as formatTimerDuration, createTimerStore, timerCancelButton, timerSendNowButton } from './lib/timer-command.js';
+import { parseTimerCommand, formatDuration as formatTimerDuration, createTimerStore, timerCancelButton, timerSendNowButton, keepAwakeMarker } from './lib/timer-command.js';
 import { sleepConfig, sleepButtons, sleepCardText, performSleep, runSleepCommand, SLEEP_NOT_CONFIGURED } from './lib/sleep-command.js';
 import { promptButtons, promptResponseForButton } from './lib/prompt-buttons.js';
 import { parseOptionReply } from './lib/prompt-reply.js';
@@ -293,6 +294,12 @@ const RECENT_FOLDERS_FILE = path.join(os.homedir(), '.matron-bridge-folders.json
 // a pending timer outlives the idle reaper, session restarts, and full
 // bridge restarts (re-armed in main() via timerStore.init()).
 const TIMERS_FILE = path.join(os.homedir(), '.matron-bridge-timers.json');
+// Guest-side keep-awake marker, derived from TIMERS_FILE on every save (see
+// writeKeepAwakeMarker): {until: epoch-ms} while any reminder was set with
+// hold_awake, absent otherwise. The dev host's vm-idle-stop probe reads it
+// next to the timers file and treats an unexpired `until` as activity, so a
+// box carrying such a reminder is not wound down before it fires.
+const KEEPAWAKE_FILE = path.join(os.homedir(), '.matron-bridge-keepawake.json');
 // In-flight turn markers for restart carry-on — written at turn start, removed
 // at turn end, reconciled at the next boot (see lib/inflight-marker.js).
 const INFLIGHT_FILE = path.join(os.homedir(), '.matron-bridge-inflight.json');
@@ -8115,18 +8122,9 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       }
       if (parsed.kind === 'set') {
         const record = timerStore.add({ convoId, roomId, text: parsed.message, delayMs: parsed.delayMs });
-        // Wall-clock rendering includes the timezone name ("12:26 AM UTC") —
-        // the server's clock is rarely the user's, so a bare time is
-        // ambiguous, and echoing the resolved moment is the only thing that
-        // catches a host/phone timezone mismatch on `/timer 00:10 <message>`.
-        // Same-day timers show just the time; anything landing on another
-        // local day adds the date. Keyed on the calendar day rather than
-        // ">=24h" because a clock time that rolled to tomorrow is under 24h
-        // away yet still not today — "at 12:10 AM" alone would read as tonight.
-        const fireAt = new Date(record.fireAt);
-        const at = fireAt.toDateString() === new Date(record.createdAt).toDateString()
-          ? fireAt.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', timeZoneName: 'short' })
-          : fireAt.toLocaleString([], { year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZoneName: 'short' });
+        // See formatTimerFireAt for why the timezone name and (sometimes)
+        // the date ride along.
+        const at = formatTimerFireAt(record);
         const summary =
           `⏰ Timer #${record.id} set — will send "${parsed.message}" in ${formatTimerDuration(parsed.delayMs)} (at ${at}). ` +
           `It survives session restarts and idle reaping.`;
@@ -9241,8 +9239,69 @@ async function fireTimer(record) {
       `⏰ Timer #${record.id} fired, but this conversation's session can't be found or resumed — "${record.text}" was not delivered.`);
     return;
   }
+  if (record.source === 'agent') {
+    // Set by the agent through reminder_create: the delivered turn says so,
+    // or the model reads its own reminder as something the user just typed.
+    journalPublishNotice(journalConvoIdFor(session), `⏰ Reminder #${record.id} (set by the agent): "${record.text}"`);
+    await journalRouteTextToSession(session,
+      `⏰ Reminder #${record.id} — you set this ${formatTimerDuration(Date.now() - record.createdAt)} ago: ${record.text}`);
+    return;
+  }
   journalPublishNotice(journalConvoIdFor(session), `⏰ Timer #${record.id}: sending "${record.text}"`);
   await journalRouteTextToSession(session, record.text);
+}
+
+// Keep KEEPAWAKE_FILE in step with the persisted timers: written with the
+// latest hold-awake fireAt while one is pending, removed the moment none is
+// (a fire, a cancel). Called from the store's save() so it can never drift
+// from what is on disk; failures are logged, never thrown — the timers
+// themselves were already persisted and a missing marker only means the
+// box may sleep, which is the default anyway.
+function writeKeepAwakeMarker(timers) {
+  try {
+    const marker = keepAwakeMarker(timers);
+    if (!marker) {
+      fs.rmSync(KEEPAWAKE_FILE, { force: true });
+      return;
+    }
+    atomicWriteFileSync(KEEPAWAKE_FILE, JSON.stringify({ ...marker, updatedAt: Date.now() }, null, 2));
+  } catch (e) {
+    try { console.warn(`[timer] keep-awake marker update failed: ${e.message}`); } catch { /* logging must never throw */ }
+  }
+}
+
+// Wall-clock rendering of a timer's fire time, including the timezone name
+// ("12:26 AM UTC") — the server's clock is rarely the user's, so a bare time
+// is ambiguous, and echoing the resolved moment is the only thing that
+// catches a host/phone timezone mismatch on `/timer 00:10 <message>`.
+// Same-day timers show just the time; anything landing on another local
+// day adds the date. Keyed on the calendar day rather than ">=24h" because
+// a clock time that rolled to tomorrow is under 24h away yet still not
+// today — "at 12:10 AM" alone would read as tonight.
+function formatTimerFireAt(record) {
+  const fireAt = new Date(record.fireAt);
+  return fireAt.toDateString() === new Date(record.createdAt).toDateString()
+    ? fireAt.toLocaleTimeString([], { hour: 'numeric', minute: '2-digit', timeZoneName: 'short' })
+    : fireAt.toLocaleString([], { year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit', timeZoneName: 'short' });
+}
+
+// The chat's record of a reminder the AGENT set (reminder_create): the same
+// Send-now / Cancel card a typed /timer gets, so the user can see and undo
+// what their agent scheduled from the phone. Falls back to a plain notice
+// where the session cannot publish picker frames.
+async function announceAgentReminder(session, record) {
+  const hold = record.holdAwake ? ' It keeps this box awake (and the session un-reaped) until then.' : '';
+  const summary =
+    `⏰ The agent set itself reminder #${record.id} — in ${formatTimerDuration(record.fireAt - Date.now())} ` +
+    `(at ${formatTimerFireAt(record)}): "${record.text}".${hold}`;
+  if (session.sendButtonMessage) {
+    await session.sendButtonMessage(
+      summary,
+      [timerSendNowButton(record.id), timerCancelButton(record.id)],
+      'pick_one', summary, escapeHtml(summary));
+  } else {
+    journalPublishNotice(journalConvoIdFor(session), summary);
+  }
 }
 
 // One boot identity per bridge process — the whole of restart-carry-on
@@ -9264,7 +9323,10 @@ const timerStore = createTimerStore({
   load: () => (fs.existsSync(TIMERS_FILE) ? JSON.parse(fs.readFileSync(TIMERS_FILE, 'utf-8')) : null),
   // Atomic replace, same rationale as savePersistedSessions: a truncating
   // in-place write that dies mid-rewrite would silently drop every timer.
-  save: (data) => atomicWriteFileSync(TIMERS_FILE, JSON.stringify(data, null, 2)),
+  save: (data) => {
+    atomicWriteFileSync(TIMERS_FILE, JSON.stringify(data, null, 2));
+    writeKeepAwakeMarker(data.timers);
+  },
   now: Date.now,
   setTimer: (fn, delay) => setTimeout(fn, delay),
   clearTimer: (handle) => clearTimeout(handle),
@@ -10611,6 +10673,16 @@ const missionsHandlers = createMissionsHandlers({
   client: missionsClient,
 });
 
+// The three reminder_* tools (lib/reminder-tools.js): the agent-callable
+// face on the /timer store, so a reminder outlives the idle reaper, a
+// restart and a VM idle-stop (the dev host wakes the box for it).
+const reminderHandlers = createReminderHandlers({
+  sessions,
+  journalConvoIdFor,
+  timerStore,
+  announce: announceAgentReminder,
+});
+
 // Parent-side agent-spawn handlers (lib/agent-spawn.js), backing the
 // agent_boxes / agent_session_start MCP tools and the kind:'spawn' outcome
 // frames. Constructed exactly once, here — the factory starts an unref'd
@@ -11065,6 +11137,15 @@ const apiServer = createServer(async (req, res) => {
         const name = itemsRoute[1];
         await respondAgentChatRoute(res, data, itemsHandlers[name],
           (status, b) => debug(`items/${name} ${status} ${b.error || (b.item ? `#${b.item.num ?? '?'}` : `${(b.items || []).length} items`)}`));
+        return;
+      }
+
+      // The three reminder_* tool routes; same one-matcher allowlist shape.
+      const remindersRoute = url.pathname.match(/^\/reminders\/(create|list|cancel)$/);
+      if (remindersRoute) {
+        const name = remindersRoute[1];
+        await respondAgentChatRoute(res, data, reminderHandlers[name],
+          (status, b) => debug(`reminders/${name} ${status} ${b.error || (b.reminder ? `#${b.reminder.id}` : b.reminders ? `${b.reminders.length} reminders` : `${(b.cancelled || []).length} cancelled`)}`));
         return;
       }
 
@@ -12118,6 +12199,16 @@ function startIdleReaper() {
       if (session._autoStopped) continue;
       const last = session.lastActivityAt || session.startedAt || 0;
       if (now - last < SESSION_IDLE_TIMEOUT_MS) continue;
+      // A pending hold-awake reminder (reminder_create hold_awake: true) is
+      // the agent saying the work in between must not be interrupted — the
+      // box stays up for it (KEEPAWAKE_FILE), and so does the session.
+      // Bounded by MAX_TIMER_MS, and the store drops the record at fire
+      // time, so this can never pin a session for good.
+      const holdUntil = timerStore.holdAwakeUntil(journalConvoIdFor(session));
+      if (holdUntil && holdUntil > now) {
+        debug(`Not reaping ${roomId}: hold-awake reminder pending until ${new Date(holdUntil).toISOString()}`);
+        continue;
+      }
 
       // Silent reap — posting a Matrix notice would bump the room to the top
       // of the user's room list, defeating the purpose. The session is

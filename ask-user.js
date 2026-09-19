@@ -10,6 +10,7 @@ import { formatBox } from './lib/agent-boxes-format.js';
 import { itemLine, formatItemList, formatItemDetail, formatCommentAck } from './lib/items-format.js';
 import { formatStartAck, formatMilestoneAck, formatMissionDetail, missionLine, formatBlocked, formatJournalError } from './lib/missions-format.js';
 import { missionIdemKey } from './lib/missions-idem.js';
+import { formatReminderLine } from './lib/reminder-tools.js';
 
 // Route to whichever bridge spawned us: explicit BRIDGE_API_URL wins, else the
 // per-session MATRON_BRIDGE_API_PORT exported by the bridge at spawn (journal=9812,
@@ -413,20 +414,21 @@ server.tool(
 
 server.tool(
   'agent_session_start',
-  "Ask the user's consent to start a new agent session on one of their boxes — this one included, when the work has to happen here — seeded with a task. If the user has not already said which box and directory the work should happen in, ask them before calling this — they usually have a preference, and the consent card can only be approved or declined, it cannot be corrected. The result is pending: do NOT wait or poll — the user's decision and the spawn outcome arrive automatically as later turns. On approval a chat room links you to the new session; its reports arrive there.",
+  "Ask the user's consent to start a new agent session on one of their boxes — this one included, when the work has to happen here — seeded with a task. If the user has not already said which box and directory the work should happen in, ask them before calling this — they usually have a preference, and the consent card can only be approved or declined, it cannot be corrected. The result is pending: do NOT wait or poll — the user's decision and the spawn outcome arrive automatically as later turns. On approval the new session runs detached by default: it does the task and does not report back — a clean break, which is what a spawn normally is. Pass link: true only when you need its results in a chat room; the room is then created on approval and the child is told to report there.",
   {
     device_id: z.number().int().describe('Target box device id, from agent_boxes'),
     workdir: z.string().describe('Absolute working directory on the target box, from agent_boxes folders'),
     task: z.string().max(2000).describe('The task prompt. Shown VERBATIM on the user\'s consent card and executed verbatim as the new session\'s first turn — write it for both audiences.'),
     topic: z.string().max(200).optional().describe('Optional short room/session title'),
     model: z.string().optional().describe('Optional Claude model alias for the new session: default, opus, opus[1m], sonnet, sonnet[1m], haiku, opusplan, fable (or a full claude-* model name). Omit to use the target box\'s own default — only set it if the user asked for a specific model.'),
+    link: z.boolean().optional().describe('Open a chat room between this session and the new one, and have it report its outcome there. Default false: the spawned session is detached and simply does its task. Set true only when you need its results back here.'),
   },
-  async ({ device_id, workdir, task, topic, model }) => {
+  async ({ device_id, workdir, task, topic, model, link }) => {
     try {
       const postRes = await fetch(`${BRIDGE_API}/agent-session-start`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ roomId: ROOM_ID, device_id, workdir, task, ...(topic ? { topic } : {}), ...(model ? { model } : {}) }),
+        body: JSON.stringify({ roomId: ROOM_ID, device_id, workdir, task, ...(topic ? { topic } : {}), ...(model ? { model } : {}), ...(link === true ? { link: true } : {}) }),
       });
       const data = await postRes.json().catch(() => ({}));
       if (!postRes.ok) {
@@ -900,3 +902,46 @@ server.tool(
 
 const transport = new StdioServerTransport();
 await server.connect(transport);
+
+// Reminders: the agent-callable face on the bridge's durable /timer store
+// (lib/reminder-tools.js). Same shape as callItems.
+async function callReminders(name, args, render) {
+  try {
+    const res = await fetch(`${BRIDGE_API}/reminders/${name}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ roomId: ROOM_ID, ...args }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) return { content: [{ type: 'text', text: `reminder_${name} failed: ${data.error || `HTTP ${res.status}`}` }] };
+    return { content: [{ type: 'text', text: render(data) }] };
+  } catch (err) {
+    return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
+  }
+}
+
+server.tool(
+  'reminder_create',
+  "Schedule a durable reminder to yourself: at the fire time the bridge delivers `text` into THIS conversation as a new turn (⏰ Reminder #N …), resuming the session if it was reaped. Unlike CronCreate / ScheduleWakeup, which live in this process and die at the bridge's idle reap (~1 h), on a restart, and when this dev box idle-stops, a reminder is persisted by the bridge, re-armed after a restart, and known to the host: the box may go to sleep meanwhile and is started again a few minutes before the reminder fires. Use this for anything further out than about an hour. The user sees a card with Send-now / Cancel buttons. Pass exactly one of `in` or `at`. Set hold_awake: true ONLY when the work between now and then must not be interrupted (a build, a watch, a long download): it keeps this box from idle-stopping and this session from being reaped until the reminder fires, which costs shared host memory for every hour of it.",
+  {
+    text: z.string().min(1).max(2000).describe('What to tell yourself when it fires — write it for your future self, with enough context to act on'),
+    in: z.string().optional().describe('Delay: 30s, 45m, 2h, 1d, 1h30m (5 s to 7 d)'),
+    at: z.string().optional().describe("Clock time on this box: 09:00, 14:30, 9pm, 12:10am — the next occurrence"),
+    hold_awake: z.boolean().optional().describe('Keep this box awake and this session un-reaped until it fires. Default false: the box may sleep and is woken for it.'),
+  },
+  async (args) => callReminders('create', args, (d) => `Reminder set: ${formatReminderLine(d.reminder)}${d.reminder.hold_awake ? ' — the box stays awake until then.' : ' — the box may sleep and will be woken for it.'}`),
+);
+
+server.tool(
+  'reminder_list',
+  "List the pending reminders for this conversation — yours and any the user set with /timer.",
+  {},
+  async (args) => callReminders('list', args, (d) => d.reminders.length ? d.reminders.map(formatReminderLine).join('\n') : 'No reminders pending in this conversation.'),
+);
+
+server.tool(
+  'reminder_cancel',
+  "Cancel a pending reminder in this conversation by its number, or 'all' of them.",
+  { id: z.union([z.number().int(), z.literal('all')]).describe("Reminder number from reminder_list / the create result, or 'all'") },
+  async (args) => callReminders('cancel', args, (d) => `Cancelled ${d.cancelled.length === 1 ? 'reminder' : `${d.cancelled.length} reminders`}: ${d.cancelled.map(formatReminderLine).join('; ')}`),
+);

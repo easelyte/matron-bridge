@@ -434,12 +434,47 @@ describe('start', () => {
       expect(responses[0].error).toEqual({ code: 'spawn_failed', detail: 'bind boom' });
     });
 
-    it('without room_id behaves exactly as before: no bind/inject calls', () => {
-      const { handler, responses, bound, injected } = spawnHarness();
-      handler(REQ('start', { prompt: 'irrelevant when there is no room_id' }));
+    it('detached spawn (prompt, no room_id): injects an opening turn that says there is no room, binds nothing, marks the session spawned', () => {
+      const { handler, responses, session, sequence, bound, injected } = spawnHarness();
+      handler(REQ('start', { prompt: 'do the thing', from_name: 'yearbook-app' }));
+      expect(sequence).toEqual(['inject']);
+      expect(bound).toHaveLength(0);
+      expect(injected).toHaveLength(1);
+      const [injectedSession, text] = injected[0];
+      expect(injectedSession).toBe(session);
+      expect(text).toContain('do the thing');
+      expect(text).toContain('yearbook-app');
+      expect(text).toMatch(/detached/);
+      expect(text).not.toMatch(/agent_chat_send/);
+      expect(session.spawnedByAgent).toBe(true);
+      expect(session.spawnTask).toBe('do the thing');
+      expect(responses[0]).toEqual({ requestId: 'r1', toDeviceId: 7, ok: true, result: { convo_id: 'convo-9' } });
+    });
+
+    it('a bare start (no prompt, no room_id — the app\'s New Chat) injects nothing and wears no marker', () => {
+      const { handler, responses, session, bound, injected } = spawnHarness();
+      handler(REQ('start', {}));
       expect(bound).toHaveLength(0);
       expect(injected).toHaveLength(0);
+      expect(session.spawnedByAgent).toBeUndefined();
       expect(responses[0]).toEqual({ requestId: 'r1', toDeviceId: 7, ok: true, result: { convo_id: 'convo-9' } });
+    });
+
+    it('detached spawn: injectTurn refusing tears the session down (no unbind — nothing was bound), spawn_failed', () => {
+      const { handler, responses, session, stopped, unbound } = spawnHarness({ injectTurn: () => false });
+      handler(REQ('start', { prompt: 'do the thing' }));
+      expect(stopped).toEqual([session]);
+      expect(unbound).toHaveLength(0);
+      expect(responses[0].error.code).toBe('spawn_failed');
+    });
+
+    it('detached spawn with no injectTurn wired -> unsupported_mode, session torn down', () => {
+      const stopped = [];
+      const session = { journalConvoId: 'convo-9' };
+      const { handler, responses } = harness({ startSession: () => session, stopSession: (s) => stopped.push(s) });
+      handler(REQ('start', { prompt: 'do the thing' }));
+      expect(stopped).toEqual([session]);
+      expect(responses[0]).toEqual({ requestId: 'r1', toDeviceId: 7, ok: false, error: { code: 'unsupported_mode', detail: 'spawn wiring absent' } });
     });
 
     it('room_id with spawn-room deps absent -> unsupported_mode, session torn down', () => {
@@ -682,6 +717,19 @@ describe('composeSpawnOpeningTurn', () => {
     });
     expect(text).not.toContain('n'.repeat(80));
     expect(text).toContain(`${'n'.repeat(79)}…`); // peerField cap: PEER_NAME_MAX incl. ellipsis
+  });
+
+  it('with no roomId the turn is a clean break: provenance and task, no channel back, no report-there instruction', () => {
+    const text = composeSpawnOpeningTurn({ task: 'do a thing', roomId: null, fromName: 'yearbook-app', serverLabel: 'dev-6' });
+    expect(text).toContain('[spawned session]');
+    expect(text).toContain('yearbook-app');
+    expect(text).toContain('do a thing');
+    expect(text).toMatch(/detached/);
+    expect(text).toMatch(/not waiting/);
+    expect(text).not.toMatch(/agent_chat_send/);
+    expect(text).not.toMatch(/report progress/);
+    expect(text).toMatch(/agent_chat_start/);
+    expect(text).toMatch(/The user can read everything you write/);
   });
 });
 

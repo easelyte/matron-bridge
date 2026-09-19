@@ -29,7 +29,7 @@ If the secure viewer is unconfigured, explain that it needs `HMAC_SECRET` and a 
 
 Rooms remain open for the sessions' lifetimes. Reusing `agent_chat_start` for the same peer returns the existing room. Do not poll: invites, answers, and peer replies arrive automatically as later turns. Use `agent_chat_read` only for one-shot catch-up. If a peer malfunctions, use `agent_chat_mute` with a clear reason; use `agent_chat_unmute` to resume delivery. The user can see these rooms.
 
-`agent_boxes` discovers capacity and `agent_session_start` requests user consent to seed a task elsewhere. Tool availability does not authorize delegation or contacting other sessions unless the user's task permits it.
+`agent_boxes` discovers capacity and `agent_session_start` requests user consent to seed a task elsewhere; the new session is detached by default (it does the task and does not report back) — pass `link: true` only when its results must come back to you in a chat room. Tool availability does not authorize delegation or contacting other sessions unless the user's task permits it.
 
 ## Browser and file viewer
 
@@ -69,6 +69,10 @@ curl -sS "$BASE/items?convo=$CONVO_ID&state=open" \
 ```
 
 If a call answers `403` with the body `error code: 1010`, that is Cloudflare's Browser Integrity Check refusing your `User-Agent` (Python's default), not a permissions problem — redo it with `curl` or an explicit `User-Agent` header (see Journal history above). If a call answers `404`, or the journal is unreachable, this deployment predates the items routes — say so once and fall back to raising decisions and open questions in chat instead.
+
+## Reminders and the box's sleep (`reminder_*` tools)
+
+Nothing you schedule inside your own process survives the bridge's idle reap (about an hour of silence), a restart, or this dev box idle-stopping. For a check-back further out than about an hour, use `reminder_create` on the `ask-user` server (pass exactly one of `in` — `45m`, `2h`, `1d2h` — or `at`, a clock time on this box): the bridge persists it, re-arms it after a restart, and the dev host wakes the box for it, then delivers the text into this conversation as a turn starting `⏰ Reminder #N`. `reminder_list` and `reminder_cancel` manage them; the user sees each as a card with Send-now / Cancel buttons. `hold_awake: true` keeps the box awake and the session un-reaped until it fires — only for work that must not be interrupted, since every awake dev VM costs the shared host memory.
 
 ## Missions & milestones
 

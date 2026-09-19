@@ -155,6 +155,20 @@ describe('createAgentSpawnHandlers', () => {
       expect(sent[0].model).toBe('claude-opus-4-8');
     });
 
+    it('carries link: true in the spawn_request frame only when asked; a non-boolean link is a 400 with no frame', async () => {
+      const { handlers, sent } = mk();
+      handlers.sessionStart({ roomId: 'sess-1', device_id: 2, workdir: '/w', task: 'x', link: true });
+      expect(sent[0].link).toBe(true);
+      handlers.sessionStart({ roomId: 'sess-1', device_id: 2, workdir: '/w', task: 'x' });
+      expect('link' in sent[1]).toBe(false);
+      handlers.sessionStart({ roomId: 'sess-1', device_id: 2, workdir: '/w', task: 'x', link: false });
+      expect('link' in sent[2]).toBe(false);
+      const bad = await handlers.sessionStart({ roomId: 'sess-1', device_id: 2, workdir: '/w', task: 'x', link: 'yes' });
+      expect(bad.status).toBe(400);
+      expect(bad.body.error).toMatch(/link/);
+      expect(sent).toHaveLength(3);
+    });
+
     it('omits the model key entirely when none was asked for', async () => {
       const { handlers, sent } = mk();
       handlers.sessionStart(good);
@@ -233,6 +247,20 @@ describe('createAgentSpawnHandlers', () => {
       const text = ctx.notices[0].text;
       expect(text).toMatch(/started/);
       expect(text).toMatch(/room-9/);
+    });
+
+    it('started without room_id (detached spawn) — rooms.record NOT called, notice says detached and names the child, no literal undefined', async () => {
+      const ctx = await armStarted();
+      ctx.handlers.onSpawnFrame({ kind: 'spawn', event: 'outcome', request_id: 'row-1', outcome: 'started', child_convo_id: 'child-1' });
+      expect(ctx.rooms.calls).toHaveLength(0);
+      expect(ctx.notifyParent).toHaveBeenCalledTimes(1);
+      const text = ctx.notices[0].text;
+      expect(text).toMatch(/started/);
+      expect(text).toMatch(/detached/);
+      expect(text).toMatch(/child-1/);
+      expect(text).toMatch(/agent_chat_start/);
+      expect(text).not.toMatch(/undefined/);
+      expect(text).not.toMatch(/Chat room/);
     });
 
     it('declined — notifyParent text contains declined; rooms.record NOT called', async () => {
@@ -568,7 +596,7 @@ describe('index.js + ask-user.js spawn wiring (source inspection)', () => {
 
   const TOOL_WIRING = [
     ['agent_boxes', '/agent-boxes', ['roomId: ROOM_ID']],
-    ['agent_session_start', '/agent-session-start', ['roomId: ROOM_ID', 'device_id', 'workdir', 'task', 'topic']],
+    ['agent_session_start', '/agent-session-start', ['roomId: ROOM_ID', 'device_id', 'workdir', 'task', 'topic', 'link']],
   ];
   function toolBlock(name) {
     const start = askUserSrc.indexOf(`'${name}',`);
@@ -589,5 +617,6 @@ describe('index.js + ask-user.js spawn wiring (source inspection)', () => {
     expect(block).toMatch(/device_id: z\.number\(\)\.int\(\)/);
     expect(block).toMatch(/task: z\.string\(\)\.max\(2000\)/);
     expect(block).toMatch(/topic: z\.string\(\)\.max\(200\)\.optional\(\)/);
+    expect(block).toMatch(/link: z\.boolean\(\)\.optional\(\)/);
   });
 });

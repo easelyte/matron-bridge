@@ -42,7 +42,7 @@ Chat rooms are shared conversations between the user's agent sessions (often on 
 - Never poll. Pending invites, answers, and peer replies all arrive automatically as later turns — if a result is `pending`, continue your own work. Use `agent_chat_read` for one-shot catch-up, never in a loop.
 - Keep room messages concise and coordination-focused: outcomes, questions, decisions — not running commentary.
 - Your working output (tool runs, files, analysis) stays in your own conversation. Only `agent_chat_start`'s opening message, `agent_chat_send`, and `send_attachment` with `chat_room_id` post into a room.
-- `agent_boxes` lists the user's boxes — this one included, marked "this box" — with recent folders, activity, and usage limits so you can find spare capacity or hand over on the same machine; `agent_session_start` asks the user's consent to seed a task on one of them — the outcome, like everything else here, arrives as a later turn.
+- `agent_boxes` lists the user's boxes — this one included, marked "this box" — with recent folders, activity, and usage limits so you can find spare capacity or hand over on the same machine; `agent_session_start` asks the user's consent to seed a task on one of them — the outcome, like everything else here, arrives as a later turn. The new session is detached by default: it does its task and does not report back (a spawn is a clean break; the user reads its transcript directly). Pass `link: true` only when you need its results in a chat room.
 
 ## Tasks & decisions (`item_*` tools)
 
@@ -56,6 +56,14 @@ The user has a task & decision tracker beside the chat — a persistent, shared 
 - Items are shared by every session of this user. Don't file a duplicate of one `item_list` already shows — `item_comment` on it instead. Keep titles short and specific; put the reasoning in `body`.
 - **An item is the whole history of that piece of work, images included.** Follow-up screenshots, renders and files go in the comment's `attachments` (local paths, same as `item_create`), never "the image is in the conversation" — the user reads the item's thread, not the chat, to see how it went.
 - Refer to items by number in chat rather than pasting their contents back in, and always as a markdown link: `[#12](matron://item/12)`. A bare `#12` is dead text in the apps and collides with GitHub issue numbers; the link form is what the apps turn into a tap-to-open reference. This is where "let's put it in a GitHub issue" instincts should go instead; use `links` on an item when an issue or PR already exists alongside it. A repo's own CLAUDE.md that still says to raise questions as GitHub issues predates the tracker: file the item, and put the issue in `links` only if one is genuinely needed for other people.
+
+## Reminders and the box's sleep (`reminder_*` tools)
+
+Your in-process schedulers (`CronCreate`, `ScheduleWakeup`) live only in this claude process. They die at the bridge's idle reap (about an hour of silence), on `!restart`/`restart_session`, and when this dev box idle-stops — keeping the box awake would not save them. For anything further out than about an hour, use `reminder_create` instead: the bridge persists it, re-arms it after a restart, and the dev host knows about it, so the box may sleep meanwhile and is started again a few minutes before it fires. The reminder arrives as a turn starting `⏰ Reminder #N — you set this … ago:`, in this conversation, resuming the session if it was reaped. Write the text for your future self with enough context to act on.
+
+- Pass exactly one of `in` (`45m`, `2h`, `1d2h`) or `at` (a clock time on this box, next occurrence). `reminder_list` shows what is pending, `reminder_cancel` (a number or `all`) removes it; the user sees each one as a card with Send-now / Cancel buttons and can do the same from the phone.
+- `hold_awake: true` keeps this box from idle-stopping and this session from being reaped until the reminder fires. Use it only when the work in between must not be interrupted (a build, a watch, a long transfer). Every awake dev VM costs the shared host memory, so the default — sleep, then be woken for it — is the right one for a plain "check back later".
+- If you have already set a CronCreate for something long, replace it: set the reminder, then delete the cron job.
 
 ## Missions & milestones
 
