@@ -219,3 +219,59 @@ describe('items handlers', () => {
     expect(client.update.mock.calls[2]).toEqual(['it_1', { mission: null }]);
   });
 });
+
+describe('items handlers Files deep link (loop #739)', () => {
+  const WEB = 'https://bridge.easelyte.ai';
+  const WORK = '/root/.openclaw/workspace';
+
+  function webFixture(webBaseUrl) {
+    const session = { roomId: '!r:s', workdir: WORK, journalConvoId: 'c1' };
+    const sessions = new Map([['!r:s', session]]);
+    const client = {
+      create: vi.fn(async () => ({ status: 201, data: { item: { id: 'it_1', num: 1 } } })),
+      comment: vi.fn(async () => ({ status: 201, data: { item: {}, comment: { id: 'ic_1' } } })),
+      update: vi.fn(async () => ({ status: 200, data: { item: {} } })),
+    };
+    // Mirrors resolveAndUploadLocalFile's media shape, including the resolved absPath + workdir the
+    // deep-link builder needs.
+    const uploadLocalFile = vi.fn(async (_s, p) => ({
+      ok: true,
+      media: { blob_ref: 'b-' + p, mime: 'text/markdown', name: p.split('/').pop(), size: 3, isImage: false, absPath: `${WORK}/${p.split('/').pop()}`, workdir: WORK },
+    }));
+    const h = createItemsHandlers({ sessions, journalConvoIdFor: (s) => s?.journalConvoId ?? null, client, uploadLocalFile, webBaseUrl });
+    return { h, client };
+  }
+
+  it('create: appends a Files deep link line per attachment to the body when webBaseUrl is set', async () => {
+    const { h, client } = webFixture(WEB);
+    await h.create({ roomId: '!r:s', kind: 'task', title: 'Handoff', body: 'draft is ready', attachments: ['dan-offer.md'] });
+    const sent = client.create.mock.calls[0][0];
+    expect(sent.body).toBe(
+      `draft is ready\n\n📁 Open dan-offer.md in Files: ${WEB}/journal/#files=${encodeURIComponent(`${WORK}/dan-offer.md`)}`,
+    );
+    // The attachment record itself is unchanged (deep link is additive, not a replacement).
+    expect(sent.attachments).toEqual([{ blob_ref: 'b-dan-offer.md', mime: 'text/markdown', name: 'dan-offer.md', size: 3 }]);
+  });
+
+  it('create: an attachment-only item gets a body built from just the deep link', async () => {
+    const { h, client } = webFixture(WEB);
+    await h.create({ roomId: '!r:s', kind: 'task', title: 'Handoff', attachments: ['dan-offer.md'] });
+    expect(client.create.mock.calls[0][0].body).toBe(
+      `📁 Open dan-offer.md in Files: ${WEB}/journal/#files=${encodeURIComponent(`${WORK}/dan-offer.md`)}`,
+    );
+  });
+
+  it('comment: appends the deep link to the comment body when webBaseUrl is set', async () => {
+    const { h, client } = webFixture(WEB);
+    await h.comment({ roomId: '!r:s', id: 'it_1', body: 'see attached', attachments: ['dan-offer.md'] });
+    expect(client.comment.mock.calls[0][1].body).toBe(
+      `see attached\n\n📁 Open dan-offer.md in Files: ${WEB}/journal/#files=${encodeURIComponent(`${WORK}/dan-offer.md`)}`,
+    );
+  });
+
+  it('leaves the body untouched (plain-path fallback) when webBaseUrl is unset', async () => {
+    const { h, client } = webFixture('');
+    await h.create({ roomId: '!r:s', kind: 'task', title: 'Handoff', body: 'draft is ready', attachments: ['dan-offer.md'] });
+    expect(client.create.mock.calls[0][0].body).toBe('draft is ready');
+  });
+});

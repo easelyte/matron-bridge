@@ -7,6 +7,7 @@ import path from 'node:path';
 import {
   isSensitivePath, checkFileLink, validateAndOpen, pinAllowedRoots, pinAllowedRootsSync,
   pinAllowedRootIdentities, FileLinkDenied, MAX_VIEW_BYTES,
+  buildFilesDeepLink, appendFilesDeepLink,
 } from '../lib/file-link-guard.js';
 
 describe('isSensitivePath', () => {
@@ -581,5 +582,81 @@ describe('pinAllowedRootIdentities', () => {
       expect(() => pinAllowedRootIdentities(identities))
         .toThrowError(expect.objectContaining({ reason: 'bad-workdir' }));
     }
+  });
+});
+
+describe('buildFilesDeepLink', () => {
+  const WEB = 'https://bridge.easelyte.ai';
+  const WORK = '/root/.openclaw/workspace';
+
+  it('mints a token-less #files= hash link for an in-root, non-sensitive file', () => {
+    const link = buildFilesDeepLink(`${WORK}/dan-offer.md`, WORK, WEB);
+    expect(link).toBe(`${WEB}/journal/#files=${encodeURIComponent(`${WORK}/dan-offer.md`)}`);
+    // No token/HMAC in the URL — auth is the operator's web session.
+    expect(link).not.toContain('token=');
+  });
+
+  it('url-encodes a path with spaces so the fragment stays a single token', () => {
+    const p = `${WORK}/my notes.md`;
+    const link = buildFilesDeepLink(p, WORK, WEB);
+    expect(link).toBe(`${WEB}/journal/#files=${encodeURIComponent(p)}`);
+    expect(link).toContain('%20');
+  });
+
+  it('strips a trailing slash from the web base URL', () => {
+    const link = buildFilesDeepLink(`${WORK}/a.md`, WORK, `${WEB}/`);
+    expect(link).toBe(`${WEB}/journal/#files=${encodeURIComponent(`${WORK}/a.md`)}`);
+  });
+
+  it('returns null when the web base URL is unset (feature dormant)', () => {
+    expect(buildFilesDeepLink(`${WORK}/a.md`, WORK, '')).toBeNull();
+    expect(buildFilesDeepLink(`${WORK}/a.md`, WORK, undefined)).toBeNull();
+  });
+
+  it('returns null (plain-path fallback) for a target outside the workdir/read-root', () => {
+    expect(buildFilesDeepLink('/etc/passwd', WORK, WEB)).toBeNull();
+  });
+
+  it('returns null (plain-path fallback) for a sensitive-looking file even inside the root', () => {
+    expect(buildFilesDeepLink(`${WORK}/.env`, WORK, WEB)).toBeNull();
+    expect(buildFilesDeepLink(`${WORK}/secrets.json`, WORK, WEB)).toBeNull();
+  });
+
+  it('returns null for a relative or empty path', () => {
+    expect(buildFilesDeepLink('relative/a.md', WORK, WEB)).toBeNull();
+    expect(buildFilesDeepLink('', WORK, WEB)).toBeNull();
+  });
+
+  it('gates on sensitive names with no workdir given (containment optional, sensitivity always)', () => {
+    expect(buildFilesDeepLink(`${WORK}/a.md`, null, WEB)).toBe(
+      `${WEB}/journal/#files=${encodeURIComponent(`${WORK}/a.md`)}`,
+    );
+    expect(buildFilesDeepLink(`${WORK}/id_rsa`, null, WEB)).toBeNull();
+  });
+});
+
+describe('appendFilesDeepLink', () => {
+  const LINK = 'https://bridge.easelyte.ai/journal/#files=%2Fx%2Fa.md';
+
+  it('appends a labelled link line after existing caption text', () => {
+    const out = appendFilesDeepLink('here is the doc', LINK);
+    expect(out).toBe(`here is the doc\n\n📁 Open in Files: ${LINK}`);
+  });
+
+  it('uses the file name in the label when given', () => {
+    const out = appendFilesDeepLink('here is the doc', LINK, 'a.md');
+    expect(out).toBe(`here is the doc\n\n📁 Open a.md in Files: ${LINK}`);
+  });
+
+  it('returns only the link line when the caption is empty', () => {
+    expect(appendFilesDeepLink('', LINK)).toBe(`📁 Open in Files: ${LINK}`);
+    expect(appendFilesDeepLink(undefined, LINK)).toBe(`📁 Open in Files: ${LINK}`);
+  });
+
+  it('returns the text verbatim when there is no link (plain-path fallback)', () => {
+    expect(appendFilesDeepLink('plain body', null)).toBe('plain body');
+    expect(appendFilesDeepLink('plain body', undefined)).toBe('plain body');
+    expect(appendFilesDeepLink('', null)).toBe('');
+    expect(appendFilesDeepLink(undefined, null)).toBe('');
   });
 });

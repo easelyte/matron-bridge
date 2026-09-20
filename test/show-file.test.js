@@ -350,3 +350,34 @@ describe('parseShowFileUploadTimeoutMs', () => {
     expect(warn).not.toHaveBeenCalled();
   });
 });
+
+describe('shareAgentMedia Files deep link (loop #739)', () => {
+  const WEB = 'https://bridge.easelyte.ai';
+
+  it('appends a Files deep link to the caption when webBaseUrl is set', async () => {
+    const deps = makeDeps({ realPath: '/work/report.pdf', content: Buffer.from('pdf bytes') });
+    deps.uploadMedia.mockResolvedValue({ media_id: 'm1', content_type: 'application/pdf', size: 9, sha256: 's1' });
+    await share(deps, { filePath: '/work/report.pdf', caption: 'the report', deps: { ...deps, webBaseUrl: WEB } });
+    const [, payload] = deps.publish.mock.calls[0];
+    expect(payload.caption).toBe(
+      `the report\n\n📁 Open report.pdf in Files: ${WEB}/journal/#files=${encodeURIComponent('/work/report.pdf')}`,
+    );
+  });
+
+  it('produces a caption from just the link when the agent passed none', async () => {
+    const deps = makeDeps({ realPath: '/work/report.pdf', content: Buffer.from('pdf bytes') });
+    deps.uploadMedia.mockResolvedValue({ media_id: 'm1', content_type: 'application/pdf', size: 9, sha256: 's1' });
+    await share(deps, { filePath: '/work/report.pdf', caption: undefined, deps: { ...deps, webBaseUrl: WEB } });
+    const [, payload] = deps.publish.mock.calls[0];
+    expect(payload.caption).toBe(
+      `📁 Open report.pdf in Files: ${WEB}/journal/#files=${encodeURIComponent('/work/report.pdf')}`,
+    );
+  });
+
+  it('leaves the caption untouched (plain-path fallback) when webBaseUrl is unset', async () => {
+    const deps = makeDeps();
+    await share(deps); // no webBaseUrl in deps
+    const [, payload] = deps.publish.mock.calls[0];
+    expect(payload.caption).toBe('Quarterly chart');
+  });
+});
