@@ -275,3 +275,40 @@ describe('items handlers Files deep link (loop #739)', () => {
     expect(client.create.mock.calls[0][0].body).toBe('draft is ready');
   });
 });
+
+describe('items handlers deep-link body bound (loop #739, F2)', () => {
+  const WEB = 'https://bridge.easelyte.ai';
+  const WORK = '/root/.openclaw/workspace';
+  const BODY_MAX = 32768;
+
+  function webFixture() {
+    const session = { roomId: '!r:s', workdir: WORK, journalConvoId: 'c1' };
+    const sessions = new Map([['!r:s', session]]);
+    const client = { create: vi.fn(async () => ({ status: 201, data: { item: { id: 'it_1', num: 1 } } })) };
+    const uploadLocalFile = vi.fn(async () => ({
+      ok: true,
+      media: { blob_ref: 'b1', mime: 'text/markdown', name: 'dan-offer.md', size: 3, isImage: false, absPath: `${WORK}/dan-offer.md`, workdir: WORK },
+    }));
+    const h = createItemsHandlers({ sessions, journalConvoIdFor: (s) => s?.journalConvoId ?? null, client, uploadLocalFile, webBaseUrl: WEB });
+    return { h, client };
+  }
+
+  it('drops the deep-link trailer rather than pushing a max-length body over the journal limit', async () => {
+    const { h, client } = webFixture();
+    const body = 'x'.repeat(BODY_MAX); // exactly at the contract max — valid, but no room for a trailer
+    const r = await h.create({ roomId: '!r:s', kind: 'task', title: 'Big', body, attachments: ['dan-offer.md'] });
+    expect(r.status).toBe(201);
+    const sent = client.create.mock.calls[0][0];
+    expect(sent.body).toBe(body); // unchanged — trailer skipped
+    expect(sent.body.length).toBeLessThanOrEqual(BODY_MAX);
+    // The attachment still went through; only the convenience link was skipped.
+    expect(sent.attachments).toHaveLength(1);
+  });
+
+  it('still appends the trailer when there is room under the limit', async () => {
+    const { h, client } = webFixture();
+    const r = await h.create({ roomId: '!r:s', kind: 'task', title: 'Small', body: 'short', attachments: ['dan-offer.md'] });
+    expect(r.status).toBe(201);
+    expect(client.create.mock.calls[0][0].body).toContain('📁 Open dan-offer.md in Files:');
+  });
+});

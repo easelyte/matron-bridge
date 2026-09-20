@@ -381,3 +381,26 @@ describe('shareAgentMedia Files deep link (loop #739)', () => {
     expect(payload.caption).toBe('Quarterly chart');
   });
 });
+
+describe('shareAgentMedia deep link across multiple pinned roots (loop #739, F3)', () => {
+  const WEB = 'https://bridge.easelyte.ai';
+
+  it('mints the link for a file under a SECONDARY pinned root, not just roots[0]', async () => {
+    const realPath = '/artifacts/report.pdf';
+    const deps = makeDeps({ realPath, content: Buffer.from('pdf bytes') });
+    deps.uploadMedia.mockResolvedValue({ media_id: 'm1', content_type: 'application/pdf', size: 9, sha256: 's1' });
+    await shareAgentMedia({
+      filePath: realPath,
+      caption: 'the report',
+      // cwd first, artifact root second — exactly index.js's [cwd, ...SHOW_FILE_ARTIFACT_ROOTS].
+      pinnedRoots: { roots: [{ realPath: '/work' }, { realPath: '/artifacts' }] },
+      maxBytes: 50 * 1024 * 1024,
+      uploadTimeoutMs: 30000,
+      deps: { ...deps, webBaseUrl: WEB },
+    });
+    const [, payload] = deps.publish.mock.calls[0];
+    expect(payload.caption).toBe(
+      `the report\n\n📁 Open report.pdf in Files: ${WEB}/journal/#files=${encodeURIComponent(realPath)}`,
+    );
+  });
+});

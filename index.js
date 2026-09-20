@@ -484,6 +484,12 @@ setInterval(() => liveOutputStore.gcExpired(), 60_000).unref();
 if (!HMAC_SECRET || !VIEWER_BASE_URL) {
   console.warn('[viewer] HMAC_SECRET or VIEWER_BASE_URL unset — file links and secure secret/sensitive-data links disabled');
 }
+if (!WEB_BASE_URL) {
+  // Fail-visible, not fail-fast: dormancy is the intended safe default (the web Files-deep-link
+  // consumer may not be deployed yet — a link to it would only 404 the hash). Warn so an operator
+  // who expects deep links can see why handoffs are falling back to plain paths.
+  console.warn('[files-deeplink] WEB_BASE_URL unset — doc handoffs omit the "Open in Files" deep link and fall back to the plain path (set it to the web client base, e.g. https://bridge.easelyte.ai, once the matron-web deep-link build is deployed)');
+}
 
 // Journal dual-post (migration off Matrix — see matron-journal's protocol
 // design doc). JOURNAL_TOKEN_FILE takes precedence over JOURNAL_TOKEN when
