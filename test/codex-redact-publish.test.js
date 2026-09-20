@@ -333,7 +333,7 @@ describe('publish-side Codex redaction', () => {
       payload: {
         tool_use_id: 'command-1',
         command: `printf ${REDACTED}`,
-        output: `result=${REDACTED}`,
+        snippet: `result=${REDACTED}`,
         exit_code: 0,
         status: 'completed',
       },
@@ -343,10 +343,15 @@ describe('publish-side Codex redaction', () => {
     expect(state.redactionDropCount).toBe(0);
   });
 
-  it('preserves the real unpinned schema and safely publishes new textual diagnostics', () => {
+  it('safely publishes a future item type under an eligible schema as redacted diagnostic text', () => {
     const publisher = makePublisher();
     const log = { warn: vi.fn() };
 
+    // 0.999.0 is eligible (>= floor, no version ceiling), but `future_answer`
+    // is an item type we don't yet render. It must fall back to the
+    // diagnostic-preserving generic-text path: textual fields survive
+    // (redacted), unknown binary structure is dropped, and — because the
+    // producer version is fine — no unsupported-schema warning fires.
     redactAndRoute({
       type: 'item.completed',
       item: {
@@ -364,7 +369,7 @@ describe('publish-side Codex redaction', () => {
       log,
     });
 
-    expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('codex-cli 0.999.0'));
+    expect(log.warn).not.toHaveBeenCalled();
     const body = publisher.calls.find(call => call.method === 'publishText')?.payload.body;
     expect(body).toContain(REDACTED);
     expect(body).toContain('future_answer');
@@ -502,7 +507,7 @@ describe('publish-side Codex redaction', () => {
       redact: replaceSentinel,
     });
     expect(publisher.calls).toHaveLength(1);
-    expect(publisher.calls[0].payload.output).toBe(output);
+    expect(publisher.calls[0].payload.snippet).toBe(output);
     expect(state.redactionDropCount).toBe(0);
   });
 
@@ -593,8 +598,8 @@ describe('publish-side Codex redaction', () => {
         expect(publisher.calls.some(call => call.method === 'publishText')).toBe(true);
       });
       const replayCall = publisher.calls.find(call => call.method === 'publishToolOutput');
-      expect(replayCall.payload.output).not.toContain('replayed-secret');
-      expect(replayCall.payload.output).toContain('[REDACTED:secret-key:');
+      expect(replayCall.payload.snippet).not.toContain('replayed-secret');
+      expect(replayCall.payload.snippet).toContain('[REDACTED:secret-key:');
       expect(replayCall.convoId).toBe(`parent:codex:${RUN_ID}`);
       expect(publisher.calls).toContainEqual(expect.objectContaining({
         method: 'publishText',
@@ -609,8 +614,8 @@ describe('publish-side Codex redaction', () => {
       await watcher.tails.get(RUN_ID).drain({ windowMs: 0 });
       const toolCalls = publisher.calls.filter(call => call.method === 'publishToolOutput');
       expect(toolCalls).toHaveLength(2);
-      expect(toolCalls[1].payload.output).not.toContain('live-secret');
-      expect(toolCalls[1].payload.output).toContain('[REDACTED:secret-key:');
+      expect(toolCalls[1].payload.snippet).not.toContain('live-secret');
+      expect(toolCalls[1].payload.snippet).toContain('[REDACTED:secret-key:');
     } finally {
       await watcher.stop();
       rmSync(dir, { recursive: true, force: true });

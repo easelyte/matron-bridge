@@ -2,7 +2,7 @@ import { readFileSync } from 'node:fs';
 import { EventEmitter } from 'node:events';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it, vi } from 'vitest';
-import { formatAndRoute } from '../lib/codex-event-format.js';
+import { formatAndRoute, redactAndRoute } from '../lib/codex-event-format.js';
 import { createJournalPublisher } from '../lib/journal-publisher.js';
 
 const FIXTURE_PATH = fileURLToPath(
@@ -94,14 +94,16 @@ describe('formatAndRoute', () => {
       [{ method: 'publishActivity', args: [ctx.convoId, 'thinking'] }],
       [],
       [
-        { method: 'publishActivity', args: [ctx.convoId, 'thinking', openingMessage] },
+        // Intermediate narration is now durable assistant text (was ephemeral
+        // 'thinking'), published as the item.started command supersedes it.
+        { method: 'publishText', args: [ctx.convoId, { body: openingMessage, from: 'assistant' }] },
         { method: 'publishActivity', args: [ctx.convoId, 'tool', "/bin/bash -lc 'cat sentinel.env'"] },
       ],
       [{
         method: 'publishToolOutput',
         args: [ctx.convoId, {
           tool_use_id: 'item_1', command: "/bin/bash -lc 'cat sentinel.env'",
-          output: 'SECRET_TOKEN=sk-REDACTED-FIXTURE-TOKEN\n', exit_code: 0, status: 'completed',
+          snippet: 'SECRET_TOKEN=sk-REDACTED-FIXTURE-TOKEN\n', exit_code: 0, status: 'completed',
         }],
       }],
       [{ method: 'publishActivity', args: [ctx.convoId, 'tool', 'Applying file changes'] }],
@@ -109,7 +111,7 @@ describe('formatAndRoute', () => {
         method: 'publishToolOutput',
         args: [ctx.convoId, {
           tool_use_id: 'item_2', command: 'file_change',
-          output: 'update /tmp/codex-fixture-wt/mutate_me.txt', status: 'completed',
+          snippet: 'update /tmp/codex-fixture-wt/mutate_me.txt', status: 'completed',
         }],
       }],
       [{ method: 'publishActivity', args: [ctx.convoId, 'tool', "/bin/bash -lc 'sleep 3 && echo done'"] }],
@@ -117,7 +119,7 @@ describe('formatAndRoute', () => {
         method: 'publishToolOutput',
         args: [ctx.convoId, {
           tool_use_id: 'item_3', command: "/bin/bash -lc 'sleep 3 && echo done'",
-          output: 'done\n', exit_code: 0, status: 'completed',
+          snippet: 'done\n', exit_code: 0, status: 'completed',
         }],
       }],
       [{ method: 'publishActivity', args: [ctx.convoId, 'tool', "/bin/bash -lc 'tail -n 3 mutate_me.txt'"] }],
@@ -125,7 +127,7 @@ describe('formatAndRoute', () => {
         method: 'publishToolOutput',
         args: [ctx.convoId, {
           tool_use_id: 'item_4', command: "/bin/bash -lc 'tail -n 3 mutate_me.txt'",
-          output: 'first line\nsecond line\n', exit_code: 0, status: 'completed',
+          snippet: 'first line\nsecond line\n', exit_code: 0, status: 'completed',
         }],
       }],
       [],
@@ -169,7 +171,8 @@ describe('formatAndRoute', () => {
     ]);
     expect(calls.filter(call => call.method === 'publishDiff')).toHaveLength(0);
     expect(ctx.state.terminalSeen).toBe(true);
-    expect(ctx.state.durableEvents).toBe(5);
+    // 4 tool_output + 1 durable narration post + 1 final answer = 6.
+    expect(ctx.state.durableEvents).toBe(6);
   });
 
   it('emits exact publisher frames and preserves explicit final idempotency across replays', async () => {
@@ -215,7 +218,7 @@ describe('formatAndRoute', () => {
           convo_id: 'parent:codex:run-1',
           type: 'tool_output',
           payload: {
-            tool_use_id: 'command-1', command: 'printf ok', output: 'ok',
+            tool_use_id: 'command-1', command: 'printf ok', snippet: 'ok',
             exit_code: 0, status: 'completed',
           },
           idem_key: expect.any(String),
@@ -232,7 +235,7 @@ describe('formatAndRoute', () => {
           convo_id: 'parent:codex:run-1',
           type: 'tool_output',
           payload: {
-            tool_use_id: 'command-1', command: 'printf ok', output: 'ok',
+            tool_use_id: 'command-1', command: 'printf ok', snippet: 'ok',
             exit_code: 0, status: 'completed',
           },
           idem_key: expect.any(String),
@@ -271,6 +274,75 @@ describe('formatAndRoute', () => {
       { method: 'publishActivity', args: [ctx.convoId, 'thinking', 'private chain summary'] },
     ]);
     expect(ctx.state.durableEvents).toBe(0);
+  });
+
+  it('publishes intermediate narration as durable text and retains the final answer', () => {
+    const { calls, ctx } = makeContext();
+
+    // narration → command → narration(final): the first message is superseded
+    // by the command and becomes a durable post; the last becomes the answer.
+    formatAndRoute({
+      type: 'item.completed',
+      item: { id: 'n1', type: 'agent_message', text: 'First, I will read the file.' },
+    }, ctx);
+    formatAndRoute({
+      type: 'item.completed',
+      item: {
+        id: 'c1', type: 'command_execution', command: 'cat f',
+        aggregated_output: 'x', exit_code: 0, status: 'completed',
+      },
+    }, ctx);
+    formatAndRoute({
+      type: 'item.completed',
+      item: { id: 'n2', type: 'agent_message', text: 'Done, looks correct.' },
+    }, ctx);
+    formatAndRoute({ type: 'turn.completed' }, ctx);
+
+    const posts = calls.filter(c => c.method === 'publishText' || c.method === 'publishToolOutput');
+    expect(posts).toEqual([
+      { method: 'publishText', args: [ctx.convoId, { body: 'First, I will read the file.', from: 'assistant' }] },
+      {
+        method: 'publishToolOutput',
+        args: [ctx.convoId, {
+          tool_use_id: 'c1', command: 'cat f', snippet: 'x', exit_code: 0, status: 'completed',
+        }],
+      },
+      {
+        method: 'publishText',
+        args: [
+          ctx.convoId,
+          { body: 'Done, looks correct.', from: 'assistant' },
+          { idemKey: 'run-1:final', onDelivered: expect.any(Function) },
+        ],
+      },
+    ]);
+    expect(ctx.state.terminalSeen).toBe(true);
+  });
+
+  it('demotes an eligible-version run to text passthrough when item shape drifts', () => {
+    const { calls, ctx } = makeContext({ meta: { schemaVersion: 'codex-cli 0.160.0', model: 'm' } });
+    ctx.redact = s => s; // identity redactor for redactAndRoute
+
+    // A future codex renames command_execution's payload fields, so the item
+    // carries neither `command` nor `aggregated_output`.
+    redactAndRoute({
+      type: 'item.completed',
+      item: { id: 'item_1', type: 'command_execution', cmd: 'printf ok', out: 'ok' },
+    }, ctx);
+    // A subsequent agent_message must NOT be treated as a final answer once the
+    // run has been demoted — it passes through as raw text.
+    redactAndRoute({
+      type: 'item.completed',
+      item: { id: 'answer', type: 'agent_message', text: 'done' },
+    }, ctx);
+
+    expect(ctx.state.schemaShapeBroken).toBe(true);
+    expect(ctx.log.warn).toHaveBeenCalledTimes(1);
+    expect(calls.filter(c => c.method === 'publishToolOutput')).toHaveLength(0);
+    expect(calls.filter(c => c.method === 'publishText').map(c => c.args[1].body)).toEqual([
+      '{"type":"item.completed","item":{"type":"command_execution","id":"item_1"}}',
+      '{"type":"item.completed","item":{"type":"agent_message","id":"answer","text":"done"}}',
+    ]);
   });
 
   it('caps durable posts and emits exactly one truncation marker', () => {
@@ -378,9 +450,9 @@ describe('formatAndRoute', () => {
     ]);
   });
 
-  it('warns once and degrades every event to text for an out-of-band schema', () => {
+  it('warns once and degrades every event to text for a below-floor schema version', () => {
     const { calls, ctx } = makeContext({
-      meta: { schemaVersion: 'codex-cli 0.148.0', model: 'future-model' },
+      meta: { schemaVersion: 'codex-cli 0.145.0', model: 'ancient-model' },
     });
     const events = fixtureEvents().slice(0, 2);
 
@@ -394,7 +466,7 @@ describe('formatAndRoute', () => {
     expect(ctx.state.unparsed).toBe(2);
   });
 
-  it('routes in-band 0.146.x–0.147.x runs through the rich item mapping', () => {
+  it('routes every codex-cli >= floor through the rich item mapping (no version ceiling)', () => {
     const commandEvent = {
       type: 'item.completed',
       item: {
@@ -402,7 +474,10 @@ describe('formatAndRoute', () => {
         aggregated_output: 'ok', exit_code: 0, status: 'completed',
       },
     };
-    for (const schemaVersion of ['codex-cli 0.146.1', 'codex-cli 0.147.0']) {
+    // 0.148.0 and 0.155.1 were BOTH out-of-band under the old [0.146, 0.148)
+    // ceiling and raw-dumped; they must now render richly, alongside the
+    // original 0.146.x/0.147.x line.
+    for (const schemaVersion of ['codex-cli 0.146.1', 'codex-cli 0.147.0', 'codex-cli 0.148.0', 'codex-cli 0.155.1']) {
       const { calls, ctx } = makeContext({ meta: { schemaVersion } });
       formatAndRoute(commandEvent, ctx);
       expect(ctx.log.warn, schemaVersion).not.toHaveBeenCalled();
@@ -411,7 +486,7 @@ describe('formatAndRoute', () => {
         method: 'publishToolOutput',
         args: [ctx.convoId, {
           tool_use_id: 'item_1', command: 'printf ok',
-          output: 'ok', exit_code: 0, status: 'completed',
+          snippet: 'ok', exit_code: 0, status: 'completed',
         }],
       }]);
     }

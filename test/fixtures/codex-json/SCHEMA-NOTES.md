@@ -2,6 +2,15 @@
 
 Flag is `--json` (NOT `--experimental-json`). Events are JSONL, one object per line.
 
+> **Re-verified stable at codex-cli 0.155.1 (2026-09-20).** The item shapes below
+> (`command_execution`/`agent_message`/`file_change` + lifecycle events) are
+> byte-for-byte the same as 0.146.0. Rich rendering is therefore gated on the
+> event SHAPE, not a version ceiling (see `lib/codex-event-format.js` —
+> `schemaVersionEligible` + `eventShapeBreaksSchema`); a hard [0.146, 0.148)
+> ceiling had silently raw-dumped 0.148→0.155. NOTE: the durable tool_output
+> post publishes the command output under the `snippet` key (what both journal
+> clients render as the card body), not `output`.
+
 ## Top-level event types (the `type` field)
 - `thread.started`   — once at start
 - `turn.started`     — once
