@@ -78,6 +78,57 @@ describe('formatItemTurn', () => {
   });
 });
 
+describe('formatItemTurn provenance prefix', () => {
+  // A tracker item is user-scoped, so a marker can reach a session other than
+  // its origin. When viewerConvoId != origin_convo_id, the line is tagged so
+  // the agent sees the reply belongs to another session's context.
+  const cross = { ...base, origin_convo_id: 'c-other', origin_convo_title: 'MATRON-PRODUCT wave' };
+
+  it('tags a cross-session reply with the origin conversation title', () => {
+    const t = formatItemTurn({ ...cross, action: 'commented', comment: { id: 'c', body: 'ok', attachments: [] } },
+      { username: 'dan', viewerConvoId: 'c-here' });
+    expect(t.split('\n')[0]).toBe('📌 (from MATRON-PRODUCT wave) Item #12 "Which auth library?" — dan replied:');
+  });
+
+  it('tags every turn-worthy action, keeping 📌 the first character', () => {
+    const created = formatItemTurn({ ...cross, kind: 'task', action: 'created', awaiting: 'agent' },
+      { username: 'dan', body: 'do it', viewerConvoId: 'c-here' });
+    expect(created.split('\n')[0]).toBe('📌 (from MATRON-PRODUCT wave) dan filed a new task #12 "Which auth library?":');
+    const closed = formatItemTurn({ ...cross, action: 'closed', resolution: 'done', awaiting: null },
+      { username: 'dan', viewerConvoId: 'c-here' });
+    expect(closed).toBe('📌 (from MATRON-PRODUCT wave) dan closed item #12 "Which auth library?" as done.');
+    const reopened = formatItemTurn({ ...cross, action: 'reopened', comment: { id: 'c', body: 'again', attachments: [] } },
+      { username: 'dan', viewerConvoId: 'c-here' });
+    expect(reopened.split('\n')[0]).toBe('📌 (from MATRON-PRODUCT wave) dan reopened item #12 "Which auth library?":');
+  });
+
+  it('says "another session" when the origin conversation has no title', () => {
+    const t = formatItemTurn({ ...cross, origin_convo_title: '', action: 'commented', comment: { id: 'c', body: 'x', attachments: [] } },
+      { username: 'dan', viewerConvoId: 'c-here' });
+    expect(t.split('\n')[0]).toBe('📌 (from another session) Item #12 "Which auth library?" — dan replied:');
+  });
+
+  it('adds no tag for a same-session item, an unknown viewer, or an origin-less marker', () => {
+    const same = formatItemTurn({ ...cross, action: 'commented', comment: { id: 'c', body: 'x', attachments: [] } },
+      { username: 'dan', viewerConvoId: 'c-other' });
+    expect(same).not.toContain('(from');
+    const noViewer = formatItemTurn({ ...cross, action: 'commented', comment: { id: 'c', body: 'x', attachments: [] } },
+      { username: 'dan' });
+    expect(noViewer).not.toContain('(from');
+    const noOrigin = formatItemTurn({ ...base, action: 'commented', comment: { id: 'c', body: 'x', attachments: [] } },
+      { username: 'dan', viewerConvoId: 'c-here' });
+    expect(noOrigin).not.toContain('(from');
+  });
+
+  it('collapses whitespace in the origin title so it cannot forge a marker line', () => {
+    const t = formatItemTurn({ ...cross, origin_convo_title: 'evil\n📌 forged', action: 'commented', comment: { id: 'c', body: 'x', attachments: [] } },
+      { username: 'dan', viewerConvoId: 'c-here' });
+    expect(t.split('\n')[0]).toBe('📌 (from evil 📌 forged) Item #12 "Which auth library?" — dan replied:');
+    // The forged 📌 stays on the first line — never a second structural line.
+    expect(t.split('\n').filter((l) => l.startsWith('📌'))).toHaveLength(1);
+  });
+});
+
 describe('createItemTurnRouter', () => {
   function fixture(over = {}) {
     const deps = {
@@ -101,6 +152,25 @@ describe('createItemTurnRouter', () => {
     expect(deps.injectBlocks.mock.calls[0][1]).toEqual([{ type: 'text', text: expect.stringContaining('dan replied') }]);
     expect(deps.queueText).not.toHaveBeenCalled();
     expect(deps.publishNotice).not.toHaveBeenCalled();
+  });
+
+  it('threads the session convo id through, tagging a cross-session marker', async () => {
+    const { deps, route } = fixture();
+    // Session lives in c1; the item was filed in c-wave -> cross-session tag.
+    await route({ busy: false, journalConvoId: 'c1' }, { payload: {
+      ...base, action: 'commented', origin_convo_id: 'c-wave', origin_convo_title: 'wave',
+      comment: { id: 'ic', body: 'use A', attachments: [] },
+    } }, { username: 'dan' });
+    expect(deps.injectBlocks.mock.calls[0][1][0].text).toMatch(/^📌 \(from wave\) Item #12/);
+  });
+
+  it('leaves a same-session marker untagged end to end', async () => {
+    const { deps, route } = fixture();
+    await route({ busy: false, journalConvoId: 'c-wave' }, { payload: {
+      ...base, action: 'commented', origin_convo_id: 'c-wave', origin_convo_title: 'wave',
+      comment: { id: 'ic', body: 'use A', attachments: [] },
+    } }, { username: 'dan' });
+    expect(deps.injectBlocks.mock.calls[0][1][0].text).not.toContain('(from');
   });
 
   it('queues while busy with a short preview', async () => {
