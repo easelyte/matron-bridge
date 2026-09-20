@@ -95,8 +95,10 @@ describe('formatAndRoute', () => {
       [],
       [
         // Intermediate narration is now durable assistant text (was ephemeral
-        // 'thinking'), published as the item.started command supersedes it.
-        { method: 'publishText', args: [ctx.convoId, { body: openingMessage, from: 'assistant' }] },
+        // 'thinking'), published as the item.started command supersedes it. It
+        // carries a deterministic runId+itemId idem key so a replay after a
+        // bridge restart dedupes it instead of duplicating.
+        { method: 'publishText', args: [ctx.convoId, { body: openingMessage, from: 'assistant' }, { idemKey: 'run-1:msg:item_0' }] },
         { method: 'publishActivity', args: [ctx.convoId, 'tool', "/bin/bash -lc 'cat sentinel.env'"] },
       ],
       [{
@@ -300,7 +302,8 @@ describe('formatAndRoute', () => {
 
     const posts = calls.filter(c => c.method === 'publishText' || c.method === 'publishToolOutput');
     expect(posts).toEqual([
-      { method: 'publishText', args: [ctx.convoId, { body: 'First, I will read the file.', from: 'assistant' }] },
+      // Narration carries a deterministic runId+itemId idem key (dedupes on replay).
+      { method: 'publishText', args: [ctx.convoId, { body: 'First, I will read the file.', from: 'assistant' }, { idemKey: 'run-1:msg:n1' }] },
       {
         method: 'publishToolOutput',
         args: [ctx.convoId, {
@@ -339,10 +342,61 @@ describe('formatAndRoute', () => {
     expect(ctx.state.schemaShapeBroken).toBe(true);
     expect(ctx.log.warn).toHaveBeenCalledTimes(1);
     expect(calls.filter(c => c.method === 'publishToolOutput')).toHaveLength(0);
+    // The fallback PRESERVES every scalar string on the item — losing the
+    // field-name mapping under a drifted schema is acceptable, but the
+    // diagnostic text (here the renamed cmd/out) must survive, not be stripped.
     expect(calls.filter(c => c.method === 'publishText').map(c => c.args[1].body)).toEqual([
-      '{"type":"item.completed","item":{"type":"command_execution","id":"item_1"}}',
-      '{"type":"item.completed","item":{"type":"agent_message","id":"answer","text":"done"}}',
+      '{"type":"item.completed","item":{"id":"item_1","type":"command_execution","cmd":"printf ok","out":"ok"}}',
+      '{"type":"item.completed","item":{"id":"answer","type":"agent_message","text":"done"}}',
     ]);
+  });
+
+  it('trips the drift latch on a PARTIAL command rename (output field lost)', () => {
+    const { calls, ctx } = makeContext({ meta: { schemaVersion: 'codex-cli 0.160.0', model: 'm' } });
+    ctx.redact = s => s;
+
+    // A future codex keeps `command` but renames aggregated_output -> `out`.
+    // Requiring BOTH mandatory fields means this trips the latch, rather than
+    // rendering a card with a header + exit badge and a silently empty body.
+    redactAndRoute({
+      type: 'item.completed',
+      item: { id: 'item_1', type: 'command_execution', command: 'printf ok', out: 'ok', exit_code: 0, status: 'completed' },
+    }, ctx);
+
+    expect(ctx.state.schemaShapeBroken).toBe(true);
+    expect(calls.filter(c => c.method === 'publishToolOutput')).toHaveLength(0);
+    // The command text and the renamed output both survive in the fallback.
+    const body = calls.find(c => c.method === 'publishText').args[1].body;
+    expect(body).toContain('"command":"printf ok"');
+    expect(body).toContain('"out":"ok"');
+  });
+
+  it('finalizes the turn after a mid-run demotion (buffered answer + idle survive)', () => {
+    const { calls, ctx } = makeContext({ meta: { schemaVersion: 'codex-cli 0.160.0', model: 'm' } });
+    ctx.redact = s => s;
+
+    // agent_message (buffered as the pending final answer under the rich path)
+    // → a malformed command that trips the latch → turn.completed. The final
+    // answer must still be retained under `${runId}:final` and the convo idled,
+    // not stranded by the passthrough demotion.
+    redactAndRoute({
+      type: 'item.completed',
+      item: { id: 'answer', type: 'agent_message', text: 'the verdict' },
+    }, ctx);
+    redactAndRoute({
+      type: 'item.completed',
+      item: { id: 'bad', type: 'command_execution' },
+    }, ctx);
+    redactAndRoute({ type: 'turn.completed' }, ctx);
+
+    expect(ctx.state.schemaShapeBroken).toBe(true);
+    expect(ctx.state.terminalSeen).toBe(true);
+    const finalPost = calls.find(c =>
+      c.method === 'publishText' && c.args[2]?.idemKey === 'run-1:final');
+    expect(finalPost, 'final answer retained under :final').toBeTruthy();
+    expect(finalPost.args[1].body).toBe('the verdict');
+    expect(calls.some(c => c.method === 'publishActivity'
+      && c.args[1] === 'idle')).toBe(true);
   });
 
   it('caps durable posts and emits exactly one truncation marker', () => {
