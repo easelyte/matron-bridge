@@ -400,6 +400,11 @@ const SERVER_LABEL = process.env.SERVER_LABEL || (() => {
 })();
 const HMAC_SECRET = process.env.HMAC_SECRET || '';
 const VIEWER_BASE_URL = process.env.VIEWER_BASE_URL || '';
+// Base URL of the matron-web client (prod: https://bridge.easelyte.ai). Used to mint token-less
+// hash deep links into the web Files pane (`${WEB_BASE_URL}/journal/#files=<enc>`, loop #739) for
+// doc handoffs — auth is the operator's existing web session, so no HMAC. Unset → deep links are
+// dormant and every handover surface falls back to the plain path.
+const WEB_BASE_URL = process.env.WEB_BASE_URL || '';
 const LINK_EXPIRY_MS = parseInt(process.env.LINK_EXPIRY_MS || String(15 * 60 * 1000), 10);
 const SHOW_FILE_MAX_BYTES = 50 * 1024 * 1024;
 const SHOW_FILE_MAX_IN_FLIGHT = 2;
@@ -478,6 +483,12 @@ sweepOrphanedLogs('/tmp', LIVE_OUTPUT_TTL);
 setInterval(() => liveOutputStore.gcExpired(), 60_000).unref();
 if (!HMAC_SECRET || !VIEWER_BASE_URL) {
   console.warn('[viewer] HMAC_SECRET or VIEWER_BASE_URL unset — file links and secure secret/sensitive-data links disabled');
+}
+if (!WEB_BASE_URL) {
+  // Fail-visible, not fail-fast: dormancy is the intended safe default (the web Files-deep-link
+  // consumer may not be deployed yet — a link to it would only 404 the hash). Warn so an operator
+  // who expects deep links can see why handoffs are falling back to plain paths.
+  console.warn('[files-deeplink] WEB_BASE_URL unset — doc handoffs omit the "Open in Files" deep link and fall back to the plain path (set it to the web client base, e.g. https://bridge.easelyte.ai, once the matron-web deep-link build is deployed)');
 }
 
 // Journal dual-post (migration off Matrix — see matron-journal's protocol
@@ -10608,6 +10619,7 @@ const handleSendAttachment = createSendAttachmentHandler({
   journalConvoIdFor,
   rooms: agentRooms,
   onLocalRoomAttachment: routeLocalRoomAttachment,
+  webBaseUrl: WEB_BASE_URL,
 });
 
 // The agent-chat tools (lib/agent-chat.js), mounted below as thin
@@ -10665,6 +10677,7 @@ const itemsHandlers = createItemsHandlers({
   journalConvoIdFor,
   client: itemsClient,
   uploadLocalFile: (session, reqPath) => resolveAndUploadLocalFile({ session, reqPath, publisher: journalPublisher }),
+  webBaseUrl: WEB_BASE_URL,
 });
 
 const missionsHandlers = createMissionsHandlers({
@@ -10941,6 +10954,7 @@ const apiServer = createServer(async (req, res) => {
           journalPublish,
           denialToStatus,
           dedupLedger: showFileDedupLedger,
+          webBaseUrl: WEB_BASE_URL,
         },
       });
       res.writeHead(status, { 'Content-Type': 'application/json', ...(headers || {}) });
