@@ -431,6 +431,49 @@ describe('formatAndRoute', () => {
       && c.args[1].body === '{"type":"item.completed","item":{"type":"agent_message","id":"b"}}')).toBe(true);
   });
 
+  it('uses a valid summary as the final answer when text is empty', () => {
+    const { calls, ctx } = makeContext({ meta: { schemaVersion: 'codex-cli 0.160.0', model: 'm' } });
+    ctx.redact = s => s;
+
+    // A post-demotion agent_message with an empty `text` but a real `summary`
+    // must retain the summary as :final — an empty text must not win and blank
+    // out the answer (nor falsely report a delivered final).
+    redactAndRoute({
+      type: 'item.completed',
+      item: { id: 'bad-cmd', type: 'command_execution' },
+    }, ctx);
+    redactAndRoute({
+      type: 'item.completed',
+      item: { id: 'b', type: 'agent_message', text: '', summary: 'Actual answer' },
+    }, ctx);
+    redactAndRoute({ type: 'turn.completed' }, ctx);
+
+    const finalPost = calls.find(c =>
+      c.method === 'publishText' && c.args[2]?.idemKey === 'run-1:final');
+    expect(finalPost, 'summary retained as :final').toBeTruthy();
+    expect(finalPost.args[1].body).toBe('Actual answer');
+  });
+
+  it('does not treat a whitespace-only post-demotion message as a final answer', () => {
+    const { calls, ctx } = makeContext({ meta: { schemaVersion: 'codex-cli 0.160.0', model: 'm' } });
+    ctx.redact = s => s;
+
+    redactAndRoute({
+      type: 'item.completed',
+      item: { id: 'bad-cmd', type: 'command_execution' },
+    }, ctx);
+    redactAndRoute({
+      type: 'item.completed',
+      item: { id: 'b', type: 'agent_message', text: '   ', summary: '' },
+    }, ctx);
+    redactAndRoute({ type: 'turn.completed' }, ctx);
+
+    // No usable body → never a :final; the message passes through raw instead.
+    expect(calls.some(c =>
+      c.method === 'publishText' && c.args[2]?.idemKey === 'run-1:final')).toBe(false);
+    expect(ctx.state.terminalSeen).toBe(true);
+  });
+
   it('caps durable posts and emits exactly one truncation marker', () => {
     const { calls, ctx } = makeContext({ maxDurableEvents: 2 });
 
