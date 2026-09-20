@@ -474,6 +474,23 @@ describe('formatAndRoute', () => {
     expect(ctx.state.terminalSeen).toBe(true);
   });
 
+  it('does not blank the final answer on a whitespace agent_message in the NORMAL path', () => {
+    const { calls, ctx } = makeContext();
+
+    // Eligible, non-demoted run: an empty/whitespace-only agent_message must not
+    // be buffered as the final answer (the same guard as the demoted path).
+    formatAndRoute({
+      type: 'item.completed',
+      item: { id: 'm', type: 'agent_message', text: '   ', summary: '' },
+    }, ctx);
+    formatAndRoute({ type: 'turn.completed' }, ctx);
+
+    expect(calls.some(c =>
+      c.method === 'publishText' && c.args[2]?.idemKey === 'run-1:final')).toBe(false);
+    expect(ctx.state.finalPostProduced).not.toBe(true);
+    expect(ctx.state.terminalSeen).toBe(true);
+  });
+
   it('caps durable posts and emits exactly one truncation marker', () => {
     const { calls, ctx } = makeContext({ maxDurableEvents: 2 });
 
