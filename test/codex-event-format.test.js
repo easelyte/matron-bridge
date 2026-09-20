@@ -404,6 +404,33 @@ describe('formatAndRoute', () => {
     expect(calls.some(c => c.method === 'publishActivity' && c.args[1] === 'idle')).toBe(true);
   });
 
+  it('never fabricates a final answer from a malformed post-demotion agent_message', () => {
+    const { calls, ctx } = makeContext({ meta: { schemaVersion: 'codex-cli 0.160.0', model: 'm' } });
+    ctx.redact = s => s;
+
+    // command drift latches the run, then an agent_message arrives whose text
+    // field was ALSO renamed away. It must NOT become the durable :final as a
+    // serialized identity object — it passes through raw instead.
+    redactAndRoute({
+      type: 'item.completed',
+      item: { id: 'bad-cmd', type: 'command_execution' },
+    }, ctx);
+    redactAndRoute({
+      type: 'item.completed',
+      item: { id: 'b', type: 'agent_message', body: 'renamed away' },
+    }, ctx);
+    redactAndRoute({ type: 'turn.completed' }, ctx);
+
+    expect(ctx.state.schemaShapeBroken).toBe(true);
+    expect(ctx.state.terminalSeen).toBe(true);
+    // No :final post at all — there was never a usable answer.
+    expect(calls.some(c =>
+      c.method === 'publishText' && c.args[2]?.idemKey === 'run-1:final')).toBe(false);
+    // The malformed message is passed through raw, not serialized into :final.
+    expect(calls.some(c => c.method === 'publishText'
+      && c.args[1].body === '{"type":"item.completed","item":{"type":"agent_message","id":"b"}}')).toBe(true);
+  });
+
   it('caps durable posts and emits exactly one truncation marker', () => {
     const { calls, ctx } = makeContext({ maxDurableEvents: 2 });
 
