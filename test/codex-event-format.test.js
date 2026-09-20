@@ -96,9 +96,9 @@ describe('formatAndRoute', () => {
       [
         // Intermediate narration is now durable assistant text (was ephemeral
         // 'thinking'), published as the item.started command supersedes it. It
-        // carries a deterministic runId+itemId idem key so a replay after a
-        // bridge restart dedupes it instead of duplicating.
-        { method: 'publishText', args: [ctx.convoId, { body: openingMessage, from: 'assistant' }, { idemKey: 'run-1:msg:item_0' }] },
+        // carries a deterministic per-run narration-counter idem key so a replay
+        // after a bridge restart dedupes it instead of duplicating.
+        { method: 'publishText', args: [ctx.convoId, { body: openingMessage, from: 'assistant' }, { idemKey: 'run-1:narration:1' }] },
         { method: 'publishActivity', args: [ctx.convoId, 'tool', "/bin/bash -lc 'cat sentinel.env'"] },
       ],
       [{
@@ -302,8 +302,8 @@ describe('formatAndRoute', () => {
 
     const posts = calls.filter(c => c.method === 'publishText' || c.method === 'publishToolOutput');
     expect(posts).toEqual([
-      // Narration carries a deterministic runId+itemId idem key (dedupes on replay).
-      { method: 'publishText', args: [ctx.convoId, { body: 'First, I will read the file.', from: 'assistant' }, { idemKey: 'run-1:msg:n1' }] },
+      // Narration carries a deterministic per-run narration-counter idem key (dedupes on replay).
+      { method: 'publishText', args: [ctx.convoId, { body: 'First, I will read the file.', from: 'assistant' }, { idemKey: 'run-1:narration:1' }] },
       {
         method: 'publishToolOutput',
         args: [ctx.convoId, {
@@ -332,32 +332,28 @@ describe('formatAndRoute', () => {
       type: 'item.completed',
       item: { id: 'item_1', type: 'command_execution', cmd: 'printf ok', out: 'ok' },
     }, ctx);
-    // A subsequent agent_message must NOT be treated as a final answer once the
-    // run has been demoted — it passes through as raw text.
-    redactAndRoute({
-      type: 'item.completed',
-      item: { id: 'answer', type: 'agent_message', text: 'done' },
-    }, ctx);
 
     expect(ctx.state.schemaShapeBroken).toBe(true);
     expect(ctx.log.warn).toHaveBeenCalledTimes(1);
     expect(calls.filter(c => c.method === 'publishToolOutput')).toHaveLength(0);
-    // The fallback PRESERVES every scalar string on the item — losing the
-    // field-name mapping under a drifted schema is acceptable, but the
-    // diagnostic text (here the renamed cmd/out) must survive, not be stripped.
+    // The fallback is a STRICT allowlist (type/id + known diagnostic keys), NOT
+    // arbitrary item fields: the shared redactor is key-aware but the pipeline
+    // redacts each value in isolation, so copying a field literally named e.g.
+    // `api_key` would egress its plaintext. The renamed cmd/out are therefore
+    // dropped — the drift is still detected and warned.
     expect(calls.filter(c => c.method === 'publishText').map(c => c.args[1].body)).toEqual([
-      '{"type":"item.completed","item":{"id":"item_1","type":"command_execution","cmd":"printf ok","out":"ok"}}',
-      '{"type":"item.completed","item":{"id":"answer","type":"agent_message","text":"done"}}',
+      '{"type":"item.completed","item":{"type":"command_execution","id":"item_1"}}',
     ]);
   });
 
-  it('trips the drift latch on a PARTIAL command rename (output field lost)', () => {
+  it('trips the drift latch on a PARTIAL command rename (only one field lost)', () => {
     const { calls, ctx } = makeContext({ meta: { schemaVersion: 'codex-cli 0.160.0', model: 'm' } });
     ctx.redact = s => s;
 
     // A future codex keeps `command` but renames aggregated_output -> `out`.
-    // Requiring BOTH mandatory fields means this trips the latch, rather than
-    // rendering a card with a header + exit badge and a silently empty body.
+    // Requiring BOTH mandatory fields (|| in eventShapeBreaksSchema) means this
+    // trips the latch, rather than rendering a card with a header + exit badge
+    // and a silently empty body.
     redactAndRoute({
       type: 'item.completed',
       item: { id: 'item_1', type: 'command_execution', command: 'printf ok', out: 'ok', exit_code: 0, status: 'completed' },
@@ -365,27 +361,32 @@ describe('formatAndRoute', () => {
 
     expect(ctx.state.schemaShapeBroken).toBe(true);
     expect(calls.filter(c => c.method === 'publishToolOutput')).toHaveLength(0);
-    // The command text and the renamed output both survive in the fallback.
-    const body = calls.find(c => c.method === 'publishText').args[1].body;
-    expect(body).toContain('"command":"printf ok"');
-    expect(body).toContain('"out":"ok"');
+    // Demoted to passthrough: a raw JSON line (strict fallback), never a card.
+    // The renamed fields are dropped by the strict allowlist (no egress surface).
+    const texts = calls.filter(c => c.method === 'publishText');
+    expect(texts).toHaveLength(1);
+    expect(texts[0].args[1].body).toBe('{"type":"item.completed","item":{"type":"command_execution","id":"item_1"}}');
   });
 
-  it('finalizes the turn after a mid-run demotion (buffered answer + idle survive)', () => {
+  it('does not resurrect stale narration as the final answer after a mid-run demotion', () => {
     const { calls, ctx } = makeContext({ meta: { schemaVersion: 'codex-cli 0.160.0', model: 'm' } });
     ctx.redact = s => s;
 
-    // agent_message (buffered as the pending final answer under the rich path)
-    // → a malformed command that trips the latch → turn.completed. The final
-    // answer must still be retained under `${runId}:final` and the convo idled,
-    // not stranded by the passthrough demotion.
+    // A (buffered under the rich path) → malformed command trips the latch → B
+    // (a real final answer arriving AFTER demotion) → turn.completed. A must be
+    // published as narration and B — the LAST answer — retained as `${runId}:final`,
+    // NOT the other way round.
     redactAndRoute({
       type: 'item.completed',
-      item: { id: 'answer', type: 'agent_message', text: 'the verdict' },
+      item: { id: 'a', type: 'agent_message', text: 'I will run one more check' },
     }, ctx);
     redactAndRoute({
       type: 'item.completed',
       item: { id: 'bad', type: 'command_execution' },
+    }, ctx);
+    redactAndRoute({
+      type: 'item.completed',
+      item: { id: 'b', type: 'agent_message', text: 'Actual final answer' },
     }, ctx);
     redactAndRoute({ type: 'turn.completed' }, ctx);
 
@@ -393,10 +394,14 @@ describe('formatAndRoute', () => {
     expect(ctx.state.terminalSeen).toBe(true);
     const finalPost = calls.find(c =>
       c.method === 'publishText' && c.args[2]?.idemKey === 'run-1:final');
-    expect(finalPost, 'final answer retained under :final').toBeTruthy();
-    expect(finalPost.args[1].body).toBe('the verdict');
-    expect(calls.some(c => c.method === 'publishActivity'
-      && c.args[1] === 'idle')).toBe(true);
+    expect(finalPost, 'the LAST answer is retained under :final').toBeTruthy();
+    expect(finalPost.args[1].body).toBe('Actual final answer');
+    // A survives as narration (deterministic counter key), never as the final.
+    const narration = calls.find(c =>
+      c.method === 'publishText' && /^run-1:narration:\d+$/.test(c.args[2]?.idemKey ?? ''));
+    expect(narration, 'stale message A published as narration').toBeTruthy();
+    expect(narration.args[1].body).toBe('I will run one more check');
+    expect(calls.some(c => c.method === 'publishActivity' && c.args[1] === 'idle')).toBe(true);
   });
 
   it('caps durable posts and emits exactly one truncation marker', () => {
