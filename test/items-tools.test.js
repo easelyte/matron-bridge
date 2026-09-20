@@ -312,3 +312,53 @@ describe('items handlers deep-link body bound (loop #739, F2)', () => {
     expect(client.create.mock.calls[0][0].body).toContain('📁 Open dan-offer.md in Files:');
   });
 });
+
+describe('items handlers deep-link byte-bound + multi-trailer (loop #739, AR-12 F1/F2)', () => {
+  const WEB = 'https://bridge.easelyte.ai';
+  const WORK = '/root/.openclaw/workspace';
+  const BODY_MAX = 32768;
+
+  function webFixtureMulti() {
+    const session = { roomId: '!r:s', workdir: WORK, journalConvoId: 'c1' };
+    const sessions = new Map([['!r:s', session]]);
+    const client = { create: vi.fn(async () => ({ status: 201, data: { item: { id: 'it_1', num: 1 } } })) };
+    const uploadLocalFile = vi.fn(async (_s, p) => {
+      const name = p.split('/').pop();
+      return { ok: true, media: { blob_ref: 'b-' + name, mime: 'text/markdown', name, size: 3, isImage: false, absPath: `${WORK}/${name}`, workdir: WORK } };
+    });
+    const h = createItemsHandlers({ sessions, journalConvoIdFor: (s) => s?.journalConvoId ?? null, client, uploadLocalFile, webBaseUrl: WEB });
+    return { h, client };
+  }
+
+  it('bounds the final body by UTF-8 BYTES, not code units (📁 is 4 bytes)', async () => {
+    const { h, client } = webFixtureMulti();
+    // Choose a body length such that appending the trailer stays within BODY_MAX code units but
+    // would exceed BODY_MAX bytes — the emoji costs +2 bytes over its 2 code units. If the bound
+    // were code-unit based, the trailer would be (wrongly) appended and the byte length exceed max.
+    const trailer = `\n\n📁 Open dan-offer.md in Files: ${WEB}/journal/#files=${encodeURIComponent(`${WORK}/dan-offer.md`)}`;
+    const trailerBytes = Buffer.byteLength(trailer, 'utf8');
+    const body = 'x'.repeat(BODY_MAX - trailerBytes + 1); // +1 byte over once the trailer is added
+    const r = await h.create({ roomId: '!r:s', kind: 'task', title: 'B', body, attachments: ['dan-offer.md'] });
+    expect(r.status).toBe(201);
+    const sent = client.create.mock.calls[0][0];
+    expect(Buffer.byteLength(sent.body, 'utf8')).toBeLessThanOrEqual(BODY_MAX);
+    expect(sent.body).toBe(body); // trailer skipped — over the byte budget
+  });
+
+  it('skips only the oversized trailer and still appends a later one that fits (continue, not break)', async () => {
+    const { h, client } = webFixtureMulti();
+    const longName = 'a'.repeat(400) + '.md'; // long path/name → big trailer
+    const shortName = 'b.md';                  // short trailer
+    // Body sized so the LONG trailer overflows but the SHORT one fits.
+    const shortTrailer = `\n\n📁 Open ${shortName} in Files: ${WEB}/journal/#files=${encodeURIComponent(`${WORK}/${shortName}`)}`;
+    const longTrailer = `\n\n📁 Open ${longName} in Files: ${WEB}/journal/#files=${encodeURIComponent(`${WORK}/${longName}`)}`;
+    const body = 'x'.repeat(BODY_MAX - Buffer.byteLength(shortTrailer, 'utf8') - 5);
+    // Sanity: the long trailer must not fit on top of body, the short one must.
+    expect(Buffer.byteLength(body + longTrailer, 'utf8')).toBeGreaterThan(BODY_MAX);
+    await h.create({ roomId: '!r:s', kind: 'task', title: 'B', body, attachments: [longName, shortName] });
+    const sent = client.create.mock.calls[0][0];
+    expect(sent.body).toContain(`📁 Open ${shortName} in Files:`); // shorter, later trailer kept
+    expect(sent.body).not.toContain(`📁 Open ${longName} in Files:`); // oversized one skipped
+    expect(Buffer.byteLength(sent.body, 'utf8')).toBeLessThanOrEqual(BODY_MAX);
+  });
+});
