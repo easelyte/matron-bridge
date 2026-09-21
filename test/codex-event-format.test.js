@@ -394,6 +394,73 @@ describe('formatAndRoute', () => {
     expect(ctx.state.unparsed).toBe(2);
   });
 
+  it('lands the durable final answer under an unpinned newer schema (text passthrough)', () => {
+    const retained = [];
+    const delivered = [];
+    const { calls, ctx } = makeContext({
+      meta: { schemaVersion: 'codex-cli 0.155.1', model: 'future-model' },
+      retainFinalAnswer: (runId, payload) => retained.push({ runId, payload }),
+      markFinalAnswerDelivered: runId => delivered.push(runId),
+    });
+    const agentMessage = {
+      type: 'item.completed',
+      item: { id: 'answer-1', type: 'agent_message', text: 'Review complete: LGTM' },
+    };
+
+    formatAndRoute(agentMessage, ctx);
+    formatAndRoute({ type: 'turn.completed' }, ctx);
+
+    // The final answer lands as the clean durable post with the stable idemKey,
+    // NOT as a raw JSON dump — and finalPostProduced flips so the watcher's
+    // terminal audit reports finalPostLanded truthy instead of false.
+    expect(ctx.state.finalPostProduced).toBe(true);
+    expect(ctx.log.warn).toHaveBeenCalledTimes(1);
+    const textCalls = calls.filter(call => call.method === 'publishText');
+    expect(textCalls).toEqual([
+      {
+        method: 'publishText',
+        args: [
+          ctx.convoId,
+          { body: 'Review complete: LGTM', from: 'assistant' },
+          expect.objectContaining({ idemKey: `${ctx.runId}:final` }),
+        ],
+      },
+    ]);
+    expect(retained).toEqual([
+      { runId: ctx.runId, payload: { body: 'Review complete: LGTM', from: 'assistant' } },
+    ]);
+    // turn.completed still marks the session idle under passthrough.
+    expect(calls.filter(call => call.method === 'publishActivity')).toContainEqual({
+      method: 'publishActivity',
+      args: [ctx.convoId, 'idle'],
+    });
+    expect(ctx.state.terminalSeen).toBe(true);
+  });
+
+  it('still text-passes non-lifecycle events under an unpinned schema', () => {
+    const { calls, ctx } = makeContext({
+      meta: { schemaVersion: 'codex-cli 0.155.1', model: 'future-model' },
+    });
+    const commandEvent = {
+      type: 'item.completed',
+      item: {
+        id: 'item_1', type: 'command_execution', command: 'printf ok',
+        aggregated_output: 'ok', exit_code: 0, status: 'completed',
+      },
+    };
+
+    formatAndRoute(commandEvent, ctx);
+
+    expect(ctx.state.unparsed).toBe(1);
+    expect(calls.filter(call => call.method === 'publishText')).toEqual([
+      {
+        method: 'publishText',
+        args: [ctx.convoId, { body: JSON.stringify(commandEvent), from: 'assistant' }],
+      },
+    ]);
+    expect(calls.some(call => call.method === 'publishToolOutput')).toBe(false);
+  });
+
   it('routes in-band 0.146.x–0.147.x runs through the rich item mapping', () => {
     const commandEvent = {
       type: 'item.completed',
