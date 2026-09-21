@@ -380,7 +380,7 @@ describe('formatAndRoute', () => {
 
   it('warns once and degrades every event to text for an out-of-band schema', () => {
     const { calls, ctx } = makeContext({
-      meta: { schemaVersion: 'codex-cli 0.148.0', model: 'future-model' },
+      meta: { schemaVersion: 'codex-cli 0.156.0', model: 'future-model' },
     });
     const events = fixtureEvents().slice(0, 2);
 
@@ -398,7 +398,7 @@ describe('formatAndRoute', () => {
     const retained = [];
     const delivered = [];
     const { calls, ctx } = makeContext({
-      meta: { schemaVersion: 'codex-cli 0.155.1', model: 'future-model' },
+      meta: { schemaVersion: 'codex-cli 0.156.0', model: 'future-model' },
       retainFinalAnswer: (runId, payload) => retained.push({ runId, payload }),
       markFinalAnswerDelivered: runId => delivered.push(runId),
     });
@@ -439,7 +439,7 @@ describe('formatAndRoute', () => {
 
   it('still text-passes non-lifecycle events under an unpinned schema', () => {
     const { calls, ctx } = makeContext({
-      meta: { schemaVersion: 'codex-cli 0.155.1', model: 'future-model' },
+      meta: { schemaVersion: 'codex-cli 0.156.0', model: 'future-model' },
     });
     const commandEvent = {
       type: 'item.completed',
@@ -461,7 +461,7 @@ describe('formatAndRoute', () => {
     expect(calls.some(call => call.method === 'publishToolOutput')).toBe(false);
   });
 
-  it('routes in-band 0.146.x–0.147.x runs through the rich item mapping', () => {
+  it('routes in-band 0.146.x–0.155.x runs through the rich item mapping', () => {
     const commandEvent = {
       type: 'item.completed',
       item: {
@@ -469,7 +469,10 @@ describe('formatAndRoute', () => {
         aggregated_output: 'ok', exit_code: 0, status: 'completed',
       },
     };
-    for (const schemaVersion of ['codex-cli 0.146.1', 'codex-cli 0.147.0']) {
+    // 0.155.1 is the live version — the band widening (MAX_EXCLUSIVE → 0.156.0)
+    // brings it in-band so it renders richly instead of raw JSON, reusing the
+    // hardened allowlist path unchanged.
+    for (const schemaVersion of ['codex-cli 0.146.1', 'codex-cli 0.147.0', 'codex-cli 0.155.1']) {
       const { calls, ctx } = makeContext({ meta: { schemaVersion } });
       formatAndRoute(commandEvent, ctx);
       expect(ctx.log.warn, schemaVersion).not.toHaveBeenCalled();
