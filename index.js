@@ -183,6 +183,7 @@ import {
 import { CodexExecSession, contentBlocksToCodexPrompt, normalizeCodexSandbox, normalizeCodexNetworkAccess } from './lib/codex-session.js';
 import { CodexAppServerSession, codexInput } from './lib/codex-app-session.js';
 import { wireCodexAppSession } from './lib/codex-app-wiring.js';
+import { stripJournalCreds } from './lib/journal-cred-scope.js';
 import { codexMcpConfig } from './lib/codex-mcp.js';
 import { handleCodexControl, isCodexAuthError, offerCodexBuild, listCodexThreads, mergeCodexThreads } from './lib/codex-controls.js';
 import { createCodexAccountReader, codexSessionOptions } from './lib/codex-account.js';
@@ -6688,7 +6689,10 @@ function fetchUsageLimitsText(cwd) {
       // it doesn't replicate the rest of the session spawns' env shape
       // (BRIDGE_ROOM_ID, MATRON_BRIDGE_API_PORT, MATRON_BASH_TEE_ENABLED —
       // all meaningless here); it just needs the same CLAUDECODE treatment.
-      env: { ...process.env, CLAUDECODE: '' },
+      // Also scope out the full-journal read credential: a `/usage` one-shot
+      // never touches the journal, so it has no reason to carry a token that
+      // reads every transcript (lib/journal-cred-scope.js). Loop #750.
+      env: stripJournalCreds({ ...process.env, CLAUDECODE: '' }),
     });
     let stdout = '';
     let stderr = '';
