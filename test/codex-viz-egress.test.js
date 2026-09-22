@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { redactAndRoute } from '../lib/codex-event-format.js';
+import { createPublishRedactor } from '../lib/redact.js';
 
 // Loop #762 — guards-first, version-tolerant codex-viz rendering.
 //
@@ -202,5 +203,70 @@ describe('codex-viz version tolerance (no upper band, no manual bump)', () => {
     expect(publisher.calls.some(call => call.method === 'publishToolOutput')).toBe(false);
     expect(publisher.calls.some(call => call.method === 'publishText')).toBe(true);
     expect(state.unparsed).toBe(1);
+  });
+});
+
+// Codex adversarial review, round 1, blockers F1 + F2 — reproduced by the
+// reviewer with the PRODUCTION baseline redactor (which cannot scrub secrets
+// under innocuous env names). These lock in the fixes using that same redactor.
+describe('codex-viz egress hardening (production baseline redactor)', () => {
+  // Baseline-only redactor: no policy file, never reads disk. It redacts
+  // secret-KEY-named assignments but leaves innocuous-named values intact — so
+  // any value that reaches a frame here is a genuine leak, not a redaction gap.
+  const baseline = createPublishRedactor({ env: {}, readFileSyncFn: () => '' });
+
+  // A partial (below-threshold) env dump under INNOCUOUS uppercase names the
+  // baseline redactor does not scrub.
+  const PARTIAL = 'ALPHA=partial-secret-1\nBRAVO=partial-secret-2';
+  // A full lowercase env dump — env names may be lowercase, and the pre-fix
+  // classifier only matched uppercase.
+  const LOWER_DUMP = 'alpha=lower-secret-1\nbravo=lower-secret-2\ncharlie=lower-secret-3';
+
+  function routeBaseline(event) {
+    return route(event, { redact: baseline });
+  }
+
+  it('F1: a partial env dump streamed in item.delta output never egresses (output not forwarded off item.completed)', () => {
+    const { publisher } = routeBaseline({
+      type: 'item.delta',
+      item: { id: 'c', type: 'command_execution', command: 'load config', aggregated_output: PARTIAL },
+    });
+    const serialized = JSON.stringify(publisher.calls);
+    expect(serialized).not.toContain('partial-secret-1');
+    expect(serialized).not.toContain('partial-secret-2');
+  });
+
+  it('F1: a partial env dump under an unknown envelope never egresses', () => {
+    const { publisher } = routeBaseline({
+      type: 'item.updated',
+      item: { id: 'c', type: 'command_execution', command: 'load config', output: PARTIAL },
+    });
+    expect(JSON.stringify(publisher.calls)).not.toContain('partial-secret');
+  });
+
+  it('F2: a lowercase env dump in a top-level error message is dropped', () => {
+    const { publisher, state } = routeBaseline({ type: 'error', message: LOWER_DUMP });
+    expect(JSON.stringify(publisher.calls)).not.toContain('lower-secret');
+    expect(state.redactionDropCount).toBe(1);
+    expect(publisher.calls).toEqual([]);
+  });
+
+  it('F2: a lowercase env dump in an unknown item textual field is dropped', () => {
+    const { publisher, state } = routeBaseline({
+      type: 'item.completed',
+      item: { id: 'x', type: 'future_diag', message: LOWER_DUMP },
+    });
+    expect(JSON.stringify(publisher.calls)).not.toContain('lower-secret');
+    expect(state.redactionDropCount).toBe(1);
+  });
+
+  it('F2: a lowercase env dump in command_execution output is dropped', () => {
+    const { publisher, state } = routeBaseline({
+      type: 'item.completed',
+      item: { id: 'c', type: 'command_execution', command: 'cat config', aggregated_output: LOWER_DUMP },
+    });
+    expect(JSON.stringify(publisher.calls)).not.toContain('lower-secret');
+    expect(state.redactionDropCount).toBe(1);
+    expect(publisher.calls).toEqual([]);
   });
 });
