@@ -345,6 +345,16 @@ describe('codex-viz egress hardening (production baseline redactor)', () => {
     expect(serialized).toContain('[REDACTED-ENV]');
   });
 
+  it('terminal gate: a lone-CR-delimited assignment after prose is scrubbed (supported + fallback)', () => {
+    const MSG = 'fatal upstream\rALPHA=cr-secret-value';
+    for (const schemaVersion of [SUPPORTED, 'codex-cli 0.145.0']) {
+      const { publisher } = route({ type: 'error', message: MSG }, { redact: baseline, schemaVersion });
+      const serialized = JSON.stringify(publisher.calls);
+      expect(serialized, schemaVersion).not.toContain('cr-secret-value');
+      expect(serialized, schemaVersion).toContain('[REDACTED-ENV]');
+    }
+  });
+
   it('delta gate 2: a NUL-framed env value that itself contains a newline is fully scrubbed', () => {
     // NUL is the authoritative delimiter; the continuation bytes of the first
     // entry's value must not survive as if they were a separate line.
