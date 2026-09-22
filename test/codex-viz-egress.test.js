@@ -62,7 +62,8 @@ function route(event, { redact = noopRedact, schemaVersion = SUPPORTED } = {}) {
 
 const ENVELOPES = ['item.started', 'item.completed', 'item.delta', 'item.updated'];
 // item.updated stands in for an unknown/newer envelope.
-const OUTPUT_ALIASES = ['aggregated_output', 'output', 'message', 'text'];
+// Every alias in COMMAND_OUTPUT_FIELDS — the command guard must scan them all.
+const OUTPUT_ALIASES = ['aggregated_output', 'output', 'message', 'text', 'delta', 'chunk', 'stdout', 'stderr'];
 
 describe('codex-viz command_execution egress guard (unconditional across envelopes)', () => {
   for (const envelope of ENVELOPES) {
@@ -143,11 +144,31 @@ describe('codex-viz top-level error diagnostics (loop #762 follow-up)', () => {
     expect(body).not.toContain('SENTINEL_CRED');
   });
 
-  it('drops a top-level error whose message is a raw env dump', () => {
-    const { publisher, state } = route({ type: 'error', message: ENV_DUMP });
-    expect(JSON.stringify(publisher.calls)).not.toContain(SECRET);
-    expect(state.redactionDropCount).toBe(1);
-    expect(publisher.calls).toEqual([]);
+  it('scrubs assignment values in a top-level error whose message is a raw env dump', () => {
+    const { publisher } = route({ type: 'error', message: ENV_DUMP });
+    const serialized = JSON.stringify(publisher.calls);
+    expect(serialized).not.toContain(SECRET);
+    expect(serialized).toContain('[REDACTED-ENV]');
+  });
+
+  it('scrubs assignment values diluted by prose (ratio-dodge), preserving the prose', () => {
+    // Codex r3 F1: two assignments mixed with two prose lines dodge any
+    // dominance-ratio heuristic; scrubbing catches them regardless.
+    const { publisher } = route({
+      type: 'error',
+      message: 'fatal\nalpha=prose-secret-1\nbravo=prose-secret-2\nat worker.js:1',
+    });
+    const body = publisher.calls.find(call => call.method === 'publishText')?.payload.body;
+    expect(body).not.toContain('prose-secret-1');
+    expect(body).not.toContain('prose-secret-2');
+    expect(body).toContain('fatal');
+    expect(body).toContain('at worker.js:1');
+  });
+
+  it('preserves an inline key=value mention inside prose (not a bare assignment line)', () => {
+    const { publisher } = route({ type: 'error', message: 'connection failed: host=db.internal' });
+    const body = publisher.calls.find(call => call.method === 'publishText')?.payload.body;
+    expect(body).toContain('host=db.internal');
   });
 });
 
@@ -246,11 +267,11 @@ describe('codex-viz egress hardening (production baseline redactor)', () => {
     expect(JSON.stringify(publisher.calls)).not.toContain('partial-secret');
   });
 
-  it('F2: a lowercase env dump in a top-level error message is dropped', () => {
-    const { publisher, state } = routeBaseline({ type: 'error', message: LOWER_DUMP });
-    expect(JSON.stringify(publisher.calls)).not.toContain('lower-secret');
-    expect(state.redactionDropCount).toBe(1);
-    expect(publisher.calls).toEqual([]);
+  it('F2: a lowercase env dump in a top-level error message has its values scrubbed', () => {
+    const { publisher } = routeBaseline({ type: 'error', message: LOWER_DUMP });
+    const serialized = JSON.stringify(publisher.calls);
+    expect(serialized).not.toContain('lower-secret');
+    expect(serialized).toContain('[REDACTED-ENV]');
   });
 
   it('F2: a lowercase env dump in an unknown item textual field never egresses (field not forwarded)', () => {
@@ -261,19 +282,35 @@ describe('codex-viz egress hardening (production baseline redactor)', () => {
     expect(JSON.stringify(publisher.calls)).not.toContain('lower-secret');
   });
 
-  it('F1(b): a two-line env dump in a top-level error message is dropped (stricter diagnostic bar)', () => {
+  it('F1(b): a two-line env dump in a top-level error message has its values scrubbed', () => {
     const TWO_LINE = 'alpha=lower-secret-1\nbravo=lower-secret-2';
-    const { publisher, state } = routeBaseline({ type: 'error', message: TWO_LINE });
-    expect(JSON.stringify(publisher.calls)).not.toContain('lower-secret');
-    expect(state.redactionDropCount).toBe(1);
-    expect(publisher.calls).toEqual([]);
+    const { publisher } = routeBaseline({ type: 'error', message: TWO_LINE });
+    const serialized = JSON.stringify(publisher.calls);
+    expect(serialized).not.toContain('lower-secret');
+    expect(serialized).toContain('[REDACTED-ENV]');
   });
 
-  it('F1(b): a normal single-assignment error diagnostic is still preserved', () => {
-    // A legitimate one-line "key=value" diagnostic must NOT be over-dropped.
+  it('F1(b): a legitimate inline key=value diagnostic is preserved (prose, not a bare line)', () => {
     const { publisher } = routeBaseline({ type: 'error', message: 'connection failed: host=db.internal' });
     const body = publisher.calls.find(call => call.method === 'publishText')?.payload.body;
     expect(body).toContain('host=db.internal');
+  });
+
+  it('F2 (r3): an overflow schema version fails safe to text passthrough, not rich routing', () => {
+    const overflowVersion = `codex-cli ${'9'.repeat(400)}.0.0`;
+    const { publisher, state } = route({
+      type: 'item.completed',
+      item: {
+        id: 'c', type: 'command_execution', command: 'printf ok',
+        aggregated_output: 'ALPHA=overflow-canary', exit_code: 0, status: 'completed',
+      },
+    }, { redact: baseline, schemaVersion: overflowVersion });
+    // Infinity-valued component must be rejected → generic text passthrough,
+    // never the rich publishToolOutput route. The generic fallback also omits
+    // aggregated_output entirely, so the canary never reaches the client.
+    expect(publisher.calls.some(call => call.method === 'publishToolOutput')).toBe(false);
+    expect(JSON.stringify(publisher.calls)).not.toContain('overflow-canary');
+    expect(state.unparsed).toBe(1);
   });
 
   it('F2: a lowercase env dump in command_execution output is dropped', () => {
