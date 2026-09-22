@@ -419,6 +419,32 @@ describe('createSubagentConvoTracker', () => {
       expect(child.state).toBe(CHILD_STATE_FINISHED);
     });
 
+    it('a late explicit task_started still corrects a reverse-discovery FIFO mispairing on a running child', () => {
+      // Delta-gate F1: the replay guard must not reject a VALID authoritative
+      // pairing. Two agents' refs are queued FIFO; discovery happens in REVERSE
+      // order so each running child provisionally gets the OTHER's ref. The
+      // later explicit task_started events must still correct them (documented
+      // discovery-beats-system-event contract), and both must then complete.
+      tracker.noteTaskStarted('ref-A');
+      tracker.noteTaskStarted('ref-B');
+      const b = tracker.discover('agent-B', { label: 'B', agentType: null }); // FIFO -> ref-A (wrong)
+      const a = tracker.discover('agent-A', { label: 'A', agentType: null }); // FIFO -> ref-B (wrong)
+      expect(b.taskRef).toBe('ref-A');
+      expect(a.taskRef).toBe('ref-B');
+
+      // Authoritative pairings correct the provisional refs on the RUNNING children.
+      tracker.noteBackgroundTaskStarted('ref-B', 'agent-B');
+      tracker.noteBackgroundTaskStarted('ref-A', 'agent-A');
+      expect(b.taskRef).toBe('ref-B');
+      expect(a.taskRef).toBe('ref-A');
+
+      // Correctly correlated completions now finish BOTH — no stranded children.
+      tracker.noteTaskCompleted('agent-B', 'ref-B');
+      tracker.noteTaskCompleted('agent-A', 'ref-A');
+      expect(b.state).toBe(CHILD_STATE_FINISHED);
+      expect(a.state).toBe(CHILD_STATE_FINISHED);
+    });
+
     it('ignores a replayed run-N notification after run N+1 has started, then finishes on run N+1', () => {
       // Run N: background spawn under toolu_runN, discovered, then completes.
       tracker.noteBackgroundTaskStarted('toolu_runN', 'agent-x');
