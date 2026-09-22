@@ -343,6 +343,60 @@ describe('createSubagentConvoTracker', () => {
     });
   });
 
+  // Loop #751: a duplicated / replayed task_notification for a PRIOR run must
+  // not finish the run currently in flight. The completion is gated on the
+  // notification's tool_use_id matching the child's CURRENT taskRef.
+  describe('completion gated on tool_use_id (loop #751)', () => {
+    it('finishes on a matching tool_use_id', () => {
+      tracker.noteBackgroundTaskStarted('toolu_1', 'agent-1');
+      tracker.discover('agent-1', { label: 'A', agentType: null });
+      publisher.calls.upsertConvo.length = 0;
+
+      tracker.noteTaskCompleted('agent-1', 'toolu_1');
+
+      expect(publisher.calls.upsertConvo.at(-1).opts.sessionState).toBe(CHILD_STATE_FINISHED);
+    });
+
+    it('falls back to finish-by-task_id when no tool_use_id is supplied', () => {
+      // Older streams that don't carry a tool_use_id on the notification must
+      // still complete — the gate only engages when a tool_use_id is present.
+      tracker.noteBackgroundTaskStarted('toolu_1', 'agent-1');
+      tracker.discover('agent-1', { label: 'A', agentType: null });
+      publisher.calls.upsertConvo.length = 0;
+
+      tracker.noteTaskCompleted('agent-1');
+
+      expect(publisher.calls.upsertConvo.at(-1).opts.sessionState).toBe(CHILD_STATE_FINISHED);
+    });
+
+    it('ignores a replayed run-N notification after run N+1 has started, then finishes on run N+1', () => {
+      // Run N: background spawn under toolu_runN, discovered, then completes.
+      tracker.noteBackgroundTaskStarted('toolu_runN', 'agent-x');
+      const child = tracker.discover('agent-x', { label: 'X', agentType: null });
+      tracker.noteTaskCompleted('agent-x', 'toolu_runN'); // run N finishes
+      expect(child.state).toBe(CHILD_STATE_FINISHED);
+
+      // Run N+1: SendMessage resume — a fresh task_started carries a NEW
+      // tool_use_id (advances taskRef), then revive flips the child running.
+      tracker.noteBackgroundTaskStarted('toolu_runN1', 'agent-x');
+      tracker.revive('agent-x');
+      expect(child.state).toBe(CHILD_STATE_RUNNING);
+      expect(child.taskRef).toBe('toolu_runN1');
+      publisher.calls.upsertConvo.length = 0;
+
+      // A LATE / duplicated run-N notification (stale tool_use_id) arrives.
+      tracker.noteTaskCompleted('agent-x', 'toolu_runN');
+      // Must NOT finish the live resumed run.
+      expect(child.state).toBe(CHILD_STATE_RUNNING);
+      expect(publisher.calls.upsertConvo).toHaveLength(0);
+
+      // The correct run-N+1 notification still finishes it.
+      tracker.noteTaskCompleted('agent-x', 'toolu_runN1');
+      expect(child.state).toBe(CHILD_STATE_FINISHED);
+      expect(publisher.calls.upsertConvo.at(-1).opts.sessionState).toBe(CHILD_STATE_FINISHED);
+    });
+  });
+
   // The tracker records every minted `running` child into a
   // persistent store and drops it the moment it finishes, so a bridge restart
   // can reconcile children that never reached `done` in-process.
