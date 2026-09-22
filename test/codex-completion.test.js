@@ -385,7 +385,7 @@ describe('Codex completion state machine', () => {
     await attach(harness);
     harness.publisher.publishText = (convoId, payload, options) => {
       harness.calls.publishText.push({ convoId, payload, options });
-      options?.onDelivered?.();
+      options?.onLocalSendComplete?.();
       return true;
     };
     const tail = harness.watcher.tails.get(RUN_ID);

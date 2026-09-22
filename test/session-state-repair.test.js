@@ -158,7 +158,7 @@ describe('retirement settles against the RECORDED state (no publish loop)', () =
     const { reoffer, retire } = selectEpochRepairs(outbox.list(), liveConvoIds);
     const offer = (convoId, token, publish) => {
       sent.push([convoId, publish]);
-      outbox.settle(convoId, token); // stands in for the publisher's onDelivered
+      outbox.settle(convoId, token); // stands in for the publisher's onLocalSendComplete
     };
     for (const { convoId, state, token } of reoffer) offer(convoId, token, state);
     for (const { convoId, token } of retire) offer(convoId, token, 'done');
@@ -184,6 +184,77 @@ describe('retirement settles against the RECORDED state (no publish loop)', () =
     sweep(outbox, new Set(), []);
 
     expect(createRunStateOutbox({ file, log: silent }).list()).toEqual([]);
+  });
+});
+
+describe('loop #754: the transition publish does NOT settle on local send — reconcile is the authority', () => {
+  let dir;
+  let file;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'run-state-754-'));
+    file = join(dir, 'outbox.json');
+  });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  // Models the epoch sweep the same way the "retirement settles" block does: classify -> publish
+  // -> settle on the sweep's own send. This is the reconcile authority.
+  function sweep(outbox, liveConvoIds, sent) {
+    const { reoffer, retire } = selectEpochRepairs(outbox.list(), liveConvoIds);
+    const offer = (convoId, token, publish) => {
+      sent.push([convoId, publish]);
+      outbox.settle(convoId, token);
+    };
+    for (const { convoId, state, token } of reoffer) offer(convoId, token, state);
+    for (const { convoId, token } of retire) offer(convoId, token, 'done');
+  }
+
+  it('a `done` whose local send completed but whose server commit was LOST survives and is redelivered', () => {
+    const outbox = createRunStateOutbox({ file, log: silent });
+
+    // journalSessionState write-aheads the terminal transition, then publishes `done`. Under the
+    // #754 fix it deliberately does NOT settle on the publisher's onLocalSendComplete callback,
+    // because that callback fires when the frame leaves the local socket buffer, NOT when the
+    // server persists it. Model exactly that: note the transition, "publish" it, and do NOT settle.
+    outbox.note('c1', 'done');
+    // <-- the local send completed here (ws.send callback fired) but the connection dropped before
+    //     the server committed. The OLD code called runStateOutbox.settle() right here and stranded
+    //     the row forever. The new code does not, so the write-ahead record MUST survive.
+    expect(outbox.size()).toBe(1);
+    expect(outbox.list().map((r) => [r.convoId, r.state])).toEqual([['c1', 'done']]);
+
+    // On the next accepted reconnect the session is gone (no live owner). The reconcile sweep
+    // re-offers the surviving terminal record — a SECOND delivery attempt for the lost `done` —
+    // and settles it against the recorded revision.
+    const sent = [];
+    sweep(outbox, new Set(), sent);
+    expect(sent).toEqual([['c1', 'done']]);
+    expect(outbox.size()).toBe(0);
+  });
+
+  it('a still-live convo whose transition send was lost is re-offered its current state on reconnect', () => {
+    const outbox = createRunStateOutbox({ file, log: silent });
+    outbox.note('c1', 'running');
+    // No eager settle on local send (the fix). The record survives.
+    expect(outbox.size()).toBe(1);
+
+    const sent = [];
+    sweep(outbox, new Set(['c1']), sent); // c1 still owned by a live session
+    expect(sent).toEqual([['c1', 'running']]); // re-offered, not retired
+    expect(outbox.size()).toBe(0);
+  });
+
+  it('a cleanly reconciled transition settles exactly once and does not loop', () => {
+    const outbox = createRunStateOutbox({ file, log: silent });
+    outbox.note('c1', 'done');
+
+    const sent = [];
+    sweep(outbox, new Set(), sent); // reconcile publishes + settles
+    expect(outbox.size()).toBe(0);
+
+    // The capacity hook fires again on the next confirmed send; with the record settled it is inert.
+    sweep(outbox, new Set(), sent);
+    expect(sent).toEqual([['c1', 'done']]);
   });
 });
 
@@ -370,12 +441,18 @@ describe('index.js wiring', () => {
     throw new Error(`unterminated ${signature}`);
   }
 
-  it('records to the DURABLE outbox and settles on delivery, not on enqueue', () => {
+  it('write-ahead records to the DURABLE outbox but does NOT settle eagerly on local send (loop #754)', () => {
     const body = sliceFunction('function journalSessionState(');
     expect(body).toContain('runStateOutbox.note(');
     expect(body).toContain('planTransition(');
-    expect(body).toContain('onDelivered');
-    expect(body).toContain('runStateOutbox.settle(');
+    // Loop #754: the transition publish must NOT clear the durable record on the publisher's
+    // local-send callback — that callback fires when the frame leaves the local socket, not when
+    // the server commits it, so settling there strands a lost-after-send `done` forever. The
+    // reconnect reconciliation sweep (republishSessionStates) is the sole settle authority.
+    // The load-bearing signal is the absence of the settle CALL (comment prose is ignored by
+    // checking for the call form, not the bare identifier).
+    expect(body).not.toContain('runStateOutbox.settle(');
+    expect(body).not.toContain('onLocalSendComplete:');
   });
 
   it('runs the run-state repair on every accepted reconnect', () => {
@@ -395,7 +472,7 @@ describe('index.js wiring', () => {
     // Retirement publishes `done` but settles against the RECORDED `running` — settling on the
     // published value would never match and would loop forever.
     expect(body).toContain("offer(convoId, token, 'done')");
-    expect(body).toContain('onDelivered: () => runStateOutbox.settle(convoId, token)');
+    expect(body).toContain('onLocalSendComplete: () => runStateOutbox.settle(convoId, token)');
     // The live set is built from sessions, the same signal the subagent reconcile uses.
     expect(body).toContain('journalConvoIdFor(session)');
   });
