@@ -286,6 +286,49 @@ describe('createJournalPublisher', () => {
     }
   });
 
+  it('onLocalSendComplete fires from the LOCAL ws.send write callback, not a server commit ack (loop #754)', async () => {
+    // Contract honesty (loop #754): there is NO application-level per-frame server ack on this WS
+    // publish path. onLocalSendComplete fires when ws.send's write callback fires — i.e. once the
+    // frame has left THIS PROCESS'S local socket buffer — NOT once the server has persisted it.
+    // Prove it with a transport that confirms the local write for a publish frame but never forwards
+    // those bytes to the server: the callback must still fire, and the server must never receive it.
+    class LocalConfirmNoServerWebSocket extends WebSocket {
+      send(data, cb) {
+        let parsed;
+        try { parsed = JSON.parse(data); } catch { parsed = null; }
+        // Let the handshake + any non-publish control frame through so the socket establishes.
+        if (!parsed || (parsed.op !== 'publish' && parsed.op !== 'convo_upsert')) {
+          return super.send(data, cb);
+        }
+        // Confirm the LOCAL write (fire the callback) but drop the bytes on the floor — the server
+        // never sees them. This is precisely the socket-accepted-but-server-uncommitted window.
+        if (typeof cb === 'function') queueMicrotask(() => cb());
+      }
+    }
+
+    const fake = await startFakeServer();
+    const pub = createJournalPublisher({
+      url: fake.url, token: 'tok', log: silentLog, ...FAST_BACKOFF,
+      WebSocketImpl: LocalConfirmNoServerWebSocket,
+    });
+    await waitFor(() => fake.connections.length >= 1);
+
+    let fired = false;
+    pub.publishText('c1', { body: 'x', from: 'user' }, { onLocalSendComplete: () => { fired = true; } });
+
+    // The local-send callback fires...
+    await waitFor(() => fired);
+    expect(fired).toBe(true);
+
+    // ...yet the server NEVER received the publish frame. onLocalSendComplete is a local-send
+    // signal, not a durability/commit ack — the exact false-confidence the #754 rename kills.
+    await new Promise((r) => setTimeout(r, 50));
+    expect(fake.received.some((f) => f.op === 'publish')).toBe(false);
+
+    pub.close();
+    await fake.close();
+  });
+
   it('keepalive: terminates and reconnects when pings go unanswered (half-open socket)', async () => {
     const fake = await startFakeServer();
     const pub = createJournalPublisher({

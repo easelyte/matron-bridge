@@ -1216,7 +1216,7 @@ function journalBufferPush(session, method, payload) {
 }
 
 // Send now if the convo_id is known, otherwise buffer for the eventual flush.
-// `options` (onDelivered, etc.) reaches the publisher only on the LIVE path: a session whose
+// `options` (onLocalSendComplete, etc.) reaches the publisher only on the LIVE path: a session whose
 // convo id is not known yet buffers the payload, and journalBufferPush has no slot to carry a
 // delivery callback. Every current options-passing caller (journalSessionState) skips the call
 // entirely when there is no convo id, so nothing is silently dropped here.
@@ -1477,17 +1477,28 @@ function journalPublishUserItem(session, method, payload) {
 // Mirror a session_state transition, but only on actual change — busy/prompt/
 // turn-end events fire far more often than the state actually flips.
 function journalSessionState(session, state) {
-  // Track the attempt until the server confirms it. The change-gate above advances on ENQUEUE,
-  // but the durable queue drops its OLDEST frame on overflow, so without a record an evicted
-  // transition is never retried and the convo's row stays at the pre-transition state forever (a
-  // stranded `running` renders as a permanent "Thinking" in every client). Keyed by convo id, not
-  // by session: the terminal paths delete the session from `sessions` immediately BEFORE
-  // publishing `done`, so a session-keyed record would miss exactly the case this repairs.
+  // Write-ahead the attempted transition to the durable outbox BEFORE publishing. The change-gate
+  // above advances on ENQUEUE, but the durable queue drops its OLDEST frame on overflow, so without
+  // a record an evicted transition is never retried and the convo's row stays at the pre-transition
+  // state forever (a stranded `running` renders as a permanent "Thinking" in every client). Keyed by
+  // convo id, not by session: the terminal paths delete the session from `sessions` immediately
+  // BEFORE publishing `done`, so a session-keyed record would miss exactly the case this repairs.
   //
-  // The gate + write-ahead + latch decision lives in planTransition so its failure sequences are
-  // testable; see lib/session-state-repair.js.
+  // The record is deliberately NOT settled here on local-send completion. There is no per-frame
+  // server commit ack on this WS path, and the publisher's onLocalSendComplete fires when the frame
+  // leaves the local socket buffer, NOT when the server persists it (see journal-publisher pump()).
+  // Settling on that callback was the loop #754 bug: a `done` frame whose write callback fired but
+  // whose connection dropped before the server committed cleared the outbox record, leaving the row
+  // stuck `running` with nothing left to reconcile — a permanent, unrecoverable "Thinking".
+  //
+  // Instead the reconnect reconciliation sweep is the settle authority: republishSessionStates
+  // (selectEpochRepairs) reads the surviving record on every accepted reconnect AND on returned send
+  // capacity (retryRunStateRepairs), re-offers a live convo's state, and retires an unowned `running`
+  // to `done` (bridge PR #54). That sweep publishes and settles against the recorded revision token,
+  // so a lost initial send self-heals via the re-offer instead of stranding. See
+  // lib/session-state-repair.js for the gate + write-ahead + latch decision.
   const convoId = journalConvoIdFor(session);
-  const { publish, latch, token } = planTransition(
+  const { publish, latch } = planTransition(
     session._journalState,
     state,
     // undefined (not null) when there is no convo id: the payload is buffered for a later
@@ -1496,9 +1507,7 @@ function journalSessionState(session, state) {
   );
   session._journalState = latch;
   if (!publish) return;
-  journalUpsertConvo(session, { sessionState: state }, {
-    onDelivered: token ? () => runStateOutbox.settle(convoId, token) : undefined,
-  });
+  journalUpsertConvo(session, { sessionState: state });
 }
 
 // Repair the session_state latch across a connection epoch — the exact analogue of
@@ -1550,7 +1559,7 @@ function republishSessionStates() {
         // record that says `running`, so matching on the published state would never clear it and
         // the capacity hook would re-publish forever; matching on the revision also means a
         // conversation that resumed since this offer keeps its newer record.
-        onDelivered: () => runStateOutbox.settle(convoId, token),
+        onLocalSendComplete: () => runStateOutbox.settle(convoId, token),
       });
 
     let refused = 0;
@@ -3535,7 +3544,7 @@ function maybeResolveInteractivePrompt(session, userText, { mirrorToJournal = tr
       text: replyText,
       // The reply goes in via iv.sendText (not sendToSession), so record it
       // only after that delayed PTY send accepts the text.
-      onDelivered: () => mirrorAnswer(replyText),
+      onLocalSendComplete: () => mirrorAnswer(replyText),
       onError: (error) => reportPromptAnswerDeliveryFailure(session, error),
     });
     if (dispatched) session.pendingInteractivePrompt = null;
@@ -3993,7 +4002,7 @@ function submitAnswer(session, answerText, { mirrorToJournal = true } = {}) {
     writePromptAnswer(session, jsonMsg, {
       // This answer goes in via a raw tool_result stdin write (not
       // sendToSession), so record it only after stdin accepts the chunk.
-      onDelivered: () => {
+      onLocalSendComplete: () => {
         recordUserAnswer(session, answerText, { mirrorToJournal });
         if (session.resetTimeout) session.resetTimeout();
       },
@@ -4149,7 +4158,7 @@ function reconcileStrandedSubagents(reason = 'startup') {
       journalPublisher.upsertConvoBestEffort(
         childConvoId,
         { sessionState: 'done', parentConvoId },
-        { onDelivered: () => subagentRunningStore.remove(childConvoId) },
+        { onLocalSendComplete: () => subagentRunningStore.remove(childConvoId) },
       );
       published += 1;
     } catch (e) {
@@ -8686,7 +8695,7 @@ function journalRoutePromptReply(session, { choice, text }) {
       const dispatched = sendDelayedPromptAnswer(session, {
         response: ftResponse,
         text: freeText,
-        onDelivered: () => recordUserAnswer(session, freeText, { mirrorToJournal: false }),
+        onLocalSendComplete: () => recordUserAnswer(session, freeText, { mirrorToJournal: false }),
         onError: (error) => reportPromptAnswerDeliveryFailure(session, error),
       });
       if (!dispatched) return null;
