@@ -343,7 +343,10 @@ describe('publish-side Codex redaction', () => {
     expect(state.redactionDropCount).toBe(0);
   });
 
-  it('preserves the real unpinned schema and safely publishes new textual diagnostics', () => {
+  it('preserves a below-floor schema via generic text passthrough and drops unknown structure', () => {
+    // Loop #762: versions at/above the floor now render richly; only a
+    // below-floor version falls back to the generic-text passthrough, which
+    // keeps textual diagnostics (redacted) and drops arbitrary object shapes.
     const publisher = makePublisher();
     const log = { warn: vi.fn() };
 
@@ -358,13 +361,13 @@ describe('publish-side Codex redaction', () => {
       publisher,
       convoId: `parent:codex:${RUN_ID}`,
       runId: RUN_ID,
-      meta: { schemaVersion: 'codex-cli 0.999.0' },
+      meta: { schemaVersion: 'codex-cli 0.145.0' },
       state: {},
       redact: replaceSentinel,
       log,
     });
 
-    expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('codex-cli 0.999.0'));
+    expect(log.warn).toHaveBeenCalledWith(expect.stringContaining('codex-cli 0.145.0'));
     const body = publisher.calls.find(call => call.method === 'publishText')?.payload.body;
     expect(body).toContain(REDACTED);
     expect(body).toContain('future_answer');
