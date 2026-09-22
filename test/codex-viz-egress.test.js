@@ -345,6 +345,21 @@ describe('codex-viz egress hardening (production baseline redactor)', () => {
     expect(serialized).toContain('[REDACTED-ENV]');
   });
 
+  it('delta gate 2: a NUL-framed env value that itself contains a newline is fully scrubbed', () => {
+    // NUL is the authoritative delimiter; the continuation bytes of the first
+    // entry's value must not survive as if they were a separate line.
+    const MIXED = 'ALPHA=first-line\ncontinuation-secret\0BRAVO=second-secret';
+    const { publisher } = route(
+      { type: 'error', message: MIXED },
+      { redact: baseline, schemaVersion: SUPPORTED },
+    );
+    const serialized = JSON.stringify(publisher.calls);
+    expect(serialized).not.toContain('continuation-secret');
+    expect(serialized).not.toContain('first-line');
+    expect(serialized).not.toContain('second-secret');
+    expect(serialized).toContain('[REDACTED-ENV]');
+  });
+
   it('delta gate: an env dump in a below-floor item textual field is scrubbed via the generic fallback', () => {
     const { publisher } = route(
       { type: 'item.completed', item: { id: 'x', type: 'future_answer', answer: LOWER_DUMP } },
