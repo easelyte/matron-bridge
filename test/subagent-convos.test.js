@@ -357,9 +357,10 @@ describe('createSubagentConvoTracker', () => {
       expect(publisher.calls.upsertConvo.at(-1).opts.sessionState).toBe(CHILD_STATE_FINISHED);
     });
 
-    it('falls back to finish-by-task_id when no tool_use_id is supplied', () => {
-      // Older streams that don't carry a tool_use_id on the notification must
-      // still complete — the gate only engages when a tool_use_id is present.
+    it('falls back to finish-by-task_id when no tool_use_id is supplied (never-resumed run)', () => {
+      // Streams that don't carry a tool_use_id on the notification must still
+      // complete a never-resumed run: generation 0 has exactly one incarnation,
+      // so an uncorrelated completion is unambiguous.
       tracker.noteBackgroundTaskStarted('toolu_1', 'agent-1');
       tracker.discover('agent-1', { label: 'A', agentType: null });
       publisher.calls.upsertConvo.length = 0;
@@ -367,6 +368,24 @@ describe('createSubagentConvoTracker', () => {
       tracker.noteTaskCompleted('agent-1');
 
       expect(publisher.calls.upsertConvo.at(-1).opts.sessionState).toBe(CHILD_STATE_FINISHED);
+    });
+
+    it('ignores an uncorrelated (id-less) notification for a RESUMED run — cannot risk killing the live incarnation', () => {
+      // Codex F1: for a producer that omits tool_use_id, a stale run-N
+      // notification arriving after run N+1 has started must not blindly finish
+      // the live resumed run. generation >= 1 means multiple incarnations exist,
+      // so an uncorrelated completion is ambiguous and is ignored (finishAll
+      // settles the child at teardown).
+      tracker.noteBackgroundTaskStarted('toolu_runN', 'agent-x');
+      const child = tracker.discover('agent-x', { label: 'X', agentType: null });
+      tracker.noteTaskCompleted('agent-x', 'toolu_runN'); // run N finishes
+      tracker.revive('agent-x');                          // run N+1 (generation -> 1)
+      expect(child.state).toBe(CHILD_STATE_RUNNING);
+      publisher.calls.upsertConvo.length = 0;
+
+      tracker.noteTaskCompleted('agent-x'); // id-less stale/uncorrelated notification
+      expect(child.state).toBe(CHILD_STATE_RUNNING);
+      expect(publisher.calls.upsertConvo).toHaveLength(0);
     });
 
     it('ignores a replayed run-N notification after run N+1 has started, then finishes on run N+1', () => {
@@ -622,9 +641,9 @@ describe('createSubagentConvoTracker', () => {
       });
       tracker.noteBackgroundTaskStarted('toolu_1', 'agent-1');
       tracker.discover('agent-1', { label: 'A', agentType: null });
-      tracker.noteTaskCompleted('agent-1');
+      tracker.noteTaskCompleted('agent-1', 'toolu_1');
       tracker.revive('agent-1');
-      tracker.noteTaskCompleted('agent-1');
+      tracker.noteTaskCompleted('agent-1', 'toolu_1');
 
       expect(publisher.calls.upsertConvo.at(-1).opts.sessionState).toBe(CHILD_STATE_FINISHED);
       expect(runningStore.list()).toEqual([]);
@@ -772,11 +791,11 @@ describe('createSubagentConvoTracker', () => {
 
       tracker.noteBackgroundTaskStarted('toolu_1', 'agent-1');
       tracker.discover('agent-1', { label: 'A', agentType: null });
-      tracker.noteTaskCompleted('agent-1');   // run 1 done — ack pending
+      tracker.noteTaskCompleted('agent-1', 'toolu_1');   // run 1 done — ack pending
       const run1Ack = deliveries.at(-1);
 
       tracker.revive('agent-1');              // resumed
-      tracker.noteTaskCompleted('agent-1');   // run 2 done — its own ack pending
+      tracker.noteTaskCompleted('agent-1', 'toolu_1');   // run 2 done — its own ack pending
       const run2Ack = deliveries.at(-1);
       expect(run2Ack).not.toBe(run1Ack);
       expect(runningStore.list()).toHaveLength(1);
