@@ -322,4 +322,36 @@ describe('codex-viz egress hardening (production baseline redactor)', () => {
     expect(state.redactionDropCount).toBe(1);
     expect(publisher.calls).toEqual([]);
   });
+
+  it('delta gate: an overflow-version top-level error diagnostic is still scrubbed via the generic fallback', () => {
+    const overflowVersion = `codex-cli ${'9'.repeat(400)}.0.0`;
+    const { publisher } = route(
+      { type: 'error', message: 'alpha=fallback-secret-1' },
+      { redact: baseline, schemaVersion: overflowVersion },
+    );
+    const serialized = JSON.stringify(publisher.calls);
+    expect(serialized).not.toContain('fallback-secret-1');
+    expect(serialized).toContain('[REDACTED-ENV]');
+  });
+
+  it('delta gate: a NUL-delimited env dump in a below-floor error diagnostic is scrubbed', () => {
+    const NUL_DUMP = 'alpha=nul-secret-1\0bravo=nul-secret-2\0charlie=nul-secret-3';
+    const { publisher } = route(
+      { type: 'error', message: NUL_DUMP },
+      { redact: baseline, schemaVersion: 'codex-cli 0.145.0' },
+    );
+    const serialized = JSON.stringify(publisher.calls);
+    expect(serialized).not.toContain('nul-secret');
+    expect(serialized).toContain('[REDACTED-ENV]');
+  });
+
+  it('delta gate: an env dump in a below-floor item textual field is scrubbed via the generic fallback', () => {
+    const { publisher } = route(
+      { type: 'item.completed', item: { id: 'x', type: 'future_answer', answer: LOWER_DUMP } },
+      { redact: baseline, schemaVersion: 'codex-cli 0.145.0' },
+    );
+    const serialized = JSON.stringify(publisher.calls);
+    expect(serialized).not.toContain('lower-secret');
+    expect(serialized).toContain('[REDACTED-ENV]');
+  });
 });
