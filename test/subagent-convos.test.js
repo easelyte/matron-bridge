@@ -388,6 +388,37 @@ describe('createSubagentConvoTracker', () => {
       expect(publisher.calls.upsertConvo).toHaveLength(0);
     });
 
+    it('a replayed run-N task_started must not regress taskRef and let a stale completion finish run N+1', () => {
+      // R2 F2: the completion gate reads child.taskRef, but noteBackgroundTaskStarted
+      // otherwise overwrites it unconditionally. A delayed replay of run N's
+      // task_started could restore the retired ref and let the replayed run-N
+      // completion match and finish the live resumed run.
+      tracker.noteBackgroundTaskStarted('toolu_runN', 'agent-x');
+      const child = tracker.discover('agent-x', { label: 'X', agentType: null });
+      tracker.noteTaskCompleted('agent-x', 'toolu_runN'); // run N finishes
+
+      // Run N+1 resumes under a new ref.
+      tracker.noteBackgroundTaskStarted('toolu_runN1', 'agent-x');
+      tracker.revive('agent-x');
+      expect(child.state).toBe(CHILD_STATE_RUNNING);
+      expect(child.taskRef).toBe('toolu_runN1');
+
+      // A DELAYED REPLAY of run N's task_started arrives while N+1 runs — must
+      // NOT regress the ref back to the retired run-N value.
+      tracker.noteBackgroundTaskStarted('toolu_runN', 'agent-x');
+      expect(child.taskRef).toBe('toolu_runN1');
+
+      publisher.calls.upsertConvo.length = 0;
+      // The replayed run-N completion is therefore still rejected.
+      tracker.noteTaskCompleted('agent-x', 'toolu_runN');
+      expect(child.state).toBe(CHILD_STATE_RUNNING);
+      expect(publisher.calls.upsertConvo).toHaveLength(0);
+
+      // And the correct run-N+1 completion still finishes it.
+      tracker.noteTaskCompleted('agent-x', 'toolu_runN1');
+      expect(child.state).toBe(CHILD_STATE_FINISHED);
+    });
+
     it('ignores a replayed run-N notification after run N+1 has started, then finishes on run N+1', () => {
       // Run N: background spawn under toolu_runN, discovered, then completes.
       tracker.noteBackgroundTaskStarted('toolu_runN', 'agent-x');
