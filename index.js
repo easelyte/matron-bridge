@@ -4910,8 +4910,11 @@ function handleClaudeEvent(session, event) {
         // this — not the spawning tool_result, which fired at launch — is the
         // completion signal that flips the child convo to 'done'. finish() is
         // a no-op for task_ids that never had a child (background Bash).
+        // Pass the notification's tool_use_id so noteTaskCompleted can reject a
+        // duplicated/replayed notification for a PRIOR incarnation of a resumed
+        // agent (loop #751): a stale run-N notification must not finish run N+1.
         if (event.task_id) {
-          session.subagentConvos?.noteTaskCompleted(event.task_id);
+          session.subagentConvos?.noteTaskCompleted(event.task_id, event.tool_use_id);
         }
         // Deliberately NOT surfaced in chat: the background task's tool_use
         // (Bash / Agent / Workflow) already renders as a tool-call panel in

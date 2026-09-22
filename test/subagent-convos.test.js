@@ -343,6 +343,136 @@ describe('createSubagentConvoTracker', () => {
     });
   });
 
+  // Loop #751: a duplicated / replayed task_notification for a PRIOR run must
+  // not finish the run currently in flight. The completion is gated on the
+  // notification's tool_use_id matching the child's CURRENT taskRef.
+  describe('completion gated on tool_use_id (loop #751)', () => {
+    it('finishes on a matching tool_use_id', () => {
+      tracker.noteBackgroundTaskStarted('toolu_1', 'agent-1');
+      tracker.discover('agent-1', { label: 'A', agentType: null });
+      publisher.calls.upsertConvo.length = 0;
+
+      tracker.noteTaskCompleted('agent-1', 'toolu_1');
+
+      expect(publisher.calls.upsertConvo.at(-1).opts.sessionState).toBe(CHILD_STATE_FINISHED);
+    });
+
+    it('falls back to finish-by-task_id when no tool_use_id is supplied (never-resumed run)', () => {
+      // Streams that don't carry a tool_use_id on the notification must still
+      // complete a never-resumed run: generation 0 has exactly one incarnation,
+      // so an uncorrelated completion is unambiguous.
+      tracker.noteBackgroundTaskStarted('toolu_1', 'agent-1');
+      tracker.discover('agent-1', { label: 'A', agentType: null });
+      publisher.calls.upsertConvo.length = 0;
+
+      tracker.noteTaskCompleted('agent-1');
+
+      expect(publisher.calls.upsertConvo.at(-1).opts.sessionState).toBe(CHILD_STATE_FINISHED);
+    });
+
+    it('ignores an uncorrelated (id-less) notification for a RESUMED run — cannot risk killing the live incarnation', () => {
+      // Codex F1: for a producer that omits tool_use_id, a stale run-N
+      // notification arriving after run N+1 has started must not blindly finish
+      // the live resumed run. generation >= 1 means multiple incarnations exist,
+      // so an uncorrelated completion is ambiguous and is ignored (finishAll
+      // settles the child at teardown).
+      tracker.noteBackgroundTaskStarted('toolu_runN', 'agent-x');
+      const child = tracker.discover('agent-x', { label: 'X', agentType: null });
+      tracker.noteTaskCompleted('agent-x', 'toolu_runN'); // run N finishes
+      tracker.revive('agent-x');                          // run N+1 (generation -> 1)
+      expect(child.state).toBe(CHILD_STATE_RUNNING);
+      publisher.calls.upsertConvo.length = 0;
+
+      tracker.noteTaskCompleted('agent-x'); // id-less stale/uncorrelated notification
+      expect(child.state).toBe(CHILD_STATE_RUNNING);
+      expect(publisher.calls.upsertConvo).toHaveLength(0);
+    });
+
+    it('a replayed run-N task_started must not regress taskRef and let a stale completion finish run N+1', () => {
+      // R2 F2: the completion gate reads child.taskRef, but noteBackgroundTaskStarted
+      // otherwise overwrites it unconditionally. A delayed replay of run N's
+      // task_started could restore the retired ref and let the replayed run-N
+      // completion match and finish the live resumed run.
+      tracker.noteBackgroundTaskStarted('toolu_runN', 'agent-x');
+      const child = tracker.discover('agent-x', { label: 'X', agentType: null });
+      tracker.noteTaskCompleted('agent-x', 'toolu_runN'); // run N finishes
+
+      // Run N+1 resumes under a new ref.
+      tracker.noteBackgroundTaskStarted('toolu_runN1', 'agent-x');
+      tracker.revive('agent-x');
+      expect(child.state).toBe(CHILD_STATE_RUNNING);
+      expect(child.taskRef).toBe('toolu_runN1');
+
+      // A DELAYED REPLAY of run N's task_started arrives while N+1 runs — must
+      // NOT regress the ref back to the retired run-N value.
+      tracker.noteBackgroundTaskStarted('toolu_runN', 'agent-x');
+      expect(child.taskRef).toBe('toolu_runN1');
+
+      publisher.calls.upsertConvo.length = 0;
+      // The replayed run-N completion is therefore still rejected.
+      tracker.noteTaskCompleted('agent-x', 'toolu_runN');
+      expect(child.state).toBe(CHILD_STATE_RUNNING);
+      expect(publisher.calls.upsertConvo).toHaveLength(0);
+
+      // And the correct run-N+1 completion still finishes it.
+      tracker.noteTaskCompleted('agent-x', 'toolu_runN1');
+      expect(child.state).toBe(CHILD_STATE_FINISHED);
+    });
+
+    it('a late explicit task_started still corrects a reverse-discovery FIFO mispairing on a running child', () => {
+      // Delta-gate F1: the replay guard must not reject a VALID authoritative
+      // pairing. Two agents' refs are queued FIFO; discovery happens in REVERSE
+      // order so each running child provisionally gets the OTHER's ref. The
+      // later explicit task_started events must still correct them (documented
+      // discovery-beats-system-event contract), and both must then complete.
+      tracker.noteTaskStarted('ref-A');
+      tracker.noteTaskStarted('ref-B');
+      const b = tracker.discover('agent-B', { label: 'B', agentType: null }); // FIFO -> ref-A (wrong)
+      const a = tracker.discover('agent-A', { label: 'A', agentType: null }); // FIFO -> ref-B (wrong)
+      expect(b.taskRef).toBe('ref-A');
+      expect(a.taskRef).toBe('ref-B');
+
+      // Authoritative pairings correct the provisional refs on the RUNNING children.
+      tracker.noteBackgroundTaskStarted('ref-B', 'agent-B');
+      tracker.noteBackgroundTaskStarted('ref-A', 'agent-A');
+      expect(b.taskRef).toBe('ref-B');
+      expect(a.taskRef).toBe('ref-A');
+
+      // Correctly correlated completions now finish BOTH — no stranded children.
+      tracker.noteTaskCompleted('agent-B', 'ref-B');
+      tracker.noteTaskCompleted('agent-A', 'ref-A');
+      expect(b.state).toBe(CHILD_STATE_FINISHED);
+      expect(a.state).toBe(CHILD_STATE_FINISHED);
+    });
+
+    it('ignores a replayed run-N notification after run N+1 has started, then finishes on run N+1', () => {
+      // Run N: background spawn under toolu_runN, discovered, then completes.
+      tracker.noteBackgroundTaskStarted('toolu_runN', 'agent-x');
+      const child = tracker.discover('agent-x', { label: 'X', agentType: null });
+      tracker.noteTaskCompleted('agent-x', 'toolu_runN'); // run N finishes
+      expect(child.state).toBe(CHILD_STATE_FINISHED);
+
+      // Run N+1: SendMessage resume — a fresh task_started carries a NEW
+      // tool_use_id (advances taskRef), then revive flips the child running.
+      tracker.noteBackgroundTaskStarted('toolu_runN1', 'agent-x');
+      tracker.revive('agent-x');
+      expect(child.state).toBe(CHILD_STATE_RUNNING);
+      expect(child.taskRef).toBe('toolu_runN1');
+      publisher.calls.upsertConvo.length = 0;
+
+      // A LATE / duplicated run-N notification (stale tool_use_id) arrives.
+      tracker.noteTaskCompleted('agent-x', 'toolu_runN');
+      // Must NOT finish the live resumed run.
+      expect(child.state).toBe(CHILD_STATE_RUNNING);
+      expect(publisher.calls.upsertConvo).toHaveLength(0);
+
+      // The correct run-N+1 notification still finishes it.
+      tracker.noteTaskCompleted('agent-x', 'toolu_runN1');
+      expect(child.state).toBe(CHILD_STATE_FINISHED);
+      expect(publisher.calls.upsertConvo.at(-1).opts.sessionState).toBe(CHILD_STATE_FINISHED);
+    });
+  });
+
   // The tracker records every minted `running` child into a
   // persistent store and drops it the moment it finishes, so a bridge restart
   // can reconcile children that never reached `done` in-process.
@@ -568,9 +698,9 @@ describe('createSubagentConvoTracker', () => {
       });
       tracker.noteBackgroundTaskStarted('toolu_1', 'agent-1');
       tracker.discover('agent-1', { label: 'A', agentType: null });
-      tracker.noteTaskCompleted('agent-1');
+      tracker.noteTaskCompleted('agent-1', 'toolu_1');
       tracker.revive('agent-1');
-      tracker.noteTaskCompleted('agent-1');
+      tracker.noteTaskCompleted('agent-1', 'toolu_1');
 
       expect(publisher.calls.upsertConvo.at(-1).opts.sessionState).toBe(CHILD_STATE_FINISHED);
       expect(runningStore.list()).toEqual([]);
@@ -718,11 +848,11 @@ describe('createSubagentConvoTracker', () => {
 
       tracker.noteBackgroundTaskStarted('toolu_1', 'agent-1');
       tracker.discover('agent-1', { label: 'A', agentType: null });
-      tracker.noteTaskCompleted('agent-1');   // run 1 done — ack pending
+      tracker.noteTaskCompleted('agent-1', 'toolu_1');   // run 1 done — ack pending
       const run1Ack = deliveries.at(-1);
 
       tracker.revive('agent-1');              // resumed
-      tracker.noteTaskCompleted('agent-1');   // run 2 done — its own ack pending
+      tracker.noteTaskCompleted('agent-1', 'toolu_1');   // run 2 done — its own ack pending
       const run2Ack = deliveries.at(-1);
       expect(run2Ack).not.toBe(run1Ack);
       expect(runningStore.list()).toHaveLength(1);
