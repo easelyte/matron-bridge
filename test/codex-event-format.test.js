@@ -378,9 +378,12 @@ describe('formatAndRoute', () => {
     ]);
   });
 
-  it('warns once and degrades every event to text for an out-of-band schema', () => {
+  it('warns once and degrades every event to text below the schema floor', () => {
+    // Loop #762: rendering is version-tolerant (no upper band), so a NEWER
+    // version renders richly. Only versions BELOW the hardened-schema floor
+    // (0.146.0) still fail safe to the text-passthrough path.
     const { calls, ctx } = makeContext({
-      meta: { schemaVersion: 'codex-cli 0.156.0', model: 'future-model' },
+      meta: { schemaVersion: 'codex-cli 0.145.0', model: 'legacy-model' },
     });
     const events = fixtureEvents().slice(0, 2);
 
@@ -394,11 +397,11 @@ describe('formatAndRoute', () => {
     expect(ctx.state.unparsed).toBe(2);
   });
 
-  it('lands the durable final answer under an unpinned newer schema (text passthrough)', () => {
+  it('lands the durable final answer below the schema floor (text passthrough)', () => {
     const retained = [];
     const delivered = [];
     const { calls, ctx } = makeContext({
-      meta: { schemaVersion: 'codex-cli 0.156.0', model: 'future-model' },
+      meta: { schemaVersion: 'codex-cli 0.145.0', model: 'legacy-model' },
       retainFinalAnswer: (runId, payload) => retained.push({ runId, payload }),
       markFinalAnswerDelivered: runId => delivered.push(runId),
     });
@@ -437,9 +440,9 @@ describe('formatAndRoute', () => {
     expect(ctx.state.terminalSeen).toBe(true);
   });
 
-  it('still text-passes non-lifecycle events under an unpinned schema', () => {
+  it('still text-passes non-lifecycle events below the schema floor', () => {
     const { calls, ctx } = makeContext({
-      meta: { schemaVersion: 'codex-cli 0.156.0', model: 'future-model' },
+      meta: { schemaVersion: 'codex-cli 0.145.0', model: 'legacy-model' },
     });
     const commandEvent = {
       type: 'item.completed',
@@ -461,7 +464,7 @@ describe('formatAndRoute', () => {
     expect(calls.some(call => call.method === 'publishToolOutput')).toBe(false);
   });
 
-  it('routes in-band 0.146.x–0.155.x runs through the rich item mapping', () => {
+  it('routes every version at/above the floor through the rich item mapping (no upper band)', () => {
     const commandEvent = {
       type: 'item.completed',
       item: {
@@ -469,10 +472,13 @@ describe('formatAndRoute', () => {
         aggregated_output: 'ok', exit_code: 0, status: 'completed',
       },
     };
-    // 0.155.1 is the live version — the band widening (MAX_EXCLUSIVE → 0.156.0)
-    // brings it in-band so it renders richly instead of raw JSON, reusing the
-    // hardened allowlist path unchanged.
-    for (const schemaVersion of ['codex-cli 0.146.1', 'codex-cli 0.147.0', 'codex-cli 0.155.1']) {
+    // Loop #762: rendering keys on event shape, not an upper version band, so
+    // 0.155.1 (live) AND future majors (0.156.0, 1.0.0) all render richly with
+    // no manual band bump, reusing the hardened allowlist path unchanged.
+    for (const schemaVersion of [
+      'codex-cli 0.146.1', 'codex-cli 0.147.0', 'codex-cli 0.155.1',
+      'codex-cli 0.156.0', 'codex-cli 1.0.0',
+    ]) {
       const { calls, ctx } = makeContext({ meta: { schemaVersion } });
       formatAndRoute(commandEvent, ctx);
       expect(ctx.log.warn, schemaVersion).not.toHaveBeenCalled();
