@@ -152,24 +152,26 @@ describe('codex-viz top-level error diagnostics (loop #762 follow-up)', () => {
 });
 
 describe('codex-viz unknown/future item type diagnostics', () => {
-  it('preserves a newer item type\'s textual diagnostic (redacted) rather than an opaque stub', () => {
+  it('renders a newer item type as a safe { type } stub without forwarding its fields', () => {
     const { publisher } = route({
       type: 'item.completed',
       item: { id: 'x', type: 'future_diag', message: 'informative detail', structural: { drop: 'me' } },
     });
     const serialized = JSON.stringify(publisher.calls);
-    expect(serialized).toContain('informative detail');
+    // The item type is visible, but arbitrary textual/structural fields are NOT
+    // forwarded — a future codex that renames a command item and streams output
+    // in a textual field the command guard never sees cannot egress here.
+    expect(serialized).toContain('future_diag');
+    expect(serialized).not.toContain('informative detail');
     expect(serialized).not.toContain('structural');
   });
 
-  it('drops an unknown item type whose textual field is a raw env dump', () => {
-    const { publisher, state } = route({
+  it('never egresses a raw env dump carried in an unknown item textual field', () => {
+    const { publisher } = route({
       type: 'item.completed',
       item: { id: 'x', type: 'future_diag', message: ENV_DUMP },
     });
     expect(JSON.stringify(publisher.calls)).not.toContain(SECRET);
-    expect(state.redactionDropCount).toBe(1);
-    expect(publisher.calls).toEqual([]);
   });
 });
 
@@ -251,13 +253,27 @@ describe('codex-viz egress hardening (production baseline redactor)', () => {
     expect(publisher.calls).toEqual([]);
   });
 
-  it('F2: a lowercase env dump in an unknown item textual field is dropped', () => {
-    const { publisher, state } = routeBaseline({
+  it('F2: a lowercase env dump in an unknown item textual field never egresses (field not forwarded)', () => {
+    const { publisher } = routeBaseline({
       type: 'item.completed',
       item: { id: 'x', type: 'future_diag', message: LOWER_DUMP },
     });
     expect(JSON.stringify(publisher.calls)).not.toContain('lower-secret');
+  });
+
+  it('F1(b): a two-line env dump in a top-level error message is dropped (stricter diagnostic bar)', () => {
+    const TWO_LINE = 'alpha=lower-secret-1\nbravo=lower-secret-2';
+    const { publisher, state } = routeBaseline({ type: 'error', message: TWO_LINE });
+    expect(JSON.stringify(publisher.calls)).not.toContain('lower-secret');
     expect(state.redactionDropCount).toBe(1);
+    expect(publisher.calls).toEqual([]);
+  });
+
+  it('F1(b): a normal single-assignment error diagnostic is still preserved', () => {
+    // A legitimate one-line "key=value" diagnostic must NOT be over-dropped.
+    const { publisher } = routeBaseline({ type: 'error', message: 'connection failed: host=db.internal' });
+    const body = publisher.calls.find(call => call.method === 'publishText')?.payload.body;
+    expect(body).toContain('host=db.internal');
   });
 
   it('F2: a lowercase env dump in command_execution output is dropped', () => {
