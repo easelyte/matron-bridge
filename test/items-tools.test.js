@@ -203,6 +203,57 @@ describe('items handlers', () => {
     expect(client.update).not.toHaveBeenCalled();
   });
 
+  it('create: rejects invalid labels BEFORE uploading any attachment (no orphaned blob)', async () => {
+    // Regression (loop #759 re-cut): the journal 400s labels > 50 / empty / > 40 chars, but the
+    // bridge used to forward them unvalidated AFTER uploadAll — so an invalid request uploaded the
+    // blob, then got 400'd, permanently orphaning it. Validate before the upload.
+    const { h, client, uploadLocalFile } = fixture();
+    const r = await h.create({ roomId: '!r:s', kind: 'task', title: 'T', attachments: ['shot.png'], labels: Array.from({ length: 51 }, (_, i) => `l${i}`) });
+    expect(r.status).toBe(400);
+    expect(r.body.error).toMatch(/labels/);
+    expect(uploadLocalFile).not.toHaveBeenCalled();
+    expect(client.create).not.toHaveBeenCalled();
+    // over-long single label
+    expect((await h.create({ roomId: '!r:s', kind: 'task', title: 'T', labels: ['x'.repeat(41)] })).status).toBe(400);
+    // empty / non-string label
+    expect((await h.create({ roomId: '!r:s', kind: 'task', title: 'T', labels: [''] })).status).toBe(400);
+    expect((await h.create({ roomId: '!r:s', kind: 'task', title: 'T', labels: ['  '] })).status).toBe(400);
+    expect((await h.create({ roomId: '!r:s', kind: 'task', title: 'T', labels: [7] })).status).toBe(400);
+    expect((await h.create({ roomId: '!r:s', kind: 'task', title: 'T', labels: 'ui' })).status).toBe(400);
+  });
+
+  it('create: rejects invalid links BEFORE uploading any attachment (no orphaned blob)', async () => {
+    const { h, client, uploadLocalFile } = fixture();
+    const r = await h.create({ roomId: '!r:s', kind: 'task', title: 'T', attachments: ['shot.png'], links: [{ url: 'ftp://x.example/f' }] });
+    expect(r.status).toBe(400);
+    expect(r.body.error).toMatch(/links/);
+    expect(uploadLocalFile).not.toHaveBeenCalled();
+    expect(client.create).not.toHaveBeenCalled();
+    // links must be an array
+    expect((await h.create({ roomId: '!r:s', kind: 'task', title: 'T', links: { url: 'https://x' } })).status).toBe(400);
+    // > 50 links
+    expect((await h.create({ roomId: '!r:s', kind: 'task', title: 'T', links: Array.from({ length: 51 }, () => ({ url: 'https://x.example' })) })).status).toBe(400);
+    // missing / non-string url
+    expect((await h.create({ roomId: '!r:s', kind: 'task', title: 'T', links: [{}] })).status).toBe(400);
+    expect((await h.create({ roomId: '!r:s', kind: 'task', title: 'T', links: [{ url: 5 }] })).status).toBe(400);
+    // over-long url
+    expect((await h.create({ roomId: '!r:s', kind: 'task', title: 'T', links: [{ url: 'https://x.example/' + 'a'.repeat(2049) }] })).status).toBe(400);
+    // non-string / over-long title
+    expect((await h.create({ roomId: '!r:s', kind: 'task', title: 'T', links: [{ url: 'https://x.example', title: 5 }] })).status).toBe(400);
+    expect((await h.create({ roomId: '!r:s', kind: 'task', title: 'T', links: [{ url: 'https://x.example', title: 'x'.repeat(201) }] })).status).toBe(400);
+  });
+
+  it('create: a valid attachment + well-formed labels/links still succeeds and uploads', async () => {
+    const { h, client, uploadLocalFile } = fixture();
+    const labels = Array.from({ length: 50 }, (_, i) => `l${i}`);
+    const links = [{ url: 'https://x.example/a', title: 'A' }, { url: 'http://y.example/b' }];
+    const r = await h.create({ roomId: '!r:s', kind: 'task', title: 'T', attachments: ['shot.png'], labels, links });
+    expect(r.status).toBe(201);
+    expect(uploadLocalFile).toHaveBeenCalled();
+    expect(client.create.mock.calls[0][0]).toMatchObject({ labels, links });
+    expect(client.create.mock.calls[0][0].attachments[0].blob_ref).toBe('b-shot.png');
+  });
+
   it('move: sets or clears the item mission through PATCH; validates the target', async () => {
     const { h, client } = fixture();
     expect((await h.move({ roomId: '!r:s', id: 'it_1' })).status).toBe(400);
