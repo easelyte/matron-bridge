@@ -26,16 +26,39 @@ describe('stripJournalCreds', () => {
     expect(out.PATH).toBe('/usr/bin');
   });
 
-  it('mutates and returns the same object', () => {
-    const env = { JOURNAL_TOKEN: 'x' };
-    expect(stripJournalCreds(env)).toBe(env);
-    expect(env.JOURNAL_TOKEN).toBeUndefined();
+  it('returns a COPY and never mutates the caller (safe on process.env)', () => {
+    const env = { JOURNAL_TOKEN: 'x', JOURNAL_TOKEN_FILE: '/f', KEEP: '1' };
+    const out = stripJournalCreds(env);
+    expect(out).not.toBe(env);
+    // Caller's object is untouched — clobbering process.env would break the
+    // bridge's own journal auth.
+    expect(env.JOURNAL_TOKEN).toBe('x');
+    expect(env.JOURNAL_TOKEN_FILE).toBe('/f');
+    expect(out.KEEP).toBe('1');
+    expect('JOURNAL_TOKEN' in out).toBe(false);
   });
 
-  it('is a no-op on env with no journal creds and tolerates non-objects', () => {
+  it('fails safe: omitted arg returns a sanitized copy of process.env, not the full env', () => {
+    const saved = { t: process.env.JOURNAL_TOKEN, f: process.env.JOURNAL_TOKEN_FILE };
+    process.env.JOURNAL_TOKEN = 'boot-secret';
+    process.env.JOURNAL_TOKEN_FILE = '/etc/matron/agent-token';
+    try {
+      const out = stripJournalCreds();
+      expect('JOURNAL_TOKEN' in out).toBe(false);
+      expect('JOURNAL_TOKEN_FILE' in out).toBe(false);
+      // ...and the real process.env is left intact.
+      expect(process.env.JOURNAL_TOKEN).toBe('boot-secret');
+    } finally {
+      if (saved.t === undefined) delete process.env.JOURNAL_TOKEN; else process.env.JOURNAL_TOKEN = saved.t;
+      if (saved.f === undefined) delete process.env.JOURNAL_TOKEN_FILE; else process.env.JOURNAL_TOKEN_FILE = saved.f;
+    }
+  });
+
+  it('is a no-op on env with no journal creds and rejects invalid non-objects', () => {
     expect(stripJournalCreds({ FOO: '1' })).toEqual({ FOO: '1' });
-    expect(() => stripJournalCreds(undefined)).not.toThrow();
-    expect(() => stripJournalCreds(null)).not.toThrow();
+    expect(stripJournalCreds(null)).toEqual({});
+    expect(() => stripJournalCreds('nope')).toThrow(TypeError);
+    expect(() => stripJournalCreds(42)).toThrow(TypeError);
   });
 
   it('targets exactly the two full-journal read credential keys', () => {
