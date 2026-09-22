@@ -1218,8 +1218,10 @@ function journalBufferPush(session, method, payload) {
 // Send now if the convo_id is known, otherwise buffer for the eventual flush.
 // `options` (onLocalSendComplete, etc.) reaches the publisher only on the LIVE path: a session whose
 // convo id is not known yet buffers the payload, and journalBufferPush has no slot to carry a
-// delivery callback. Every current options-passing caller (journalSessionState) skips the call
-// entirely when there is no convo id, so nothing is silently dropped here.
+// local-send callback. Any options-passing caller must therefore skip the call entirely when there
+// is no convo id (as journalSessionState does — it gates the whole publish on convoId), so a
+// callback is never silently dropped here. (journalSessionState no longer passes a callback at all
+// after loop #754 — the durable run-state settle is reconciliation-authoritative.)
 function journalPublish(session, method, payload, options) {
   if (!JOURNAL_ENABLED) return;
   const convoId = journalConvoIdFor(session);
