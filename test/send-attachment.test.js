@@ -1,9 +1,21 @@
-import { describe, it, expect, vi } from 'vitest';
+import { describe, it, expect, vi, afterEach } from 'vitest';
 import path from 'path';
-import { mkdtempSync, writeFileSync, mkdirSync, symlinkSync } from 'fs';
+import { mkdtempSync, writeFileSync, mkdirSync, symlinkSync, rmSync } from 'fs';
 import { realpath } from 'fs/promises';
 import { tmpdir } from 'os';
 import { classifyContentType, createSendAttachmentHandler, resolveAndUploadLocalFile } from '../lib/send-attachment.js';
+
+// Every temp dir a test creates is tracked and removed after it, so the suite
+// leaves nothing behind in the machine's /tmp.
+const tmpDirs = [];
+function mkTmp(prefix) {
+  const dir = mkdtempSync(path.join(tmpdir(), prefix));
+  tmpDirs.push(dir);
+  return dir;
+}
+afterEach(() => {
+  for (const dir of tmpDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+});
 
 // Shared by the handler tests (via makeFixture) and the resolveAndUploadLocalFile
 // tests below: a temp workdir with a small real PNG plus a fake publisher whose
@@ -20,7 +32,7 @@ function makeUploadFixture() {
 }
 
 function mktempWorkdir() {
-  const dir = mkdtempSync(path.join(tmpdir(), 'send-attach-'));
+  const dir = mkTmp('send-attach-');
   writeFileSync(path.join(dir, 'shot.png'), Buffer.from([0x89, 0x50, 0x4e, 0x47]));
   writeFileSync(path.join(dir, 'report.pdf'), 'pdf-bytes');
   return dir;
@@ -51,7 +63,7 @@ describe('classifyContentType', () => {
 });
 
 function makeFixture() {
-  const workdir = mkdtempSync(path.join(tmpdir(), 'send-attach-'));
+  const workdir = mkTmp('send-attach-');
   writeFileSync(path.join(workdir, 'shot.png'), Buffer.from([0x89, 0x50, 0x4e, 0x47]));
   writeFileSync(path.join(workdir, 'report.pdf'), 'pdf-bytes');
   const published = [];
@@ -299,7 +311,7 @@ describe('createSendAttachmentHandler', () => {
   describe('symlink escapes', () => {
     it('refuses a symlink that points at a sensitive file outside the workdir', async () => {
       const { handler, workdir, uploads } = makeFixture();
-      const outsideDir = mkdtempSync(path.join(tmpdir(), 'send-attach-outside-'));
+      const outsideDir = mkTmp('send-attach-outside-');
       mkdirSync(path.join(outsideDir, 'secrets'));
       writeFileSync(path.join(outsideDir, 'secrets', 'id_rsa'), '-----BEGIN PRIVATE KEY-----');
       // Innocent-looking name INSIDE the workdir, but it's a symlink to a
@@ -318,7 +330,7 @@ describe('createSendAttachmentHandler', () => {
 
     it('refuses a directory symlink that escapes the workdir', async () => {
       const { handler, workdir } = makeFixture();
-      const outsideDir = mkdtempSync(path.join(tmpdir(), 'send-attach-outside-'));
+      const outsideDir = mkTmp('send-attach-outside-');
       writeFileSync(path.join(outsideDir, 'plain.txt'), 'not sensitive');
       symlinkSync(outsideDir, path.join(workdir, 'linkdir'));
 

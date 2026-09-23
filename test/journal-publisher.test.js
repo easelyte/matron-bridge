@@ -1,9 +1,9 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, afterEach } from 'vitest';
 import { EventEmitter } from 'node:events';
 import WebSocket, { WebSocketServer } from 'ws';
 import net from 'net';
 import http from 'node:http';
-import { mkdtempSync, readFileSync, existsSync, writeFileSync } from 'fs';
+import { mkdtempSync, readFileSync, existsSync, writeFileSync, rmSync } from 'fs';
 import { tmpdir } from 'os';
 import path from 'path';
 import { createJournalPublisher } from '../lib/journal-publisher.js';
@@ -1286,8 +1286,15 @@ describe('createJournalPublisher', () => {
 describe('createJournalPublisher — onEvent + cursor persistence', () => {
   const FAST_CURSOR = { cursorDebounceMs: 20 };
 
+  // Cursor dirs are removed after each test so the suite leaves nothing in /tmp.
+  const cursorDirs = [];
+  afterEach(() => {
+    for (const dir of cursorDirs.splice(0)) rmSync(dir, { recursive: true, force: true });
+  });
+
   function tmpCursorFile() {
     const dir = mkdtempSync(path.join(tmpdir(), 'journal-cursor-'));
+    cursorDirs.push(dir);
     return path.join(dir, 'cursor.json');
   }
 
