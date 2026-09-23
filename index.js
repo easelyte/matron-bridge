@@ -183,7 +183,7 @@ import {
 import { CodexExecSession, contentBlocksToCodexPrompt, normalizeCodexSandbox, normalizeCodexNetworkAccess } from './lib/codex-session.js';
 import { CodexAppServerSession, codexInput } from './lib/codex-app-session.js';
 import { wireCodexAppSession } from './lib/codex-app-wiring.js';
-import { stripJournalCreds } from './lib/journal-cred-scope.js';
+import { stripBridgeOnlySecrets, stripJournalCreds } from './lib/journal-cred-scope.js';
 import { createJournalReadProxy } from './lib/journal-read-proxy.js';
 import { codexMcpConfig } from './lib/codex-mcp.js';
 import { handleCodexControl, isCodexAuthError, offerCodexBuild, listCodexThreads, mergeCodexThreads } from './lib/codex-controls.js';
@@ -2582,8 +2582,9 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
     // needs the loopback proxy to also cover the write-side `/items` routes (the
     // open design question in loop #765) — tracked as a follow-up. Claude session
     // + interactive spawns ARE stripped (they reach journal search via the proxy
-    // and have no token-based HTTP fallback).
-    env: { ...process.env, BRIDGE_ROOM_ID: roomId, MATRON_BRIDGE_API_PORT: String(API_PORT) },
+    // and have no token-based HTTP fallback). Bridge-only secrets (HMAC_SECRET)
+    // ARE stripped here: no Codex path uses them.
+    env: { ...stripBridgeOnlySecrets(process.env), BRIDGE_ROOM_ID: roomId, MATRON_BRIDGE_API_PORT: String(API_PORT) },
     config: CODEX_APP_SERVER ? codexMcpConfig({ baseConfig: RAW_MCP_CONFIG, extras,
       bridgeDir: __dirname, roomId, apiPort: API_PORT, showFileToken }) : {},
   });

@@ -4,7 +4,7 @@ import { dirname, join } from 'node:path';
 import { EventEmitter } from 'node:events';
 import { PassThrough } from 'node:stream';
 import { describe, expect, it, vi } from 'vitest';
-import { stripJournalCreds, JOURNAL_CHILD_STRIPPED_KEYS } from '../lib/journal-cred-scope.js';
+import { stripJournalCreds, JOURNAL_CHILD_STRIPPED_KEYS, stripBridgeOnlySecrets, BRIDGE_ONLY_SECRET_KEYS } from '../lib/journal-cred-scope.js';
 import { withCodexAppServer } from '../lib/codex-account.js';
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
@@ -145,8 +145,36 @@ describe('bridge-controlled journal-free child spawns are scoped in index.js', (
   // Deliberate NON-change (loop #765): Codex session spawns keep the token
   // because BRIDGE_CODEX.md documents a token-based /items HTTP fallback for
   // legacy-exec sessions; stripping needs the write-side /items proxy first.
-  it('does NOT yet strip the token from the Codex session spawn', () => {
-    const codexEnv = indexSrc.indexOf('env: { ...process.env, BRIDGE_ROOM_ID: roomId, MATRON_BRIDGE_API_PORT: String(API_PORT) }');
+  it('does NOT yet strip the journal token from the Codex session spawn (only bridge-only secrets)', () => {
+    const codexEnv = indexSrc.indexOf('env: { ...stripBridgeOnlySecrets(process.env), BRIDGE_ROOM_ID: roomId, MATRON_BRIDGE_API_PORT: String(API_PORT) }');
     expect(codexEnv).toBeGreaterThan(-1);
+  });
+});
+
+describe('bridge-only secrets (HMAC_SECRET)', () => {
+  it('stripBridgeOnlySecrets removes HMAC_SECRET, keeps the journal token and the rest', () => {
+    const env = { HMAC_SECRET: 'sign', JOURNAL_TOKEN: 'j', SHOW_FILE_TOKEN: 's', PATH: '/bin' };
+    const out = stripBridgeOnlySecrets(env);
+    expect('HMAC_SECRET' in out).toBe(false);
+    expect(out.JOURNAL_TOKEN).toBe('j');
+    expect(out.SHOW_FILE_TOKEN).toBe('s');
+    expect(env.HMAC_SECRET).toBe('sign');
+    expect(() => stripBridgeOnlySecrets('nope')).toThrow(TypeError);
+    expect(BRIDGE_ONLY_SECRET_KEYS).toContain('HMAC_SECRET');
+  });
+
+  it('stripJournalCreds also drops HMAC_SECRET (every caller is a child spawn)', () => {
+    const out = stripJournalCreds({ HMAC_SECRET: 'sign', JOURNAL_TOKEN: 'j', KEEP: '1' });
+    expect('HMAC_SECRET' in out).toBe(false);
+    expect('JOURNAL_TOKEN' in out).toBe(false);
+    expect(out.KEEP).toBe('1');
+  });
+
+  it('no child spawn in index.js inherits a bare ...process.env', () => {
+    // Every process.env spread handed to a child must go through a strip helper.
+    const bare = indexSrc.match(/\{\s*\.\.\.process\.env\b/g) || [];
+    const wrapped = indexSrc.match(/strip(?:JournalCreds|BridgeOnlySecrets)\(\{\s*\.\.\.process\.env\b/g) || [];
+    expect(bare.length).toBe(wrapped.length);
+    expect(indexSrc).toMatch(/env: \{ \.\.\.stripBridgeOnlySecrets\(process\.env\), BRIDGE_ROOM_ID/);
   });
 });
