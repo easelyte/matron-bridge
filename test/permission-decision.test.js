@@ -271,17 +271,15 @@ describe('permission hook spawn environment wiring (source inspection)', () => {
     expect(interactiveSpawn).toContain("'--settings', JSON.stringify(buildSessionSettings('iv')),");
   });
 
-  it('snapshots MATRON_PERMISSION_CARDS only into the print spawn environment', () => {
-    expect(printSpawn).toContain("MATRON_PERMISSION_CARDS: process.env.MATRON_PERMISSION_CARDS || '',");
-    expect(interactiveSpawn).not.toContain('MATRON_PERMISSION_CARDS:');
-  });
-
-  it('mints and injects a per-session permission token only for print sessions', () => {
+  // What the child env carries (MATRON_PERMISSION_CARDS snapshot, the
+  // per-session MATRON_PERMISSION_TOKEN, print-only) is asserted on the built env
+  // in test/spawn-env.test.js (loop #784). Here: only that the print path mints
+  // a token and hands it to the builder, and the iv path never does.
+  it('mints a per-session permission token only for print sessions', () => {
     expect(printSpawn).toContain('const permissionToken = randomUUID();');
-    expect(printSpawn).toContain('spawnEnv.MATRON_PERMISSION_TOKEN = permissionToken;');
-    expect(printSpawn).toContain('permissionToken,');
+    expect(printSpawn).toMatch(/buildClaudeSpawnEnv\(\{\s*mode: 'print',[\s\S]*?permissionToken,[\s\S]*?\}\);/);
+    expect(interactiveSpawn).toMatch(/buildClaudeSpawnEnv\(\{\s*mode: 'iv',/);
     expect(interactiveSpawn).not.toContain('permissionToken');
-    expect(interactiveSpawn).not.toContain('MATRON_PERMISSION_TOKEN');
   });
 });
 

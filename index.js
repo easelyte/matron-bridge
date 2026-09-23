@@ -5,7 +5,6 @@ import { transcribeAudio, transcribeAudioSegments } from './lib/transcribe.js';
 import { extractVideoFrames, videoFramesMessage } from './lib/video-frames.js';
 import { prepareInlineImage, appendInlineImageBlocks } from './lib/inline-image.js';
 import { createSendAttachmentHandler, resolveAndUploadLocalFile } from './lib/send-attachment.js';
-import { bashTimeoutEnv } from './lib/bash-timeout-env.js';
 import { createItemsClient } from './lib/items-client.js';
 import { createItemsHandlers } from './lib/items-tools.js';
 import { createReminderHandlers } from './lib/reminder-tools.js';
@@ -185,7 +184,8 @@ import {
 import { CodexExecSession, contentBlocksToCodexPrompt, normalizeCodexSandbox, normalizeCodexNetworkAccess } from './lib/codex-session.js';
 import { CodexAppServerSession, codexInput } from './lib/codex-app-session.js';
 import { wireCodexAppSession } from './lib/codex-app-wiring.js';
-import { stripBridgeOnlySecrets, stripJournalCreds } from './lib/journal-cred-scope.js';
+import { stripJournalCreds } from './lib/journal-cred-scope.js';
+import { buildClaudeSpawnEnv, buildCodexSpawnEnv } from './lib/spawn-env.js';
 import { createJournalReadProxy } from './lib/journal-read-proxy.js';
 import { codexMcpConfig } from './lib/codex-mcp.js';
 import { handleCodexControl, isCodexAuthError, offerCodexBuild, listCodexThreads, mergeCodexThreads } from './lib/codex-controls.js';
@@ -2251,68 +2251,18 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   debug(`Spawning claude with args: ${args.join(' ')}`);
   debug(`Working directory: ${cwd}`);
 
-  // Ensure the node binary running the bridge is reachable from the spawned
-  // claude process. The ask-user MCP server and the matron-tee Bash hook both
-  // resolve `node` via PATH; when the bridge is launched non-interactively
-  // (e.g. launchd) nvm hasn't loaded and PATH lacks the node bin dir.
-  const nodeBinDir = path.dirname(process.execPath);
-  const existingPath = process.env.PATH || '';
-  const pathWithNode = existingPath.split(':').includes(nodeBinDir)
-    ? existingPath
-    : `${nodeBinDir}:${existingPath}`;
-
-  const spawnEnv = {
-    // Strip the full-journal read credential (loop #765): sessions now reach the
-    // journal search routes through the bridge-local read proxy (see
-    // journalReadProxy / BRIDGE_CLAUDE.md "Searching the journal"), so no child —
-    // session or its subagents — needs the raw JOURNAL_TOKEN that can pull every
-    // transcript. JOURNAL_WS_URL etc. (non-credentials) are kept.
-    ...stripJournalCreds(process.env),
-    PATH: pathWithNode,
-    CLAUDECODE: '',
-    CLAUDE_CODE_MAX_OUTPUT_TOKENS: '128000',
-    // Raise the Bash-tool timeout floor above the 2-min built-in default so long
-    // Codex reviews / test suites in bridge sessions aren't SIGTERM'd mid-run.
-    // Operator-overridable via BASH_DEFAULT_TIMEOUT_MS / BASH_MAX_TIMEOUT_MS in
-    // the bridge env (read from process.env inside the helper; explicit wins).
-    ...bashTimeoutEnv(),
-    BRIDGE_ROOM_ID: roomId,
-    MATRON_BRIDGE_API_PORT: String(API_PORT),
-    // Path to the 0600 header file carrying the journal read-proxy capability
-    // (loop #765). The token value is never placed in the child env or argv.
-    MATRON_JOURNAL_PROXY_HEADER_FILE: JOURNAL_PROXY_HEADER_FILE,
-    // Env is fixed at spawn time; toggling the flag later requires
-    // !restart to take effect.
-    MATRON_PERMISSION_CARDS: process.env.MATRON_PERMISSION_CARDS || '',
-    MATRON_BASH_TEE_ENABLED: showBashOutputAtSpawn ? '1' : '0',
-    CLAUDE_CODE_PLUGIN_CACHE_DIR: PLUGIN_CACHE_DIR,
-    // Load every MCP tool up front instead of letting Claude Code defer
-    // them behind ToolSearch. With deferral on, the item_* tools (and the
-    // rest of ask-user) reach the model only as names in a reminder, and a
-    // tool that needs a schema lookup before its first call is a tool the
-    // model reaches for last: a fleet survey on 2026-09-09 found not one
-    // item_* call on any box other than the one whose sessions were
-    // steered to them by hand, while questions went out as prose. The
-    // cost is a larger (cached) tool prefix per request. Values: `false`
-    // loads everything; `auto:N` defers past N% of context. Operators can
-    // set it in the bridge's `.env` like any other setting (dotenv loads
-    // that with `override: true` at startup, so `.env` beats the service
-    // environment — the same rule as for every other bridge setting), and
-    // whatever `process.env` holds by now wins over the default.
-    ENABLE_TOOL_SEARCH: process.env.ENABLE_TOOL_SEARCH ?? 'false',
-    // No MCP_TOOL_TIMEOUT default here. #254 briefly injected a 10-minute
-    // backstop so a wedged MCP server couldn't hang a turn forever, but a
-    // hard kill also cut off legitimately long calls (long builds, big test
-    // runs, patient subagents). The slow-tool notices below make a hung call
-    // visible instead and leave the cancel decision with the user. An
-    // operator who wants the hard cap can still set MCP_TOOL_TIMEOUT in the
-    // bridge's own env; it passes through via ...process.env.
-  };
-  delete spawnEnv.SHOW_FILE_TOKEN;
-  if (showFileToken) spawnEnv.SHOW_FILE_TOKEN = showFileToken;
-  delete spawnEnv.MATRON_PERMISSION_TOKEN;
-  // CC hooks cannot receive isolated env: the whole claude process inherits this token, authenticating "a process in this print session"; emitted identifiers are parser-bounded.
-  spawnEnv.MATRON_PERMISSION_TOKEN = permissionToken;
+  // Child env (lib/spawn-env.js): journal creds + bridge-only secrets stripped,
+  // node bin dir on PATH, per-session SHOW_FILE_TOKEN / MATRON_PERMISSION_TOKEN.
+  const spawnEnv = buildClaudeSpawnEnv({
+    mode: 'print',
+    roomId,
+    apiPort: API_PORT,
+    journalProxyHeaderFile: JOURNAL_PROXY_HEADER_FILE,
+    pluginCacheDir: PLUGIN_CACHE_DIR,
+    showBashOutput: showBashOutputAtSpawn,
+    showFileToken,
+    permissionToken,
+  });
 
   const permissionSnapshot = process.env.MATRON_PERMISSION_CARDS
     ? buildPermissionSnapshot({ workdir: cwd })
@@ -2653,16 +2603,8 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
     sandbox: CODEX_SANDBOX_MODE,
     networkAccess: CODEX_NETWORK_ACCESS,
     developerInstructions: CODEX_BRIDGE_PROMPT + (CODEX_APP_SERVER ? '' : '\nLegacy exec transport: native approvals, native questions, and Matron MCP tools are unavailable. If blocked, explain it in your final response.'),
-    // NOTE (loop #765): the JOURNAL_TOKEN is deliberately NOT stripped from Codex
-    // sessions yet. BRIDGE_CODEX.md documents a token-based journal `/items` HTTP
-    // fallback for legacy-exec Codex sessions (which have no Matron MCP tools), so
-    // stripping the token here would break tracker writes for them. Closing this
-    // needs the loopback proxy to also cover the write-side `/items` routes (the
-    // open design question in loop #765) — tracked as a follow-up. Claude session
-    // + interactive spawns ARE stripped (they reach journal search via the proxy
-    // and have no token-based HTTP fallback). Bridge-only secrets (HMAC_SECRET)
-    // ARE stripped here: no Codex path uses them.
-    env: { ...stripBridgeOnlySecrets(process.env), BRIDGE_ROOM_ID: roomId, MATRON_BRIDGE_API_PORT: String(API_PORT) },
+    // Journal-token scoping for Codex children: see buildCodexSpawnEnv.
+    env: buildCodexSpawnEnv({ roomId, apiPort: API_PORT }),
     config: CODEX_APP_SERVER ? codexMcpConfig({ baseConfig: RAW_MCP_CONFIG, extras,
       bridgeDir: __dirname, roomId, apiPort: API_PORT, showFileToken }) : {},
   });
@@ -3151,37 +3093,17 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     claudeArgs.push('--model', model);
   }
 
-  const nodeBinDir = path.dirname(process.execPath);
-  const existingPath = process.env.PATH || '';
-  const pathWithNode = existingPath.split(':').includes(nodeBinDir) ? existingPath : `${nodeBinDir}:${existingPath}`;
-
-  const interactiveEnv = {
-    // Strip the full-journal read credential (loop #765): the interactive session
-    // reaches journal search through the bridge-local read proxy, so it no longer
-    // needs the raw JOURNAL_TOKEN.
-    ...stripJournalCreds(process.env),
-    PATH: pathWithNode,
-    CLAUDECODE: '',
-    CLAUDE_CODE_MAX_OUTPUT_TOKENS: '128000',
-    // Raise the Bash-tool timeout floor above the 2-min built-in default so long
-    // Codex reviews / test suites in bridge sessions aren't SIGTERM'd mid-run.
-    // Operator-overridable via BASH_DEFAULT_TIMEOUT_MS / BASH_MAX_TIMEOUT_MS in
-    // the bridge env (read from process.env inside the helper; explicit wins).
-    ...bashTimeoutEnv(),
-    BRIDGE_ROOM_ID: roomId,
-    MATRON_BRIDGE_API_PORT: String(API_PORT),
-    // Path to the 0600 header file carrying the journal read-proxy capability
-    // (loop #765). The token value is never placed in the child env or argv.
-    MATRON_JOURNAL_PROXY_HEADER_FILE: JOURNAL_PROXY_HEADER_FILE,
-    // Same up-front MCP tool loading as spawnEnv above.
-    ENABLE_TOOL_SEARCH: process.env.ENABLE_TOOL_SEARCH ?? 'false',
-    MATRON_BASH_TEE_ENABLED: showBashOutputAtSpawn ? '1' : '0',
-    CLAUDE_CODE_PLUGIN_CACHE_DIR: PLUGIN_CACHE_DIR,
-    // No MCP_TOOL_TIMEOUT default, same reasoning as spawnEnv above:
-    // warn, don't kill. Operator env passes through if set.
-  };
-  delete interactiveEnv.SHOW_FILE_TOKEN;
-  if (showFileToken) interactiveEnv.SHOW_FILE_TOKEN = showFileToken;
+  // Child env (lib/spawn-env.js): same scoping as the print spawn, minus the
+  // print-only permission-card keys.
+  const interactiveEnv = buildClaudeSpawnEnv({
+    mode: 'iv',
+    roomId,
+    apiPort: API_PORT,
+    journalProxyHeaderFile: JOURNAL_PROXY_HEADER_FILE,
+    pluginCacheDir: PLUGIN_CACHE_DIR,
+    showBashOutput: showBashOutputAtSpawn,
+    showFileToken,
+  });
 
   debug(`Spawning interactive claude session ${sessionId} in ${cwd}`);
 

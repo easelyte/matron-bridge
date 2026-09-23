@@ -118,36 +118,19 @@ describe('bridge-controlled journal-free child spawns are scoped in index.js', (
     expect(body).toMatch(/env:\s*stripJournalCreds\(\{\s*\.\.\.process\.env/);
   });
 
-  // Loop #765: Claude session + interactive spawns NOW strip the token — they
-  // reach journal search through the bridge-local read proxy (BRIDGE_CLAUDE.md),
-  // so no session (or its inheriting subagents) needs the raw full-read token.
-  it('strips the token from the Claude session and interactive spawns', () => {
-    const printStart = indexSrc.indexOf('const spawnEnv = {');
-    const ivStart = indexSrc.indexOf('const interactiveEnv = {');
-    expect(printStart).toBeGreaterThan(-1);
-    expect(ivStart).toBeGreaterThan(-1);
-    expect(indexSrc.slice(printStart, printStart + 800)).toMatch(/\.\.\.stripJournalCreds\(process\.env\)/);
-    expect(indexSrc.slice(ivStart, ivStart + 800)).toMatch(/\.\.\.stripJournalCreds\(process\.env\)/);
-  });
+  // The Claude session / interactive / Codex spawn envs are built by
+  // lib/spawn-env.js and tested behaviorally in test/spawn-env.test.js (loop
+  // #784); only the index.js-side wiring that has no builder stays here.
 
   // Loop #765: the journal read-proxy capability reaches Claude children as a
   // 0600 header FILE path, never as a token value in the env or on argv (a token
   // on curl's command line leaks via world-readable /proc/<pid>/cmdline).
   it('injects the proxy capability as a header-file PATH, not a token value', () => {
-    // The child env carries the file path...
-    expect(indexSrc).toContain('MATRON_JOURNAL_PROXY_HEADER_FILE: JOURNAL_PROXY_HEADER_FILE');
-    // ...never the raw token value.
+    // The child env carries the file path (asserted on the built env in
+    // test/spawn-env.test.js), never the raw token value...
     expect(indexSrc).not.toContain('MATRON_JOURNAL_PROXY_TOKEN: JOURNAL_PROXY_CAP_TOKEN');
-    // The header file is written 0600.
+    // ...and the header file is written 0600.
     expect(indexSrc).toMatch(/writeFileSync\(JOURNAL_PROXY_HEADER_FILE[\s\S]*?mode: 0o600/);
-  });
-
-  // Deliberate NON-change (loop #765): Codex session spawns keep the token
-  // because BRIDGE_CODEX.md documents a token-based /items HTTP fallback for
-  // legacy-exec sessions; stripping needs the write-side /items proxy first.
-  it('does NOT yet strip the journal token from the Codex session spawn (only bridge-only secrets)', () => {
-    const codexEnv = indexSrc.indexOf('env: { ...stripBridgeOnlySecrets(process.env), BRIDGE_ROOM_ID: roomId, MATRON_BRIDGE_API_PORT: String(API_PORT) }');
-    expect(codexEnv).toBeGreaterThan(-1);
   });
 });
 
@@ -170,11 +153,14 @@ describe('bridge-only secrets (HMAC_SECRET)', () => {
     expect(out.KEEP).toBe('1');
   });
 
-  it('no child spawn in index.js inherits a bare ...process.env', () => {
-    // Every process.env spread handed to a child must go through a strip helper.
+  // The one broad text invariant kept from the old source pins (loop #784):
+  // no child spawn in index.js gets the bridge's env unscoped. Every
+  // process.env handed to a child goes through a strip helper or a
+  // lib/spawn-env.js builder (which strip internally, tested behaviorally).
+  it('no child spawn in index.js inherits a bare process.env', () => {
     const bare = indexSrc.match(/\{\s*\.\.\.process\.env\b/g) || [];
     const wrapped = indexSrc.match(/strip(?:JournalCreds|BridgeOnlySecrets)\(\{\s*\.\.\.process\.env\b/g) || [];
     expect(bare.length).toBe(wrapped.length);
-    expect(indexSrc).toMatch(/env: \{ \.\.\.stripBridgeOnlySecrets\(process\.env\), BRIDGE_ROOM_ID/);
+    expect(indexSrc).not.toMatch(/\benv:\s*process\.env\b/);
   });
 });

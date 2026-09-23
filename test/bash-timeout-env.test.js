@@ -1,7 +1,4 @@
 import { describe, it, expect } from 'vitest';
-import { readFileSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
-import path from 'node:path';
 import {
   bashTimeoutEnv,
   DEFAULT_BASH_DEFAULT_TIMEOUT_MS,
@@ -141,37 +138,5 @@ describe('bashTimeoutEnv', () => {
   });
 });
 
-// F1 — both Claude spawn environments (print-mode + interactive PTY) must merge
-// the timeout helper. index.js is a large ESM entrypoint with no exports, so the
-// wiring is pinned with a source-text assertion (P71: non-testable entry point
-// needs a source-text wiring test). If a future refactor drops the spread from
-// either spawn env, Bash calls in that path silently revert to the 2-min cap.
-describe('index.js spawn-env wiring', () => {
-  const indexSrc = readFileSync(
-    path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'index.js'),
-    'utf8',
-  );
-
-  it('imports the bashTimeoutEnv helper', () => {
-    expect(indexSrc).toMatch(
-      /import\s*\{\s*bashTimeoutEnv\s*\}\s*from\s*'\.\/lib\/bash-timeout-env\.js'/,
-    );
-  });
-
-  it('merges bashTimeoutEnv() into both the print-mode and interactive spawn envs', () => {
-    const spreads = indexSrc.match(/\.\.\.bashTimeoutEnv\(\)/g) || [];
-    expect(spreads.length).toBe(2);
-  });
-
-  it('spreads the helper into the print-mode spawnEnv object', () => {
-    const spawnEnvBlock = indexSrc.match(/const spawnEnv = \{[\s\S]*?\n {2}\};/);
-    expect(spawnEnvBlock, 'spawnEnv object literal not found').not.toBeNull();
-    expect(spawnEnvBlock[0]).toContain('...bashTimeoutEnv()');
-  });
-
-  it('spreads the helper into the interactive interactiveEnv object', () => {
-    const interactiveEnvBlock = indexSrc.match(/const interactiveEnv = \{[\s\S]*?\n {2}\};/);
-    expect(interactiveEnvBlock, 'interactiveEnv object literal not found').not.toBeNull();
-    expect(interactiveEnvBlock[0]).toContain('...bashTimeoutEnv()');
-  });
-});
+// Both Claude spawn envs carry the helper's values: asserted on the built env
+// in test/spawn-env.test.js (lib/spawn-env.js, loop #784).
