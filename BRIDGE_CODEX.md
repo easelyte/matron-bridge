@@ -43,11 +43,12 @@ The journal has a full-text search API over every one of the user's conversation
 - Auth: pass the loopback capability header from its file — `curl -H @"$MATRON_JOURNAL_PROXY_HEADER_FILE"` (`MATRON_JOURNAL_PROXY_HEADER_FILE` is in your env; the file already contains the full `X-Matron-Journal-Proxy-Token:` header line). Use the `@file` form, never `-H "…: <value>"` with the token inlined — a token on the command line leaks into the process table. The capability is low-privilege (only the two read routes below, never `/snapshot`, `/roster`, `/items` or writes); still, never `cat` the file or use `curl -v`/`--trace` (which print request headers). Your commands and output are mirrored into the journal.
 - `GET /journal/search?q=<terms>&limit=<n>&convo_id=<id>` → `{hits: [{convo_id, title, seq, ts, sender, snippet, live}]}`. URL-encode `q` (spaces, `&`, `#`, non-ASCII). Terms are ANDed literals, ranked best-match first; `q` is capped at 256 chars, `limit` defaults to 20 and clamps at 50, and `convo_id` narrows to one conversation. `live: true` means that conversation's agent is running now, so consider `agent_chat_start` instead of only reading history. Only prose is indexed — tool output never appears in results.
 - `GET /journal/convo/:id/messages?around_seq=<seq>&limit=<n>` — context around a hit, on any of the user's conversations (foreign reads return indexed prose only, `limit` clamped to 30).
+- If `MATRON_JOURNAL_PROXY_HEADER_FILE` is empty or unset, the bridge could not set up the proxy capability and journal search is unavailable in this session: say so once rather than retrying or looking for a journal token.
 - Use `curl` (its default `User-Agent` is fine); the proxy is plain loopback HTTP. Pace request bursts — the journal's own rate limiter still applies to forwarded requests and answers 403 across the board for a while once tripped.
 
 ## Tasks & decisions (`/items` HTTP API)
 
-The user has a task & decision tracker beside the chat — a persistent, shared list, not another chat message. **Before you end a turn with a question for the user, file it there (`kind: "question"`, options and your recommendation in `body`), say in chat which item you're waiting on as a markdown link — `[#12](matron://item/12)`, never a bare `#12` — and carry on with whatever doesn't depend on it.** A call you made is a `decision`; work you're deferring is a `task`. Do not file these as GitHub issues instead — the tracker is the user's list; a repo CLAUDE.md that still says otherwise predates it. Use the tracker's MCP tools on the `ask-user` server — `item_create`, `item_list`, `item_get`, `item_comment`, `item_close`, `item_reopen`, `item_reorder`, `item_move` — they are ordinary tools in this session and fill in this conversation's id for you. Only if those tools are absent from your tool list (the legacy exec transport), fall back to the journal's `/items` HTTP routes below. That transport, and only that one, has the journal agent token in its env: authenticate with `Authorization: Bearer $(cat "$JOURNAL_TOKEN_FILE")` (or `$JOURNAL_TOKEN` when the file variable is unset), read inside the request, never printed, no `-v`/`--trace`. Use `curl`, not Python `urllib`: the journal sits behind Cloudflare, whose Browser Integrity Check rejects Python's default `User-Agent` with `403` and the body `error code: 1010`. `$BASE` is the journal's https base (`JOURNAL_WS_URL` with `wss://` → `https://`, trailing `/ws` stripped). The read proxy above does not cover these routes.
+The user has a task & decision tracker beside the chat — a persistent, shared list, not another chat message. **Before you end a turn with a question for the user, file it there (`kind: "question"`, options and your recommendation in `body`), say in chat which item you're waiting on as a markdown link — `[#12](matron://item/12)`, never a bare `#12` — and carry on with whatever doesn't depend on it.** A call you made is a `decision`; work you're deferring is a `task`. Do not file these as GitHub issues instead — the tracker is the user's list; a repo CLAUDE.md that still says otherwise predates it. Use the tracker's MCP tools on the `ask-user` server — `item_create`, `item_list`, `item_get`, `item_comment`, `item_close`, `item_reopen`, `item_reorder`, `item_move` — they are ordinary tools in this session and fill in this conversation's id for you. Only if those tools are absent from your tool list (the legacy exec transport), fall back to the journal's `/items` HTTP routes below. That transport, and only that one, has the journal agent token in its env: authenticate by feeding curl the header from a process substitution — `-H @<(printf 'Authorization: Bearer %s\n' "$(cat "$JOURNAL_TOKEN_FILE")")` (use `"$JOURNAL_TOKEN"` in place of the `cat` when the file variable is unset). Never put the token itself on a command line (an inline `-H` header built with `$(cat …)` expands it into curl's argv, readable in the process table), never print it, no `-v`/`--trace`. Use `curl`, not Python `urllib`: the journal sits behind Cloudflare, whose Browser Integrity Check rejects Python's default `User-Agent` with `403` and the body `error code: 1010`. `$BASE` is the journal's https base (`JOURNAL_WS_URL` with `wss://` → `https://`, trailing `/ws` stripped). The read proxy above does not cover these routes.
 
 - `GET $BASE/items?convo=<id>&state=open` — list items for one conversation. `state` is `open` or `closed` — there is no `any`, and the raw route has no default; omit `state` to get both. Add `kind=task|question|decision`, `awaiting=user|agent`, or `label=<name>` to narrow further. Omit `convo` to list across every conversation of this user instead — there is no "current conversation" default here (see below).
 - `POST $BASE/items` — file one: `{"kind":"question"|"decision"|"task","title":"...","body":"...","convo_id":"<id>"}` (optional `labels`, `links`, `awaiting`, `supersedes`, and at most one of `position` (`"top"`/`"bottom"`), `after`, or `before` an existing item id — omitting all three lands it at the bottom). `convo_id` is required — the journal does not fill it in for an HTTP caller the way the MCP tools do for a Claude Code session.
@@ -64,13 +65,13 @@ CONVO_ID=<this conversation's id — see above>
 KEY=$(uuidgen)   # one key per intent; reuse it if you retry this exact request
 
 curl -sS -X POST "$BASE/items" \
-  -H "Authorization: Bearer $(cat "$JOURNAL_TOKEN_FILE")" \
+  -H @<(printf 'Authorization: Bearer %s\n' "$(cat "$JOURNAL_TOKEN_FILE")") \
   -H "Content-Type: application/json" \
   -H "Idempotency-Key: $KEY" \
   -d "{\"kind\":\"question\",\"title\":\"Which auth flow?\",\"body\":\"OAuth vs API key — recommend OAuth.\",\"convo_id\":\"$CONVO_ID\"}"
 
 curl -sS "$BASE/items?convo=$CONVO_ID&state=open" \
-  -H "Authorization: Bearer $(cat "$JOURNAL_TOKEN_FILE")"
+  -H @<(printf 'Authorization: Bearer %s\n' "$(cat "$JOURNAL_TOKEN_FILE")")
 ```
 
 If a call answers `403` with the body `error code: 1010`, that is Cloudflare's Browser Integrity Check refusing your `User-Agent` (Python's default), not a permissions problem — redo it with `curl` or an explicit `User-Agent` header. If a call answers `404`, or the journal is unreachable, this deployment predates the items routes — say so once and fall back to raising decisions and open questions in chat instead.
@@ -93,13 +94,13 @@ A mission is the human-readable record of one piece of work; milestones are its 
 ```bash
 KEY=$(uuidgen)   # one key per REQUEST, reused verbatim on every retry of it
 curl -sS -X POST "$BASE/missions" \
-  -H "Authorization: Bearer $(cat "$JOURNAL_TOKEN_FILE")" \
+  -H @<(printf 'Authorization: Bearer %s\n' "$(cat "$JOURNAL_TOKEN_FILE")") \
   -H "Content-Type: application/json" -H "Idempotency-Key: $KEY" \
   -d "{\"title\":\"Missions & milestones\",\"body\":\"Ship the journal half\",\"convo_id\":\"$CONVO_ID\"}"
 
 KEY=$(uuidgen)
 curl -sS -X POST "$BASE/milestones" \
-  -H "Authorization: Bearer $(cat "$JOURNAL_TOKEN_FILE")" \
+  -H @<(printf 'Authorization: Bearer %s\n' "$(cat "$JOURNAL_TOKEN_FILE")") \
   -H "Content-Type: application/json" -H "Idempotency-Key: $KEY" \
   -d "{\"convo_id\":\"$CONVO_ID\",\"kind\":\"user_input\",\"title\":\"Dan asked for missions\"}"
 ```

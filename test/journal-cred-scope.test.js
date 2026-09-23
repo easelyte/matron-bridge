@@ -155,6 +155,12 @@ describe('BRIDGE_CODEX.md journal search (loop #781)', () => {
     expect(section).toContain('curl -H @"$MATRON_JOURNAL_PROXY_HEADER_FILE"');
   });
 
+  it('never puts the legacy-exec journal token on a command line', () => {
+    // `-H "Authorization: Bearer $(cat ...)"` expands the token into curl's argv.
+    expect(codexMd).not.toMatch(/-H "Authorization: Bearer \$\(/);
+    expect(codexMd).toContain(`-H @<(printf 'Authorization: Bearer %s\\n' "$(cat "$JOURNAL_TOKEN_FILE")")`);
+  });
+
   it('no longer tells app-server sessions to authenticate search with the journal token', () => {
     expect(section).not.toMatch(/JOURNAL_TOKEN(_FILE)?\b/);
     expect(section).not.toContain('Authorization: Bearer');
