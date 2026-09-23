@@ -1,11 +1,13 @@
 // Regression guard for test/setup-isolated-home.js: the suite must never see
 // the developer's real home, so nothing derived from os.homedir() can touch
 // the real ~/.claude/projects.
+import { spawnSync } from 'node:child_process';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, it, expect } from 'vitest';
 import { projectDirFor, subagentsDirFor } from '../lib/transcript-dir.js';
 import { codexSinksRoot } from '../lib/codex-paths.js';
+import { isolatedHomeEnv } from './helpers/home-env.js';
 
 const realHome = process.env.MATRON_TEST_REAL_HOME;
 const under = (p, root) => path.resolve(p).startsWith(path.resolve(root) + path.sep);
@@ -27,5 +29,18 @@ describe('isolated test home', () => {
 
   it('the codex-viz sink root resolves under the fake home', () => {
     expect(under(codexSinksRoot(), os.homedir())).toBe(true);
+  });
+
+  const childHome = (env) => spawnSync(process.execPath, ['-e', 'process.stdout.write(require("os").homedir())'], { env, encoding: 'utf8' }).stdout;
+
+  it('child processes inherit the fake home', () => {
+    expect(childHome(process.env)).toBe(os.homedir());
+  });
+
+  it('a from-scratch child env gets the fake home via isolatedHomeEnv()', () => {
+    const env = { PATH: process.env.PATH, ...isolatedHomeEnv() };
+    expect(childHome(env)).toBe(os.homedir());
+    expect(env.CODEX_HOME).toBe(path.join(os.homedir(), '.codex'));
+    expect(env.CLAUDE_CONFIG_DIR).toBe(path.join(os.homedir(), '.claude'));
   });
 });

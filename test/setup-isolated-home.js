@@ -9,7 +9,9 @@
 // ~/.claude/projects/<workspace> directory (session transcripts + project
 // memory). This file points HOME and friends at a fresh temp dir before the test
 // file (and anything it imports) loads, so os.homedir() and every path derived
-// from it land in the sandbox.
+// from it land in the sandbox. Children inherit it through process.env; a test
+// that builds a child env from scratch must spread isolatedHomeEnv() from
+// test/helpers/home-env.js into it.
 //
 // On POSIX os.homedir() follows $HOME; USERPROFILE is the Windows equivalent.
 import fs from 'node:fs';
@@ -27,10 +29,10 @@ process.env.XDG_CONFIG_HOME = path.join(fakeHome, '.config');
 process.env.XDG_DATA_HOME = path.join(fakeHome, '.local', 'share');
 process.env.XDG_CACHE_HOME = path.join(fakeHome, '.cache');
 process.env.XDG_STATE_HOME = path.join(fakeHome, '.local', 'state');
-// Unset rather than redirected: code that honours these falls back to a path
-// under os.homedir(), which is now the fake home.
-delete process.env.CLAUDE_CONFIG_DIR;
-delete process.env.CODEX_HOME;
+// Explicit, so a child handed these (test/helpers/home-env.js) cannot fall back
+// to anything outside the sandbox.
+process.env.CODEX_HOME = path.join(fakeHome, '.codex');
+process.env.CLAUDE_CONFIG_DIR = path.join(fakeHome, '.claude');
 
 if (path.resolve(os.homedir()) === path.resolve(realHome) && realHome !== fakeHome) {
   throw new Error(`setup-isolated-home: os.homedir() still resolves to the real home (${realHome})`);
