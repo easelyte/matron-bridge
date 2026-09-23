@@ -129,7 +129,9 @@ describe('bridge-controlled journal-free child spawns are scoped in index.js', (
       expect(call).toContain('journalProxyHeaderFile: JOURNAL_PROXY_HEADER_FILE,');
       expect(call).toContain('showFileToken,');
     }
-    expect(indexSrc).toMatch(/env: buildCodexSpawnEnv\(\{ roomId, apiPort: API_PORT \}\),/);
+    const codexCall = indexSrc.match(/env: buildCodexSpawnEnv\(\{[\s\S]*?\}\),/)?.[0] ?? '';
+    expect(codexCall).toContain('appServer: CODEX_APP_SERVER,');
+    expect(codexCall).toContain('journalProxyHeaderFile: JOURNAL_PROXY_HEADER_FILE,');
   });
 
   // Loop #765: the journal read-proxy capability reaches Claude children as a
@@ -141,6 +143,27 @@ describe('bridge-controlled journal-free child spawns are scoped in index.js', (
     expect(indexSrc).not.toContain('MATRON_JOURNAL_PROXY_TOKEN: JOURNAL_PROXY_CAP_TOKEN');
     // ...and the header file is written 0600.
     expect(indexSrc).toMatch(/writeFileSync\(JOURNAL_PROXY_HEADER_FILE[\s\S]*?mode: 0o600/);
+  });
+});
+
+describe('BRIDGE_CODEX.md journal search (loop #781)', () => {
+  const codexMd = readFileSync(join(__dirname, '..', 'BRIDGE_CODEX.md'), 'utf8');
+  const section = codexMd.slice(codexMd.indexOf('## Journal history'), codexMd.indexOf('## Tasks & decisions'));
+
+  it('points search at the tokenless bridge-local read proxy', () => {
+    expect(section).toContain('http://127.0.0.1:$MATRON_BRIDGE_API_PORT/journal');
+    expect(section).toContain('curl -H @"$MATRON_JOURNAL_PROXY_HEADER_FILE"');
+  });
+
+  it('never puts the legacy-exec journal token on a command line', () => {
+    // `-H "Authorization: Bearer $(cat ...)"` expands the token into curl's argv.
+    expect(codexMd).not.toMatch(/-H "Authorization: Bearer \$\(/);
+    expect(codexMd).toContain(`-H @<(printf 'Authorization: Bearer %s\\n' "$(cat "$JOURNAL_TOKEN_FILE")")`);
+  });
+
+  it('no longer tells app-server sessions to authenticate search with the journal token', () => {
+    expect(section).not.toMatch(/JOURNAL_TOKEN(_FILE)?\b/);
+    expect(section).not.toContain('Authorization: Bearer');
   });
 });
 

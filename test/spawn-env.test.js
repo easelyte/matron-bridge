@@ -125,22 +125,59 @@ describe('buildClaudeSpawnEnv', () => {
 });
 
 describe('buildCodexSpawnEnv', () => {
-  const env = buildCodexSpawnEnv({ baseEnv: BRIDGE_ENV, roomId: '!room:example', apiPort: 8787 });
-
-  it('strips bridge-only secrets', () => {
-    expect('HMAC_SECRET' in env).toBe(false);
+  const codex = (appServer) => buildCodexSpawnEnv({
+    baseEnv: BRIDGE_ENV, roomId: '!room:example', apiPort: 8787, appServer,
+    journalProxyHeaderFile: '/run/matron/proxy/header',
   });
 
-  it('keeps the journal token (BRIDGE_CODEX.md documents a token-based /items fallback)', () => {
+  for (const appServer of [true, false]) {
+    describe(appServer ? 'app-server transport' : 'legacy exec transport', () => {
+      const env = codex(appServer);
+
+      it('strips bridge-only secrets', () => {
+        expect('HMAC_SECRET' in env).toBe(false);
+      });
+
+      it('sets the bridge wiring keys and passes the rest through', () => {
+        expect(env.BRIDGE_ROOM_ID).toBe('!room:example');
+        expect(env.MATRON_BRIDGE_API_PORT).toBe('8787');
+        expect(env.PATH).toBe('/usr/bin:/bin');
+        expect(env.JOURNAL_WS_URL).toBe('wss://journal.example/ws');
+      });
+
+      it('passes the journal read-proxy capability as a header-file path', () => {
+        expect(env.MATRON_JOURNAL_PROXY_HEADER_FILE).toBe('/run/matron/proxy/header');
+      });
+    });
+  }
+
+  // Loop #781: app-server sessions have the item_* / mission MCP tools and reach
+  // journal search through the read proxy, so they never need the full-read token.
+  it('app-server: strips the full-journal read credential', () => {
+    const env = codex(true);
+    expect('JOURNAL_TOKEN' in env).toBe(false);
+    expect('JOURNAL_TOKEN_FILE' in env).toBe(false);
+    expect(Object.values(env)).not.toContain('full-read-secret');
+  });
+
+  // Legacy exec sessions have no Matron MCP tools; BRIDGE_CODEX.md's /items
+  // HTTP fallback authenticates with the token, so they keep it.
+  it('legacy exec: keeps the journal token for the /items fallback', () => {
+    const env = codex(false);
     expect(env.JOURNAL_TOKEN).toBe('full-read-secret');
     expect(env.JOURNAL_TOKEN_FILE).toBe('/run/journal.token');
   });
 
-  it('sets the bridge wiring keys and passes the rest through', () => {
-    expect(env.BRIDGE_ROOM_ID).toBe('!room:example');
-    expect(env.MATRON_BRIDGE_API_PORT).toBe('8787');
-    expect(env.PATH).toBe('/usr/bin:/bin');
-    expect(env.JOURNAL_WS_URL).toBe('wss://journal.example/ws');
+  it('fails safe: an unspecified transport is treated as app-server (token stripped)', () => {
+    const env = buildCodexSpawnEnv({ baseEnv: BRIDGE_ENV, roomId: 'r', apiPort: 1 });
+    expect('JOURNAL_TOKEN' in env).toBe(false);
+    expect('JOURNAL_TOKEN_FILE' in env).toBe(false);
+  });
+
+  it('never mutates the base env', () => {
+    const base = { ...BRIDGE_ENV };
+    buildCodexSpawnEnv({ baseEnv: base, roomId: 'r', apiPort: 1, appServer: true });
+    expect(base).toEqual(BRIDGE_ENV);
   });
 
   it('rejects a non-object base env', () => {
