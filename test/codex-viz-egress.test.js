@@ -173,16 +173,24 @@ describe('codex-viz top-level error diagnostics (loop #762 follow-up)', () => {
 });
 
 describe('codex-viz unknown/future item type diagnostics', () => {
-  it('renders a newer item type as a safe { type } stub without forwarding its fields', () => {
+  it('renders a newer item type as a humanized line without forwarding its fields', () => {
     const { publisher } = route({
       type: 'item.completed',
       item: { id: 'x', type: 'future_diag', message: 'informative detail', structural: { drop: 'me' } },
     });
+    // Loop #772: a newer item.completed type now lands a compact formatted line
+    // (humanized type label) instead of a raw { type, id } JSON stub — but the
+    // egress contract is unchanged. allowlistedEvent still strips the item to
+    // { type, id } BEFORE the fallback runs, and the fallback forwards ONLY the
+    // humanized type, so arbitrary textual/structural fields (and a command item
+    // renamed to stream output in a textual field the command guard never sees)
+    // still cannot egress here.
+    const line = publisher.calls.find(call => call.method === 'publishText');
+    expect(line).toBeDefined();
+    // The item type is visible as a humanized label, not raw JSON.
+    expect(line.payload.body).toBe('`Future diag`');
+    expect(line.payload.body).not.toContain('future_diag');
     const serialized = JSON.stringify(publisher.calls);
-    // The item type is visible, but arbitrary textual/structural fields are NOT
-    // forwarded — a future codex that renames a command item and streams output
-    // in a textual field the command guard never sees cannot egress here.
-    expect(serialized).toContain('future_diag');
     expect(serialized).not.toContain('informative detail');
     expect(serialized).not.toContain('structural');
   });
@@ -193,6 +201,42 @@ describe('codex-viz unknown/future item type diagnostics', () => {
       item: { id: 'x', type: 'future_diag', message: ENV_DUMP },
     });
     expect(JSON.stringify(publisher.calls)).not.toContain(SECRET);
+  });
+
+  it('neutralizes Markdown/link/newline/bidi injection carried in the item type', () => {
+    // A hostile or newer producer sets an item type that tries to break out of
+    // the inline-code wrapper and inject an assistant-authored link/instruction.
+    const hostileType = '`\n[Authorize](https://attacker.invalid)\n`‮';
+    const { publisher } = route({
+      type: 'item.completed',
+      item: { id: 'x', type: hostileType },
+    });
+    const line = publisher.calls.find(call => call.method === 'publishText');
+    expect(line).toBeDefined();
+    const body = line.payload.body;
+    // Only the inline-code wrapper's own backticks remain; the label between
+    // them is a bounded [A-Za-z0-9 ] grammar — no markdown link, no newline, no
+    // stray backtick, no bidi control can escape the wrapper.
+    expect(body.startsWith('`') && body.endsWith('`')).toBe(true);
+    const label = body.slice(1, -1);
+    expect(label).toMatch(/^[A-Za-z0-9 ]+$/);
+    // The label is plain words only, so no markdown link can form even though
+    // harmless word fragments ("https", "attacker") may survive as text.
+    expect(body).not.toContain('](');
+    expect(body).not.toContain('\n');
+    expect(body).not.toContain('‮');
+    expect(body).not.toContain('attacker.invalid');
+  });
+
+  it('length-caps an oversized item type', () => {
+    const { publisher } = route({
+      type: 'item.completed',
+      item: { id: 'x', type: 'a'.repeat(5000) },
+    });
+    const line = publisher.calls.find(call => call.method === 'publishText');
+    expect(line).toBeDefined();
+    // Wrapper (2 backticks) + at most 80 label chars.
+    expect(line.payload.body.length).toBeLessThanOrEqual(82);
   });
 });
 

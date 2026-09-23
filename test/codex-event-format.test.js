@@ -348,32 +348,128 @@ describe('formatAndRoute', () => {
     expect(retained.has(ctx.runId)).toBe(false);
   });
 
-  it('passes an unknown item through as text and increments unparsed', () => {
+  // Loop #772: an unrecognized item.completed type renders a DURABLE compact,
+  // formatted line, NOT a raw JSON dump. The line carries only a humanized
+  // label; no other item field (and not even the id) survives. It is a neutral
+  // text line, NOT a "done" tool card — see the mcp-failure rationale (Codex F1).
+  it('renders an unrecognized item.completed type as a compact formatted line, not raw JSON', () => {
     const { calls, ctx } = makeContext();
     const unknown = { type: 'item.completed', item: { id: 'x', type: 'future_item', value: 42 } };
 
     formatAndRoute(unknown, ctx);
 
-    expect(ctx.state.unparsed).toBe(1);
-    expect(calls.filter(call => call.method !== 'publishStatus')).toEqual([
+    const nonStatus = calls.filter(call => call.method !== 'publishStatus');
+    expect(nonStatus).toEqual([
       {
         method: 'publishText',
-        args: [ctx.convoId, { body: JSON.stringify(unknown), from: 'assistant' }],
+        args: [ctx.convoId, { body: '`Future item`', from: 'assistant' }],
       },
     ]);
+    // No raw-JSON leak, and no other item field is forwarded.
+    const serialized = JSON.stringify(nonStatus);
+    expect(serialized).not.toBe(JSON.stringify(unknown));
+    expect(serialized).not.toContain('42');
+    expect(nonStatus[0].args[1].body).not.toBe(JSON.stringify(unknown));
+    // No "done" tool card is emitted (would misreport a failed tool as success).
+    expect(calls.some(call => call.method === 'publishToolOutput')).toBe(false);
+    expect(ctx.state.unparsed).toBe(0);
+    expect(ctx.state.durableEvents).toBe(1);
   });
 
-  it('passes an unknown item.started type through as text and increments unparsed', () => {
+  // Loop #772: an unrecognized item.started type shows an ephemeral "tool"
+  // activity indicator (like command_execution/file_change started), NOT raw
+  // JSON. Ephemeral -> no durable-cap consumption, no unparsed increment.
+  it('renders an unrecognized item.started type as a tool activity, not raw JSON', () => {
     const { calls, ctx } = makeContext();
     const unknown = { type: 'item.started', item: { id: 'x', type: 'future_item', value: 42 } };
 
     formatAndRoute(unknown, ctx);
 
+    expect(calls.filter(call => call.method !== 'publishStatus')).toEqual([
+      { method: 'publishActivity', args: [ctx.convoId, 'tool', 'Future item'] },
+    ]);
+    expect(calls.some(call => call.method === 'publishText')).toBe(false);
+    expect(ctx.state.unparsed).toBe(0);
+    expect(ctx.state.durableEvents).toBe(0);
+  });
+
+  // Loop #772 (the reported bug): web_search item.started/completed no longer
+  // leak raw `{"type":"item.started","item":{"type":"web_search",...}}` blobs
+  // between the clean bash-command cards.
+  it('renders web_search item.started as a tool activity, not a raw JSON publishText', () => {
+    const { calls, ctx } = makeContext();
+
+    formatAndRoute(
+      { type: 'item.started', item: { id: 'exec-1', type: 'web_search' } },
+      ctx,
+    );
+
+    expect(calls.filter(call => call.method !== 'publishStatus')).toEqual([
+      { method: 'publishActivity', args: [ctx.convoId, 'tool', 'Web search'] },
+    ]);
+    expect(calls.some(call => call.method === 'publishText')).toBe(false);
+  });
+
+  it('renders web_search item.completed as a formatted line whose body is not the raw event', () => {
+    const { calls, ctx } = makeContext();
+    const event = { type: 'item.completed', item: { id: 'exec-1', type: 'web_search' } };
+
+    formatAndRoute(event, ctx);
+
+    const textPosts = calls.filter(call => call.method === 'publishText');
+    expect(textPosts).toEqual([
+      {
+        method: 'publishText',
+        args: [ctx.convoId, { body: '`Web search`', from: 'assistant' }],
+      },
+    ]);
+    // The published line is a formatted label, NOT a stringified raw event, and
+    // not a "done" tool card.
+    expect(textPosts[0].args[1].body).not.toBe(JSON.stringify(event));
+    expect(calls.some(call => call.method === 'publishToolOutput')).toBe(false);
+  });
+
+  // Proves the fallback is GENERIC (a formatter over the item.* family), not a
+  // web_search special case: a different novel item type renders the same way.
+  it('renders a different novel item type (mcp_tool_call) generically too', () => {
+    const { calls, ctx } = makeContext();
+
+    formatAndRoute(
+      { type: 'item.started', item: { id: 'mcp-1', type: 'mcp_tool_call' } },
+      ctx,
+    );
+    formatAndRoute(
+      { type: 'item.completed', item: { id: 'mcp-1', type: 'mcp_tool_call' } },
+      ctx,
+    );
+
+    expect(calls.filter(call => call.method === 'publishActivity')).toContainEqual(
+      { method: 'publishActivity', args: [ctx.convoId, 'tool', 'Mcp tool call'] },
+    );
+    expect(calls.filter(call => call.method === 'publishText')).toEqual([
+      {
+        method: 'publishText',
+        args: [ctx.convoId, { body: '`Mcp tool call`', from: 'assistant' }],
+      },
+    ]);
+    // Never a "done" card: a status-bearing item's real status was stripped
+    // upstream, so the bridge must not assert success (Codex F1).
+    expect(calls.some(call => call.method === 'publishToolOutput')).toBe(false);
+  });
+
+  // A truly unstructured item (no string type) still falls to raw passthrough —
+  // the fallback keys on a string item.type, so shapeless events are unaffected.
+  it('still passes a typeless item through as raw text', () => {
+    const { calls, ctx } = makeContext();
+    const shapeless = { type: 'item.completed', item: { id: 'x' } };
+
+    formatAndRoute(shapeless, ctx);
+
     expect(ctx.state.unparsed).toBe(1);
     expect(calls.filter(call => call.method !== 'publishStatus')).toEqual([
       {
         method: 'publishText',
-        args: [ctx.convoId, { body: JSON.stringify(unknown), from: 'assistant' }],
+        args: [ctx.convoId, { body: JSON.stringify(shapeless), from: 'assistant' }],
       },
     ]);
   });
