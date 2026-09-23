@@ -629,6 +629,57 @@ describe('createSubagentConvoTracker', () => {
       expect(runningStore.list()).toEqual([]);
     });
 
+    it('a stale premature-finish callback cannot erase the record re-armed by a corrective revival (Codex #764 delta F1)', () => {
+      // Deferring publisher: capture each finish frame's onLocalSendComplete so we
+      // can fire the stale one AFTER the corrective revival re-arms the record.
+      const deferred = [];
+      const publisher = {
+        calls: { upsertConvo: [] },
+        upsertConvo(convoId, opts, options) {
+          this.calls.upsertConvo.push({ convoId, opts });
+          if (options?.onLocalSendComplete) deferred.push(options.onLocalSendComplete);
+        },
+        publishStatus() {}, publishText() {}, publishDiff() {},
+      };
+      const runningStore = makeStore();
+      const tracker = createSubagentConvoTracker({
+        publisher,
+        getParentConvoId: () => 'parent-uuid',
+        runningStore,
+        log: { warn() {} },
+      });
+
+      // Background Agent: ref queued, discovery FIFO-pairs and mints running.
+      tracker.noteTaskStarted('toolu_bg');
+      const child = tracker.discover('agent-bg', { label: 'BG', agentType: null });
+      expect(runningStore.list()).toHaveLength(1);
+
+      // Premature finish from the launch tool_result — its cleanup callback is
+      // captured (delivery not yet acked).
+      tracker.noteTaskResult('toolu_bg');
+      expect(child.state).toBe(CHILD_STATE_FINISHED);
+      const stalePrematureCallback = deferred.shift();
+
+      // The genuine first task_started arrives: corrective revival re-arms the
+      // running record and bumps the revive epoch (generation stays 0).
+      const disp = tracker.noteBackgroundTaskStarted('toolu_bg', 'agent-bg');
+      tracker.revive('agent-bg', { incrementGeneration: disp === TASK_STARTED_RESUMED });
+      expect(child.state).toBe(CHILD_STATE_RUNNING);
+      expect(child.generation).toBe(0);
+      expect(runningStore.list()).toHaveLength(1);
+
+      // The stale premature callback now fires — it MUST be fenced (epoch moved),
+      // leaving the re-armed record intact so reconciliation can still recover.
+      stalePrematureCallback();
+      expect(runningStore.list()).toHaveLength(1);
+
+      // The run's real completion finishes it and its own callback clears the record.
+      tracker.noteTaskCompleted('agent-bg'); // id-less; generation 0 -> still finishes
+      expect(child.state).toBe(CHILD_STATE_FINISHED);
+      deferred.shift()(); // real done ack
+      expect(runningStore.list()).toEqual([]);
+    });
+
     it('does not re-add on repeat discovery of the same agent', () => {
       const runningStore = makeStore();
       const tracker = createSubagentConvoTracker({
