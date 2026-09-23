@@ -12,6 +12,7 @@ import {
   resolveSchemaVersion,
 } from '../bin/codex-producer.mjs';
 import { formatAndRoute } from '../lib/codex-event-format.js';
+import { isolatedHomeEnv } from './helpers/home-env.js';
 
 const SHIM = fileURLToPath(new URL('../bin/codex-producer.mjs', import.meta.url));
 const RUN_ID_RE = /^\d{13}-[1-9]\d{0,9}-[0-9a-f]{4}$/;
@@ -55,7 +56,7 @@ function writeFakeCodex(dir, { name = 'codex', version = '0.147.0', body } = {})
 
 function runShimSubprocess(args, { env = {}, input = '' } = {}) {
   const res = spawnSync(process.execPath, [SHIM, ...args], {
-    env: { PATH: process.env.PATH, ...env },
+    env: { PATH: process.env.PATH, ...isolatedHomeEnv(), ...env },
     input,
     encoding: 'utf8',
   });
@@ -248,7 +249,7 @@ describe('producer shim — signal forwarding + no orphan (T-6.4)', () => {
     const sink = path.join(dir, 'sink');
 
     const child = spawn(process.execPath, [SHIM, 'exec', '-'], {
-      env: { PATH: process.env.PATH, MATRON_CODEX_REAL_BIN: real, MATRON_CODEX_SINK_DIR: sink },
+      env: { PATH: process.env.PATH, ...isolatedHomeEnv(), MATRON_CODEX_REAL_BIN: real, MATRON_CODEX_SINK_DIR: sink },
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     child.stdin.end('prompt\n');
@@ -372,12 +373,24 @@ const REAL_CODEX = (() => {
   return null;
 })();
 
-describe.skipIf(!REAL_CODEX)('producer shim — live smoke (T-1.7)', () => {
+// Opt-in (MATRON_LIVE_CODEX_SMOKE=1): the live run needs the real codex auth in
+// the developer's ~/.codex, which the isolated test home (setup-isolated-home.js)
+// otherwise keeps out of reach. Opting in points CODEX_HOME, and only that, at
+// the real one.
+const LIVE_CODEX_SMOKE = process.env.MATRON_LIVE_CODEX_SMOKE === '1';
+
+describe.skipIf(!REAL_CODEX || !LIVE_CODEX_SMOKE)('producer shim — live smoke (T-1.7)', () => {
   it('resolves the real bin + json flag and writes a decoder-shaped transcript', () => {
     const dir = makeDir();
     const sink = path.join(dir, 'sink');
     const res = spawnSync(process.execPath, [SHIM, 'exec', '--sandbox', 'read-only', '-'], {
-      env: { PATH: process.env.PATH, MATRON_CODEX_REAL_BIN: REAL_CODEX, MATRON_CODEX_SINK_DIR: sink },
+      env: {
+        PATH: process.env.PATH,
+        ...isolatedHomeEnv(),
+        CODEX_HOME: path.join(process.env.MATRON_TEST_REAL_HOME, '.codex'),
+        MATRON_CODEX_REAL_BIN: REAL_CODEX,
+        MATRON_CODEX_SINK_DIR: sink,
+      },
       input: 'Say only OK\n',
       encoding: 'utf8',
       timeout: 120_000,
