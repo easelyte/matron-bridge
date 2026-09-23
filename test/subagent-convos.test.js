@@ -554,6 +554,31 @@ describe('createSubagentConvoTracker', () => {
       expect(tracker.noteBackgroundTaskStarted('', 'agent-x')).toBe(TASK_STARTED_IGNORED);
       expect(tracker.noteBackgroundTaskStarted('toolu', '')).toBe(TASK_STARTED_IGNORED);
     });
+
+    it('a late FIRST task_started still revives a child finished by a premature launch tool_result (Codex F1)', () => {
+      // Race: discovery FIFO-pairs the queued ref onto the child, THEN the instant
+      // launch tool_result finishes it (noteTaskResult, before backgroundRefs is
+      // populated). The child is now 'done' carrying the ref — but its real
+      // task_started has not fired yet. That first start must NOT be mistaken for
+      // a replay: it is the genuine start of a live agent.
+      tracker.noteTaskStarted('toolu_bg');                                 // queue ref
+      const child = tracker.discover('agent-bg', { label: 'BG', agentType: null }); // FIFO-pair
+      expect(child.taskRef).toBe('toolu_bg');
+      tracker.noteTaskResult('toolu_bg');                                  // premature finish
+      expect(child.state).toBe(CHILD_STATE_FINISHED);
+
+      // First task_started for the ref: not a replay -> started-new, so index.js revives.
+      const disp = tracker.noteBackgroundTaskStarted('toolu_bg', 'agent-bg');
+      expect(disp).toBe(TASK_STARTED_STARTED_NEW);
+      tracker.revive('agent-bg');
+      expect(child.state).toBe(CHILD_STATE_RUNNING);
+
+      // A subsequent same-ref replay (now that the start has been seen) is rejected.
+      tracker.noteTaskCompleted('agent-bg', 'toolu_bg'); // real completion
+      expect(child.state).toBe(CHILD_STATE_FINISHED);
+      expect(tracker.noteBackgroundTaskStarted('toolu_bg', 'agent-bg'))
+        .toBe(TASK_STARTED_REJECTED_REPLAY);
+    });
   });
 
   // The tracker records every minted `running` child into a
