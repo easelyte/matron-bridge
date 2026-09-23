@@ -343,7 +343,7 @@ describe('items handlers Files deep link (loop #739)', () => {
     await h.create({ roomId: '!r:s', kind: 'task', title: 'Handoff', body: 'draft is ready', attachments: ['dan-offer.md'] });
     const sent = client.create.mock.calls[0][0];
     expect(sent.body).toBe(
-      `draft is ready\n\n📁 Open dan-offer.md in Files: ${WEB}/journal/#files=${encodeURIComponent(`${WORK}/dan-offer.md`)}`,
+      `draft is ready\n\n📁 Open dan-offer.md in Files: ${WEB}/#files=${encodeURIComponent(`${WORK}/dan-offer.md`)}`,
     );
     // The attachment record itself is unchanged (deep link is additive, not a replacement).
     expect(sent.attachments).toEqual([{ blob_ref: 'b-dan-offer.md', mime: 'text/markdown', name: 'dan-offer.md', size: 3 }]);
@@ -353,7 +353,7 @@ describe('items handlers Files deep link (loop #739)', () => {
     const { h, client } = webFixture(WEB);
     await h.create({ roomId: '!r:s', kind: 'task', title: 'Handoff', attachments: ['dan-offer.md'] });
     expect(client.create.mock.calls[0][0].body).toBe(
-      `📁 Open dan-offer.md in Files: ${WEB}/journal/#files=${encodeURIComponent(`${WORK}/dan-offer.md`)}`,
+      `📁 Open dan-offer.md in Files: ${WEB}/#files=${encodeURIComponent(`${WORK}/dan-offer.md`)}`,
     );
   });
 
@@ -361,7 +361,7 @@ describe('items handlers Files deep link (loop #739)', () => {
     const { h, client } = webFixture(WEB);
     await h.comment({ roomId: '!r:s', id: 'it_1', body: 'see attached', attachments: ['dan-offer.md'] });
     expect(client.comment.mock.calls[0][1].body).toBe(
-      `see attached\n\n📁 Open dan-offer.md in Files: ${WEB}/journal/#files=${encodeURIComponent(`${WORK}/dan-offer.md`)}`,
+      `see attached\n\n📁 Open dan-offer.md in Files: ${WEB}/#files=${encodeURIComponent(`${WORK}/dan-offer.md`)}`,
     );
   });
 
@@ -431,7 +431,7 @@ describe('items handlers deep-link byte-bound + multi-trailer (loop #739, AR-12 
     // Choose a body length such that appending the trailer stays within BODY_MAX code units but
     // would exceed BODY_MAX bytes — the emoji costs +2 bytes over its 2 code units. If the bound
     // were code-unit based, the trailer would be (wrongly) appended and the byte length exceed max.
-    const trailer = `\n\n📁 Open dan-offer.md in Files: ${WEB}/journal/#files=${encodeURIComponent(`${WORK}/dan-offer.md`)}`;
+    const trailer = `\n\n📁 Open dan-offer.md in Files: ${WEB}/#files=${encodeURIComponent(`${WORK}/dan-offer.md`)}`;
     const trailerBytes = Buffer.byteLength(trailer, 'utf8');
     const body = 'x'.repeat(BODY_MAX - trailerBytes + 1); // +1 byte over once the trailer is added
     const r = await h.create({ roomId: '!r:s', kind: 'task', title: 'B', body, attachments: ['dan-offer.md'] });
@@ -446,8 +446,8 @@ describe('items handlers deep-link byte-bound + multi-trailer (loop #739, AR-12 
     const longName = 'a'.repeat(400) + '.md'; // long path/name → big trailer
     const shortName = 'b.md';                  // short trailer
     // Body sized so the LONG trailer overflows but the SHORT one fits.
-    const shortTrailer = `\n\n📁 Open ${shortName} in Files: ${WEB}/journal/#files=${encodeURIComponent(`${WORK}/${shortName}`)}`;
-    const longTrailer = `\n\n📁 Open ${longName} in Files: ${WEB}/journal/#files=${encodeURIComponent(`${WORK}/${longName}`)}`;
+    const shortTrailer = `\n\n📁 Open ${shortName} in Files: ${WEB}/#files=${encodeURIComponent(`${WORK}/${shortName}`)}`;
+    const longTrailer = `\n\n📁 Open ${longName} in Files: ${WEB}/#files=${encodeURIComponent(`${WORK}/${longName}`)}`;
     const body = 'x'.repeat(BODY_MAX - Buffer.byteLength(shortTrailer, 'utf8') - 5);
     // Sanity: the long trailer must not fit on top of body, the short one must.
     expect(Buffer.byteLength(body + longTrailer, 'utf8')).toBeGreaterThan(BODY_MAX);

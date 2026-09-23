@@ -360,7 +360,7 @@ describe('shareAgentMedia Files deep link (loop #739)', () => {
     await share(deps, { filePath: '/work/report.pdf', caption: 'the report', deps: { ...deps, webBaseUrl: WEB } });
     const [, payload] = deps.publish.mock.calls[0];
     expect(payload.caption).toBe(
-      `the report\n\n📁 Open report.pdf in Files: ${WEB}/journal/#files=${encodeURIComponent('/work/report.pdf')}`,
+      `the report\n\n📁 Open report.pdf in Files: ${WEB}/#files=${encodeURIComponent('/work/report.pdf')}`,
     );
   });
 
@@ -370,7 +370,7 @@ describe('shareAgentMedia Files deep link (loop #739)', () => {
     await share(deps, { filePath: '/work/report.pdf', caption: undefined, deps: { ...deps, webBaseUrl: WEB } });
     const [, payload] = deps.publish.mock.calls[0];
     expect(payload.caption).toBe(
-      `📁 Open report.pdf in Files: ${WEB}/journal/#files=${encodeURIComponent('/work/report.pdf')}`,
+      `📁 Open report.pdf in Files: ${WEB}/#files=${encodeURIComponent('/work/report.pdf')}`,
     );
   });
 
@@ -400,7 +400,7 @@ describe('shareAgentMedia deep link across multiple pinned roots (loop #739, F3)
     });
     const [, payload] = deps.publish.mock.calls[0];
     expect(payload.caption).toBe(
-      `the report\n\n📁 Open report.pdf in Files: ${WEB}/journal/#files=${encodeURIComponent(realPath)}`,
+      `the report\n\n📁 Open report.pdf in Files: ${WEB}/#files=${encodeURIComponent(realPath)}`,
     );
   });
 });
