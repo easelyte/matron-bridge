@@ -118,15 +118,35 @@ describe('bridge-controlled journal-free child spawns are scoped in index.js', (
     expect(body).toMatch(/env:\s*stripJournalCreds\(\{\s*\.\.\.process\.env/);
   });
 
-  // Guard the deliberate NON-change: interactive/print session spawns keep the
-  // token because the shipped prompt requires it for journal search. If someone
-  // later strips it here, this test fails loudly and points them at the PR.
-  it('does NOT strip the token from the interactive/print session spawns', () => {
+  // Loop #765: Claude session + interactive spawns NOW strip the token — they
+  // reach journal search through the bridge-local read proxy (BRIDGE_CLAUDE.md),
+  // so no session (or its inheriting subagents) needs the raw full-read token.
+  it('strips the token from the Claude session and interactive spawns', () => {
     const printStart = indexSrc.indexOf('const spawnEnv = {');
     const ivStart = indexSrc.indexOf('const interactiveEnv = {');
     expect(printStart).toBeGreaterThan(-1);
     expect(ivStart).toBeGreaterThan(-1);
-    expect(indexSrc.slice(printStart, printStart + 3000)).not.toContain('stripJournalCreds(spawnEnv)');
-    expect(indexSrc.slice(ivStart, ivStart + 1200)).not.toContain('stripJournalCreds(interactiveEnv)');
+    expect(indexSrc.slice(printStart, printStart + 800)).toMatch(/\.\.\.stripJournalCreds\(process\.env\)/);
+    expect(indexSrc.slice(ivStart, ivStart + 800)).toMatch(/\.\.\.stripJournalCreds\(process\.env\)/);
+  });
+
+  // Loop #765: the journal read-proxy capability reaches Claude children as a
+  // 0600 header FILE path, never as a token value in the env or on argv (a token
+  // on curl's command line leaks via world-readable /proc/<pid>/cmdline).
+  it('injects the proxy capability as a header-file PATH, not a token value', () => {
+    // The child env carries the file path...
+    expect(indexSrc).toContain('MATRON_JOURNAL_PROXY_HEADER_FILE: JOURNAL_PROXY_HEADER_FILE');
+    // ...never the raw token value.
+    expect(indexSrc).not.toContain('MATRON_JOURNAL_PROXY_TOKEN: JOURNAL_PROXY_CAP_TOKEN');
+    // The header file is written 0600.
+    expect(indexSrc).toMatch(/writeFileSync\(JOURNAL_PROXY_HEADER_FILE[\s\S]*?mode: 0o600/);
+  });
+
+  // Deliberate NON-change (loop #765): Codex session spawns keep the token
+  // because BRIDGE_CODEX.md documents a token-based /items HTTP fallback for
+  // legacy-exec sessions; stripping needs the write-side /items proxy first.
+  it('does NOT yet strip the token from the Codex session spawn', () => {
+    const codexEnv = indexSrc.indexOf('env: { ...process.env, BRIDGE_ROOM_ID: roomId, MATRON_BRIDGE_API_PORT: String(API_PORT) }');
+    expect(codexEnv).toBeGreaterThan(-1);
   });
 });

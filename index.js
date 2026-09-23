@@ -12,7 +12,7 @@ import { createReminderHandlers } from './lib/reminder-tools.js';
 import { createMissionsClient } from './lib/missions-client.js';
 import { createMissionsHandlers } from './lib/missions-tools.js';
 import { createServer } from 'http';
-import { createHmac, randomUUID } from 'crypto';
+import { createHmac, randomUUID, randomBytes } from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -184,6 +184,7 @@ import { CodexExecSession, contentBlocksToCodexPrompt, normalizeCodexSandbox, no
 import { CodexAppServerSession, codexInput } from './lib/codex-app-session.js';
 import { wireCodexAppSession } from './lib/codex-app-wiring.js';
 import { stripJournalCreds } from './lib/journal-cred-scope.js';
+import { createJournalReadProxy } from './lib/journal-read-proxy.js';
 import { codexMcpConfig } from './lib/codex-mcp.js';
 import { handleCodexControl, isCodexAuthError, offerCodexBuild, listCodexThreads, mergeCodexThreads } from './lib/codex-controls.js';
 import { createCodexAccountReader, codexSessionOptions } from './lib/codex-account.js';
@@ -530,6 +531,45 @@ const itemsClient = createItemsClient({
 const missionsClient = createMissionsClient({
   baseUrl: journalHttpBase,
   token: _journalToken,
+});
+
+// Journal READ proxy (loop #765): the loopback API forwards the journal search
+// routes (/journal/search, /journal/convo/:id/messages) to the journal under the
+// BRIDGE's own token, so spawned sessions never hold the raw full-read
+// JOURNAL_TOKEN (it is stripped from their spawn env below). Same base URL +
+// token as the items/missions clients.
+//
+// A per-boot capability token gates the proxy: it is injected into the (stripped)
+// child env as MATRON_JOURNAL_PROXY_TOKEN and required on every proxy request, so
+// a DIFFERENT local user hitting the loopback port cannot search the journal with
+// no credential (the child env is readable only by the bridge's own uid). This is
+// a low-privilege capability (proxied /search + /convo read only — never
+// /snapshot, /roster, /items or writes), far narrower than the raw JOURNAL_TOKEN.
+const JOURNAL_PROXY_CAP_TOKEN = randomBytes(32).toString('hex');
+const JOURNAL_PROXY_CAP_HEADER = 'x-matron-journal-proxy-token';
+// The capability is delivered to children as a 0600 header FILE, never in an env
+// value or argv (loop #765): a child that put the token on curl's command line
+// would leak it to other local users via the world-readable /proc/<pid>/cmdline.
+// The bridge writes `<Header>: <token>` to a 0600 file (owner = bridge uid) and
+// injects only its PATH; children pass `curl -H @"$MATRON_JOURNAL_PROXY_HEADER_FILE"`,
+// so the token value touches neither their environment nor any process argv, and
+// another uid can read neither the file (0600) nor the request headers.
+let JOURNAL_PROXY_HEADER_FILE = '';
+if (journalHttpBase && _journalToken) {
+  try {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-journal-proxy-'));
+    JOURNAL_PROXY_HEADER_FILE = path.join(dir, 'header');
+    fs.writeFileSync(JOURNAL_PROXY_HEADER_FILE, `X-Matron-Journal-Proxy-Token: ${JOURNAL_PROXY_CAP_TOKEN}\n`, { mode: 0o600 });
+    fs.chmodSync(JOURNAL_PROXY_HEADER_FILE, 0o600);
+  } catch (e) {
+    JOURNAL_PROXY_HEADER_FILE = '';
+    console.warn(`[journal] could not write proxy header file; journal search will be unavailable to sessions: ${e.message}`);
+  }
+}
+const journalReadProxy = createJournalReadProxy({
+  baseUrl: journalHttpBase,
+  token: _journalToken,
+  capabilityToken: JOURNAL_PROXY_CAP_TOKEN,
 });
 
 // NOTE (easelyte fork): upstream's summary-model-nag is intentionally dropped
@@ -2153,7 +2193,12 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     : `${nodeBinDir}:${existingPath}`;
 
   const spawnEnv = {
-    ...process.env,
+    // Strip the full-journal read credential (loop #765): sessions now reach the
+    // journal search routes through the bridge-local read proxy (see
+    // journalReadProxy / BRIDGE_CLAUDE.md "Searching the journal"), so no child —
+    // session or its subagents — needs the raw JOURNAL_TOKEN that can pull every
+    // transcript. JOURNAL_WS_URL etc. (non-credentials) are kept.
+    ...stripJournalCreds(process.env),
     PATH: pathWithNode,
     CLAUDECODE: '',
     CLAUDE_CODE_MAX_OUTPUT_TOKENS: '128000',
@@ -2164,6 +2209,9 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     ...bashTimeoutEnv(),
     BRIDGE_ROOM_ID: roomId,
     MATRON_BRIDGE_API_PORT: String(API_PORT),
+    // Path to the 0600 header file carrying the journal read-proxy capability
+    // (loop #765). The token value is never placed in the child env or argv.
+    MATRON_JOURNAL_PROXY_HEADER_FILE: JOURNAL_PROXY_HEADER_FILE,
     // Env is fixed at spawn time; toggling the flag later requires
     // !restart to take effect.
     MATRON_PERMISSION_CARDS: process.env.MATRON_PERMISSION_CARDS || '',
@@ -2527,6 +2575,14 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
     sandbox: CODEX_SANDBOX_MODE,
     networkAccess: CODEX_NETWORK_ACCESS,
     developerInstructions: CODEX_BRIDGE_PROMPT + (CODEX_APP_SERVER ? '' : '\nLegacy exec transport: native approvals, native questions, and Matron MCP tools are unavailable. If blocked, explain it in your final response.'),
+    // NOTE (loop #765): the JOURNAL_TOKEN is deliberately NOT stripped from Codex
+    // sessions yet. BRIDGE_CODEX.md documents a token-based journal `/items` HTTP
+    // fallback for legacy-exec Codex sessions (which have no Matron MCP tools), so
+    // stripping the token here would break tracker writes for them. Closing this
+    // needs the loopback proxy to also cover the write-side `/items` routes (the
+    // open design question in loop #765) — tracked as a follow-up. Claude session
+    // + interactive spawns ARE stripped (they reach journal search via the proxy
+    // and have no token-based HTTP fallback).
     env: { ...process.env, BRIDGE_ROOM_ID: roomId, MATRON_BRIDGE_API_PORT: String(API_PORT) },
     config: CODEX_APP_SERVER ? codexMcpConfig({ baseConfig: RAW_MCP_CONFIG, extras,
       bridgeDir: __dirname, roomId, apiPort: API_PORT, showFileToken }) : {},
@@ -3014,7 +3070,10 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
   const pathWithNode = existingPath.split(':').includes(nodeBinDir) ? existingPath : `${nodeBinDir}:${existingPath}`;
 
   const interactiveEnv = {
-    ...process.env,
+    // Strip the full-journal read credential (loop #765): the interactive session
+    // reaches journal search through the bridge-local read proxy, so it no longer
+    // needs the raw JOURNAL_TOKEN.
+    ...stripJournalCreds(process.env),
     PATH: pathWithNode,
     CLAUDECODE: '',
     CLAUDE_CODE_MAX_OUTPUT_TOKENS: '128000',
@@ -3025,6 +3084,9 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     ...bashTimeoutEnv(),
     BRIDGE_ROOM_ID: roomId,
     MATRON_BRIDGE_API_PORT: String(API_PORT),
+    // Path to the 0600 header file carrying the journal read-proxy capability
+    // (loop #765). The token value is never placed in the child env or argv.
+    MATRON_JOURNAL_PROXY_HEADER_FILE: JOURNAL_PROXY_HEADER_FILE,
     // Same up-front MCP tool loading as spawnEnv above.
     ENABLE_TOOL_SEARCH: process.env.ENABLE_TOOL_SEARCH ?? 'false',
     MATRON_BASH_TEE_ENABLED: showBashOutputAtSpawn ? '1' : '0',
@@ -10842,6 +10904,24 @@ async function respondAgentChatRoute(res, data, handler, describe) {
 
 const apiServer = createServer(async (req, res) => {
   const url = new URL(req.url, `http://localhost:${API_PORT}`);
+
+  // Journal READ proxy (loop #765): forward the allowlisted journal search
+  // routes to the journal under the bridge's own token so children need no
+  // JOURNAL_TOKEN. Handled first, and only for paths the proxy owns; any other
+  // path returns null and falls through to the normal dispatch below.
+  {
+    const proxied = await journalReadProxy.handle({
+      method: req.method,
+      pathname: url.pathname,
+      search: url.search,
+      callerToken: req.headers[JOURNAL_PROXY_CAP_HEADER],
+    });
+    if (proxied) {
+      res.writeHead(proxied.status, { 'Content-Type': proxied.contentType });
+      res.end(proxied.body);
+      return;
+    }
+  }
 
   // GET /secret/:id — legacy poll route. Nothing in the current ask-user.js
   // uses it (request_secret is non-blocking since item #120); it stays so a
