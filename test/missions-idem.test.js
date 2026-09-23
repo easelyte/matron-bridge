@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { missionIdemKey } from '../lib/missions-idem.js';
+import { missionIdemKey, itemIdemKey } from '../lib/missions-idem.js';
 
 const base = { op: 'post', roomId: '!r:s', kind: 'progress', title: 'Landed PR', body: 'the diff', now: 1789056600000 };
 
@@ -43,5 +43,54 @@ describe('missionIdemKey', () => {
     const after = Date.now();
     const candidates = new Set([before, after].map((now) => missionIdemKey({ op: 'start', roomId: '!r:s', title: 'M', now })));
     expect(candidates.has(key)).toBe(true);
+  });
+});
+
+describe('itemIdemKey (loop #763)', () => {
+  const NOW = 1789056600000;
+  const create = { op: 'item_create', roomId: '!r:s', now: NOW, args: { kind: 'task', title: 'Ship it', body: 'do the thing' } };
+  const comment = { op: 'item_comment', roomId: '!r:s', now: NOW, args: { id: 'it_7', body: 'progress note' } };
+
+  it('is a sha256 hex digest, stable across a retry in the same bucket', () => {
+    expect(itemIdemKey(create)).toMatch(/^[0-9a-f]{64}$/);
+    expect(itemIdemKey(create)).toBe(itemIdemKey({ ...create, now: NOW + 599_999 }));
+    expect(itemIdemKey(comment)).toBe(itemIdemKey({ ...comment }));
+  });
+
+  it('differs across a bucket boundary', () => {
+    expect(itemIdemKey(create)).not.toBe(itemIdemKey({ ...create, now: NOW + 600_000 }));
+  });
+
+  it('a comment key includes the item id — same body on DIFFERENT items must not collide', () => {
+    expect(itemIdemKey(comment)).not.toBe(itemIdemKey({ ...comment, args: { ...comment.args, id: 'it_8' } }));
+  });
+
+  it('differs for a different op, room, kind, title or body', () => {
+    const key = itemIdemKey(create);
+    expect(itemIdemKey({ ...create, op: 'item_comment' })).not.toBe(key);
+    expect(itemIdemKey({ ...create, roomId: '!other:s' })).not.toBe(key);
+    expect(itemIdemKey({ ...create, args: { ...create.args, kind: 'decision' } })).not.toBe(key);
+    expect(itemIdemKey({ ...create, args: { ...create.args, title: 'Ship it 2' } })).not.toBe(key);
+    expect(itemIdemKey({ ...create, args: { ...create.args, body: 'a different body' } })).not.toBe(key);
+  });
+
+  it('differs when ONLY a non-content field differs — distinct mutations must not share a key (Codex F2)', () => {
+    const key = itemIdemKey(create);
+    expect(itemIdemKey({ ...create, args: { ...create.args, attachments: ['a.png'] } })).not.toBe(key);
+    expect(itemIdemKey({ ...create, args: { ...create.args, labels: ['ui'] } })).not.toBe(key);
+    expect(itemIdemKey({ ...create, args: { ...create.args, links: [{ url: 'https://x' }] } })).not.toBe(key);
+    expect(itemIdemKey({ ...create, args: { ...create.args, awaiting: 'user' } })).not.toBe(key);
+    expect(itemIdemKey({ ...create, args: { ...create.args, position: 'top' } })).not.toBe(key);
+    expect(itemIdemKey({ ...create, args: { ...create.args, supersedes: 'it_9' } })).not.toBe(key);
+    // Two creates differing ONLY in attachments must differ.
+    expect(itemIdemKey({ ...create, args: { ...create.args, attachments: ['a.png'] } }))
+      .not.toBe(itemIdemKey({ ...create, args: { ...create.args, attachments: ['b.png'] } }));
+  });
+
+  it('is length-safe — a delimiter in one field cannot masquerade as a field boundary', () => {
+    // The classic unescaped-join collision: ["a|b","c"] vs ["a","b|c"].
+    const k1 = itemIdemKey({ op: 'item_create', roomId: '!r:s', now: NOW, args: { title: 'a|b', body: 'c' } });
+    const k2 = itemIdemKey({ op: 'item_create', roomId: '!r:s', now: NOW, args: { title: 'a', body: 'b|c' } });
+    expect(k1).not.toBe(k2);
   });
 });

@@ -41,6 +41,51 @@ describe('items handlers', () => {
     expect(client.create).not.toHaveBeenCalled();
   });
 
+  // Loop #763: supersedes existence is a journal DB lookup, so a bad id 400s the
+  // create AFTER uploadAll — orphaning the blob. With attachments present the
+  // bridge pre-checks the target exists BEFORE uploading.
+  it('create: bad supersedes with attachments fails BEFORE uploading (no orphan)', async () => {
+    const { h, client, uploadLocalFile } = fixture({ get: vi.fn(async () => ({ status: 404, data: { error: 'not found' } })) });
+    const r = await h.create({ roomId: '!r:s', kind: 'decision', title: 'D', attachments: ['shot.png'], supersedes: 'it_999' });
+    expect(r.status).toBe(400);
+    expect(client.get).toHaveBeenCalledWith('it_999');
+    expect(client.create).not.toHaveBeenCalled();
+    // No actual upload happened — nothing to orphan.
+    expect(uploadLocalFile.mock.calls.every(([, , opts]) => opts?.validateOnly)).toBe(true);
+  });
+
+  it('create: supersedes pre-check is skipped when there are no attachments (nothing to orphan)', async () => {
+    const { h, client } = fixture();
+    await h.create({ roomId: '!r:s', kind: 'decision', title: 'D', supersedes: 'it_2' });
+    expect(client.get).not.toHaveBeenCalled();
+    expect(client.create).toHaveBeenCalled();
+    expect(client.create.mock.calls[0][0]).toMatchObject({ supersedes: 'it_2' });
+  });
+
+  // Loop #763 multi-attachment atomicity: all paths are validated (local gates
+  // only) before ANY blob is uploaded, so a bad path among several cannot orphan
+  // the earlier, already-uploaded ones.
+  it('create: validates all attachment paths before uploading any blob', async () => {
+    const uploads = [];
+    const uploadLocalFile = vi.fn(async (_s, p, opts) => {
+      if (!opts?.validateOnly) uploads.push(p);
+      if (p.endsWith('.png')) {
+        return { ok: true, media: { blob_ref: 'b-' + p, mime: 'image/png', name: p, size: 3, isImage: true } };
+      }
+      return { ok: false, status: 404, body: { error: `file not found: ${p}` } };
+    });
+    const client = { create: vi.fn(async () => ({ status: 201, data: { item: { id: 'it_1', num: 1 } } })) };
+    const sessions = new Map([['!r:s', { roomId: '!r:s', workdir: '/w', journalConvoId: 'c1' }]]);
+    const h = createItemsHandlers({ sessions, journalConvoIdFor: () => 'c1', client, uploadLocalFile });
+
+    const r = await h.create({ roomId: '!r:s', kind: 'task', title: 'T', attachments: ['ok.png', 'bad.txt'] });
+    expect(r.status).toBe(404);
+    // The valid first file was NEVER actually uploaded — the invalid second path
+    // was caught in the validation pass first.
+    expect(uploads).toEqual([]);
+    expect(client.create).not.toHaveBeenCalled();
+  });
+
   it('create: validates kind and title', async () => {
     const { h } = fixture();
     expect((await h.create({ roomId: '!r:s', kind: 'bug', title: 'T' })).status).toBe(400);

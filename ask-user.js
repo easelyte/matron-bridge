@@ -9,7 +9,7 @@ import { resolvePermissionTimeoutMs } from './lib/permission-prompt.js';
 import { formatBox } from './lib/agent-boxes-format.js';
 import { itemLine, formatItemList, formatItemDetail, formatCommentAck } from './lib/items-format.js';
 import { formatStartAck, formatMilestoneAck, formatMissionDetail, missionLine, formatBlocked, formatJournalError } from './lib/missions-format.js';
-import { missionIdemKey } from './lib/missions-idem.js';
+import { missionIdemKey, itemIdemKey } from './lib/missions-idem.js';
 import { formatReminderLine } from './lib/reminder-tools.js';
 
 // Route to whichever bridge spawned us: explicit BRIDGE_API_URL wins, else the
@@ -708,11 +708,22 @@ server.tool(
 // is testable without a journal). Never isError: a tool result that reads as
 // a sentence keeps the model working instead of retrying blindly.
 async function callItems(name, args, render) {
+  const payload = { roomId: ROOM_ID, ...args };
+  // The two minting/appending item ops carry an idempotency key the model never
+  // sees or supplies (loop #763 F2): a harness-retried item_create/item_comment
+  // would otherwise duplicate the item/comment AND re-upload its attachment blob
+  // (permanently orphaning the first upload — retention.js never reaps it). The
+  // key is derived from the call (op, room, content, +id for comments) inside a
+  // ten-minute bucket, so a retry replays the existing row instead. See
+  // lib/missions-idem.js.
+  if (name === 'create' || name === 'comment') {
+    payload.idem_key = itemIdemKey({ op: `item_${name}`, roomId: ROOM_ID, args: args || {} });
+  }
   try {
     const res = await fetch(`${BRIDGE_API}/items/${name}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ roomId: ROOM_ID, ...args }),
+      body: JSON.stringify(payload),
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) return { content: [{ type: 'text', text: `item_${name} failed: ${data.error || `HTTP ${res.status}`}` }] };
