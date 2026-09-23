@@ -130,6 +130,18 @@ describe('bridge-controlled journal-free child spawns are scoped in index.js', (
     expect(indexSrc.slice(ivStart, ivStart + 800)).toMatch(/\.\.\.stripJournalCreds\(process\.env\)/);
   });
 
+  // Loop #765: the journal read-proxy capability reaches Claude children as a
+  // 0600 header FILE path, never as a token value in the env or on argv (a token
+  // on curl's command line leaks via world-readable /proc/<pid>/cmdline).
+  it('injects the proxy capability as a header-file PATH, not a token value', () => {
+    // The child env carries the file path...
+    expect(indexSrc).toContain('MATRON_JOURNAL_PROXY_HEADER_FILE: JOURNAL_PROXY_HEADER_FILE');
+    // ...never the raw token value.
+    expect(indexSrc).not.toContain('MATRON_JOURNAL_PROXY_TOKEN: JOURNAL_PROXY_CAP_TOKEN');
+    // The header file is written 0600.
+    expect(indexSrc).toMatch(/writeFileSync\(JOURNAL_PROXY_HEADER_FILE[\s\S]*?mode: 0o600/);
+  });
+
   // Deliberate NON-change (loop #765): Codex session spawns keep the token
   // because BRIDGE_CODEX.md documents a token-based /items HTTP fallback for
   // legacy-exec sessions; stripping needs the write-side /items proxy first.

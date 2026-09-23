@@ -547,6 +547,25 @@ const missionsClient = createMissionsClient({
 // /snapshot, /roster, /items or writes), far narrower than the raw JOURNAL_TOKEN.
 const JOURNAL_PROXY_CAP_TOKEN = randomBytes(32).toString('hex');
 const JOURNAL_PROXY_CAP_HEADER = 'x-matron-journal-proxy-token';
+// The capability is delivered to children as a 0600 header FILE, never in an env
+// value or argv (loop #765): a child that put the token on curl's command line
+// would leak it to other local users via the world-readable /proc/<pid>/cmdline.
+// The bridge writes `<Header>: <token>` to a 0600 file (owner = bridge uid) and
+// injects only its PATH; children pass `curl -H @"$MATRON_JOURNAL_PROXY_HEADER_FILE"`,
+// so the token value touches neither their environment nor any process argv, and
+// another uid can read neither the file (0600) nor the request headers.
+let JOURNAL_PROXY_HEADER_FILE = '';
+if (journalHttpBase && _journalToken) {
+  try {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-journal-proxy-'));
+    JOURNAL_PROXY_HEADER_FILE = path.join(dir, 'header');
+    fs.writeFileSync(JOURNAL_PROXY_HEADER_FILE, `X-Matron-Journal-Proxy-Token: ${JOURNAL_PROXY_CAP_TOKEN}\n`, { mode: 0o600 });
+    fs.chmodSync(JOURNAL_PROXY_HEADER_FILE, 0o600);
+  } catch (e) {
+    JOURNAL_PROXY_HEADER_FILE = '';
+    console.warn(`[journal] could not write proxy header file; journal search will be unavailable to sessions: ${e.message}`);
+  }
+}
 const journalReadProxy = createJournalReadProxy({
   baseUrl: journalHttpBase,
   token: _journalToken,
@@ -2190,8 +2209,9 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     ...bashTimeoutEnv(),
     BRIDGE_ROOM_ID: roomId,
     MATRON_BRIDGE_API_PORT: String(API_PORT),
-    // Low-privilege capability for the bridge-local journal read proxy (loop #765).
-    MATRON_JOURNAL_PROXY_TOKEN: JOURNAL_PROXY_CAP_TOKEN,
+    // Path to the 0600 header file carrying the journal read-proxy capability
+    // (loop #765). The token value is never placed in the child env or argv.
+    MATRON_JOURNAL_PROXY_HEADER_FILE: JOURNAL_PROXY_HEADER_FILE,
     // Env is fixed at spawn time; toggling the flag later requires
     // !restart to take effect.
     MATRON_PERMISSION_CARDS: process.env.MATRON_PERMISSION_CARDS || '',
@@ -3064,8 +3084,9 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     ...bashTimeoutEnv(),
     BRIDGE_ROOM_ID: roomId,
     MATRON_BRIDGE_API_PORT: String(API_PORT),
-    // Low-privilege capability for the bridge-local journal read proxy (loop #765).
-    MATRON_JOURNAL_PROXY_TOKEN: JOURNAL_PROXY_CAP_TOKEN,
+    // Path to the 0600 header file carrying the journal read-proxy capability
+    // (loop #765). The token value is never placed in the child env or argv.
+    MATRON_JOURNAL_PROXY_HEADER_FILE: JOURNAL_PROXY_HEADER_FILE,
     // Same up-front MCP tool loading as spawnEnv above.
     ENABLE_TOOL_SEARCH: process.env.ENABLE_TOOL_SEARCH ?? 'false',
     MATRON_BASH_TEE_ENABLED: showBashOutputAtSpawn ? '1' : '0',
