@@ -348,32 +348,136 @@ describe('formatAndRoute', () => {
     expect(retained.has(ctx.runId)).toBe(false);
   });
 
-  it('passes an unknown item through as text and increments unparsed', () => {
+  // Loop #772: an unrecognized item.completed type renders a DURABLE compact
+  // card (same family as the bash-command cards), NOT a raw JSON dump. The card
+  // carries only the item id + a humanized label; no other item field survives.
+  it('renders an unrecognized item.completed type as a compact card, not raw JSON', () => {
     const { calls, ctx } = makeContext();
     const unknown = { type: 'item.completed', item: { id: 'x', type: 'future_item', value: 42 } };
 
     formatAndRoute(unknown, ctx);
 
-    expect(ctx.state.unparsed).toBe(1);
-    expect(calls.filter(call => call.method !== 'publishStatus')).toEqual([
+    const nonStatus = calls.filter(call => call.method !== 'publishStatus');
+    expect(nonStatus).toEqual([
       {
-        method: 'publishText',
-        args: [ctx.convoId, { body: JSON.stringify(unknown), from: 'assistant' }],
+        method: 'publishToolOutput',
+        args: [ctx.convoId, {
+          tool_use_id: 'x',
+          command: 'Future item',
+          status: 'completed',
+        }],
       },
     ]);
+    // No raw-JSON leak, and the arbitrary `value` field is never forwarded.
+    expect(calls.some(call => call.method === 'publishText')).toBe(false);
+    expect(nonStatus[0].args[1]).not.toHaveProperty('value');
+    expect(ctx.state.unparsed).toBe(0);
+    expect(ctx.state.durableEvents).toBe(1);
   });
 
-  it('passes an unknown item.started type through as text and increments unparsed', () => {
+  // Loop #772: an unrecognized item.started type shows an ephemeral "tool"
+  // activity indicator (like command_execution/file_change started), NOT raw
+  // JSON. Ephemeral -> no durable-cap consumption, no unparsed increment.
+  it('renders an unrecognized item.started type as a tool activity, not raw JSON', () => {
     const { calls, ctx } = makeContext();
     const unknown = { type: 'item.started', item: { id: 'x', type: 'future_item', value: 42 } };
 
     formatAndRoute(unknown, ctx);
 
+    expect(calls.filter(call => call.method !== 'publishStatus')).toEqual([
+      { method: 'publishActivity', args: [ctx.convoId, 'tool', 'Future item'] },
+    ]);
+    expect(calls.some(call => call.method === 'publishText')).toBe(false);
+    expect(ctx.state.unparsed).toBe(0);
+    expect(ctx.state.durableEvents).toBe(0);
+  });
+
+  // Loop #772 (the reported bug): web_search item.started/completed no longer
+  // leak raw `{"type":"item.started","item":{"type":"web_search",...}}` blobs
+  // between the clean bash-command cards.
+  it('renders web_search item.started as a tool activity, not a raw JSON publishText', () => {
+    const { calls, ctx } = makeContext();
+
+    formatAndRoute(
+      { type: 'item.started', item: { id: 'exec-1', type: 'web_search' } },
+      ctx,
+    );
+
+    expect(calls.filter(call => call.method !== 'publishStatus')).toEqual([
+      { method: 'publishActivity', args: [ctx.convoId, 'tool', 'Web search'] },
+    ]);
+    expect(calls.some(call => call.method === 'publishText')).toBe(false);
+  });
+
+  it('renders web_search item.completed as a formatted card whose body is not the raw event', () => {
+    const { calls, ctx } = makeContext();
+    const event = { type: 'item.completed', item: { id: 'exec-1', type: 'web_search' } };
+
+    formatAndRoute(event, ctx);
+
+    const toolCards = calls.filter(call => call.method === 'publishToolOutput');
+    expect(toolCards).toEqual([
+      {
+        method: 'publishToolOutput',
+        args: [ctx.convoId, {
+          tool_use_id: 'exec-1',
+          command: 'Web search',
+          status: 'completed',
+        }],
+      },
+    ]);
+    // The published card is a formatted payload, NOT a stringified raw event.
+    const textPosts = calls.filter(call => call.method === 'publishText');
+    expect(textPosts).toHaveLength(0);
+    for (const card of toolCards) {
+      expect(JSON.stringify(card.args[1])).not.toBe(JSON.stringify(event));
+      expect(card.args[1].command).not.toContain('{');
+    }
+  });
+
+  // Proves the fallback is GENERIC (a formatter over the item.* family), not a
+  // web_search special case: a different novel item type also renders as a card.
+  it('renders a different novel item type (mcp_tool_call) as a card too', () => {
+    const { calls, ctx } = makeContext();
+
+    formatAndRoute(
+      { type: 'item.started', item: { id: 'mcp-1', type: 'mcp_tool_call' } },
+      ctx,
+    );
+    formatAndRoute(
+      { type: 'item.completed', item: { id: 'mcp-1', type: 'mcp_tool_call' } },
+      ctx,
+    );
+
+    expect(calls.filter(call => call.method === 'publishActivity')).toContainEqual(
+      { method: 'publishActivity', args: [ctx.convoId, 'tool', 'Mcp tool call'] },
+    );
+    expect(calls.filter(call => call.method === 'publishToolOutput')).toEqual([
+      {
+        method: 'publishToolOutput',
+        args: [ctx.convoId, {
+          tool_use_id: 'mcp-1',
+          command: 'Mcp tool call',
+          status: 'completed',
+        }],
+      },
+    ]);
+    expect(calls.some(call => call.method === 'publishText')).toBe(false);
+  });
+
+  // A truly unstructured item (no string type) still falls to raw passthrough —
+  // the fallback keys on a string item.type, so shapeless events are unaffected.
+  it('still passes a typeless item through as raw text', () => {
+    const { calls, ctx } = makeContext();
+    const shapeless = { type: 'item.completed', item: { id: 'x' } };
+
+    formatAndRoute(shapeless, ctx);
+
     expect(ctx.state.unparsed).toBe(1);
     expect(calls.filter(call => call.method !== 'publishStatus')).toEqual([
       {
         method: 'publishText',
-        args: [ctx.convoId, { body: JSON.stringify(unknown), from: 'assistant' }],
+        args: [ctx.convoId, { body: JSON.stringify(shapeless), from: 'assistant' }],
       },
     ]);
   });

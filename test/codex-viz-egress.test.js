@@ -173,16 +173,25 @@ describe('codex-viz top-level error diagnostics (loop #762 follow-up)', () => {
 });
 
 describe('codex-viz unknown/future item type diagnostics', () => {
-  it('renders a newer item type as a safe { type } stub without forwarding its fields', () => {
+  it('renders a newer item type as a humanized card without forwarding its fields', () => {
     const { publisher } = route({
       type: 'item.completed',
       item: { id: 'x', type: 'future_diag', message: 'informative detail', structural: { drop: 'me' } },
     });
+    // Loop #772: a newer item.completed type now lands a compact card (humanized
+    // type label + id) instead of a raw { type, id } JSON stub — but the egress
+    // contract is unchanged. allowlistedEvent still strips the item to
+    // { type, id } BEFORE the card fallback runs, and the fallback forwards ONLY
+    // the type + id, so arbitrary textual/structural fields (and a command item
+    // renamed to stream output in a textual field the command guard never sees)
+    // still cannot egress here.
+    const card = publisher.calls.find(call => call.method === 'publishToolOutput');
+    expect(card).toBeDefined();
+    expect(card.payload.tool_use_id).toBe('x');
+    // The item type is visible as a humanized label, not raw JSON.
+    expect(card.payload.command).toBe('Future diag');
+    expect(publisher.calls.some(call => call.method === 'publishText')).toBe(false);
     const serialized = JSON.stringify(publisher.calls);
-    // The item type is visible, but arbitrary textual/structural fields are NOT
-    // forwarded — a future codex that renames a command item and streams output
-    // in a textual field the command guard never sees cannot egress here.
-    expect(serialized).toContain('future_diag');
     expect(serialized).not.toContain('informative detail');
     expect(serialized).not.toContain('structural');
   });
