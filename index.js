@@ -12,7 +12,7 @@ import { createReminderHandlers } from './lib/reminder-tools.js';
 import { createMissionsClient } from './lib/missions-client.js';
 import { createMissionsHandlers } from './lib/missions-tools.js';
 import { createServer } from 'http';
-import { createHmac, randomUUID } from 'crypto';
+import { createHmac, randomUUID, randomBytes } from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -534,13 +534,23 @@ const missionsClient = createMissionsClient({
 });
 
 // Journal READ proxy (loop #765): the loopback API forwards the journal search
-// routes (/journal/search, /journal/convo/:id/messages, /journal/help) to the
-// journal under the BRIDGE's own token, so spawned sessions never hold the raw
-// full-read JOURNAL_TOKEN (it is stripped from their spawn env below). Same base
-// URL + token as the items/missions clients.
+// routes (/journal/search, /journal/convo/:id/messages) to the journal under the
+// BRIDGE's own token, so spawned sessions never hold the raw full-read
+// JOURNAL_TOKEN (it is stripped from their spawn env below). Same base URL +
+// token as the items/missions clients.
+//
+// A per-boot capability token gates the proxy: it is injected into the (stripped)
+// child env as MATRON_JOURNAL_PROXY_TOKEN and required on every proxy request, so
+// a DIFFERENT local user hitting the loopback port cannot search the journal with
+// no credential (the child env is readable only by the bridge's own uid). This is
+// a low-privilege capability (proxied /search + /convo read only — never
+// /snapshot, /roster, /items or writes), far narrower than the raw JOURNAL_TOKEN.
+const JOURNAL_PROXY_CAP_TOKEN = randomBytes(32).toString('hex');
+const JOURNAL_PROXY_CAP_HEADER = 'x-matron-journal-proxy-token';
 const journalReadProxy = createJournalReadProxy({
   baseUrl: journalHttpBase,
   token: _journalToken,
+  capabilityToken: JOURNAL_PROXY_CAP_TOKEN,
 });
 
 // NOTE (easelyte fork): upstream's summary-model-nag is intentionally dropped
@@ -2180,6 +2190,8 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     ...bashTimeoutEnv(),
     BRIDGE_ROOM_ID: roomId,
     MATRON_BRIDGE_API_PORT: String(API_PORT),
+    // Low-privilege capability for the bridge-local journal read proxy (loop #765).
+    MATRON_JOURNAL_PROXY_TOKEN: JOURNAL_PROXY_CAP_TOKEN,
     // Env is fixed at spawn time; toggling the flag later requires
     // !restart to take effect.
     MATRON_PERMISSION_CARDS: process.env.MATRON_PERMISSION_CARDS || '',
@@ -3052,6 +3064,8 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     ...bashTimeoutEnv(),
     BRIDGE_ROOM_ID: roomId,
     MATRON_BRIDGE_API_PORT: String(API_PORT),
+    // Low-privilege capability for the bridge-local journal read proxy (loop #765).
+    MATRON_JOURNAL_PROXY_TOKEN: JOURNAL_PROXY_CAP_TOKEN,
     // Same up-front MCP tool loading as spawnEnv above.
     ENABLE_TOOL_SEARCH: process.env.ENABLE_TOOL_SEARCH ?? 'false',
     MATRON_BASH_TEE_ENABLED: showBashOutputAtSpawn ? '1' : '0',
@@ -10879,6 +10893,7 @@ const apiServer = createServer(async (req, res) => {
       method: req.method,
       pathname: url.pathname,
       search: url.search,
+      callerToken: req.headers[JOURNAL_PROXY_CAP_HEADER],
     });
     if (proxied) {
       res.writeHead(proxied.status, { 'Content-Type': proxied.contentType });
