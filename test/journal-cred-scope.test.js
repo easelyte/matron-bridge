@@ -120,7 +120,17 @@ describe('bridge-controlled journal-free child spawns are scoped in index.js', (
 
   // The Claude session / interactive / Codex spawn envs are built by
   // lib/spawn-env.js and tested behaviorally in test/spawn-env.test.js (loop
-  // #784); only the index.js-side wiring that has no builder stays here.
+  // #784). index.js has no exports, so what stays here is the wiring (P71):
+  // each agent spawn goes through its builder with the security-relevant args.
+  it('builds every agent-session env through lib/spawn-env.js', () => {
+    const calls = indexSrc.match(/buildClaudeSpawnEnv\(\{[\s\S]*?\}\);/g) || [];
+    expect(calls.map(c => c.match(/mode: '(\w+)'/)?.[1]).sort()).toEqual(['iv', 'print']);
+    for (const call of calls) {
+      expect(call).toContain('journalProxyHeaderFile: JOURNAL_PROXY_HEADER_FILE,');
+      expect(call).toContain('showFileToken,');
+    }
+    expect(indexSrc).toMatch(/env: buildCodexSpawnEnv\(\{ roomId, apiPort: API_PORT \}\),/);
+  });
 
   // Loop #765: the journal read-proxy capability reaches Claude children as a
   // 0600 header FILE path, never as a token value in the env or on argv (a token

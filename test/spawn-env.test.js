@@ -112,11 +112,8 @@ describe('buildClaudeSpawnEnv', () => {
     expect(off.MATRON_PERMISSION_CARDS).toBe('');
   });
 
-  it('iv: sets neither permission-card key', () => {
-    const base = { ...BRIDGE_ENV };
-    delete base.MATRON_PERMISSION_CARDS;
-    delete base.MATRON_PERMISSION_TOKEN;
-    const env = claude('iv', { baseEnv: base });
+  it('iv: carries neither permission-card key, even when the bridge env has them', () => {
+    const env = claude('iv');
     expect('MATRON_PERMISSION_CARDS' in env).toBe(false);
     expect('MATRON_PERMISSION_TOKEN' in env).toBe(false);
   });
