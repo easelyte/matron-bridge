@@ -348,10 +348,11 @@ describe('formatAndRoute', () => {
     expect(retained.has(ctx.runId)).toBe(false);
   });
 
-  // Loop #772: an unrecognized item.completed type renders a DURABLE compact
-  // card (same family as the bash-command cards), NOT a raw JSON dump. The card
-  // carries only the item id + a humanized label; no other item field survives.
-  it('renders an unrecognized item.completed type as a compact card, not raw JSON', () => {
+  // Loop #772: an unrecognized item.completed type renders a DURABLE compact,
+  // formatted line, NOT a raw JSON dump. The line carries only a humanized
+  // label; no other item field (and not even the id) survives. It is a neutral
+  // text line, NOT a "done" tool card — see the mcp-failure rationale (Codex F1).
+  it('renders an unrecognized item.completed type as a compact formatted line, not raw JSON', () => {
     const { calls, ctx } = makeContext();
     const unknown = { type: 'item.completed', item: { id: 'x', type: 'future_item', value: 42 } };
 
@@ -360,17 +361,17 @@ describe('formatAndRoute', () => {
     const nonStatus = calls.filter(call => call.method !== 'publishStatus');
     expect(nonStatus).toEqual([
       {
-        method: 'publishToolOutput',
-        args: [ctx.convoId, {
-          tool_use_id: 'x',
-          command: 'Future item',
-          status: 'completed',
-        }],
+        method: 'publishText',
+        args: [ctx.convoId, { body: '`Future item`', from: 'assistant' }],
       },
     ]);
-    // No raw-JSON leak, and the arbitrary `value` field is never forwarded.
-    expect(calls.some(call => call.method === 'publishText')).toBe(false);
-    expect(nonStatus[0].args[1]).not.toHaveProperty('value');
+    // No raw-JSON leak, and no other item field is forwarded.
+    const serialized = JSON.stringify(nonStatus);
+    expect(serialized).not.toBe(JSON.stringify(unknown));
+    expect(serialized).not.toContain('42');
+    expect(nonStatus[0].args[1].body).not.toBe(JSON.stringify(unknown));
+    // No "done" tool card is emitted (would misreport a failed tool as success).
+    expect(calls.some(call => call.method === 'publishToolOutput')).toBe(false);
     expect(ctx.state.unparsed).toBe(0);
     expect(ctx.state.durableEvents).toBe(1);
   });
@@ -409,35 +410,28 @@ describe('formatAndRoute', () => {
     expect(calls.some(call => call.method === 'publishText')).toBe(false);
   });
 
-  it('renders web_search item.completed as a formatted card whose body is not the raw event', () => {
+  it('renders web_search item.completed as a formatted line whose body is not the raw event', () => {
     const { calls, ctx } = makeContext();
     const event = { type: 'item.completed', item: { id: 'exec-1', type: 'web_search' } };
 
     formatAndRoute(event, ctx);
 
-    const toolCards = calls.filter(call => call.method === 'publishToolOutput');
-    expect(toolCards).toEqual([
+    const textPosts = calls.filter(call => call.method === 'publishText');
+    expect(textPosts).toEqual([
       {
-        method: 'publishToolOutput',
-        args: [ctx.convoId, {
-          tool_use_id: 'exec-1',
-          command: 'Web search',
-          status: 'completed',
-        }],
+        method: 'publishText',
+        args: [ctx.convoId, { body: '`Web search`', from: 'assistant' }],
       },
     ]);
-    // The published card is a formatted payload, NOT a stringified raw event.
-    const textPosts = calls.filter(call => call.method === 'publishText');
-    expect(textPosts).toHaveLength(0);
-    for (const card of toolCards) {
-      expect(JSON.stringify(card.args[1])).not.toBe(JSON.stringify(event));
-      expect(card.args[1].command).not.toContain('{');
-    }
+    // The published line is a formatted label, NOT a stringified raw event, and
+    // not a "done" tool card.
+    expect(textPosts[0].args[1].body).not.toBe(JSON.stringify(event));
+    expect(calls.some(call => call.method === 'publishToolOutput')).toBe(false);
   });
 
   // Proves the fallback is GENERIC (a formatter over the item.* family), not a
-  // web_search special case: a different novel item type also renders as a card.
-  it('renders a different novel item type (mcp_tool_call) as a card too', () => {
+  // web_search special case: a different novel item type renders the same way.
+  it('renders a different novel item type (mcp_tool_call) generically too', () => {
     const { calls, ctx } = makeContext();
 
     formatAndRoute(
@@ -452,17 +446,15 @@ describe('formatAndRoute', () => {
     expect(calls.filter(call => call.method === 'publishActivity')).toContainEqual(
       { method: 'publishActivity', args: [ctx.convoId, 'tool', 'Mcp tool call'] },
     );
-    expect(calls.filter(call => call.method === 'publishToolOutput')).toEqual([
+    expect(calls.filter(call => call.method === 'publishText')).toEqual([
       {
-        method: 'publishToolOutput',
-        args: [ctx.convoId, {
-          tool_use_id: 'mcp-1',
-          command: 'Mcp tool call',
-          status: 'completed',
-        }],
+        method: 'publishText',
+        args: [ctx.convoId, { body: '`Mcp tool call`', from: 'assistant' }],
       },
     ]);
-    expect(calls.some(call => call.method === 'publishText')).toBe(false);
+    // Never a "done" card: a status-bearing item's real status was stripped
+    // upstream, so the bridge must not assert success (Codex F1).
+    expect(calls.some(call => call.method === 'publishToolOutput')).toBe(false);
   });
 
   // A truly unstructured item (no string type) still falls to raw passthrough —

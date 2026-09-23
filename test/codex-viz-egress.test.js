@@ -173,24 +173,23 @@ describe('codex-viz top-level error diagnostics (loop #762 follow-up)', () => {
 });
 
 describe('codex-viz unknown/future item type diagnostics', () => {
-  it('renders a newer item type as a humanized card without forwarding its fields', () => {
+  it('renders a newer item type as a humanized line without forwarding its fields', () => {
     const { publisher } = route({
       type: 'item.completed',
       item: { id: 'x', type: 'future_diag', message: 'informative detail', structural: { drop: 'me' } },
     });
-    // Loop #772: a newer item.completed type now lands a compact card (humanized
-    // type label + id) instead of a raw { type, id } JSON stub — but the egress
-    // contract is unchanged. allowlistedEvent still strips the item to
-    // { type, id } BEFORE the card fallback runs, and the fallback forwards ONLY
-    // the type + id, so arbitrary textual/structural fields (and a command item
+    // Loop #772: a newer item.completed type now lands a compact formatted line
+    // (humanized type label) instead of a raw { type, id } JSON stub — but the
+    // egress contract is unchanged. allowlistedEvent still strips the item to
+    // { type, id } BEFORE the fallback runs, and the fallback forwards ONLY the
+    // humanized type, so arbitrary textual/structural fields (and a command item
     // renamed to stream output in a textual field the command guard never sees)
     // still cannot egress here.
-    const card = publisher.calls.find(call => call.method === 'publishToolOutput');
-    expect(card).toBeDefined();
-    expect(card.payload.tool_use_id).toBe('x');
+    const line = publisher.calls.find(call => call.method === 'publishText');
+    expect(line).toBeDefined();
     // The item type is visible as a humanized label, not raw JSON.
-    expect(card.payload.command).toBe('Future diag');
-    expect(publisher.calls.some(call => call.method === 'publishText')).toBe(false);
+    expect(line.payload.body).toBe('`Future diag`');
+    expect(line.payload.body).not.toContain('future_diag');
     const serialized = JSON.stringify(publisher.calls);
     expect(serialized).not.toContain('informative detail');
     expect(serialized).not.toContain('structural');
