@@ -184,6 +184,7 @@ import { CodexExecSession, contentBlocksToCodexPrompt, normalizeCodexSandbox, no
 import { CodexAppServerSession, codexInput } from './lib/codex-app-session.js';
 import { wireCodexAppSession } from './lib/codex-app-wiring.js';
 import { stripJournalCreds } from './lib/journal-cred-scope.js';
+import { createJournalReadProxy } from './lib/journal-read-proxy.js';
 import { codexMcpConfig } from './lib/codex-mcp.js';
 import { handleCodexControl, isCodexAuthError, offerCodexBuild, listCodexThreads, mergeCodexThreads } from './lib/codex-controls.js';
 import { createCodexAccountReader, codexSessionOptions } from './lib/codex-account.js';
@@ -528,6 +529,16 @@ const itemsClient = createItemsClient({
 // Missions & milestones (spec 2026-09-10): same base URL and token as the
 // items client; a missing journal resolves status 0 → 502 in the handlers.
 const missionsClient = createMissionsClient({
+  baseUrl: journalHttpBase,
+  token: _journalToken,
+});
+
+// Journal READ proxy (loop #765): the loopback API forwards the journal search
+// routes (/journal/search, /journal/convo/:id/messages, /journal/help) to the
+// journal under the BRIDGE's own token, so spawned sessions never hold the raw
+// full-read JOURNAL_TOKEN (it is stripped from their spawn env below). Same base
+// URL + token as the items/missions clients.
+const journalReadProxy = createJournalReadProxy({
   baseUrl: journalHttpBase,
   token: _journalToken,
 });
@@ -2153,7 +2164,12 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     : `${nodeBinDir}:${existingPath}`;
 
   const spawnEnv = {
-    ...process.env,
+    // Strip the full-journal read credential (loop #765): sessions now reach the
+    // journal search routes through the bridge-local read proxy (see
+    // journalReadProxy / BRIDGE_CLAUDE.md "Searching the journal"), so no child —
+    // session or its subagents — needs the raw JOURNAL_TOKEN that can pull every
+    // transcript. JOURNAL_WS_URL etc. (non-credentials) are kept.
+    ...stripJournalCreds(process.env),
     PATH: pathWithNode,
     CLAUDECODE: '',
     CLAUDE_CODE_MAX_OUTPUT_TOKENS: '128000',
@@ -2527,6 +2543,14 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
     sandbox: CODEX_SANDBOX_MODE,
     networkAccess: CODEX_NETWORK_ACCESS,
     developerInstructions: CODEX_BRIDGE_PROMPT + (CODEX_APP_SERVER ? '' : '\nLegacy exec transport: native approvals, native questions, and Matron MCP tools are unavailable. If blocked, explain it in your final response.'),
+    // NOTE (loop #765): the JOURNAL_TOKEN is deliberately NOT stripped from Codex
+    // sessions yet. BRIDGE_CODEX.md documents a token-based journal `/items` HTTP
+    // fallback for legacy-exec Codex sessions (which have no Matron MCP tools), so
+    // stripping the token here would break tracker writes for them. Closing this
+    // needs the loopback proxy to also cover the write-side `/items` routes (the
+    // open design question in loop #765) — tracked as a follow-up. Claude session
+    // + interactive spawns ARE stripped (they reach journal search via the proxy
+    // and have no token-based HTTP fallback).
     env: { ...process.env, BRIDGE_ROOM_ID: roomId, MATRON_BRIDGE_API_PORT: String(API_PORT) },
     config: CODEX_APP_SERVER ? codexMcpConfig({ baseConfig: RAW_MCP_CONFIG, extras,
       bridgeDir: __dirname, roomId, apiPort: API_PORT, showFileToken }) : {},
@@ -3014,7 +3038,10 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
   const pathWithNode = existingPath.split(':').includes(nodeBinDir) ? existingPath : `${nodeBinDir}:${existingPath}`;
 
   const interactiveEnv = {
-    ...process.env,
+    // Strip the full-journal read credential (loop #765): the interactive session
+    // reaches journal search through the bridge-local read proxy, so it no longer
+    // needs the raw JOURNAL_TOKEN.
+    ...stripJournalCreds(process.env),
     PATH: pathWithNode,
     CLAUDECODE: '',
     CLAUDE_CODE_MAX_OUTPUT_TOKENS: '128000',
@@ -10842,6 +10869,23 @@ async function respondAgentChatRoute(res, data, handler, describe) {
 
 const apiServer = createServer(async (req, res) => {
   const url = new URL(req.url, `http://localhost:${API_PORT}`);
+
+  // Journal READ proxy (loop #765): forward the allowlisted journal search
+  // routes to the journal under the bridge's own token so children need no
+  // JOURNAL_TOKEN. Handled first, and only for paths the proxy owns; any other
+  // path returns null and falls through to the normal dispatch below.
+  {
+    const proxied = await journalReadProxy.handle({
+      method: req.method,
+      pathname: url.pathname,
+      search: url.search,
+    });
+    if (proxied) {
+      res.writeHead(proxied.status, { 'Content-Type': proxied.contentType });
+      res.end(proxied.body);
+      return;
+    }
+  }
 
   // GET /secret/:id — legacy poll route. Nothing in the current ask-user.js
   // uses it (request_secret is non-blocking since item #120); it stays so a
