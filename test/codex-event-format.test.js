@@ -4,6 +4,7 @@ import { fileURLToPath } from 'node:url';
 import { describe, expect, it, vi } from 'vitest';
 import { formatAndRoute, redactAndRoute } from '../lib/codex-event-format.js';
 import { createJournalPublisher } from '../lib/journal-publisher.js';
+import { createPublishRedactor } from '../lib/redact.js';
 
 const FIXTURE_PATH = fileURLToPath(
   new URL('./fixtures/codex-json/review-run.jsonl', import.meta.url),
@@ -718,6 +719,32 @@ describe('formatAndRoute known protocol events (loop #787)', () => {
     expect(calls.some(isRawJsonBody)).toBe(false);
     expect(calls.filter(call => call.method === 'publishText').map(call => call.args[1].body))
       .toEqual(['⚠️ Codex turn failed: `auth failed for [REDACTED]`']);
+  });
+
+  it('scrubs an assignment behind prose in a NUL-framed turn.failed diagnostic (production redactor)', () => {
+    const { calls, ctx } = makeContext({ redact: createPublishRedactor() });
+
+    redactAndRoute({
+      type: 'turn.failed',
+      error: { message: 'fatal\nALPHA=canary-secret-value\nmore-value\0BRAVO=other-value' },
+    }, ctx);
+
+    const bodies = calls.filter(call => call.method === 'publishText').map(call => call.args[1].body);
+    expect(bodies).toHaveLength(1);
+    expect(bodies[0]).not.toContain('canary-secret-value');
+    expect(bodies[0]).not.toContain('more-value');
+    expect(bodies[0]).not.toContain('other-value');
+    expect(bodies[0]).toContain('fatal');
+  });
+
+  it('scrubs a NUL-framed top-level error diagnostic the same way', () => {
+    const { calls, ctx } = makeContext({ redact: createPublishRedactor() });
+
+    redactAndRoute({ type: 'error', message: 'boom\r\nALPHA=canary-secret-value\0tail' }, ctx);
+
+    const body = calls.find(call => call.method === 'publishText').args[1].body;
+    expect(body).not.toContain('canary-secret-value');
+    expect(body).toContain('boom');
   });
 
   it('routes item.updated (todo_list) to an ephemeral activity, never a durable post', () => {
