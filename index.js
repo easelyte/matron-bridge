@@ -1,6 +1,6 @@
 import dotenv from 'dotenv';
 dotenv.config({ override: true });
-import { spawn } from 'child_process';
+import { spawn, execFileSync } from 'child_process';
 import { transcribeAudio, transcribeAudioSegments } from './lib/transcribe.js';
 import { extractVideoFrames, videoFramesMessage } from './lib/video-frames.js';
 import { prepareInlineImage, appendInlineImageBlocks } from './lib/inline-image.js';
@@ -124,13 +124,15 @@ import { shouldAnnounceOnline, recordOnlineAnnounced } from './lib/announce-once
 import { createInflightMarker } from './lib/inflight-marker.js';
 import { cancelQueuedItem, dispatchBusyQueueMagicWord, notifyQueuedMessage, resolveQueueReleaseTap } from './lib/busy-queue.js';
 import { handlePickerValue, isResumeConvoId } from './lib/picker-dispatch.js';
-import { createPermissionRegistry, renderPermissionCard, permissionButtons, permissionSpawnArgs, resolveBypassMode, resolvePermissionTimeoutMs } from './lib/permission-prompt.js';
+import { createPermissionRegistry, renderPermissionCard, permissionButtons, permissionSpawnArgs, resolveBypassMode, resolvePermissionTimeoutMs, isRootOutsideSandbox, guardRootBypass, ROOT_BYPASS_WARNING } from './lib/permission-prompt.js';
+import { createPlanApprovalItems } from './lib/plan-approval-items.js';
 import { createSlowToolNotices, renderSlowToolNotice, resolveSlowToolNoticeMs, resolveSlowToolReminderMs } from './lib/slow-tool-notice.js';
 import { createJournalInputConsumer, resolvePromptChoice } from './lib/journal-input-router.js';
 import { createAgentRooms, INVITE_TTL_MS } from './lib/agent-rooms.js';
 import { createAgentInvites, formatInviteRequestNotice, INVITE_WAKE_NOTICE } from './lib/agent-invites.js';
 import { resolveInviteTarget } from './lib/invite-target.js';
-import { createRoomDelivery, formatRoomMessageNotice, formatRoomDeliveredNotice, formatRoomDeliveryFailedNotice, roomEchoLabel, roomFrameDisposition, ROOM_MESSAGE_QUEUED_NOTICE, ROOM_MUTED_NOT_DELIVERED_NOTICE } from './lib/room-delivery.js';
+import { createRoomDelivery, formatRoomMessageNotice, formatRoomDeliveredNotice, formatRoomDeliveryFailedNotice, roomEchoLabel, roomFrameDisposition, ROOM_MESSAGE_QUEUED_NOTICE, ROOM_MUTED_NOT_DELIVERED_NOTICE, ROOM_WAKE_NOTICE } from './lib/room-delivery.js';
+import { parseProcessTable, liveWorkChildren, workHold, keepAwakeUntil, mcpServerSignatures, WORK_HOLD_LEASE_MS } from './lib/work-hold.js';
 import { unmuteChoiceValue, ROOM_MUTE_ACTION_ID, ROOM_MUTE_KIND } from './lib/room-mute-cards.js';
 import { oneLine, quotedField } from './lib/peer-text.js';
 import { TURN_TIER, peerBatchTier, roomBatchTier, shouldPreemptForPriorityPeer } from './lib/peer-priority.js';
@@ -241,6 +243,12 @@ if (!['bypass', 'auto'].includes(MATRON_PERMISSION_MODE)) {
   console.warn(`[permissions] Unknown MATRON_PERMISSION_MODE=${JSON.stringify(process.env.MATRON_PERMISSION_MODE)}; defaulting to bypass.`);
 }
 const DEFAULT_BYPASS_MODE = MATRON_PERMISSION_MODE !== 'auto';
+// Claude Code exits 1 on --dangerously-skip-permissions under root unless
+// IS_SANDBOX=1 (lib/permission-prompt.js isRootOutsideSandbox). Say so once
+// at boot; each affected spawn also downgrades to auto and warns the room.
+if (isRootOutsideSandbox()) {
+  console.warn(`[permissions] ${ROOT_BYPASS_WARNING}`);
+}
 // Idle reaping: a session is killed if no activity (incoming user message OR
 // outgoing assistant text posted to Matrix) is observed within this window.
 // Sessions are resumable, so the next user message will respawn claude with
@@ -369,6 +377,14 @@ function mcpConfigPathFor(extras = []) {
 // disk by the time any session spawns. Per-extras variants are generated
 // lazily on first use.
 mcpConfigPathFor([]);
+// Every server a session of this bridge can be running — the always-on set
+// and each extras group, local overlay included — resolved exactly as the
+// spawn resolves them (absolute paths, macify). The idle reaper uses these
+// to tell claude's own MCP servers from work in flight (lib/work-hold.js).
+const MCP_SERVER_SIGNATURES = mcpServerSignatures(
+  [[], ...KNOWN_MCP_EXTRAS.map((ex) => [ex])].flatMap((extras) =>
+    Object.values(buildMcpServers({ baseConfig: RAW_MCP_CONFIG, extras, askUserBaseDir: __dirname }).config.mcpServers)),
+);
 // Drop (and warn about) any machine default that names an extra no config block
 // defines. buildMcpServers would silently ignore it at spawn time, so filtering
 // here keeps /start and /restart from advertising an extra that never loads.
@@ -643,6 +659,9 @@ function handleJournalReconnect() {
   journalOnReconnect();
   republishSessionStates();
   republishSessionSummaries({ clearHints: true });
+  // Every hello_ok is a fresh epoch for the journal's copy of this box's
+  // status too (a box that just woke reports itself before anyone asks).
+  publishBoxStatus('reconnect');
 }
 
 // Repair the summary publish hint across a connection epoch (loop #554 F3).
@@ -709,6 +728,38 @@ function warnRejectedConvoUpsert(e) {
   console.warn('[journal] convo_upsert REJECTED — frame dropped (title/summary/state lost)', {
     detail: e.detail ?? null, roomId: e.roomId ?? null,
   });
+}
+
+// Box status lives in the journal (matron-journal #82): this box's activity,
+// usage limits, disk and account, sent as a `box_status` op so every client
+// sees them from /devices — including one that has never talked to this
+// box, and while this box is asleep. Same payload the recent_folders RPC
+// reply carries (lib/journal-rpc.js), built from the same thunks, so the
+// two never disagree. Fired on every hello_ok, after each usage-limits
+// refresh (the numbers changed), and at shutdown (the last report before
+// the host idle-stops the VM is the one clients will see all night).
+// Fails open like every other journal send: a dropped report is replaced
+// by the next one.
+function publishBoxStatus(reason) {
+  if (!JOURNAL_ENABLED) return false;
+  let activity = null;
+  let limits = null;
+  let disk = null;
+  let accountEmail = null;
+  try { activity = buildActivity({ sessions, persisted: loadPersistedSessions() }); } catch { /* best-effort */ }
+  try { limits = buildLimits(usageLimitsCache); } catch { /* best-effort */ }
+  try { disk = buildDisk({ path: DEFAULT_WORKDIR }); } catch { /* best-effort */ }
+  try { accountEmail = getAccountEmail(); } catch { /* best-effort */ }
+  if (!activity && !limits && !disk && !accountEmail) return false;
+  const sent = journalPublisher.sendRoomOp({
+    op: 'box_status',
+    ...(activity ? { activity } : {}),
+    ...(limits ? { limits } : {}),
+    ...(disk ? { disk } : {}),
+    ...(accountEmail ? { account: { email: accountEmail } } : {}),
+  });
+  debug(`box_status (${reason}) ${sent ? 'sent' : 'not sent (journal not connected)'}`);
+  return sent;
 }
 
 const journalPublisher = createJournalPublisher({
@@ -1788,7 +1839,12 @@ function refreshUsageLimits(cwd) {
     .then((raw) => {
       const parsed = parseUsageLimits(raw);
       usageLimitsCache.fetchedAt = Date.now();
-      if (parsed.ok) usageLimitsCache.lines = parsed.lines;
+      if (parsed.ok) {
+        usageLimitsCache.lines = parsed.lines;
+        // Fresh numbers: the journal's copy of this box's status is stale
+        // the moment they land.
+        publishBoxStatus('limits refresh');
+      }
       return parsed.ok;
     })
     .catch((e) => {
@@ -2029,6 +2085,15 @@ function journalFlushForSession(session) {
   }
 }
 
+// Room card for a root-downgraded spawn (lib/permission-prompt.js
+// guardRootBypass). Must run after the session is in `sessions`: sendToRoom
+// mirrors into the journal via sessions.get(roomId) and drops the notice for
+// a room with no live entry.
+function postRootBypassWarning(roomId) {
+  const rw = notice('warning', ROOT_BYPASS_WARNING, escapeHtml(ROOT_BYPASS_WARNING));
+  Promise.resolve(sendToRoom(roomId, rw.plain, rw.html)).catch(() => {});
+}
+
 function createSession(roomId, workdir, resumeSessionId, options = {}) {
   // A persisted workdir can stop existing between spawns (repo renamed,
   // worktree pruned). Node reports a missing spawn cwd as `spawn claude
@@ -2119,7 +2184,11 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   const mcpExtras = Array.isArray(options.mcpExtras)
     ? options.mcpExtras
     : (Array.isArray(persistedForRoom?.mcpExtras) ? persistedForRoom.mcpExtras : []);
-  const bypassMode = resolveBypassMode(options.bypass, persistedForRoom?.bypassMode, DEFAULT_BYPASS_MODE);
+  const requestedBypassMode = resolveBypassMode(options.bypass, persistedForRoom?.bypassMode, DEFAULT_BYPASS_MODE);
+  // Root guard: the session's persisted choice stays as requested; only the
+  // spawn args downgrade (see guardRootBypass).
+  const { bypass: bypassMode, downgraded: rootDowngraded } = guardRootBypass(requestedBypassMode);
+  if (rootDowngraded) console.warn(`[permissions] ${roomId}: ${ROOT_BYPASS_WARNING}`);
   const effectiveMcpExtras = effectiveExtras(mcpExtras, DEFAULT_MCP_EXTRAS);
   const shareEnabled = effectiveMcpExtras.includes('share');
   const permissionToken = randomUUID();
@@ -2277,12 +2346,14 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     _showFileInFlight: 0,
     mcpExtras,
     permissionSnapshot,
-    bypassMode,
+    bypassMode: requestedBypassMode,
     permAllowedTools: new Set(),
     responseBuffer: '',
     sendCallback: null,
     pendingPlan: null,
     pendingPlanDenialId: resumeSessionId ? (getPersistedSession(roomId)?.pendingPlanDenialId || null) : null,
+    planItemId: resumeSessionId ? (getPersistedSession(roomId)?.planItemId || null) : null,
+    planToolUseId: resumeSessionId ? (getPersistedSession(roomId)?.planToolUseId || null) : null,
     sendHtml: null,
     showWorking: false,
     showBashOutput: showBashOutputAtSpawn,
@@ -2530,11 +2601,18 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   // the parent's stream emits a Task tool_use. The watcher object is cheap
   // to construct; it doesn't poll until the first Task fires.
   sessions.set(roomId, session);
+  // A plan item restored with this session may belong to a hook that died
+  // with the old process (lib/plan-approval-items.js reconcileRestored).
+  if (resumeSessionId && session.planItemId) void planItems.reconcileRestored(session);
   if (session.claudeSessionId) {
     setupSubagentWatcher(session, cwd, session.claudeSessionId);
   }
   journalSeedTitle(session, { incomingHint: options.journalTitleHint, persistedHint: persistedMode?.journalTitleHint, reattaching: options.journalConvoId != null });
   journalSpawnStatus(session);
+  // The root-downgrade card goes out only now: sendToRoom journals through
+  // sessions.get(roomId), which is empty until the sessions.set above, so a
+  // fresh !start / RPC start / recreateSession spawn would drop it.
+  if (rootDowngraded) postRootBypassWarning(roomId);
   return session;
 }
 
@@ -2604,6 +2682,8 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
     sendCallback: null,
     pendingPlan: null,
     pendingPlanDenialId: null,
+    planItemId: null,
+    planToolUseId: null,
     sendHtml: null,
     sendButtonMessage: null,
     showWorking: false,
@@ -3051,6 +3131,11 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
   // Fresh sessions pre-assign --session-id so the transcript path is known
   // before spawn; resumes pass --resume only. The exclusivity rule lives in
   // planSessionIdentity.
+  // easelyte fork delta: interactive sessions pass no bypass / permission-mode
+  // flag — permissions come from the full tool allow-list in
+  // buildSessionSettings('iv') (lib/session-settings.js), and any TUI prompt
+  // outside it is surfaced by lib/prompt-detector.js. Upstream's iv
+  // guardRootBypass(true) branch is deliberately not adopted.
   const claudeArgs = [...identity.cliArgs];
   claudeArgs.push(
     // AskUserQuestion is allowed in iv-mode: the TUI prompt detector
@@ -3133,6 +3218,8 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     sendCallback: null,
     pendingPlan: null,
     pendingPlanDenialId: resumeSessionId ? (getPersistedSession(roomId)?.pendingPlanDenialId || null) : null,
+    planItemId: resumeSessionId ? (getPersistedSession(roomId)?.planItemId || null) : null,
+    planToolUseId: resumeSessionId ? (getPersistedSession(roomId)?.planToolUseId || null) : null,
     sendHtml: null,
     sendButtonMessage: null,
     showWorking: false,
@@ -3441,8 +3528,12 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
         `<b>📋 Plan Ready</b><blockquote>${markdownToHtml(preview)}</blockquote>` +
         `Reply <code>build</code> to execute, or send feedback.`;
       session.sendHtml(plainPlan, htmlPlan);
+      // The card's mirror in the tracker (lib/plan-approval-items.js): a
+      // question the user can find and answer from the Decisions list.
+      void planItems.opened(session, planText || '', { toolUseId });
     } else if (session.sendCallback) {
       session.sendCallback(plainPlan);
+      void planItems.opened(session, planText || '', { toolUseId });
     } else {
       // No output channel yet — auto-deny so the hook unblocks.
       const pending = pendingPlanDecisions.get(toolUseId);
@@ -3451,8 +3542,12 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
   };
 
   sessions.set(roomId, session);
+  // A plan item restored with this session may belong to a hook that died
+  // with the old process (lib/plan-approval-items.js reconcileRestored).
+  if (resumeSessionId && session.planItemId) void planItems.reconcileRestored(session);
   // Subagent activity watcher — see createSession() for the rationale.
   setupSubagentWatcher(session, cwd, sessionId);
+  // After sessions.set for the same reason as in createSession.
   return session;
 }
 
@@ -4880,6 +4975,8 @@ function handleClaudeEvent(session, event) {
         } else {
           session.sendCallback(plainPlan);
         }
+        // The card's mirror in the tracker (lib/plan-approval-items.js).
+        void planItems.opened(session, planText, { toolUseId: planDenial.tool_use_id });
       }
 
       // A /restart parked mid-turn fires now, INSTEAD of the queue flush —
@@ -9020,6 +9117,8 @@ const itemTurnRouter = createItemTurnRouter({
   // item arrives with transcript:null and only the bridge can fill it in.
   setTranscript: (id, commentId, body) => itemsClient.setTranscript(id, commentId, body),
   getItem: (id) => itemsClient.get(id),
+  // A turn held for the journal's transcript may outlive its session.
+  resolveSession: (convoId) => findSessionByClaudeSessionId(convoId),
   log: console,
 });
 
@@ -9027,6 +9126,20 @@ function journalOnItem(session, item, ctx) {
   // Same reasoning as journalOnMedia: answering the agent's question is the
   // user back in the loop, so it refreshes the self-restart budget.
   session._agentRestartCount = 0;
+  // `build` typed on the plan's own tracker item is the same answer as
+  // `build` in the conversation (lib/plan-approval-items.js): approve the
+  // plan through the one shared path instead of handing the agent a
+  // "📌 dan replied: build" turn it cannot act on. Same pending-plan gate
+  // dispatchPlanBuild applies, so a stale item can never trigger a build.
+  if (planItems.consumedReply(item?.payload)) return; // a replay of a build already acted on
+  const hasPendingPlan = !!(session.pendingPlan || session.pendingPlanDenialId || session.ivPendingPlanToolUseId);
+  if (hasPendingPlan && planItems.isBuildReply(session, item?.payload)) {
+    const cmdCtx = journalSessionCommandCtx(session);
+    approvePlanBuild(session, { sendHtml: cmdCtx.sendHtml }).catch((e) => {
+      try { console.warn(`[plan-items] build from item reply failed: ${e?.message ?? e}`); } catch { /* logging must never throw */ }
+    });
+    return;
+  }
   // Fire-and-forget, matching routeMediaToSession's contract — the route
   // swallows its own failures, so this catch is belt-and-braces.
   itemTurnRouter(session, item, ctx).catch((e) => {
@@ -9291,6 +9404,16 @@ function journalResumeRoom(roomId, noticeText = JOURNAL_RESUME_NOTICE) {
   return resumeSleepingSession(roomId, prev, prev.journalConvoId || prev.sessionId || null, noticeText);
 }
 
+// The journal conversation a NOT-running session key maps to, from the same
+// persisted record journalResumeRoom would wake it through — for the one
+// case that needs to write into a sleeping conversation without waking it
+// (a muted room's receipt in deliverRoomFrameTo). Null when nothing is
+// persisted: then there is no conversation to write into either.
+function sleepingConvoIdFor(roomId) {
+  const prev = loadPersistedSessions()[roomId];
+  return prev ? (prev.journalConvoId || prev.sessionId || null) : null;
+}
+
 // A "Carry on" tap. The router has already auto-resumed the session for a
 // verified resume tap (lib/journal-input-router.js), so `session` is live by
 // the time this runs; the lookup is a fallback for the ordering-independent
@@ -9369,14 +9492,31 @@ async function fireTimer(record) {
 // from what is on disk; failures are logged, never thrown — the timers
 // themselves were already persisted and a missing marker only means the
 // box may sleep, which is the default anyway.
+// Work in flight leases the same marker (lib/work-hold.js, 2026-09-21): the
+// idle reaper sets workHoldUntil/workHoldSessions once per tick and rewrites
+// the file through refreshKeepAwakeMarker, so a session mid-turn or with a
+// live background job keeps the box up even if its load dips below the
+// probe's threshold. The two sources share one writer: a timer save cannot
+// forget the work lease, a reaper tick cannot forget the reminders.
+let workHoldUntil = 0;
+let workHoldSessions = 0;
+
 function writeKeepAwakeMarker(timers) {
+  writeKeepAwake(keepAwakeMarker(timers));
+}
+
+function refreshKeepAwakeMarker() {
+  writeKeepAwake(timerStore.holdAwakeMarker());
+}
+
+function writeKeepAwake(marker) {
   try {
-    const marker = keepAwakeMarker(timers);
-    if (!marker) {
+    const until = keepAwakeUntil({ timerUntil: marker?.until ?? null, workUntil: workHoldUntil });
+    if (!until) {
       fs.rmSync(KEEPAWAKE_FILE, { force: true });
       return;
     }
-    atomicWriteFileSync(KEEPAWAKE_FILE, JSON.stringify({ ...marker, updatedAt: Date.now() }, null, 2));
+    atomicWriteFileSync(KEEPAWAKE_FILE, JSON.stringify({ until, reminders: marker?.reminders ?? 0, work: workHoldSessions, updatedAt: Date.now() }, null, 2));
   } catch (e) {
     try { console.warn(`[timer] keep-awake marker update failed: ${e.message}`); } catch { /* logging must never throw */ }
   }
@@ -9821,11 +9961,6 @@ function journalOnRoomFrame(room, frame) {
 // `[room …]` line and hands it to roomDelivery against room.sessionRoomId
 // (callers substitute the guest binding in for the fan-out above).
 function deliverRoomFrameTo(room, frame) {
-  const session = sessions.get(room.sessionRoomId);
-  if (!session || !session.alive) {
-    debug(`room frame for ${frame.convo_id} but session ${room.sessionRoomId} not live — dropping (agent_chat_read recovers)`);
-    return;
-  }
   const sender = frame.sender || '';
   const from = sender.startsWith('agent:') ? `${sender.slice(6)} (agent)` : sender.startsWith('user:') ? sender.slice(5) : sender;
   const payload = frame.payload || {};
@@ -9840,6 +9975,8 @@ function deliverRoomFrameTo(room, frame) {
     body = `[sent ${kind} "${payload.name || 'unnamed'}"${payload.blob_ref ? ` (blob ${payload.blob_ref})` : ''}${payload.caption ? `: ${payload.caption}` : ''}]`;
   }
   if (!body) return;
+  let session = sessions.get(room.sessionRoomId);
+  const live = !!(session && session.alive);
   // The user's copy of the peer's message. The agent-facing injection below
   // passes skipJournalMirror (the message is durable in the room convo), so
   // without this the session conversation shows the agent's REPLY to a peer
@@ -9865,39 +10002,59 @@ function deliverRoomFrameTo(room, frame) {
   // Runs BEFORE this message's own notice so the journal reads in the order
   // things happened: any ⏳ from an earlier batch is closed by its 📨 above
   // the 💬 line for the message that arrived after it.
-  maybeFlushRoomDelivery(session);
+  if (live) maybeFlushRoomDelivery(session);
   const echoFrom = roomEchoLabel(sender, from);
+  const roomTitle = room.title || room.topic || null;
   // Mute gate (2026-08-19). agent_chat_mute replaced agent_chat_leave as the
   // way out of a room the agent can't work with, so a muted binding takes NO
   // delivery at all: no injected turn, no pending-inbox growth, and no reply
   // waiter — which is why it sits above all three. Only the decision lives in
   // lib/room-delivery.js (roomFrameDisposition), because index.js can't be
-  // imported by a test.
+  // imported by a test. It also sits above the WAKE below (Bugbot on #288):
+  // a muted binding whose session the reaper took down must stay down —
+  // waking it only to drop the frame as muted would hand a peer that keeps
+  // writing exactly the respawn-per-message the mute was reached for.
   const disposition = roomFrameDisposition({
     muted: agentRooms.isMuted(frame.convo_id, room.sessionRoomId),
     sender,
   });
   if (disposition !== 'deliver') {
     // A `user:` frame is something Dan typed into the room himself, so
-    // swallowing it silently would look exactly like the message being lost.
-    // He gets the 💬 echo and then the 🔇 line in the ⏳'s place — the same
-    // seam, the same job: say what happened to it. Peer AGENT frames get
-    // nothing at all: a notice per dropped frame would relay the very spam
-    // the mute was reached for. Either way agent_chat_read still reads the
-    // room back in full.
+    // swallowing it silently would look like the message being lost: he gets
+    // the 💬 echo and then the 🔇 line in the ⏳'s place. Peer AGENT frames
+    // get nothing (a notice per frame would relay the spam the mute was for);
+    // agent_chat_read still reads the room in full. A sleeping conversation
+    // gets the same receipt via its persisted session record, no wake.
     if (disposition === 'muted-user' && echoFrom) {
-      journalPublishNotice(
-        journalConvoIdFor(session),
-        formatRoomMessageNotice({ from: echoFrom, body, roomTitle: room.title || room.topic || null, roomId: frame.convo_id }),
-      );
-      journalPublishNotice(journalConvoIdFor(session), ROOM_MUTED_NOT_DELIVERED_NOTICE);
+      const convoId = live ? journalConvoIdFor(session) : sleepingConvoIdFor(room.sessionRoomId);
+      if (convoId) {
+        journalPublishNotice(convoId, formatRoomMessageNotice({ from: echoFrom, body, roomTitle, roomId: frame.convo_id }));
+        journalPublishNotice(convoId, ROOM_MUTED_NOT_DELIVERED_NOTICE);
+      }
     }
     return;
+  }
+  if (!live) {
+    // The bound session is not running — reaped, !stopped, or the bridge /
+    // box restarted since it joined. Rooms outlive the claude process
+    // (2026-09-21): wake the conversation through its persisted session
+    // record, the way an item reply or a chat request does, and let the
+    // message ride the resume hold into the coalesced room inbox (the
+    // readiness seam flushes it). Only a conversation that cannot be
+    // resumed at all is truly gone — that binding is left now, lazily, so
+    // the peer hears 'left' at the moment it matters instead of on every
+    // teardown.
+    session = journalResumeRoom(room.sessionRoomId, ROOM_WAKE_NOTICE);
+    if (!session) {
+      debug(`room frame for ${frame.convo_id} but session ${room.sessionRoomId} is gone and not resumable — leaving the room (agent_chat_read recovers the message)`);
+      orphanRoomBinding(frame.convo_id, room.sessionRoomId);
+      return;
+    }
   }
   if (echoFrom) {
     journalPublishNotice(
       journalConvoIdFor(session),
-      formatRoomMessageNotice({ from: echoFrom, body, roomTitle: room.title || room.topic || null, roomId: frame.convo_id }),
+      formatRoomMessageNotice({ from: echoFrom, body, roomTitle, roomId: frame.convo_id }),
     );
   }
   // A reply consumed by an agent_chat_send wait already reached the agent
@@ -9918,7 +10075,7 @@ function deliverRoomFrameTo(room, frame) {
   // case the agent responded fastest.
   const queuedBefore = roomDelivery.pendingCount(session.roomId);
   roomDelivery.deliver(session, session.roomId, {
-    roomId: frame.convo_id, roomTitle: room.title || room.topic || null, from, body, at: frame.ts,
+    roomId: frame.convo_id, roomTitle, from, body, at: frame.ts,
     // Sender provenance for turn-tier classification (loop #688 F2): an agent
     // room turn is peer-coalesced (preemptable), a user (operator) room turn
     // stays operator-protected. Inlined rather than a named local so the echo
@@ -10362,6 +10519,32 @@ function journalHandleInboundEvent(frame) {
   if (_releaseReconcileTimer) scheduleReleaseReconcile();
 }
 
+// Leave ONE room binding whose session key no longer resolves to a
+// resumable conversation — the lazy half of "rooms outlive the claude
+// process" (see journalEvictConvoInput). Called from deliverRoomFrameTo when
+// a peer writes to a room and journalResumeRoom finds nothing to wake. Only a
+// 'joined' binding is acted on; anything else is already terminal or still
+// mid-invite. Tell the peer (fire-and-forget — there is no one left to
+// report a failure to; an owner's leave is rejected server-side, a journal
+// gap noted in the original PR) and mark the binding left. A local
+// (same-bridge) room has no journal participant state to leave: flip both
+// bindings (pairwise rooms end when either side goes) and tell the
+// surviving end directly, the way a remote 'left' frame would have.
+function orphanRoomBinding(roomId, sessionKey) {
+  const r = agentRooms.get(roomId);
+  const binding = r && agentRooms.bindingFor(roomId, sessionKey);
+  if (!binding || binding.state !== 'joined') return;
+  if (r.guestSessionRoomId != null) {
+    const otherKey = binding.binding === 'guest' ? r.sessionRoomId : r.guestSessionRoomId;
+    agentRooms.setState(roomId, 'left');
+    agentRooms.setGuestState(roomId, 'left');
+    journalNotifyRoomEvent(roomId, 'left the room', { sessionKey: otherKey });
+    return;
+  }
+  agentInvites.leave({ roomId }).catch(() => {});
+  agentRooms.setState(roomId, 'left');
+}
+
 // Finalize pending permission decisions and evict the reply-staleness guard
 // record for a torn-down session's convo (the consumer's per-convo map is
 // otherwise never pruned).
@@ -10373,28 +10556,16 @@ function journalHandleInboundEvent(frame) {
 // Hoisted function declaration — the exit handlers are defined earlier in
 // this file but only ever fire long after journalInputConsumer is assigned.
 function journalEvictConvoInput(session) {
-  // Terminal teardown leaves this session's joined rooms too: an orphaned
-  // 'joined' entry stays bound to a dead session key forever — isActive
-  // true, every peer frame dropped at debug level, noticeUnknownConvo
-  // suppressed by the known-room guard: a permanent silent black hole
-  // (whole-branch review, I4). Tell the peer (fire-and-forget — there is no
-  // one left to report a failure to; an owner's leave is rejected
-  // server-side, a journal gap noted in the PR) and mark the binding left.
-  for (const r of agentRooms.forSession(session?.roomId)) {
-    if (r.state !== 'joined') continue;
-    if (r.guestSessionRoomId != null) {
-      // Local room: no journal participant state to leave — flip both
-      // bindings (pairwise rooms end when either side goes) and tell the
-      // surviving end directly, the way a remote 'left' frame would have.
-      const otherKey = r.binding === 'guest' ? r.sessionRoomId : r.guestSessionRoomId;
-      agentRooms.setState(r.roomId, 'left');
-      agentRooms.setGuestState(r.roomId, 'left');
-      journalNotifyRoomEvent(r.roomId, 'left the room', { sessionKey: otherKey });
-      continue;
-    }
-    agentInvites.leave({ roomId: r.roomId }).catch(() => {});
-    agentRooms.setState(r.roomId, 'left');
-  }
+  // Terminal teardown deliberately does NOT leave this session's rooms
+  // (2026-09-21). It used to — every non-restart exit, the one-hour idle
+  // reap and !stop included, marked each joined room 'left' and told the
+  // peer — so a conversation the user simply left idle came back from
+  // auto-resume with no rooms, and its next agent_chat_start opened a
+  // duplicate. The session KEY (the Matron conversation) is what a room
+  // binds to, and it outlives the claude process; a peer's next message
+  // wakes the conversation through deliverRoomFrameTo, which is also where
+  // a binding whose conversation can no longer be resumed is left — lazily,
+  // by orphanRoomBinding, at the one moment it matters.
   // …and drops any pending room-message inbox with the session: there is no
   // live session left to coalesce into, and the room content is durable in
   // the journal (agent_chat_read recovers it). Auto-restart and
@@ -10445,6 +10616,9 @@ function journalEvictConvoInput(session) {
 async function approvePlanBuild(session, { sendHtml }) {
   const toolUseId = session.pendingPlanDenialId;
   debug(`[PLAN-DEBUG] Build triggered! pendingPlan=${!!session.pendingPlan} denialId=${toolUseId}`);
+  // The tracker mirror closes as decided, whichever mode settles the plan
+  // below (lib/plan-approval-items.js); best-effort, never blocks the build.
+  void planItems.resolved(session, 'build', { toolUseId: session.ivPendingPlanToolUseId || toolUseId || null });
 
   // Check if a tool_result already exists in the session history for this tool_use_id.
   // Claude CLI auto-generates a tool_result for permission denials, so sending another
@@ -10785,6 +10959,21 @@ const missionsHandlers = createMissionsHandlers({
   sessions,
   journalConvoIdFor,
   client: missionsClient,
+});
+
+// Plan approvals mirrored into the tracker (lib/plan-approval-items.js,
+// item #2317): the "📋 Plan Ready" card files a question the user can find
+// and answer from the Decisions list; build / timeout / a newer plan close
+// it. The item id persists next to pendingPlanDenialId so a restart can
+// still close it.
+const planItems = createPlanApprovalItems({
+  items: itemsClient,
+  journalConvoIdFor,
+  persist: (session, planItemId, planToolUseId) => {
+    if (!session?.roomId || !session.claudeSessionId) return;
+    persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { planItemId, planToolUseId });
+  },
+  log: console,
 });
 
 // The three reminder_* tools (lib/reminder-tools.js): the agent-callable
@@ -11629,6 +11818,11 @@ const apiServer = createServer(async (req, res) => {
           pendingPlanDecisions.delete(tool_use_id);
           res.writeHead(200, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ decision: 'deny', reason: 'timeout waiting for user' }));
+          // The plan is dead: its tracker mirror closes as cancelled
+          // (lib/plan-approval-items.js). The session may have been
+          // replaced meanwhile; whichever holds the room now owns the item.
+          const holder = sessions.get(target.roomId);
+          if (holder) void planItems.resolved(holder, 'timeout', { toolUseId: tool_use_id });
         }, PLAN_DECISION_TIMEOUT_MS);
         pendingPlanDecisions.set(tool_use_id, {
           resolve: ({ decision, reason }) => {
@@ -12324,14 +12518,61 @@ function killSession(session, signal = 'SIGTERM', { preserveQueue = false } = {}
   }
 }
 
+// The claude child's pid for every session shape: print mode (child_process),
+// interactive mode (node-pty handle), codex (its own spawn wrapper).
+function sessionChildPid(session) {
+  const pid = session.proc?.pid ?? session.iv?.pty?.pid ?? session.codex?.child?.pid ?? null;
+  return Number.isInteger(pid) ? pid : null;
+}
+
+// `ps` rather than /proc so the same call works on the macOS bridges. Fails
+// closed to an empty table: with no table there are no work children, and
+// the idle clock rules as it did before — never the other way round.
+function readProcessTable() {
+  try {
+    return parseProcessTable(execFileSync('ps', ['-axo', 'pid=,ppid=,args='], { encoding: 'utf8', timeout: 5000, maxBuffer: 16 * 1024 * 1024 }));
+  } catch (e) {
+    debug(`readProcessTable failed: ${e.message}`);
+    return [];
+  }
+}
+
+// {reason} when this session has work in flight (a turn running, or a live
+// descendant of its claude process that is not one of its configured MCP
+// servers — a tool call, a background task), null when the idle clock
+// should rule. See lib/work-hold.js.
+function sessionWorkHold(session, last, now, table) {
+  return workHold({
+    busy: !!session.busy,
+    children: liveWorkChildren(sessionChildPid(session), table, MCP_SERVER_SIGNATURES),
+    idleSince: last,
+    now,
+  });
+}
+
 function startIdleReaper() {
   setInterval(() => {
     const now = Date.now();
+    // Read the process table at most once per tick, and only if some session
+    // has actually passed the idle timeout — most ticks never get that far.
+    let table = null;
+    const processTable = () => (table ??= readProcessTable());
+    let held = 0;
     for (const [roomId, session] of sessions) {
       if (!session.alive) continue;
       if (session._autoStopped) continue;
       const last = session.lastActivityAt || session.startedAt || 0;
       if (now - last < SESSION_IDLE_TIMEOUT_MS) continue;
+      // Work in flight is not idle (lib/work-hold.js): a turn still running,
+      // or a background job the agent started — a colleague's hour-plus rake
+      // test was cut off here at the 60-minute mark (Dan, 2026-09-21).
+      // Bounded at WORK_HOLD_MAX_MS from the last activity inside workHold.
+      const hold = sessionWorkHold(session, last, now, processTable());
+      if (hold) {
+        held += 1;
+        debug(`Not reaping ${roomId}: ${hold.reason}`);
+        continue;
+      }
       // A pending hold-awake reminder (reminder_create hold_awake: true) is
       // the agent saying the work in between must not be interrupted — the
       // box stays up for it (KEEPAWAKE_FILE), and so does the session.
@@ -12361,6 +12602,12 @@ function startIdleReaper() {
         journalEvictConvoInput(session);
       }
     }
+    // Lease the host-side keep-awake marker for the held sessions; a lease
+    // is re-issued every tick and lapses on its own when nothing holds, so a
+    // crashed bridge cannot pin the box.
+    workHoldUntil = held > 0 ? now + WORK_HOLD_LEASE_MS : 0;
+    workHoldSessions = held;
+    refreshKeepAwakeMarker();
   }, SESSION_IDLE_CHECK_MS).unref();
 }
 
@@ -12534,6 +12781,11 @@ async function gracefulShutdown(signal) {
   // / killSession ran outside the try, so a throw there rejected the promise the
   // signal handlers ignore, and the process never exited (unhandled rejection).
   try {
+    // Last box-status report before this process goes: with the host
+    // idle-stopping the VM right after, these are the numbers every client
+    // will see for this box until it wakes again. Sent before the sessions
+    // are killed so `activity` still describes what was running.
+    publishBoxStatus('shutdown');
     stopCpuSampler();
     for (const [, session] of sessions) {
       killSession(session);

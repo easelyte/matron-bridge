@@ -11,15 +11,15 @@ describe('createSummaryModel', () => {
     expect(createSummaryModel({})).toBeNull();
   });
 
-  it('prefers OpenAI when a key is set, defaulting to gpt-5.6-luna', async () => {
+  it('prefers OpenAI when a key is set, defaulting to gpt-6-luna', async () => {
     const fetchImpl = okFetch('TITLE: t');
     const m = createSummaryModel({ openaiApiKey: 'sk-x', geminiClient: {}, fetchImpl });
-    expect(m.model).toBe('gpt-5.6-luna');
+    expect(m.model).toBe('gpt-6-luna');
     await expect(m.generate('hello')).resolves.toBe('TITLE: t');
     const [url, opts] = fetchImpl.mock.calls[0];
     expect(url).toBe('https://api.openai.com/v1/chat/completions');
     const body = JSON.parse(opts.body);
-    expect(body.model).toBe('gpt-5.6-luna');
+    expect(body.model).toBe('gpt-6-luna');
     expect(body.messages).toEqual([{ role: 'user', content: 'hello' }]);
     expect(opts.headers.Authorization).toBe('Bearer sk-x');
   });

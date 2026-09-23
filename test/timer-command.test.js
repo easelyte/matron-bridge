@@ -481,3 +481,18 @@ describe('keepAwakeMarker', () => {
     ])).toEqual({ until: 9, reminders: 2 });
   });
 });
+
+describe('holdAwakeMarker', () => {
+  it('is the same marker the save path derives, including records re-armed from disk', () => {
+    const now = 1_700_000_000_000;
+    const persisted = { nextId: 3, timers: [
+      { id: 1, convoId: 'c1', fireAt: now + 60_000, text: 'a', createdAt: now, holdAwake: true, source: 'agent' },
+      { id: 2, convoId: 'c2', fireAt: now + 120_000, text: 'b', createdAt: now },
+    ] };
+    const store = createTimerStore({ load: () => persisted, save: () => {}, now: () => now, setTimer: () => 1, clearTimer: () => {}, onFire: () => {} });
+    expect(store.holdAwakeMarker()).toEqual(keepAwakeMarker(persisted.timers));
+    expect(store.holdAwakeMarker()).toEqual({ until: now + 60_000, reminders: 1 });
+    store.cancel('c1', 1);
+    expect(store.holdAwakeMarker()).toBeNull();
+  });
+});

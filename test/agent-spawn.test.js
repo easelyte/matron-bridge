@@ -122,6 +122,22 @@ describe('createAgentSpawnHandlers', () => {
       expect(res).toEqual({ status: 200, body: { status: 'pending', spawn_id: 'row-1' } });
     });
 
+    it('a pending ack with target_waking says the box is being woken; anything but literal true is ignored', async () => {
+      const { handlers, sent } = mk();
+      const p = handlers.sessionStart(good);
+      handlers.onSpawnFrame({ kind: 'spawn', event: 'pending', request_id: sent[0].request_id, spawn_id: 'row-1', target_waking: true });
+      const res = await p;
+      expect(res.status).toBe(200);
+      expect(res.body.status).toBe('pending');
+      expect(res.body.target_waking).toBe(true);
+      expect(res.body.note).toMatch(/asleep/);
+      const p2 = handlers.sessionStart(good);
+      handlers.onSpawnFrame({ kind: 'spawn', event: 'pending', request_id: sent[1].request_id, spawn_id: 'row-2', target_waking: 'true' });
+      const res2 = await p2;
+      expect('target_waking' in res2.body).toBe(false);
+      expect('note' in res2.body).toBe(false);
+    });
+
     it('validates task / topic / device_id / workdir before sending any frame', async () => {
       const { handlers, sent } = mk();
       const cases = [

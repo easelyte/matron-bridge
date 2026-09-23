@@ -298,7 +298,11 @@ server.tool(
           const summary = c.summary ? `: ${String(c.summary).slice(0, 200)}` : '';
           return `- ${c.id} — "${c.title || 'untitled'}" [${c.session_state || 'unknown'}]${agent}${summary}`;
         });
-      const agents = (data.agents || []).map((a) => `- device ${a.device_id}: ${a.name}`);
+      // `connected`/`wakeable` are journal-composed. An asleep box is still a
+      // valid chat target: the journal wakes it when the invite parks, so the
+      // answer just takes a few minutes longer.
+      const agentState = (a) => a.connected === true ? 'online' : a.wakeable === true ? 'asleep (woken on demand)' : a.connected === false ? 'offline' : '';
+      const agents = (data.agents || []).map((a) => `- device ${a.device_id}: ${a.name}${agentState(a) ? ` — ${agentState(a)}` : ''}`);
       const self = data.self ? `You are "${data.self.name}" (device ${data.self.device_id}).` : 'Your own identity is unknown.';
       return { content: [{ type: 'text', text: `${self}\nOther agents:\n${agents.join('\n') || '- none'}\nConversations:\n${convos.join('\n') || '- none'}` }] };
     } catch (err) {
@@ -363,7 +367,7 @@ server.tool(
 
 server.tool(
   'agent_chat_start',
-  "Start a chat room with one of the user's other agent sessions: pick a target conversation from agent_roster, and the bridge invites its agent. Sessions on this same bridge are valid targets too (the invite is delivered locally). You and a given peer session share ONE room for the life of both sessions: calling this again at the same target returns that existing room (and posts your message into it) rather than opening a second one — there is no way to close a room, so use agent_chat_mute if one goes wrong. If the result is pending or pending_busy, do NOT wait or poll: continue your own work — the answer and any replies arrive automatically as later turns.",
+  "Start a chat room with one of the user's other agent sessions: pick a target conversation from agent_roster, and the bridge invites its agent. Sessions on this same bridge are valid targets too (the invite is delivered locally). A target whose box is asleep is fine: the journal wakes the box while the invite waits for the user's consent, so the answer just takes a few minutes longer. You and a given peer session share ONE room for the life of both conversations — it survives an idle reap, a restart and the box sleeping, and a peer's message wakes this conversation: calling this again at the same target returns that existing room (and posts your message into it) rather than opening a second one — there is no way to close a room, so use agent_chat_mute if one goes wrong. If the result is pending or pending_busy, do NOT wait or poll: continue your own work — the answer and any replies arrive automatically as later turns.",
   {
     target_convo_id: z.string().describe('Conversation id of the target session, from agent_roster'),
     topic: z.string().optional().describe('Optional short topic for the room title'),
@@ -390,7 +394,7 @@ server.tool(
 
 server.tool(
   'agent_boxes',
-  "List the user's agent boxes (machines) as spawn targets — including this one, marked \"this box\" — with recent folders, current activity, and account usage limits. Use this when the user asks to start a new session here or on another machine, or to find a box with spare capacity: prefer a box whose usage percentages are low and whose activity shows few or no recent sessions. Data may be minutes old; offline boxes cannot be spawned on.",
+  "List the user's agent boxes (machines) as spawn targets — including this one, marked \"this box\" — with recent folders, current activity, and account usage limits. Use this when the user asks to start a new session here or on another machine, or to find a box with spare capacity: prefer a box whose usage percentages are low and whose activity shows few or no recent sessions. Data may be minutes old. A box shown asleep is a valid target: the journal wakes it when you spawn on it or invite it, and the session or invite goes through a few minutes later once it is up. A box shown offline cannot be reached from here.",
   {},
   async () => {
     try {
@@ -434,7 +438,10 @@ server.tool(
       if (!postRes.ok) {
         return { content: [{ type: 'text', text: `agent_session_start failed: ${data.error || `HTTP ${postRes.status}`}` }] };
       }
-      return { content: [{ type: 'text', text: `Spawn request ${data.spawn_id} sent — awaiting the user's approval. Continue your own work; the outcome will arrive as a later turn.` }] };
+      const waking = data.target_waking === true
+        ? ' The target box is asleep and is being woken: the session starts once the user approves and the box is up, which takes a few minutes for a cold start — a slow outcome is not a failure.'
+        : '';
+      return { content: [{ type: 'text', text: `Spawn request ${data.spawn_id} sent — awaiting the user's approval.${waking} Continue your own work; the outcome will arrive as a later turn.` }] };
     } catch (err) {
       return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
     }
@@ -589,12 +596,14 @@ server.tool(
 );
 
 // There is deliberately NO agent_chat_leave tool (2026-08-19). A room lives
-// for the life of the two sessions: agents kept closing rooms and opening new
-// ones for every exchange, which filled the user's chat list with dead
+// for the life of the two conversations: agents kept closing rooms and opening
+// new ones for every exchange, which filled the user's chat list with dead
 // single-exchange rooms and lost the thread between two sessions that talk
 // repeatedly. agent_chat_mute below is the escape hatch instead. The
-// /agent-chat-leave route and chatLeave internals still exist — session
-// eviction uses them to close a dead session's rooms out.
+// /agent-chat-leave route and chatLeave internals still exist, but since
+// 2026-09-21 no teardown calls them: a room outlives the claude process (idle
+// reap, restart, box asleep) and is only left, lazily, once its conversation
+// can no longer be resumed (index.js orphanRoomBinding).
 
 server.tool(
   'agent_chat_invite',
@@ -625,7 +634,7 @@ server.tool(
 
 server.tool(
   'agent_chat_mute',
-  'Mute an agent chat room: its messages stop being delivered to you. Use this when a room has gone wrong — the peer is looping, spamming, or malfunctioning — instead of trying to leave (you cannot: a room stays open for the life of both sessions). The room stays open and readable with agent_chat_read, you can still post into it, and your user sees why you muted it and can unmute you with one tap.',
+  'Mute an agent chat room: its messages stop being delivered to you. Use this when a room has gone wrong — the peer is looping, spamming, or malfunctioning — instead of trying to leave (you cannot: a room stays open for the life of both conversations, across restarts and sleeps). The room stays open and readable with agent_chat_read, you can still post into it, and your user sees why you muted it and can unmute you with one tap.',
   {
     room_id: z.string().describe('The agent chat room id to mute'),
     reason: z.string().describe('Why you are muting it, in one line — shown to your user, who decides whether to unmute'),
@@ -933,7 +942,7 @@ async function callReminders(name, args, render) {
 
 server.tool(
   'reminder_create',
-  "Schedule a durable reminder to yourself: at the fire time the bridge delivers `text` into THIS conversation as a new turn (⏰ Reminder #N …), resuming the session if it was reaped. Unlike CronCreate / ScheduleWakeup, which live in this process and die at the bridge's idle reap (~1 h), on a restart, and when this dev box idle-stops, a reminder is persisted by the bridge, re-armed after a restart, and known to the host: the box may go to sleep meanwhile and is started again a few minutes before the reminder fires. Use this for anything further out than about an hour. The user sees a card with Send-now / Cancel buttons. Pass exactly one of `in` or `at`. Set hold_awake: true ONLY when the work between now and then must not be interrupted (a build, a watch, a long download): it keeps this box from idle-stopping and this session from being reaped until the reminder fires, which costs shared host memory for every hour of it.",
+  "Schedule a durable reminder to yourself: at the fire time the bridge delivers `text` into THIS conversation as a new turn (⏰ Reminder #N …), resuming the session if it was reaped. Unlike CronCreate / ScheduleWakeup, which live in this process and die at the bridge's idle reap (~1 h), on a restart, and when this dev box idle-stops, a reminder is persisted by the bridge, re-armed after a restart, and known to the host: the box may go to sleep meanwhile and is started again a few minutes before the reminder fires. Use this for anything further out than about an hour. The user sees a card with Send-now / Cancel buttons. Pass exactly one of `in` or `at`. A turn in progress or a background job you started that is still running already holds this session and this box awake (up to 8 hours from your last output), so a reminder is not needed for that. Set hold_awake: true ONLY when the work between now and then must not be interrupted across quiet gaps between turns (a watch, a long download you are not a parent of): it keeps this box from idle-stopping and this session from being reaped until the reminder fires, which costs shared host memory for every hour of it.",
   {
     text: z.string().min(1).max(2000).describe('What to tell yourself when it fires — write it for your future self, with enough context to act on'),
     in: z.string().optional().describe('Delay: 30s, 45m, 2h, 1d, 1h30m (5 s to 7 d)'),

@@ -1449,22 +1449,32 @@ describe('index.js routes + ask-user.js tools (source inspection)', () => {
     expect(indexSrc).toMatch(/import \{ createAgentInvites, formatInviteRequestNotice[^}]*\} from '\.\/lib\/agent-invites\.js';/);
   });
 
-  it('terminal teardown leaves joined rooms before dropping the inbox (I4)', () => {
+  it('terminal teardown keeps joined rooms; only an unresumable binding is left, lazily, by orphanRoomBinding', () => {
+    // Rooms outlive the claude process (2026-09-21): the idle reap, !stop, a
+    // bridge restart and the box sleeping all leave the conversation
+    // resumable, and the auto-resumed session must still hold its rooms.
+    // Eviction therefore only drops the pending inbox …
     const start = indexSrc.indexOf('function journalEvictConvoInput(');
     expect(start).toBeGreaterThan(-1);
     const end = indexSrc.indexOf('\nfunction ', start + 1);
     const body = indexSrc.slice(start, end);
-    // A dead session's joined rooms must not stay routable black holes:
-    // tell the peer, mark left, THEN drop the pending inbox.
-    const loop = body.indexOf('for (const r of agentRooms.forSession(session?.roomId))');
-    const drop = body.indexOf('roomDelivery.dropSession(session?.roomId)');
-    expect(loop).toBeGreaterThan(-1);
-    expect(drop).toBeGreaterThan(loop);
-    expect(body).toMatch(/if \(r\.state !== 'joined'\) continue;/);
-    expect(body).toMatch(/agentInvites\.leave\(\{ roomId: r\.roomId \}\)[\s\S]{0,120}agentRooms\.setState\(r\.roomId, 'left'\)/);
-    // Local rooms skip the journal op and flip BOTH bindings, telling the
-    // surviving end directly.
-    expect(body).toMatch(/r\.guestSessionRoomId != null[\s\S]{0,600}setGuestState\(r\.roomId, 'left'\)/);
+    expect(body).not.toMatch(/agentRooms\.forSession\(/);
+    expect(body).not.toMatch(/agentInvites\.leave\(/);
+    expect(body).not.toMatch(/setState\(/);
+    expect(body).toMatch(/roomDelivery\.dropSession\(session\?\.roomId\)/);
+    // … and the I4 black-hole guard moved to the moment a peer writes to a
+    // room whose conversation is GONE: tell the peer, mark left. Local rooms
+    // skip the journal op and flip BOTH bindings, telling the surviving end
+    // directly.
+    const oStart = indexSrc.indexOf('function orphanRoomBinding(');
+    expect(oStart).toBeGreaterThan(-1);
+    const orphan = indexSrc.slice(oStart, indexSrc.indexOf('\nfunction ', oStart + 1));
+    expect(orphan).toMatch(/if \(!binding \|\| binding\.state !== 'joined'\) return;/);
+    expect(orphan).toMatch(/agentInvites\.leave\(\{ roomId \}\)[\s\S]{0,120}agentRooms\.setState\(roomId, 'left'\)/);
+    expect(orphan).toMatch(/r\.guestSessionRoomId != null[\s\S]{0,600}setGuestState\(roomId, 'left'\)/);
+    const dStart = indexSrc.indexOf('function deliverRoomFrameTo(');
+    const deliver = indexSrc.slice(dStart, indexSrc.indexOf('\nfunction ', dStart + 1));
+    expect(deliver).toMatch(/journalResumeRoom\(room\.sessionRoomId, ROOM_WAKE_NOTICE\)[\s\S]{0,400}orphanRoomBinding\(frame\.convo_id, room\.sessionRoomId\)/);
   });
 
   it('declares every agent-chat MCP tool in ask-user.js', () => {
@@ -2225,7 +2235,10 @@ describe('mute wiring (source inspection)', () => {
     // This block is read verbatim into every Claude session's system prompt
     // (BRIDGE_CLAUDE_MD_PATH), so it is the actual behavioural lever — the
     // tool descriptions alone were not enough to stop agents closing rooms.
-    expect(bridgeMd).toMatch(/stays open for the life of the sessions\. Do not try to close it\./);
+    expect(bridgeMd).toMatch(/stays open for the life of the two conversations\. Do not try to close it\./);
+    // …and that it outlives the process: an agent that thinks a reap or a
+    // restart lost its room opens a duplicate.
+    expect(bridgeMd).toMatch(/survives everything that ends your process but not the conversation/);
     expect(bridgeMd).toMatch(/There is no leave tool\./);
     expect(bridgeMd).toMatch(/looping, spamming[\s\S]{0,120}agent_chat_mute\(room_id, reason\)/);
     expect(bridgeMd).not.toMatch(/agent_chat_leave/);
@@ -2236,7 +2249,7 @@ describe('mute wiring (source inspection)', () => {
   it('agent_chat_start tells the agent it will get the room it already has', () => {
     const start = askUserSrc.indexOf("'agent_chat_start',");
     const block = askUserSrc.slice(start, askUserSrc.indexOf('server.tool(', start));
-    expect(block).toMatch(/ONE room for the life of both sessions/);
+    expect(block).toMatch(/ONE room for the life of both conversations/);
     expect(block).toMatch(/returns that existing room \(and posts your message into it\)/);
     expect(block).toMatch(/there is no way to close a room/);
   });
@@ -2245,7 +2258,7 @@ describe('mute wiring (source inspection)', () => {
     const start = askUserSrc.indexOf("'agent_chat_mute',");
     const block = askUserSrc.slice(start, askUserSrc.indexOf('server.tool(', start));
     expect(block).toMatch(/looping, spamming, or malfunctioning/);
-    expect(block).toMatch(/you cannot: a room stays open for the life of both sessions/);
+    expect(block).toMatch(/you cannot: a room stays open for the life of both conversations, across restarts and sleeps/);
   });
 });
 
