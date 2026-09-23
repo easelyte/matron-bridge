@@ -4887,23 +4887,43 @@ function handleClaudeEvent(session, event) {
         // discovery. local_agent only — background Bash task_started events
         // carry no subagent and must not register phantom refs.
         if (event.task_type === 'local_agent' && event.tool_use_id && event.task_id) {
-          session.subagentConvos?.noteBackgroundTaskStarted(event.tool_use_id, event.task_id);
+          const startDisposition = session.subagentConvos?.noteBackgroundTaskStarted(event.tool_use_id, event.task_id);
           session.subagentWatcher?.notifyTaskStarted();
-          // RESUME (SendMessage on an existing agent id): the agent comes back
-          // under its ORIGINAL id, so it reuses agent-<task_id>.jsonl — a file
-          // snapshot() already marked "seen" and the burst scan will therefore
-          // never attach. Nothing is re-created, so there is nothing for the
-          // poll to find, and the resumed agent would run to completion with no
-          // tail and no card. task_id names the file exactly, so attach it
-          // explicitly (EOF-anchored so the earlier run isn't replayed;
-          // idempotent; a no-op for a fresh spawn, which keeps the scan path).
-          session.subagentWatcher?.forceAttach(event.task_id);
-          // ...and un-finish its child convo. Unconditional, not gated on the
-          // forceAttach result: when the agent finished and resumed WITHOUT a
-          // bridge restart its tail is still live, so forceAttach no-ops while
-          // the child convo is nonetheless sitting at `done`. revive() itself
-          // no-ops for an unknown or already-running child.
-          session.subagentConvos?.revive(event.task_id);
+          // Gate revive/forceAttach on the start disposition (loop #764). A
+          // REPLAYED task_started for an already-finished run (same-ref replay, or
+          // a ref retired by a prior resume) must NOT revive/re-attach — doing so
+          // unconditionally flipped a completed child back to a phantom 'running'
+          // in every client (and polluted the generation counter that gates
+          // resume/completion, #751). Only a genuine start proceeds:
+          //   - 'resumed': a finished child restarting under a new tool_use_id.
+          //   - 'started-new': a fresh spawn (revive/forceAttach no-op safely) or
+          //     a normal start on a live child.
+          // 'rejected-replay' and 'ignored' skip both.
+          const shouldAttachAndRevive =
+            startDisposition === 'resumed' || startDisposition === 'started-new';
+          if (shouldAttachAndRevive) {
+            // RESUME (SendMessage on an existing agent id): the agent comes back
+            // under its ORIGINAL id, so it reuses agent-<task_id>.jsonl — a file
+            // snapshot() already marked "seen" and the burst scan will therefore
+            // never attach. Nothing is re-created, so there is nothing for the
+            // poll to find, and the resumed agent would run to completion with no
+            // tail and no card. task_id names the file exactly, so attach it
+            // explicitly (EOF-anchored so the earlier run isn't replayed;
+            // idempotent; a no-op for a fresh spawn, which keeps the scan path).
+            session.subagentWatcher?.forceAttach(event.task_id);
+            // ...and un-finish its child convo. Not gated on the forceAttach
+            // result: when the agent finished and resumed WITHOUT a bridge restart
+            // its tail is still live, so forceAttach no-ops while the child convo
+            // is nonetheless sitting at `done`. revive() itself no-ops for an
+            // unknown or already-running child. Advance the incarnation counter
+            // only for a genuine resume; a 'started-new' revive here is a
+            // corrective revival of a first run finished early by the launch
+            // tool_result (#764 F1) — the SAME incarnation, so generation must
+            // not advance or the id-less completion fallback (#751) would strand it.
+            session.subagentConvos?.revive(event.task_id, {
+              incrementGeneration: startDisposition === 'resumed',
+            });
+          }
         }
       } else if (event.subtype === 'task_notification') {
         // A background task actually finished. For a subagent (Agent tool)

@@ -5,6 +5,10 @@ import {
   createSubagentConvoTracker,
   CHILD_STATE_RUNNING,
   CHILD_STATE_FINISHED,
+  TASK_STARTED_STARTED_NEW,
+  TASK_STARTED_RESUMED,
+  TASK_STARTED_REJECTED_REPLAY,
+  TASK_STARTED_IGNORED,
 } from '../lib/subagent-convos.js';
 import { modelFromEvent } from '../lib/model-aliases.js';
 
@@ -473,6 +477,121 @@ describe('createSubagentConvoTracker', () => {
     });
   });
 
+  // Loop #764: noteBackgroundTaskStarted returns a disposition so index.js can
+  // gate revive/forceAttach. A REPLAYED task_started for an already-finished run
+  // must report 'rejected-replay' — reviving unconditionally flipped the
+  // completed child back to a phantom 'running' in every client.
+  describe('task_started disposition gates revive (loop #764)', () => {
+    it('a fresh background spawn (no child yet) reports started-new', () => {
+      expect(tracker.noteBackgroundTaskStarted('toolu_bg', 'agent-bg'))
+        .toBe(TASK_STARTED_STARTED_NEW);
+    });
+
+    it('a same-ref start on a live child reports started-new (harmless echo)', () => {
+      tracker.noteBackgroundTaskStarted('toolu_bg', 'agent-bg');
+      tracker.discover('agent-bg', { label: 'BG', agentType: null });
+      expect(tracker.noteBackgroundTaskStarted('toolu_bg', 'agent-bg'))
+        .toBe(TASK_STARTED_STARTED_NEW);
+    });
+
+    it('a SAME-REF replay of a FINISHED run reports rejected-replay (the ghost-revive bug)', () => {
+      tracker.noteBackgroundTaskStarted('toolu_bg', 'agent-bg');
+      const child = tracker.discover('agent-bg', { label: 'BG', agentType: null });
+      tracker.noteTaskCompleted('agent-bg', 'toolu_bg'); // run finishes
+      expect(child.state).toBe(CHILD_STATE_FINISHED);
+      const gen = child.generation;
+      publisher.calls.upsertConvo.length = 0;
+
+      // The replayed task_started for the same, already-finished run.
+      const disp = tracker.noteBackgroundTaskStarted('toolu_bg', 'agent-bg');
+      expect(disp).toBe(TASK_STARTED_REJECTED_REPLAY);
+      // Gate honored by index.js means revive is NOT called; the tracker itself
+      // must also not have mutated the finished child's state or generation.
+      expect(child.state).toBe(CHILD_STATE_FINISHED);
+      expect(child.generation).toBe(gen);
+      expect(publisher.calls.upsertConvo).toHaveLength(0);
+    });
+
+    it('a genuine resume (finished child, NEW ref) reports resumed and advances taskRef', () => {
+      tracker.noteBackgroundTaskStarted('toolu_runN', 'agent-x');
+      const child = tracker.discover('agent-x', { label: 'X', agentType: null });
+      tracker.noteTaskCompleted('agent-x', 'toolu_runN');
+      expect(child.state).toBe(CHILD_STATE_FINISHED);
+
+      const disp = tracker.noteBackgroundTaskStarted('toolu_runN1', 'agent-x');
+      expect(disp).toBe(TASK_STARTED_RESUMED);
+      expect(child.taskRef).toBe('toolu_runN1');
+      // The disposition tells index.js to revive; doing so still works.
+      tracker.revive('agent-x');
+      expect(child.state).toBe(CHILD_STATE_RUNNING);
+    });
+
+    it('a replay of a RETIRED ref (after a resume) reports rejected-replay', () => {
+      tracker.noteBackgroundTaskStarted('toolu_runN', 'agent-x');
+      const child = tracker.discover('agent-x', { label: 'X', agentType: null });
+      tracker.noteTaskCompleted('agent-x', 'toolu_runN');
+      tracker.noteBackgroundTaskStarted('toolu_runN1', 'agent-x'); // resume, retires runN
+      tracker.revive('agent-x');
+      expect(child.state).toBe(CHILD_STATE_RUNNING);
+
+      const disp = tracker.noteBackgroundTaskStarted('toolu_runN', 'agent-x'); // replay
+      expect(disp).toBe(TASK_STARTED_REJECTED_REPLAY);
+      expect(child.taskRef).toBe('toolu_runN1'); // not regressed
+    });
+
+    it('a reverse-discovery FIFO correction on a RUNNING child reports started-new', () => {
+      tracker.noteTaskStarted('ref-A');
+      tracker.noteTaskStarted('ref-B');
+      const b = tracker.discover('agent-B', { label: 'B', agentType: null }); // FIFO -> ref-A
+      tracker.discover('agent-A', { label: 'A', agentType: null }); // FIFO -> ref-B
+      // Authoritative pairing corrects the provisional ref on the RUNNING child.
+      const disp = tracker.noteBackgroundTaskStarted('ref-B', 'agent-B');
+      expect(disp).toBe(TASK_STARTED_STARTED_NEW);
+      expect(b.taskRef).toBe('ref-B');
+    });
+
+    it('invalid input reports ignored', () => {
+      expect(tracker.noteBackgroundTaskStarted('', 'agent-x')).toBe(TASK_STARTED_IGNORED);
+      expect(tracker.noteBackgroundTaskStarted('toolu', '')).toBe(TASK_STARTED_IGNORED);
+    });
+
+    it('a late FIRST task_started still revives a child finished by a premature launch tool_result (Codex F1)', () => {
+      // Race: discovery FIFO-pairs the queued ref onto the child, THEN the instant
+      // launch tool_result finishes it (noteTaskResult, before backgroundRefs is
+      // populated). The child is now 'done' carrying the ref — but its real
+      // task_started has not fired yet. That first start must NOT be mistaken for
+      // a replay: it is the genuine start of a live agent.
+      tracker.noteTaskStarted('toolu_bg');                                 // queue ref
+      const child = tracker.discover('agent-bg', { label: 'BG', agentType: null }); // FIFO-pair
+      expect(child.taskRef).toBe('toolu_bg');
+      tracker.noteTaskResult('toolu_bg');                                  // premature finish
+      expect(child.state).toBe(CHILD_STATE_FINISHED);
+
+      // First task_started for the ref: not a replay -> started-new, so index.js
+      // revives WITHOUT advancing generation (corrective revival, not a resume).
+      const disp = tracker.noteBackgroundTaskStarted('toolu_bg', 'agent-bg');
+      expect(disp).toBe(TASK_STARTED_STARTED_NEW);
+      tracker.revive('agent-bg', { incrementGeneration: disp === TASK_STARTED_RESUMED });
+      expect(child.state).toBe(CHILD_STATE_RUNNING);
+      // Corrective revival must NOT look like a resume, or the id-less completion
+      // fallback (#751) would strand this single-incarnation run.
+      expect(child.generation).toBe(0);
+
+      // An id-less completion still finishes this never-resumed run (generation 0).
+      tracker.noteTaskCompleted('agent-bg'); // no tool_use_id
+      expect(child.state).toBe(CHILD_STATE_FINISHED);
+    });
+
+    it('a same-ref replay after a real completion is rejected (start already seen)', () => {
+      tracker.noteBackgroundTaskStarted('toolu_bg', 'agent-bg');
+      const child = tracker.discover('agent-bg', { label: 'BG', agentType: null });
+      tracker.noteTaskCompleted('agent-bg', 'toolu_bg'); // real completion
+      expect(child.state).toBe(CHILD_STATE_FINISHED);
+      expect(tracker.noteBackgroundTaskStarted('toolu_bg', 'agent-bg'))
+        .toBe(TASK_STARTED_REJECTED_REPLAY);
+    });
+  });
+
   // The tracker records every minted `running` child into a
   // persistent store and drops it the moment it finishes, so a bridge restart
   // can reconcile children that never reached `done` in-process.
@@ -507,6 +626,57 @@ describe('createSubagentConvoTracker', () => {
 
       tracker.noteTaskResult('toolu_1'); // sync-Task tool_result → finish
       expect(runningStore.calls.remove).toEqual(['parent-uuid:sub:agent-1']);
+      expect(runningStore.list()).toEqual([]);
+    });
+
+    it('a stale premature-finish callback cannot erase the record re-armed by a corrective revival (Codex #764 delta F1)', () => {
+      // Deferring publisher: capture each finish frame's onLocalSendComplete so we
+      // can fire the stale one AFTER the corrective revival re-arms the record.
+      const deferred = [];
+      const publisher = {
+        calls: { upsertConvo: [] },
+        upsertConvo(convoId, opts, options) {
+          this.calls.upsertConvo.push({ convoId, opts });
+          if (options?.onLocalSendComplete) deferred.push(options.onLocalSendComplete);
+        },
+        publishStatus() {}, publishText() {}, publishDiff() {},
+      };
+      const runningStore = makeStore();
+      const tracker = createSubagentConvoTracker({
+        publisher,
+        getParentConvoId: () => 'parent-uuid',
+        runningStore,
+        log: { warn() {} },
+      });
+
+      // Background Agent: ref queued, discovery FIFO-pairs and mints running.
+      tracker.noteTaskStarted('toolu_bg');
+      const child = tracker.discover('agent-bg', { label: 'BG', agentType: null });
+      expect(runningStore.list()).toHaveLength(1);
+
+      // Premature finish from the launch tool_result — its cleanup callback is
+      // captured (delivery not yet acked).
+      tracker.noteTaskResult('toolu_bg');
+      expect(child.state).toBe(CHILD_STATE_FINISHED);
+      const stalePrematureCallback = deferred.shift();
+
+      // The genuine first task_started arrives: corrective revival re-arms the
+      // running record and bumps the revive epoch (generation stays 0).
+      const disp = tracker.noteBackgroundTaskStarted('toolu_bg', 'agent-bg');
+      tracker.revive('agent-bg', { incrementGeneration: disp === TASK_STARTED_RESUMED });
+      expect(child.state).toBe(CHILD_STATE_RUNNING);
+      expect(child.generation).toBe(0);
+      expect(runningStore.list()).toHaveLength(1);
+
+      // The stale premature callback now fires — it MUST be fenced (epoch moved),
+      // leaving the re-armed record intact so reconciliation can still recover.
+      stalePrematureCallback();
+      expect(runningStore.list()).toHaveLength(1);
+
+      // The run's real completion finishes it and its own callback clears the record.
+      tracker.noteTaskCompleted('agent-bg'); // id-less; generation 0 -> still finishes
+      expect(child.state).toBe(CHILD_STATE_FINISHED);
+      deferred.shift()(); // real done ack
       expect(runningStore.list()).toEqual([]);
     });
 
