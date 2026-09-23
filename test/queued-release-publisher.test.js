@@ -134,6 +134,63 @@ describe('journal-publisher — queued-release durability hooks', () => {
     await expect(publisher.flush({ timeoutMs: 5 })).resolves.toEqual({ drained: true });
   });
 
+  // Direct room-op sends (box_status at gracefulShutdown is the one that
+  // matters) bypass the queue, so flush() must wait for the socket to
+  // confirm them too — otherwise process.exit(0) races the write on an idle
+  // box whose durable queue is already empty.
+  it('flush() waits for an unconfirmed sendRoomOp write before resolving drained:true', async () => {
+    const publisher = makePublisher();
+    const sock = await connected();
+    expect(publisher.sendRoomOp({ op: 'box_status', disk: { free_bytes: 1 } })).toBe(true);
+    expect(sock.pending.some(p => p.frame.op === 'box_status')).toBe(true);
+    let settled = false;
+    const flushed = publisher.flush({ timeoutMs: 500 }).then((r) => { settled = true; return r; });
+    await new Promise(r => setTimeout(r, 20));
+    expect(settled).toBe(false); // still on its way to the socket
+    sock.confirmAll();
+    await expect(flushed).resolves.toEqual({ drained: true });
+  });
+
+  it('flush() resolves drained:false when a sendRoomOp write is never confirmed (bounded)', async () => {
+    const publisher = makePublisher();
+    await connected();
+    expect(publisher.sendRoomOp({ op: 'box_status', disk: { free_bytes: 1 } })).toBe(true);
+    await expect(publisher.flush({ timeoutMs: 30 })).resolves.toEqual({ drained: false });
+  });
+
+  it('flush() does not wait on a sendRoomOp write the socket reported as failed', async () => {
+    const publisher = makePublisher();
+    const sock = await connected();
+    expect(publisher.sendRoomOp({ op: 'box_status', disk: { free_bytes: 1 } })).toBe(true);
+    const flushed = publisher.flush({ timeoutMs: 500 });
+    for (const { callback } of sock.pending.splice(0)) callback?.(new Error('EPIPE'));
+    // A failed direct write is lost (room ops are never retried); flush must
+    // still settle promptly and honestly rather than wait out the timeout.
+    await expect(flushed).resolves.toEqual({ drained: false });
+  });
+
+  it('flush() settles drained:false promptly when the socket dies with a sendRoomOp write unconfirmed', async () => {
+    const publisher = makePublisher();
+    const sock = await connected();
+    expect(publisher.sendRoomOp({ op: 'box_status', disk: { free_bytes: 1 } })).toBe(true);
+    const flushed = publisher.flush({ timeoutMs: 500 });
+    const started = Date.now();
+    sock.close(); // markDown writes the in-flight room op off
+    await expect(flushed).resolves.toEqual({ drained: false });
+    expect(Date.now() - started).toBeLessThan(200);
+    // A late error callback from the dead socket must not poison a later flush.
+    for (const { callback } of sock.pending.splice(0)) callback?.(new Error('ECONNRESET'));
+    await expect(publisher.flush({ timeoutMs: 5 })).resolves.toEqual({ drained: true });
+  });
+
+  it('flush() after a synchronously-confirmed sendRoomOp resolves drained:true immediately', async () => {
+    const publisher = makePublisher();
+    const sock = await connected();
+    sock.autoConfirm = true;
+    expect(publisher.sendRoomOp({ op: 'box_status', disk: { free_bytes: 1 } })).toBe(true);
+    await expect(publisher.flush({ timeoutMs: 5 })).resolves.toEqual({ drained: true });
+  });
+
   it('exports a sane FLUSH_TIMEOUT_MS default', () => {
     expect(FLUSH_TIMEOUT_MS).toBe(2000);
   });

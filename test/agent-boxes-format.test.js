@@ -76,6 +76,17 @@ describe('formatBox', () => {
       .toBe('idle-box (device 1) — offline');
   });
 
+  it('an offline box the journal can wake is named asleep, not offline; online boxes ignore the flag', () => {
+    expect(formatBox({ device_id: 1, name: 'napping', online: false, wakeable: true, folders: [] }))
+      .toBe('napping (device 1) — asleep (woken on demand; allow a few minutes)');
+    // Only a literal true counts: a journal that never sends the key, or a
+    // peer-relayed garbage value, leaves the plain offline rendering.
+    expect(formatBox({ device_id: 1, name: 'napping', online: false, wakeable: 'yes', folders: [] }))
+      .toBe('napping (device 1) — offline');
+    expect(formatBox({ device_id: 2, name: 'up', online: true, wakeable: true, folders: [], self: true }))
+      .toBe('up (device 2) — online — this box');
+  });
+
   it('falls back to "unknown" for a missing/empty name rather than an empty header', () => {
     expect(formatBox({ device_id: 1, name: '', online: true, folders: [] }))
       .toBe('unknown (device 1) — online');

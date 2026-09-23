@@ -5,6 +5,8 @@ import {
   parsePermTap,
   permissionSpawnArgs,
   resolveBypassMode,
+  isRootOutsideSandbox,
+  guardRootBypass,
   createPermissionRegistry,
   resolvePermissionTimeoutMs,
   DENY_MESSAGE,
@@ -278,5 +280,68 @@ describe('resolvePermissionTimeoutMs', () => {
     for (const raw of ['abc', '0', '-5', 'Infinity', 'NaN', '3600001']) {
       expect(resolvePermissionTimeoutMs(raw)).toBe(300000);
     }
+  });
+});
+
+// Claude Code exits 1 on `--dangerously-skip-permissions` when it runs as
+// root (uid 0) unless IS_SANDBOX=1 or CLAUDE_CODE_BUBBLEWRAP is set. A bridge
+// deployed as root would crash-loop every bypass spawn, so the guard mirrors
+// that exact predicate and downgrades the session to auto mode instead.
+describe('isRootOutsideSandbox', () => {
+  it('is false for an unprivileged uid regardless of env', () => {
+    expect(isRootOutsideSandbox({ getuid: () => 1001, env: {} })).toBe(false);
+  });
+
+  it('is true for uid 0 with no sandbox marker', () => {
+    expect(isRootOutsideSandbox({ getuid: () => 0, env: {} })).toBe(true);
+  });
+
+  it('is false for uid 0 when IS_SANDBOX=1 (the sanctioned escape hatch)', () => {
+    expect(isRootOutsideSandbox({ getuid: () => 0, env: { IS_SANDBOX: '1' } })).toBe(false);
+  });
+
+  it('only accepts the exact string "1" for IS_SANDBOX, like Claude Code', () => {
+    expect(isRootOutsideSandbox({ getuid: () => 0, env: { IS_SANDBOX: 'true' } })).toBe(true);
+    expect(isRootOutsideSandbox({ getuid: () => 0, env: { IS_SANDBOX: '' } })).toBe(true);
+  });
+
+  it('is false for uid 0 under the bubblewrap sandbox', () => {
+    expect(isRootOutsideSandbox({ getuid: () => 0, env: { CLAUDE_CODE_BUBBLEWRAP: '1' } })).toBe(false);
+  });
+
+  it('is false when getuid is unavailable (non-POSIX platforms)', () => {
+    // null, not undefined: undefined would trigger the process.getuid default,
+    // which makes this test fail whenever the suite itself runs as root.
+    expect(isRootOutsideSandbox({ getuid: null, env: {} })).toBe(false);
+  });
+});
+
+describe('guardRootBypass', () => {
+  it('leaves a bypass session alone for an unprivileged user', () => {
+    expect(guardRootBypass(true, { getuid: () => 1001, env: {} }))
+      .toEqual({ bypass: true, downgraded: false });
+  });
+
+  it('leaves an auto session alone even as root (nothing to downgrade)', () => {
+    expect(guardRootBypass(false, { getuid: () => 0, env: {} }))
+      .toEqual({ bypass: false, downgraded: false });
+  });
+
+  it('downgrades a bypass session to auto when running as root outside a sandbox', () => {
+    expect(guardRootBypass(true, { getuid: () => 0, env: {} }))
+      .toEqual({ bypass: false, downgraded: true });
+  });
+
+  it('keeps bypass for root inside a sandbox', () => {
+    expect(guardRootBypass(true, { getuid: () => 0, env: { IS_SANDBOX: '1' } }))
+      .toEqual({ bypass: true, downgraded: false });
+  });
+
+  it('feeds permissionSpawnArgs the downgraded value', () => {
+    const { bypass } = guardRootBypass(true, { getuid: () => 0, env: {} });
+    expect(permissionSpawnArgs(bypass)).toEqual([
+      '--permission-mode', 'auto',
+      '--permission-prompt-tool', 'mcp__ask-user__permission_request',
+    ]);
   });
 });

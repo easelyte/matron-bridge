@@ -2144,9 +2144,11 @@ describe('index.js agent-chat room wiring (source inspection)', () => {
     const teardown = src.slice(start, end);
     expect(teardown.indexOf('roomDelivery.pendingCount(')).toBeLessThan(teardown.indexOf('roomDelivery.dropSession('));
     expect(teardown).toMatch(/if \(strandedRoomMessages && convoId\) \{\s*\n\s*journalPublishNotice\(convoId, formatRoomDeliveryFailedNotice\(strandedRoomMessages\)\)/);
-    // Eviction must auto-leave every joined room so the peer's bridge doesn't
-    // keep publishing into a black hole (whole-branch review, I4).
-    expect(src.slice(start, end)).toMatch(/agentInvites\.leave\(\{ roomId: r\.roomId \}\)[\s\S]*agentRooms\.setState\(r\.roomId, 'left'\)/);
+    // Eviction must NOT leave the rooms (2026-09-21): the conversation is
+    // still resumable and keeps them. The I4 black-hole guard lives in
+    // deliverRoomFrameTo / orphanRoomBinding instead (test/agent-chat.test.js).
+    expect(src.slice(start, end)).not.toMatch(/agentInvites\.leave\(/);
+    expect(src.slice(start, end)).not.toMatch(/agentRooms\.setState\(/);
   });
 
   it('an inbound join_request never touches the room record — only the pendingJoinRequests seam (whole-branch review, C1)', () => {
