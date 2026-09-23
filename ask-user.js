@@ -717,10 +717,7 @@ async function callItems(name, args, render) {
   // ten-minute bucket, so a retry replays the existing row instead. See
   // lib/missions-idem.js.
   if (name === 'create' || name === 'comment') {
-    payload.idem_key = itemIdemKey({
-      op: `item_${name}`, roomId: ROOM_ID,
-      kind: args?.kind, title: args?.title, body: args?.body, id: args?.id,
-    });
+    payload.idem_key = itemIdemKey({ op: `item_${name}`, roomId: ROOM_ID, args: args || {} });
   }
   try {
     const res = await fetch(`${BRIDGE_API}/items/${name}`, {
