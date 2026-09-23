@@ -2603,8 +2603,14 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
     sandbox: CODEX_SANDBOX_MODE,
     networkAccess: CODEX_NETWORK_ACCESS,
     developerInstructions: CODEX_BRIDGE_PROMPT + (CODEX_APP_SERVER ? '' : '\nLegacy exec transport: native approvals, native questions, and Matron MCP tools are unavailable. If blocked, explain it in your final response.'),
-    // Journal-token scoping for Codex children: see buildCodexSpawnEnv.
-    env: buildCodexSpawnEnv({ roomId, apiPort: API_PORT }),
+    // Journal-token scoping for Codex children: see buildCodexSpawnEnv (stripped
+    // on app-server, kept on legacy exec for its /items HTTP fallback).
+    env: buildCodexSpawnEnv({
+      roomId,
+      apiPort: API_PORT,
+      appServer: CODEX_APP_SERVER,
+      journalProxyHeaderFile: JOURNAL_PROXY_HEADER_FILE,
+    }),
     config: CODEX_APP_SERVER ? codexMcpConfig({ baseConfig: RAW_MCP_CONFIG, extras,
       bridgeDir: __dirname, roomId, apiPort: API_PORT, showFileToken }) : {},
   });
