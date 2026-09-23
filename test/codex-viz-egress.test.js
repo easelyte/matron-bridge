@@ -202,6 +202,42 @@ describe('codex-viz unknown/future item type diagnostics', () => {
     });
     expect(JSON.stringify(publisher.calls)).not.toContain(SECRET);
   });
+
+  it('neutralizes Markdown/link/newline/bidi injection carried in the item type', () => {
+    // A hostile or newer producer sets an item type that tries to break out of
+    // the inline-code wrapper and inject an assistant-authored link/instruction.
+    const hostileType = '`\n[Authorize](https://attacker.invalid)\n`‮';
+    const { publisher } = route({
+      type: 'item.completed',
+      item: { id: 'x', type: hostileType },
+    });
+    const line = publisher.calls.find(call => call.method === 'publishText');
+    expect(line).toBeDefined();
+    const body = line.payload.body;
+    // Only the inline-code wrapper's own backticks remain; the label between
+    // them is a bounded [A-Za-z0-9 ] grammar — no markdown link, no newline, no
+    // stray backtick, no bidi control can escape the wrapper.
+    expect(body.startsWith('`') && body.endsWith('`')).toBe(true);
+    const label = body.slice(1, -1);
+    expect(label).toMatch(/^[A-Za-z0-9 ]+$/);
+    // The label is plain words only, so no markdown link can form even though
+    // harmless word fragments ("https", "attacker") may survive as text.
+    expect(body).not.toContain('](');
+    expect(body).not.toContain('\n');
+    expect(body).not.toContain('‮');
+    expect(body).not.toContain('attacker.invalid');
+  });
+
+  it('length-caps an oversized item type', () => {
+    const { publisher } = route({
+      type: 'item.completed',
+      item: { id: 'x', type: 'a'.repeat(5000) },
+    });
+    const line = publisher.calls.find(call => call.method === 'publishText');
+    expect(line).toBeDefined();
+    // Wrapper (2 backticks) + at most 80 label chars.
+    expect(line.payload.body.length).toBeLessThanOrEqual(82);
+  });
 });
 
 describe('codex-viz version tolerance (no upper band, no manual bump)', () => {
