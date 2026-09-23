@@ -591,7 +591,7 @@ describe('buildFilesDeepLink', () => {
 
   it('mints a token-less #files= hash link for an in-root, non-sensitive file', () => {
     const link = buildFilesDeepLink(`${WORK}/dan-offer.md`, WORK, WEB);
-    expect(link).toBe(`${WEB}/journal/#files=${encodeURIComponent(`${WORK}/dan-offer.md`)}`);
+    expect(link).toBe(`${WEB}/#files=${encodeURIComponent(`${WORK}/dan-offer.md`)}`);
     // No token/HMAC in the URL — auth is the operator's web session.
     expect(link).not.toContain('token=');
   });
@@ -599,13 +599,13 @@ describe('buildFilesDeepLink', () => {
   it('url-encodes a path with spaces so the fragment stays a single token', () => {
     const p = `${WORK}/my notes.md`;
     const link = buildFilesDeepLink(p, WORK, WEB);
-    expect(link).toBe(`${WEB}/journal/#files=${encodeURIComponent(p)}`);
+    expect(link).toBe(`${WEB}/#files=${encodeURIComponent(p)}`);
     expect(link).toContain('%20');
   });
 
   it('strips a trailing slash from the web base URL', () => {
     const link = buildFilesDeepLink(`${WORK}/a.md`, WORK, `${WEB}/`);
-    expect(link).toBe(`${WEB}/journal/#files=${encodeURIComponent(`${WORK}/a.md`)}`);
+    expect(link).toBe(`${WEB}/#files=${encodeURIComponent(`${WORK}/a.md`)}`);
   });
 
   it('returns null when the web base URL is unset (feature dormant)', () => {
@@ -629,14 +629,14 @@ describe('buildFilesDeepLink', () => {
 
   it('gates on sensitive names with no workdir given (containment optional, sensitivity always)', () => {
     expect(buildFilesDeepLink(`${WORK}/a.md`, null, WEB)).toBe(
-      `${WEB}/journal/#files=${encodeURIComponent(`${WORK}/a.md`)}`,
+      `${WEB}/#files=${encodeURIComponent(`${WORK}/a.md`)}`,
     );
     expect(buildFilesDeepLink(`${WORK}/id_rsa`, null, WEB)).toBeNull();
   });
 });
 
 describe('appendFilesDeepLink', () => {
-  const LINK = 'https://bridge.easelyte.ai/journal/#files=%2Fx%2Fa.md';
+  const LINK = 'https://bridge.easelyte.ai/#files=%2Fx%2Fa.md';
 
   it('appends a labelled link line after existing caption text', () => {
     const out = appendFilesDeepLink('here is the doc', LINK);

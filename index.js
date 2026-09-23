@@ -419,7 +419,7 @@ const SERVER_LABEL = process.env.SERVER_LABEL || (() => {
 const HMAC_SECRET = process.env.HMAC_SECRET || '';
 const VIEWER_BASE_URL = process.env.VIEWER_BASE_URL || '';
 // Base URL of the matron-web client (prod: https://bridge.easelyte.ai). Used to mint token-less
-// hash deep links into the web Files pane (`${WEB_BASE_URL}/journal/#files=<enc>`, loop #739) for
+// hash deep links into the web Files pane (`${WEB_BASE_URL}/#files=<enc>`, loop #739) for
 // doc handoffs — auth is the operator's existing web session, so no HMAC. Unset → deep links are
 // dormant and every handover surface falls back to the plain path.
 const WEB_BASE_URL = process.env.WEB_BASE_URL || '';

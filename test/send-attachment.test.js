@@ -387,7 +387,7 @@ describe('createSendAttachmentHandler Files deep link (loop #739)', () => {
     const realWorkdir = await realpath(workdir);
     const abs = path.join(realWorkdir, 'shot.png');
     expect(published[0].payload.caption).toBe(
-      `the bug\n\n📁 Open shot.png in Files: ${WEB}/journal/#files=${encodeURIComponent(abs)}`,
+      `the bug\n\n📁 Open shot.png in Files: ${WEB}/#files=${encodeURIComponent(abs)}`,
     );
   });
 
@@ -398,7 +398,7 @@ describe('createSendAttachmentHandler Files deep link (loop #739)', () => {
     const realWorkdir = await realpath(workdir);
     const abs = path.join(realWorkdir, 'report.pdf');
     expect(published[0].payload.caption).toBe(
-      `📁 Open report.pdf in Files: ${WEB}/journal/#files=${encodeURIComponent(abs)}`,
+      `📁 Open report.pdf in Files: ${WEB}/#files=${encodeURIComponent(abs)}`,
     );
   });
 
