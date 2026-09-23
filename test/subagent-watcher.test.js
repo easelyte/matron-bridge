@@ -466,6 +466,11 @@ describe('index.js subagent-resume wiring (source inspection)', () => {
     expect(body).toContain('noteBackgroundTaskStarted(event.tool_use_id, event.task_id)');
     expect(body).toContain('notifyTaskStarted()');
     expect(body).toContain('forceAttach(event.task_id)');
-    expect(body).toContain('revive(event.task_id)');
+    // Revive is now gated on the start disposition (loop #764): it fires for
+    // started-new/resumed, is suppressed for a rejected-replay, and advances the
+    // incarnation counter only for a genuine resume.
+    expect(body).toContain('revive(event.task_id');
+    expect(body).toContain("startDisposition === 'resumed'");
+    expect(body).toContain("startDisposition === 'started-new'");
   });
 });

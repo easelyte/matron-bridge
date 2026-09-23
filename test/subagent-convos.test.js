@@ -567,13 +567,24 @@ describe('createSubagentConvoTracker', () => {
       tracker.noteTaskResult('toolu_bg');                                  // premature finish
       expect(child.state).toBe(CHILD_STATE_FINISHED);
 
-      // First task_started for the ref: not a replay -> started-new, so index.js revives.
+      // First task_started for the ref: not a replay -> started-new, so index.js
+      // revives WITHOUT advancing generation (corrective revival, not a resume).
       const disp = tracker.noteBackgroundTaskStarted('toolu_bg', 'agent-bg');
       expect(disp).toBe(TASK_STARTED_STARTED_NEW);
-      tracker.revive('agent-bg');
+      tracker.revive('agent-bg', { incrementGeneration: disp === TASK_STARTED_RESUMED });
       expect(child.state).toBe(CHILD_STATE_RUNNING);
+      // Corrective revival must NOT look like a resume, or the id-less completion
+      // fallback (#751) would strand this single-incarnation run.
+      expect(child.generation).toBe(0);
 
-      // A subsequent same-ref replay (now that the start has been seen) is rejected.
+      // An id-less completion still finishes this never-resumed run (generation 0).
+      tracker.noteTaskCompleted('agent-bg'); // no tool_use_id
+      expect(child.state).toBe(CHILD_STATE_FINISHED);
+    });
+
+    it('a same-ref replay after a real completion is rejected (start already seen)', () => {
+      tracker.noteBackgroundTaskStarted('toolu_bg', 'agent-bg');
+      const child = tracker.discover('agent-bg', { label: 'BG', agentType: null });
       tracker.noteTaskCompleted('agent-bg', 'toolu_bg'); // real completion
       expect(child.state).toBe(CHILD_STATE_FINISHED);
       expect(tracker.noteBackgroundTaskStarted('toolu_bg', 'agent-bg'))

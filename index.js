@@ -4915,8 +4915,14 @@ function handleClaudeEvent(session, event) {
             // result: when the agent finished and resumed WITHOUT a bridge restart
             // its tail is still live, so forceAttach no-ops while the child convo
             // is nonetheless sitting at `done`. revive() itself no-ops for an
-            // unknown or already-running child.
-            session.subagentConvos?.revive(event.task_id);
+            // unknown or already-running child. Advance the incarnation counter
+            // only for a genuine resume; a 'started-new' revive here is a
+            // corrective revival of a first run finished early by the launch
+            // tool_result (#764 F1) — the SAME incarnation, so generation must
+            // not advance or the id-less completion fallback (#751) would strand it.
+            session.subagentConvos?.revive(event.task_id, {
+              incrementGeneration: startDisposition === 'resumed',
+            });
           }
         }
       } else if (event.subtype === 'task_notification') {
