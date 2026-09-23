@@ -22,7 +22,15 @@ describe('items tracker wiring', () => {
   });
 
   it('uploads item attachments through send-attachment\'s guarded resolver, not a bespoke read', () => {
-    expect(index).toMatch(/uploadLocalFile: \(session, reqPath\) => resolveAndUploadLocalFile\(\{ session, reqPath, publisher: journalPublisher \}\)/);
+    // opts is threaded so uploadAll can request a validate-only pass (loop #763
+    // multi-attachment atomicity) before any blob is uploaded.
+    expect(index).toMatch(/uploadLocalFile: \(session, reqPath, opts\) => resolveAndUploadLocalFile\(\{ session, reqPath, publisher: journalPublisher, \.\.\.opts \}\)/);
+  });
+
+  it('callItems attaches an idempotency key for create and comment (loop #763 F2)', () => {
+    expect(askUser).toContain('itemIdemKey');
+    expect(askUser).toMatch(/name === 'create' \|\| name === 'comment'/);
+    expect(askUser).toMatch(/payload\.idem_key = itemIdemKey\(/);
   });
 
   it('registers all eight item_* tools, each posting through callItems', () => {

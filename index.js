@@ -10714,7 +10714,7 @@ const itemsHandlers = createItemsHandlers({
   sessions,
   journalConvoIdFor,
   client: itemsClient,
-  uploadLocalFile: (session, reqPath) => resolveAndUploadLocalFile({ session, reqPath, publisher: journalPublisher }),
+  uploadLocalFile: (session, reqPath, opts) => resolveAndUploadLocalFile({ session, reqPath, publisher: journalPublisher, ...opts }),
   webBaseUrl: WEB_BASE_URL,
 });
 

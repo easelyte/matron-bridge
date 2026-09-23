@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { missionIdemKey } from '../lib/missions-idem.js';
+import { missionIdemKey, itemIdemKey } from '../lib/missions-idem.js';
 
 const base = { op: 'post', roomId: '!r:s', kind: 'progress', title: 'Landed PR', body: 'the diff', now: 1789056600000 };
 
@@ -43,5 +43,33 @@ describe('missionIdemKey', () => {
     const after = Date.now();
     const candidates = new Set([before, after].map((now) => missionIdemKey({ op: 'start', roomId: '!r:s', title: 'M', now })));
     expect(candidates.has(key)).toBe(true);
+  });
+});
+
+describe('itemIdemKey (loop #763)', () => {
+  const create = { op: 'item_create', roomId: '!r:s', kind: 'task', title: 'Ship it', body: 'do the thing', now: 1789056600000 };
+  const comment = { op: 'item_comment', roomId: '!r:s', id: 'it_7', body: 'progress note', now: 1789056600000 };
+
+  it('is a sha256 hex digest, stable across a retry in the same bucket', () => {
+    expect(itemIdemKey(create)).toMatch(/^[0-9a-f]{64}$/);
+    expect(itemIdemKey(create)).toBe(itemIdemKey({ ...create, now: create.now + 599_999 }));
+    expect(itemIdemKey(comment)).toBe(itemIdemKey({ ...comment }));
+  });
+
+  it('differs across a bucket boundary', () => {
+    expect(itemIdemKey(create)).not.toBe(itemIdemKey({ ...create, now: create.now + 600_000 }));
+  });
+
+  it('a comment key includes the item id — same body on DIFFERENT items must not collide', () => {
+    expect(itemIdemKey(comment)).not.toBe(itemIdemKey({ ...comment, id: 'it_8' }));
+  });
+
+  it('differs for a different op, room, kind, title or body', () => {
+    const key = itemIdemKey(create);
+    expect(itemIdemKey({ ...create, op: 'item_comment' })).not.toBe(key);
+    expect(itemIdemKey({ ...create, roomId: '!other:s' })).not.toBe(key);
+    expect(itemIdemKey({ ...create, kind: 'decision' })).not.toBe(key);
+    expect(itemIdemKey({ ...create, title: 'Ship it 2' })).not.toBe(key);
+    expect(itemIdemKey({ ...create, body: 'a different body' })).not.toBe(key);
   });
 });
