@@ -130,6 +130,32 @@ function startFakeHttpServer(handler) {
 const FAST_BACKOFF = { backoffBaseMs: 15, backoffCapMs: 60 };
 
 describe('createJournalPublisher', () => {
+  // Loop #787: a text frame whose body is not a string reached the journal
+  // as `{"body":{"username":"fantin"}}` (the auto-resume notice slot was fed
+  // the router ctx). The sink refuses a non-string body instead of rendering
+  // an object as chat text.
+  it('refuses a text publish whose body is not a string', async () => {
+    const fake = await startFakeServer();
+    const warnings = [];
+    const pub = createJournalPublisher({
+      url: fake.url, token: 'tok', log: { warn: m => warnings.push(m), error: () => {} }, ...FAST_BACKOFF,
+    });
+
+    pub.upsertConvo('c1', { title: 'Room', sessionState: 'running' });
+    expect(pub.publishText('c1', { body: { username: 'fantin' }, from: 'assistant' })).toBe(false);
+    expect(pub.publishTextBestEffort('c1', { body: ['x'], from: 'assistant' })).toBe(false);
+    pub.publishText('c1', { body: 'ok', from: 'assistant' });
+
+    await waitFor(() => fake.received.some(f => f.op === 'publish'));
+    await delay(30);
+    const publishes = fake.received.filter(f => f.op === 'publish');
+    expect(publishes.map(f => f.payload.body)).toEqual(['ok']);
+    expect(warnings.some(w => /non-string text body/.test(w))).toBe(true);
+
+    pub.close();
+    await fake.close();
+  });
+
   it('handshake then publish: convo_upsert precedes the first publish', async () => {
     const fake = await startFakeServer();
     const pub = createJournalPublisher({ url: fake.url, token: 'tok', log: silentLog, ...FAST_BACKOFF });

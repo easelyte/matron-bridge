@@ -9291,6 +9291,9 @@ function resumeSleepingSession(roomId, prev, noticeConvoId, noticeText) {
 // and print mode's stdin buffers), or null to fall back to the unknown-convo
 // notice.
 function journalResumeConvo(convoId, noticeText = JOURNAL_RESUME_NOTICE) {
+  // Never publish a non-string notice (loop #787): a mis-wired caller once
+  // passed the router ctx here and it rendered as `{"username":…}` JSON.
+  if (typeof noticeText !== 'string') noticeText = JOURNAL_RESUME_NOTICE;
   const data = loadPersistedSessions();
   for (const [roomId, prev] of Object.entries(data)) {
     if (!prev || (prev.journalConvoId !== convoId && prev.sessionId !== convoId)) continue;
@@ -10342,7 +10345,10 @@ const journalInputConsumer = createJournalInputConsumer({
   routePromptReply: journalOnPromptReply,
   ...permissionSeams,
   resolvePermissionReply: resolveJournalPermissionReply,
-  resumeSessionForConvo: journalResumeConvo,
+  // The router passes (convoId, {username}); journalResumeConvo's 2nd param is
+  // the notice TEXT, so drop the ctx here (loop #787: it was published as
+  // `{"body":{"username":…}}` after every message that woke a reaped session).
+  resumeSessionForConvo: (convoId) => journalResumeConvo(convoId),
   // A verified /sleep card tap whose session the idle reaper already removed
   // (lib/journal-input-router.js isSleepPickerTap). The card acts on the
   // host, so it needs only a convo to answer into — no session, no resume.

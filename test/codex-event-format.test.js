@@ -2,8 +2,9 @@ import { readFileSync } from 'node:fs';
 import { EventEmitter } from 'node:events';
 import { fileURLToPath } from 'node:url';
 import { describe, expect, it, vi } from 'vitest';
-import { formatAndRoute } from '../lib/codex-event-format.js';
+import { formatAndRoute, redactAndRoute } from '../lib/codex-event-format.js';
 import { createJournalPublisher } from '../lib/journal-publisher.js';
+import { createPublishRedactor } from '../lib/redact.js';
 
 const FIXTURE_PATH = fileURLToPath(
   new URL('./fixtures/codex-json/review-run.jsonl', import.meta.url),
@@ -651,5 +652,108 @@ describe('formatAndRoute', () => {
 
     expect(calls.find(call => call.method === 'publishStatus')).toBeUndefined();
     expect(calls[0].args[1]).not.toHaveProperty('model');
+  });
+});
+
+// Loop #787: the known codex exec --json protocol events that still reached the
+// journal as raw JSON text on the SUPPORTED schema path (error, turn.failed,
+// item.updated). Every one must render as a readable line or an ephemeral
+// activity, never as a stringified event body.
+describe('formatAndRoute known protocol events (loop #787)', () => {
+  const isRawJsonBody = call => call.method === 'publishText'
+    && typeof call.args[1]?.body === 'string'
+    && call.args[1].body.trimStart().startsWith('{');
+
+  it('renders a top-level error as a readable warning line, not raw JSON', () => {
+    const { calls, ctx } = makeContext();
+
+    formatAndRoute({ type: 'error', message: 'unexpected status 404 Not Found' }, ctx);
+
+    expect(calls.some(isRawJsonBody)).toBe(false);
+    expect(calls.filter(call => call.method === 'publishText')).toEqual([{
+      method: 'publishText',
+      args: [ctx.convoId, { body: '⚠️ Codex error: `unexpected status 404 Not Found`', from: 'assistant' }],
+    }]);
+    expect(ctx.state.unparsed).toBe(0);
+  });
+
+  it('keeps an error message inside its code span (no markdown escape, bounded)', () => {
+    const { calls, ctx } = makeContext();
+
+    formatAndRoute({ type: 'error', message: 'bad `x` [link](http://e.vil)\nsecond line' + 'y'.repeat(900) }, ctx);
+
+    const body = calls.find(call => call.method === 'publishText').args[1].body;
+    const inner = body.slice('⚠️ Codex error: `'.length, -1);
+    expect(inner).not.toContain('`');
+    expect(inner).not.toMatch(/[\r\n]/);
+    expect(inner.length).toBeLessThanOrEqual(500);
+  });
+
+  it('renders turn.failed as a failure line, lands any pending answer, and goes idle', () => {
+    const { calls, ctx } = makeContext();
+
+    formatAndRoute({ type: 'item.completed', item: { id: 'a1', type: 'agent_message', text: 'partial answer' } }, ctx);
+    formatAndRoute({ type: 'turn.failed', message: 'stream disconnected' }, ctx);
+
+    expect(calls.some(isRawJsonBody)).toBe(false);
+    const bodies = calls.filter(call => call.method === 'publishText').map(call => call.args[1].body);
+    expect(bodies).toEqual(['partial answer', '⚠️ Codex turn failed: `stream disconnected`']);
+    expect(calls).toContainEqual({ method: 'publishActivity', args: [ctx.convoId, 'idle'] });
+    expect(ctx.state.terminalSeen).toBe(true);
+  });
+
+  it('renders a bare turn.failed stub without a message', () => {
+    const { calls, ctx } = makeContext();
+
+    formatAndRoute({ type: 'turn.failed' }, ctx);
+
+    expect(calls.filter(call => call.method === 'publishText').map(call => call.args[1].body))
+      .toEqual(['⚠️ Codex turn failed']);
+  });
+
+  it('carries turn.failed error.message through the allowlist (redacted), not as JSON', () => {
+    const { calls, ctx } = makeContext({ redact: value => value.replaceAll('sk-live-123', '[REDACTED]') });
+
+    redactAndRoute({ type: 'turn.failed', error: { message: 'auth failed for sk-live-123' } }, ctx);
+
+    expect(calls.some(isRawJsonBody)).toBe(false);
+    expect(calls.filter(call => call.method === 'publishText').map(call => call.args[1].body))
+      .toEqual(['⚠️ Codex turn failed: `auth failed for [REDACTED]`']);
+  });
+
+  it('scrubs an assignment behind prose in a NUL-framed turn.failed diagnostic (production redactor)', () => {
+    const { calls, ctx } = makeContext({ redact: createPublishRedactor() });
+
+    redactAndRoute({
+      type: 'turn.failed',
+      error: { message: 'fatal\nALPHA=canary-secret-value\nmore-value\0BRAVO=other-value' },
+    }, ctx);
+
+    const bodies = calls.filter(call => call.method === 'publishText').map(call => call.args[1].body);
+    expect(bodies).toHaveLength(1);
+    expect(bodies[0]).not.toContain('canary-secret-value');
+    expect(bodies[0]).not.toContain('more-value');
+    expect(bodies[0]).not.toContain('other-value');
+    expect(bodies[0]).toContain('fatal');
+  });
+
+  it('scrubs a NUL-framed top-level error diagnostic the same way', () => {
+    const { calls, ctx } = makeContext({ redact: createPublishRedactor() });
+
+    redactAndRoute({ type: 'error', message: 'boom\r\nALPHA=canary-secret-value\0tail' }, ctx);
+
+    const body = calls.find(call => call.method === 'publishText').args[1].body;
+    expect(body).not.toContain('canary-secret-value');
+    expect(body).toContain('boom');
+  });
+
+  it('routes item.updated (todo_list) to an ephemeral activity, never a durable post', () => {
+    const { calls, ctx } = makeContext();
+
+    formatAndRoute({ type: 'item.updated', item: { id: 'item_1', type: 'todo_list' } }, ctx);
+
+    expect(calls.filter(call => call.method === 'publishText')).toEqual([]);
+    expect(calls).toContainEqual({ method: 'publishActivity', args: [ctx.convoId, 'tool', 'Todo list'] });
+    expect(ctx.state.durableEvents).toBe(0);
   });
 });
