@@ -4275,6 +4275,7 @@ function setupSubagentWatcher(session, workdir, sessionId) {
   session.subagentConvos = createSubagentConvoTracker({
     publisher: journalPublisher,
     getParentConvoId: () => journalConvoIdFor(session),
+    getParentModel: () => session.currentModel || session.initData?.model,
     runningStore: subagentRunningStore,
     log: console,
   });
