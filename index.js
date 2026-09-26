@@ -81,7 +81,7 @@ import { selectStrandedChildren, strandedRepairFrames } from './lib/subagent-rec
 import { planTransition, selectEpochRepairs } from './lib/session-state-repair.js';
 import { createRunStateOutbox } from './lib/run-state-outbox.js';
 import { journalReemitCodexOutcomes } from './lib/codex-convos.js';
-import { formatSubagentToolBody } from './lib/subagent-tool-format.js';
+import { formatSubagentToolBody, subagentToolStep } from './lib/subagent-tool-format.js';
 import { ivUploadDir, ivUploadAnnotation } from './lib/iv-uploads.js';
 import { matronFilesDir } from './lib/matron-files.js';
 import { parseUsageLimits, formatLimits } from './lib/usage-limits.js';
@@ -4451,7 +4451,11 @@ function handleSubagentEvent(session, { agentId, label, agentType, event }) {
       }
       const body = formatSubagentToolBody(block.name, block.input || {});
       if (!body) continue;
-      journalPublisher.publishText(convoId, { body, from: 'assistant' });
+      // `step` is the same call as data (lib/subagent-tool-format.js): clients
+      // read it for the plain-English activity line; older clients ignore it
+      // and render the body exactly as before.
+      const step = subagentToolStep(block.name, block.input || {});
+      journalPublisher.publishText(convoId, { body, from: 'assistant', ...(step ? { step } : {}) });
       session.lastActivityAt = Date.now();
     }
   }

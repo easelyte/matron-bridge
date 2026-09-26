@@ -1,5 +1,8 @@
 import { describe, it, expect } from 'vitest';
-import { formatSubagentToolBody } from '../lib/subagent-tool-format.js';
+import fs from 'node:fs';
+import path from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { formatSubagentToolBody, subagentToolStep } from '../lib/subagent-tool-format.js';
 
 // Regression under test (Dan, 2026-07-16): sub-chat panels showed only the
 // subagent's text messages. The old inline formatter in index.js returned
@@ -77,5 +80,42 @@ describe('formatSubagentToolBody', () => {
     expect(formatSubagentToolBody(undefined)).toBeNull();
     expect(formatSubagentToolBody('')).toBeNull();
     expect(formatSubagentToolBody('Read')).toBe('🔧 Read');
+  });
+});
+
+// payload.step (2026-09-26): the structured twin of the text body, read by
+// matron-web's plain-English activity (src/journal/activity-text.ts payloadStep:
+// a flat { tool, command?, path?, pattern?, url?, description? }).
+describe('subagentToolStep', () => {
+  it('describes each call with the fields the body shows', () => {
+    expect(subagentToolStep('Bash', { command: 'pnpm test' })).toEqual({ tool: 'Bash', command: 'pnpm test' });
+    expect(subagentToolStep('Read', { file_path: '/tmp/a.txt' })).toEqual({ tool: 'Read', path: '/tmp/a.txt' });
+    expect(subagentToolStep('Grep', { pattern: 'TODO' })).toEqual({ tool: 'Grep', pattern: 'TODO' });
+    expect(subagentToolStep('Glob', { pattern: '**/*.swift' })).toEqual({ tool: 'Glob', pattern: '**/*.swift' });
+    expect(subagentToolStep('WebSearch', { query: 'swift textkit' })).toEqual({ tool: 'WebSearch', pattern: 'swift textkit' });
+    expect(subagentToolStep('WebFetch', { url: 'https://x.test/a' })).toEqual({ tool: 'WebFetch', url: 'https://x.test/a' });
+    expect(subagentToolStep('Task', { description: 'scan logs' })).toEqual({ tool: 'Task', description: 'scan logs' });
+    expect(subagentToolStep('TodoWrite', { todos: [] })).toEqual({ tool: 'TodoWrite' });
+    expect(subagentToolStep('mcp__ask-user__item_create', {})).toEqual({ tool: 'mcp__ask-user__item_create' });
+  });
+
+  it('never carries more of a command than the body does', () => {
+    const step = subagentToolStep('Bash', { command: 'x'.repeat(150) });
+    expect(step.command).toBe(`${'x'.repeat(100)}…`);
+    expect(formatSubagentToolBody('Bash', { command: 'x'.repeat(150) })).toContain(step.command);
+  });
+
+  it('is null exactly when no text line is published (diff-card tools, no tool name)', () => {
+    expect(subagentToolStep('Edit', { file_path: '/a' })).toBeNull();
+    expect(subagentToolStep('Write', { file_path: '/a' })).toBeNull();
+    expect(subagentToolStep('MultiEdit', { file_path: '/a' })).toBeNull();
+    expect(subagentToolStep('', {})).toBeNull();
+    expect(subagentToolStep(undefined, {})).toBeNull();
+  });
+
+  it('is published with the body on the subagent text event', () => {
+    const here = path.dirname(fileURLToPath(import.meta.url));
+    const source = fs.readFileSync(path.join(here, '..', 'index.js'), 'utf8');
+    expect(source).toMatch(/const step = subagentToolStep\(block\.name, block\.input \|\| \{\}\);\s*journalPublisher\.publishText\(convoId, \{ body, from: 'assistant', \.\.\.\(step \? \{ step \} : \{\}\) \}\);/);
   });
 });
