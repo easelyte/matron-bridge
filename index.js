@@ -11260,14 +11260,22 @@ const apiServer = createServer(async (req, res) => {
   // Journal READ proxy (loop #765): forward the allowlisted journal search
   // routes to the journal under the bridge's own token so children need no
   // JOURNAL_TOKEN. Handled first, and only for paths the proxy owns; any other
-  // path returns null and falls through to the normal dispatch below.
+  // path returns null and falls through to the normal dispatch below. Guarded:
+  // this listener has no outer catch, so a throw would be an unhandled
+  // rejection that takes the bridge down.
   {
-    const proxied = await journalReadProxy.handle({
-      method: req.method,
-      pathname: url.pathname,
-      search: url.search,
-      callerToken: req.headers[JOURNAL_PROXY_CAP_HEADER],
-    });
+    let proxied;
+    try {
+      proxied = await journalReadProxy.handle({
+        method: req.method,
+        pathname: url.pathname,
+        search: url.search,
+        callerToken: req.headers[JOURNAL_PROXY_CAP_HEADER],
+      });
+    } catch (e) {
+      console.warn(`[journal] read proxy error: ${e.message}`);
+      proxied = { status: 500, contentType: 'application/json', body: JSON.stringify({ error: 'proxy error' }) };
+    }
     if (proxied) {
       res.writeHead(proxied.status, { 'Content-Type': proxied.contentType });
       res.end(proxied.body);
