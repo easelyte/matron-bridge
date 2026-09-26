@@ -2,7 +2,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
 import {
   OPS_SECTIONS, OPS_RESULT_MAX_BYTES, processName, splitCommand, parseCpuLine, parseProcPidStat,
-  parseMeminfo, parsePasswd, fitToBudget, readHostSection, runOpsCommand, createOpsSnapshot, OpsError,
+  parseMeminfo, parsePasswd, fitToBudget, detectPageSize, readHostSection, runOpsCommand, createOpsSnapshot, OpsError,
 } from '../lib/ops-snapshot.js';
 
 describe('processName (contract §2.1: never the full command line)', () => {
@@ -25,6 +25,17 @@ describe('processName (contract §2.1: never the full command line)', () => {
     expect(processName(['/usr/bin/bash', '/root/scripts/run.sh', 'secret'])).toBe('bash run.sh');
     expect(processName(['sh', '-e', '/x/y.sh'])).toBe('sh y.sh');
     expect(processName(['node', '/usr/bin/codex', 'exec', 'prompt text'])).toBe('node codex');
+  });
+
+  it('never names a flag operand (review F1): only provable script paths', () => {
+    expect(processName(['python3', '-W', 'ignore:sk_live_123', '/srv/worker.py'])).toBe('python3 worker.py');
+    expect(processName(['python3', '-W', 'ignore:sk_live_123'])).toBe('python3');
+    expect(processName(['node', '--token', 'sk_live_abc', 'arg2'])).toBe('node');
+    expect(processName(['node', '--max-old-space-size', '4096', '/w/server.mjs'])).toBe('node server.mjs');
+    expect(processName(['node', '-r', 'dotenv/config', 'sk-secret'])).toBe('node');
+    expect(processName(['python3', 'ignore:sk_live_123'])).toBe('python3');
+    expect(processName(['python3', '-m', 'sk live'])).toBe('python3');
+    expect(processName(['bash', 'secret words'])).toBe('bash');
   });
 
   it('skips a bun/deno `run` subcommand', () => {
@@ -221,6 +232,20 @@ describe('readHostSection', () => {
     expect(h.processes[2]).toMatchObject({ name: 'codex', cpu_pct: 0 }); // no baseline -> 0, not garbage
     expect(h.processes[3]).toMatchObject({ name: 'bash', cpu_pct: 4, user: null });
     expect(JSON.stringify(h)).not.toMatch(/SECRET|TOKEN|secret/);
+  });
+
+  it('detects the kernel page size so 64 KiB-page hosts keep their processes (review F2)', async () => {
+    const f = fakeProc();
+    const readText = async (file) => {
+      if (file === '/proc/self/stat') return '1 (node) S 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 100 1000000 320';
+      if (file === '/proc/self/status') return 'VmRSS:\t20480 kB\n';
+      return f.readText(file);
+    };
+    expect(await detectPageSize(readText)).toBe(65536);
+    expect(await detectPageSize(f.readText)).toBe(4096);
+    // 1 MiB of 4 KiB pages is 256 pages; at 64 KiB the same count reads 16 MiB.
+    const h = await readHostSection(baseDeps(f, { readText }));
+    expect(h.processes.map((p) => p.pid)).toContain(12);
   });
 
   it('caps the process list at 12', async () => {
