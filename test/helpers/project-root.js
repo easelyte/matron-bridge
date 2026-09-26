@@ -33,12 +33,16 @@ export function assertRemovableProjectRoot(d, { prefix } = {}) {
 }
 
 // Create the real subagents dir for (workdir, sessionId) and register its
-// encoded project dir (…/projects/<enc>) in `roots` for teardown.
+// encoded project dir (…/projects/<enc>) in `roots` for teardown. The project
+// dir is created EXCLUSIVELY (non-recursive mkdir, EEXIST throws), so teardown
+// only ever removes a dir this test created — never a pre-existing project.
 export function makeSubagentsDir(workdir, sessionId, roots, opts) {
   const dir = subagentsDirFor(workdir, sessionId);
   const projectRoot = assertRemovableProjectRoot(projectDirFor(workdir), opts);
-  fs.mkdirSync(dir, { recursive: true });
+  fs.mkdirSync(claudeProjectsRoot(), { recursive: true });
+  fs.mkdirSync(projectRoot); // throws EEXIST for a dir we did not create
   roots.push(projectRoot);
+  fs.mkdirSync(dir, { recursive: true });
   return dir;
 }
 

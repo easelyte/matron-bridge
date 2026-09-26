@@ -65,6 +65,20 @@ describe('project-root teardown guard', () => {
     }
   });
 
+  it('makeSubagentsDir refuses to adopt a project dir that already exists', () => {
+    const w = workdir();
+    const existing = projectDirFor(w);
+    fs.mkdirSync(existing, { recursive: true });
+    fs.writeFileSync(path.join(existing, 'keep.jsonl'), 'x');
+    try {
+      expect(() => makeSubagentsDir(w, 'sid-4', roots)).toThrow(/EEXIST/);
+      expect(roots).toEqual([]);
+      expect(fs.existsSync(path.join(existing, 'keep.jsonl'))).toBe(true);
+    } finally {
+      fs.rmSync(assertRemovableProjectRoot(existing), { recursive: true, force: true });
+    }
+  });
+
   it('removeProjectRoots throws (and removes nothing) for an unsafe root', () => {
     fs.mkdirSync(claudeProjectsRoot(), { recursive: true });
     const bad = [claudeProjectsRoot()];
