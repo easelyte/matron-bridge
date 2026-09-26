@@ -314,6 +314,7 @@ matron-bridge/
 ├── BRIDGE_CLAUDE.md      # Extra instructions for bridge-spawned Claude sessions
 ├── BRIDGE_CODEX.md       # Extra instructions for bridge-spawned Codex turns
 ├── docs/codex.md         # Codex setup, switching, security, and troubleshooting
+├── docs/agent-rpc.md     # Agent RPC methods (recent_folders, start, read/edit_file, ops_snapshot)
 ├── mcp-config.json       # MCP server config for Claude Code
 ├── viewer/               # HMAC-signed file viewer
 ├── setup/                # OS-dispatching installer, service, whisper

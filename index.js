@@ -116,6 +116,8 @@ import { createMediaDedupLedger } from './lib/media-dedup-ledger.js';
 import { createJournalPublisher, FLUSH_TIMEOUT_MS, deriveMediaHttpBaseUrl } from './lib/journal-publisher.js';
 import { createRpcRequestHandler } from './lib/journal-rpc.js';
 import { buildActivity, buildLimits, buildDisk } from './lib/spawn-capacity.js';
+import { buildBoxVitals, createCodexLimitsRefresher, BOX_STATUS_REPUBLISH_MS } from './lib/box-status.js';
+import { createOpsSnapshot, readHostSection } from './lib/ops-snapshot.js';
 import { createAgentSpawnHandlers } from './lib/agent-spawn.js';
 import { createSelfRestartHandler } from './lib/self-restart.js';
 import { createRecentFolders } from './lib/recent-folders.js';
@@ -272,6 +274,9 @@ const HOST_VITALS_SAMPLE_MS = parseInt(process.env.HOST_VITALS_SAMPLE_MS || '200
 const HOST_VITALS_DELTA_PCT = parseInt(process.env.HOST_VITALS_DELTA_PCT || '4', 10);
 const HOST_VITALS_HEARTBEAT_MS = parseInt(process.env.HOST_VITALS_HEARTBEAT_MS || '30000', 10);
 let _hostVitalsPushHandle = null;
+// box_status heartbeat (loop #542 phase B): re-publish every
+// BOX_STATUS_REPUBLISH_MS so the journal's persisted vitals stay fresh.
+let _boxStatusRepublishHandle = null;
 let _lastVitalsPublished = null; // { cpu, ram, at } of the last emitted frame
 
 // Restart carry-on window. A turn interrupted by a bridge restart is offered
@@ -684,6 +689,9 @@ function handleJournalReconnect() {
   // Every hello_ok is a fresh epoch for the journal's copy of this box's
   // status too (a box that just woke reports itself before anyone asks).
   publishBoxStatus('reconnect');
+  // Codex quotas are account-scoped and need no session, so a box that just
+  // woke can report them without waiting for a turn to end (throttled).
+  refreshCodexLimits();
   // A fresh epoch may follow a gap in which the Coordinator moved; the
   // replayed `coordinator` events cover a live bridge, this covers a cursor
   // reset (snapshot_required) that skipped them.
@@ -772,17 +780,22 @@ function publishBoxStatus(reason) {
   let limits = null;
   let disk = null;
   let accountEmail = null;
+  let vitals = null;
   try { activity = buildActivity({ sessions, persisted: loadPersistedSessions() }); } catch { /* best-effort */ }
-  try { limits = buildLimits(usageLimitsCache); } catch { /* best-effort */ }
+  try { limits = buildLimits(usageLimitsCache, codexLimits.cache); } catch { /* best-effort */ }
   try { disk = buildDisk({ path: DEFAULT_WORKDIR }); } catch { /* best-effort */ }
   try { accountEmail = getAccountEmail(); } catch { /* best-effort */ }
-  if (!activity && !limits && !disk && !accountEmail) return false;
+  // Host CPU/RAM (lib/box-status.js buildBoxVitals over the same sampler
+  // hostVitals() reads for status frames); omitted until both have a sample.
+  try { vitals = buildBoxVitals(hostVitals()); } catch { /* best-effort */ }
+  if (!activity && !limits && !disk && !accountEmail && !vitals) return false;
   const sent = journalPublisher.sendRoomOp({
     op: 'box_status',
     ...(activity ? { activity } : {}),
     ...(limits ? { limits } : {}),
     ...(disk ? { disk } : {}),
     ...(accountEmail ? { account: { email: accountEmail } } : {}),
+    ...(vitals ? { vitals } : {}),
   });
   debug(`box_status (${reason}) ${sent ? 'sent' : 'not sent (journal not connected)'}`);
   return sent;
@@ -1231,6 +1244,24 @@ function journalStartSessionForRpc({ workdir, mcpExtras, model = null, agent = n
 // this makes the backend live and reachable.
 const editAllowedRoots = pinAllowedRootsSync([DEFAULT_WORKDIR, ...SHOW_FILE_ARTIFACT_ROOTS]);
 
+// ops_snapshot RPC backend (loop #542 phase B, lib/ops-snapshot.js). `host`
+// is computed here from /proc; the other sections run MATRON_OPS_SNAPSHOT_CMD
+// (whitespace-split, no shell) + `--section <s>` in MATRON_OPS_SNAPSHOT_CWD or
+// the default workdir. Unset command -> those sections answer not_configured.
+const opsSnapshot = createOpsSnapshot({
+  command: process.env.MATRON_OPS_SNAPSHOT_CMD,
+  cwd: process.env.MATRON_OPS_SNAPSHOT_CWD
+    ? path.resolve(expandHome(process.env.MATRON_OPS_SNAPSHOT_CWD))
+    : DEFAULT_WORKDIR,
+  readHost: () => readHostSection({
+    getDisk: () => {
+      const disk = buildDisk({ path: DEFAULT_WORKDIR });
+      return disk ? { path: DEFAULT_WORKDIR, ...disk } : null;
+    },
+    getLiveSessions: () => buildActivity({ sessions, persisted: {} }).live_sessions,
+  }),
+});
+
 const journalRpcHandler = createRpcRequestHandler({
   respondRpc: (args) => journalPublisher.respondRpc(args),
   startSession: journalStartSessionForRpc,
@@ -1267,13 +1298,15 @@ const journalRpcHandler = createRpcRequestHandler({
   // (throttled, see refreshUsageLimits) but always returns synchronously
   // from whatever usageLimitsCache holds right now.
   getActivity: () => buildActivity({ sessions, persisted: loadPersistedSessions() }),
-  getLimits: () => { refreshUsageLimits(DEFAULT_WORKDIR); return buildLimits(usageLimitsCache); },
+  getLimits: () => { refreshUsageLimits(DEFAULT_WORKDIR); return buildLimits(usageLimitsCache, codexLimits.cache); },
   // Free space on the default-workdir filesystem — a full box is a bad spawn
   // target however idle it looks. One statfs syscall, answered inline.
   getDisk: () => buildDisk({ path: DEFAULT_WORKDIR }),
   // Which account a new session here would burn quota against, so the chooser
   // can tell boxes on different logins apart. Same cache as the status frames.
   getAccountEmail: () => getAccountEmail(),
+  // Ops page (loop #542 phase B): read-only host/ops sections.
+  opsSnapshot,
   // Spawn-room wiring (2026-08-09 agent-spawn spec). agentRooms is declared
   // later in this file (~:7223) — these arrows only dereference it at call
   // time, long after module evaluation finishes, same late-binding as
@@ -1820,6 +1853,21 @@ function publishEditDiffToConvo(session, convoId, toolName, input) {
 const LIMITS_REFRESH_MS = parseInt(process.env.LIMITS_REFRESH_MS || '300000', 10); // 5 min
 const usageLimitsCache = { lines: null, fetchedAt: 0, inflight: null };
 const codexAccountReader = createCodexAccountReader();
+// Codex quota lines for box_status (wire contract 2026-09-26 §1): the
+// account-scoped `account/rateLimits/read` query via the shared reader, on the
+// Claude cache's LIMITS_REFRESH_MS throttle, only where Codex can run. A
+// failed read keeps the previous lines (lib/box-status.js).
+const codexLimits = createCodexLimitsRefresher({
+  read: () => codexAccountReader.read(DEFAULT_WORKDIR),
+  available: () => detectCodexBinary(),
+  refreshMs: LIMITS_REFRESH_MS,
+  onFresh: () => publishBoxStatus('codex limits refresh'),
+});
+function refreshCodexLimits() {
+  // Same gate as refreshUsageLimits: nothing consumes it without the journal.
+  if (!JOURNAL_ENABLED) return null;
+  return codexLimits.refresh();
+}
 const codexTelemetryReader = new CodexTelemetryReader();
 
 async function refreshCodexMetadata(session, options) {
@@ -1865,6 +1913,8 @@ function refreshUsageLimits(cwd) {
   // The cache exists solely to feed status frames — with the journal
   // disabled nothing consumes it, and each refresh boots a claude process.
   if (!JOURNAL_ENABLED) return null;
+  // Codex lines ride the same triggers on their own throttle (fire-and-forget).
+  refreshCodexLimits();
   if (usageLimitsCache.inflight) return usageLimitsCache.inflight;
   if (Date.now() - usageLimitsCache.fetchedAt < LIMITS_REFRESH_MS) return null;
   usageLimitsCache.inflight = fetchUsageLimitsText(cwd)
@@ -12913,6 +12963,10 @@ async function main() {
   // stays quiet. Ephemeral/fail-open. .unref()'d; cleared in shutdown handlers.
   _hostVitalsPushHandle = setInterval(pushHostVitals, HOST_VITALS_SAMPLE_MS);
   if (typeof _hostVitalsPushHandle.unref === 'function') _hostVitalsPushHandle.unref();
+  // box_status heartbeat: publishBoxStatus is a no-op while disconnected
+  // (sendRoomOp refuses), so this only reports while connected.
+  _boxStatusRepublishHandle = setInterval(() => publishBoxStatus('heartbeat'), BOX_STATUS_REPUBLISH_MS);
+  if (typeof _boxStatusRepublishHandle.unref === 'function') _boxStatusRepublishHandle.unref();
   // Retention: the relocated codex-viz sink tree lives outside Claude Code's
   // pruned project dirs, so its unredacted JSONL would accumulate forever.
   // Best-effort age-based sweep at boot (never throws).
@@ -12969,6 +13023,7 @@ async function gracefulShutdown(signal) {
   shuttingDown = true;
   if (signal === 'SIGINT') console.log('\nShutting down...');
   if (_hostVitalsPushHandle) { clearInterval(_hostVitalsPushHandle); _hostVitalsPushHandle = null; }
+  if (_boxStatusRepublishHandle) { clearInterval(_boxStatusRepublishHandle); _boxStatusRepublishHandle = null; }
   // Everything is inside try/finally so a throw from ANY step (sampler, session
   // kill, or the flush) still reaches process.exit(0). Previously stopCpuSampler
   // / killSession ran outside the try, so a throw there rejected the promise the
