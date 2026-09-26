@@ -1,9 +1,10 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 
-const OPS = ['start', 'post', 'update', 'join', 'get', 'close'];
+const OPS = ['start', 'create', 'post', 'update', 'join', 'get', 'close'];
 const TOOL_CALLS = {
   mission_start: "callMissions('start', args, formatStartAck)",
+  mission_create: "callMissions('create', args, formatCreateAck)",
   milestone_post: "callMissions('post', args, formatMilestoneAck)",
   mission_update: "callMissions('update', args, (d) => missionLine(d.mission))",
   mission_join: "callMissions('join', args, (d) => missionLine(d.mission))",
@@ -18,7 +19,7 @@ describe('missions wiring', () => {
   const claudeMd = readFileSync(new URL('../BRIDGE_CLAUDE.md', import.meta.url), 'utf8');
   const codexMd = readFileSync(new URL('../BRIDGE_CODEX.md', import.meta.url), 'utf8');
 
-  it('mounts all six /missions routes through the shared handler map', () => {
+  it('mounts all seven /missions routes through the shared handler map', () => {
     const m = index.match(/url\.pathname\.match\(\/\^\\\/missions\\\/\(([a-z|]+)\)\$\/\)/);
     expect(m, 'the /missions route matcher is missing from index.js').toBeTruthy();
     expect(m[1].split('|').sort()).toEqual([...OPS].sort());
@@ -26,7 +27,7 @@ describe('missions wiring', () => {
     expect(index).toMatch(/createMissionsHandlers\(\{\s*sessions,\s*journalConvoIdFor,\s*client: missionsClient,?\s*\}\)/);
   });
 
-  it('registers the six mission tools and item_move, each pinned to its exact renderer', () => {
+  it('registers the seven mission tools and item_move, each pinned to its exact renderer', () => {
     for (const [tool, call] of Object.entries(TOOL_CALLS)) {
       expect(askUser, `${tool} is not registered`).toContain(`'${tool}',`);
       expect(askUser, `${tool} does not go through ${call}`).toContain(call);
@@ -69,7 +70,7 @@ describe('missions wiring', () => {
   it('the prompts promise only the inheritance the journal actually wires, and idempotency-key REUSE', () => {
     // Only conversations with a parent_convo_id inherit; a box spawned via
     // agent_session_start does not, so the prompt must not imply it does.
-    expect(claudeMd).toContain("Sub-chats and subagents inherit this conversation's mission automatically; a session you start on another box with `agent_session_start` does not — put the mission number in its task and have it `mission_join #N`.");
+    expect(claudeMd).toContain("Sub-chats and subagents inherit this conversation's mission automatically; a session you start on another box with `agent_session_start` does not, unless you pass `mission: N` — then it is on mission #N from its first turn.");
     expect(claudeMd).not.toMatch(/A spawned session inherits its parent's mission/);
     expect(codexMd).toMatch(/Sub-chats and subagents inherit this conversation's mission automatically; a session you start on another box with `agent_session_start` does not/);
     // A fresh uuid per attempt defeats the whole point of the header.
@@ -80,5 +81,21 @@ describe('missions wiring', () => {
     expect(missionsSection).not.toMatch(/Idempotency-Key: \$\(uuidgen\)/);
     expect(missionsSection).toMatch(/KEY=\$\(uuidgen\)/);
     expect(missionsSection).toMatch(/Idempotency-Key: \$KEY/);
+  });
+
+  it('mission_create sends an idem_key and renders through formatCreateAck', () => {
+    const start = askUser.indexOf('async function callMissions');
+    const fn = askUser.slice(start, askUser.indexOf('const missionToolName'));
+    expect(fn).toMatch(/name === 'start' \|\| name === 'post' \|\| name === 'create'/);
+    expect(askUser).toMatch(/import \{[^}]*\bformatCreateAck\b[^}]*\} from '\.\/lib\/missions-format\.js'/);
+    expect(askUser).toContain("create: 'mission_create'");
+  });
+
+  it('both prompt files teach mission_create and the agent_session_start mission param', () => {
+    expect(claudeMd).toMatch(/`mission_create` creates a mission without joining this conversation to it/);
+    expect(claudeMd).toMatch(/`agent_session_start` .*`mission: N`/);
+    expect(codexMd).toMatch(/`mission_create`/);
+    expect(codexMd).toMatch(/`mission: N`/);
+    expect(codexMd).toMatch(/"attach":false/);
   });
 });

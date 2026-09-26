@@ -161,7 +161,7 @@ describe('index.js busy /model parks on the deferred-command stash (source inspe
   it('parks the normalized replay text when the planner defers', () => {
     expect(start).toBeGreaterThan(-1);
     expect(body).toMatch(/decision\.defer/);
-    expect(body).toMatch(/_deferredCommandText = `!model \$\{decision\.normalized\}`/);
+    expect(body).toMatch(/_deferredCommandText = `!model \$\{decision\.normalized\}\$\{explicit \? '' : ' --implicit'\}`/);
   });
 
   it('a repeat of the same parked /model just says it is already queued', () => {

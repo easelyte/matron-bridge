@@ -71,6 +71,27 @@ describe('formatItemTurn', () => {
     expect(formatItemTurn({ ...base, kind: undefined, action: 'commented', comment: { id: 'c', body: 'x', attachments: [] } }, { username: 'dan' }))
       .toContain('(item, now awaiting: agent.');
   });
+  it('phrases a tapped action reply as "tapped", not "replied"', () => {
+    const t = formatItemTurn({ ...base, action: 'commented', comment: { id: 'ic_1', body: 'Go', action: 'Go', attachments: [] } }, { username: 'dan' });
+    expect(t).toBe('📌 Item #12 "Which auth library?" — dan tapped "Go".\nGo\n(question, now awaiting: agent. item_get it_1 for the full thread; item_close when acted on.)');
+  });
+
+  it('reads the tapped action from meta.action when action itself is absent', () => {
+    const t = formatItemTurn({ ...base, action: 'commented', comment: { id: 'ic_1', body: 'Go', meta: { action: 'Go' }, attachments: [] } }, { username: 'dan' });
+    expect(t).toContain('dan tapped "Go".');
+  });
+
+  it('a comment with no action still reads as a plain reply', () => {
+    const t = formatItemTurn({ ...base, action: 'commented', comment: { id: 'ic_1', body: 'use A', action: null, attachments: [] } }, { username: 'dan' });
+    expect(t).toContain('dan replied:');
+    expect(t).not.toContain('tapped');
+  });
+
+  it('collapses whitespace in a tapped label the same way titles are collapsed', () => {
+    const t = formatItemTurn({ ...base, action: 'commented', comment: { id: 'ic_1', body: 'Go', action: 'Go\nnow', attachments: [] } }, { username: 'dan' });
+    expect(t).toContain('dan tapped "Go now".');
+  });
+
   it('falls back to a generic author and a null awaiting', () => {
     const t = formatItemTurn({ ...base, action: 'commented', awaiting: null, comment: { id: 'c', body: 'x', attachments: [] } }, {});
     expect(t).toContain('— the user replied:');

@@ -241,6 +241,51 @@ describe('createAgentSpawnHandlers', () => {
       const res = await handlers.sessionStart(good);
       expect(res.status).toBe(504);
     });
+
+    it('mission: sent as mission_num, echoed back; absent when not given', async () => {
+      const { handlers, sent } = mk();
+      const p = handlers.sessionStart({ ...good, mission: 64 });
+      expect(sent[0].mission_num).toBe(64);
+      expect('mission' in sent[0]).toBe(false);
+      handlers.onSpawnFrame({ kind: 'spawn', event: 'pending', request_id: sent[0].request_id, spawn_id: 'row-1' });
+      expect(await p).toEqual({ status: 200, body: { status: 'pending', spawn_id: 'row-1', mission_num: 64 } });
+      const p2 = handlers.sessionStart(good);
+      expect('mission_num' in sent[1]).toBe(false);
+      handlers.onSpawnFrame({ kind: 'spawn', event: 'pending', request_id: sent[1].request_id, spawn_id: 'row-2' });
+      await p2;
+    });
+
+    it('mission must be a positive integer; nothing is sent otherwise', async () => {
+      const { handlers, sent } = mk();
+      for (const mission of [0, -1, 1.5, '64', true]) {
+        const r = await handlers.sessionStart({ ...good, mission });
+        expect(r.status).toBe(400);
+        expect(r.body.error).toMatch(/mission must be a positive integer/);
+      }
+      expect(sent).toHaveLength(0);
+      const nullOk = handlers.sessionStart({ ...good, mission: null });
+      expect('mission_num' in sent[0]).toBe(false);
+      handlers.onSpawnFrame({ kind: 'spawn', event: 'pending', request_id: sent[0].request_id, spawn_id: 'r' });
+      await nullOk;
+    });
+
+    it('journal refusals no_mission / mission_closed become sentences the agent can act on', async () => {
+      const a = mk();
+      const p1 = a.handlers.sessionStart({ ...good, mission: 99 });
+      a.handlers.onOpError({ code: 'no_mission', ref: a.sent[0].request_id, detail: 'x' });
+      const r1 = await p1;
+      expect(r1.status).toBe(404);
+      expect(r1.body.error).toMatch(/no mission #99/);
+      expect(r1.body.error).toMatch(/private/);
+      expect(r1.body.error).toMatch(/nothing was sent to the user/);
+      const b = mk();
+      const p2 = b.handlers.sessionStart({ ...good, mission: 61 });
+      b.handlers.onOpError({ code: 'mission_closed', ref: b.sent[0].request_id, detail: 'x' });
+      const r2 = await p2;
+      expect(r2.status).toBe(409);
+      expect(r2.body.error).toMatch(/mission #61 is closed/);
+      expect(r2.body.error).toMatch(/mission_create/);
+    });
   });
 
   describe('outcomes', () => {
@@ -263,6 +308,8 @@ describe('createAgentSpawnHandlers', () => {
       const text = ctx.notices[0].text;
       expect(text).toMatch(/started/);
       expect(text).toMatch(/room-9/);
+      expect(text).toContain('Child conversation: child-1.');
+      expect(text).toContain('Link it for the user as [title](matron://convo/child-1).');
     });
 
     it('started without room_id (detached spawn) — rooms.record NOT called, notice says detached and names the child, no literal undefined', async () => {
@@ -277,6 +324,7 @@ describe('createAgentSpawnHandlers', () => {
       expect(text).toMatch(/agent_chat_start/);
       expect(text).not.toMatch(/undefined/);
       expect(text).not.toMatch(/Chat room/);
+      expect(text).toContain('Link it for the user as [title](matron://convo/child-1).');
     });
 
     it('declined — notifyParent text contains declined; rooms.record NOT called', async () => {
@@ -356,9 +404,52 @@ describe('createAgentSpawnHandlers', () => {
 
       // Missing room_id/child_convo_id on a started outcome falls back to
       // 'unknown' rather than interpolating the literal string 'undefined'.
+      // It also gets no link hint: a matron://convo/unknown link couldn't
+      // identify the child conversation, so it would just be dead weight —
+      // the plain "Child conversation: unknown." sentence stands alone.
       const ctx3 = await armStarted();
       ctx3.handlers.onSpawnFrame({ kind: 'spawn', event: 'outcome', request_id: 'row-1', outcome: 'started' });
       expect(ctx3.notices[0].text).not.toMatch(/undefined/);
+      expect(ctx3.notices[0].text).not.toMatch(/matron:\/\/convo/);
+      expect(ctx3.notices[0].text).not.toMatch(/Link it for the user/);
+
+      // A child_convo_id carrying a raw ')' must not close the markdown
+      // link's `(...)` early — that would splice whatever follows straight
+      // into a notice the bridge signs and publishes to the user's chat.
+      // The link target is percent-encoded, so the closing paren in the
+      // notice is only ever the link's own.
+      const ctx4 = await armStarted();
+      const injectingConvoId = 'child-1) [click me](https://evil.example';
+      ctx4.handlers.onSpawnFrame({
+        kind: 'spawn', event: 'outcome', request_id: 'row-1', outcome: 'started',
+        room_id: 'room-9', child_convo_id: injectingConvoId,
+      });
+      const text4 = ctx4.notices[0].text;
+      const linkSafeConvoId = encodeURIComponent(injectingConvoId).replace(/[()]/g, (c) => (c === '(' ? '%28' : '%29'));
+      // linkSafeConvoId itself carries no raw '(' or ')' — the exact
+      // characters Bugbot flagged as able to close the link early — so the
+      // closing paren right after it is the link's own, not a forged one.
+      expect(linkSafeConvoId).not.toMatch(/[()]/);
+      expect(text4).toContain(`[title](matron://convo/${linkSafeConvoId}).`);
+
+      // A child_convo_id carrying a lone UTF-16 surrogate (unpaired — not
+      // filtered by peerField, and reachable without hostile intent since
+      // peerField's 64-char cap can itself create one by slicing an astral
+      // character in half) makes a bare encodeURIComponent throw URIError.
+      // handleOutcome tombstones the spawn before this runs, so an uncaught
+      // throw here would silently and permanently drop the spawn-started
+      // notice — it must still produce one.
+      const ctx5 = await armStarted();
+      const loneSurrogateConvoId = 'child-\uD800-lone';
+      expect(() => ctx5.handlers.onSpawnFrame({
+        kind: 'spawn', event: 'outcome', request_id: 'row-1', outcome: 'started',
+        room_id: 'room-9', child_convo_id: loneSurrogateConvoId,
+      })).not.toThrow();
+      expect(ctx5.notifyParent).toHaveBeenCalledTimes(1);
+      const text5 = ctx5.notices[0].text;
+      expect(text5).toContain('Link it for the user as [title](matron://convo/');
+      expect(text5).not.toMatch(/undefined/);
+
       expect(ctx3.notices[0].text).toMatch(/unknown/);
     });
   });

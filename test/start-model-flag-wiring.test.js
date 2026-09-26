@@ -88,13 +88,13 @@ describe('--model wiring in the /start command family (source inspection)', () =
   it('!start persists the flag model explicitly, even with no mcpExtras', () => {
     const block = BLOCKS['!start']();
     expect(block).toContain('mcpExtras.length > 0 || startModel');
-    expect(block).toContain('startModel ? { model: startModel } : undefined');
+    expect(block).toContain('startModel ? { model: startModel, ...explicitModelFlag(startModel) } : undefined');
   });
 
   it('!workdir persists the flag model explicitly, even with no mcpExtras', () => {
     const block = BLOCKS['!workdir']();
     expect(block).toContain('workdirExtras.length > 0 || workdirModel');
-    expect(block).toContain('workdirModel ? { model: workdirModel } : undefined');
+    expect(block).toContain('workdirModel ? { model: workdirModel, ...explicitModelFlag(workdirModel) } : undefined');
   });
 
   it('!restart persists the flag model AFTER the recreate, when the new session exists', () => {
@@ -115,7 +115,7 @@ describe('--model wiring in the /start command family (source inspection)', () =
     expect(block).toMatch(/function journalStartSessionForRpc\(\{[^}]*\bmodel\b/);
     expect(block).toContain('...(model ? { model } : {})');
     expect(block).toContain('mcpExtras.length > 0 || model');
-    expect(block).toContain('model ? { model } : undefined');
+    expect(block).toContain('model ? { model, ...explicitModelFlag(model) } : undefined');
   });
 
   // journal-rpc.js gates model selection on the box's default agent and

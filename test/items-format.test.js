@@ -112,6 +112,60 @@ describe('formatItemDetail', () => {
     });
     expect(text).toContain('- [user, unknown time] hi');
   });
+
+  it('shows the item actions and marks the chosen one', () => {
+    const text = formatItemDetail({
+      item: { ...open, body: 'A or B?', actions: ['Go', 'No'], chosen_action: 'Go' },
+      comments: [],
+    });
+    expect(text).toBe([
+      '#12 Which auth library? — open, awaiting user (id it_1)',
+      'A or B?',
+      'Actions: [Go], No',
+      '',
+      '(no comments)',
+    ].join('\n'));
+  });
+
+  it('shows actions with none chosen yet', () => {
+    const text = formatItemDetail({ item: { ...open, body: '', actions: ['Go', 'No'], chosen_action: null }, comments: [] });
+    expect(text).toContain('Actions: Go, No');
+  });
+
+  it('omits the actions line when there are none', () => {
+    const text = formatItemDetail({ item: { ...open, body: '', actions: [] }, comments: [] });
+    expect(text).not.toContain('Actions:');
+  });
+
+  it('an item with no actions field at all (older journal) renders exactly as before', () => {
+    const text = formatItemDetail({ item: { ...open, body: 'A or B?' }, comments: [] });
+    expect(text).not.toContain('Actions:');
+  });
+
+  it('marks a comment the user produced by tapping an action', () => {
+    const text = formatItemDetail({
+      item: { ...open, actions: ['Go', 'No'], chosen_action: 'Go' },
+      comments: [{ id: 'ic_1', author: 'user', kind: 'comment', body: 'Go', action: 'Go', attachments: [], created_at: 1757328000000 }],
+    });
+    expect(text).toContain('- [user, 2025-09-08T10:40:00.000Z] [tapped "Go"] Go');
+  });
+
+  it('marks a comment whose action lives under meta.action (an older journal)', () => {
+    const text = formatItemDetail({
+      item: { ...open, actions: ['Go', 'No'], chosen_action: 'Go' },
+      comments: [{ id: 'ic_1', author: 'user', kind: 'comment', body: 'Go', meta: { action: 'Go' }, attachments: [], created_at: 1757328000000 }],
+    });
+    expect(text).toContain('- [user, 2025-09-08T10:40:00.000Z] [tapped "Go"] Go');
+  });
+
+  it('an ordinary comment with no action is unmarked', () => {
+    const text = formatItemDetail({
+      item: open,
+      comments: [{ id: 'ic_1', author: 'user', kind: 'comment', body: 'use A', action: null, attachments: [], created_at: 1757328000000 }],
+    });
+    expect(text).toContain('- [user, 2025-09-08T10:40:00.000Z] use A');
+    expect(text).not.toContain('tapped');
+  });
 });
 
 describe('formatCommentAck', () => {

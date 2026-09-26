@@ -93,6 +93,42 @@ describe('items handlers', () => {
     expect((await h.create({ roomId: '!r:s', kind: 'task', title: 'x'.repeat(201) })).status).toBe(400);
   });
 
+  it('create: passes trimmed actions through to the journal', async () => {
+    const { h, client } = fixture();
+    const r = await h.create({ roomId: '!r:s', kind: 'question', title: 'Go?', actions: [' Go ', 'No'] });
+    expect(r.status).toBe(201);
+    expect(client.create.mock.calls[0][0]).toMatchObject({ actions: ['Go', 'No'] });
+  });
+
+  it('create: [] actions passes an empty array through', async () => {
+    const { h, client } = fixture();
+    await h.create({ roomId: '!r:s', kind: 'task', title: 'T', actions: [] });
+    expect(client.create.mock.calls[0][0]).toMatchObject({ actions: [] });
+  });
+
+  it('create: omitting actions omits the field entirely', async () => {
+    const { h, client } = fixture();
+    await h.create({ roomId: '!r:s', kind: 'task', title: 'T' });
+    expect(client.create.mock.calls[0][0]).not.toHaveProperty('actions');
+  });
+
+  it('create: rejects more than 4 actions, a non-string entry, an over-long or empty label, control characters, and case-insensitive duplicates', async () => {
+    const { h, client } = fixture();
+    expect((await h.create({ roomId: '!r:s', kind: 'task', title: 'T', actions: ['A', 'B', 'C', 'D', 'E'] })).status).toBe(400);
+    expect((await h.create({ roomId: '!r:s', kind: 'task', title: 'T', actions: [1] })).status).toBe(400);
+    expect((await h.create({ roomId: '!r:s', kind: 'task', title: 'T', actions: ['x'.repeat(41)] })).status).toBe(400);
+    expect((await h.create({ roomId: '!r:s', kind: 'task', title: 'T', actions: ['  '] })).status).toBe(400);
+    expect((await h.create({ roomId: '!r:s', kind: 'task', title: 'T', actions: ['a\nb'] })).status).toBe(400);
+    // U+2028/U+2029 (line/paragraph separator) read as a line break in
+    // rendered text just like \n does, so a plain \x00-\x1f check would miss
+    // them — reject alongside ordinary control characters.
+    expect((await h.create({ roomId: '!r:s', kind: 'task', title: 'T', actions: ['a b'] })).status).toBe(400);
+    expect((await h.create({ roomId: '!r:s', kind: 'task', title: 'T', actions: ['a b'] })).status).toBe(400);
+    expect((await h.create({ roomId: '!r:s', kind: 'task', title: 'T', actions: ['Go', 'go'] })).status).toBe(400);
+    expect((await h.create({ roomId: '!r:s', kind: 'task', title: 'T', actions: 'Go' })).status).toBe(400);
+    expect(client.create).not.toHaveBeenCalled();
+  });
+
   it('session guards: 400 no roomId, 404 unknown session, 409 no convo yet', async () => {
     const { h, session } = fixture();
     expect((await h.list({})).status).toBe(400);

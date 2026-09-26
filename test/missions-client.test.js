@@ -24,6 +24,17 @@ describe('createMissionsClient', () => {
     expect(JSON.parse(calls[0].init.body)).toEqual({ title: 'M', body: 'goal', convo_id: 'c1' });
   });
 
+  it('create posts to the mission create route with attach:false in the body and the idempotency key', async () => {
+    const { fetchImpl, calls } = fakeFetch(() => ({ status: 201, body: { mission: { id: 'ms_2', num: 62 } } }));
+    const c = createMissionsClient({ baseUrl: 'https://j', token: 'tok', fetchImpl });
+    const r = await c.create({ title: 'M', convo_id: 'c1', attach: false }, { idemKey: 'k2' });
+    expect(r.status).toBe(201);
+    expect(calls[0].url).toBe('https://j/missions');
+    expect(calls[0].init.method).toBe('POST');
+    expect(calls[0].init.headers['Idempotency-Key']).toBe('k2');
+    expect(JSON.parse(calls[0].init.body)).toEqual({ title: 'M', convo_id: 'c1', attach: false });
+  });
+
   it('routes every verb to the documented path', async () => {
     const { fetchImpl, calls } = fakeFetch(() => ({ status: 200, body: {} }));
     const c = createMissionsClient({ baseUrl: 'https://j', token: 't', fetchImpl });

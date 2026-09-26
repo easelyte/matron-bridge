@@ -10,6 +10,7 @@ import { createItemsHandlers } from './lib/items-tools.js';
 import { createReminderHandlers } from './lib/reminder-tools.js';
 import { createMissionsClient } from './lib/missions-client.js';
 import { createMissionsHandlers } from './lib/missions-tools.js';
+import { createCoordinatorLookup, loadCoordinatorBlock, claudeCoordinatorArgs, codexCoordinatorOptions, explicitModelFlag, explicitModelFlagForResume, coordinatorTurnText, planCoordinatorTransition, decideCoordinatorEvent, withCoordinatorModel, recreateSpawnModel } from './lib/coordinator.js';
 import { createServer } from 'http';
 import { createHmac, randomUUID, randomBytes } from 'crypto';
 import fs from 'fs';
@@ -194,6 +195,7 @@ import { CodexTelemetryReader, codexUsageFor } from './lib/codex-telemetry.js';
 
 const DEFAULT_BRIDGE_CLAUDE_MD_PATH = path.join(__dirname, 'BRIDGE_CLAUDE.md');
 const DEFAULT_BRIDGE_CODEX_MD_PATH = path.join(__dirname, 'BRIDGE_CODEX.md');
+const DEFAULT_BRIDGE_COORDINATOR_MD_PATH = path.join(__dirname, 'BRIDGE_COORDINATOR.md');
 const FALLBACK_BRIDGE_PROMPT = 'You are running through a remote Matron bridge. The user interacts through chat, not a terminal.';
 const FALLBACK_CODEX_BRIDGE_PROMPT = 'You are running through Matron chat. Work within the configured sandbox. Use native approval requests for actions requiring extra permission. Never post secrets in chat.';
 
@@ -469,6 +471,7 @@ const SECRET_TTL_MS = 3600000; // 1 hour — how long a SUBMITTED value stays on
 const SECRET_REQUESTS_FILE = path.join(os.homedir(), '.matron-bridge-secrets.json');
 const BRIDGE_CLAUDE_MD_PATH = process.env.BRIDGE_CLAUDE_MD_PATH || DEFAULT_BRIDGE_CLAUDE_MD_PATH;
 const BRIDGE_CODEX_MD_PATH = process.env.BRIDGE_CODEX_MD_PATH || DEFAULT_BRIDGE_CODEX_MD_PATH;
+const BRIDGE_COORDINATOR_MD_PATH = process.env.BRIDGE_COORDINATOR_MD_PATH || DEFAULT_BRIDGE_COORDINATOR_MD_PATH;
 
 function loadBridgeSystemPrompt() {
   try {
@@ -491,6 +494,15 @@ function loadCodexBridgePrompt() {
 }
 
 const CODEX_BRIDGE_PROMPT = loadCodexBridgePrompt();
+
+// The Coordinator's instruction block (spec 2026-09-23 §2b), appended to the
+// system prompt / Codex developer instructions of the one room that holds
+// the role. Read once at boot like the two prompt files above.
+const COORDINATOR_BLOCK = loadCoordinatorBlock({
+  readFile: (p) => fs.readFileSync(p, 'utf-8'),
+  path: BRIDGE_COORDINATOR_MD_PATH,
+  log: console,
+});
 
 // Live-bash-output store (per-process). Tracks active matron-tee'd Bash commands
 // so that tool_result events can write the corresponding .done sentinel.
@@ -588,6 +600,16 @@ const journalReadProxy = createJournalReadProxy({
   capabilityToken: JOURNAL_PROXY_CAP_TOKEN,
 });
 
+// Which conversation is the user's Coordinator (spec 2026-09-23 §2a):
+// GET /coordinator on the same host and token as the items/missions
+// clients, cached (lib/coordinator.js). No journal configured → the base URL
+// is empty, the role stays unknown, and every session spawns ordinary.
+const coordinatorLookup = createCoordinatorLookup({
+  baseUrl: journalHttpBase,
+  token: _journalToken,
+  log: console,
+});
+
 // NOTE (easelyte fork): upstream's summary-model-nag is intentionally dropped
 // here. This fork generates titles/summaries via a codex exec one-shot
 // (lib/pinned-summary.js + lib/codex-oneshot.js), not the Gemini summaryModel,
@@ -662,6 +684,10 @@ function handleJournalReconnect() {
   // Every hello_ok is a fresh epoch for the journal's copy of this box's
   // status too (a box that just woke reports itself before anyone asks).
   publishBoxStatus('reconnect');
+  // A fresh epoch may follow a gap in which the Coordinator moved; the
+  // replayed `coordinator` events cover a live bridge, this covers a cursor
+  // reset (snapshot_required) that skipped them.
+  coordinatorLookup.refresh({ force: true });
 }
 
 // Repair the summary publish hint across a connection epoch (loop #554 F3).
@@ -803,6 +829,8 @@ const journalPublisher = createJournalPublisher({
 const JOURNAL_ENABLED = !!(JOURNAL_WS_URL && _journalToken);
 
 if (JOURNAL_ENABLED) {
+  // Warm the Coordinator cache before the first resume can ask for it.
+  coordinatorLookup.refresh({ force: true });
   // Boot the control convo eagerly — safe even before the WS is connected
   // (journalPublisher queues FIFO and flushes on connect, same as every
   // other publish here). No Matrix dependency: this convo has no Matrix
@@ -1190,7 +1218,7 @@ function journalStartSessionForRpc({ workdir, mcpExtras, model = null, agent = n
   // persistSession keeps it null rather than inventing one.
   if ((mcpExtras.length > 0 || model || mintedConvoId) && (session.claudeSessionId || mintedConvoId)) {
     persistSession(sessionRoomId, session.claudeSessionId, session.workdir, null,
-      model ? { model } : undefined);
+      model ? { model, ...explicitModelFlag(model) } : undefined);
   }
   return session;
 }
@@ -1258,6 +1286,10 @@ const journalRpcHandler = createRpcRequestHandler({
   // lowest tier so a priority peer can preempt it, per the operator >
   // peer-priority > peer-coalesced > autonomous precedence.
   injectTurn: (session, text) => sendTextToSession(session, text, { skipJournalMirror: true, turnTier: 'autonomous' }),
+  // Spawn onto a mission: join the new conversation before its opening turn
+  // (lib/journal-rpc.js start). Late-bound — missionsHandlers is constructed
+  // further down; this only runs once the socket is live.
+  joinMission: (session, num) => missionsHandlers.join({ roomId: session.roomId, num }),
   serverLabel: SERVER_LABEL,
   log: console,
 });
@@ -2094,6 +2126,34 @@ function postRootBypassWarning(roomId) {
   Promise.resolve(sendToRoom(roomId, rw.plain, rw.html)).catch(() => {});
 }
 
+// Coordinator role for one spawn (spec 2026-09-23 §2a). createSession is
+// synchronous with a dozen callers, so the spawn reads the cached answer and
+// kicks a throttled GET /coordinator behind it; hello_ok and `coordinator`
+// events are what keep the cache current. The room's journal conversation id
+// can sit in any of these fields depending on the path (fresh, resume,
+// pre-init restart, agent switch), so all of them are candidates. A role
+// that is not known yet (journal not reached since boot) spawns an ordinary
+// session and says so — never a failed spawn. Said once per room, and only
+// on a box with a journal: without one the role is never known, and a line
+// on every spawn forever is noise.
+const coordinatorUnknownWarned = new Set();
+function coordinatorRoleAtSpawn(roomId, resumeSessionId, options, persisted) {
+  const candidates = [
+    options.journalConvoId,
+    persisted?.journalConvoId,
+    persisted?.sessionId,
+    resumeSessionId,
+    options.presetSessionId,
+  ];
+  const role = coordinatorLookup.roleFor(candidates);
+  coordinatorLookup.refresh();
+  if (JOURNAL_ENABLED && !role.known && !coordinatorUnknownWarned.has(roomId) && candidates.some((c) => typeof c === 'string' && c)) {
+    coordinatorUnknownWarned.add(roomId);
+    console.warn(`[coordinator] ${roomId}: coordinator not known yet (journal has not answered GET /coordinator) — starting as an ordinary session`);
+  }
+  return role.coordinator;
+}
+
 function createSession(roomId, workdir, resumeSessionId, options = {}) {
   // A persisted workdir can stop existing between spawns (repo renamed,
   // worktree pruned). Node reports a missing spawn cwd as `spawn claude
@@ -2109,6 +2169,8 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   workdir = guarded.cwd;
   const persistedMode = getPersistedSession(roomId);
   const agent = resolveAgent({ option: options.agent, persisted: persistedMode?.agent, fallback: DEFAULT_AGENT });
+  const coordinator = coordinatorRoleAtSpawn(roomId, resumeSessionId, options, persistedMode);
+  options = { ...options, coordinator };
   // A Claude session that changes cwd mid-flight (EnterWorktree is the common
   // case) has its transcript relocated to the NEW cwd's project dir, while the
   // bridge's persisted workdir stays where the session was spawned. Resuming
@@ -2219,14 +2281,15 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     resumeSessionId, presetId: options.presetSessionId, mintId: randomUUID,
     transcriptExists: (id) => fs.existsSync(transcriptPathFor(cwd, id)),
   });
+  const printCoord = claudeCoordinatorArgs({ coordinator: !!options.coordinator, basePrompt: BRIDGE_SYSTEM_PROMPT, block: COORDINATOR_BLOCK, baseDisallowed: ['AskUserQuestion'] });
   const args = [
     '--print',
     '--verbose',
     '--input-format', 'stream-json',
     '--output-format', 'stream-json',
     ...permissionSpawnArgs(bypassMode),
-    '--disallowed-tools', 'AskUserQuestion',
-    '--append-system-prompt', BRIDGE_SYSTEM_PROMPT,
+    '--disallowed-tools', ...printCoord.disallowedTools,
+    '--append-system-prompt', printCoord.appendSystemPrompt,
     '--include-partial-messages',
     '--strict-mcp-config',
     '--mcp-config', mcpConfigPathFor(effectiveMcpExtras),
@@ -2284,6 +2347,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     agent: AGENT_CLAUDE,
     proc,
     roomId,
+    coordinator: !!options.coordinator,
     workdir: cwd,
     // The spawned session's effective env (shim prepended to PATH when
     // MATRON_CODEX_VIZ=1). The codex-viz activation guard must evaluate the
@@ -2594,15 +2658,16 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
       console.warn(`[show-file] disabled for ${roomId}: failed to pin allowed roots (${error.message})`);
     }
   }
+  const codexCoord = codexCoordinatorOptions({ coordinator: !!options.coordinator, baseInstructions: CODEX_BRIDGE_PROMPT, block: COORDINATOR_BLOCK, baseSandbox: CODEX_SANDBOX_MODE });
   const Adapter = CODEX_APP_SERVER ? CodexAppServerSession : CodexExecSession;
   const codex = new Adapter({
     cwd,
     threadId: resumeSessionId || null,
     model,
     effort: persistedCodexState.effort || null,
-    sandbox: CODEX_SANDBOX_MODE,
+    sandbox: codexCoord.sandbox,
     networkAccess: CODEX_NETWORK_ACCESS,
-    developerInstructions: CODEX_BRIDGE_PROMPT + (CODEX_APP_SERVER ? '' : '\nLegacy exec transport: native approvals, native questions, and Matron MCP tools are unavailable. If blocked, explain it in your final response.'),
+    developerInstructions: codexCoord.developerInstructions + (CODEX_APP_SERVER ? '' : '\nLegacy exec transport: native approvals, native questions, and Matron MCP tools are unavailable. If blocked, explain it in your final response.'),
     // Journal-token scoping for Codex children: see buildCodexSpawnEnv (stripped
     // on app-server, kept on legacy exec for its /items HTTP fallback).
     env: buildCodexSpawnEnv({
@@ -2621,6 +2686,7 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
     codex,
     proc: null,
     roomId,
+    coordinator: !!options.coordinator,
     workdir: cwd,
     mcpExtras,
     ...(showFileToken ? { showFileToken } : {}),
@@ -3084,13 +3150,17 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
   // buildSessionSettings('iv') (lib/session-settings.js), and any TUI prompt
   // outside it is surfaced by lib/prompt-detector.js. Upstream's iv
   // guardRootBypass(true) branch is deliberately not adopted.
+  const ivCoord = claudeCoordinatorArgs({ coordinator: !!options.coordinator, basePrompt: BRIDGE_SYSTEM_PROMPT, block: COORDINATOR_BLOCK });
   const claudeArgs = [...identity.cliArgs];
   claudeArgs.push(
     // AskUserQuestion is allowed in iv-mode: the TUI prompt detector
     // (lib/prompt-detector.js) catches it and routes the question through
     // Matrix. Print-mode kept it disallowed because there was no way to
     // surface the TUI prompt; that constraint no longer applies.
-    '--append-system-prompt', BRIDGE_SYSTEM_PROMPT,
+    // The Coordinator runs without file-editing tools (spec §2c). iv mode has
+    // no other disallowed tool, so an ordinary session gets no flag at all.
+    ...(ivCoord.disallowedTools.length ? ['--disallowed-tools', ...ivCoord.disallowedTools] : []),
+    '--append-system-prompt', ivCoord.appendSystemPrompt,
     '--strict-mcp-config',
     '--mcp-config', mcpConfigPathFor(effectiveMcpExtras),
     '--settings', JSON.stringify(buildSessionSettings('iv')),
@@ -3135,6 +3205,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     proc: null,
     iv,
     roomId,
+    coordinator: !!options.coordinator,
     workdir: cwd,
     codexSpawnEnv: interactiveEnv,
     ...(showFileToken ? { showFileToken } : {}),
@@ -6958,7 +7029,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       // picks are session-scoped and must not be persisted).
       if ((mcpExtras.length > 0 || startModel) && session.claudeSessionId) {
         persistSession(sessionRoomId, session.claudeSessionId, session.workdir, roomId,
-          startModel ? { model: startModel } : undefined);
+          startModel ? { model: startModel, ...explicitModelFlag(startModel) } : undefined);
       }
 
       // Confirm in the origin room/convo. No matrix.to room link: Matron is
@@ -7110,7 +7181,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       if (restartModelFlag.model && restarted) {
         restarted.currentModel = restartModelFlag.model;
         persistSession(roomId, restarted.claudeSessionId, restarted.workdir, restarted.originRoomId,
-          { model: restartModelFlag.model });
+          { model: restartModelFlag.model, ...explicitModelFlag(restartModelFlag.model) });
       }
       const shownRestartExtras = effectiveExtras(effectiveRestartExtras, DEFAULT_MCP_EXTRAS);
       const extrasLine = shownRestartExtras.length > 0
@@ -7443,6 +7514,13 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         repoScores: session.repoScores,
         peerHandledWatermark: session.peerHandledWatermark,
         model: session.currentModel || null,
+        // Only a --model typed now is a fresh pick; resumeState.model may be
+        // a model Claude merely reported, so it must not be marked explicit
+        // on that basis. But !resume always mints a new room id, so this
+        // persistSession call has no prior record at that id to merge over —
+        // without carrying resumePersisted.modelExplicit forward, an
+        // explicit pick made before the resume is silently lost.
+        ...explicitModelFlagForResume(resumeModelFlag.model, resumePersisted),
         interactiveMode: selectedAgent === AGENT_CLAUDE ? !!session.iv : undefined,
         mcpExtras: session.mcpExtras,
         totalUsage: session.totalUsage,
@@ -7535,7 +7613,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       if (workdirModel) session.currentModel = workdirModel;
       if ((workdirExtras.length > 0 || workdirModel) && session.claudeSessionId) {
         persistSession(sessionRoomId, session.claudeSessionId, session.workdir, roomId,
-          workdirModel ? { model: workdirModel } : undefined);
+          workdirModel ? { model: workdirModel, ...explicitModelFlag(workdirModel) } : undefined);
       }
 
       const workdirPermNote = permissionNote(session);
@@ -7901,7 +7979,12 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       }
       const arg = parts[1];
       if (arg) {
-        applyModelSwitch(roomId, session, arg, { sendReply, sendHtml });
+        // `--implicit` is how a Coordinator model switch parked mid-turn
+        // (applyModelSwitch explicit:false) replays without turning into a
+        // user pick. A person can type it too, but there's no reason to —
+        // it only downgrades this room's own pick to non-explicit.
+        const implicit = parts.slice(2).includes('--implicit');
+        applyModelSwitch(roomId, session, arg, { sendReply, sendHtml, explicit: !implicit });
         break;
       }
       const current = session.currentModel || session.initData?.model || null;
@@ -9073,6 +9156,144 @@ function journalOnItem(session, item, ctx) {
   itemTurnRouter(session, item, ctx).catch((e) => {
     try { console.warn(`[items-turn] ${e?.message ?? e}`); } catch { /* logging must never throw */ }
   });
+}
+
+// A journal `coordinator` event (spec 2026-09-23 §2a/§2e; router seam
+// onCoordinatorEvent). The event is applied to the cache at once, then the
+// journal is re-read and only a role it confirms is acted on
+// (decideCoordinatorEvent) — so a replayed or reversed pair (A assigned, then
+// B assigned, replayed on reconnect) never tells A it is the Coordinator.
+// For a running session: an idle one is respawned through recreateSession —
+// the /model and /restart path — so the block and the no-edit tools apply
+// now, moving onto opus[1m] on the way when nobody picked a model; a busy one
+// gets the model switch through applyModelSwitch (parked until the turn
+// ends) and the role at its next spawn. Either way it is then told, as an
+// injected turn (queued behind a running turn, never dropped). A Coordinator
+// that is not running only has its persisted model updated; its next resume
+// reads the role from the cache.
+async function journalOnCoordinator(convoId, { role }) {
+  coordinatorLookup.apply(convoId, role);
+  const truth = await coordinatorLookup.refresh({ force: true });
+  // Looked up after the await: the session may have been reaped or respawned
+  // while the journal answered.
+  const session = findSessionByClaudeSessionId(convoId);
+  const live = !!(session && session.alive);
+  const verdict = decideCoordinatorEvent({
+    role,
+    convoId,
+    truth,
+    live,
+    sessionCoordinator: !!session?.coordinator,
+    pendingRole: session?._coordinatorPending ?? null,
+  });
+  if (verdict === 'stale') {
+    console.warn(`[coordinator] ignoring ${role} for ${convoId}: the journal says the Coordinator is ${truth.convoId ?? 'nobody'}`);
+    return;
+  }
+  if (verdict === 'persist-sleeping') {
+    persistCoordinatorModelForSleepingConvo(convoId);
+    return;
+  }
+  if (verdict !== 'transition') return;
+  const roomId = session.roomId;
+  const ctx = journalSessionCommandCtx(session);
+  const plan = planCoordinatorTransition({
+    role,
+    agent: session.agent,
+    occupied: sessionOccupiedForRoomDelivery(session),
+    busy: !!session.busy,
+    persisted: getPersistedSession(roomId),
+    // A `!model <x>` the user queued mid-turn is their pick; only the
+    // `--implicit` form is ours to replace.
+    parkedCommand: session._deferredCommandText,
+  });
+  if (plan.action === 'respawn') {
+    ctx.sendReply(role === 'assigned'
+      ? '🧭 This chat is now the Coordinator — restarting the session to apply it (history preserved).'
+      : '🧭 This chat is no longer the Coordinator — restarting the session to lift its restrictions (history preserved).');
+    const next = recreateSession(roomId, plan.model ? { model: plan.model } : {}, ctx);
+    if (next && plan.model) {
+      // Same tail as applyModelSwitch: the replacement's live snapshot cannot
+      // know the new model until its first event, so say it, then persist.
+      next.currentModel = plan.model;
+      persistSession(roomId, next.claudeSessionId, next.workdir, next.originRoomId, { model: plan.model, modelExplicit: false });
+    }
+  } else {
+    // Occupied: the role can only apply at a spawn. Record it as pending (a
+    // replay of this event meanwhile is then 'none', not a second turn).
+    // The replacement is a new session object built by createSession, which
+    // reads the role from the cache, so the pending mark is not carried.
+    //
+    // Busy (a running turn): get a spawn at turn end through the
+    // deferred-command slot dispatchDeferredCommand replays — which also
+    // carries the queued turn below onto the replacement. A print-mode model
+    // switch parks a `!model … --implicit` there (itself a respawn); a slot
+    // the user already filled (/model, /restart) also ends in
+    // recreateSession, so it is kept. Same gate as a user's /restart, which
+    // parks only on `busy`.
+    //
+    // Occupied but not busy (a pending question or prompt, the iv resume
+    // hold): nothing is parked. No turn end is coming to replay it, and
+    // flushQueue refuses to deliver past a parked restart, so it would strand
+    // the queued turn below. The turn is delivered by the normal queue
+    // flush; the role and the model apply at the next spawn.
+    //
+    // Either way the model is persisted now (a reap-and-resume reads the
+    // record) and held pending on the session, which recreateSession prefers
+    // over the live model: in iv mode the live model is re-observed from
+    // each assistant event and still reads as the old one after the typed
+    // /model, so the parked restart would otherwise carry it back.
+    if (plan.action === 'switch-model-live') {
+      applyModelSwitch(roomId, session, plan.model, { ...ctx, explicit: false });
+    }
+    if (plan.model) {
+      session._coordinatorModel = plan.model;
+      persistSession(roomId, session.claudeSessionId, session.workdir, session.originRoomId, { model: plan.model, modelExplicit: false });
+    }
+    session._coordinatorPending = role;
+    if (session.busy && !session._deferredCommandText) session._deferredCommandText = '!restart --force';
+  }
+  await deliverCoordinatorTurn(sessions.get(roomId) || session, coordinatorTurnText(role, COORDINATOR_BLOCK));
+}
+
+// The injected assigned/released turn. Same inject-or-queue rule as a
+// tracker reply (lib/items-turn.js): a busy session queues it behind the
+// running turn instead of losing it. Never mirrored — the journal already
+// shows the `coordinator` marker the apps render.
+async function deliverCoordinatorTurn(session, text) {
+  if (!text || !session?.alive) return;
+  if (sessionOccupiedForRoomDelivery(session)) {
+    await journalQueueMedia(session, {
+      blocks: [{ type: 'text', text }],
+      mirrorToJournal: false,
+      preview: text.split('\n')[0],
+      fullText: text,
+    });
+    return;
+  }
+  if (!sendTextToSession(session, text, { skipJournalMirror: true })) {
+    console.warn(`[coordinator] could not deliver the coordinator turn to ${session.roomId}`);
+  }
+}
+
+// A Coordinator assigned while its session is not running: move the
+// persisted model onto opus[1m] unless someone picked one (spec §2e). Same
+// record lookup as journalResumeConvo. Codex rooms keep their model.
+function persistCoordinatorModelForSleepingConvo(convoId) {
+  const data = loadPersistedSessions();
+  for (const [roomId, rec] of Object.entries(data)) {
+    if (!rec || (rec.journalConvoId !== convoId && rec.sessionId !== convoId)) continue;
+    const plan = planCoordinatorTransition({
+      role: 'assigned',
+      agent: normalizeAgent(rec.agent) || AGENT_CLAUDE,
+      occupied: false,
+      persisted: rec,
+    });
+    if (!plan.model) return;
+    data[roomId] = withCoordinatorModel(rec, plan.model);
+    savePersistedSessions(data);
+    return;
+  }
 }
 
 function journalOnMedia(session, media, ctx) {
@@ -10342,6 +10563,13 @@ const journalInputConsumer = createJournalInputConsumer({
   routeTextToSession: journalOnText,
   routeMediaToSession: journalOnMedia,
   routeItemToSession: journalOnItem,
+  // Coordinator role changes (spec 2026-09-23 §2a): never a turn by
+  // themselves; journalOnCoordinator re-reads the journal and decides.
+  onCoordinatorEvent: (convoId, ev) => {
+    journalOnCoordinator(convoId, ev).catch((e) => {
+      try { console.warn(`[coordinator] handling ${ev?.role} for ${convoId} failed: ${e?.message ?? e}`); } catch { /* logging must never throw */ }
+    });
+  },
   routePromptReply: journalOnPromptReply,
   ...permissionSeams,
   resolvePermissionReply: resolveJournalPermissionReply,
@@ -11405,9 +11633,9 @@ const apiServer = createServer(async (req, res) => {
         return;
       }
 
-      // The six mission_* / milestone_post tool routes; same one-matcher
+      // The seven mission_* / milestone_post tool routes; same one-matcher
       // allowlist shape as /items above.
-      const missionsRoute = url.pathname.match(/^\/missions\/(start|post|update|join|get|close)$/);
+      const missionsRoute = url.pathname.match(/^\/missions\/(start|create|post|update|join|get|close)$/);
       if (missionsRoute) {
         const name = missionsRoute[1];
         await respondAgentChatRoute(res, data, missionsHandlers[name],
@@ -11982,7 +12210,10 @@ function switchEffortAndTrack(session, arg, send) {
 // the live TUI (immediate); print sessions restart the claude -p process with
 // --model <alias> --resume (history preserved). Used by the !model command and
 // the model: picker button.
-function applyModelSwitch(roomId, session, arg, { sendReply, sendHtml }) {
+// explicit:false is the Coordinator's default-model switch (spec 2026-09-23
+// §2e): same path, but persisted as modelExplicit:false so a later
+// assignment may change it again.
+function applyModelSwitch(roomId, session, arg, { sendReply, sendHtml, explicit = true }) {
   if (session.agent === AGENT_CODEX) {
     if (session.busy) {
       sendReply('Finish or interrupt the current Codex turn before switching models.');
@@ -12001,17 +12232,30 @@ function applyModelSwitch(roomId, session, arg, { sendReply, sendHtml }) {
     const efforts = codexSessionOptions(session).effortLevels;
     if (session.codex.effort && !efforts.some(e => e.value === session.codex.effort)) session.codex.effort = null;
     journalStatus(session);
-    persistSession(roomId, session.claudeSessionId, session.workdir, session.originRoomId, { model });
+    persistSession(roomId, session.claudeSessionId, session.workdir, session.originRoomId,
+      { model, ...(explicit ? explicitModelFlag(model) : { modelExplicit: false }) });
     sendReply(model
       ? `Codex model set to ${model}; it will apply on the next turn.`
       : 'Codex model reset to the local config default; it will apply on the next turn.');
     return;
   }
   if (session.iv) {
-    // Interactive: type /model into the live TUI. Not persisted by design —
-    // the pick applies to the live session only (spec non-goal); a restart
-    // falls back to the persisted/default model.
-    switchModelInSession(session, arg, sendReply);
+    // Interactive: type /model into the live TUI. The MODEL is not persisted
+    // by design — the pick applies to the live session only (spec non-goal);
+    // a restart falls back to the persisted/default model. Whether a person
+    // picked it is persisted, so a later Coordinator assignment leaves it
+    // alone. The Coordinator's own switch does persist the model, so its
+    // next spawn stays on it.
+    const switched = switchModelInSession(session, arg, sendReply);
+    if (switched) {
+      // A person's pick replaces any Coordinator model still pending on the
+      // session: a later restart must carry what they chose.
+      if (explicit) session._coordinatorModel = null;
+      persistSession(roomId, session.claudeSessionId, session.workdir, session.originRoomId, {
+        ...(explicit ? explicitModelFlag(arg) : { modelExplicit: false }),
+        ...(explicit ? {} : { model: normalizeModelArg(arg) }),
+      });
+    }
     return;
   }
   const decision = planPrintModelSwitch(session, arg, {
@@ -12026,10 +12270,15 @@ function applyModelSwitch(roomId, session, arg, { sendReply, sendHtml }) {
     // applies ahead of every queued message. One slot: a parked /restart is
     // replaced with a notice, same as the /login parked-slash convention.
     const previousParked = session._deferredCommandText;
-    session._deferredCommandText = `!model ${decision.normalized}`;
+    // The Coordinator parks `!restart --force` on a busy session it could
+    // not respawn (journalOnCoordinator). A model switch restarts the
+    // session anyway, so replacing that one is not news to the user, who
+    // never asked for a /restart.
+    const parkedByCoordinator = !!session._coordinatorPending && previousParked === '!restart --force';
+    session._deferredCommandText = `!model ${decision.normalized}${explicit ? '' : ' --implicit'}`;
     if (previousParked === session._deferredCommandText) {
       sendReply(`🧠 /model ${decision.normalized} is already queued — it will apply as soon as this turn finishes.`);
-    } else if (previousParked) {
+    } else if (previousParked && !parkedByCoordinator) {
       sendReply(`${decision.message.replace(/\.$/, '')} (replacing the queued /${previousParked.slice(1).split(' ')[0]}).`);
     } else {
       sendReply(decision.message);
@@ -12041,7 +12290,8 @@ function applyModelSwitch(roomId, session, arg, { sendReply, sendHtml }) {
     return;
   }
   sendReply(decision.message);
-  persistSession(roomId, session.claudeSessionId, session.workdir, session.originRoomId, { model: decision.normalized });
+  persistSession(roomId, session.claudeSessionId, session.workdir, session.originRoomId,
+    { model: decision.normalized, ...(explicit ? explicitModelFlag(decision.normalized) : { modelExplicit: false }) });
   const next = recreateSession(roomId, { model: decision.normalized }, { sendReply, sendHtml });
   if (next) next.currentModel = decision.normalized;
 }
@@ -12154,9 +12404,10 @@ function recreateSession(roomId, overrides, { sendReply, sendHtml }) {
     // falling back to persisted.model can otherwise pick up Claude's model.
     // Claude keeps the historical undefined fallback for a not-yet-observed
     // live model so its persisted selection survives a TUI restart.
-    model: existing.agent === AGENT_CODEX
-      ? existing.currentModel
-      : (existing.currentModel || undefined),
+    // A Coordinator model still pending on the session (journalOnCoordinator
+    // could not respawn it) beats the live model, which in iv mode keeps
+    // reading as the old one — see recreateSpawnModel.
+    model: recreateSpawnModel({ agent: existing.agent, currentModel: existing.currentModel, pendingModel: existing._coordinatorModel }),
     ...overrides,
   });
   next.sendCallback = sendReply;
