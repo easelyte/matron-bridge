@@ -674,7 +674,7 @@ describe('index.js + ask-user.js spawn wiring (source inspection)', () => {
     // Answered from cache only — never awaited, never blocking a reply on a
     // subprocess boot.
     expect(args).toMatch(/getActivity: \(\) => buildActivity\(\{ sessions, persisted: loadPersistedSessions\(\) \}\)/);
-    expect(args).toMatch(/getLimits: \(\) => \{ refreshUsageLimits\(DEFAULT_WORKDIR\); return buildLimits\(usageLimitsCache\); \}/);
+    expect(args).toMatch(/getLimits: \(\) => \{ refreshUsageLimits\(DEFAULT_WORKDIR\); return buildLimits\(usageLimitsCache, codexLimits\.cache\); \}/);
     expect(args).toMatch(/getDisk: \(\) => buildDisk\(\{ path: DEFAULT_WORKDIR \}\)/);
     expect(args).toMatch(/bindSpawnRoom: \(roomId, session\) => \{[\s\S]{0,200}agentRooms\.record\(roomId, \{ role: 'guest', state: 'joined', sessionRoomId: session\.roomId \}\)/);
     expect(args).toMatch(/unbindSpawnRoom: \(roomId\) => agentRooms\.remove\(roomId\)/);
