@@ -51,6 +51,11 @@ describe('box status wiring', () => {
     expect(block).toMatch(/available: \(\) => detectCodexBinary\(\)/);
     expect(block).toMatch(/refreshMs: LIMITS_REFRESH_MS/);
     expect(block).toMatch(/onFresh: \(\) => publishBoxStatus\('codex limits refresh'\)/);
+    // Claude cache: throttle on attemptedAt, as_of (fetchedAt) only on success.
+    const claudeRefresh = index.slice(index.indexOf('function refreshUsageLimits('), index.indexOf('function refreshUsageLimits(') + 1600);
+    expect(claudeRefresh).toMatch(/Date\.now\(\) - usageLimitsCache\.attemptedAt < LIMITS_REFRESH_MS/);
+    expect(claudeRefresh).toMatch(/if \(parsed\.ok\) \{\n\s*usageLimitsCache\.lines = parsed\.lines;\n\s*usageLimitsCache\.fetchedAt = usageLimitsCache\.attemptedAt;/);
+    expect(claudeRefresh.match(/usageLimitsCache\.fetchedAt =/g)).toHaveLength(1);
     const refresh = index.slice(index.indexOf('function refreshUsageLimits('), index.indexOf('function refreshUsageLimits(') + 600);
     expect(refresh).toMatch(/if \(!JOURNAL_ENABLED\) return null;[\s\S]*?refreshCodexLimits\(\);/);
     // The recent_folders reply carries the same merged limits as box_status.

@@ -284,6 +284,12 @@ describe('readHostSection', () => {
       const readText = async (file) => { if (file === bad) throw new Error('EIO'); return f.readText(file); };
       await expect(readHostSection(baseDeps(f, { readText }))).rejects.toMatchObject({ code: 'unavailable' });
     }
+    const garbage = { '/proc/uptime': '123bad 0\n', '/proc/loadavg': '1bad 2bad 3bad 1/2 3\n' };
+    for (const [file, text] of Object.entries(garbage)) {
+      const f = fakeProc();
+      const readText = async (p) => (p === file ? text : f.readText(p));
+      await expect(readHostSection(baseDeps(f, { readText }))).rejects.toMatchObject({ code: 'unavailable' });
+    }
   });
 
   it('bounds concurrent /proc reads (review round 3 F4)', async () => {

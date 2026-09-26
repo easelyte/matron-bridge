@@ -1851,7 +1851,10 @@ function publishEditDiffToConvo(session, convoId, toolName, input) {
 // runs overnight). A failed fetch stamps fetchedAt too, so an outage can't
 // turn every turn end into a spawn storm.
 const LIMITS_REFRESH_MS = parseInt(process.env.LIMITS_REFRESH_MS || '300000', 10); // 5 min
-const usageLimitsCache = { lines: null, fetchedAt: 0, inflight: null };
+// fetchedAt = when the held lines were measured (box_status limits.as_of);
+// attemptedAt = last fetch attempt, success or failure (the throttle). Kept
+// apart so a failed refresh never re-stamps old quotas as fresh.
+const usageLimitsCache = { lines: null, fetchedAt: 0, attemptedAt: 0, inflight: null };
 const codexAccountReader = createCodexAccountReader();
 // Codex quota lines for box_status (wire contract 2026-09-26 §1): the
 // account-scoped `account/rateLimits/read` query via the shared reader, on the
@@ -1916,13 +1919,14 @@ function refreshUsageLimits(cwd) {
   // Codex lines ride the same triggers on their own throttle (fire-and-forget).
   refreshCodexLimits();
   if (usageLimitsCache.inflight) return usageLimitsCache.inflight;
-  if (Date.now() - usageLimitsCache.fetchedAt < LIMITS_REFRESH_MS) return null;
+  if (Date.now() - usageLimitsCache.attemptedAt < LIMITS_REFRESH_MS) return null;
   usageLimitsCache.inflight = fetchUsageLimitsText(cwd)
     .then((raw) => {
       const parsed = parseUsageLimits(raw);
-      usageLimitsCache.fetchedAt = Date.now();
+      usageLimitsCache.attemptedAt = Date.now();
       if (parsed.ok) {
         usageLimitsCache.lines = parsed.lines;
+        usageLimitsCache.fetchedAt = usageLimitsCache.attemptedAt;
         // Fresh numbers: the journal's copy of this box's status is stale
         // the moment they land.
         publishBoxStatus('limits refresh');
@@ -1931,7 +1935,7 @@ function refreshUsageLimits(cwd) {
     })
     .catch((e) => {
       debug(`Usage limits refresh failed: ${e.message}`);
-      usageLimitsCache.fetchedAt = Date.now();
+      usageLimitsCache.attemptedAt = Date.now();
       return false;
     })
     .finally(() => { usageLimitsCache.inflight = null; });
