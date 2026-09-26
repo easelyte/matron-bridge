@@ -28,10 +28,17 @@ describe('processName (contract §2.1: never the full command line)', () => {
   });
 
   it('never names a flag operand (review F1): only provable script paths', () => {
-    expect(processName(['python3', '-W', 'ignore:sk_live_123', '/srv/worker.py'])).toBe('python3 worker.py');
+    expect(processName(['python3', '-W', 'ignore:sk_live_123', '/srv/worker.py'])).toBe('python3');
+    expect(processName(['python3', '-X', 'sk_live_customer.py'])).toBe('python3');
+    expect(processName(['python3', '-X', 'dev', '/srv/worker.py'])).toBe('python3');
+    expect(processName(['python3', '-uB', '/srv/worker.py'])).toBe('python3 worker.py');
+    expect(processName(['node', '--max-old-space-size=4096', '/w/server.mjs'])).toBe('node server.mjs');
+    expect(processName(['node', '--enable-source-maps', '/w/dist/main'])).toBe('node main');
+    expect(processName(['bash', '-o', 'secret.sh'])).toBe('bash');
+    expect(processName(['deno', 'run', '--allow-net', '--allow-read=/w', 'main.ts'])).toBe('deno main.ts');
     expect(processName(['python3', '-W', 'ignore:sk_live_123'])).toBe('python3');
     expect(processName(['node', '--token', 'sk_live_abc', 'arg2'])).toBe('node');
-    expect(processName(['node', '--max-old-space-size', '4096', '/w/server.mjs'])).toBe('node server.mjs');
+    expect(processName(['node', '--max-old-space-size', '4096', '/w/server.mjs'])).toBe('node');
     expect(processName(['node', '-r', 'dotenv/config', 'sk-secret'])).toBe('node');
     expect(processName(['python3', 'ignore:sk_live_123'])).toBe('python3');
     expect(processName(['python3', '-m', 'sk live'])).toBe('python3');
@@ -266,10 +273,16 @@ describe('readHostSection', () => {
     await expect(readHostSection(baseDeps(fakeProc(), { readText }))).rejects.toMatchObject({ code: 'unavailable' });
   });
 
-  it('degrades optional pieces to null instead of failing', async () => {
-    const h = await readHostSection(baseDeps(fakeProc(), { getDisk: () => { throw new Error('x'); }, getLiveSessions: () => null }));
-    expect(h.disk).toBeNull();
+  it('degrades live_sessions to 0 instead of failing', async () => {
+    const h = await readHostSection(baseDeps(fakeProc(), { getLiveSessions: () => null }));
     expect(h.live_sessions).toBe(0);
+  });
+
+  it('a failed disk probe is unavailable, not a different shape (review round 2 F3)', async () => {
+    await expect(readHostSection(baseDeps(fakeProc(), { getDisk: () => { throw new Error('x'); } })))
+      .rejects.toMatchObject({ code: 'unavailable', detail: 'disk probe failed' });
+    await expect(readHostSection(baseDeps(fakeProc(), { getDisk: () => null })))
+      .rejects.toMatchObject({ code: 'unavailable' });
   });
 });
 

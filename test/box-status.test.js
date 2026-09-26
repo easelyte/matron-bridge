@@ -134,14 +134,19 @@ describe('createCodexLimitsRefresher', () => {
     expect(read).not.toHaveBeenCalled();
   });
 
-  it('a failed read keeps the previous lines, stamps fetchedAt, and does not fire onFresh', async () => {
+  it('a failed read keeps the previous lines and their sample time, throttles, and does not fire onFresh', async () => {
     const { r, read, onFresh, advance } = mk();
     await r.refresh();
     advance(300_000);
     read.mockResolvedValueOnce({ limits: [], limitsError: 'Codex app server is unavailable.' });
     await expect(r.refresh()).resolves.toBe(false);
     expect(r.cache.lines).toEqual(codex(2));
-    expect(r.cache.fetchedAt).toBe(1_300_000);
+    // as_of stays the time the lines were measured (review round 2 F2)...
+    expect(r.cache.fetchedAt).toBe(1_000_000);
+    expect(buildLimits(null, r.cache).as_of).toBe(1_000_000);
+    // ...while the failed attempt still counts for the throttle.
+    expect(r.refresh()).toBeNull();
+    expect(read).toHaveBeenCalledTimes(2);
     expect(onFresh).toHaveBeenCalledTimes(1);
     advance(300_000);
     read.mockRejectedValueOnce(new Error('boom'));
