@@ -129,6 +129,22 @@ describe('subagent child context window', () => {
     expect(ctx.pct).toBe(10);
   });
 
+  it('a child that later reports a different model recomputes its window', () => {
+    const publisher = makePublisher();
+    const tracker = createSubagentConvoTracker({
+      publisher,
+      getParentConvoId: () => 'parent-uuid',
+      getParentModel: () => 'claude-opus-5-5[1m]',
+      log: { warn() {} },
+    });
+    tracker.discover('agent-1', { label: 'x', agentType: null });
+    tracker.onEvent('agent-1', { event: subagentAssistantEvent({ model: 'claude-opus-5-5', usage: { input_tokens: 100_000 } }) });
+    tracker.onEvent('agent-1', { event: subagentAssistantEvent({ model: 'claude-haiku-4-5', usage: { input_tokens: 100_000 } }) });
+    const ctx = publisher.calls.publishStatus.filter(s => s.convoId === 'parent-uuid:sub:agent-1').at(-1).status.context;
+    expect(ctx.window).toBe(200_000);
+    expect(ctx.pct).toBe(50);
+  });
+
   it('a throwing getParentModel does not break the status frame', () => {
     const publisher = makePublisher();
     const tracker = createSubagentConvoTracker({
