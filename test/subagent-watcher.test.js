@@ -3,6 +3,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { SubagentWatcher, subagentsDirFor } from '../lib/subagent-watcher.js';
+import { makeSubagentsDir, removeProjectRoots } from './helpers/project-root.js';
 
 // subagentsDirFor is re-exported from the shared lib/transcript-dir.js encoder;
 // this pins the watcher's public entry point. The subagents dir is derived from
@@ -43,20 +44,16 @@ describe('SubagentWatcher.repoint (cwd rehome / EnterWorktree)', () => {
 
   afterEach(async () => {
     for (const w of watchers.splice(0)) { try { await w.stop(); } catch { /* ignore */ } }
-    for (const d of projectRoots.splice(0)) { try { fs.rmSync(d, { recursive: true, force: true }); } catch { /* ignore */ } }
+    removeProjectRoots(projectRoots);
   });
 
   const uniqueWorkdir = tag => `/tmp/bridge631-${tag}-${process.pid}-${Math.random().toString(36).slice(2)}`;
 
   // The real subagents dir for (workdir, sessionId), created on disk. Registers
-  // the encoded project root (…/projects/<enc>) for teardown.
-  const mkSubagentsDir = (workdir, sessionId) => {
-    const dir = subagentsDirFor(workdir, sessionId);
-    fs.mkdirSync(dir, { recursive: true });
-    // …/projects/<enc>/<sid>/subagents → up three to …/projects/<enc>
-    projectRoots.push(path.dirname(path.dirname(path.dirname(dir))));
-    return dir;
-  };
+  // projectDirFor(workdir) (…/projects/<enc>) for teardown — never a dirname
+  // chain, which is one level short of ~/.claude/projects itself.
+  const mkSubagentsDir = (workdir, sessionId) =>
+    makeSubagentsDir(workdir, sessionId, projectRoots, { prefix: '-tmp-bridge631-' });
 
   it('re-points this.dir to the new workdir and preserves the seen set', () => {
     const sessionId = `sid-${Math.random().toString(36).slice(2)}`;
@@ -131,17 +128,13 @@ describe('SubagentWatcher.forceAttach (resumed agent under an already-seen trans
 
   afterEach(async () => {
     for (const w of watchers.splice(0)) { try { await w.stop(); } catch { /* ignore */ } }
-    for (const d of projectRoots.splice(0)) { try { fs.rmSync(d, { recursive: true, force: true }); } catch { /* ignore */ } }
+    removeProjectRoots(projectRoots);
   });
 
   const uniqueWorkdir = tag => `/tmp/bridge-resume-${tag}-${process.pid}-${Math.random().toString(36).slice(2)}`;
 
-  const mkSubagentsDir = (workdir, sessionId) => {
-    const dir = subagentsDirFor(workdir, sessionId);
-    fs.mkdirSync(dir, { recursive: true });
-    projectRoots.push(path.dirname(path.dirname(path.dirname(dir))));
-    return dir;
-  };
+  const mkSubagentsDir = (workdir, sessionId) =>
+    makeSubagentsDir(workdir, sessionId, projectRoots, { prefix: '-tmp-bridge-resume-' });
 
   // A watcher over a subagents dir that already holds `agent-<id>.jsonl` with
   // `priorLines` of history — the post-restart state: the transcript is the
