@@ -578,6 +578,47 @@ describe('start', () => {
       expect(warns.some((w) => /mission #61/.test(w) && /closed/.test(w))).toBe(true);
     });
 
+    it('mission_num: a duplicate start during a pending join waits for the real outcome — never "ok" for a child that is then stopped', async () => {
+      let releaseJoin;
+      const joinMission = vi.fn(() => new Promise((resolve) => { releaseJoin = () => resolve({ status: 200, body: {} }); }));
+      let started = 0;
+      const { handler, responses, stopped } = spawnHarness({
+        joinMission,
+        startSession: () => { started++; return { roomId: 'sess-key', journalConvoId: 'convo-9' }; },
+        injectTurn: () => false, // opening turn refused -> the child is stopped
+      });
+      handler(REQ('start', { prompt: 'do the thing', mission_num: 64, idempotency_key: 'k' }, 'a'));
+      handler(REQ('start', { prompt: 'do the thing', mission_num: 64, idempotency_key: 'k' }, 'b'));
+      await Promise.resolve();
+      expect(responses).toHaveLength(0); // the duplicate is NOT answered while the first is pending
+      releaseJoin();
+      await vi.waitFor(() => expect(responses).toHaveLength(2));
+      expect(started).toBe(1);
+      expect(stopped).toHaveLength(1);
+      for (const r of responses) expect(r.ok).toBe(false);
+      expect(responses.map((r) => r.requestId).sort()).toEqual(['a', 'b']);
+      expect(responses.find((r) => r.requestId === 'b').error.code).toBe('spawn_failed');
+    });
+
+    it('mission_num: a duplicate during a pending join gets the same convo once it succeeds, and a later retry is served from cache', async () => {
+      let releaseJoin;
+      const joinMission = vi.fn(() => new Promise((resolve) => { releaseJoin = () => resolve({ status: 200, body: {} }); }));
+      let started = 0;
+      const { handler, responses } = spawnHarness({
+        joinMission,
+        startSession: () => { started++; return { roomId: 'sess-key', journalConvoId: 'convo-9' }; },
+      });
+      handler(REQ('start', { prompt: 'do the thing', mission_num: 64, idempotency_key: 'k' }, 'a'));
+      handler(REQ('start', { prompt: 'do the thing', mission_num: 64, idempotency_key: 'k' }, 'b'));
+      releaseJoin();
+      await vi.waitFor(() => expect(responses).toHaveLength(2));
+      for (const r of responses) expect(r).toMatchObject({ ok: true, result: { convo_id: 'convo-9' } });
+      handler(REQ('start', { prompt: 'do the thing', mission_num: 64, idempotency_key: 'k' }, 'c'));
+      expect(responses[2]).toEqual({ requestId: 'c', toDeviceId: 7, ok: true, result: { convo_id: 'convo-9' } });
+      expect(started).toBe(1);
+      expect(joinMission).toHaveBeenCalledTimes(1);
+    });
+
     it('mission_num must be a positive integer; nothing is spawned otherwise', () => {
       let started = 0;
       const { handler, responses } = spawnHarness({ startSession: () => { started += 1; return { journalConvoId: 'c' }; } });
