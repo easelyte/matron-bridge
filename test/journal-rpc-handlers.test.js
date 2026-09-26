@@ -899,6 +899,25 @@ describe('start idempotency (#482)', () => {
     expect(responses[1]).toEqual({ requestId: 'r2', toDeviceId: 7, ok: true, result: { convo_id: 'session-ok' } });
   });
 
+  it('a start whose opening turn is refused drops its dedup entry — a retry re-spawns instead of answering the dead convo', () => {
+    let n = 0;
+    let refuse = true;
+    const calls = [];
+    const stopped = [];
+    const { handler, responses } = harness({
+      startSession: (args) => { calls.push(args); return { claudeSessionId: `session-${++n}` }; },
+      stopSession: (s) => stopped.push(s),
+      injectTurn: () => !refuse,
+    });
+    handler(REQ('start', { prompt: 'do it', idempotency_key: 'k' }, 'r1'));
+    expect(responses[0].error.code).toBe('spawn_failed');
+    expect(stopped).toHaveLength(1);
+    refuse = false;
+    handler(REQ('start', { prompt: 'do it', idempotency_key: 'k' }, 'r2'));
+    expect(calls).toHaveLength(2);
+    expect(responses[1]).toEqual({ requestId: 'r2', toDeviceId: 7, ok: true, result: { convo_id: 'session-2' } });
+  });
+
   it('the dedup cache is bounded — the oldest key evicts and re-spawns', () => {
     let n = 0;
     const calls = [];

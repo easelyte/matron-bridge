@@ -82,6 +82,9 @@ describe('itemIdemKey (loop #763)', () => {
     expect(itemIdemKey({ ...create, args: { ...create.args, awaiting: 'user' } })).not.toBe(key);
     expect(itemIdemKey({ ...create, args: { ...create.args, position: 'top' } })).not.toBe(key);
     expect(itemIdemKey({ ...create, args: { ...create.args, supersedes: 'it_9' } })).not.toBe(key);
+    expect(itemIdemKey({ ...create, args: { ...create.args, actions: ['Go'] } })).not.toBe(key);
+    expect(itemIdemKey({ ...create, args: { ...create.args, actions: ['Go'] } }))
+      .not.toBe(itemIdemKey({ ...create, args: { ...create.args, actions: ['A', 'B'] } }));
     // Two creates differing ONLY in attachments must differ.
     expect(itemIdemKey({ ...create, args: { ...create.args, attachments: ['a.png'] } }))
       .not.toBe(itemIdemKey({ ...create, args: { ...create.args, attachments: ['b.png'] } }));
