@@ -110,6 +110,25 @@ describe('subagent child context window', () => {
     expect(ctx.pct).toBe(50);
   });
 
+  it('a later parent model switch does not shrink a running child\'s inherited window', () => {
+    const publisher = makePublisher();
+    let parentModel = 'claude-opus-5-5[1m]';
+    const tracker = createSubagentConvoTracker({
+      publisher,
+      getParentConvoId: () => 'parent-uuid',
+      getParentModel: () => parentModel,
+      log: { warn() {} },
+    });
+    tracker.discover('agent-1', { label: 'x', agentType: null });
+    const ev = () => subagentAssistantEvent({ model: 'claude-opus-5-5', usage: { input_tokens: 100_000 } });
+    tracker.onEvent('agent-1', { event: ev() });
+    parentModel = 'claude-fable-5';
+    tracker.onEvent('agent-1', { event: ev() });
+    const ctx = publisher.calls.publishStatus.filter(s => s.convoId === 'parent-uuid:sub:agent-1').at(-1).status.context;
+    expect(ctx.window).toBe(1_000_000);
+    expect(ctx.pct).toBe(10);
+  });
+
   it('a throwing getParentModel does not break the status frame', () => {
     const publisher = makePublisher();
     const tracker = createSubagentConvoTracker({
