@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { createServer, request } from 'node:http';
+import { readFileSync } from 'node:fs';
 import { createJournalReadProxy, isJournalProxyPath } from '../lib/journal-read-proxy.js';
 
 function fakeFetch(impl) {
@@ -89,6 +90,17 @@ describe('journal read proxy (loop #765)', () => {
     } finally {
       await new Promise((ok) => server.close(ok));
     }
+  });
+
+  it('the API listener wraps the proxy call in try/catch (a throw must not be an unhandled rejection)', () => {
+    // index.js is not importable in tests (it starts the bridge), so pin the
+    // wiring by source text: the handle() call sits inside a try whose catch
+    // answers 500 instead of letting the async listener reject.
+    const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
+    const m = src.match(/try \{\s*proxied = await journalReadProxy\.handle\(\{[\s\S]*?\}\);\s*\} catch \(e\) \{([\s\S]*?)\n    \}/);
+    expect(m).not.toBeNull();
+    expect(m[1]).toMatch(/status: 500/);
+    expect(src.match(/journalReadProxy\.handle\(/g)).toHaveLength(1);
   });
 
   it('fails closed when no capability token is configured (never unauthenticated)', async () => {
