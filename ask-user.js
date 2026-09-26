@@ -8,7 +8,7 @@ import { z } from 'zod';
 import { resolvePermissionTimeoutMs } from './lib/permission-prompt.js';
 import { formatBox } from './lib/agent-boxes-format.js';
 import { itemLine, formatItemList, formatItemDetail, formatCommentAck } from './lib/items-format.js';
-import { formatStartAck, formatMilestoneAck, formatMissionDetail, missionLine, formatBlocked, formatJournalError } from './lib/missions-format.js';
+import { formatStartAck, formatCreateAck, formatMilestoneAck, formatMissionDetail, missionLine, formatBlocked, formatJournalError } from './lib/missions-format.js';
 import { missionIdemKey, itemIdemKey } from './lib/missions-idem.js';
 import { formatReminderLine } from './lib/reminder-tools.js';
 
@@ -418,7 +418,7 @@ server.tool(
 
 server.tool(
   'agent_session_start',
-  "Ask the user's consent to start a new agent session on one of their boxes — this one included, when the work has to happen here — seeded with a task. If the user has not already said which box and directory the work should happen in, ask them before calling this — they usually have a preference, and the consent card can only be approved or declined, it cannot be corrected. The result is pending: do NOT wait or poll — the user's decision and the spawn outcome arrive automatically as later turns. On approval the new session runs detached by default: it does the task and does not report back — a clean break, which is what a spawn normally is. Pass link: true only when you need its results in a chat room; the room is then created on approval and the child is told to report there.",
+  "Ask the user's consent to start a new agent session on one of their boxes — this one included, when the work has to happen here — seeded with a task. If the user has not already said which box and directory the work should happen in, ask them before calling this — they usually have a preference, and the consent card can only be approved or declined, it cannot be corrected. The result is pending: do NOT wait or poll — the user's decision and the spawn outcome arrive automatically as later turns. On approval the new session runs detached by default: it does the task and does not report back — a clean break, which is what a spawn normally is. Pass link: true only when you need its results in a chat room; the room is then created on approval and the child is told to report there. Pass mission: N to put the new session on mission #N from its first turn (the consent card says so) — the way to assign a mission made with mission_create.",
   {
     device_id: z.number().int().describe('Target box device id, from agent_boxes'),
     workdir: z.string().describe('Absolute working directory on the target box, from agent_boxes folders'),
@@ -426,13 +426,14 @@ server.tool(
     topic: z.string().max(200).optional().describe('Optional short room/session title'),
     model: z.string().optional().describe('Optional Claude model alias for the new session: default, opus, opus[1m], sonnet, sonnet[1m], haiku, opusplan, fable (or a full claude-* model name). Omit to use the target box\'s own default — only set it if the user asked for a specific model.'),
     link: z.boolean().optional().describe('Open a chat room between this session and the new one, and have it report its outcome there. Default false: the spawned session is detached and simply does its task. Set true only when you need its results back here.'),
+    mission: z.number().int().min(1).optional().describe('Mission number the new session joins before its first turn — e.g. one you made with mission_create. The consent card shows it.'),
   },
-  async ({ device_id, workdir, task, topic, model, link }) => {
+  async ({ device_id, workdir, task, topic, model, link, mission }) => {
     try {
       const postRes = await fetch(`${BRIDGE_API}/agent-session-start`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ roomId: ROOM_ID, device_id, workdir, task, ...(topic ? { topic } : {}), ...(model ? { model } : {}), ...(link === true ? { link: true } : {}) }),
+        body: JSON.stringify({ roomId: ROOM_ID, device_id, workdir, task, ...(topic ? { topic } : {}), ...(model ? { model } : {}), ...(link === true ? { link: true } : {}), ...(mission ? { mission } : {}) }),
       });
       const data = await postRes.json().catch(() => ({}));
       if (!postRes.ok) {
@@ -441,7 +442,8 @@ server.tool(
       const waking = data.target_waking === true
         ? ' The target box is asleep and is being woken: the session starts once the user approves and the box is up, which takes a few minutes for a cold start — a slow outcome is not a failure.'
         : '';
-      return { content: [{ type: 'text', text: `Spawn request ${data.spawn_id} sent — awaiting the user's approval.${waking} Continue your own work; the outcome will arrive as a later turn.` }] };
+      const joins = mission ? ` The new session joins mission #${mission} from its first turn.` : '';
+      return { content: [{ type: 'text', text: `Spawn request ${data.spawn_id} sent — awaiting the user's approval.${joins}${waking} Continue your own work; the outcome will arrive as a later turn.` }] };
     } catch (err) {
       return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
     }
@@ -744,7 +746,7 @@ async function callItems(name, args, render) {
 
 server.tool(
   'item_create',
-  "File an item in the user's task & decision tracker — a panel beside the chat, so it survives this session and the user can answer in their own time. Use kind 'question' for EACH decision you need from the user instead of listing questions in prose: the user answers in that item's own thread and their reply reaches you as a 📌 turn, so do not block waiting for it. Use 'decision' to record a choice you made yourself (what and why, in body) and 'task' for work to do later. Markdown body; attach screenshots or files by local path (uploaded and shown inline).",
+  "File an item in the user's task & decision tracker — a panel beside the chat, so it survives this session and the user can answer in their own time. Use kind 'question' for EACH decision you need from the user instead of listing questions in prose: the user answers in that item's own thread and their reply reaches you as a 📌 turn, so do not block waiting for it. Use 'decision' to record a choice you made yourself (what and why, in body) and 'task' for work to do later. Markdown body; attach screenshots or files by local path (uploaded and shown inline). When the question has an obvious one-tap answer — a go-ahead, or a choice between 2–3 options — pass `actions` so the user can tap instead of typing (they can still reply in words).",
   {
     kind: z.enum(['task', 'question', 'decision']),
     title: z.string().describe('One line, ≤200 chars'),
@@ -755,6 +757,7 @@ server.tool(
     awaiting: z.enum(['user', 'agent']).nullable().optional().describe('Who acts next. Defaults: question→user, task→agent, decision→nobody'),
     position: z.enum(['top', 'bottom']).optional().describe('Where a task lands in the ordered task list'),
     supersedes: z.string().optional().describe('Item id of a decision this one replaces'),
+    actions: z.array(z.string()).max(4).optional().describe('Up to 4 short one-tap reply labels (≤40 chars each, unique), e.g. ["Go"] or ["Option A","Option B"]. Tapping one behaves exactly like the user typing that label as a reply.'),
   },
   async (args) => callItems('create', args, (d) => itemLine(d.item)),
 );
@@ -839,7 +842,7 @@ server.tool(
 // milestone AND a second transcript marker (see lib/missions-idem.js).
 async function callMissions(name, args, render) {
   const payload = { roomId: ROOM_ID, ...args };
-  if (name === 'start' || name === 'post') {
+  if (name === 'start' || name === 'post' || name === 'create') {
     payload.idem_key = missionIdemKey({ op: name, roomId: ROOM_ID, kind: args?.kind, title: args?.title, body: args?.body });
   }
   try {
@@ -856,7 +859,7 @@ async function callMissions(name, args, render) {
     return { content: [{ type: 'text', text: `${missionToolName(name)} failed: ${err.message}` }] };
   }
 }
-const missionToolName = (op) => ({ start: 'mission_start', post: 'milestone_post', update: 'mission_update', join: 'mission_join', get: 'mission_get', close: 'mission_close' }[op] || `mission_${op}`);
+const missionToolName = (op) => ({ start: 'mission_start', create: 'mission_create', post: 'milestone_post', update: 'mission_update', join: 'mission_join', get: 'mission_get', close: 'mission_close' }[op] || `mission_${op}`);
 
 server.tool(
   'mission_start',
@@ -866,6 +869,16 @@ server.tool(
     body: z.string().optional().describe('Markdown ≤32 KiB — the goal and the standing description'),
   },
   async (args) => callMissions('start', args, formatStartAck),
+);
+
+server.tool(
+  'mission_create',
+  "Create a mission WITHOUT joining this conversation to it (an unassigned mission) — for work you are handing to another agent. Assign it by starting a session with agent_session_start and mission: N, or by asking a running agent (agent_chat_start) to mission_join N. mission_start is the one that creates AND joins, for your own work. Returns the mission number.",
+  {
+    title: z.string().describe('One line, ≤200 chars — what the work is'),
+    body: z.string().optional().describe('Markdown ≤32 KiB — the goal: what done looks like, constraints, links'),
+  },
+  async (args) => callMissions('create', args, formatCreateAck),
 );
 
 server.tool(

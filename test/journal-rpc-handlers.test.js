@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { createRpcRequestHandler, composeSpawnOpeningTurn } from '../lib/journal-rpc.js';
 import { modelOptions, isValidModelArg } from '../lib/model-aliases.js';
 
@@ -489,6 +489,114 @@ describe('start', () => {
       expect(stopped).toEqual([session]);
       expect(responses[0]).toEqual({ requestId: 'r1', toDeviceId: 7, ok: false, error: { code: 'unsupported_mode', detail: 'spawn-room wiring absent' } });
     });
+
+    it('mission_num: joins the mission BEFORE the opening turn, names it in the turn, then replies', async () => {
+      const joins = [];
+      const { handler, responses, session, sequence, injected } = spawnHarness({
+        joinMission: async (s, num) => { sequence.push('join'); joins.push([s, num]); return { status: 200, body: { mission: { num } } }; },
+      });
+      handler(REQ('start', { prompt: 'do the thing', mission_num: 64 }));
+      await vi.waitFor(() => expect(responses).toHaveLength(1));
+      expect(sequence).toEqual(['join', 'inject']);
+      expect(joins).toEqual([[session, 64]]);
+      expect(injected[0][1]).toContain('You are on mission #64 — run mission_get');
+      expect(responses[0]).toEqual({ requestId: 'r1', toDeviceId: 7, ok: true, result: { convo_id: 'convo-9' } });
+    });
+
+    it('mission_num: retries while the convo is not on the journal yet, then succeeds', async () => {
+      const answers = [{ status: 404, body: { error: 'not found' } }, { status: 409, body: { error: 'journal conversation not established yet' } }, { status: 200, body: {} }];
+      const joinMission = vi.fn(async () => answers.shift());
+      const { handler, responses, sequence } = spawnHarness({ joinMission, joinRetryDelayMs: 0 });
+      handler(REQ('start', { prompt: 'do the thing', mission_num: 64 }));
+      await vi.waitFor(() => expect(responses).toHaveLength(1));
+      expect(joinMission).toHaveBeenCalledTimes(3);
+      expect(sequence).toEqual(['inject']);
+      expect(responses[0].ok).toBe(true);
+    });
+
+    it('mission_num: a join that keeps failing is logged and the session still starts (the journal joins after the reply)', async () => {
+      const warns = [];
+      const joinMission = vi.fn(async () => { throw new Error('ECONNRESET'); });
+      const { handler, responses, stopped, injected } = spawnHarness({ joinMission, joinRetryDelayMs: 0, log: { warn: (m) => warns.push(m), error: () => {} } });
+      handler(REQ('start', { prompt: 'do the thing', mission_num: 64 }));
+      await vi.waitFor(() => expect(responses).toHaveLength(1));
+      expect(joinMission).toHaveBeenCalledTimes(3);
+      expect(stopped).toHaveLength(0);
+      expect(injected[0][1]).toContain('You are on mission #64');
+      expect(responses[0].ok).toBe(true);
+      expect(warns.some((w) => /could not join mission #64 before the opening turn/.test(w))).toBe(true);
+    });
+
+    it('mission_num: a join that hangs gives up at the overall join deadline and starts anyway (well inside the journal start timeout)', async () => {
+      vi.useFakeTimers();
+      try {
+        const warns = [];
+        const joinMission = vi.fn(() => new Promise(() => {}));
+        const { handler, responses, stopped, injected } = spawnHarness({ joinMission, log: { warn: (m) => warns.push(m), error: () => {} } });
+        handler(REQ('start', { prompt: 'do the thing', mission_num: 64 }));
+        await vi.advanceTimersByTimeAsync(4_999);
+        expect(responses).toHaveLength(0);
+        await vi.advanceTimersByTimeAsync(1);
+        expect(responses).toHaveLength(1);
+        expect(responses[0].ok).toBe(true);
+        expect(stopped).toHaveLength(0);
+        expect(injected[0][1]).toContain('You are on mission #64');
+        expect(joinMission).toHaveBeenCalledTimes(1);
+        expect(warns.some((w) => /could not join mission #64 before the opening turn/.test(w))).toBe(true);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('mission_num: no retry starts after the join deadline has passed', async () => {
+      vi.useFakeTimers();
+      try {
+        const joinMission = vi.fn(() => new Promise((resolve) => setTimeout(() => resolve({ status: 502, body: {} }), 4_000)));
+        const { handler, responses } = spawnHarness({ joinMission, joinRetryDelayMs: 300 });
+        handler(REQ('start', { prompt: 'do the thing', mission_num: 64 }));
+        await vi.advanceTimersByTimeAsync(5_000);
+        expect(responses).toHaveLength(1);
+        expect(joinMission).toHaveBeenCalledTimes(2);
+        await vi.advanceTimersByTimeAsync(20_000);
+        expect(joinMission).toHaveBeenCalledTimes(2);
+        expect(responses).toHaveLength(1);
+      } finally {
+        vi.useRealTimers();
+      }
+    });
+
+    it('mission_num: a closed mission (409 blocked_by) is not retried, and — unlike a timed-out/pending join — the opening turn does not name a mission the journal has already refused', async () => {
+      const warns = [];
+      const joinMission = vi.fn(async () => ({ status: 409, body: { error: 'conflict', blocked_by: 'closed' } }));
+      const { handler, responses, injected } = spawnHarness({ joinMission, joinRetryDelayMs: 0, log: { warn: (m) => warns.push(m), error: () => {} } });
+      handler(REQ('start', { prompt: 'do the thing', mission_num: 61 }));
+      await vi.waitFor(() => expect(responses).toHaveLength(1));
+      expect(joinMission).toHaveBeenCalledTimes(1);
+      expect(responses[0].ok).toBe(true);
+      expect(injected[0][1]).not.toContain('You are on mission');
+      expect(injected[0][1]).not.toContain('mission_start');
+      expect(warns.some((w) => /mission #61/.test(w) && /closed/.test(w))).toBe(true);
+    });
+
+    it('mission_num must be a positive integer; nothing is spawned otherwise', () => {
+      let started = 0;
+      const { handler, responses } = spawnHarness({ startSession: () => { started += 1; return { journalConvoId: 'c' }; } });
+      handler(REQ('start', { prompt: 'x', mission_num: '64' }));
+      handler(REQ('start', { prompt: 'x', mission_num: 0 }, 'r2'));
+      expect(started).toBe(0);
+      expect(responses.map((r) => r.error)).toEqual([
+        { code: 'bad_request', detail: 'bad mission_num' },
+        { code: 'bad_request', detail: 'bad mission_num' },
+      ]);
+    });
+
+    it('no mission_num: the start stays synchronous and never calls joinMission', () => {
+      const joinMission = vi.fn();
+      const { handler, responses } = spawnHarness({ joinMission });
+      handler(REQ('start', { prompt: 'do the thing' }));
+      expect(responses).toHaveLength(1);
+      expect(joinMission).not.toHaveBeenCalled();
+    });
   });
 
   // Wire contract: `model` is an optional Claude model alias (or full
@@ -791,6 +899,25 @@ describe('start idempotency (#482)', () => {
     expect(responses[1]).toEqual({ requestId: 'r2', toDeviceId: 7, ok: true, result: { convo_id: 'session-ok' } });
   });
 
+  it('a start whose opening turn is refused drops its dedup entry — a retry re-spawns instead of answering the dead convo', () => {
+    let n = 0;
+    let refuse = true;
+    const calls = [];
+    const stopped = [];
+    const { handler, responses } = harness({
+      startSession: (args) => { calls.push(args); return { claudeSessionId: `session-${++n}` }; },
+      stopSession: (s) => stopped.push(s),
+      injectTurn: () => !refuse,
+    });
+    handler(REQ('start', { prompt: 'do it', idempotency_key: 'k' }, 'r1'));
+    expect(responses[0].error.code).toBe('spawn_failed');
+    expect(stopped).toHaveLength(1);
+    refuse = false;
+    handler(REQ('start', { prompt: 'do it', idempotency_key: 'k' }, 'r2'));
+    expect(calls).toHaveLength(2);
+    expect(responses[1]).toEqual({ requestId: 'r2', toDeviceId: 7, ok: true, result: { convo_id: 'session-2' } });
+  });
+
   it('the dedup cache is bounded — the oldest key evicts and re-spawns', () => {
     let n = 0;
     const calls = [];
@@ -845,5 +972,15 @@ describe('dispatch guarantees', () => {
     handler(REQ('start', {}, 'b'));
     handler(REQ('nope', {}, 'c'));
     expect(responses.map((r) => [r.requestId, r.toDeviceId])).toEqual([['a', 7], ['b', 7], ['c', 7]]);
+  });
+});
+
+describe('composeSpawnOpeningTurn mission line', () => {
+  it('names the mission only when one is given', () => {
+    const withMission = composeSpawnOpeningTurn({ task: 't', roomId: null, fromName: 'a', serverLabel: 'b', missionNum: 64 });
+    expect(withMission).toMatch(/\n\nYou are on mission #64 — run mission_get to read its goal, milestones and open items/);
+    expect(withMission).toMatch(/Do not call mission_start/);
+    const without = composeSpawnOpeningTurn({ task: 't', roomId: null, fromName: 'a', serverLabel: 'b' });
+    expect(without).not.toMatch(/mission/);
   });
 });

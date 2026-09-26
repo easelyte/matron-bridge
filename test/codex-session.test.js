@@ -302,8 +302,11 @@ describe('Codex bridge wiring', () => {
     const recreateStart = src.indexOf('function recreateSession(');
     const recreateEnd = src.indexOf('\nfunction ', recreateStart + 1);
     const recreateBody = src.slice(recreateStart, recreateEnd);
-    expect(recreateBody).toMatch(
-      /model: existing\.agent === AGENT_CODEX[\s\S]*\? existing\.currentModel[\s\S]*: \(existing\.currentModel \|\| undefined\)/,
+    // The Codex-keeps-null / Claude-undefined-fallback rule lives in
+    // recreateSpawnModel (lib/coordinator.js, unit-tested in
+    // test/coordinator.test.js); recreateSession must route through it.
+    expect(recreateBody).toContain(
+      'model: recreateSpawnModel({ agent: existing.agent, currentModel: existing.currentModel, pendingModel: existing._coordinatorModel }),',
     );
   });
 

@@ -43,4 +43,11 @@ describe('items tracker wiring', () => {
   it('sends roomId on every item route call', () => {
     expect(askUser).toContain('JSON.stringify({ roomId: ROOM_ID, ...args })');
   });
+
+  it('item_create exposes an actions field (item-actions-contract)', () => {
+    const start = askUser.indexOf("'item_create',");
+    const end = askUser.indexOf('server.tool(', start + 1);
+    const block = askUser.slice(start, end === -1 ? undefined : end);
+    expect(block).toMatch(/actions:\s*z\.array\(z\.string\(\)\)/);
+  });
 });

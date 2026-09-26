@@ -2457,3 +2457,68 @@ describe('room mute card taps', () => {
     expect(deps.routePromptReply.mock.calls[0][1].roomMute).toBeUndefined();
   });
 });
+
+describe('coordinator events', () => {
+  function consumer(overrides = {}) {
+    const seams = {
+      isControlConvo: () => false,
+      handleControlCommand: vi.fn(),
+      findSessionByConvoId: vi.fn(() => null),
+      routeTextToSession: vi.fn(),
+      routePromptReply: vi.fn(),
+      resumeSessionForConvo: vi.fn(() => null),
+      noticeUnknownConvo: vi.fn(),
+      onCoordinatorEvent: vi.fn(),
+      log: silentLog,
+      ...overrides,
+    };
+    return { onEvent: createJournalInputConsumer(seams), seams };
+  }
+
+  it('hands assigned/released to the seam from any sender, with the seq', () => {
+    const { onEvent, seams } = consumer();
+    onEvent(baseFrame({ seq: 7, type: 'coordinator', sender: 'user:dan', payload: { role: 'assigned' } }));
+    onEvent(baseFrame({ seq: 8, type: 'coordinator', sender: 'agent:box', payload: { role: 'released' } }));
+    onEvent(baseFrame({ seq: 9, type: 'coordinator', sender: 'system', payload: { role: 'assigned' } }));
+    expect(seams.onCoordinatorEvent.mock.calls).toEqual([
+      ['convo-1', { role: 'assigned', seq: 7 }],
+      ['convo-1', { role: 'released', seq: 8 }],
+      ['convo-1', { role: 'assigned', seq: 9 }],
+    ]);
+  });
+
+  it('is never input: no text route, no resume, no unknown-convo notice', () => {
+    const { onEvent, seams } = consumer();
+    onEvent(baseFrame({ type: 'coordinator', payload: { role: 'assigned' } }));
+    expect(seams.routeTextToSession).not.toHaveBeenCalled();
+    expect(seams.resumeSessionForConvo).not.toHaveBeenCalled();
+    expect(seams.findSessionByConvoId).not.toHaveBeenCalled();
+    expect(seams.noticeUnknownConvo).not.toHaveBeenCalled();
+  });
+
+  it('drops an unknown role or a missing convo id', () => {
+    const { onEvent, seams } = consumer();
+    onEvent(baseFrame({ type: 'coordinator', payload: { role: 'promoted' } }));
+    onEvent(baseFrame({ type: 'coordinator', payload: null }));
+    onEvent(baseFrame({ type: 'coordinator', convo_id: '', payload: { role: 'assigned' } }));
+    expect(seams.onCoordinatorEvent).not.toHaveBeenCalled();
+  });
+
+  it('a throwing seam is contained; an unwired seam is a silent drop', () => {
+    const warns = [];
+    const { onEvent } = consumer({ onCoordinatorEvent: () => { throw new Error('boom'); }, log: { warn: (m) => warns.push(m) } });
+    expect(() => onEvent(baseFrame({ type: 'coordinator', payload: { role: 'assigned' } }))).not.toThrow();
+    expect(warns.some((w) => /onCoordinatorEvent threw: boom/.test(w))).toBe(true);
+    const { onEvent: bare, seams } = consumer({ onCoordinatorEvent: undefined });
+    bare(baseFrame({ type: 'coordinator', payload: { role: 'assigned' } }));
+    expect(seams.noticeUnknownConvo).not.toHaveBeenCalled();
+  });
+
+  it('a coordinator frame in an active room convo still goes to the coordinator seam, not the room', () => {
+    const routeRoomFrame = vi.fn();
+    const { onEvent, seams } = consumer({ roomFor: () => ({ peerName: 'x' }), routeRoomFrame });
+    onEvent(baseFrame({ type: 'coordinator', payload: { role: 'assigned' } }));
+    expect(routeRoomFrame).not.toHaveBeenCalled();
+    expect(seams.onCoordinatorEvent).toHaveBeenCalledTimes(1);
+  });
+});

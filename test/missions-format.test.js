@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { describe, it, expect } from 'vitest';
-import { missionLine, formatStartAck, formatMilestoneAck, formatMissionDetail, formatBlocked, formatJournalError } from '../lib/missions-format.js';
+import { missionLine, formatStartAck, formatCreateAck, formatMilestoneAck, formatMissionDetail, formatBlocked, formatJournalError } from '../lib/missions-format.js';
 
 // Real journal response bodies (see the file's _source): these renderers are
 // the only place the bridge reads the mission JSON, so the contract is
@@ -19,6 +19,10 @@ describe('missions-format', () => {
   it('start ack distinguishes new from existing', () => {
     expect(formatStartAck({ mission })).toBe('Started mission #61 "Missions" (id ms_1)');
     expect(formatStartAck({ mission, existing: true })).toBe('Already in mission #61 "Missions" — nothing changed (id ms_1)');
+  });
+  it('create ack uses the contract wording', () => {
+    expect(formatCreateAck({ mission })).toBe('Mission #61 "Missions" created (unassigned)');
+    expect(formatCreateAck({})).toBe('Mission created (unassigned).');
   });
   it('milestone ack names both numbers', () => {
     expect(formatMilestoneAck({ milestone: { num: 63, kind: 'progress', title: 'Landed PR' }, mission })).toBe('Milestone #63 posted to mission #61 "Missions"');
