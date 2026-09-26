@@ -1,4 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
+import { createServer, request } from 'node:http';
 import { createJournalReadProxy, isJournalProxyPath } from '../lib/journal-read-proxy.js';
 
 function fakeFetch(impl) {
@@ -49,6 +50,45 @@ describe('journal read proxy (loop #765)', () => {
     expect((await proxy.handle({ method: 'GET', pathname: '/journal/search', search: '?q=x', callerToken: undefined })).status).toBe(401);
     expect((await proxy.handle({ method: 'GET', pathname: '/journal/search', search: '?q=x', callerToken: 'wrong' })).status).toBe(401);
     expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it('rejects (never throws on) a same-length token with non-ASCII characters', async () => {
+    const fetchImpl = fakeFetch(() => okRes('x'));
+    const proxy = makeProxy(fetchImpl);
+    // Header values arrive latin1-decoded: 'é' is one UTF-16 unit, two UTF-8 bytes.
+    const sameLength = CAP.slice(0, -1) + '\u00e9';
+    expect(sameLength.length).toBe(CAP.length);
+    const r = await proxy.handle({ method: 'GET', pathname: '/journal/search', search: '?q=x', callerToken: sameLength });
+    expect(r.status).toBe(401);
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
+  it('a raw non-ASCII header byte over real HTTP gets 401 and the server keeps serving', async () => {
+    const fetchImpl = fakeFetch(() => okRes('{"hits":[]}'));
+    const proxy = makeProxy(fetchImpl);
+    const server = createServer(async (req, res) => {
+      const u = new URL(req.url, 'http://localhost');
+      const r = await proxy.handle({ method: req.method, pathname: u.pathname, search: u.search, callerToken: req.headers['x-matron-journal-proxy-token'] });
+      res.writeHead(r.status, { 'Content-Type': r.contentType });
+      res.end(r.body);
+    });
+    await new Promise((ok) => server.listen(0, '127.0.0.1', ok));
+    const { port } = server.address();
+    const get = (headerBytes) => new Promise((ok, fail) => {
+      const req = request({ host: '127.0.0.1', port, path: '/journal/search?q=x', method: 'GET',
+        headers: { 'x-matron-journal-proxy-token': Buffer.from(headerBytes).toString('latin1') } }, (res) => { res.resume(); res.on('end', () => ok(res.statusCode)); });
+      req.on('error', fail);
+      req.end();
+    });
+    try {
+      // Same character count as CAP, but the last byte is 0xE9 (latin1 'e-acute').
+      const bytes = Buffer.concat([Buffer.from(CAP.slice(0, -1)), Buffer.from([0xe9])]);
+      expect(await get(bytes)).toBe(401);
+      expect(await get(Buffer.from(CAP))).toBe(200);
+      expect(fetchImpl).toHaveBeenCalledTimes(1);
+    } finally {
+      await new Promise((ok) => server.close(ok));
+    }
   });
 
   it('fails closed when no capability token is configured (never unauthenticated)', async () => {
