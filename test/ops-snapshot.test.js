@@ -2,7 +2,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { EventEmitter } from 'node:events';
 import {
   OPS_SECTIONS, OPS_RESULT_MAX_BYTES, processName, splitCommand, parseCpuLine, parseProcPidStat,
-  parseMeminfo, parsePasswd, fitToBudget, detectPageSize, readHostSection, runOpsCommand, createOpsSnapshot, OpsError,
+  parseMeminfo, parsePasswd, fitToBudget, detectPageSize, mapLimit, readHostSection, runOpsCommand, createOpsSnapshot, OpsError,
 } from '../lib/ops-snapshot.js';
 
 describe('processName (contract §2.1: never the full command line)', () => {
@@ -276,6 +276,28 @@ describe('readHostSection', () => {
   it('degrades live_sessions to 0 instead of failing', async () => {
     const h = await readHostSection(baseDeps(fakeProc(), { getLiveSessions: () => null }));
     expect(h.live_sessions).toBe(0);
+  });
+
+  it('a failed required /proc probe is unavailable, never zeros (review round 3 F3)', async () => {
+    for (const bad of ['/proc/meminfo', '/proc/uptime', '/proc/loadavg']) {
+      const f = fakeProc();
+      const readText = async (file) => { if (file === bad) throw new Error('EIO'); return f.readText(file); };
+      await expect(readHostSection(baseDeps(f, { readText }))).rejects.toMatchObject({ code: 'unavailable' });
+    }
+  });
+
+  it('bounds concurrent /proc reads (review round 3 F4)', async () => {
+    let inFlight = 0;
+    let peak = 0;
+    await mapLimit(Array.from({ length: 500 }, (_, i) => i), 32, async () => {
+      inFlight += 1; peak = Math.max(peak, inFlight);
+      await new Promise((r) => setImmediate(r));
+      inFlight -= 1;
+    });
+    expect(peak).toBe(32);
+    const seen = [];
+    await mapLimit(new Set([1, 2, 3]).keys(), 32, async (x) => { seen.push(x); });
+    expect(seen).toEqual([1, 2, 3]);
   });
 
   it('a failed disk probe is unavailable, not a different shape (review round 2 F3)', async () => {

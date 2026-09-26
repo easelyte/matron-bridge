@@ -17,7 +17,7 @@ describe('buildLimits with codex lines (contract §1)', () => {
 
   it('puts Claude lines first, then Codex lines', () => {
     const out = buildLimits({ lines: claude(2), fetchedAt: 5 }, { lines: codex(2), fetchedAt: 9 });
-    expect(out.as_of).toBe(5);
+    expect(out.as_of).toBe(5); // oldest of the two samples
     expect(out.lines.map((l) => l.id)).toEqual(['c0', 'c1', 'codex:codex:0', 'codex:codex:1']);
   });
 
@@ -32,6 +32,13 @@ describe('buildLimits with codex lines (contract §1)', () => {
   it('reports Codex lines alone (as_of from the codex cache) while the Claude cache is cold', () => {
     const out = buildLimits({ lines: null, fetchedAt: 0 }, { lines: codex(1), fetchedAt: 9 });
     expect(out).toEqual({ as_of: 9, lines: codex(1) });
+  });
+
+  it('stamps the merged block with its OLDEST sample (review round 3 F1)', () => {
+    expect(buildLimits({ lines: claude(1), fetchedAt: 500 }, { lines: codex(1), fetchedAt: 100 }).as_of).toBe(100);
+    expect(buildLimits({ lines: claude(1), fetchedAt: 100 }, { lines: codex(1), fetchedAt: 500 }).as_of).toBe(100);
+    // Codex lines all dropped (cap / invalid) -> only Claude's time counts.
+    expect(buildLimits({ lines: claude(12), fetchedAt: 500 }, { lines: codex(1), fetchedAt: 100 }).as_of).toBe(500);
   });
 
   it('drops Codex lines the journal would reject rather than invalidating the whole block', () => {
