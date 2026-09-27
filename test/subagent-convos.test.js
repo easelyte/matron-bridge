@@ -437,10 +437,10 @@ describe('createSubagentConvoTracker', () => {
     });
   });
 
-  // Loop #751: a duplicated / replayed task_notification for a PRIOR run must
+  // A duplicated / replayed task_notification for a PRIOR run must
   // not finish the run currently in flight. The completion is gated on the
   // notification's tool_use_id matching the child's CURRENT taskRef.
-  describe('completion gated on tool_use_id (loop #751)', () => {
+  describe('completion gated on tool_use_id', () => {
     it('finishes on a matching tool_use_id', () => {
       tracker.noteBackgroundTaskStarted('toolu_1', 'agent-1');
       tracker.discover('agent-1', { label: 'A', agentType: null });
@@ -464,8 +464,28 @@ describe('createSubagentConvoTracker', () => {
       expect(publisher.calls.upsertConvo.at(-1).opts.sessionState).toBe(CHILD_STATE_FINISHED);
     });
 
+    it('a never-resumed child completes on a mismatched tool_use_id (FIFO mispairing never corrected)', () => {
+      // Two refs queued FIFO; only agent-B is discovered, and it provisionally
+      // takes ref-A (wrong). Its corrective task_started never arrives (a
+      // producer that does not emit one). Its completion carries the TRUE ref.
+      // A never-resumed child has exactly one incarnation, so the mismatch
+      // cannot be a stale prior-run notification: it must finish by task_id, as
+      // on master — otherwise the child strands at running until teardown.
+      tracker.noteTaskStarted('ref-A');
+      tracker.noteTaskStarted('ref-B');
+      const b = tracker.discover('agent-B', { label: 'B', agentType: null });
+      expect(b.taskRef).toBe('ref-A');
+      expect(b.retiredRefs ?? new Set()).toHaveProperty('size', 0);
+      publisher.calls.upsertConvo.length = 0;
+
+      tracker.noteTaskCompleted('agent-B', 'ref-B');
+
+      expect(b.state).toBe(CHILD_STATE_FINISHED);
+      expect(publisher.calls.upsertConvo.at(-1).opts.sessionState).toBe(CHILD_STATE_FINISHED);
+    });
+
     it('ignores an uncorrelated (id-less) notification for a RESUMED run — cannot risk killing the live incarnation', () => {
-      // Codex F1: for a producer that omits tool_use_id, a stale run-N
+      // For a producer that omits tool_use_id, a stale run-N
       // notification arriving after run N+1 has started must not blindly finish
       // the live resumed run. generation >= 1 means multiple incarnations exist,
       // so an uncorrelated completion is ambiguous and is ignored (finishAll
@@ -483,7 +503,7 @@ describe('createSubagentConvoTracker', () => {
     });
 
     it('a replayed run-N task_started must not regress taskRef and let a stale completion finish run N+1', () => {
-      // R2 F2: the completion gate reads child.taskRef, but noteBackgroundTaskStarted
+      // The completion gate reads child.taskRef, but noteBackgroundTaskStarted
       // otherwise overwrites it unconditionally. A delayed replay of run N's
       // task_started could restore the retired ref and let the replayed run-N
       // completion match and finish the live resumed run.
@@ -514,7 +534,7 @@ describe('createSubagentConvoTracker', () => {
     });
 
     it('a late explicit task_started still corrects a reverse-discovery FIFO mispairing on a running child', () => {
-      // Delta-gate F1: the replay guard must not reject a VALID authoritative
+      // The replay guard must not reject a VALID authoritative
       // pairing. Two agents' refs are queued FIFO; discovery happens in REVERSE
       // order so each running child provisionally gets the OTHER's ref. The
       // later explicit task_started events must still correct them (documented
@@ -567,11 +587,11 @@ describe('createSubagentConvoTracker', () => {
     });
   });
 
-  // Loop #764: noteBackgroundTaskStarted returns a disposition so index.js can
+  // noteBackgroundTaskStarted returns a disposition so index.js can
   // gate revive/forceAttach. A REPLAYED task_started for an already-finished run
   // must report 'rejected-replay' — reviving unconditionally flipped the
   // completed child back to a phantom 'running' in every client.
-  describe('task_started disposition gates revive (loop #764)', () => {
+  describe('task_started disposition gates revive', () => {
     it('a fresh background spawn (no child yet) reports started-new', () => {
       expect(tracker.noteBackgroundTaskStarted('toolu_bg', 'agent-bg'))
         .toBe(TASK_STARTED_STARTED_NEW);
@@ -645,7 +665,7 @@ describe('createSubagentConvoTracker', () => {
       expect(tracker.noteBackgroundTaskStarted('toolu', '')).toBe(TASK_STARTED_IGNORED);
     });
 
-    it('a late FIRST task_started still revives a child finished by a premature launch tool_result (Codex F1)', () => {
+    it('a late FIRST task_started still revives a child finished by a premature launch tool_result', () => {
       // Race: discovery FIFO-pairs the queued ref onto the child, THEN the instant
       // launch tool_result finishes it (noteTaskResult, before backgroundRefs is
       // populated). The child is now 'done' carrying the ref — but its real
@@ -664,7 +684,7 @@ describe('createSubagentConvoTracker', () => {
       tracker.revive('agent-bg', { incrementGeneration: disp === TASK_STARTED_RESUMED });
       expect(child.state).toBe(CHILD_STATE_RUNNING);
       // Corrective revival must NOT look like a resume, or the id-less completion
-      // fallback (#751) would strand this single-incarnation run.
+      // fallback would strand this single-incarnation run.
       expect(child.generation).toBe(0);
 
       // An id-less completion still finishes this never-resumed run (generation 0).
@@ -719,7 +739,7 @@ describe('createSubagentConvoTracker', () => {
       expect(runningStore.list()).toEqual([]);
     });
 
-    it('a stale premature-finish callback cannot erase the record re-armed by a corrective revival (Codex #764 delta F1)', () => {
+    it('a stale premature-finish callback cannot erase the record re-armed by a corrective revival', () => {
       // Deferring publisher: capture each finish frame's onLocalSendComplete so we
       // can fire the stale one AFTER the corrective revival re-arms the record.
       const deferred = [];
@@ -966,7 +986,7 @@ describe('createSubagentConvoTracker', () => {
       expect(runningStore.list()).toEqual([]);
     });
 
-    // Codex R2 F4: a refused write-ahead record must not be terminal. Without a
+    // A refused write-ahead record must not be terminal. Without a
     // retry, one transient store hiccup leaves the whole resumed run rendered
     // `done`, with no durable record either — the worst of both.
     it('retries a refused revive on the next event, then publishes running', () => {
@@ -1088,7 +1108,7 @@ describe('createSubagentConvoTracker', () => {
       expect(publisher.calls.upsertConvo).toHaveLength(before);
     });
 
-    // Codex R1 F2: state alone cannot separate incarnations. Run 1's ack arriving
+    // State alone cannot separate incarnations. Run 1's ack arriving
     // after run 2 has ALSO finished sees state === done and would clear run 2's
     // write-ahead record — which is still gated on run 2's own (unlanded) ack.
     it('a stale ack from the PREVIOUS run must not erase the resumed run\'s record', () => {

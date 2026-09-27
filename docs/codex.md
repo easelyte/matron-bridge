@@ -39,15 +39,28 @@ to activate it. When it is unset (the default), the bridge provisions no sink
 directory and starts no watcher, so existing sessions behave exactly as before.
 
 The live view needs an event **producer** on the session's PATH. With
-`MATRON_CODEX_VIZ=1` the bridge deploys one automatically: it prepends its
-shipped `bin/shim` directory to each launched session's `PATH`, so the session's
-`codex` resolves to the redaction-aware producer shim (which forwards to the real
-`codex` found later on PATH). No manual PATH step is required. A son-of-anton–style
-integration that sets `MATRON_CODEX_REAL_BIN` to a redaction-aware wrapper is also
-recognized as a producer; the activation guard evaluates the session's environment
-(not the bridge's), and if neither a shim on PATH nor a resolvable
-`MATRON_CODEX_REAL_BIN` is present it logs one warning and leaves the live view
-disabled rather than rendering a silent empty view.
+`MATRON_CODEX_VIZ=1` the bridge deploys one automatically **by default**: it
+prepends its shipped `bin/shim` directory to each launched session's `PATH`, so
+the session's `codex` resolves to the redaction-aware producer shim (which
+forwards to the real `codex` found later on PATH). No manual PATH step is
+required. If stock `codex` is not resolvable on the session PATH, set
+`MATRON_CODEX_REAL_BIN` to the absolute path of the real `codex` binary so the
+shim can forward to it; this does **not** change who the producer is — the shim
+is still deployed.
+
+An external integration whose own codex launcher is a redaction-aware producer
+opts out of the shim by setting `MATRON_CODEX_PRODUCER=wrapper` in the bridge
+environment. In that mode the bridge does **not** prepend the shim (deploying it
+alongside the wrapper would make the wrapper's own bare `codex` resolve to the
+shim and emit a duplicate card for the same run), and the wrapper is the sole
+producer. `MATRON_CODEX_PRODUCER=wrapper` is the distinct producer signal;
+`MATRON_CODEX_REAL_BIN` is only how the shim finds the real `codex` and never by
+itself suppresses the shim.
+
+The activation guard evaluates the session's environment (not the bridge's), and
+if neither a shim on PATH nor a `MATRON_CODEX_PRODUCER=wrapper` producer is
+present it logs one warning and leaves the live view disabled rather than
+rendering a silent empty view.
 
 Sink directories accumulate under `~/.claude/matron/codex-sinks/<sessionId>/`
 (outside Claude Code's own pruned project tree). The bridge sweeps stale session

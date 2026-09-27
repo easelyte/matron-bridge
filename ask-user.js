@@ -5,11 +5,12 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
-import { resolvePermissionTimeoutMs } from './lib/permission-prompt.js';
+import { resolvePermissionTimeoutMs, classifyPermissionPostResponse } from './lib/permission-prompt.js';
 import { formatBox } from './lib/agent-boxes-format.js';
 import { itemLine, formatItemList, formatItemDetail, formatCommentAck } from './lib/items-format.js';
 import { formatStartAck, formatCreateAck, formatMilestoneAck, formatMissionDetail, missionLine, formatBlocked, formatJournalError } from './lib/missions-format.js';
 import { missionIdemKey, itemIdemKey } from './lib/missions-idem.js';
+import { formatMemoryList, formatMemoryDetail, formatSaveAck, formatDeleteAck } from './lib/memory-format.js';
 import { formatReminderLine } from './lib/reminder-tools.js';
 
 // Route to whichever bridge spawned us: explicit BRIDGE_API_URL wins, else the
@@ -101,12 +102,14 @@ server.tool(
         return deny(`Matron bridge rejected the permission request (HTTP ${postRes.status}).`);
       }
       const data = await postRes.json();
-      if (data.behavior === 'allow') return allow(); // session-allowlisted tool, no card
-
-      const { requestId } = data;
-      if (typeof requestId !== 'string' || requestId === '') {
-        return deny('Matron bridge returned an invalid permission request id.');
-      }
+      // The bridge is the deciding layer: a grant or classifier allow → silent
+      // allow (no card); a classifier policy deny → deny with the bridge's
+      // message (no card); otherwise poll the minted card. See
+      // classifyPermissionPostResponse (extracted for testing).
+      const mapped = classifyPermissionPostResponse(data);
+      if (mapped.action === 'allow') return allow();
+      if (mapped.action === 'deny') return deny(mapped.message);
+      const { requestId } = mapped;
       const deadline = Date.now() + PERMISSION_TIMEOUT_MS;
       while (Date.now() < deadline) {
         await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
@@ -367,7 +370,7 @@ server.tool(
 
 server.tool(
   'agent_chat_start',
-  "Start a chat room with one of the user's other agent sessions: pick a target conversation from agent_roster, and the bridge invites its agent. Sessions on this same bridge are valid targets too (the invite is delivered locally). A target whose box is asleep is fine: the journal wakes the box while the invite waits for the user's consent, so the answer just takes a few minutes longer. You and a given peer session share ONE room for the life of both conversations — it survives an idle reap, a restart and the box sleeping, and a peer's message wakes this conversation: calling this again at the same target returns that existing room (and posts your message into it) rather than opening a second one — there is no way to close a room, so use agent_chat_mute if one goes wrong. If the result is pending or pending_busy, do NOT wait or poll: continue your own work — the answer and any replies arrive automatically as later turns.",
+  "Start a chat room with one of the user's other agent sessions: pick a target conversation from agent_roster, and the bridge invites its agent. Sessions on this same bridge are valid targets too (the invite is delivered locally). The user approves the invite on a consent card; once approved, the peer's bridge joins its agent to the room at once (there is no accept step on that side) and the agent reads your opening message as its next turn. A target whose box is asleep is fine: the journal wakes the box while the invite waits for the user's consent, so it just takes a few minutes longer. You and a given peer session share ONE room for the life of both conversations — it survives an idle reap, a restart and the box sleeping, and a peer's message wakes this conversation: calling this again at the same target returns that existing room (and posts your message into it) rather than opening a second one — there is no way to close a room, so use agent_chat_mute if one goes wrong. If the result is pending or pending_busy, do NOT wait or poll: continue your own work — the answer and any replies arrive automatically as later turns.",
   {
     target_convo_id: z.string().describe('Conversation id of the target session, from agent_roster'),
     topic: z.string().optional().describe('Optional short topic for the room title'),
@@ -516,7 +519,7 @@ server.tool(
 
 server.tool(
   'agent_chat_accept',
-  'Answer a chat request another agent sent you: accept it and join the room.',
+  "Accept a chat request that still needs an answer: a same-bridge invite, or a request from a third agent to join a room you own. An invite from another box that your user approved has ALREADY joined you to the room by the time you read it (you are told 'You are now in a room with…'), so calling this on such a room is a harmless no-op — just reply with agent_chat_send.",
   {
     room_id: z.string().describe('The room id from the chat request'),
   },
@@ -536,6 +539,10 @@ server.tool(
       if (data.admitted) {
         return { content: [{ type: 'text', text: `Admitted the requesting agent to your room ${data.room_id}.` }] };
       }
+      // Approved invites join on delivery: there was nothing left to accept.
+      if (data.already_joined) {
+        return { content: [{ type: 'text', text: `You are already in room ${data.room_id} — the invite joined you when it was approved. Reply with agent_chat_send.` }] };
+      }
       const backlog = (data.messages || []).map(messageLine);
       const text = `Joined room ${data.room_id}. Messages from it arrive as later turns.`
         + (backlog.length ? `\nThe room so far:\n${backlog.join('\n')}` : '')
@@ -549,7 +556,7 @@ server.tool(
 
 server.tool(
   'agent_chat_refuse',
-  'Answer a chat request another agent sent you: refuse it. The reason is relayed to the caller.',
+  'Refuse a chat request that still needs an answer: a same-bridge invite, or a request from a third agent to join a room you own. The reason is relayed to the caller. On a room you are already in (an approved invite from another box joins you on delivery) this cannot un-join you: it mutes the room with your reason instead, exactly as agent_chat_mute would.',
   {
     room_id: z.string().describe('The room id from the chat request'),
     reason: z.string().optional().describe('Optional short reason, relayed to the requesting agent'),
@@ -564,6 +571,9 @@ server.tool(
       const data = await postRes.json().catch(() => ({}));
       if (!postRes.ok) {
         return { content: [{ type: 'text', text: `agent_chat_refuse failed: ${data.error || `HTTP ${postRes.status}`}` }] };
+      }
+      if (data.muted) {
+        return { content: [{ type: 'text', text: `You were already in room ${data.room_id} (the approved invite joined you on delivery), so it has been muted instead. ${data.note || ''}`.trim() }] };
       }
       return { content: [{ type: 'text', text: `Refused room ${data.room_id}.` }] };
     } catch (err) {
@@ -931,6 +941,59 @@ server.tool(
     mission: z.number().int().min(1).nullable().describe('Target mission number, or null to detach'),
   },
   async (args) => callItems('move', args, (d) => itemLine(d.item)),
+);
+
+// --- Memories (spec 2026-09-27 memories): the user's shared agent memory ---
+// The four memory_* tools go through the bridge loopback (index.js mounts
+// lib/memory-tools.js at /memory/<op>), the items/missions shape.
+async function callMemory(name, args, render) {
+  try {
+    const res = await fetch(`${BRIDGE_API}/memory/${name}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ roomId: ROOM_ID, ...args }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) return { content: [{ type: 'text', text: `memory_${name} failed: ${data.error || `HTTP ${res.status}`}` }] };
+    return { content: [{ type: 'text', text: render(data) }] };
+  } catch (err) {
+    return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
+  }
+}
+
+const MEMORY_WHAT = "The user's memories are their standing rules and facts about how they want their agents to work (which boxes to avoid, which model to use, how to report), saved in the journal, shared by every session on every box, and read by the Coordinator at the start of each of its sessions.";
+
+server.tool(
+  'memory_save',
+  `Save or update one of the user's memories. ${MEMORY_WHAT} Save a memory the moment the user states such a rule — one memory per rule — and confirm in one line. The \`description\` is the one line the Coordinator sees at spawn, so write it as the actionable rule itself; put the why and the how in \`body\`. The same \`name\` overwrites the WHOLE memory, so send the body back when updating one. Not for project or code facts an ordinary session should keep in its own Claude Code memory directory.`,
+  {
+    name: z.string().describe("Kebab-case slug, unique per user: lowercase letters, digits and dashes, ≤64 chars, e.g. 'avoid-eric-and-fatima'. Reuse an existing name to update it."),
+    description: z.string().describe('One line, ≤200 chars: the rule as the Coordinator should read it.'),
+    body: z.string().optional().describe('Markdown, ≤8 KB: **Why:** and **How to apply:**. Omitted on an update clears the stored body — send it back.'),
+    type: z.enum(['user', 'feedback', 'project', 'reference']).optional().describe("Defaults to 'feedback' (how the user wants work done). 'user' = who they are; 'project' = ongoing work or constraints; 'reference' = a pointer (URL, dashboard, ticket)."),
+  },
+  async (args) => callMemory('save', args, formatSaveAck),
+);
+
+server.tool(
+  'memory_list',
+  `List the user's memories: name, type, description and when each was last updated. ${MEMORY_WHAT} Call it before deciding anything a standing rule might cover if your instructions do not already carry the list.`,
+  {},
+  async (args) => callMemory('list', args, formatMemoryList),
+);
+
+server.tool(
+  'memory_get',
+  'Read one memory in full, body included (the why and the how behind the one-line description).',
+  { name: z.string().describe('The memory name') },
+  async (args) => callMemory('get', args, formatMemoryDetail),
+);
+
+server.tool(
+  'memory_delete',
+  'Delete one of the user\'s memories — when the user retires a rule, or a memory turns out to be wrong. To change a memory, memory_save it under the same name instead.',
+  { name: z.string().describe('The memory name') },
+  async (args) => callMemory('delete', args, formatDeleteAck),
 );
 
 const transport = new StdioServerTransport();

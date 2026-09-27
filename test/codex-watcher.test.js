@@ -603,13 +603,13 @@ describe('bridge watcher wiring', () => {
     const WatcherClass = vi.fn();
     const log = { warn: vi.fn() };
 
-    // MATRON_CODEX_REAL_BIN set to a RESOLVABLE binary → the real detectProducer
-    // returns true even with the shim absent from PATH (no false-disable of the
-    // valid wrapper producer). process.execPath always resolves; detectProducer
-    // now requires the configured bin to exist, so an arbitrary path won't do.
+    // MATRON_CODEX_PRODUCER=wrapper → the real detectProducer returns true even
+    // with the shim absent from PATH (no false-disable of the declared wrapper
+    // producer). This is the distinct producer signal; a resolvable
+    // MATRON_CODEX_REAL_BIN alone is a shim-only deployment, not a wrapper.
     const watcher = createCodexWatcherIfEnabled(
       { dir: '/unused' },
-      { env: { MATRON_CODEX_VIZ: '1', MATRON_CODEX_REAL_BIN: process.execPath }, WatcherClass, log },
+      { env: { MATRON_CODEX_VIZ: '1', MATRON_CODEX_PRODUCER: 'wrapper' }, WatcherClass, log },
     );
 
     expect(watcher).not.toBeNull();

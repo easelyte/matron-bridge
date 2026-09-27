@@ -344,7 +344,7 @@ describe('publish-side Codex redaction', () => {
   });
 
   it('preserves a below-floor schema via generic text passthrough and drops unknown structure', () => {
-    // Loop #762: versions at/above the floor now render richly; only a
+    // Versions at/above the floor now render richly; only a
     // below-floor version falls back to the generic-text passthrough, which
     // keeps textual diagnostics (redacted) and drops arbitrary object shapes.
     const publisher = makePublisher();

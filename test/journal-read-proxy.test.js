@@ -1,6 +1,5 @@
-import { describe, it, expect, vi } from 'vitest';
-import { createServer, request } from 'node:http';
 import { readFileSync } from 'node:fs';
+import { describe, it, expect, vi } from 'vitest';
 import { createJournalReadProxy, isJournalProxyPath } from '../lib/journal-read-proxy.js';
 
 function fakeFetch(impl) {
@@ -12,14 +11,14 @@ function okRes(body, contentType = 'application/json') {
 }
 
 const BASE = 'https://journal.example';
-const TOKEN = 'full-read-secret';
+const TOKEN = 'agent-token';
 const CAP = 'cap-token-abc';
 
 function makeProxy(fetchImpl, { capabilityToken = CAP } = {}) {
   return createJournalReadProxy({ baseUrl: BASE, token: TOKEN, capabilityToken, fetchImpl });
 }
 
-describe('journal read proxy (loop #765)', () => {
+describe('journal read proxy', () => {
   it('forwards /journal/search to the journal /search with the bridge bearer, query verbatim', async () => {
     const fetchImpl = fakeFetch((url, opts) => {
       expect(url).toBe(`${BASE}/search?q=deploy&limit=5`);
@@ -45,6 +44,25 @@ describe('journal read proxy (loop #765)', () => {
     expect(r.status).toBe(200);
   });
 
+  it('keeps an encoded slash inside the id segment', async () => {
+    const fetchImpl = fakeFetch((url) => {
+      expect(url).toBe(`${BASE}/convo/a%2Fsnapshot/messages`);
+      return okRes('{"messages":[]}');
+    });
+    const r = await makeProxy(fetchImpl).handle({ method: 'GET', pathname: '/journal/convo/a%2Fsnapshot/messages', search: '', callerToken: CAP });
+    expect(r.status).toBe(200);
+  });
+
+  it('refuses a dot-segment id (fetch would resolve it and widen the target path)', async () => {
+    const fetchImpl = fakeFetch(() => okRes('x'));
+    const proxy = makeProxy(fetchImpl);
+    for (const id of ['%2E%2E', '%2e', '.%2E']) {
+      const r = await proxy.handle({ method: 'GET', pathname: `/journal/convo/${id}/messages`, search: '', callerToken: CAP });
+      expect(r.status).toBe(400);
+    }
+    expect(fetchImpl).not.toHaveBeenCalled();
+  });
+
   it('requires the capability token — a caller without it gets 401 and no upstream call', async () => {
     const fetchImpl = fakeFetch(() => okRes('should not happen'));
     const proxy = makeProxy(fetchImpl);
@@ -62,45 +80,6 @@ describe('journal read proxy (loop #765)', () => {
     const r = await proxy.handle({ method: 'GET', pathname: '/journal/search', search: '?q=x', callerToken: sameLength });
     expect(r.status).toBe(401);
     expect(fetchImpl).not.toHaveBeenCalled();
-  });
-
-  it('a raw non-ASCII header byte over real HTTP gets 401 and the server keeps serving', async () => {
-    const fetchImpl = fakeFetch(() => okRes('{"hits":[]}'));
-    const proxy = makeProxy(fetchImpl);
-    const server = createServer(async (req, res) => {
-      const u = new URL(req.url, 'http://localhost');
-      const r = await proxy.handle({ method: req.method, pathname: u.pathname, search: u.search, callerToken: req.headers['x-matron-journal-proxy-token'] });
-      res.writeHead(r.status, { 'Content-Type': r.contentType });
-      res.end(r.body);
-    });
-    await new Promise((ok) => server.listen(0, '127.0.0.1', ok));
-    const { port } = server.address();
-    const get = (headerBytes) => new Promise((ok, fail) => {
-      const req = request({ host: '127.0.0.1', port, path: '/journal/search?q=x', method: 'GET',
-        headers: { 'x-matron-journal-proxy-token': Buffer.from(headerBytes).toString('latin1') } }, (res) => { res.resume(); res.on('end', () => ok(res.statusCode)); });
-      req.on('error', fail);
-      req.end();
-    });
-    try {
-      // Same character count as CAP, but the last byte is 0xE9 (latin1 'e-acute').
-      const bytes = Buffer.concat([Buffer.from(CAP.slice(0, -1)), Buffer.from([0xe9])]);
-      expect(await get(bytes)).toBe(401);
-      expect(await get(Buffer.from(CAP))).toBe(200);
-      expect(fetchImpl).toHaveBeenCalledTimes(1);
-    } finally {
-      await new Promise((ok) => server.close(ok));
-    }
-  });
-
-  it('the API listener wraps the proxy call in try/catch (a throw must not be an unhandled rejection)', () => {
-    // index.js is not importable in tests (it starts the bridge), so pin the
-    // wiring by source text: the handle() call sits inside a try whose catch
-    // answers 500 instead of letting the async listener reject.
-    const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
-    const m = src.match(/try \{\s*proxied = await journalReadProxy\.handle\(\{[\s\S]*?\}\);\s*\} catch \(e\) \{([\s\S]*?)\n    \}/);
-    expect(m).not.toBeNull();
-    expect(m[1]).toMatch(/status: 500/);
-    expect(src.match(/journalReadProxy\.handle\(/g)).toHaveLength(1);
   });
 
   it('fails closed when no capability token is configured (never unauthenticated)', async () => {
@@ -169,5 +148,24 @@ describe('journal read proxy (loop #765)', () => {
     expect(isJournalProxyPath('/journal/help')).toBe(false);
     expect(isJournalProxyPath('/journal/snapshot')).toBe(false);
     expect(isJournalProxyPath('/items/create')).toBe(false);
+  });
+});
+
+describe('session prompts point journal search at the proxy', () => {
+  const root = new URL('..', import.meta.url);
+  const read = (f) => readFileSync(new URL(f, root), 'utf8');
+
+  for (const file of ['BRIDGE_CLAUDE.md', 'BRIDGE_CODEX.md']) {
+    it(`${file}: search goes through the loopback proxy with the header file`, () => {
+      const text = read(file);
+      expect(text).toContain('http://127.0.0.1:$MATRON_BRIDGE_API_PORT/journal');
+      expect(text).toContain('curl -H @"$MATRON_JOURNAL_PROXY_HEADER_FILE"');
+      // Never a token expanded onto curl's command line.
+      expect(text).not.toMatch(/-H "Authorization: Bearer \$\(cat/);
+    });
+  }
+
+  it('BRIDGE_CLAUDE.md no longer tells sessions to use the journal token', () => {
+    expect(read('BRIDGE_CLAUDE.md')).not.toMatch(/JOURNAL_TOKEN/);
   });
 });

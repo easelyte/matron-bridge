@@ -46,14 +46,14 @@ describe('coordinator spawn wiring (source inspection)', () => {
 
   it('print mode: prompt and disallowed tools come from claudeCoordinatorArgs', () => {
     const cs = body('function createSession(roomId, workdir, resumeSessionId, options = {}) {', '\nfunction ');
-    expect(cs).toMatch(/const printCoord = claudeCoordinatorArgs\(\{ coordinator: !!options\.coordinator, basePrompt: BRIDGE_SYSTEM_PROMPT, block: COORDINATOR_BLOCK, baseDisallowed: \['AskUserQuestion'\] \}\);/);
+    expect(cs).toMatch(/const printCoord = claudeCoordinatorArgs\(\{ coordinator: !!options\.coordinator, basePrompt: BRIDGE_SYSTEM_PROMPT, block: COORDINATOR_BLOCK, baseDisallowed: \['AskUserQuestion'\], memoryBlock: memoryBlockNow\(\) \}\);/);
     expect(cs).toContain("'--disallowed-tools', ...printCoord.disallowedTools,");
     expect(cs).toContain("'--append-system-prompt', printCoord.appendSystemPrompt,");
   });
 
   it('interactive mode: same helper, --disallowed-tools only when there is something to disallow', () => {
     const iv = body('function createInteractiveSessionForRoom(', '\nfunction ');
-    expect(iv).toMatch(/const ivCoord = claudeCoordinatorArgs\(\{ coordinator: !!options\.coordinator, basePrompt: BRIDGE_SYSTEM_PROMPT, block: COORDINATOR_BLOCK \}\);/);
+    expect(iv).toMatch(/const ivCoord = claudeCoordinatorArgs\(\{ coordinator: !!options\.coordinator, basePrompt: BRIDGE_SYSTEM_PROMPT, block: COORDINATOR_BLOCK, memoryBlock: memoryBlockNow\(\) \}\);/);
     expect(iv).toContain("...(ivCoord.disallowedTools.length ? ['--disallowed-tools', ...ivCoord.disallowedTools] : []),");
     expect(iv).toContain("'--append-system-prompt', ivCoord.appendSystemPrompt,");
   });
@@ -64,7 +64,7 @@ describe('coordinator spawn wiring (source inspection)', () => {
 
   it('Codex: developer instructions and sandbox come from codexCoordinatorOptions', () => {
     const cx = body('function createCodexSessionForRoom(', '\nfunction ');
-    expect(cx).toMatch(/const codexCoord = codexCoordinatorOptions\(\{ coordinator: !!options\.coordinator, baseInstructions: CODEX_BRIDGE_PROMPT, block: COORDINATOR_BLOCK, baseSandbox: CODEX_SANDBOX_MODE \}\);/);
+    expect(cx).toMatch(/const codexCoord = codexCoordinatorOptions\(\{ coordinator: !!options\.coordinator, baseInstructions: CODEX_BRIDGE_PROMPT, block: COORDINATOR_BLOCK, baseSandbox: CODEX_SANDBOX_MODE, memoryBlock: memoryBlockNow\(\) \}\);/);
     expect(cx).toContain('sandbox: codexCoord.sandbox,');
     expect(cx).toContain('developerInstructions: codexCoord.developerInstructions + (CODEX_APP_SERVER');
     expect(cx).not.toContain('sandbox: CODEX_SANDBOX_MODE,');
@@ -128,7 +128,7 @@ describe('live coordinator events (source inspection)', () => {
     expect(fn).toContain("recreateSession(roomId, plan.model ? { model: plan.model } : {}, ctx)");
     expect(fn).toContain('{ model: plan.model, modelExplicit: false }');
     expect(fn).toContain('applyModelSwitch(roomId, session, plan.model, { ...ctx, explicit: false });');
-    expect(fn).toContain('await deliverCoordinatorTurn(sessions.get(roomId) || session, coordinatorTurnText(role, COORDINATOR_BLOCK));');
+    expect(fn).toContain('await deliverCoordinatorTurn(sessions.get(roomId) || session, coordinatorTurnText(role, COORDINATOR_BLOCK, memoryBlockNow()));');
   });
 
   it("a user's parked /model pick is handed to the plan, so the implicit switch never overwrites it", () => {

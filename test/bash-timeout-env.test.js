@@ -5,6 +5,7 @@ import {
   DEFAULT_BASH_MAX_TIMEOUT_MS,
   ABSOLUTE_MAX_TIMEOUT_MS,
 } from '../lib/bash-timeout-env.js';
+import { buildClaudeSpawnEnv } from '../lib/spawn-env.js';
 
 const noop = () => {};
 
@@ -138,5 +139,33 @@ describe('bashTimeoutEnv', () => {
   });
 });
 
-// Both Claude spawn envs carry the helper's values: asserted on the built env
-// in test/spawn-env.test.js (lib/spawn-env.js, loop #784).
+// Wiring: both Claude spawn paths in index.js (print-mode spawnEnv and the
+// interactive PTY interactiveEnv) build their child env through
+// buildClaudeSpawnEnv (lib/spawn-env.js), so pinning the builder's output
+// covers both. If a future refactor drops the spread from the builder, Bash
+// calls in every bridge session silently revert to the 2-min cap.
+describe('buildClaudeSpawnEnv wiring', () => {
+  const build = (baseEnv) =>
+    buildClaudeSpawnEnv({
+      mode: 'print', // fork delta: the builder requires a mode (permission cards)
+      baseEnv,
+      execPath: '/opt/node/bin/node',
+      roomId: '!room:example',
+      apiPort: 8787,
+      journalProxyHeaderFile: '/tmp/header',
+      pluginCacheDir: '/var/cache/plugins',
+      showBashOutput: false,
+    });
+
+  it('carries the raised Bash-timeout defaults into the Claude child env', () => {
+    const env = build({ PATH: '/usr/bin' });
+    expect(env.BASH_DEFAULT_TIMEOUT_MS).toBe(String(DEFAULT_BASH_DEFAULT_TIMEOUT_MS));
+    expect(env.BASH_MAX_TIMEOUT_MS).toBe(String(DEFAULT_BASH_MAX_TIMEOUT_MS));
+  });
+
+  it('honours a valid operator override from the bridge env', () => {
+    const env = build({ PATH: '/usr/bin', BASH_DEFAULT_TIMEOUT_MS: '300000', BASH_MAX_TIMEOUT_MS: '900000' });
+    expect(env.BASH_DEFAULT_TIMEOUT_MS).toBe('300000');
+    expect(env.BASH_MAX_TIMEOUT_MS).toBe('900000');
+  });
+});

@@ -10,7 +10,10 @@ import { createItemsHandlers } from './lib/items-tools.js';
 import { createReminderHandlers } from './lib/reminder-tools.js';
 import { createMissionsClient } from './lib/missions-client.js';
 import { createMissionsHandlers } from './lib/missions-tools.js';
-import { createCoordinatorLookup, loadCoordinatorBlock, claudeCoordinatorArgs, codexCoordinatorOptions, explicitModelFlag, explicitModelFlagForResume, coordinatorTurnText, planCoordinatorTransition, decideCoordinatorEvent, withCoordinatorModel, recreateSpawnModel } from './lib/coordinator.js';
+import { createMemoryClient } from './lib/memory-client.js';
+import { createMemoryHandlers } from './lib/memory-tools.js';
+import { createMemoryLookup } from './lib/memory-lookup.js';
+import { createCoordinatorLookup, loadCoordinatorBlock, claudeCoordinatorArgs, codexCoordinatorOptions, explicitModelFlag, explicitModelFlagForResume, coordinatorTurnText, planCoordinatorTransition, decideCoordinatorEvent, withCoordinatorModel, recreateSpawnModel, renderMemoryBlock } from './lib/coordinator.js';
 import { createServer } from 'http';
 import { createHmac, randomUUID, randomBytes } from 'crypto';
 import fs from 'fs';
@@ -86,7 +89,7 @@ import { ivUploadDir, ivUploadAnnotation } from './lib/iv-uploads.js';
 import { matronFilesDir } from './lib/matron-files.js';
 import { parseUsageLimits, formatLimits } from './lib/usage-limits.js';
 import { resolveSpawnCwd, attachSpawnErrorHandler } from './lib/spawn-guard.js';
-import { buildSessionSettings } from './lib/session-settings.js';
+import { buildSessionSettings, withForkPrintSettings } from './lib/session-settings.js';
 import { buildPermissionSnapshot, classifyPermission } from './lib/permission-eval.js';
 import { readSessionSummary, listSessionSummaries, listSessionIdsByMtime, pathExists } from './lib/session-summary.js';
 import {
@@ -114,6 +117,7 @@ import {
 import { processShowFile } from './lib/show-file-handler.js';
 import { createMediaDedupLedger } from './lib/media-dedup-ledger.js';
 import { createJournalPublisher, FLUSH_TIMEOUT_MS, deriveMediaHttpBaseUrl } from './lib/journal-publisher.js';
+import { createSessionStateLatch } from './lib/journal-session-state.js';
 import { createRpcRequestHandler } from './lib/journal-rpc.js';
 import { buildActivity, buildLimits, buildDisk } from './lib/spawn-capacity.js';
 import { buildBoxVitals, createCodexLimitsRefresher, BOX_STATUS_REPUBLISH_MS } from './lib/box-status.js';
@@ -126,12 +130,12 @@ import { shouldAnnounceOnline, recordOnlineAnnounced } from './lib/announce-once
 import { createInflightMarker } from './lib/inflight-marker.js';
 import { cancelQueuedItem, dispatchBusyQueueMagicWord, notifyQueuedMessage, resolveQueueReleaseTap } from './lib/busy-queue.js';
 import { handlePickerValue, isResumeConvoId } from './lib/picker-dispatch.js';
-import { createPermissionRegistry, renderPermissionCard, permissionButtons, permissionSpawnArgs, resolveBypassMode, resolvePermissionTimeoutMs, isRootOutsideSandbox, guardRootBypass, ROOT_BYPASS_WARNING } from './lib/permission-prompt.js';
+import { createPermissionRegistry, renderPermissionCard, permissionButtons, permissionSpawnArgs, resolveBypassMode, resolvePermissionTimeoutMs, isRootOutsideSandbox, guardRootBypass, ROOT_BYPASS_WARNING, resolvePermissionRequest, resolvePermissionCheck, buildPrintSessionSettings, listSessionGrants, revokeSessionGrant } from './lib/permission-prompt.js';
 import { createPlanApprovalItems } from './lib/plan-approval-items.js';
 import { createSlowToolNotices, renderSlowToolNotice, resolveSlowToolNoticeMs, resolveSlowToolReminderMs } from './lib/slow-tool-notice.js';
 import { createJournalInputConsumer, resolvePromptChoice } from './lib/journal-input-router.js';
 import { createAgentRooms, INVITE_TTL_MS } from './lib/agent-rooms.js';
-import { createAgentInvites, formatInviteRequestNotice, INVITE_WAKE_NOTICE } from './lib/agent-invites.js';
+import { createAgentInvites, formatInviteRequestNotice, formatAutoJoinedRequest, INVITE_WAKE_NOTICE } from './lib/agent-invites.js';
 import { resolveInviteTarget } from './lib/invite-target.js';
 import { createRoomDelivery, formatRoomMessageNotice, formatRoomDeliveredNotice, formatRoomDeliveryFailedNotice, roomEchoLabel, roomFrameDisposition, ROOM_MESSAGE_QUEUED_NOTICE, ROOM_MUTED_NOT_DELIVERED_NOTICE, ROOM_WAKE_NOTICE } from './lib/room-delivery.js';
 import { parseProcessTable, liveWorkChildren, workHold, keepAwakeUntil, mcpServerSignatures, WORK_HOLD_LEASE_MS } from './lib/work-hold.js';
@@ -139,7 +143,7 @@ import { unmuteChoiceValue, ROOM_MUTE_ACTION_ID, ROOM_MUTE_KIND } from './lib/ro
 import { oneLine, quotedField } from './lib/peer-text.js';
 import { TURN_TIER, peerBatchTier, roomBatchTier, shouldPreemptForPriorityPeer } from './lib/peer-priority.js';
 import { createRoomReplyWaiters } from './lib/room-reply-waiters.js';
-import { createAgentChatHandlers, roomAgentLabel } from './lib/agent-chat.js';
+import { createAgentChatHandlers, probeJoinedRoom, roomAgentLabel } from './lib/agent-chat.js';
 import {
   auditPermissionDecision,
   createPermissionDecisionBodyCollector,
@@ -566,37 +570,37 @@ const missionsClient = createMissionsClient({
   token: _journalToken,
 });
 
-// Journal READ proxy (loop #765): the loopback API forwards the journal search
-// routes (/journal/search, /journal/convo/:id/messages) to the journal under the
-// BRIDGE's own token, so spawned sessions never hold the raw full-read
-// JOURNAL_TOKEN (it is stripped from their spawn env below). Same base URL +
-// token as the items/missions clients.
+// Memories (spec 2026-09-27): same base URL and token; the memory_* tools.
+const memoryClient = createMemoryClient({
+  baseUrl: journalHttpBase,
+  token: _journalToken,
+});
+
+// Journal READ proxy (lib/journal-read-proxy.js): the loopback API forwards
+// the journal search routes under the bridge's own token, so Claude sessions
+// and app-server Codex sessions are spawned without JOURNAL_TOKEN /
+// JOURNAL_TOKEN_FILE (lib/spawn-env.js).
 //
-// A per-boot capability token gates the proxy: it is injected into the (stripped)
-// child env as MATRON_JOURNAL_PROXY_TOKEN and required on every proxy request, so
-// a DIFFERENT local user hitting the loopback port cannot search the journal with
-// no credential (the child env is readable only by the bridge's own uid). This is
-// a low-privilege capability (proxied /search + /convo read only — never
-// /snapshot, /roster, /items or writes), far narrower than the raw JOURNAL_TOKEN.
+// The loopback port is open to every local user, so the proxy is gated by a
+// per-boot capability token. Children get it as a 0600 header FILE, never as
+// an env value or argv: `curl -H @"$MATRON_JOURNAL_PROXY_HEADER_FILE"` reads
+// the header from the file, whereas a token on curl's command line would be
+// visible to other users in the process table. The file is `<Header>: <token>`
+// in a private mkdtemp dir, removed on exit.
 const JOURNAL_PROXY_CAP_TOKEN = randomBytes(32).toString('hex');
 const JOURNAL_PROXY_CAP_HEADER = 'x-matron-journal-proxy-token';
-// The capability is delivered to children as a 0600 header FILE, never in an env
-// value or argv (loop #765): a child that put the token on curl's command line
-// would leak it to other local users via the world-readable /proc/<pid>/cmdline.
-// The bridge writes `<Header>: <token>` to a 0600 file (owner = bridge uid) and
-// injects only its PATH; children pass `curl -H @"$MATRON_JOURNAL_PROXY_HEADER_FILE"`,
-// so the token value touches neither their environment nor any process argv, and
-// another uid can read neither the file (0600) nor the request headers.
 let JOURNAL_PROXY_HEADER_FILE = '';
-if (journalHttpBase && _journalToken) {
+if (journalHttpBase) {
+  let dir = '';
   try {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-journal-proxy-'));
-    JOURNAL_PROXY_HEADER_FILE = path.join(dir, 'header');
-    fs.writeFileSync(JOURNAL_PROXY_HEADER_FILE, `X-Matron-Journal-Proxy-Token: ${JOURNAL_PROXY_CAP_TOKEN}\n`, { mode: 0o600 });
-    fs.chmodSync(JOURNAL_PROXY_HEADER_FILE, 0o600);
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-journal-proxy-'));
+    const file = path.join(dir, 'header');
+    fs.writeFileSync(file, `X-Matron-Journal-Proxy-Token: ${JOURNAL_PROXY_CAP_TOKEN}\n`, { mode: 0o600 });
+    JOURNAL_PROXY_HEADER_FILE = file;
+    process.once('exit', () => { try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ } });
   } catch (e) {
-    JOURNAL_PROXY_HEADER_FILE = '';
-    console.warn(`[journal] could not write proxy header file; journal search will be unavailable to sessions: ${e.message}`);
+    if (dir) { try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ } }
+    console.warn(`[journal] could not write the read-proxy header file; journal search is unavailable to sessions: ${e.message}`);
   }
 }
 const journalReadProxy = createJournalReadProxy({
@@ -614,6 +618,17 @@ const coordinatorLookup = createCoordinatorLookup({
   token: _journalToken,
   log: console,
 });
+
+// The user's memories, cached for the Coordinator's spawn (spec 2026-09-27
+// memories, "The index at spawn"): lib/memory-lookup.js, refreshed on every
+// hello_ok, on every `coordinator` and `memory` event, and throttled behind
+// every spawn. memoryBlockNow() renders whatever the cache holds for the
+// three spawn builders and the live `assigned` turn.
+const memoryLookup = createMemoryLookup({
+  baseUrl: journalHttpBase,
+  token: _journalToken,
+});
+const memoryBlockNow = () => renderMemoryBlock(memoryLookup.snapshot());
 
 // NOTE (easelyte fork): upstream's summary-model-nag is intentionally dropped
 // here. This fork generates titles/summaries via a codex exec one-shot
@@ -696,6 +711,7 @@ function handleJournalReconnect() {
   // replayed `coordinator` events cover a live bridge, this covers a cursor
   // reset (snapshot_required) that skipped them.
   coordinatorLookup.refresh({ force: true });
+  memoryLookup.refresh({ force: true });
 }
 
 // Repair the summary publish hint across a connection epoch (loop #554 F3).
@@ -816,7 +832,7 @@ const journalPublisher = createJournalPublisher({
   onReconnect: handleJournalReconnect,
   // Send-completion retry trigger (the mandatory one): re-publishes an
   // overflow-evicted release frame on a healthy socket that never reconnects.
-  onSendCapacity: () => { republishPendingReleases(); retrySessionSummaryRepairs(); retryRunStateRepairs(); },
+  onSendCapacity: () => { republishPendingReleases(); retrySessionSummaryRepairs(); retryRunStateRepairs(); sessionStateLatch.onCapacity(); },
   // Agent-RPC dispatch. Arrow + late-bound const (journalRpcHandler is
   // defined below): safe for the same reason onEvent's forward reference
   // is — the callback only ever fires once the socket is live, long after
@@ -844,6 +860,7 @@ const JOURNAL_ENABLED = !!(JOURNAL_WS_URL && _journalToken);
 if (JOURNAL_ENABLED) {
   // Warm the Coordinator cache before the first resume can ask for it.
   coordinatorLookup.refresh({ force: true });
+  memoryLookup.refresh({ force: true });
   // Boot the control convo eagerly — safe even before the WS is connected
   // (journalPublisher queues FIFO and flushes on connect, same as every
   // other publish here). No Matrix dependency: this convo has no Matrix
@@ -1360,7 +1377,7 @@ function findSessionByClaudeSessionId(claudeSessionId) {
 // scope.
 const JOURNAL_BUFFER_LIMIT = 100;
 
-function journalBufferPush(session, method, payload) {
+function journalBufferPush(session, method, payload, options) {
   if (!session._journalBuffer) session._journalBuffer = [];
   if (session._journalBuffer.length >= JOURNAL_BUFFER_LIMIT) {
     session._journalBuffer.shift();
@@ -1369,16 +1386,13 @@ function journalBufferPush(session, method, payload) {
       console.warn(`[journal] pre-session-id buffer overflow for room ${session.roomId} — dropping oldest`);
     }
   }
-  session._journalBuffer.push({ method, payload });
+  session._journalBuffer.push({ method, payload, options });
 }
 
 // Send now if the convo_id is known, otherwise buffer for the eventual flush.
-// `options` (onLocalSendComplete, etc.) reaches the publisher only on the LIVE path: a session whose
-// convo id is not known yet buffers the payload, and journalBufferPush has no slot to carry a
-// local-send callback. Any options-passing caller must therefore skip the call entirely when there
-// is no convo id (as journalSessionState does — it gates the whole publish on convoId), so a
-// callback is never silently dropped here. (journalSessionState no longer passes a callback at all
-// after loop #754 — the durable run-state settle is reconciliation-authoritative.)
+// `options` is the publisher's per-frame options bag ({onLocalSendComplete,
+// onEvicted, idemKey}); it rides the buffer too, so a hook attached to a
+// pre-session-id frame still fires once the flushed frame is sent/evicted.
 function journalPublish(session, method, payload, options) {
   if (!JOURNAL_ENABLED) return;
   const convoId = journalConvoIdFor(session);
@@ -1401,7 +1415,7 @@ function journalPublish(session, method, payload, options) {
     }
     journalPublisher[method](convoId, payload, options);
   } else {
-    journalBufferPush(session, method, payload);
+    journalBufferPush(session, method, payload, options);
   }
 }
 
@@ -1634,7 +1648,19 @@ function journalPublishUserItem(session, method, payload) {
 }
 
 // Mirror a session_state transition, but only on actual change — busy/prompt/
-// turn-end events fire far more often than the state actually flips.
+// turn-end events fire far more often than the state actually flips. The
+// change-dedup latch (session._journalState) lives in
+// lib/journal-session-state.js: it is released when the publisher evicts the
+// frame under overflow (a state that never left the box must not count as
+// sent, or the row sits at `running` and every client shows "Thinking"
+// forever) and the convo's current state is re-offered once the publisher
+// has headroom again — `done` when the session is gone by then.
+const sessionStateLatch = createSessionStateLatch({
+  publish: (session, state, options) => journalUpsertConvo(session, { sessionState: state }, options),
+  upsertConvoDirect: (convoId, state, options) => journalPublisher.upsertConvo(convoId, { sessionState: state }, options),
+  resolveSession: (convoId) => findSessionByClaudeSessionId(convoId),
+  warn: (m) => console.warn(m),
+});
 function journalSessionState(session, state) {
   // Write-ahead the attempted transition to the durable outbox BEFORE publishing. The change-gate
   // above advances on ENQUEUE, but the durable queue drops its OLDEST frame on overflow, so without
@@ -1664,9 +1690,20 @@ function journalSessionState(session, state) {
     // flush rather than published, so there is nothing to protect and nothing has failed.
     () => (convoId ? runStateOutbox.note(convoId, state) : undefined),
   );
+  if (!publish) {
+    session._journalState = latch;
+    return;
+  }
+  // Publish through the eviction-aware latch (lib/journal-session-state.js) so the frame carries
+  // its onEvicted hook: if queue overflow drops it, the latch is released on the live session and
+  // the convo's state is re-offered on the next send-capacity tick. This COMPOSES with the outbox
+  // above: the outbox is the durable, reconnect-authoritative repair (survives a restart); the
+  // eviction hook is the fast in-process repair on a healthy socket. planTransition has already
+  // made the change-gate decision, so clear the latch for offer() (which would otherwise dedupe
+  // against it), then restore planTransition's verdict — `undefined` after a failed write-ahead.
+  session._journalState = undefined;
+  sessionStateLatch.offer(session, state);
   session._journalState = latch;
-  if (!publish) return;
-  journalUpsertConvo(session, { sessionState: state });
 }
 
 // Repair the session_state latch across a connection epoch — the exact analogue of
@@ -2166,8 +2203,8 @@ function journalFlushForSession(session) {
   const buffered = session._journalBuffer;
   session._journalBuffer = null;
   if (!buffered) return;
-  for (const { method, payload } of buffered) {
-    journalPublisher[method](convoId, payload);
+  for (const { method, payload, options } of buffered) {
+    journalPublisher[method](convoId, payload, options);
   }
 }
 
@@ -2201,6 +2238,7 @@ function coordinatorRoleAtSpawn(roomId, resumeSessionId, options, persisted) {
   ];
   const role = coordinatorLookup.roleFor(candidates);
   coordinatorLookup.refresh();
+  memoryLookup.refresh();
   if (JOURNAL_ENABLED && !role.known && !coordinatorUnknownWarned.has(roomId) && candidates.some((c) => typeof c === 'string' && c)) {
     coordinatorUnknownWarned.add(roomId);
     console.warn(`[coordinator] ${roomId}: coordinator not known yet (journal has not answered GET /coordinator) — starting as an ordinary session`);
@@ -2335,7 +2373,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     resumeSessionId, presetId: options.presetSessionId, mintId: randomUUID,
     transcriptExists: (id) => fs.existsSync(transcriptPathFor(cwd, id)),
   });
-  const printCoord = claudeCoordinatorArgs({ coordinator: !!options.coordinator, basePrompt: BRIDGE_SYSTEM_PROMPT, block: COORDINATOR_BLOCK, baseDisallowed: ['AskUserQuestion'] });
+  const printCoord = claudeCoordinatorArgs({ coordinator: !!options.coordinator, basePrompt: BRIDGE_SYSTEM_PROMPT, block: COORDINATOR_BLOCK, baseDisallowed: ['AskUserQuestion'], memoryBlock: memoryBlockNow() });
   const args = [
     '--print',
     '--verbose',
@@ -2347,7 +2385,14 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     '--include-partial-messages',
     '--strict-mcp-config',
     '--mcp-config', mcpConfigPathFor(effectiveMcpExtras),
-    '--settings', JSON.stringify(buildSessionSettings('print')),
+    // Additive inline settings: the bridge's hooks (and, when gated, the MCP
+    // permission gate hook) merge with the on-disk settings, which all load.
+    // Fork delta (withForkPrintSettings): the fork's tool allow-list, and the
+    // permission-card hook on bypass sessions (lib/session-settings.js).
+    '--settings', JSON.stringify(withForkPrintSettings(
+      buildPrintSessionSettings({ bypass: bypassMode, hooksDir: path.join(__dirname, 'hooks'), apiPort: API_PORT, roomId }),
+      { bypass: bypassMode },
+    )),
   ];
   const printModel = options.model === null
     ? undefined
@@ -2368,8 +2413,9 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   debug(`Spawning claude with args: ${args.join(' ')}`);
   debug(`Working directory: ${cwd}`);
 
-  // Child env (lib/spawn-env.js): journal creds + bridge-only secrets stripped,
-  // node bin dir on PATH, per-session SHOW_FILE_TOKEN / MATRON_PERMISSION_TOKEN.
+  // Child env (lib/spawn-env.js): journal token and bridge-only secrets
+  // stripped, read-proxy header file, node bin dir on PATH, per-session
+  // SHOW_FILE_TOKEN / MATRON_PERMISSION_TOKEN.
   const spawnEnv = buildClaudeSpawnEnv({
     mode: 'print',
     roomId,
@@ -2380,10 +2426,6 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     showFileToken,
     permissionToken,
   });
-
-  const permissionSnapshot = process.env.MATRON_PERMISSION_CARDS
-    ? buildPermissionSnapshot({ workdir: cwd })
-    : null;
 
   const proc = launchWithCodexSinkEnv({
     spawnEnv,
@@ -2413,9 +2455,15 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     permissionToken,
     _showFileInFlight: 0,
     mcpExtras,
-    permissionSnapshot,
     bypassMode: requestedBypassMode,
     permAllowedTools: new Set(),
+    // Spawn-time MCP permission snapshot ({mcpAllow,mcpDeny,mcpAsk} from the
+    // session's layered .claude settings), built ONCE here and immutable for the
+    // session's life — the POST /permission-request classifier reads it to
+    // decide allow-silent / deny-visible / ask-card. Built for every session
+    // (cheap, fail-closed): only auto-mode sessions ever route MCP calls through
+    // the permission_request tool, but a bypass session simply never consults it.
+    permissionSnapshot: buildPermissionSnapshot({ workdir: cwd }),
     responseBuffer: '',
     sendCallback: null,
     pendingPlan: null,
@@ -2712,7 +2760,7 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
       console.warn(`[show-file] disabled for ${roomId}: failed to pin allowed roots (${error.message})`);
     }
   }
-  const codexCoord = codexCoordinatorOptions({ coordinator: !!options.coordinator, baseInstructions: CODEX_BRIDGE_PROMPT, block: COORDINATOR_BLOCK, baseSandbox: CODEX_SANDBOX_MODE });
+  const codexCoord = codexCoordinatorOptions({ coordinator: !!options.coordinator, baseInstructions: CODEX_BRIDGE_PROMPT, block: COORDINATOR_BLOCK, baseSandbox: CODEX_SANDBOX_MODE, memoryBlock: memoryBlockNow() });
   const Adapter = CODEX_APP_SERVER ? CodexAppServerSession : CodexExecSession;
   const codex = new Adapter({
     cwd,
@@ -2722,8 +2770,8 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
     sandbox: codexCoord.sandbox,
     networkAccess: CODEX_NETWORK_ACCESS,
     developerInstructions: codexCoord.developerInstructions + (CODEX_APP_SERVER ? '' : '\nLegacy exec transport: native approvals, native questions, and Matron MCP tools are unavailable. If blocked, explain it in your final response.'),
-    // Journal-token scoping for Codex children: see buildCodexSpawnEnv (stripped
-    // on app-server, kept on legacy exec for its /items HTTP fallback).
+    // Journal token stripped on app-server, kept on legacy exec for its /items
+    // HTTP fallback (see buildCodexSpawnEnv).
     env: buildCodexSpawnEnv({
       roomId,
       apiPort: API_PORT,
@@ -3204,7 +3252,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
   // buildSessionSettings('iv') (lib/session-settings.js), and any TUI prompt
   // outside it is surfaced by lib/prompt-detector.js. Upstream's iv
   // guardRootBypass(true) branch is deliberately not adopted.
-  const ivCoord = claudeCoordinatorArgs({ coordinator: !!options.coordinator, basePrompt: BRIDGE_SYSTEM_PROMPT, block: COORDINATOR_BLOCK });
+  const ivCoord = claudeCoordinatorArgs({ coordinator: !!options.coordinator, basePrompt: BRIDGE_SYSTEM_PROMPT, block: COORDINATOR_BLOCK, memoryBlock: memoryBlockNow() });
   const claudeArgs = [...identity.cliArgs];
   claudeArgs.push(
     // AskUserQuestion is allowed in iv-mode: the TUI prompt detector
@@ -3223,7 +3271,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     claudeArgs.push('--model', model);
   }
 
-  // Child env (lib/spawn-env.js): same scoping as the print spawn, minus the
+  // Child env (lib/spawn-env.js): same shape as the print spawn, minus the
   // print-only permission-card keys.
   const interactiveEnv = buildClaudeSpawnEnv({
     mode: 'iv',
@@ -5107,12 +5155,12 @@ function handleClaudeEvent(session, event) {
         if (event.task_type === 'local_agent' && event.tool_use_id && event.task_id) {
           const startDisposition = session.subagentConvos?.noteBackgroundTaskStarted(event.tool_use_id, event.task_id);
           session.subagentWatcher?.notifyTaskStarted();
-          // Gate revive/forceAttach on the start disposition (loop #764). A
+          // Gate revive/forceAttach on the start disposition. A
           // REPLAYED task_started for an already-finished run (same-ref replay, or
           // a ref retired by a prior resume) must NOT revive/re-attach — doing so
           // unconditionally flipped a completed child back to a phantom 'running'
           // in every client (and polluted the generation counter that gates
-          // resume/completion, #751). Only a genuine start proceeds:
+          // resume/completion). Only a genuine start proceeds:
           //   - 'resumed': a finished child restarting under a new tool_use_id.
           //   - 'started-new': a fresh spawn (revive/forceAttach no-op safely) or
           //     a normal start on a live child.
@@ -5136,8 +5184,8 @@ function handleClaudeEvent(session, event) {
             // unknown or already-running child. Advance the incarnation counter
             // only for a genuine resume; a 'started-new' revive here is a
             // corrective revival of a first run finished early by the launch
-            // tool_result (#764 F1) — the SAME incarnation, so generation must
-            // not advance or the id-less completion fallback (#751) would strand it.
+            // tool_result — the SAME incarnation, so generation must not advance
+            // or the id-less completion fallback would strand it.
             session.subagentConvos?.revive(event.task_id, {
               incrementGeneration: startDisposition === 'resumed',
             });
@@ -5150,7 +5198,7 @@ function handleClaudeEvent(session, event) {
         // a no-op for task_ids that never had a child (background Bash).
         // Pass the notification's tool_use_id so noteTaskCompleted can reject a
         // duplicated/replayed notification for a PRIOR incarnation of a resumed
-        // agent (loop #751): a stale run-N notification must not finish run N+1.
+        // agent: a stale run-N notification must not finish run N+1.
         if (event.task_id) {
           session.subagentConvos?.noteTaskCompleted(event.task_id, event.tool_use_id);
         }
@@ -6930,9 +6978,8 @@ function fetchUsageLimitsText(cwd) {
       // it doesn't replicate the rest of the session spawns' env shape
       // (BRIDGE_ROOM_ID, MATRON_BRIDGE_API_PORT, MATRON_BASH_TEE_ENABLED —
       // all meaningless here); it just needs the same CLAUDECODE treatment.
-      // Also scope out the full-journal read credential: a `/usage` one-shot
-      // never touches the journal, so it has no reason to carry a token that
-      // reads every transcript (lib/journal-cred-scope.js). Loop #750.
+      // A `/usage` one-shot never touches the journal: no journal credential,
+      // no bridge-only secrets (lib/journal-cred-scope.js).
       env: stripJournalCreds({ ...process.env, CLAUDECODE: '' }),
     });
     let stdout = '';
@@ -7871,6 +7918,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         `/timer <duration|time> <message> — Send a message to this chat later (e.g. /timer 2h hey, /timer 30m /compact, /timer 09:00 standup, /timer 12:10am ping); /timer lists, /timer cancel <id|all> cancels\n` +
         `/tools — List available tools\n` +
         `/sleep — Stop this machine now, with a confirmation button (needs MATRON_SLEEP_COMMAND)\n` +
+        `/permissions — List session-allowed tools; /permissions revoke <name> (or all) removes a grant\n` +
         `/help — Show this help message\n\n` +
         `Each /start, /resume, and /workdir creates a new session.\n` +
         `Room names show ${SERVER_LABEL} · <repo> · <topic>.\n\n` +
@@ -7916,6 +7964,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
           ['/timer &lt;duration|time&gt; &lt;message&gt;', 'Send a message to this chat later (e.g. /timer 2h hey, /timer 30m /compact, /timer 09:00 standup, /timer 12:10am ping); /timer lists, /timer cancel &lt;id|all&gt; cancels'],
           ['/tools', 'List available tools'],
           ['/sleep', 'Stop this machine now, with a confirmation button (needs <code>MATRON_SLEEP_COMMAND</code>)'],
+          ['/permissions', 'List session-allowed tools; <code>/permissions revoke &lt;name&gt;</code> (or <code>all</code>) removes a grant'],
           ['/help', 'Show this help message'],
         ]) +
         `<b>Tips</b><ul>` +
@@ -8520,6 +8569,49 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       }
 
       await sendHtml(plainMsg, htmlMsg);
+      break;
+    }
+
+    case '!permissions': {
+      const session = sessions.get(roomId);
+      if (!session || !session.alive) {
+        await sendReply('No active session. Start a session first.');
+        break;
+      }
+      const sub = (parts[1] || '').toLowerCase();
+      if (sub === 'revoke') {
+        const target = parts[2];
+        if (!target) {
+          await sendReply('Usage: /permissions revoke <tool-name> (exact name, e.g. mcp__webflow__pages_update). /permissions lists current grants.');
+          break;
+        }
+        if (target.toLowerCase() === 'all') {
+          const count = session.permAllowedTools?.size ?? 0;
+          session.permAllowedTools?.clear();
+          await sendReply(count > 0
+            ? `Revoked all ${count} session grant${count === 1 ? '' : 's'}.`
+            : 'No session grants to revoke.');
+          break;
+        }
+        const removed = revokeSessionGrant(session.permAllowedTools, target);
+        await sendReply(removed
+          ? `Revoked session grant: ${target}. Claude will be re-prompted next time it uses this tool.`
+          : `${target} isn't a current session grant. /permissions lists what's granted.`);
+        break;
+      }
+      // Bare /permissions — list the session's "Always allow" grants.
+      const grants = listSessionGrants(session.permAllowedTools);
+      if (grants.length === 0) {
+        await sendReply('No tools are session-allowed. Tap "Always allow" on a permission card to grant one for this session (cleared on restart).');
+        break;
+      }
+      const plain = `Session-allowed tools (${grants.length}) — cleared on restart:\n` +
+        grants.map(t => `  ${t}`).join('\n') +
+        `\n\nRevoke with /permissions revoke <name> (or /permissions revoke all).`;
+      const html = `<b>Session-allowed tools (${grants.length})</b> — cleared on restart<ul>` +
+        grants.map(t => `<li><code>${escapeHtml(t)}</code></li>`).join('') +
+        `</ul>Revoke with <code>/permissions revoke &lt;name&gt;</code> (or <code>/permissions revoke all</code>).`;
+      await sendHtml(plain, html);
       break;
     }
 
@@ -9233,6 +9325,9 @@ function journalOnItem(session, item, ctx) {
 async function journalOnCoordinator(convoId, { role }) {
   coordinatorLookup.apply(convoId, role);
   const truth = await coordinatorLookup.refresh({ force: true });
+  // A new Coordinator must respawn with its memories: refresh the cache
+  // before recreateSession reads it (spec 2026-09-27 memories).
+  if (role === 'assigned') await memoryLookup.refresh({ force: true });
   // Looked up after the await: the session may have been reaped or respawned
   // while the journal answered.
   const session = findSessionByClaudeSessionId(convoId);
@@ -9312,7 +9407,7 @@ async function journalOnCoordinator(convoId, { role }) {
     session._coordinatorPending = role;
     if (session.busy && !session._deferredCommandText) session._deferredCommandText = '!restart --force';
   }
-  await deliverCoordinatorTurn(sessions.get(roomId) || session, coordinatorTurnText(role, COORDINATOR_BLOCK));
+  await deliverCoordinatorTurn(sessions.get(roomId) || session, coordinatorTurnText(role, COORDINATOR_BLOCK, memoryBlockNow()));
 }
 
 // The injected assigned/released turn. Same inject-or-queue rule as a
@@ -9571,8 +9666,8 @@ function resumeSleepingSession(roomId, prev, noticeConvoId, noticeText) {
 // and print mode's stdin buffers), or null to fall back to the unknown-convo
 // notice.
 function journalResumeConvo(convoId, noticeText = JOURNAL_RESUME_NOTICE) {
-  // Never publish a non-string notice (loop #787): a mis-wired caller once
-  // passed the router ctx here and it rendered as `{"username":…}` JSON.
+  // Never publish a non-string notice: a mis-wired caller once passed the
+  // router ctx here and it rendered as `{"username":…}` JSON.
   if (typeof noticeText !== 'string') noticeText = JOURNAL_RESUME_NOTICE;
   const data = loadPersistedSessions();
   for (const [roomId, prev] of Object.entries(data)) {
@@ -10162,9 +10257,32 @@ function journalOnPeerMessage(frame) {
 // device's own echoes, dropped upstream, and delivered locally instead by
 // routeLocalRoomMessage).
 function journalOnRoomFrame(room, frame) {
+  reconcilePendingGuestOnFrame(room, frame);
   deliverRoomFrameTo(room, frame);
   if (room.guestSessionRoomId != null && room.guestSessionRoomId !== room.sessionRoomId) {
     deliverRoomFrameTo({ ...room, sessionRoomId: room.guestSessionRoomId }, frame);
+  }
+}
+
+// First-use membership reconciliation for a REMOTE guest binding stranded
+// 'pending'. Approved invites join on delivery and that accept is awaited
+// (deliverAutoJoinedRequest): the binding is persisted pending before the
+// accept is sent and flips to joined only on the journal's answer, so a
+// bridge restart or crash in that gap leaves the journal row joined and the
+// local binding pending — and the request frame is ephemeral, so nothing
+// ever retries the flip. The journal has no op that lists this device's
+// memberships (hello_ok carries none), but it does not need one: room
+// fan-out is participation-gated server-side (the recorded owner plus
+// JOINED rows — journal agentTargetsFor), so a frame reaching this bridge for
+// a room where it is a pending guest is itself proof the journal has it
+// joined. Flip the binding so the agent's replies are not refused as "not
+// joined". Same-bridge rooms are excluded (guestSessionRoomId set): there
+// this device is the room's owner and receives every frame regardless.
+// setState refuses terminal states, so a refused/left binding stays put.
+function reconcilePendingGuestOnFrame(room, frame) {
+  if (room.role !== 'guest' || room.state !== 'pending' || room.guestSessionRoomId != null) return;
+  if (agentRooms.setState(frame.convo_id, 'joined')) {
+    console.warn(`[agent-chat] room ${frame.convo_id}: guest binding was pending but the journal fans this room to us — reconciled to joined`);
   }
 }
 
@@ -10490,6 +10608,13 @@ function journalInjectInviteRequest(frame) {
       peerDeviceId: frame.from_device_id, peerName: frame.from_name || null,
       topic: frame.topic || null,
       title: room?.title || null,
+      // The inviter's conversation, so this room is what findLivePair hands
+      // back when THIS session later calls the inviter back: the reuse key is
+      // peer device + peer conversation, and the owner already records both.
+      // Recording only the device here is why a guest calling back used to
+      // open a second room in the other direction. Null from a journal that
+      // predates the field on the request frame — fails safe into a new room.
+      targetConvoId: frame.from_convo_id || null,
     });
   }
   if (frame.local) {
@@ -10499,6 +10624,83 @@ function journalInjectInviteRequest(frame) {
   } else {
     agentInvites.ack({ roomId: frame.room_id, peerDeviceId: isJoin ? frame.from_device_id : null, sessionState: sessionOccupiedForRoomDelivery(session) ? 'busy' : 'idle' });
   }
+  // Approved invites join on delivery (2026-09-27). The user's consent card on
+  // the asking side is the gate; a request frame only reaches this bridge
+  // once it has been cleared. Making the target AGENT accept as well was a
+  // second gate nobody wanted, and one a busy target could never pass: an
+  // agent mid-turn for the whole 30-minute invite window (INVITE_TTL_MS)
+  // let the invite expire, and both sides then opened fresh rooms — pairs
+  // ended up with two or three. So the bridge sends the same accept answer
+  // agent_chat_accept would have sent, right after the ack, and the agent is
+  // told it is in the room rather than asked to join it.
+  //
+  // Remote guest invites only. A join_request is answered by the room OWNER
+  // (a third party asking in), and the same-bridge path keeps its loopback
+  // ask: there the "answer" is a local state flip, not a journal op, and its
+  // owner-side waiter semantics are different enough to leave alone.
+  //
+  // The accept is AWAITED (answerAwait, the accept-path contract in
+  // lib/agent-invites.js), which is why it lives in the async helper rather
+  // than in this synchronous function: the socket-write boolean answer()
+  // returns is not the journal's answer. The op is queued behind the ack
+  // and, if the socket drops before the pump sends them, retried on the next
+  // connect — where the journal rejects it with not_ready between hello_ok
+  // and registration. Marking the binding joined on the write alone would
+  // then leave the journal row 'invited' while the local room said 'joined':
+  // every send refused, and the owner told 'expired' 30 minutes later. The
+  // helper flips the binding only once the journal has let the answer stand;
+  // otherwise the room stays pending and the agent gets the accept/refuse
+  // ask below, whose agent_chat_accept retries the answer properly.
+  //
+  // easelyte fork delta: only an ADDRESSED request auto-joins. An unaddressed
+  // one (a peer bridge that predates target_convo_id) was routed here by a
+  // guess among live sessions (lib/invite-target.js); auto-joining would bind
+  // a room into a conversation it was never meant for with the user's notice
+  // suppressed, so the guessed session keeps the explicit accept/refuse ask.
+  if (!isJoin && !frame.local && addressed) {
+    deliverAutoJoinedRequest(session, frame, room, { addressed })
+      .catch((e) => { try { console.warn(`[agent-invites] joined-room delivery for ${frame.room_id} failed: ${e?.message ?? e}`); } catch { /* logging must never throw */ } });
+    return;
+  }
+  publishInviteRequestNotice(session, frame, room, { addressed, joined: false });
+  deliverInviteAsk(session, frame, room);
+}
+
+// The USER's copy of an inbound request, published BEFORE the agent is woken
+// so it sits above whatever the agent decides. Two separate texts on
+// purpose: the agent's (deliverInviteAsk / formatAutoJoinedRequest)
+// instructs the agent, tool syntax and all; this one just tells Dan who is
+// asking and why — otherwise he sees "I'll accept that chat request" with
+// nothing above it explaining what was requested. `joined`: the bridge
+// accepted on delivery, so the line states a fact rather than a request.
+//
+// journalPublishNotice, NOT the ordinary sendToSession mirror: that mirror
+// publishes from:'user' (journalPublishUserItem), and every field of this
+// text is written by a REMOTE agent — rendering it as Dan's own message
+// would let a peer put words in his mouth in his own chat. A notice is
+// from:'assistant', i.e. the bridge's own voice, which is what it is.
+// formatInviteRequestNotice sanitises each interpolated field.
+//
+// Only when the request was actually ADDRESSED here. An unaddressed one
+// (pre-3.5 caller) reached this session by a guess among several live
+// ones, and publishing a stranger's request into a conversation it was
+// never meant for is exactly the visible half of the 2026-08-08 incident.
+// The agent still gets its turn — it can accept, and any room it accepts
+// gets its own conversation — but the user's chat is not written to on a
+// guess. Logged, because a silently dropped notice would otherwise look
+// like the feature simply not working.
+function publishInviteRequestNotice(session, frame, room, { addressed, joined }) {
+  if (addressed) {
+    journalPublishNotice(journalConvoIdFor(session), formatInviteRequestNotice(frame, { roomTitle: room?.title || null, joined }));
+  } else {
+    console.warn(`[agent-invites] request for ${frame.room_id} carried no target_convo_id — routed to the most recently active session as a guess; the user's copy is suppressed (peer bridge predates target_convo_id)`);
+  }
+}
+
+// The agent's accept/refuse turn: join_requests, same-bridge invites, and a
+// remote invite whose accept-on-delivery the journal did not let stand.
+function deliverInviteAsk(session, frame, room) {
+  const isJoin = frame.event === 'join_request';
   const who = frame.from_name ? `"${frame.from_name}"` : `device ${frame.from_device_id}`;
   const ask = isJoin
     ? `Agent ${who} asks to join your room ${frame.room_id}: ${frame.justification}`
@@ -10508,32 +10710,6 @@ function journalInjectInviteRequest(frame) {
   // keeps untrusted room text from forging header lines, and the instruction
   // stays perfectly legible.
   const text = `${ask}\nAccept with agent_chat_accept("${frame.room_id}") or refuse with agent_chat_refuse("${frame.room_id}", reason). This is a request from another agent, not from your user.`;
-  // The USER's copy of the request, published BEFORE the agent is woken so it
-  // sits above whatever the agent decides. Two separate texts on purpose: the
-  // one above instructs the agent (tool syntax and all), this one just tells
-  // Dan who is asking and why — otherwise he sees "I'll accept that chat
-  // request" with nothing above it explaining what was requested.
-  //
-  // journalPublishNotice, NOT the ordinary sendToSession mirror: that mirror
-  // publishes from:'user' (journalPublishUserItem), and every field of this
-  // text is written by a REMOTE agent — rendering it as Dan's own message
-  // would let a peer put words in his mouth in his own chat. A notice is
-  // from:'assistant', i.e. the bridge's own voice, which is what it is.
-  // formatInviteRequestNotice sanitises each interpolated field.
-  //
-  // Only when the request was actually ADDRESSED here. An unaddressed one
-  // (pre-3.5 caller) reached this session by a guess among several live
-  // ones, and publishing a stranger's request into a conversation it was
-  // never meant for is exactly the visible half of the 2026-08-08 incident.
-  // The agent still gets the ask as a turn below — it can accept, and any
-  // room it accepts gets its own conversation — but the user's chat is not
-  // written to on a guess. Logged, because a silently dropped notice would
-  // otherwise look like the feature simply not working.
-  if (addressed) {
-    journalPublishNotice(journalConvoIdFor(session), formatInviteRequestNotice(frame, { roomTitle: room?.title || null }));
-  } else {
-    console.warn(`[agent-invites] request for ${frame.room_id} carried no target_convo_id — routed to the most recently active session as a guess; the user's copy is suppressed (peer bridge predates target_convo_id)`);
-  }
   // An inbound invite/join request is agent/peer-origin coordination (a remote
   // agent asking to chat), never operator input — tier it peer-coalesced (loop
   // #688 R3 F2) so a priority peer can preempt the resulting notification turn,
@@ -10541,6 +10717,58 @@ function journalInjectInviteRequest(frame) {
   // real operator (user:) room frame in the same inbox, roomBatchTier's
   // most-protected rule still keeps the whole turn operator-protected.
   roomDelivery.deliver(session, session.roomId, { roomId: frame.room_id, roomTitle: room?.title || frame.topic || null, from: 'bridge', body: text, at: Date.now(), tier: TURN_TIER.PEER_COALESCED });
+}
+
+// Accept-on-delivery for a remote guest invite, then the agent's turn. Async
+// because it awaits two things: first the accept itself (answerAwait — the
+// journal answers agent_invite_answer only on failure, so silence within its
+// window is the answer having taken; up to DEFAULT_DELIVER_WAIT_MS of
+// latency, the same cost agent_chat_accept pays), and only on that does the
+// guest binding flip to 'joined'. A rejected accept (journal_unreachable,
+// not_ready on a reconnect retry, a server-expired invite) leaves the
+// binding pending — no terminal state is latched here: 'not_ready' is a
+// plain reconnect race and the invite is still live, and agent_chat_accept
+// already knows which codes prove an invite dead — and hands the agent the
+// ordinary accept/refuse ask instead, whose accept retries the answer.
+//
+// Then the backfill: the inviter published its opening message into the
+// room BEFORE the invite went out, and fan-out is participation-gated at
+// publish time, so the guest never received it — without this read the agent
+// would know why the peer asked but not what it said (the same backfill
+// agent_chat_accept does). Best-effort: the join already took, so a failed
+// read degrades to a pointer at agent_chat_read inside the text. Delivery
+// goes through the same per-recipient path as the ask it replaces (busy
+// coalescing, resume-hold flush), just a round-trip or two later. The
+// user's notice is published between the two, once the outcome is known,
+// so it sits above the agent's turn as for any request.
+async function deliverAutoJoinedRequest(session, frame, room, { addressed }) {
+  const res = await agentInvites.answerAwait({ roomId: frame.room_id, peerDeviceId: null, accept: true });
+  let joined = res.kind === 'answered';
+  let backlog = null;
+  // A conflict can mean the row is ALREADY joined: the guest binding is
+  // persisted 'pending' before the accept is sent and flips only on the
+  // answer, so a restart in that gap leaves the journal row joined with
+  // nothing to retry the local flip — and a peer re-inviting into the same
+  // room lands here again. The journal's detail is 'no pending invite' for
+  // every non-invited state, so a membership probe (one transcript read the
+  // journal 404s for a non-member) decides; a positive also serves as the
+  // backlog below.
+  if (!joined && res.code === 'conflict') {
+    const probe = await probeJoinedRoom(journalPublisher, frame.room_id);
+    if (probe.joined) { joined = true; backlog = probe.events; }
+  }
+  if (joined) {
+    agentRooms.setState(frame.room_id, 'joined');
+  } else {
+    console.warn(`[agent-invites] accept on delivery for ${frame.room_id} did not take (${res.code || res.kind}); room stays pending, asking the agent instead`);
+  }
+  publishInviteRequestNotice(session, frame, room, { addressed, joined });
+  if (!joined) { deliverInviteAsk(session, frame, room); return; }
+  if (!backlog) {
+    const page = await journalPublisher.fetchMessages(frame.room_id, { limit: 20 }).catch(() => null);
+    backlog = page ? page.events : null;
+  }
+  roomDelivery.deliver(session, session.roomId, { roomId: frame.room_id, roomTitle: room?.title || frame.topic || null, from: 'bridge', body: formatAutoJoinedRequest(frame, { events: backlog }), at: Date.now(), tier: TURN_TIER.PEER_COALESCED });
 }
 
 // Room-lifecycle FYI (late answers, peer left) surfaced to the bound session
@@ -10624,6 +10852,9 @@ const journalInputConsumer = createJournalInputConsumer({
   routeItemToSession: journalOnItem,
   // Coordinator role changes (spec 2026-09-23 §2a): never a turn by
   // themselves; journalOnCoordinator re-reads the journal and decides.
+  // A `memory` marker on any of this bridge's conversations: the user's
+  // memories changed, so the cached index is re-read (spec 2026-09-27).
+  onMemoryEvent: () => { memoryLookup.refresh({ force: true }); },
   onCoordinatorEvent: (convoId, ev) => {
     journalOnCoordinator(convoId, ev).catch((e) => {
       try { console.warn(`[coordinator] handling ${ev?.role} for ${convoId} failed: ${e?.message ?? e}`); } catch { /* logging must never throw */ }
@@ -10632,9 +10863,10 @@ const journalInputConsumer = createJournalInputConsumer({
   routePromptReply: journalOnPromptReply,
   ...permissionSeams,
   resolvePermissionReply: resolveJournalPermissionReply,
-  // The router passes (convoId, {username}); journalResumeConvo's 2nd param is
-  // the notice TEXT, so drop the ctx here (loop #787: it was published as
-  // `{"body":{"username":…}}` after every message that woke a reaped session).
+  // The router calls resumeSessionForConvo(convoId, {username}), but
+  // journalResumeConvo's 2nd param is the notice TEXT: drop the ctx here, or it
+  // is published as `{"body":{"username":…}}` after every message that wakes a
+  // reaped session.
   resumeSessionForConvo: (convoId) => journalResumeConvo(convoId),
   // A verified /sleep card tap whose session the idle reaper already removed
   // (lib/journal-input-router.js isSleepPickerTap). The card acts on the
@@ -11182,6 +11414,13 @@ const missionsHandlers = createMissionsHandlers({
   client: missionsClient,
 });
 
+// The four memory_* tool routes (lib/memory-tools.js), mounted below.
+const memoryHandlers = createMemoryHandlers({
+  sessions,
+  journalConvoIdFor,
+  client: memoryClient,
+});
+
 // Plan approvals mirrored into the tracker (lib/plan-approval-items.js,
 // item #2317): the "📋 Plan Ready" card files a question the user can find
 // and answer from the Decisions list; build / timeout / a newer plan close
@@ -11316,10 +11555,8 @@ async function respondAgentChatRoute(res, data, handler, describe) {
 const apiServer = createServer(async (req, res) => {
   const url = new URL(req.url, `http://localhost:${API_PORT}`);
 
-  // Journal READ proxy (loop #765): forward the allowlisted journal search
-  // routes to the journal under the bridge's own token so children need no
-  // JOURNAL_TOKEN. Handled first, and only for paths the proxy owns; any other
-  // path returns null and falls through to the normal dispatch below. Guarded:
+  // Journal read proxy: only the allowlisted /journal/* read routes; any
+  // other path returns null and falls through to the dispatch below. Guarded:
   // this listener has no outer catch, so a throw would be an unhandled
   // rejection that takes the bridge down.
   {
@@ -11529,6 +11766,34 @@ const apiServer = createServer(async (req, res) => {
         res.writeHead(200, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify({ secretId, itemNum, itemError }));
         return;
+      } else if (url.pathname === '/permission-check') {
+        // The gated-session PreToolUse hook (hooks/permission-gate.mjs) asks
+        // here before every non-infra MCP call. Never mints a card: allow and
+        // deny are final (deny also posts the visible room notice); anything
+        // that needs the user answers `ask`, and the CLI then routes the call to
+        // the permission_request tool, which mints the card via
+        // /permission-request below. The hook fails closed to `ask` on any error.
+        const { roomId, toolName } = data;
+        if (!roomId || typeof toolName !== 'string' || toolName === '') {
+          res.writeHead(400);
+          res.end(JSON.stringify({ error: 'roomId and toolName are required' }));
+          return;
+        }
+        const checkSession = sessions.get(roomId);
+        if (!checkSession) {
+          res.writeHead(404);
+          res.end(JSON.stringify({ error: 'No session for roomId' }));
+          return;
+        }
+        const check = resolvePermissionCheck({
+          permAllowedTools: checkSession.permAllowedTools,
+          snapshot: checkSession.permissionSnapshot,
+          toolName,
+        });
+        if (check.notice) Promise.resolve(sendToRoom(roomId, check.notice)).catch(() => {});
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(check.body));
+        return;
       } else if (url.pathname === '/permission-request') {
         const { roomId, toolName, input } = data;
         if (!roomId || typeof toolName !== 'string' || toolName === '') {
@@ -11542,11 +11807,29 @@ const apiServer = createServer(async (req, res) => {
           res.end(JSON.stringify({ error: 'No session for roomId' }));
           return;
         }
-        // Session-allowlisted (an earlier "Always allow" tap): short-circuit,
-        // no card.
-        if (permSession.permAllowedTools?.has(toolName)) {
+        // Decision sequence (extracted to resolvePermissionRequest for
+        // route-level testing): an "Always allow (session)" grant short-circuits
+        // to a silent allow BEFORE the classifier; otherwise the classifier
+        // (spawn-time snapshot) decides — allow → silent allow; deny → immediate
+        // deny + a visible room notice so a policy block isn't silent; anything
+        // else (ask / default-gated / uncertain) falls through to the card mint
+        // below, unchanged.
+        const outcome = resolvePermissionRequest({
+          permAllowedTools: permSession.permAllowedTools,
+          snapshot: permSession.permissionSnapshot,
+          toolName,
+        });
+        if (outcome.kind === 'allow') {
           res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ behavior: 'allow' }));
+          res.end(JSON.stringify(outcome.body));
+          return;
+        }
+        if (outcome.kind === 'deny') {
+          // Fire-and-forget the room notice: the deny response must not block on
+          // journal delivery, and a failed notice can't change the verdict.
+          Promise.resolve(sendToRoom(roomId, outcome.notice)).catch(() => {});
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(outcome.body));
           return;
         }
         const { id: permRequestId } = permissionRegistry.create({ roomId, toolName });
@@ -11707,6 +11990,15 @@ const apiServer = createServer(async (req, res) => {
         const name = missionsRoute[1];
         await respondAgentChatRoute(res, data, missionsHandlers[name],
           (status, b) => debug(`missions/${name} ${status} ${b.error || (b.mission ? `#${b.mission.num ?? '?'}` : 'ok')}`));
+        return;
+      }
+
+      // The four memory_* tool routes; same one-matcher allowlist shape.
+      const memoryRoute = url.pathname.match(/^\/memory\/(save|list|get|delete)$/);
+      if (memoryRoute) {
+        const name = memoryRoute[1];
+        await respondAgentChatRoute(res, data, memoryHandlers[name],
+          (status, b) => debug(`memory/${name} ${status} ${b.error || (b.memory ? b.memory.name : `${(b.memories || []).length} memories`)}`));
         return;
       }
 
@@ -12782,7 +13074,7 @@ function sessionChildPid(session) {
 // the idle clock rules as it did before — never the other way round.
 function readProcessTable() {
   try {
-    return parseProcessTable(execFileSync('ps', ['-axo', 'pid=,ppid=,args='], { encoding: 'utf8', timeout: 5000, maxBuffer: 16 * 1024 * 1024 }));
+    return parseProcessTable(execFileSync('ps', ['-axo', 'pid=,ppid=,args='], { encoding: 'utf8', timeout: 5000, maxBuffer: 16 * 1024 * 1024, env: stripJournalCreds() }));
   } catch (e) {
     debug(`readProcessTable failed: ${e.message}`);
     return [];

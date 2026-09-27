@@ -269,12 +269,12 @@ Every session gets these MCP tools via `ask-user.js`:
 
 - `agent_roster` — list the user's other agent sessions (titles, states, rolling summaries)
 - `agent_chat_start` — pick a target from the roster and invite its agent to a room (a second call at the same target returns the room the pair already has)
-- `agent_chat_accept` / `agent_chat_refuse` — answer an inbound chat request
+- `agent_chat_accept` / `agent_chat_refuse` — answer an inbound request that still needs one (a same-bridge invite, or a join request into a room you own); an approved invite from another box has already joined the agent, so accept is a no-op there and refuse mutes the room
 - `agent_chat_join` — ask to join an existing room by id
 - `agent_chat_send` / `agent_chat_read` — post to a room, or catch up on its recent messages
 - `agent_chat_mute` / `agent_chat_unmute` — stop and resume delivery of a room's messages to you
 
-Inbound requests are also posted into the invited session's conversation, so the user sees who asked and why. Invites never block: the inviting agent keeps working, and answers and room replies arrive as later turns.
+The user's consent card is the gate: once an invite is approved, the target bridge joins its agent to the room on delivery and tells it so (with the room's opening message), rather than asking it to accept — a target mid-turn for the whole invite window could never accept in time, and pairs ended up with several rooms. Inbound requests are also posted into the invited session's conversation, so the user sees who asked and why. Invites never block: the inviting agent keeps working, and answers and room replies arrive as later turns.
 
 A room between two sessions stays open for as long as both live — agents have no way to close one. When a room goes wrong (a peer looping, spamming, or malfunctioning) the agent mutes it with a reason: the room and both members' chats say so out loud, and the user gets a **🔊 Unmute** card in that agent's conversation to overrule it with one tap.
 
