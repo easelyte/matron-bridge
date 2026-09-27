@@ -1452,11 +1452,7 @@ function journalOnReconnect() {
   scheduleReleaseReconcile();
 }
 
-// Durable phase of a release: write-ahead the outbox record and return a
-// descriptor the caller can later publish. Returns null (fail-closed) if the
-// durable write can't persist, so a caller aborts before the irreversible step
-// (queue splice, or — on the SEND path — the merged delivery) it guards.
-function writeAheadRelease(convoId, { promptId, action, releasedIds }) {
+function emitRelease(convoId, { promptId, action, releasedIds }, { mutate } = {}) {
   const itemId = (Array.isArray(releasedIds) && releasedIds.length)
     ? releasedIds[0]
     : `${promptId}::0`;
@@ -1473,15 +1469,10 @@ function writeAheadRelease(convoId, { promptId, action, releasedIds }) {
   });
   if (!durable) {
     console.warn(`[queued-release-outbox] write-ahead failed for ${recordKey} — aborting release (card stays actionable)`);
-    return null;
+    return false;
   }
-  return { recordKey, convoId, promptId, itemId, action, releasedIds, at };
-}
-
-// Network phase of a release: publish the prompt_reply for an already
-// written-ahead record. Idem-keyed so the retry driver's re-publish of the same
-// pending record is a server-side dedup no-op.
-function publishReleaseRecord({ convoId, promptId, itemId, action, releasedIds, at }) {
+  try { mutate?.(); }
+  catch (e) { console.warn(`[emitRelease] mutate thunk threw for ${recordKey}: ${e?.message ?? String(e)}`); }
   journalPublisher.publishPromptReply(convoId, {
     kind: 'queued_release',
     prompt_id: promptId,
@@ -1489,14 +1480,6 @@ function publishReleaseRecord({ convoId, promptId, itemId, action, releasedIds, 
     released: releasedIds,
     at,
   }, { idemKey: `qr\0${promptId}\0${itemId}\0${action}` });
-}
-
-function emitRelease(convoId, spec, { mutate } = {}) {
-  const rec = writeAheadRelease(convoId, spec);
-  if (!rec) return false;
-  try { mutate?.(); }
-  catch (e) { console.warn(`[emitRelease] mutate thunk threw for ${rec.recordKey}: ${e?.message ?? String(e)}`); }
-  publishReleaseRecord(rec);
   return true;
 }
 
@@ -6071,9 +6054,9 @@ function snapshotQueuedReleaseBatch(session, queued) {
 // The prefix of session.queuedMessages the NEXT flush will actually send —
 // the whole queue normally, or just a leading /compact when one is jumping
 // (lib/compact-priority.js). Every release-registry seam has to be scoped to
-// that batch: handed the whole queue instead, the flush's send write-ahead
-// would emit `send` releases for messages still sitting in the queue, retiring
-// their cards while they wait for the compaction to finish.
+// that batch: handed the whole queue instead, finalizeSentQueue would emit
+// `send` releases for messages still sitting in the queue, retiring their
+// cards while they wait for the compaction to finish.
 function pendingFlushBatch(session) {
   const queue = session.queuedMessages || [];
   return queue.slice(0, compactBatchSize(queue));
@@ -6183,56 +6166,9 @@ function flushQueue(session, queued, releaseSnapshot = null) {
     console.log(`[QUEUE] could not interrupt active Codex turn; kept ${queued.length} queued message(s)`);
     return false;
   }
-  // Fail-closed SEND, mirroring the cancel path (busy-queue.js): the durable
-  // release write-ahead must precede the point where dispatchMergedFlush commits
-  // delivery to the agent — NOT follow it. Write-ahead every live release record
-  // for this batch FIRST. If any durable write faults (ENOSPC etc.), undo the
-  // partial write-aheads, keep the whole batch queued, and leave the cards
-  // actionable — nothing was delivered, so the user can retap. (The old ordering
-  // delivered first and wrote-ahead in finalizeSentQueue afterward, so a disk
-  // fault between delivery and release stranded a delivered-but-unreleased,
-  // stale-actionable card.)
-  const written = [];
-  const abortWrittenReleases = () => {
-    for (const w of written) releaseOutbox.abort(w.recordKey);
-  };
-  for (const { promptId, itemId } of snapshot.entries || []) {
-    const rec = writeAheadRelease(snapshot.convoId, {
-      promptId,
-      action: 'send',
-      releasedIds: [itemId],
-    });
-    if (!rec) {
-      // Roll back via abort (in-memory authoritative), NOT remove: the disk is
-      // already faulting, so a persist-only remove could leave an earlier
-      // write-ahead `pending` for the retry driver to republish as a false
-      // `send` for an undelivered batch.
-      abortWrittenReleases();
-      restoreQueuedBatch(session, queued);
-      console.log(`[QUEUE] send write-ahead faulted; kept ${queued.length} queued message(s) actionable (room ${session.roomId})`);
-      return false;
-    }
-    written.push(rec);
-  }
-  let delivered;
-  try {
-    delivered = dispatchMergedFlush(session, queued);
-  } catch (e) {
-    // A dispatch that THROWS (e.g. a PTY/stdin write error) has NOT committed
-    // delivery. Because the `send` write-aheads now precede dispatch, letting
-    // the throw escape would strand them as `pending` for the retry driver to
-    // republish as a false `send`. Abort them + restore the batch, and surface
-    // the throw as an ordinary retain-for-retry failure so flushQueue keeps its
-    // non-throwing true/false/'deferred' contract.
-    abortWrittenReleases();
-    restoreQueuedBatch(session, queued);
-    console.log(`[QUEUE] dispatch threw; kept ${queued.length} queued message(s) for retry (room ${session.roomId}): ${e?.message ?? String(e)}`);
-    return false;
-  }
-  if (!delivered) {
-    // Delivery never committed. Roll back every write-ahead so the retry driver
-    // can never republish a `send` release for an undelivered batch, then take
-    // the two branches dispatchMergedFlush failure splits into:
+  if (!dispatchMergedFlush(session, queued)) {
+    // dispatchMergedFlush fails in two distinct situations that must NOT be
+    // handled the same way:
     //   1. The session is gone (dead / auto-stopped). There is nothing to
     //      retry against, so retaining would strand the batch forever. Every
     //      entry was acknowledged with a success-style "📨 Queued" tile, so a
@@ -6244,9 +6180,6 @@ function flushQueue(session, queued, releaseSnapshot = null) {
     //      those already surfaced its specific reason via
     //      reportSessionSendFailure, and the session is still there to retry
     //      against, so retain the batch for a later flush rather than dropping.
-    // abort (in-memory authoritative) not remove: guarantees no `send` survives
-    // for this undelivered batch even if the persist of the removal fails.
-    abortWrittenReleases();
     if (!session.alive || session._autoStopped) {
       console.log(`[QUEUE] dropped queued message(s) (room ${session.roomId})`);
       // Unlink any saved-media files these dropped entries wrote to disk — the
@@ -6264,14 +6197,7 @@ function flushQueue(session, queued, releaseSnapshot = null) {
     console.log(`[QUEUE] could not send queued message(s); kept ${queued.length} queued message(s) for retry (room ${session.roomId})`);
     return false;
   }
-  // Delivered. Only now publish the durable send releases and retire the live
-  // cards — the same post-commit publish ordering the cancel path uses (splice
-  // under the write-ahead, publish after). A crash after this point leaves
-  // durable `send` records the retry driver / boot reconcile finish.
-  for (const rec of written) {
-    publishReleaseRecord(rec);
-    journalInputConsumer.queueRelease.dropItem(snapshot.convoId, rec.itemId);
-  }
+  finalizeSentQueue(snapshot.convoId, snapshot.entries);
   return true;
 }
 
