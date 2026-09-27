@@ -1585,7 +1585,8 @@ describe('index.js routes + ask-user.js tools (source inspection)', () => {
     // local binding said 'joined' (answerAwait's contract in lib/agent-invites.js).
     const hand = body.indexOf('deliverAutoJoinedRequest(session, frame, room, { addressed })');
     expect(hand).toBeGreaterThan(-1);
-    expect(body).toMatch(/if \(!isJoin && !frame\.local\) \{[\s\S]{0,1200}deliverAutoJoinedRequest\(session, frame, room, \{ addressed \}\)/);
+    // Fork delta: only an addressed request auto-joins; a guessed target keeps the ask.
+    expect(body).toMatch(/if \(!isJoin && !frame\.local && addressed\) \{[\s\S]{0,1200}deliverAutoJoinedRequest\(session, frame, room, \{ addressed \}\)/);
     expect(strip(body)).not.toMatch(/agentInvites\.answer\(\{ roomId: frame\.room_id, peerDeviceId: null, accept: true/);
     expect(strip(body)).not.toContain("setState(frame.room_id, 'joined')");
     // Ack first (unchanged, it settles the inviter's chatStart waiter), then

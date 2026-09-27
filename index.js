@@ -10625,7 +10625,13 @@ function journalInjectInviteRequest(frame) {
   // helper flips the binding only once the journal has let the answer stand;
   // otherwise the room stays pending and the agent gets the accept/refuse
   // ask below, whose agent_chat_accept retries the answer properly.
-  if (!isJoin && !frame.local) {
+  //
+  // easelyte fork delta: only an ADDRESSED request auto-joins. An unaddressed
+  // one (a peer bridge that predates target_convo_id) was routed here by a
+  // guess among live sessions (lib/invite-target.js); auto-joining would bind
+  // a room into a conversation it was never meant for with the user's notice
+  // suppressed, so the guessed session keeps the explicit accept/refuse ask.
+  if (!isJoin && !frame.local && addressed) {
     deliverAutoJoinedRequest(session, frame, room, { addressed })
       .catch((e) => { try { console.warn(`[agent-invites] joined-room delivery for ${frame.room_id} failed: ${e?.message ?? e}`); } catch { /* logging must never throw */ } });
     return;
