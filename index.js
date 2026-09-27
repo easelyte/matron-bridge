@@ -10,7 +10,10 @@ import { createItemsHandlers } from './lib/items-tools.js';
 import { createReminderHandlers } from './lib/reminder-tools.js';
 import { createMissionsClient } from './lib/missions-client.js';
 import { createMissionsHandlers } from './lib/missions-tools.js';
-import { createCoordinatorLookup, loadCoordinatorBlock, claudeCoordinatorArgs, codexCoordinatorOptions, explicitModelFlag, explicitModelFlagForResume, coordinatorTurnText, planCoordinatorTransition, decideCoordinatorEvent, withCoordinatorModel, recreateSpawnModel } from './lib/coordinator.js';
+import { createMemoryClient } from './lib/memory-client.js';
+import { createMemoryHandlers } from './lib/memory-tools.js';
+import { createMemoryLookup } from './lib/memory-lookup.js';
+import { createCoordinatorLookup, loadCoordinatorBlock, claudeCoordinatorArgs, codexCoordinatorOptions, explicitModelFlag, explicitModelFlagForResume, coordinatorTurnText, planCoordinatorTransition, decideCoordinatorEvent, withCoordinatorModel, recreateSpawnModel, renderMemoryBlock } from './lib/coordinator.js';
 import { createServer } from 'http';
 import { createHmac, randomUUID, randomBytes } from 'crypto';
 import fs from 'fs';
@@ -567,6 +570,12 @@ const missionsClient = createMissionsClient({
   token: _journalToken,
 });
 
+// Memories (spec 2026-09-27): same base URL and token; the memory_* tools.
+const memoryClient = createMemoryClient({
+  baseUrl: journalHttpBase,
+  token: _journalToken,
+});
+
 // Journal READ proxy (lib/journal-read-proxy.js): the loopback API forwards
 // the journal search routes under the bridge's own token, so Claude sessions
 // and app-server Codex sessions are spawned without JOURNAL_TOKEN /
@@ -609,6 +618,17 @@ const coordinatorLookup = createCoordinatorLookup({
   token: _journalToken,
   log: console,
 });
+
+// The user's memories, cached for the Coordinator's spawn (spec 2026-09-27
+// memories, "The index at spawn"): lib/memory-lookup.js, refreshed on every
+// hello_ok, on every `coordinator` and `memory` event, and throttled behind
+// every spawn. memoryBlockNow() renders whatever the cache holds for the
+// three spawn builders and the live `assigned` turn.
+const memoryLookup = createMemoryLookup({
+  baseUrl: journalHttpBase,
+  token: _journalToken,
+});
+const memoryBlockNow = () => renderMemoryBlock(memoryLookup.snapshot());
 
 // NOTE (easelyte fork): upstream's summary-model-nag is intentionally dropped
 // here. This fork generates titles/summaries via a codex exec one-shot
@@ -691,6 +711,7 @@ function handleJournalReconnect() {
   // replayed `coordinator` events cover a live bridge, this covers a cursor
   // reset (snapshot_required) that skipped them.
   coordinatorLookup.refresh({ force: true });
+  memoryLookup.refresh({ force: true });
 }
 
 // Repair the summary publish hint across a connection epoch (loop #554 F3).
@@ -839,6 +860,7 @@ const JOURNAL_ENABLED = !!(JOURNAL_WS_URL && _journalToken);
 if (JOURNAL_ENABLED) {
   // Warm the Coordinator cache before the first resume can ask for it.
   coordinatorLookup.refresh({ force: true });
+  memoryLookup.refresh({ force: true });
   // Boot the control convo eagerly — safe even before the WS is connected
   // (journalPublisher queues FIFO and flushes on connect, same as every
   // other publish here). No Matrix dependency: this convo has no Matrix
@@ -2216,6 +2238,7 @@ function coordinatorRoleAtSpawn(roomId, resumeSessionId, options, persisted) {
   ];
   const role = coordinatorLookup.roleFor(candidates);
   coordinatorLookup.refresh();
+  memoryLookup.refresh();
   if (JOURNAL_ENABLED && !role.known && !coordinatorUnknownWarned.has(roomId) && candidates.some((c) => typeof c === 'string' && c)) {
     coordinatorUnknownWarned.add(roomId);
     console.warn(`[coordinator] ${roomId}: coordinator not known yet (journal has not answered GET /coordinator) — starting as an ordinary session`);
@@ -2350,7 +2373,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     resumeSessionId, presetId: options.presetSessionId, mintId: randomUUID,
     transcriptExists: (id) => fs.existsSync(transcriptPathFor(cwd, id)),
   });
-  const printCoord = claudeCoordinatorArgs({ coordinator: !!options.coordinator, basePrompt: BRIDGE_SYSTEM_PROMPT, block: COORDINATOR_BLOCK, baseDisallowed: ['AskUserQuestion'] });
+  const printCoord = claudeCoordinatorArgs({ coordinator: !!options.coordinator, basePrompt: BRIDGE_SYSTEM_PROMPT, block: COORDINATOR_BLOCK, baseDisallowed: ['AskUserQuestion'], memoryBlock: memoryBlockNow() });
   const args = [
     '--print',
     '--verbose',
@@ -2737,7 +2760,7 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
       console.warn(`[show-file] disabled for ${roomId}: failed to pin allowed roots (${error.message})`);
     }
   }
-  const codexCoord = codexCoordinatorOptions({ coordinator: !!options.coordinator, baseInstructions: CODEX_BRIDGE_PROMPT, block: COORDINATOR_BLOCK, baseSandbox: CODEX_SANDBOX_MODE });
+  const codexCoord = codexCoordinatorOptions({ coordinator: !!options.coordinator, baseInstructions: CODEX_BRIDGE_PROMPT, block: COORDINATOR_BLOCK, baseSandbox: CODEX_SANDBOX_MODE, memoryBlock: memoryBlockNow() });
   const Adapter = CODEX_APP_SERVER ? CodexAppServerSession : CodexExecSession;
   const codex = new Adapter({
     cwd,
@@ -3229,7 +3252,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
   // buildSessionSettings('iv') (lib/session-settings.js), and any TUI prompt
   // outside it is surfaced by lib/prompt-detector.js. Upstream's iv
   // guardRootBypass(true) branch is deliberately not adopted.
-  const ivCoord = claudeCoordinatorArgs({ coordinator: !!options.coordinator, basePrompt: BRIDGE_SYSTEM_PROMPT, block: COORDINATOR_BLOCK });
+  const ivCoord = claudeCoordinatorArgs({ coordinator: !!options.coordinator, basePrompt: BRIDGE_SYSTEM_PROMPT, block: COORDINATOR_BLOCK, memoryBlock: memoryBlockNow() });
   const claudeArgs = [...identity.cliArgs];
   claudeArgs.push(
     // AskUserQuestion is allowed in iv-mode: the TUI prompt detector
@@ -9302,6 +9325,9 @@ function journalOnItem(session, item, ctx) {
 async function journalOnCoordinator(convoId, { role }) {
   coordinatorLookup.apply(convoId, role);
   const truth = await coordinatorLookup.refresh({ force: true });
+  // A new Coordinator must respawn with its memories: refresh the cache
+  // before recreateSession reads it (spec 2026-09-27 memories).
+  if (role === 'assigned') await memoryLookup.refresh({ force: true });
   // Looked up after the await: the session may have been reaped or respawned
   // while the journal answered.
   const session = findSessionByClaudeSessionId(convoId);
@@ -9381,7 +9407,7 @@ async function journalOnCoordinator(convoId, { role }) {
     session._coordinatorPending = role;
     if (session.busy && !session._deferredCommandText) session._deferredCommandText = '!restart --force';
   }
-  await deliverCoordinatorTurn(sessions.get(roomId) || session, coordinatorTurnText(role, COORDINATOR_BLOCK));
+  await deliverCoordinatorTurn(sessions.get(roomId) || session, coordinatorTurnText(role, COORDINATOR_BLOCK, memoryBlockNow()));
 }
 
 // The injected assigned/released turn. Same inject-or-queue rule as a
@@ -10826,6 +10852,9 @@ const journalInputConsumer = createJournalInputConsumer({
   routeItemToSession: journalOnItem,
   // Coordinator role changes (spec 2026-09-23 §2a): never a turn by
   // themselves; journalOnCoordinator re-reads the journal and decides.
+  // A `memory` marker on any of this bridge's conversations: the user's
+  // memories changed, so the cached index is re-read (spec 2026-09-27).
+  onMemoryEvent: () => { memoryLookup.refresh({ force: true }); },
   onCoordinatorEvent: (convoId, ev) => {
     journalOnCoordinator(convoId, ev).catch((e) => {
       try { console.warn(`[coordinator] handling ${ev?.role} for ${convoId} failed: ${e?.message ?? e}`); } catch { /* logging must never throw */ }
@@ -11383,6 +11412,13 @@ const missionsHandlers = createMissionsHandlers({
   sessions,
   journalConvoIdFor,
   client: missionsClient,
+});
+
+// The four memory_* tool routes (lib/memory-tools.js), mounted below.
+const memoryHandlers = createMemoryHandlers({
+  sessions,
+  journalConvoIdFor,
+  client: memoryClient,
 });
 
 // Plan approvals mirrored into the tracker (lib/plan-approval-items.js,
@@ -11954,6 +11990,15 @@ const apiServer = createServer(async (req, res) => {
         const name = missionsRoute[1];
         await respondAgentChatRoute(res, data, missionsHandlers[name],
           (status, b) => debug(`missions/${name} ${status} ${b.error || (b.mission ? `#${b.mission.num ?? '?'}` : 'ok')}`));
+        return;
+      }
+
+      // The four memory_* tool routes; same one-matcher allowlist shape.
+      const memoryRoute = url.pathname.match(/^\/memory\/(save|list|get|delete)$/);
+      if (memoryRoute) {
+        const name = memoryRoute[1];
+        await respondAgentChatRoute(res, data, memoryHandlers[name],
+          (status, b) => debug(`memory/${name} ${status} ${b.error || (b.memory ? b.memory.name : `${(b.memories || []).length} memories`)}`));
         return;
       }
 

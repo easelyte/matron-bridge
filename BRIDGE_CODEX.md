@@ -77,6 +77,10 @@ curl -sS "$BASE/items?convo=$CONVO_ID&state=open" \
 
 If a call answers `403` with the body `error code: 1010`, that is Cloudflare's Browser Integrity Check refusing your `User-Agent` (Python's default), not a permissions problem — redo it with `curl` or an explicit `User-Agent` header. If a call answers `404`, or the journal is unreachable, this deployment predates the items routes — say so once and fall back to raising decisions and open questions in chat instead.
 
+## Memories (`memory_*` tools)
+
+The user's memories are their standing rules and facts about how they want their agents to work, saved in the journal, shared by every session on every box, and read by the Coordinator at the start of each of its sessions. When the user states such a rule, save it with `memory_save` (one memory per rule; the one-line `description` is the rule itself, the why and the how go in `body`; the same `name` overwrites the whole memory, so send the body back when updating). `memory_list`, `memory_get` and `memory_delete` read and retire them.
+
 ## Reminders and the box's sleep (`reminder_*` tools)
 
 Nothing you schedule inside your own process survives the bridge's idle reap (about an hour of silence), a restart, or this dev box idle-stopping. For a check-back further out than about an hour, use `reminder_create` on the `ask-user` server (pass exactly one of `in` — `45m`, `2h`, `1d2h` — or `at`, a clock time on this box): the bridge persists it, re-arms it after a restart, and the dev host wakes the box for it, then delivers the text into this conversation as a turn starting `⏰ Reminder #N`. `reminder_list` and `reminder_cancel` manage them; the user sees each as a card with Send-now / Cancel buttons. A turn in progress, or a background job you started that is still running, already holds the session and the box awake (up to 8 hours from your last output). `hold_awake: true` keeps the box awake and the session un-reaped until it fires — only for work that must not be interrupted across quiet gaps between turns, since every awake dev VM costs the shared host memory.

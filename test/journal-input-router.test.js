@@ -2514,6 +2514,37 @@ describe('coordinator events', () => {
     expect(seams.noticeUnknownConvo).not.toHaveBeenCalled();
   });
 
+  it('memory: hands every memory marker to onMemoryEvent from any sender, stripped payloads included', () => {
+    const { onEvent, seams } = consumer({ onMemoryEvent: vi.fn() });
+    onEvent(baseFrame({ seq: 7, type: 'memory', sender: 'agent:box', payload: { memory_id: 'me_1', name: 'a', action: 'saved', created: true, by: 'agent' } }));
+    onEvent(baseFrame({ seq: 8, type: 'memory', sender: 'user:dan', payload: { memory_id: 'me_2', action: 'deleted' } }));
+    onEvent(baseFrame({ seq: 9, type: 'memory', sender: 'user:dan', payload: null }));
+    expect(seams.onMemoryEvent.mock.calls).toEqual([
+      ['convo-1', { seq: 7, action: 'saved', memoryId: 'me_1' }],
+      ['convo-1', { seq: 8, action: 'deleted', memoryId: 'me_2' }],
+      ['convo-1', { seq: 9, action: null, memoryId: null }],
+    ]);
+    expect(seams.routeTextToSession).not.toHaveBeenCalled();
+    expect(seams.resumeSessionForConvo).not.toHaveBeenCalled();
+    expect(seams.noticeUnknownConvo).not.toHaveBeenCalled();
+  });
+
+  it('memory: a throwing seam is contained, an unwired seam is a silent drop, a room convo still goes to the seam', () => {
+    const warns = [];
+    const { onEvent } = consumer({ onMemoryEvent: () => { throw new Error('boom'); }, log: { warn: (m) => warns.push(m) } });
+    expect(() => onEvent(baseFrame({ type: 'memory', payload: { memory_id: 'me_1', action: 'saved' } }))).not.toThrow();
+    expect(warns.some((w) => /onMemoryEvent threw: boom/.test(w))).toBe(true);
+    const { onEvent: bare, seams } = consumer({ onMemoryEvent: undefined });
+    bare(baseFrame({ type: 'memory', payload: { memory_id: 'me_1', action: 'saved' } }));
+    expect(seams.noticeUnknownConvo).not.toHaveBeenCalled();
+    const routeRoomFrame = vi.fn();
+    const onMemoryEvent = vi.fn();
+    const { onEvent: roomy } = consumer({ roomFor: () => ({ peerName: 'x' }), routeRoomFrame, onMemoryEvent });
+    roomy(baseFrame({ type: 'memory', payload: { memory_id: 'me_1', action: 'saved' } }));
+    expect(routeRoomFrame).not.toHaveBeenCalled();
+    expect(onMemoryEvent).toHaveBeenCalledTimes(1);
+  });
+
   it('a coordinator frame in an active room convo still goes to the coordinator seam, not the room', () => {
     const routeRoomFrame = vi.fn();
     const { onEvent, seams } = consumer({ roomFor: () => ({ peerName: 'x' }), routeRoomFrame });

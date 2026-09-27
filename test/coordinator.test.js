@@ -4,6 +4,8 @@ import {
   createCoordinatorLookup,
   loadCoordinatorBlock,
   claudeCoordinatorArgs,
+  renderMemoryBlock,
+  MEMORY_BLOCK_MAX_BYTES,
   codexCoordinatorOptions,
   coordinatorTurnText,
   explicitModelFlag,
@@ -202,6 +204,53 @@ describe('claudeCoordinatorArgs', () => {
     const r = claudeCoordinatorArgs({ coordinator: true, basePrompt: 'BASE', block: 'BLOCK', baseDisallowed: ['AskUserQuestion', 'Edit'] });
     expect(r.appendSystemPrompt).toBe('BASE\n\nBLOCK');
     expect(r.disallowedTools).toEqual(['AskUserQuestion', 'Edit', 'Write', 'NotebookEdit', 'MultiEdit']);
+  });
+});
+
+describe('memory block plumbing (spec 2026-09-27 memories)', () => {
+  it('an ordinary session is byte-identical with a memoryBlock given', () => {
+    expect(claudeCoordinatorArgs({ coordinator: false, basePrompt: 'BASE', block: 'BLOCK', memoryBlock: 'MEM' }).appendSystemPrompt).toBe('BASE');
+    expect(codexCoordinatorOptions({ coordinator: false, baseInstructions: 'B', block: 'K', baseSandbox: 'x', memoryBlock: 'MEM' }).developerInstructions).toBe('B');
+  });
+  it('the Coordinator gets the memory block after the brief on all three paths; an empty block appends nothing', () => {
+    expect(claudeCoordinatorArgs({ coordinator: true, basePrompt: 'BASE', block: 'BLOCK', memoryBlock: 'MEM' }).appendSystemPrompt).toBe('BASE\n\nBLOCK\n\nMEM');
+    expect(claudeCoordinatorArgs({ coordinator: true, basePrompt: 'BASE', block: 'BLOCK', memoryBlock: '' }).appendSystemPrompt).toBe('BASE\n\nBLOCK');
+    expect(codexCoordinatorOptions({ coordinator: true, baseInstructions: 'B', block: 'K', baseSandbox: 'x', memoryBlock: 'MEM' }).developerInstructions).toBe('B\n\nK\n\nMEM');
+    expect(coordinatorTurnText('assigned', 'BLOCK', 'MEM')).toBe(`${COORDINATOR_ASSIGNED_PREFIX}\n\nBLOCK\n\nMEM`);
+    expect(coordinatorTurnText('assigned', 'BLOCK')).toBe(`${COORDINATOR_ASSIGNED_PREFIX}\n\nBLOCK`);
+    expect(coordinatorTurnText('released', 'BLOCK', 'MEM')).toBe(COORDINATOR_RELEASED_TURN);
+  });
+});
+
+describe('renderMemoryBlock', () => {
+  const m = (name, description = `Rule ${name}.`, type = 'feedback') => ({ id: `me_${name}`, name, type, description });
+  it('lists name (type): description per memory, sorted by name', () => {
+    const out = renderMemoryBlock({ known: true, memories: [m('b-two'), m('a-one', 'Never use eric.', 'user')] });
+    expect(out.startsWith('## Your memories\n\n')).toBe(true);
+    expect(out).toContain('memory_save');
+    expect(out.endsWith('\n- a-one (user): Never use eric.\n- b-two (feedback): Rule b-two.')).toBe(true);
+  });
+  it('known and empty says there are none; unknown says to call memory_list and never claims none', () => {
+    expect(renderMemoryBlock({ known: true, memories: [] })).toMatch(/You have no memories yet\.$/);
+    const unknown = renderMemoryBlock({ known: false, memories: [] });
+    expect(unknown).toMatch(/could not be loaded.*call memory_list/);
+    expect(unknown).not.toMatch(/no memories/);
+    expect(renderMemoryBlock(null)).toBe(unknown);
+  });
+  it('flattens multi-line fields and skips junk entries', () => {
+    const out = renderMemoryBlock({ known: true, memories: [m('x', 'line one\nline  two'), null, { name: '' }, 'junk'] });
+    expect(out).toContain('- x (feedback): line one line two');
+    expect(out.split('\n- ')).toHaveLength(2);
+  });
+  it('caps the block at 16 KB and says how many were left out', () => {
+    const many = Array.from({ length: 200 }, (_, i) => m(`m-${String(i).padStart(3, '0')}`, 'd'.repeat(200)));
+    const out = renderMemoryBlock({ known: true, memories: many });
+    expect(Buffer.byteLength(out, 'utf8')).toBeLessThanOrEqual(MEMORY_BLOCK_MAX_BYTES);
+    const tail = out.match(/… (\d+) more — call memory_list\.$/);
+    expect(tail).toBeTruthy();
+    const shown = out.split('\n- ').length - 1;
+    expect(shown + Number(tail[1])).toBe(200);
+    expect(shown).toBeGreaterThan(50);
   });
 });
 

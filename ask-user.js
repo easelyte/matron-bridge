@@ -10,6 +10,7 @@ import { formatBox } from './lib/agent-boxes-format.js';
 import { itemLine, formatItemList, formatItemDetail, formatCommentAck } from './lib/items-format.js';
 import { formatStartAck, formatCreateAck, formatMilestoneAck, formatMissionDetail, missionLine, formatBlocked, formatJournalError } from './lib/missions-format.js';
 import { missionIdemKey, itemIdemKey } from './lib/missions-idem.js';
+import { formatMemoryList, formatMemoryDetail, formatSaveAck, formatDeleteAck } from './lib/memory-format.js';
 import { formatReminderLine } from './lib/reminder-tools.js';
 
 // Route to whichever bridge spawned us: explicit BRIDGE_API_URL wins, else the
@@ -940,6 +941,59 @@ server.tool(
     mission: z.number().int().min(1).nullable().describe('Target mission number, or null to detach'),
   },
   async (args) => callItems('move', args, (d) => itemLine(d.item)),
+);
+
+// --- Memories (spec 2026-09-27 memories): the user's shared agent memory ---
+// The four memory_* tools go through the bridge loopback (index.js mounts
+// lib/memory-tools.js at /memory/<op>), the items/missions shape.
+async function callMemory(name, args, render) {
+  try {
+    const res = await fetch(`${BRIDGE_API}/memory/${name}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ roomId: ROOM_ID, ...args }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) return { content: [{ type: 'text', text: `memory_${name} failed: ${data.error || `HTTP ${res.status}`}` }] };
+    return { content: [{ type: 'text', text: render(data) }] };
+  } catch (err) {
+    return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
+  }
+}
+
+const MEMORY_WHAT = "The user's memories are their standing rules and facts about how they want their agents to work (which boxes to avoid, which model to use, how to report), saved in the journal, shared by every session on every box, and read by the Coordinator at the start of each of its sessions.";
+
+server.tool(
+  'memory_save',
+  `Save or update one of the user's memories. ${MEMORY_WHAT} Save a memory the moment the user states such a rule — one memory per rule — and confirm in one line. The \`description\` is the one line the Coordinator sees at spawn, so write it as the actionable rule itself; put the why and the how in \`body\`. The same \`name\` overwrites the WHOLE memory, so send the body back when updating one. Not for project or code facts an ordinary session should keep in its own Claude Code memory directory.`,
+  {
+    name: z.string().describe("Kebab-case slug, unique per user: lowercase letters, digits and dashes, ≤64 chars, e.g. 'avoid-eric-and-fatima'. Reuse an existing name to update it."),
+    description: z.string().describe('One line, ≤200 chars: the rule as the Coordinator should read it.'),
+    body: z.string().optional().describe('Markdown, ≤8 KB: **Why:** and **How to apply:**. Omitted on an update clears the stored body — send it back.'),
+    type: z.enum(['user', 'feedback', 'project', 'reference']).optional().describe("Defaults to 'feedback' (how the user wants work done). 'user' = who they are; 'project' = ongoing work or constraints; 'reference' = a pointer (URL, dashboard, ticket)."),
+  },
+  async (args) => callMemory('save', args, formatSaveAck),
+);
+
+server.tool(
+  'memory_list',
+  `List the user's memories: name, type, description and when each was last updated. ${MEMORY_WHAT} Call it before deciding anything a standing rule might cover if your instructions do not already carry the list.`,
+  {},
+  async (args) => callMemory('list', args, formatMemoryList),
+);
+
+server.tool(
+  'memory_get',
+  'Read one memory in full, body included (the why and the how behind the one-line description).',
+  { name: z.string().describe('The memory name') },
+  async (args) => callMemory('get', args, formatMemoryDetail),
+);
+
+server.tool(
+  'memory_delete',
+  'Delete one of the user\'s memories — when the user retires a rule, or a memory turns out to be wrong. To change a memory, memory_save it under the same name instead.',
+  { name: z.string().describe('The memory name') },
+  async (args) => callMemory('delete', args, formatDeleteAck),
 );
 
 const transport = new StdioServerTransport();
