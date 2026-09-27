@@ -1689,18 +1689,16 @@ describe('notifyQueuedMessage — compact jump tile', () => {
 describe('queued-release publisher wiring', () => {
   it('emitRelease write-aheads before publishing exactly one structured prompt_reply with a deterministic idem_key', () => {
     const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
-    // emitRelease now composes the two extracted phases (writeAheadRelease +
-    // publishReleaseRecord), so pull all three into the sandbox.
-    const start = src.indexOf('function writeAheadRelease(convoId, { promptId, action, releasedIds }');
+    const start = src.indexOf('function emitRelease(convoId, { promptId, action, releasedIds }');
     expect(start).toBeGreaterThan(-1);
-    const end = src.indexOf('// In-process retry driver', start);
+    const end = src.indexOf('\n}\n\n// In-process retry driver', start);
     expect(end).toBeGreaterThan(start);
 
     const publishPromptReply = vi.fn();
     const put = vi.fn(() => true); // durable write-ahead
     const now = vi.spyOn(Date, 'now').mockReturnValue(1_722_000_000_000);
     const emitRelease = runInNewContext(
-      `(() => { ${src.slice(start, end)}; return emitRelease; })()`,
+      `(${src.slice(start, end + 2)})`,
       { journalPublisher: { publishPromptReply }, releaseOutbox: { put }, console, Date },
     );
 
@@ -1737,13 +1735,13 @@ describe('queued-release publisher wiring', () => {
 
   it('emitRelease fail-closes when the write-ahead put returns false: no mutate, no publish', () => {
     const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
-    const start = src.indexOf('function writeAheadRelease(convoId, { promptId, action, releasedIds }');
-    const end = src.indexOf('// In-process retry driver', start);
+    const start = src.indexOf('function emitRelease(convoId, { promptId, action, releasedIds }');
+    const end = src.indexOf('\n}\n\n// In-process retry driver', start);
     const publishPromptReply = vi.fn();
     const put = vi.fn(() => false); // disk fault
     const mutate = vi.fn();
     const emitRelease = runInNewContext(
-      `(() => { ${src.slice(start, end)}; return emitRelease; })()`,
+      `(${src.slice(start, end + 2)})`,
       { journalPublisher: { publishPromptReply }, releaseOutbox: { put }, console, Date },
     );
 
@@ -1774,21 +1772,14 @@ describe('queued-release publisher wiring', () => {
 });
 
 describe('index.js queued-send finalizer', () => {
-  function loadFlushHarness({ dispatchResult = true } = {}) {
+  function loadFlushHarness({ dispatchResult = true, dispatchThrows = null } = {}) {
     const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
     const start = src.indexOf('function queuedReleaseItemIds(');
     const end = src.indexOf('\nfunction splitMessage(', start);
     expect(start).toBeGreaterThan(-1);
     expect(end).toBeGreaterThan(start);
 
-    // The send path now write-aheads each release (durable phase) BEFORE
-    // delivery and publishes it (network phase) only after delivery commits.
-    const writeAheadRelease = vi.fn((convoId, { promptId, action, releasedIds }) => ({
-      recordKey: `${promptId}\0${releasedIds[0]}\0${action}`,
-      convoId, promptId, itemId: releasedIds[0], action, releasedIds, at: 1,
-    }));
-    const publishReleaseRecord = vi.fn();
-    const abort = vi.fn();
+    const emitRelease = vi.fn(() => true); // durable emit — finalizeSentQueue's fail-closed gate drops only on success
     const dropItem = vi.fn();
     const journalPublishNotice = vi.fn();
     const listLive = vi.fn(() => [
@@ -1796,7 +1787,10 @@ describe('index.js queued-send finalizer', () => {
       { promptId: 'pr_2', itemId: 'pr_2::0' },
       { promptId: 'pr_drifted', itemId: 'pr_drifted::0' },
     ]);
-    const dispatchMergedFlush = vi.fn(() => dispatchResult);
+    const dispatchMergedFlush = vi.fn(() => {
+      if (dispatchThrows) throw dispatchThrows;
+      return dispatchResult;
+    });
     const runQueuedCleanup = vi.fn(); // observe orphan-cleanup on the dead-session drop path
     const flushQueue = runInNewContext(
       `(() => { ${src.slice(start, end)}; return flushQueue; })()`,
@@ -1804,9 +1798,7 @@ describe('index.js queued-send finalizer', () => {
         AGENT_CODEX: 'codex',
         console: { log: vi.fn() },
         dispatchMergedFlush,
-        writeAheadRelease,
-        publishReleaseRecord,
-        releaseOutbox: { abort },
+        emitRelease,
         journalConvoIdFor: () => 'convo-1',
         journalPublishNotice,
         runQueuedCleanup,
@@ -1815,10 +1807,10 @@ describe('index.js queued-send finalizer', () => {
         },
       },
     );
-    return { flushQueue, writeAheadRelease, publishReleaseRecord, abort, dropItem, listLive, dispatchMergedFlush, journalPublishNotice, runQueuedCleanup };
+    return { flushQueue, emitRelease, dropItem, listLive, dispatchMergedFlush, journalPublishNotice, runQueuedCleanup };
   }
 
-  it('write-aheads every release before dispatch, then publishes + drops exactly once each after the batch is accepted', () => {
+  it('commits every release exactly once, only after merged dispatch accepts the batch', () => {
     const harness = loadFlushHarness();
     const queued = [[{ type: 'text', text: 'first' }], [{ type: 'text', text: 'second' }]];
     const session = {
@@ -1834,19 +1826,14 @@ describe('index.js queued-send finalizer', () => {
 
     expect(harness.flushQueue(session, queued)).toBe(true);
     expect(harness.dispatchMergedFlush).toHaveBeenCalledWith(session, queued);
-    expect(harness.writeAheadRelease).toHaveBeenCalledTimes(2);
-    expect(harness.publishReleaseRecord).toHaveBeenCalledTimes(2);
+    expect(harness.emitRelease).toHaveBeenCalledTimes(2);
     expect(harness.dropItem).toHaveBeenCalledTimes(2);
-    // The drifted live entry is not in this batch's notifications → never written.
-    expect(harness.writeAheadRelease).not.toHaveBeenCalledWith(
+    expect(harness.emitRelease).not.toHaveBeenCalledWith(
       'convo-1',
       expect.objectContaining({ releasedIds: ['pr_drifted::0'] }),
     );
-    // Fail-closed ordering: write-ahead precedes delivery; publish follows it.
-    expect(harness.writeAheadRelease.mock.invocationCallOrder[0])
-      .toBeLessThan(harness.dispatchMergedFlush.mock.invocationCallOrder[0]);
     expect(harness.dispatchMergedFlush.mock.invocationCallOrder[0])
-      .toBeLessThan(harness.publishReleaseRecord.mock.invocationCallOrder[0]);
+      .toBeLessThan(harness.emitRelease.mock.invocationCallOrder[0]);
   });
 
   it('skips a batch notification whose registry entry is no longer live', () => {
@@ -1864,8 +1851,8 @@ describe('index.js queued-send finalizer', () => {
     };
 
     expect(harness.flushQueue(session, queued)).toBe(true);
-    expect(harness.writeAheadRelease).toHaveBeenCalledTimes(1);
-    expect(harness.writeAheadRelease).toHaveBeenCalledWith('convo-1', {
+    expect(harness.emitRelease).toHaveBeenCalledTimes(1);
+    expect(harness.emitRelease).toHaveBeenCalledWith('convo-1', {
       promptId: 'pr_1',
       action: 'send',
       releasedIds: ['pr_1::0'],
@@ -1885,31 +1872,19 @@ describe('index.js queued-send finalizer', () => {
     expect(harness.flushQueue(session, queued)).toBe(false);
     // Chronological order: the batch being retried was queued before `later`.
     expect(session.queuedMessages).toEqual([...queued, ...later]);
-    expect(harness.publishReleaseRecord).not.toHaveBeenCalled();
+    expect(harness.emitRelease).not.toHaveBeenCalled();
     expect(harness.dropItem).not.toHaveBeenCalled();
   });
 
-  it('rolls back the written-ahead releases when delivery is refused so none is ever published', () => {
-    // A batch WITH live release entries whose delivery is refused: every
-    // write-ahead must be undone (releaseOutbox.abort — in-memory authoritative)
-    // so the retry driver never republishes a `send` for an undelivered batch.
-    const harness = loadFlushHarness({ dispatchResult: false });
-    const queued = [[{ type: 'text', text: 'a' }], [{ type: 'text', text: 'b' }]];
-    const session = {
-      agent: 'claude',
-      alive: true,
-      busy: false,
-      queuedMessages: null,
-      queueNotifications: [{ id: 'pr_1::0' }, { id: 'pr_2::0' }],
-      roomId: '!room',
-    };
+  it('restores the detached batch (no releases, no throw) when dispatch THROWS before delivery', () => {
+    const harness = loadFlushHarness({ dispatchThrows: new Error('pty closed') });
+    const queued = [[{ type: 'text', text: 'retry me' }]];
+    const later = [[{ type: 'text', text: 'arrived later' }]];
+    const session = { agent: 'claude', alive: true, busy: false, queuedMessages: later, roomId: '!room' };
 
     expect(harness.flushQueue(session, queued)).toBe(false);
-    expect(harness.writeAheadRelease).toHaveBeenCalledTimes(2);
-    expect(harness.abort).toHaveBeenCalledTimes(2);
-    expect(harness.abort).toHaveBeenCalledWith('pr_1\0pr_1::0\0send');
-    expect(harness.abort).toHaveBeenCalledWith('pr_2\0pr_2::0\0send');
-    expect(harness.publishReleaseRecord).not.toHaveBeenCalled();
+    expect(session.queuedMessages).toEqual([...queued, ...later]);
+    expect(harness.emitRelease).not.toHaveBeenCalled();
     expect(harness.dropItem).not.toHaveBeenCalled();
   });
 
@@ -1923,7 +1898,7 @@ describe('index.js queued-send finalizer', () => {
 
     expect(harness.flushQueue(session, queued)).toBe(false);
     expect(session.queuedMessages).toBeNull(); // dropped, not retained
-    expect(harness.publishReleaseRecord).not.toHaveBeenCalled();
+    expect(harness.emitRelease).not.toHaveBeenCalled();
     expect(harness.dropItem).not.toHaveBeenCalled();
     expect(harness.journalPublishNotice).toHaveBeenCalledTimes(1);
     expect(harness.journalPublishNotice.mock.calls[0][1]).toMatch(/2 queued messages/);
@@ -1952,12 +1927,12 @@ describe('index.js queued-send finalizer', () => {
     expect(harness.flushQueue(session, queued, snapshot)).toBe('deferred');
     expect(session.queuedMessages).toEqual(queued);
     expect(harness.dispatchMergedFlush).not.toHaveBeenCalled();
-    expect(harness.writeAheadRelease).not.toHaveBeenCalled();
+    expect(harness.emitRelease).not.toHaveBeenCalled();
 
     session.busy = false;
     session.queuedMessages = null;
     expect(harness.flushQueue(session, queued, snapshot)).toBe(true);
-    expect(harness.writeAheadRelease).toHaveBeenCalledTimes(1);
+    expect(harness.emitRelease).toHaveBeenCalledTimes(1);
     expect(harness.dropItem).toHaveBeenCalledTimes(1);
   });
 });
