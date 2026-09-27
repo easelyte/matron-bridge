@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+  accessSync,
+  constants as fsConstants,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -16,7 +18,21 @@ import {
 } from '../lib/permission-eval.js';
 
 const WEBFLOW_SETTINGS_FIXTURE = path.resolve('test/fixtures/webflow-settings.local.json');
-const PRODUCTION_SETTINGS_LOCAL = '/root/.openclaw/workspace/.claude/settings.local.json';
+const PRODUCTION_WORKDIR = process.env.DEFAULT_WORKDIR ?? '/root/.openclaw/workspace';
+const PRODUCTION_SETTINGS_LOCAL = PRODUCTION_WORKDIR + '/.claude/settings.local.json';
+
+// Which settings file the live-allowlist test reads: the live file when readable, the
+// committed fixture when the live file is absent, and a skip (with the reason) when the
+// live file exists but this user cannot read it (e.g. a non-root runner and root's file).
+function resolveLiveSettingsSource(livePath, { exists = existsSync, access = accessSync } = {}) {
+  if (!exists(livePath)) return { sourcePath: WEBFLOW_SETTINGS_FIXTURE };
+  try {
+    access(livePath, fsConstants.R_OK);
+  } catch (err) {
+    return { skipReason: `live settings ${livePath} unreadable (${err.code ?? err.message})` };
+  }
+  return { sourcePath: livePath };
+}
 
 function webflowAllowRules(settings) {
   return settings.permissions.allow.filter(rule => (
@@ -60,10 +76,22 @@ describe('permission snapshot', () => {
     expect(classifyPermission(snapshot, 'mcp__webflow__data_scripts_tool')).toBe('default-gated');
   });
 
-  it('classifies the live Webflow allowlist when present, otherwise the committed fixture', () => {
-    const sourcePath = existsSync(PRODUCTION_SETTINGS_LOCAL)
-      ? PRODUCTION_SETTINGS_LOCAL
-      : WEBFLOW_SETTINGS_FIXTURE;
+  it('resolves the live settings source: live when readable, fixture when absent, skip when unreadable', () => {
+    const live = '/srv/workspace/.claude/settings.local.json';
+    expect(resolveLiveSettingsSource(live, { exists: () => true, access: () => {} }))
+      .toEqual({ sourcePath: live });
+    expect(resolveLiveSettingsSource(live, { exists: () => false, access: () => {} }))
+      .toEqual({ sourcePath: WEBFLOW_SETTINGS_FIXTURE });
+    const eacces = Object.assign(new Error('permission denied'), { code: 'EACCES' });
+    expect(resolveLiveSettingsSource(live, {
+      exists: () => true,
+      access: () => { throw eacces; },
+    })).toEqual({ skipReason: `live settings ${live} unreadable (EACCES)` });
+  });
+
+  it('classifies the live Webflow allowlist when present, otherwise the committed fixture', ({ skip }) => {
+    const { sourcePath, skipReason } = resolveLiveSettingsSource(PRODUCTION_SETTINGS_LOCAL);
+    if (skipReason) skip(skipReason);
     const fixtureSettings = JSON.parse(readFileSync(WEBFLOW_SETTINGS_FIXTURE, 'utf8'));
     const settings = JSON.parse(readFileSync(sourcePath, 'utf8'));
     const fixtureWebflowTools = webflowAllowRules(fixtureSettings);
