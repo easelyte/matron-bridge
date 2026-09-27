@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
-  existsSync,
+  accessSync,
+  constants as fsConstants,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -17,7 +18,31 @@ import {
 } from '../lib/permission-eval.js';
 
 const WEBFLOW_SETTINGS_FIXTURE = path.resolve('test/fixtures/webflow-settings.local.json');
-const PRODUCTION_SETTINGS_LOCAL = '/root/.openclaw/workspace/.claude/settings.local.json';
+// Same `~` expansion + resolve as index.js applies to DEFAULT_WORKDIR.
+function expandWorkdir(p) {
+  if (p === '~') return os.homedir();
+  if (p.startsWith('~/') || p.startsWith('~\\')) return path.join(os.homedir(), p.slice(2));
+  return path.resolve(p);
+}
+const PRODUCTION_WORKDIR = expandWorkdir(process.env.DEFAULT_WORKDIR || '/root/.openclaw/workspace');
+const PRODUCTION_SETTINGS_LOCAL = path.join(PRODUCTION_WORKDIR, '.claude', 'settings.local.json');
+
+// Which settings file the live-allowlist test reads: the live file when readable, the
+// committed fixture when the live file is absent, and a skip (with the reason) when the
+// live file exists but this user cannot read it (e.g. a non-root runner and root's file).
+// Only ENOENT/ENOTDIR count as absent; any other access error (EACCES on the file or on a
+// parent directory) is a skip, never a silent fall-back to the fixture.
+function resolveLiveSettingsSource(livePath, { access = accessSync } = {}) {
+  try {
+    access(livePath, fsConstants.R_OK);
+  } catch (err) {
+    if (err?.code === 'ENOENT' || err?.code === 'ENOTDIR') {
+      return { sourcePath: WEBFLOW_SETTINGS_FIXTURE };
+    }
+    return { skipReason: `live settings ${livePath} unreadable (${err?.code ?? err?.message})` };
+  }
+  return { sourcePath: livePath };
+}
 
 function webflowAllowRules(settings) {
   return settings.permissions.allow.filter(rule => (
@@ -70,10 +95,29 @@ describe('permission snapshot', () => {
     expect(classifyPermission(snapshot, 'mcp__webflow__data_scripts_tool')).toBe('default-gated');
   });
 
-  it('classifies the live Webflow allowlist when present, otherwise the committed fixture', () => {
-    const sourcePath = existsSync(PRODUCTION_SETTINGS_LOCAL)
-      ? PRODUCTION_SETTINGS_LOCAL
-      : WEBFLOW_SETTINGS_FIXTURE;
+  it('resolves the live settings source: live when readable, fixture when absent, skip when unreadable', () => {
+    const live = '/srv/workspace/.claude/settings.local.json';
+    const failWith = code => () => { throw Object.assign(new Error(code), { code }); };
+    expect(resolveLiveSettingsSource(live, { access: () => {} })).toEqual({ sourcePath: live });
+    expect(resolveLiveSettingsSource(live, { access: failWith('ENOENT') }))
+      .toEqual({ sourcePath: WEBFLOW_SETTINGS_FIXTURE });
+    expect(resolveLiveSettingsSource(live, { access: failWith('ENOTDIR') }))
+      .toEqual({ sourcePath: WEBFLOW_SETTINGS_FIXTURE });
+    // EACCES covers both an unreadable file and an untraversable parent directory.
+    expect(resolveLiveSettingsSource(live, { access: failWith('EACCES') }))
+      .toEqual({ skipReason: `live settings ${live} unreadable (EACCES)` });
+  });
+
+  it('expands ~ in DEFAULT_WORKDIR the way the bridge does', () => {
+    expect(expandWorkdir('~')).toBe(os.homedir());
+    expect(expandWorkdir('~/')).toBe(os.homedir());
+    expect(expandWorkdir('~/ws')).toBe(path.join(os.homedir(), 'ws'));
+    expect(expandWorkdir('/root/.openclaw/workspace')).toBe('/root/.openclaw/workspace');
+  });
+
+  it('classifies the live Webflow allowlist when present, otherwise the committed fixture', ({ skip }) => {
+    const { sourcePath, skipReason } = resolveLiveSettingsSource(PRODUCTION_SETTINGS_LOCAL);
+    if (skipReason) skip(skipReason);
     const fixtureSettings = JSON.parse(readFileSync(WEBFLOW_SETTINGS_FIXTURE, 'utf8'));
     const settings = JSON.parse(readFileSync(sourcePath, 'utf8'));
     const fixtureWebflowTools = webflowAllowRules(fixtureSettings);
