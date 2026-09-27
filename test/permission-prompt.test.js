@@ -102,11 +102,15 @@ describe('renderPermissionCard', () => {
 });
 
 describe('permissionSpawnArgs', () => {
-  it('default: auto mode plus the prompt tool', () => {
-    expect(permissionSpawnArgs(false)).toEqual([
+  it('default: auto mode plus the prompt tool, settings sources left alone', () => {
+    const args = permissionSpawnArgs(false);
+    expect(args).toEqual([
       '--permission-mode', 'auto',
       '--permission-prompt-tool', 'mcp__ask-user__permission_request',
     ]);
+    // The bridge gates MCP calls with an additive hook, not by dropping the
+    // on-disk settings sources (that also dropped CLAUDE.md, env and hooks).
+    expect(args).not.toContain('--setting-sources');
   });
 
   it('bypass: the old skip-permissions flag', () => {

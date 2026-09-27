@@ -387,6 +387,22 @@ describe('findLivePair (reuse-first lookup)', () => {
     } finally { vi.useRealTimers(); }
   });
 
+  it('a GUEST binding recorded with the inviter\'s conversation is reused when the guest calls back', () => {
+    // The invited side's mirror of the remote case: the bridge records the
+    // inbound request as a guest binding keyed on the inviter's device and
+    // (from the frame's from_convo_id) the inviter's conversation. A later
+    // agent_chat_start from this session AT that conversation must land on
+    // this room, not open a second one in the other direction.
+    const { rooms } = makeStore();
+    rooms.record('r1', { role: 'guest', state: 'joined', sessionRoomId: '!guest', peerDeviceId: 7, targetConvoId: 'inviter-convo' });
+    expect(rooms.findLivePair('!guest', { peerDeviceId: 7, targetConvoId: 'inviter-convo' }))
+      .toMatchObject({ roomId: 'r1', role: 'guest' });
+    // A guest binding that never learned the inviter's conversation (an
+    // older journal omitted from_convo_id) still fails safe into a new room.
+    rooms.record('r2', { role: 'guest', state: 'joined', sessionRoomId: '!guest2', peerDeviceId: 7 });
+    expect(rooms.findLivePair('!guest2', { peerDeviceId: 7, targetConvoId: 'inviter-convo' })).toBeNull();
+  });
+
   it('rooms recorded before targetConvoId existed are never reused (fail safe)', () => {
     const { rooms } = makeStore();
     rooms.record('r1', { role: 'owner', state: 'joined', sessionRoomId: '!sess1', peerDeviceId: 7 });

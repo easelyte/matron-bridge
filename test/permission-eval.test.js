@@ -8,6 +8,7 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { spawnSync } from 'node:child_process';
+import os from 'node:os';
 import path from 'node:path';
 import {
   buildPermissionSnapshot,
@@ -33,8 +34,17 @@ function writeSettings(filename, permissions) {
 }
 
 beforeEach(() => {
-  fixtureDir = mkdtempSync(path.resolve('test/fixtures/permission-eval-'));
+  // Under the OS temp dir, outside any git repository: the default source
+  // lookup resolves the git toplevel of the workdir, and a fixture inside this
+  // repository would resolve to the bridge's own .claude directory.
+  fixtureDir = mkdtempSync(path.join(os.tmpdir(), 'permission-eval-'));
 });
+
+function gitInit(dir) {
+  const result = spawnSync('git', ['-C', dir, 'init', '-q'], { encoding: 'utf8' });
+  expect(result.error).toBeUndefined();
+  expect(result.status).toBe(0);
+}
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -77,7 +87,7 @@ describe('permission snapshot', () => {
     expect(classifyPermission(snapshot, 'mcp__webflow__data_scripts_tool')).toBe('default-gated');
   });
 
-  it('discovers workspace, local, and user permission layers by default', () => {
+  it('discovers workspace, local, and user permission layers by default (workdir not in a repository)', () => {
     const workdir = path.join(fixtureDir, 'workspace');
     const homeDir = path.join(fixtureDir, 'home');
     mkdirSync(path.join(workdir, '.claude'), { recursive: true });
@@ -98,6 +108,61 @@ describe('permission snapshot', () => {
     expect(classifyPermission(snapshot, 'mcp__workspace__settings_tool')).toBe('allow');
     expect(classifyPermission(snapshot, 'mcp__workspace__local_tool')).toBe('allow');
     expect(classifyPermission(snapshot, 'mcp__user__settings_tool')).toBe('allow');
+  });
+
+  it('reads settings.local.json from the git toplevel when the workdir is inside a repository', () => {
+    // Claude Code loads the project settings.local.json from the git root of
+    // the working directory (settings.json from the cwd). The classifier must
+    // see the same allow/deny rules the CLI does, or a rule the CLI honours is
+    // invisible to the gate.
+    const repo = path.join(fixtureDir, 'repo');
+    const workdir = path.join(repo, 'packages', 'app');
+    const homeDir = path.join(fixtureDir, 'home');
+    mkdirSync(path.join(repo, '.claude'), { recursive: true });
+    mkdirSync(path.join(workdir, '.claude'), { recursive: true });
+    mkdirSync(homeDir, { recursive: true });
+    gitInit(repo);
+    writeFileSync(path.join(repo, '.claude', 'settings.local.json'), JSON.stringify({
+      permissions: { allow: ['mcp__root__local_tool'], deny: ['mcp__root__denied_tool'] },
+    }));
+    writeFileSync(path.join(workdir, '.claude', 'settings.json'), JSON.stringify({
+      permissions: { allow: ['mcp__workspace__settings_tool'] },
+    }));
+    writeFileSync(path.join(workdir, '.claude', 'settings.local.json'), JSON.stringify({
+      permissions: { allow: ['mcp__workspace__local_tool'] },
+    }));
+    vi.stubEnv('HOME', homeDir);
+
+    const snapshot = buildPermissionSnapshot({ workdir });
+
+    expect(classifyPermission(snapshot, 'mcp__root__local_tool')).toBe('allow');
+    expect(classifyPermission(snapshot, 'mcp__root__denied_tool')).toBe('deny');
+    expect(classifyPermission(snapshot, 'mcp__workspace__settings_tool')).toBe('allow');
+    // The CLI does not read a subdirectory's settings.local.json, so neither do we.
+    expect(classifyPermission(snapshot, 'mcp__workspace__local_tool')).toBe('default-gated');
+    expect(snapshot.uncertain).toBe(false);
+  });
+
+  it('fails closed when the git-toplevel settings.local.json is malformed', () => {
+    const repo = path.join(fixtureDir, 'repo');
+    const workdir = path.join(repo, 'sub');
+    const homeDir = path.join(fixtureDir, 'home');
+    mkdirSync(path.join(repo, '.claude'), { recursive: true });
+    mkdirSync(path.join(workdir, '.claude'), { recursive: true });
+    mkdirSync(homeDir, { recursive: true });
+    gitInit(repo);
+    writeFileSync(path.join(repo, '.claude', 'settings.local.json'), '{ not json');
+    writeFileSync(path.join(workdir, '.claude', 'settings.json'), JSON.stringify({
+      permissions: { allow: ['mcp__workspace__settings_tool'] },
+    }));
+    vi.stubEnv('HOME', homeDir);
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+
+    const snapshot = buildPermissionSnapshot({ workdir });
+
+    expect(snapshot.uncertain).toBe(true);
+    expect(classifyPermission(snapshot, 'mcp__workspace__settings_tool')).toBe('default-gated');
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining(path.join(repo, '.claude', 'settings.local.json')));
   });
 
   it('ignores non-MCP permission rules in every rule list', () => {
@@ -211,7 +276,12 @@ describe('permission snapshot', () => {
     const result = spawnSync(process.execPath, ['--input-type=module', '--eval', script], {
       cwd: path.resolve('.'),
       encoding: 'utf8',
-      timeout: 1000,
+      // Generous ceiling, not a performance assertion: buildPermissionSnapshot
+      // rejects a non-regular file via fstat before any read, so this returns
+      // promptly. A 1 s cap flaked under load (node startup + ESM load alone can
+      // exceed it); 30 s still catches a genuine regression that blocks on the
+      // FIFO read while never tripping on a busy CI host.
+      timeout: 30000,
     });
 
     expect(result.error).toBeUndefined();
@@ -293,10 +363,15 @@ describe('permission snapshot', () => {
     expect(classifyPermission(snapshot, 'mcp__server__allowed_tool')).toBe('allow');
   });
 
-  it('includes the bridge print-mode MCP permission in every snapshot', () => {
+  it('includes the bridge print-mode MCP permission in every snapshot (fork: lib/session-settings.js allow-list)', () => {
     const snapshot = buildPermissionSnapshot({ sourcePaths: [] });
 
+    expect(snapshot.mcpDeny).toEqual([]);
+    expect(snapshot.mcpAsk).toEqual([]);
+    expect(snapshot.uncertain).toBe(false);
     expect(classifyPermission(snapshot, 'mcp__show-file__show_file')).toBe('allow');
+    // Anything else is still default-gated (fail-closed).
+    expect(classifyPermission(snapshot, 'mcp__other__tool')).toBe('default-gated');
   });
 });
 
@@ -307,10 +382,8 @@ describe('print-session snapshot wiring (source inspection)', () => {
     indexSource.indexOf('// --- Codex programmatic sessions ---'),
   );
 
-  it('only builds the snapshot when permission cards are enabled and stores null otherwise', () => {
-    expect(printSpawn).toContain('const permissionSnapshot = process.env.MATRON_PERMISSION_CARDS');
-    expect(printSpawn).toContain('buildPermissionSnapshot({ workdir: cwd })');
-    expect(printSpawn).toContain(': null;');
-    expect(printSpawn).toContain('permissionSnapshot,');
+  it('builds one immutable snapshot per print session (read by both the card hook and the classifier)', () => {
+    expect(printSpawn).toContain('permissionSnapshot: buildPermissionSnapshot({ workdir: cwd })');
+    expect((printSpawn.match(/permissionSnapshot[,:]/g) || [])).toHaveLength(1);
   });
 });

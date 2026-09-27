@@ -133,6 +133,8 @@ describe('SubagentWatcher.forceAttach (resumed agent under an already-seen trans
 
   const uniqueWorkdir = tag => `/tmp/bridge-resume-${tag}-${process.pid}-${Math.random().toString(36).slice(2)}`;
 
+  // Registers projectDirFor(workdir) (…/projects/<enc>) for teardown — never a
+  // dirname chain, which is one level short of ~/.claude/projects itself.
   const mkSubagentsDir = (workdir, sessionId) =>
     makeSubagentsDir(workdir, sessionId, projectRoots, { prefix: '-tmp-bridge-resume-' });
 
@@ -207,7 +209,7 @@ describe('SubagentWatcher.forceAttach (resumed agent under an already-seen trans
     expect(events[0].message.content[0].text).toBe('fresh work');
   });
 
-  // Codex R1 F1: the agent is ALREADY RUNNING by the time task_started reaches
+  // The agent is ALREADY RUNNING by the time task_started reaches
   // the bridge, so it can append records in that gap. Anchoring the tail at the
   // file's size NOW discards them — a fast resumed agent renders an empty card.
   // The boundary has to be the size recorded when the file was marked seen.
@@ -249,7 +251,7 @@ describe('SubagentWatcher.forceAttach (resumed agent under an already-seen trans
     expect(events.map(e => e.message.content[0].text)).toEqual(['all new']);
   });
 
-  // Codex R1 F4: _scan() skips every `seen` name, so a force-attach that could
+  // _scan() skips every `seen` name, so a force-attach that could
   // not read its transcript has no other recovery path. It must be retried, and
   // fail visibly rather than silently costing the whole resumed run.
   it('retries a force-attach whose transcript was not readable yet, then attaches it', async () => {
@@ -291,7 +293,7 @@ describe('SubagentWatcher.forceAttach (resumed agent under an already-seen trans
     expect(warnings.join('\n')).toContain('will not be shown');
   });
 
-  // Codex R2 F1: a missing/unreadable subagents dir is one of the conditions a
+  // A missing/unreadable subagents dir is one of the conditions a
   // pending force-attach is waiting out, and the burst timer refuses to stop
   // while the queue is nonempty — so expiry must not sit behind the directory
   // enumeration, or the deadline never fires and nothing ever warns.
@@ -319,7 +321,7 @@ describe('SubagentWatcher.forceAttach (resumed agent under an already-seen trans
     expect(warnings.join('\n')).toContain('vanished');
   });
 
-  // Codex R2 F2: metadata is not readability. Declaring attachment off a stat
+  // Metadata is not readability. Declaring attachment off a stat
   // registers the filename in `tails` (so nothing can ever attach it again),
   // drops the retry, and leaves the child running with no output forever —
   // TranscriptTail swallows the open failure on every tick.
@@ -459,7 +461,7 @@ describe('index.js subagent-resume wiring (source inspection)', () => {
     expect(body).toContain('noteBackgroundTaskStarted(event.tool_use_id, event.task_id)');
     expect(body).toContain('notifyTaskStarted()');
     expect(body).toContain('forceAttach(event.task_id)');
-    // Revive is now gated on the start disposition (loop #764): it fires for
+    // Revive is now gated on the start disposition: it fires for
     // started-new/resumed, is suppressed for a rejected-replay, and advances the
     // incarnation counter only for a genuine resume.
     expect(body).toContain('revive(event.task_id');

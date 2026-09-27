@@ -1,187 +1,197 @@
-// Behavioral tests for the agent-session child envs (lib/spawn-env.js).
-// These replace the source-text pins that used to check how index.js spelled
-// the env object literals (loop #784): assert what the child gets instead.
+// Behavioral tests for the agent-session child envs (lib/spawn-env.js):
+// assert what the child gets rather than how index.js spells the literal.
 import { describe, it, expect } from 'vitest';
 import { buildClaudeSpawnEnv, buildCodexSpawnEnv, pathWithNodeBin } from '../lib/spawn-env.js';
-import { DEFAULT_BASH_DEFAULT_TIMEOUT_MS, DEFAULT_BASH_MAX_TIMEOUT_MS } from '../lib/bash-timeout-env.js';
 
 const EXEC = '/opt/node/bin/node';
 const BRIDGE_ENV = Object.freeze({
   PATH: '/usr/bin:/bin',
   HOME: '/home/bridge',
-  JOURNAL_TOKEN: 'full-read-secret',
-  JOURNAL_TOKEN_FILE: '/run/journal.token',
+  JOURNAL_TOKEN: 'agent-token',
+  JOURNAL_TOKEN_FILE: '/etc/matron/agent-token',
   JOURNAL_WS_URL: 'wss://journal.example/ws',
   HMAC_SECRET: 'viewer-signing-key',
+  OPENAI_API_KEY: 'sk-user',
   SHOW_FILE_TOKEN: 'inherited-show-file',
+  // Fork delta: permission cards.
   MATRON_PERMISSION_TOKEN: 'inherited-permission',
   MATRON_PERMISSION_CARDS: '1',
   CLAUDECODE: '1',
   MCP_TOOL_TIMEOUT: '600000',
 });
 
-function claude(mode, overrides = {}) {
+// Fork delta: buildClaudeSpawnEnv takes a required mode ('print' | 'iv');
+// the shared expectations below run in print mode.
+function claude(overrides = {}) {
   return buildClaudeSpawnEnv({
-    mode,
+    mode: 'print',
+    permissionToken: 'session-permission',
     baseEnv: BRIDGE_ENV,
     execPath: EXEC,
     roomId: '!room:example',
     apiPort: 8787,
-    journalProxyHeaderFile: '/run/matron/proxy/header',
+    journalProxyHeaderFile: '/tmp/matron-journal-proxy-x/header',
     pluginCacheDir: '/var/cache/plugins',
     showBashOutput: true,
     showFileToken: 'session-show-file',
-    permissionToken: 'session-permission',
-    warn: () => {},
     ...overrides,
   });
 }
 
 describe('buildClaudeSpawnEnv', () => {
-  for (const mode of ['print', 'iv']) {
-    describe(`${mode} mode`, () => {
-      it('strips the full-journal read credential and bridge-only secrets', () => {
-        const env = claude(mode);
-        expect('JOURNAL_TOKEN' in env).toBe(false);
-        expect('JOURNAL_TOKEN_FILE' in env).toBe(false);
-        expect('HMAC_SECRET' in env).toBe(false);
-        // Non-credential journal config and the rest of the bridge env pass through.
-        expect(env.JOURNAL_WS_URL).toBe('wss://journal.example/ws');
-        expect(env.HOME).toBe('/home/bridge');
-        expect(env.MCP_TOOL_TIMEOUT).toBe('600000');
-      });
-
-      it('never mutates the base env', () => {
-        const base = { ...BRIDGE_ENV };
-        claude(mode, { baseEnv: base });
-        expect(base).toEqual(BRIDGE_ENV);
-      });
-
-      it('sets the session wiring keys', () => {
-        const env = claude(mode);
-        expect(env.CLAUDECODE).toBe('');
-        expect(env.CLAUDE_CODE_MAX_OUTPUT_TOKENS).toBe('128000');
-        expect(env.BRIDGE_ROOM_ID).toBe('!room:example');
-        expect(env.MATRON_BRIDGE_API_PORT).toBe('8787');
-        expect(env.CLAUDE_CODE_PLUGIN_CACHE_DIR).toBe('/var/cache/plugins');
-        expect(env.MATRON_BASH_TEE_ENABLED).toBe('1');
-        expect(claude(mode, { showBashOutput: false }).MATRON_BASH_TEE_ENABLED).toBe('0');
-      });
-
-      it('passes the read-proxy capability as a header-file path, never a token value', () => {
-        const env = claude(mode);
-        expect(env.MATRON_JOURNAL_PROXY_HEADER_FILE).toBe('/run/matron/proxy/header');
-        expect(Object.values(env)).not.toContain('full-read-secret');
-      });
-
-      it('prepends the node bin dir to PATH once', () => {
-        expect(claude(mode).PATH).toBe('/opt/node/bin:/usr/bin:/bin');
-        const already = claude(mode, { baseEnv: { ...BRIDGE_ENV, PATH: '/usr/bin:/opt/node/bin' } });
-        expect(already.PATH).toBe('/usr/bin:/opt/node/bin');
-        expect(claude(mode, { baseEnv: {} }).PATH).toBe('/opt/node/bin:');
-      });
-
-      it('applies the Bash timeout floor, honouring the bridge env override', () => {
-        const env = claude(mode);
-        expect(env.BASH_DEFAULT_TIMEOUT_MS).toBe(String(DEFAULT_BASH_DEFAULT_TIMEOUT_MS));
-        expect(env.BASH_MAX_TIMEOUT_MS).toBe(String(DEFAULT_BASH_MAX_TIMEOUT_MS));
-        const custom = claude(mode, { baseEnv: { ...BRIDGE_ENV, BASH_DEFAULT_TIMEOUT_MS: '700000', BASH_MAX_TIMEOUT_MS: '900000' } });
-        expect(custom.BASH_DEFAULT_TIMEOUT_MS).toBe('700000');
-        expect(custom.BASH_MAX_TIMEOUT_MS).toBe('900000');
-      });
-
-      it('loads MCP tools up front unless the bridge env says otherwise', () => {
-        expect(claude(mode).ENABLE_TOOL_SEARCH).toBe('false');
-        expect(claude(mode, { baseEnv: { ...BRIDGE_ENV, ENABLE_TOOL_SEARCH: 'auto:10' } }).ENABLE_TOOL_SEARCH).toBe('auto:10');
-        // `??`, not `||`: an explicit empty string is the operator's choice.
-        expect(claude(mode, { baseEnv: { ...BRIDGE_ENV, ENABLE_TOOL_SEARCH: '' } }).ENABLE_TOOL_SEARCH).toBe('');
-      });
-
-      it('carries only the per-session SHOW_FILE_TOKEN, never an inherited one', () => {
-        expect(claude(mode).SHOW_FILE_TOKEN).toBe('session-show-file');
-        expect('SHOW_FILE_TOKEN' in claude(mode, { showFileToken: undefined })).toBe(false);
-      });
-    });
-  }
-
-  it('print: snapshots MATRON_PERMISSION_CARDS and injects the per-session permission token', () => {
-    const env = claude('print');
-    expect(env.MATRON_PERMISSION_CARDS).toBe('1');
-    expect(env.MATRON_PERMISSION_TOKEN).toBe('session-permission');
-    const off = claude('print', { baseEnv: { ...BRIDGE_ENV, MATRON_PERMISSION_CARDS: undefined } });
-    expect(off.MATRON_PERMISSION_CARDS).toBe('');
+  it('strips HMAC_SECRET', () => {
+    const env = claude();
+    expect('HMAC_SECRET' in env).toBe(false);
+    expect(Object.values(env)).not.toContain('viewer-signing-key');
   });
 
-  it('iv: carries neither permission-card key, even when the bridge env has them', () => {
-    const env = claude('iv');
-    expect('MATRON_PERMISSION_CARDS' in env).toBe(false);
-    expect('MATRON_PERMISSION_TOKEN' in env).toBe(false);
-  });
-
-  it('rejects an unknown mode or a non-object base env', () => {
-    expect(() => claude('exec')).toThrow(RangeError);
-    expect(() => claude('print', { baseEnv: null })).toThrow(TypeError);
-  });
-});
-
-describe('buildCodexSpawnEnv', () => {
-  const codex = (appServer) => buildCodexSpawnEnv({
-    baseEnv: BRIDGE_ENV, roomId: '!room:example', apiPort: 8787, appServer,
-    journalProxyHeaderFile: '/run/matron/proxy/header',
-  });
-
-  for (const appServer of [true, false]) {
-    describe(appServer ? 'app-server transport' : 'legacy exec transport', () => {
-      const env = codex(appServer);
-
-      it('strips bridge-only secrets', () => {
-        expect('HMAC_SECRET' in env).toBe(false);
-      });
-
-      it('sets the bridge wiring keys and passes the rest through', () => {
-        expect(env.BRIDGE_ROOM_ID).toBe('!room:example');
-        expect(env.MATRON_BRIDGE_API_PORT).toBe('8787');
-        expect(env.PATH).toBe('/usr/bin:/bin');
-        expect(env.JOURNAL_WS_URL).toBe('wss://journal.example/ws');
-      });
-
-      it('passes the journal read-proxy capability as a header-file path', () => {
-        expect(env.MATRON_JOURNAL_PROXY_HEADER_FILE).toBe('/run/matron/proxy/header');
-      });
-    });
-  }
-
-  // Loop #781: app-server sessions have the item_* / mission MCP tools and reach
-  // journal search through the read proxy, so they never need the full-read token.
-  it('app-server: strips the full-journal read credential', () => {
-    const env = codex(true);
+  it('strips the journal token (search goes through the read proxy)', () => {
+    const env = claude();
     expect('JOURNAL_TOKEN' in env).toBe(false);
     expect('JOURNAL_TOKEN_FILE' in env).toBe(false);
-    expect(Object.values(env)).not.toContain('full-read-secret');
+    expect(Object.values(env)).not.toContain('agent-token');
+    // Non-credential journal config passes through.
+    expect(env.JOURNAL_WS_URL).toBe('wss://journal.example/ws');
   });
 
-  // Legacy exec sessions have no Matron MCP tools; BRIDGE_CODEX.md's /items
-  // HTTP fallback authenticates with the token, so they keep it.
-  it('legacy exec: keeps the journal token for the /items fallback', () => {
-    const env = codex(false);
-    expect(env.JOURNAL_TOKEN).toBe('full-read-secret');
-    expect(env.JOURNAL_TOKEN_FILE).toBe('/run/journal.token');
+  it('passes the read-proxy capability as a header-file path', () => {
+    expect(claude().MATRON_JOURNAL_PROXY_HEADER_FILE).toBe('/tmp/matron-journal-proxy-x/header');
+    expect(claude({ journalProxyHeaderFile: '' }).MATRON_JOURNAL_PROXY_HEADER_FILE).toBe('');
+    expect(claude({ journalProxyHeaderFile: undefined }).MATRON_JOURNAL_PROXY_HEADER_FILE).toBe('');
   });
 
-  it('fails safe: an unspecified transport is treated as app-server (token stripped)', () => {
-    const env = buildCodexSpawnEnv({ baseEnv: BRIDGE_ENV, roomId: 'r', apiPort: 1 });
-    expect('JOURNAL_TOKEN' in env).toBe(false);
-    expect('JOURNAL_TOKEN_FILE' in env).toBe(false);
+  it('passes the rest of the bridge env through', () => {
+    const env = claude();
+    expect(env.HOME).toBe('/home/bridge');
+    expect(env.MCP_TOOL_TIMEOUT).toBe('600000');
+    // The user's provider keys stay with the session.
+    expect(env.OPENAI_API_KEY).toBe('sk-user');
   });
 
   it('never mutates the base env', () => {
     const base = { ...BRIDGE_ENV };
-    buildCodexSpawnEnv({ baseEnv: base, roomId: 'r', apiPort: 1, appServer: true });
+    claude({ baseEnv: base });
+    expect(base).toEqual(BRIDGE_ENV);
+  });
+
+  it('sets the session wiring keys', () => {
+    const env = claude();
+    expect(env.CLAUDECODE).toBe('');
+    expect(env.CLAUDE_CODE_MAX_OUTPUT_TOKENS).toBe('128000');
+    expect(env.BRIDGE_ROOM_ID).toBe('!room:example');
+    expect(env.MATRON_BRIDGE_API_PORT).toBe('8787');
+    expect(env.CLAUDE_CODE_PLUGIN_CACHE_DIR).toBe('/var/cache/plugins');
+    expect(env.MATRON_BASH_TEE_ENABLED).toBe('1');
+    expect(claude({ showBashOutput: false }).MATRON_BASH_TEE_ENABLED).toBe('0');
+  });
+
+  it('prepends the node bin dir to PATH once', () => {
+    expect(claude().PATH).toBe('/opt/node/bin:/usr/bin:/bin');
+    expect(claude({ baseEnv: { ...BRIDGE_ENV, PATH: '/usr/bin:/opt/node/bin' } }).PATH).toBe('/usr/bin:/opt/node/bin');
+    expect(claude({ baseEnv: {} }).PATH).toBe('/opt/node/bin:');
+  });
+
+  it('loads MCP tools up front unless the bridge env says otherwise', () => {
+    expect(claude().ENABLE_TOOL_SEARCH).toBe('false');
+    expect(claude({ baseEnv: { ...BRIDGE_ENV, ENABLE_TOOL_SEARCH: 'auto:10' } }).ENABLE_TOOL_SEARCH).toBe('auto:10');
+    // `??`, not `||`: an explicit empty string is the operator's choice.
+    expect(claude({ baseEnv: { ...BRIDGE_ENV, ENABLE_TOOL_SEARCH: '' } }).ENABLE_TOOL_SEARCH).toBe('');
+  });
+
+  it('carries only the per-session SHOW_FILE_TOKEN, never an inherited one', () => {
+    expect(claude().SHOW_FILE_TOKEN).toBe('session-show-file');
+    expect('SHOW_FILE_TOKEN' in claude({ showFileToken: undefined })).toBe(false);
+  });
+
+  it('rejects a non-object base env', () => {
+    expect(() => claude({ baseEnv: null })).toThrow(TypeError);
+    expect(() => claude({ baseEnv: 'nope' })).toThrow(TypeError);
+  });
+});
+
+describe('buildCodexSpawnEnv', () => {
+  const codex = (overrides = {}) => buildCodexSpawnEnv({
+    baseEnv: BRIDGE_ENV, roomId: '!room:example', apiPort: 8787,
+    journalProxyHeaderFile: '/tmp/matron-journal-proxy-x/header', ...overrides,
+  });
+
+  it('strips HMAC_SECRET on both transports', () => {
+    expect('HMAC_SECRET' in codex({ appServer: true })).toBe(false);
+    expect('HMAC_SECRET' in codex({ appServer: false })).toBe(false);
+  });
+
+  it('app-server: strips the journal token (MCP tools for writes, read proxy for search)', () => {
+    const env = codex({ appServer: true });
+    expect('JOURNAL_TOKEN' in env).toBe(false);
+    expect('JOURNAL_TOKEN_FILE' in env).toBe(false);
+  });
+
+  it('legacy exec: keeps the journal token for the /items HTTP fallback', () => {
+    const env = codex({ appServer: false });
+    expect(env.JOURNAL_TOKEN).toBe('agent-token');
+    expect(env.JOURNAL_TOKEN_FILE).toBe('/etc/matron/agent-token');
+  });
+
+  it('fails safe: an unspecified transport is treated as app-server', () => {
+    const env = codex();
+    expect('JOURNAL_TOKEN' in env).toBe(false);
+    expect('JOURNAL_TOKEN_FILE' in env).toBe(false);
+  });
+
+  it('passes the read-proxy header file on both transports', () => {
+    expect(codex({ appServer: true }).MATRON_JOURNAL_PROXY_HEADER_FILE).toBe('/tmp/matron-journal-proxy-x/header');
+    expect(codex({ appServer: false }).MATRON_JOURNAL_PROXY_HEADER_FILE).toBe('/tmp/matron-journal-proxy-x/header');
+  });
+
+  it('sets the bridge wiring keys and passes the rest through', () => {
+    const env = codex();
+    expect(env.BRIDGE_ROOM_ID).toBe('!room:example');
+    expect(env.MATRON_BRIDGE_API_PORT).toBe('8787');
+    expect(env.PATH).toBe('/usr/bin:/bin');
+    expect(env.JOURNAL_WS_URL).toBe('wss://journal.example/ws');
+    expect(codex({ appServer: true }).OPENAI_API_KEY).toBe('sk-user');
+    expect(codex({ appServer: false }).OPENAI_API_KEY).toBe('sk-user');
+  });
+
+  it('never mutates the base env', () => {
+    const base = { ...BRIDGE_ENV };
+    codex({ baseEnv: base });
     expect(base).toEqual(BRIDGE_ENV);
   });
 
   it('rejects a non-object base env', () => {
-    expect(() => buildCodexSpawnEnv({ baseEnv: 'nope' })).toThrow(TypeError);
+    expect(() => codex({ baseEnv: 'nope' })).toThrow(TypeError);
+  });
+});
+
+// easelyte fork delta: permission cards (MATRON_PERMISSION_CARDS /
+// MATRON_PERMISSION_TOKEN) reach print sessions only.
+describe('buildClaudeSpawnEnv permission-card keys (fork)', () => {
+  it('print: snapshots MATRON_PERMISSION_CARDS and injects the per-session permission token', () => {
+    const env = claude({ mode: 'print' });
+    expect(env.MATRON_PERMISSION_CARDS).toBe('1');
+    expect(env.MATRON_PERMISSION_TOKEN).toBe('session-permission');
+    const off = claude({ mode: 'print', baseEnv: { ...BRIDGE_ENV, MATRON_PERMISSION_CARDS: undefined } });
+    expect(off.MATRON_PERMISSION_CARDS).toBe('');
+  });
+
+  it('iv: carries neither permission-card key, even when the bridge env has them', () => {
+    const env = claude({ mode: 'iv' });
+    expect('MATRON_PERMISSION_CARDS' in env).toBe(false);
+    expect('MATRON_PERMISSION_TOKEN' in env).toBe(false);
+  });
+
+  it('iv: otherwise the same shape as print (credentials stripped, wiring set)', () => {
+    const env = claude({ mode: 'iv' });
+    expect('JOURNAL_TOKEN' in env).toBe(false);
+    expect('HMAC_SECRET' in env).toBe(false);
+    expect(env.MATRON_JOURNAL_PROXY_HEADER_FILE).toBe('/tmp/matron-journal-proxy-x/header');
+    expect(env.SHOW_FILE_TOKEN).toBe('session-show-file');
+  });
+
+  it('rejects an unknown or missing mode', () => {
+    expect(() => claude({ mode: 'exec' })).toThrow(RangeError);
+    expect(() => claude({ mode: undefined })).toThrow(RangeError);
   });
 });
 

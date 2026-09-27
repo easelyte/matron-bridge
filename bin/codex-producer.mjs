@@ -49,10 +49,14 @@ function isExecutableFile(p) {
 
 // A cheap, spawn-free "is this our shim?" check: sniff the file head for the
 // sentinel token. Covers a second on-PATH copy of the shim at a different path.
+// Opened non-blocking and checked on the descriptor, so a FIFO (or other
+// non-regular file) named `codex` can never block the caller: the bridge runs
+// this synchronously via detectCodexBinary.
 function looksLikeShim(p) {
   try {
-    const fd = fs.openSync(p, 'r');
+    const fd = fs.openSync(p, fs.constants.O_RDONLY | fs.constants.O_NONBLOCK);
     try {
+      if (!fs.fstatSync(fd).isFile()) return false;
       const buf = Buffer.alloc(SENTINEL_SNIFF_BYTES);
       const n = fs.readSync(fd, buf, 0, SENTINEL_SNIFF_BYTES, 0);
       return buf.subarray(0, n).includes(SHIM_SENTINEL_TOKEN);
@@ -83,8 +87,9 @@ export function resolveRealCodex({ env = process.env, self = process.argv[1] } =
     if (!real) continue;
     if (selfDir && path.dirname(real) === selfDir) continue;
     if (real === selfReal) continue;
+    if (!isExecutableFile(real)) continue;
     if (looksLikeShim(real)) continue;
-    if (isExecutableFile(real)) return real;
+    return real;
   }
   return null;
 }

@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { redactAndRoute } from '../lib/codex-event-format.js';
 import { createPublishRedactor } from '../lib/redact.js';
 
-// Loop #762 — guards-first, version-tolerant codex-viz rendering.
+// guards-first, version-tolerant codex-viz rendering.
 //
 // These tests prove the env-dump / secret-reference guards in allowlistedEvent
 // run UNCONDITIONALLY for command_execution across every envelope
@@ -124,7 +124,7 @@ describe('codex-viz command_execution egress guard (unconditional across envelop
   });
 });
 
-describe('codex-viz top-level error diagnostics (loop #762 follow-up)', () => {
+describe('codex-viz top-level error diagnostics', () => {
   it('renders a top-level error message at 0.155.1 (regression) instead of dropping it', () => {
     const { publisher, state } = route({ type: 'error', message: 'fatal upstream failure' });
     const body = publisher.calls.find(call => call.method === 'publishText')?.payload.body;
@@ -152,7 +152,7 @@ describe('codex-viz top-level error diagnostics (loop #762 follow-up)', () => {
   });
 
   it('scrubs assignment values diluted by prose (ratio-dodge), preserving the prose', () => {
-    // Codex r3 F1: two assignments mixed with two prose lines dodge any
+    // Two assignments mixed with two prose lines dodge any
     // dominance-ratio heuristic; scrubbing catches them regardless.
     const { publisher } = route({
       type: 'error',
@@ -165,10 +165,11 @@ describe('codex-viz top-level error diagnostics (loop #762 follow-up)', () => {
     expect(body).toContain('at worker.js:1');
   });
 
-  it('preserves an inline key=value mention inside prose (not a bare assignment line)', () => {
+  it('keeps the prose and the name of an inline key=value mention, but not its value', () => {
     const { publisher } = route({ type: 'error', message: 'connection failed: host=db.internal' });
     const body = publisher.calls.find(call => call.method === 'publishText')?.payload.body;
-    expect(body).toContain('host=db.internal');
+    expect(body).toContain('connection failed: host=');
+    expect(body).not.toContain('db.internal');
   });
 });
 
@@ -178,7 +179,7 @@ describe('codex-viz unknown/future item type diagnostics', () => {
       type: 'item.completed',
       item: { id: 'x', type: 'future_diag', message: 'informative detail', structural: { drop: 'me' } },
     });
-    // Loop #772: a newer item.completed type now lands a compact formatted line
+    // A newer item.completed type now lands a compact formatted line
     // (humanized type label) instead of a raw { type, id } JSON stub — but the
     // egress contract is unchanged. allowlistedEvent still strips the item to
     // { type, id } BEFORE the fallback runs, and the fallback forwards ONLY the
@@ -273,9 +274,9 @@ describe('codex-viz version tolerance (no upper band, no manual bump)', () => {
   });
 });
 
-// Codex adversarial review, round 1, blockers F1 + F2 — reproduced by the
-// reviewer with the PRODUCTION baseline redactor (which cannot scrub secrets
-// under innocuous env names). These lock in the fixes using that same redactor.
+// Egress regressions reproduced with the PRODUCTION baseline redactor (which
+// cannot scrub secrets under innocuous env names). These lock in the fixes
+// using that same redactor.
 describe('codex-viz egress hardening (production baseline redactor)', () => {
   // Baseline-only redactor: no policy file, never reads disk. It redacts
   // secret-KEY-named assignments but leaves innocuous-named values intact — so
@@ -293,7 +294,7 @@ describe('codex-viz egress hardening (production baseline redactor)', () => {
     return route(event, { redact: baseline });
   }
 
-  it('F1: a partial env dump streamed in item.delta output never egresses (output not forwarded off item.completed)', () => {
+  it('a partial env dump streamed in item.delta output never egresses (output not forwarded off item.completed)', () => {
     const { publisher } = routeBaseline({
       type: 'item.delta',
       item: { id: 'c', type: 'command_execution', command: 'load config', aggregated_output: PARTIAL },
@@ -303,7 +304,7 @@ describe('codex-viz egress hardening (production baseline redactor)', () => {
     expect(serialized).not.toContain('partial-secret-2');
   });
 
-  it('F1: a partial env dump under an unknown envelope never egresses', () => {
+  it('a partial env dump under an unknown envelope never egresses', () => {
     const { publisher } = routeBaseline({
       type: 'item.updated',
       item: { id: 'c', type: 'command_execution', command: 'load config', output: PARTIAL },
@@ -311,14 +312,14 @@ describe('codex-viz egress hardening (production baseline redactor)', () => {
     expect(JSON.stringify(publisher.calls)).not.toContain('partial-secret');
   });
 
-  it('F2: a lowercase env dump in a top-level error message has its values scrubbed', () => {
+  it('a lowercase env dump in a top-level error message has its values scrubbed', () => {
     const { publisher } = routeBaseline({ type: 'error', message: LOWER_DUMP });
     const serialized = JSON.stringify(publisher.calls);
     expect(serialized).not.toContain('lower-secret');
     expect(serialized).toContain('[REDACTED-ENV]');
   });
 
-  it('F2: a lowercase env dump in an unknown item textual field never egresses (field not forwarded)', () => {
+  it('a lowercase env dump in an unknown item textual field never egresses (field not forwarded)', () => {
     const { publisher } = routeBaseline({
       type: 'item.completed',
       item: { id: 'x', type: 'future_diag', message: LOWER_DUMP },
@@ -326,7 +327,7 @@ describe('codex-viz egress hardening (production baseline redactor)', () => {
     expect(JSON.stringify(publisher.calls)).not.toContain('lower-secret');
   });
 
-  it('F1(b): a two-line env dump in a top-level error message has its values scrubbed', () => {
+  it('a two-line env dump in a top-level error message has its values scrubbed', () => {
     const TWO_LINE = 'alpha=lower-secret-1\nbravo=lower-secret-2';
     const { publisher } = routeBaseline({ type: 'error', message: TWO_LINE });
     const serialized = JSON.stringify(publisher.calls);
@@ -334,13 +335,73 @@ describe('codex-viz egress hardening (production baseline redactor)', () => {
     expect(serialized).toContain('[REDACTED-ENV]');
   });
 
-  it('F1(b): a legitimate inline key=value diagnostic is preserved (prose, not a bare line)', () => {
-    const { publisher } = routeBaseline({ type: 'error', message: 'connection failed: host=db.internal' });
-    const body = publisher.calls.find(call => call.method === 'publishText')?.payload.body;
-    expect(body).toContain('host=db.internal');
+  it('an inline assignment behind prose in an error diagnostic does not egress its value', () => {
+    for (const message of [
+      'fatal: ALPHA=CANARY_SECRET_VALUE',
+      'failed to start --token=CANARY_SECRET_VALUE (exit 1)',
+      'bad config ALPHA="CANARY SECRET VALUE" near line 3',
+      "bad config ALPHA='CANARY SECRET VALUE' near line 3",
+      'fatal: ALPHA=[REDACTED-ENV]CANARY_SECRET_VALUE',
+      'fatal: ALPHA=""CANARY_SECRET_VALUE',
+      "fatal: ALPHA='x y'CANARY_SECRET_VALUE",
+      'fatal: ALPHA="a\\" CANARY_SECRET_VALUE"',
+      "fatal: ALPHA='a\\' CANARY_SECRET_VALUE'",
+    ]) {
+      const { publisher } = routeBaseline({ type: 'error', message });
+      const serialized = JSON.stringify(publisher.calls);
+      expect(serialized, message).not.toContain('CANARY');
+      expect(serialized, message).toMatch(/\[REDACTED/);
+    }
   });
 
-  it('F2 (r3): an overflow schema version fails safe to text passthrough, not rich routing', () => {
+  it('an inline assignment in a nested turn.failed error message does not egress its value', () => {
+    const { publisher } = routeBaseline({ type: 'turn.failed', error: { message: 'stream error: ALPHA=CANARY_SECRET_VALUE' } });
+    const serialized = JSON.stringify(publisher.calls);
+    expect(serialized).not.toContain('CANARY');
+    expect(serialized).toContain('stream error');
+  });
+
+  it('inline redaction leaves URL query parameters and short numeric/duration values readable', () => {
+    // A real upstream diagnostic: `word=value` tokens that are not secrets.
+    // Assignments inside a URL query (after `?`/`&` in a `scheme://` token)
+    // and short numeric/duration values must survive so the line stays
+    // actionable; `model=gpt-5` is still redacted (fail closed on an unknown
+    // alphanumeric value).
+    const MSG = 'status 429 for model=gpt-5 (retry-after=30s) code=429, n=3 after 1.5h'
+      + ' url https://api.example.test/v1/y?stream=true&limit=10 see http://docs.test/x?a=1';
+    for (const schemaVersion of [SUPPORTED, 'codex-cli 0.145.0']) {
+      const { publisher } = route({ type: 'error', message: MSG }, { redact: baseline, schemaVersion });
+      const serialized = JSON.stringify(publisher.calls);
+      expect(serialized, schemaVersion).toContain('(retry-after=30s)');
+      expect(serialized, schemaVersion).toContain('code=429,');
+      expect(serialized, schemaVersion).toContain('n=3 after 1.5h');
+      expect(serialized, schemaVersion).toContain('https://api.example.test/v1/y?stream=true&limit=10');
+      expect(serialized, schemaVersion).toContain('http://docs.test/x?a=1');
+      expect(serialized, schemaVersion).toContain('model=[REDACTED-ENV]');
+      expect(serialized, schemaVersion).not.toContain('gpt-5');
+    }
+  });
+
+  it('inline redaction still fails closed on secret-shaped and non-URL assignments', () => {
+    for (const message of [
+      'auth failed: OPENAI_API_KEY=sk-CANARY0123456789abcdef',
+      'TOKEN=abc123defCANARY456ghi789 rejected',
+      'login failed for password=hunter2CANARY',
+      // A URL as a VALUE is not an assignment inside a URL: the value goes.
+      'fetching url=https://x.test/y?token=CANARY',
+      // `?`/`&` without a scheme:// token is not a URL query.
+      'bad ?token=CANARY here',
+      // Too long to be a short numeric value (6-digit OTP shape).
+      'sent otp=123456CANARY',
+    ]) {
+      const { publisher } = routeBaseline({ type: 'error', message });
+      const serialized = JSON.stringify(publisher.calls);
+      expect(serialized, message).not.toContain('CANARY');
+      expect(serialized, message).toMatch(/\[REDACTED/);
+    }
+  });
+
+  it('an overflow schema version fails safe to text passthrough, not rich routing', () => {
     const overflowVersion = `codex-cli ${'9'.repeat(400)}.0.0`;
     const { publisher, state } = route({
       type: 'item.completed',
@@ -357,7 +418,7 @@ describe('codex-viz egress hardening (production baseline redactor)', () => {
     expect(state.unparsed).toBe(1);
   });
 
-  it('F2: a lowercase env dump in command_execution output is dropped', () => {
+  it('a lowercase env dump in command_execution output is dropped', () => {
     const { publisher, state } = routeBaseline({
       type: 'item.completed',
       item: { id: 'c', type: 'command_execution', command: 'cat config', aggregated_output: LOWER_DUMP },
@@ -367,7 +428,7 @@ describe('codex-viz egress hardening (production baseline redactor)', () => {
     expect(publisher.calls).toEqual([]);
   });
 
-  it('delta gate: an overflow-version top-level error diagnostic is still scrubbed via the generic fallback', () => {
+  it('an overflow-version top-level error diagnostic is still scrubbed via the generic fallback', () => {
     const overflowVersion = `codex-cli ${'9'.repeat(400)}.0.0`;
     const { publisher } = route(
       { type: 'error', message: 'alpha=fallback-secret-1' },
@@ -378,7 +439,7 @@ describe('codex-viz egress hardening (production baseline redactor)', () => {
     expect(serialized).toContain('[REDACTED-ENV]');
   });
 
-  it('delta gate: a NUL-delimited env dump in a below-floor error diagnostic is scrubbed', () => {
+  it('a NUL-delimited env dump in a below-floor error diagnostic is scrubbed', () => {
     const NUL_DUMP = 'alpha=nul-secret-1\0bravo=nul-secret-2\0charlie=nul-secret-3';
     const { publisher } = route(
       { type: 'error', message: NUL_DUMP },
@@ -389,7 +450,7 @@ describe('codex-viz egress hardening (production baseline redactor)', () => {
     expect(serialized).toContain('[REDACTED-ENV]');
   });
 
-  it('terminal gate: a lone-CR-delimited assignment after prose is scrubbed (supported + fallback)', () => {
+  it('a lone-CR-delimited assignment after prose is scrubbed (supported + fallback)', () => {
     const MSG = 'fatal upstream\rALPHA=cr-secret-value';
     for (const schemaVersion of [SUPPORTED, 'codex-cli 0.145.0']) {
       const { publisher } = route({ type: 'error', message: MSG }, { redact: baseline, schemaVersion });
@@ -399,7 +460,7 @@ describe('codex-viz egress hardening (production baseline redactor)', () => {
     }
   });
 
-  it('delta gate 2: a NUL-framed env value that itself contains a newline is fully scrubbed', () => {
+  it('a NUL-framed env value that itself contains a newline is fully scrubbed', () => {
     // NUL is the authoritative delimiter; the continuation bytes of the first
     // entry's value must not survive as if they were a separate line.
     const MIXED = 'ALPHA=first-line\ncontinuation-secret\0BRAVO=second-secret';
@@ -414,7 +475,7 @@ describe('codex-viz egress hardening (production baseline redactor)', () => {
     expect(serialized).toContain('[REDACTED-ENV]');
   });
 
-  it('delta gate: an env dump in a below-floor item textual field is scrubbed via the generic fallback', () => {
+  it('an env dump in a below-floor item textual field is scrubbed via the generic fallback', () => {
     const { publisher } = route(
       { type: 'item.completed', item: { id: 'x', type: 'future_answer', answer: LOWER_DUMP } },
       { redact: baseline, schemaVersion: 'codex-cli 0.145.0' },

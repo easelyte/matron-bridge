@@ -263,8 +263,10 @@ describe('permission hook spawn environment wiring (source inspection)', () => {
     indexSource.indexOf('// --- Structured Question Handling ---')
   );
 
-  it('builds print spawn settings in print mode', () => {
-    expect(printSpawn).toContain("'--settings', JSON.stringify(buildSessionSettings('print')),");
+  it('builds print spawn settings by composing the fork settings onto upstream buildPrintSessionSettings', () => {
+    expect(printSpawn).toContain("'--settings', JSON.stringify(withForkPrintSettings(");
+    expect(printSpawn).toContain("buildPrintSessionSettings({ bypass: bypassMode, hooksDir: path.join(__dirname, 'hooks'), apiPort: API_PORT, roomId }),");
+    expect(printSpawn).toContain('{ bypass: bypassMode },');
   });
 
   it('builds interactive spawn settings in iv mode', () => {

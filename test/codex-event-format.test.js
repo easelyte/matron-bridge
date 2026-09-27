@@ -349,10 +349,10 @@ describe('formatAndRoute', () => {
     expect(retained.has(ctx.runId)).toBe(false);
   });
 
-  // Loop #772: an unrecognized item.completed type renders a DURABLE compact,
+  // An unrecognized item.completed type renders a DURABLE compact,
   // formatted line, NOT a raw JSON dump. The line carries only a humanized
   // label; no other item field (and not even the id) survives. It is a neutral
-  // text line, NOT a "done" tool card — see the mcp-failure rationale (Codex F1).
+  // text line, NOT a "done" tool card — see the mcp-failure rationale.
   it('renders an unrecognized item.completed type as a compact formatted line, not raw JSON', () => {
     const { calls, ctx } = makeContext();
     const unknown = { type: 'item.completed', item: { id: 'x', type: 'future_item', value: 42 } };
@@ -377,7 +377,7 @@ describe('formatAndRoute', () => {
     expect(ctx.state.durableEvents).toBe(1);
   });
 
-  // Loop #772: an unrecognized item.started type shows an ephemeral "tool"
+  // An unrecognized item.started type shows an ephemeral "tool"
   // activity indicator (like command_execution/file_change started), NOT raw
   // JSON. Ephemeral -> no durable-cap consumption, no unparsed increment.
   it('renders an unrecognized item.started type as a tool activity, not raw JSON', () => {
@@ -394,7 +394,7 @@ describe('formatAndRoute', () => {
     expect(ctx.state.durableEvents).toBe(0);
   });
 
-  // Loop #772 (the reported bug): web_search item.started/completed no longer
+  // Web_search item.started/completed no longer
   // leak raw `{"type":"item.started","item":{"type":"web_search",...}}` blobs
   // between the clean bash-command cards.
   it('renders web_search item.started as a tool activity, not a raw JSON publishText', () => {
@@ -454,7 +454,7 @@ describe('formatAndRoute', () => {
       },
     ]);
     // Never a "done" card: a status-bearing item's real status was stripped
-    // upstream, so the bridge must not assert success (Codex F1).
+    // upstream, so the bridge must not assert success.
     expect(calls.some(call => call.method === 'publishToolOutput')).toBe(false);
   });
 
@@ -476,7 +476,7 @@ describe('formatAndRoute', () => {
   });
 
   it('warns once and degrades every event to text below the schema floor', () => {
-    // Loop #762: rendering is version-tolerant (no upper band), so a NEWER
+    // Rendering is version-tolerant (no upper band), so a NEWER
     // version renders richly. Only versions BELOW the hardened-schema floor
     // (0.146.0) still fail safe to the text-passthrough path.
     const { calls, ctx } = makeContext({
@@ -537,6 +537,28 @@ describe('formatAndRoute', () => {
     expect(ctx.state.terminalSeen).toBe(true);
   });
 
+  it('lands a pending answer before a turn.failed below the schema floor', () => {
+    const { calls, ctx } = makeContext({
+      meta: { schemaVersion: 'codex-cli 0.145.0', model: 'legacy-model' },
+    });
+
+    formatAndRoute({
+      type: 'item.completed',
+      item: { id: 'answer-1', type: 'agent_message', text: 'Partial answer' },
+    }, ctx);
+    formatAndRoute({ type: 'turn.failed' }, ctx);
+
+    const bodies = calls.filter(call => call.method === 'publishText').map(call => call.args[1].body);
+    expect(bodies).toEqual(['Partial answer', JSON.stringify({ type: 'turn.failed' })]);
+    expect(ctx.state.finalPostProduced).toBe(true);
+    expect(ctx.state.pendingAgentMessage).toBeNull();
+    expect(ctx.state.terminalSeen).toBe(true);
+    expect(calls.filter(call => call.method === 'publishActivity')).toContainEqual({
+      method: 'publishActivity',
+      args: [ctx.convoId, 'idle'],
+    });
+  });
+
   it('still text-passes non-lifecycle events below the schema floor', () => {
     const { calls, ctx } = makeContext({
       meta: { schemaVersion: 'codex-cli 0.145.0', model: 'legacy-model' },
@@ -569,7 +591,7 @@ describe('formatAndRoute', () => {
         aggregated_output: 'ok', exit_code: 0, status: 'completed',
       },
     };
-    // Loop #762: rendering keys on event shape, not an upper version band, so
+    // Rendering keys on event shape, not an upper version band, so
     // 0.155.1 (live) AND future majors (0.156.0, 1.0.0) all render richly with
     // no manual band bump, reusing the hardened allowlist path unchanged.
     for (const schemaVersion of [
@@ -655,11 +677,11 @@ describe('formatAndRoute', () => {
   });
 });
 
-// Loop #787: the known codex exec --json protocol events that still reached the
+// The known codex exec --json protocol events that still reached the
 // journal as raw JSON text on the SUPPORTED schema path (error, turn.failed,
 // item.updated). Every one must render as a readable line or an ephemeral
 // activity, never as a stringified event body.
-describe('formatAndRoute known protocol events (loop #787)', () => {
+describe('formatAndRoute known protocol events', () => {
   const isRawJsonBody = call => call.method === 'publishText'
     && typeof call.args[1]?.body === 'string'
     && call.args[1].body.trimStart().startsWith('{');
@@ -700,6 +722,20 @@ describe('formatAndRoute known protocol events (loop #787)', () => {
     expect(bodies).toEqual(['partial answer', '⚠️ Codex turn failed: `stream disconnected`']);
     expect(calls).toContainEqual({ method: 'publishActivity', args: [ctx.convoId, 'idle'] });
     expect(ctx.state.terminalSeen).toBe(true);
+  });
+
+  it('keeps the turn.failed line even when the answer takes the last durable slot', () => {
+    for (const schemaVersion of ['codex-cli 0.146.0', 'codex-cli 0.145.0']) {
+      const { calls, ctx } = makeContext({ meta: { schemaVersion }, maxDurableEvents: 1 });
+      ctx.state = { durableEvents: 0 };
+      formatAndRoute({ type: 'item.completed', item: { id: 'a1', type: 'agent_message', text: 'partial answer' } }, ctx);
+      formatAndRoute({ type: 'turn.failed' }, ctx);
+
+      const bodies = calls.filter(call => call.method === 'publishText').map(call => call.args[1].body);
+      expect(bodies[0], schemaVersion).toBe('partial answer');
+      expect(bodies.slice(1).some(body => body.includes('turn.failed') || body.includes('turn failed')), schemaVersion).toBe(true);
+      expect(bodies, schemaVersion).not.toContain('Additional events truncated');
+    }
   });
 
   it('renders a bare turn.failed stub without a message', () => {

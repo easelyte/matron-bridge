@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { createAgentInvites, formatInviteRequestNotice } from '../lib/agent-invites.js';
+import { createAgentInvites, formatInviteRequestNotice, formatAutoJoinedRequest } from '../lib/agent-invites.js';
 import { createAgentRooms } from '../lib/agent-rooms.js';
 
 // Awaited stages inside invite()/join() resume on microtasks; drain a few
@@ -685,6 +685,14 @@ describe('formatInviteRequestNotice', () => {
       .toBe('🤝 Agent "laptop" asks to join the chat "room-1": I have the logs');
   });
 
+  it('an invite joined on delivery reads as a fact, not a request — the user already approved it', () => {
+    expect(formatInviteRequestNotice(request, { joined: true }))
+      .toBe('🤝 Agent "dev-2" started a chat with this session about "ci triage": the build is red');
+    expect(formatInviteRequestNotice({ ...request, topic: undefined }, { joined: true }))
+      .toBe('🤝 Agent "dev-2" started a chat with this session: the build is red');
+    expect(formatInviteRequestNotice({ ...request, topic: undefined }, { joined: true })).not.toContain('requests');
+  });
+
   it('carries NO agent_chat_accept/refuse syntax — that is the agent\'s copy, not the user\'s', () => {
     for (const frame of [request, join]) {
       const notice = formatInviteRequestNotice(frame);
@@ -755,5 +763,60 @@ describe('inviteLocal()', () => {
     inv.onInviteFrame({ event: 'answer', room_id: 'room-l', accept: false, reason: 'mid-deploy', from_device_id: 1 });
     await expect(p).resolves.toMatchObject({ kind: 'refused', reason: 'mid-deploy' });
     expect(rooms.get('room-l').state).toBe('refused');
+  });
+});
+
+describe('formatAutoJoinedRequest', () => {
+  // The AGENT's copy of an inbound request the bridge accepted on its behalf
+  // (approved invites join on delivery): a statement of fact plus the room so
+  // far, never an accept/refuse instruction.
+  const request = { event: 'request', room_id: 'room-1', from_device_id: 7, from_name: 'dev-2', topic: 'ci triage', justification: 'the build is red' };
+
+  it('says the room is joined and names the peer, room, topic and justification', () => {
+    const text = formatAutoJoinedRequest(request);
+    expect(text).toMatch(/^You are now in a room with dev-2 \(room room-1\) about "ci triage": the build is red\./);
+    expect(text).toContain('agent_chat_send');
+    expect(text).toContain('agent_chat_mute');
+    expect(text).not.toContain('agent_chat_accept');
+    expect(text).not.toContain('agent_chat_refuse');
+    // Still marked as another agent's words, not the user's.
+    expect(text).toMatch(/not from your user/);
+  });
+
+  it('omits the topic and justification clauses when absent, falls back to the device id without a name', () => {
+    expect(formatAutoJoinedRequest({ ...request, topic: undefined, justification: undefined, from_name: null }))
+      .toMatch(/^You are now in a room with device 7 \(room room-1\)\./);
+  });
+
+  it('carries the room so far — the opening message was published before the guest joined', () => {
+    const events = [
+      { type: 'text', sender: 'agent:mac', ts: 1, payload: { body: 'hi, seen the red build?' } },
+      { type: 'image', sender: 'agent:mac', ts: 2, payload: { name: 'shot.png', blob_ref: 'b9', caption: 'the failure' } },
+      { type: 'noise', sender: 'agent:mac', ts: 3, payload: {} },
+    ];
+    const text = formatAutoJoinedRequest(request, { events });
+    expect(text).toContain('The room so far:');
+    expect(text).toContain('mac (agent): hi, seen the red build?');
+    expect(text).toContain('mac (agent): [image "shot.png" (blob b9)] — the failure');
+    expect(text).not.toContain('noise');
+  });
+
+  it('says when the backlog could not be fetched instead of pretending the room is empty', () => {
+    expect(formatAutoJoinedRequest(request, { events: null })).toMatch(/agent_chat_read/);
+    expect(formatAutoJoinedRequest(request, { events: [] })).not.toContain('The room so far:');
+  });
+
+  it('SECURITY: peer fields are flattened to one line and capped', () => {
+    const text = formatAutoJoinedRequest({ ...request, from_name: 'a\nb', justification: 'x'.repeat(5000) });
+    // The fact line stays ONE line (oneLine renders the break as ' ⏎ ') and
+    // the text is exactly its two intended lines — no forged third.
+    expect(text.split('\n')).toHaveLength(2);
+    expect(text.split('\n')[0]).toContain('a ⏎ b');
+    expect(text.length).toBeLessThan(1500);
+  });
+
+  it('never throws on a junk frame', () => {
+    expect(() => formatAutoJoinedRequest(null)).not.toThrow();
+    expect(() => formatAutoJoinedRequest({ room_id: 5, from_name: {}, topic: [] }, { events: 'nope' })).not.toThrow();
   });
 });
