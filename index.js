@@ -1264,7 +1264,7 @@ function journalStartSessionForRpc({ workdir, mcpExtras, model = null, agent = n
 // RPCs (lib/file-rpc-roots.js); the default workdir on a dev box is often $HOME.
 const fileRpcRoots = filterFileRpcRoots([DEFAULT_WORKDIR, ...SHOW_FILE_ARTIFACT_ROOTS]);
 for (const { root, reason } of fileRpcRoots.refused) {
-  console.warn(`[file-rpc] read_file/edit_file root refused (${reason}): ${root}`);
+  console.warn(`[file-rpc] read_file/edit_file root refused (${reason}): ${root} — point DEFAULT_WORKDIR or SHOW_FILE_ARTIFACT_ROOTS at a project directory to enable them`);
 }
 const editAllowedRoots = pinAllowedRootsSync(fileRpcRoots.kept);
 

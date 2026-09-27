@@ -31,6 +31,12 @@ describe('filterFileRpcRoots (read_file / edit_file roots)', () => {
     expect(r.refused).toEqual([]);
   });
 
+  it('refuses every root when the passwd home is unknown (never trusts $HOME)', () => {
+    const r = filterFileRpcRoots([ws, other], { home: null });
+    expect(r.kept).toEqual([]);
+    expect(r.refused.map((x) => x.reason)).toEqual(['home-unknown', 'home-unknown']);
+  });
+
   it('an all-refused set comes back empty (the RPCs then fail closed with bad_workdir)', () => {
     expect(filterFileRpcRoots([home], { home }).kept).toEqual([]);
   });
