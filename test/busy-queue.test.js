@@ -1772,7 +1772,7 @@ describe('queued-release publisher wiring', () => {
 });
 
 describe('index.js queued-send finalizer', () => {
-  function loadFlushHarness({ dispatchResult = true } = {}) {
+  function loadFlushHarness({ dispatchResult = true, dispatchThrows = null } = {}) {
     const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
     const start = src.indexOf('function queuedReleaseItemIds(');
     const end = src.indexOf('\nfunction splitMessage(', start);
@@ -1787,7 +1787,10 @@ describe('index.js queued-send finalizer', () => {
       { promptId: 'pr_2', itemId: 'pr_2::0' },
       { promptId: 'pr_drifted', itemId: 'pr_drifted::0' },
     ]);
-    const dispatchMergedFlush = vi.fn(() => dispatchResult);
+    const dispatchMergedFlush = vi.fn(() => {
+      if (dispatchThrows) throw dispatchThrows;
+      return dispatchResult;
+    });
     const runQueuedCleanup = vi.fn(); // observe orphan-cleanup on the dead-session drop path
     const flushQueue = runInNewContext(
       `(() => { ${src.slice(start, end)}; return flushQueue; })()`,
@@ -1868,6 +1871,18 @@ describe('index.js queued-send finalizer', () => {
 
     expect(harness.flushQueue(session, queued)).toBe(false);
     // Chronological order: the batch being retried was queued before `later`.
+    expect(session.queuedMessages).toEqual([...queued, ...later]);
+    expect(harness.emitRelease).not.toHaveBeenCalled();
+    expect(harness.dropItem).not.toHaveBeenCalled();
+  });
+
+  it('restores the detached batch (no releases, no throw) when dispatch THROWS before delivery', () => {
+    const harness = loadFlushHarness({ dispatchThrows: new Error('pty closed') });
+    const queued = [[{ type: 'text', text: 'retry me' }]];
+    const later = [[{ type: 'text', text: 'arrived later' }]];
+    const session = { agent: 'claude', alive: true, busy: false, queuedMessages: later, roomId: '!room' };
+
+    expect(harness.flushQueue(session, queued)).toBe(false);
     expect(session.queuedMessages).toEqual([...queued, ...later]);
     expect(harness.emitRelease).not.toHaveBeenCalled();
     expect(harness.dropItem).not.toHaveBeenCalled();

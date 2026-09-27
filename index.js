@@ -6166,7 +6166,21 @@ function flushQueue(session, queued, releaseSnapshot = null) {
     console.log(`[QUEUE] could not interrupt active Codex turn; kept ${queued.length} queued message(s)`);
     return false;
   }
-  if (!dispatchMergedFlush(session, queued)) {
+  let delivered;
+  try {
+    delivered = dispatchMergedFlush(session, queued);
+  } catch (e) {
+    // Fork-only: a dispatch that THROWS (e.g. the PTY closed between the
+    // liveness check and pty.write) did not commit delivery, and the callers
+    // have already detached the batch from session.queuedMessages. Restore it
+    // (and its notifications) for a later flush, keeping flushQueue's
+    // non-throwing true/false/'deferred' contract. Nothing was written ahead
+    // under deliver-first, so there is nothing to roll back.
+    restore();
+    console.log(`[QUEUE] dispatch threw; kept ${queued.length} queued message(s) for retry (room ${session.roomId}): ${e?.message ?? String(e)}`);
+    return false;
+  }
+  if (!delivered) {
     // dispatchMergedFlush fails in two distinct situations that must NOT be
     // handled the same way:
     //   1. The session is gone (dead / auto-stopped). There is nothing to
