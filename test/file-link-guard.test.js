@@ -22,6 +22,17 @@ describe('isSensitivePath', () => {
     '/w/secret/note.txt', '/w/credentials/token.dat',
     '/w/proj/secrets', '/w/proj/secret', '/w/prod.env/x.dat', '/w/tokens.json/x.dat',
     '/w/app.key/nested/file.txt',
+    // 2026-09-27 hardening (maintainer review of the File Explorer stack)
+    '/root/.secrets', '/root/.secrets/req-abc.txt', '/root/.anton/approval_grant_secret',
+    '/root/.supabase/access-token', '/etc/matron/agent-token', '/w/agent_token.json',
+    '/opt/matron/journal/data/bridge-agent-token.txt', '/opt/matron/journal/data/bridge-agent-creds.txt',
+    '/root/.claude-matrix-sessions.json', '/root/.claude-matrix-config.json', '/root/.matron-bridge-secrets.json',
+    '/root/.matron-bridge-timers.json', '/root/.claude-queued-release-outbox.json',
+    '/root/.claude-run-state-outbox.json', '/root/.claude-subagent-running.json',
+    '/opt/matron/bridge-journal/run-state-outbox.json', '/opt/matron/bridge-journal/journal-cursor.json',
+    '/root/.bash_history', '/root/.python_history',
+    '/root/.codex/auth.json', '/root/.codex', '/root/.config/gh/hosts.yml', '/root/auth.json',
+    '/root/.git-credentials', '/root/.pgpass', '/root/.claude.json', '/home/u/.gcloud/x', '/home/u/.azure/y',
   ])('flags %s', (p) => {
     expect(isSensitivePath(p)).toBe(true);
   });
@@ -30,6 +41,9 @@ describe('isSensitivePath', () => {
     '/w/index.js', '/w/env.md', '/w/configuration.json', '/w/package.json',
     '/w/README.md', '/w/awsome/notes.txt', '/w/keyboard.js',
     '/w/secretary/notes.txt', '/w/credentialing/doc.md',
+    '/w/lib/secret-requests.js', '/w/tokenizer.js', '/w/docs/agent-token.md', '/w/src/credit.js',
+    '/w/history.md', '/w/lib/journal-cursor.js', '/w/test/run-state-outbox.test.js', '/w/configure.js',
+    '/w/.claude/skills/x/SKILL.md',
   ])('allows %s', (p) => {
     expect(isSensitivePath(p)).toBe(false);
   });

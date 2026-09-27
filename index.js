@@ -109,6 +109,7 @@ import {
   FileLinkDenied,
   pinAllowedRootsSync,
 } from './lib/file-link-guard.js';
+import { filterFileRpcRoots } from './lib/file-rpc-roots.js';
 import {
   denialToStatus,
   parseShowFileUploadTimeoutMs,
@@ -1259,7 +1260,13 @@ function journalStartSessionForRpc({ workdir, mcpExtras, model = null, agent = n
 // pinAllowedRootsSync the per-session show_file path uses), never rebuilt from
 // client-supplied strings. The client-facing edit affordance is separate work;
 // this makes the backend live and reachable.
-const editAllowedRoots = pinAllowedRootsSync([DEFAULT_WORKDIR, ...SHOW_FILE_ARTIFACT_ROOTS]);
+// A root of / or of $HOME (or anything containing it) is refused for these
+// RPCs (lib/file-rpc-roots.js); the default workdir on a dev box is often $HOME.
+const fileRpcRoots = filterFileRpcRoots([DEFAULT_WORKDIR, ...SHOW_FILE_ARTIFACT_ROOTS]);
+for (const { root, reason } of fileRpcRoots.refused) {
+  console.warn(`[file-rpc] read_file/edit_file root refused (${reason}): ${root}`);
+}
+const editAllowedRoots = pinAllowedRootsSync(fileRpcRoots.kept);
 
 // ops_snapshot RPC backend (loop #542 phase B, lib/ops-snapshot.js). `host`
 // is computed here from /proc; the other sections run MATRON_OPS_SNAPSHOT_CMD
