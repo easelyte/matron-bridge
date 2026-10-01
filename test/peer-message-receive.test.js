@@ -651,6 +651,28 @@ describe('journalOnPeerMessage priority preemption (loop #688 consumer half)', (
     assert.equal(runtime.roomDelivery.pendingCount(target.roomId), 1);
   });
 
+  it('a queued operator room message still flushes before a priority peer (operator > peer-priority)', () => {
+    for (const replace of [false, true]) {
+      const target = session({ busy: true, turnTier: 'autonomous' });
+      const runtime = makeRuntime({ target, markBusyOnInject: true });
+      runtime.roomDelivery.deliver(target, target.roomId, {
+        roomId: 'room-x', roomTitle: 'coord', from: 'Dan', body: 'operator says stop', fromAgent: false,
+      });
+      runtime.journalOnPeerMessage(priorityFrame({ payload: { body: 'urgent' } }));
+      let live = target;
+      if (replace) {
+        live = session({ busy: false });
+        target.alive = false;
+        runtime.sessions.set(target.roomId, live);
+      } else {
+        target.busy = false;
+      }
+      runtime.maybeFlushRoomDelivery(live);
+      assert.equal(runtime.injectCalls.at(-1)[1].includes('operator says stop'), true, `replace=${replace}`);
+      assert.equal(runtime.peerDelivery.pendingCount(target.roomId), 1, `replace=${replace}`);
+    }
+  });
+
   it('delivers to the live session when the pre-delivery flush replaced it', () => {
     const target = session();
     const runtime = makeRuntime({ target });

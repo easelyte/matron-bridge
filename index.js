@@ -10569,7 +10569,11 @@ function flushRoomInbox(session) {
   // The flag lives on the session object, which a drained agent switch or
   // print-mode recreate replaces; the pending peer inbox (keyed by roomId)
   // survives that, so it is consulted too.
-  if (session._priorityPreemptPending || peerDelivery.pendingSome(session.roomId, (m) => m.priority === true)) {
+  // Operator content in the queued room batch still outranks a priority peer
+  // (operator > peer-priority, lib/peer-priority.js), so the peer only jumps
+  // a room batch that is purely agent-origin.
+  const priorityPeerPending = session._priorityPreemptPending || peerDelivery.pendingSome(session.roomId, (m) => m.priority === true);
+  if (priorityPeerPending && !roomDelivery.pendingSome(session.roomId, (m) => m.fromAgent !== true)) {
     session._priorityPreemptPending = false;
     peerDelivery.flush(session, session.roomId);
     if (sessionOccupiedForRoomDelivery(session)) return; // peer turn started; room batch waits
