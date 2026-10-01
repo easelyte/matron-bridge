@@ -20,6 +20,9 @@ describe('coordinator spawn wiring (source inspection)', () => {
     expect(index).toContain("const DEFAULT_BRIDGE_COORDINATOR_MD_PATH = path.join(__dirname, 'BRIDGE_COORDINATOR.md');");
     expect(index).toContain('const BRIDGE_COORDINATOR_MD_PATH = process.env.BRIDGE_COORDINATOR_MD_PATH || DEFAULT_BRIDGE_COORDINATOR_MD_PATH;');
     expect(index).toMatch(/const COORDINATOR_BLOCK = loadCoordinatorBlock\(\{/);
+    expect(index).toContain("const DEFAULT_BRIDGE_COORDINATOR_DIR = path.join(__dirname, 'coordinator');");
+    expect(index).toContain('const BRIDGE_COORDINATOR_DIR = process.env.BRIDGE_COORDINATOR_DIR || DEFAULT_BRIDGE_COORDINATOR_DIR;');
+    expect(index).toMatch(/dir: BRIDGE_COORDINATOR_DIR,\s*readDir: \(d\) => fs\.readdirSync\(d\),/);
   });
 
   it('builds one lookup on the journal HTTP base and refreshes it at boot and on every hello_ok', () => {
@@ -46,14 +49,14 @@ describe('coordinator spawn wiring (source inspection)', () => {
 
   it('print mode: prompt and disallowed tools come from claudeCoordinatorArgs', () => {
     const cs = body('function createSession(roomId, workdir, resumeSessionId, options = {}) {', '\nfunction ');
-    expect(cs).toMatch(/const printCoord = claudeCoordinatorArgs\(\{ coordinator: !!options\.coordinator, basePrompt: BRIDGE_SYSTEM_PROMPT, block: COORDINATOR_BLOCK, baseDisallowed: \['AskUserQuestion'\], memoryBlock: memoryBlockNow\(\) \}\);/);
+    expect(cs).toMatch(/const printCoord = claudeCoordinatorArgs\(\{ coordinator: !!options\.coordinator, basePrompt: BRIDGE_SYSTEM_PROMPT, block: COORDINATOR_BLOCK, baseDisallowed: \['AskUserQuestion'\], memoryBlock: memoryBlockNow\(\{ coordinator: !!options\.coordinator, workdir: cwd \}\) \}\);/);
     expect(cs).toContain("'--disallowed-tools', ...printCoord.disallowedTools,");
     expect(cs).toContain("'--append-system-prompt', printCoord.appendSystemPrompt,");
   });
 
   it('interactive mode: same helper, --disallowed-tools only when there is something to disallow', () => {
     const iv = body('function createInteractiveSessionForRoom(', '\nfunction ');
-    expect(iv).toMatch(/const ivCoord = claudeCoordinatorArgs\(\{ coordinator: !!options\.coordinator, basePrompt: BRIDGE_SYSTEM_PROMPT, block: COORDINATOR_BLOCK, memoryBlock: memoryBlockNow\(\) \}\);/);
+    expect(iv).toMatch(/const ivCoord = claudeCoordinatorArgs\(\{ coordinator: !!options\.coordinator, basePrompt: BRIDGE_SYSTEM_PROMPT, block: COORDINATOR_BLOCK, memoryBlock: memoryBlockNow\(\{ coordinator: !!options\.coordinator, workdir: cwd \}\) \}\);/);
     expect(iv).toContain("...(ivCoord.disallowedTools.length ? ['--disallowed-tools', ...ivCoord.disallowedTools] : []),");
     expect(iv).toContain("'--append-system-prompt', ivCoord.appendSystemPrompt,");
   });
@@ -64,7 +67,7 @@ describe('coordinator spawn wiring (source inspection)', () => {
 
   it('Codex: developer instructions and sandbox come from codexCoordinatorOptions', () => {
     const cx = body('function createCodexSessionForRoom(', '\nfunction ');
-    expect(cx).toMatch(/const codexCoord = codexCoordinatorOptions\(\{ coordinator: !!options\.coordinator, baseInstructions: CODEX_BRIDGE_PROMPT, block: COORDINATOR_BLOCK, baseSandbox: CODEX_SANDBOX_MODE, memoryBlock: memoryBlockNow\(\) \}\);/);
+    expect(cx).toMatch(/const codexCoord = codexCoordinatorOptions\(\{ coordinator: !!options\.coordinator, baseInstructions: CODEX_BRIDGE_PROMPT, block: COORDINATOR_BLOCK, baseSandbox: CODEX_SANDBOX_MODE, memoryBlock: memoryBlockNow\(\{ coordinator: !!options\.coordinator, workdir: cwd \}\) \}\);/);
     expect(cx).toContain('sandbox: codexCoord.sandbox,');
     expect(cx).toContain('developerInstructions: codexCoord.developerInstructions + (CODEX_APP_SERVER');
     expect(cx).not.toContain('sandbox: CODEX_SANDBOX_MODE,');
@@ -128,7 +131,8 @@ describe('live coordinator events (source inspection)', () => {
     expect(fn).toContain("recreateSession(roomId, plan.model ? { model: plan.model } : {}, ctx)");
     expect(fn).toContain('{ model: plan.model, modelExplicit: false }');
     expect(fn).toContain('applyModelSwitch(roomId, session, plan.model, { ...ctx, explicit: false });');
-    expect(fn).toContain('await deliverCoordinatorTurn(sessions.get(roomId) || session, coordinatorTurnText(role, COORDINATOR_BLOCK, memoryBlockNow()));');
+    expect(fn).toContain('const target = sessions.get(roomId) || session;');
+    expect(fn).toContain("await deliverCoordinatorTurn(target, coordinatorTurnText(role, COORDINATOR_BLOCK, memoryBlockNow({ coordinator: role === 'assigned', workdir: target?.workdir })));");
   });
 
   it("a user's parked /model pick is handed to the plan, so the implicit switch never overwrites it", () => {
@@ -200,7 +204,7 @@ describe('spawn mission join (source inspection)', () => {
 describe('pending Coordinator model (final review #1/#2)', () => {
   it('recreateSession prefers the pending Coordinator model over the observed live model, and overrides still win', () => {
     const fn = body('function recreateSession(', '\nfunction ');
-    const modelAt = fn.indexOf('model: recreateSpawnModel({ agent: existing.agent, currentModel: existing.currentModel, pendingModel: existing._coordinatorModel }),');
+    const modelAt = fn.indexOf('model: recreateSpawnModel({ agent: existing.agent, currentModel: existing._modelAlias || existing.currentModel, pendingModel: existing._coordinatorModel }),');
     expect(modelAt).toBeGreaterThan(-1);
     expect(fn.indexOf('...overrides,', modelAt)).toBeGreaterThan(modelAt);
     expect(fn).not.toContain('? existing.currentModel');

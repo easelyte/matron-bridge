@@ -8,10 +8,15 @@ import { z } from 'zod';
 import { resolvePermissionTimeoutMs, classifyPermissionPostResponse } from './lib/permission-prompt.js';
 import { formatBox } from './lib/agent-boxes-format.js';
 import { itemLine, formatItemList, formatItemDetail, formatCommentAck } from './lib/items-format.js';
-import { formatStartAck, formatCreateAck, formatMilestoneAck, formatMissionDetail, missionLine, formatBlocked, formatJournalError } from './lib/missions-format.js';
+import { formatStartAck, formatCreateAck, formatMilestoneAck, formatMissionDetail, missionLine, formatBlocked, formatJournalError, formatStatusAck, formatMissionList, formatJoinAck, formatLeaveAck, formatUpdateAck } from './lib/missions-format.js';
 import { missionIdemKey, itemIdemKey } from './lib/missions-idem.js';
+import { projectLine, formatProjectList, formatProjectDetail, formatProjectCreateAck, formatProjectStatusAck, formatProjectMergeAck, formatProjectBlocked, formatProjectJournalError } from './lib/projects-format.js';
 import { formatMemoryList, formatMemoryDetail, formatSaveAck, formatDeleteAck } from './lib/memory-format.js';
 import { formatReminderLine } from './lib/reminder-tools.js';
+import { rosterLine } from './lib/roster-format.js';
+import { formatPendingList, formatDecideAck } from './lib/consent-tools.js';
+import { formatUnseenList, formatUnseenMine, formatFlagAck } from './lib/unseen-tools.js';
+import { formatRoutineList, formatRoutineUpdateAck, formatRoutineRunAck } from './lib/routines-tools.js';
 
 // Route to whichever bridge spawned us: explicit BRIDGE_API_URL wins, else the
 // per-session MATRON_BRIDGE_API_PORT exported by the bridge at spawn (journal=9812,
@@ -271,7 +276,7 @@ const messageLine = (m) => `${senderLabel(m.sender)}: ${m.body}${m.caption ? ` �
 
 server.tool(
   'agent_roster',
-  "List this user's other agent sessions (boxes, conversation titles, states, rolling summaries) so you can pick a target for agent_chat_start. Excludes yourself.",
+  "List this user's other agent sessions (boxes, conversation titles, states, rolling summaries) so you can pick a target for agent_chat_start, plus each session's model, context gauge (tokens used of its window, e.g. `870k/1m 87%`) and any usage-limit stall (`stalled: usage limit, resets HH:MM UTC`), as last reported by its bridge — so you can also see which sessions are near full or out of allowance. Excludes yourself.",
   {},
   async () => {
     try {
@@ -291,16 +296,10 @@ server.tool(
         .slice()
         .sort((a, b) => (b.last_ts || 0) - (a.last_ts || 0))
         .slice(0, 30)
-        .map((c) => {
-          // Rows owned by this bridge are valid targets too (same-bridge
-          // rooms): the invite is delivered locally instead of via the
-          // journal. Only the caller's OWN conversation is refused.
-          const agent = c.agent_device_id == null ? ' (no agent)'
-            : (mine != null && c.agent_device_id === mine) ? ' (this bridge)'
-              : ` (agent ${c.agent_device_id})`;
-          const summary = c.summary ? `: ${String(c.summary).slice(0, 200)}` : '';
-          return `- ${c.id} — "${c.title || 'untitled'}" [${c.session_state || 'unknown'}]${agent}${summary}`;
-        });
+        // Rows owned by this bridge are valid targets too (same-bridge
+        // rooms): the invite is delivered locally instead of via the
+        // journal. Only the caller's OWN conversation is refused.
+        .map((c) => rosterLine(c, mine));
       // `connected`/`wakeable` are journal-composed. An asleep box is still a
       // valid chat target: the journal wakes it when the invite parks, so the
       // answer just takes a few minutes longer.
@@ -452,6 +451,207 @@ server.tool(
     }
   }
 );
+
+const SESSION_CONTROL_WHAT = "Session control is for the user's Coordinator only (the journal refuses anyone else): it acts on ANOTHER session, found by its conversation id from agent_roster or mission_get. The target bridge resumes the session if it is idle-reaped, parks the action while the session is mid-turn or waiting on a prompt, applies it at the session's next idle point, and writes a one-line notice into that session's chat saying the Coordinator did it and why. The tool returns as soon as the journal has taken the request; the outcome (applied / parked / failed) arrives in this chat as a later notice, minutes later if the target box had to be woken. Never expect an immediate effect on a running session.";
+
+server.tool(
+  'session_set_model',
+  `Switch another session's model, or move it between Claude and Codex. ${SESSION_CONTROL_WHAT} Use it when a session is stalled on a usage limit for its current model (agent_roster shows "stalled: usage limit") and waiting for the reset is not acceptable, or when the user asks for a different model on a session. A print-mode Claude session restarts to apply the switch (history kept); an interactive one applies it on its next message.`,
+  {
+    target_convo_id: z.string().describe('The target conversation id (from agent_roster or mission_get) — never this conversation'),
+    model: z.string().max(64).optional().describe('Claude: default, opus, opus[1m], sonnet, sonnet[1m], haiku, opusplan, fable, or a full claude-* name. Codex: a Codex model id, or "default". Optional when only `agent` changes.'),
+    agent: z.enum(['claude', 'codex']).optional().describe('Move the session to this backend first (the bridge hands the unseen transcript over on the next turn). Omit to keep the current one.'),
+    reason: z.string().max(200).optional().describe('One line shown in the target chat, e.g. "Fable limit reached, resets 15:00 UTC"'),
+  },
+  async ({ target_convo_id, model, agent, reason }) => sessionControlCall('/session-set-model', { target_convo_id, ...(model ? { model } : {}), ...(agent ? { agent } : {}), ...(reason ? { reason } : {}) }, 'session_set_model')
+);
+
+server.tool(
+  'session_compact',
+  `Compact another session's context (/compact at its next idle point). ${SESSION_CONTROL_WHAT} Use it when agent_roster or mission_get shows a session above about 80% of its window and it is still working; a compact goes ahead of anything else queued for that session.`,
+  {
+    target_convo_id: z.string().describe('The target conversation id (from agent_roster or mission_get) — never this conversation'),
+    reason: z.string().max(200).optional().describe('One line shown in the target chat, e.g. "context at 92%"'),
+  },
+  async ({ target_convo_id, reason }) => sessionControlCall('/session-compact', { target_convo_id, ...(reason ? { reason } : {}) }, 'session_compact')
+);
+
+server.tool(
+  'session_carry_on',
+  `Tell another session to carry on: the message is sent into it as a turn attributed to the Coordinator. ${SESSION_CONTROL_WHAT} A session stalled on a usage limit is carried on automatically by its own bridge when the limit resets (and moved to the default model if its model became unavailable), so use this for what the automatic path cannot know: a session with no reset time, one you want continued with different instructions, or one that simply stopped. With when: "after_limit_reset" the message replaces the automatic carry-on's default text and fires at the reset time (refused as not_stalled / no_reset_time when that does not apply).`,
+  {
+    target_convo_id: z.string().describe('The target conversation id (from agent_roster or mission_get) — never this conversation'),
+    message: z.string().max(2000).describe('What the session should do next, written to the agent in that session'),
+    when: z.enum(['now', 'after_limit_reset']).optional().describe('Default now. after_limit_reset: hold it until the usage-limit stall the session reported has reset.'),
+    reason: z.string().max(200).optional().describe('One line shown in the target chat'),
+  },
+  async ({ target_convo_id, message, when, reason }) => sessionControlCall('/session-carry-on', { target_convo_id, message, ...(when ? { when } : {}), ...(reason ? { reason } : {}) }, 'session_carry_on')
+);
+
+// --- Coordinator consent approval (spec 2026-09-29 coordinator consent) ---
+// consent_list / consent_decide go through the bridge loopback
+// (index.js mounts lib/consent-tools.js at /consent/<op>); the journal
+// allows both to the Coordinator alone.
+const CONSENT_WHAT = "Consent approval is for the user's Coordinator only (the journal refuses anyone else) and only for the user's own agents and boxes. It covers agent chat invites, room join requests and agent_session_start spawns — never tool permission prompts or secret requests, which stay with the user. The user always sees the card too and may answer first; every decision you make shows on the card and in the tracker as made by the Coordinator, with your reason, and the user can stop the session or mute the room with one tap. Follow the rules in your instructions: approve only what you understand and that follows the box rules, never into an offline box, give a reason every time, and leave the rest for the user.";
+
+async function callConsent(name, args, render) {
+  try {
+    const res = await fetch(`${BRIDGE_API}/consent/${name}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ roomId: ROOM_ID, ...args }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) return { content: [{ type: 'text', text: `consent_${name} failed: ${data.error || `HTTP ${res.status}`}` }] };
+    return { content: [{ type: 'text', text: render(data) }] };
+  } catch (err) {
+    return { content: [{ type: 'text', text: `consent_${name} failed: ${err.message}` }] };
+  }
+}
+
+server.tool(
+  'consent_list',
+  `List the chat invites, room join requests and spawn requests waiting for the user's approval, oldest first, each with who asks whom, the box and its state, the task or justification, and the consent_decide call to answer it. ${CONSENT_WHAT} Call it when the journal nudges you about a pending request, when your own agent_session_start or agent_chat_start is waiting, and when you sweep the state of the world.`,
+  {},
+  async () => callConsent('list', {}, formatPendingList),
+);
+
+server.tool(
+  'consent_decide',
+  `Approve or decline one waiting chat or spawn request on the user's behalf, with a reason the user will read. ${CONSENT_WHAT} The journal's operator may cap approvals per day; at that cap, and for a box that is offline, the journal refuses and the request stays for the user — say so in one line. Declines are never capped.`,
+  {
+    kind: z.enum(['chat', 'spawn']).describe('As consent_list shows it'),
+    id: z.string().max(128).describe('The request id from consent_list (a spawn id, or room_id/device_id for a chat)'),
+    decision: z.enum(['approve', 'decline']),
+    reason: z.string().min(1).max(200).describe('One line the user reads on the card and in the tracker: why this follows the rules, or why not'),
+  },
+  async (args) => callConsent('decide', args, (d) => formatDecideAck(d, args)),
+);
+
+// --- Read state (spec: matron-journal 2026-09-30 read state) ---
+// unseen_list (Coordinator), unseen_mine (any agent, its own messages) and
+// unseen_flag go through the bridge loopback (index.js mounts
+// lib/unseen-tools.js at /unseen/<op>); the journal is the gate.
+async function callUnseen(name, args, render) {
+  try {
+    const res = await fetch(`${BRIDGE_API}/unseen/${name}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ roomId: ROOM_ID, ...args }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) return { content: [{ type: 'text', text: `unseen_${name} failed: ${data.error || `HTTP ${res.status}`}` }] };
+    return { content: [{ type: 'text', text: render(data) }] };
+  } catch (err) {
+    return { content: [{ type: 'text', text: `unseen_${name} failed: ${err.message}` }] };
+  }
+}
+
+server.tool(
+  'unseen_list',
+  "List what the user hasn't actually seen — messages that were never on their screen and tracker items they haven't opened — grouped by conversation, important first, each with why it matters and a ref. Coordinator only. Importance comes from the journal: items waiting on the user, questions, unanswered prompts, a session's last message before it stopped, failures. Agent-to-agent rooms are never important on their own (what needs the user there becomes a tracker item). Use it in every status update (a short \"You haven't seen\" section, at most 5 lines) and when the journal nudges you. Things already raised (unseen_flag) are left out unless include_flagged.",
+  {
+    older_than: z.string().max(16).optional().describe("Skip what's newer than this — the user may be about to read it. Default 30m."),
+    since: z.string().max(16).optional().describe('How far back to look, e.g. 3d (default), up to 30d.'),
+    importance: z.enum(['important', 'all']).optional().describe("'important' (default) or 'all' unseen agent messages"),
+    conversation: z.string().max(128).optional().describe('Only this conversation (its id)'),
+    mission: z.number().int().min(1).optional().describe('Only this mission number'),
+    include_flagged: z.boolean().optional().describe('Include entries already raised with the user'),
+    limit: z.number().int().min(1).max(200).optional().describe('Default 50'),
+  },
+  async (args) => callUnseen('list', args, formatUnseenList),
+);
+
+server.tool(
+  'unseen_mine',
+  "Which of YOUR messages in this conversation the user hasn't seen yet — they were never on the user's screen. Check it when you finish a long turn: if something that matters went unseen, restate it once, briefly, in your closing message (\"Earlier I said X; you may have missed it\"), then unseen_flag its ref. Never repeat a restatement, and never tell the user they haven't read something.",
+  {
+    older_than: z.string().max(16).optional().describe('Skip messages newer than this. Default 10m.'),
+    room_id: z.string().max(128).optional().describe('An agent chat room you take part in, instead of this conversation'),
+  },
+  async (args) => callUnseen('mine', args, formatUnseenMine),
+);
+
+server.tool(
+  'unseen_flag',
+  "Record that you've raised these unseen entries with the user, so they are never listed or nudged about again. Pass refs exactly as unseen_list or unseen_mine gave them. An ordinary agent may only flag its own messages in this conversation.",
+  {
+    refs: z.array(z.string().max(200)).min(1).max(100).describe('Refs from unseen_list / unseen_mine'),
+  },
+  async (args) => callUnseen('flag', args, (d) => formatFlagAck(d, d.refs || args.refs)),
+);
+
+// --- Coordinator routines (spec: matron-journal 2026-10-01 coordinator routines) ---
+// routine_list / routine_update / routine_run go through the bridge loopback
+// (index.js mounts lib/routines-tools.js at /routine/<op>); the journal
+// allows all three to the Coordinator alone. Create and delete stay in the apps.
+const ROUTINE_WHAT = "A routine is a prompt the journal owns and fires into the Coordinator conversation, on a schedule or when a trigger trips (a session past a context threshold, a session stalled on a usage limit, a box low on disk), as a turn starting `[routine <name>, fired by the journal …]`, waking the box if needed — nothing in any conversation keeps it alive, so never set reminders for routine work. Coordinator only.";
+
+async function callRoutine(name, args, render) {
+  try {
+    const res = await fetch(`${BRIDGE_API}/routine/${name}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ roomId: ROOM_ID, ...args }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) return { content: [{ type: 'text', text: `routine_${name} failed: ${data.error || `HTTP ${res.status}`}` }] };
+    return { content: [{ type: 'text', text: render(data) }] };
+  } catch (err) {
+    return { content: [{ type: 'text', text: `routine_${name} failed: ${err.message}` }] };
+  }
+}
+
+server.tool(
+  'routine_list',
+  `List the user's Coordinator routines: name, title, schedule in words, next fire, last fire and outcome, paused or not. ${ROUTINE_WHAT} Call it when a routine turn seems to be missing or doubled, and when the user asks what runs when.`,
+  {},
+  async () => callRoutine('list', {}, formatRoutineList),
+);
+
+server.tool(
+  'routine_update',
+  `Pause (enabled: false), resume (enabled: true) or edit one routine — its title, schedule (five cron fields, in tz), zone, prompt, or for a triggered routine its trigger threshold. ${ROUTINE_WHAT} The schedule must fire at least 15 minutes apart. Resuming or rescheduling recomputes the next fire from now. The user creates and deletes routines in the apps (Settings ▸ Coordinator ▸ Routines); only change one when the user asks or the playbook says to.`,
+  {
+    name: z.string().max(64).describe('The routine\'s slug, as routine_list shows it'),
+    title: z.string().max(200).optional().describe('One line'),
+    schedule: z.string().max(64).optional().describe('Five cron fields: minute hour day-of-month month day-of-week, e.g. "5 7 * * *" (daily 07:05) or "0 */2 * * *" (every 2 h)'),
+    tz: z.string().max(64).optional().describe('IANA zone the schedule is in, e.g. Europe/London'),
+    prompt: z.string().max(2000).optional().describe('The turn text the journal fires; keep it one line pointing at the playbook section'),
+    enabled: z.boolean().optional().describe('false pauses, true resumes'),
+    trigger: z.object({ kind: z.enum(['context_over', 'stalled', 'disk_under']), pct: z.number().int().min(1).max(99).optional(), reset_minutes: z.number().int().min(0).optional() }).optional().describe('For a triggered routine: the rule it fires on — context_over/disk_under take pct, stalled takes reset_minutes (fire only when the reset is at least that far away, or unknown)'),
+  },
+  async (args) => callRoutine('update', args, (d) => formatRoutineUpdateAck(d, args)),
+);
+
+server.tool(
+  'routine_run',
+  `Fire one routine now, whatever its schedule or paused state says; the journal delivers its prompt to this conversation as a later turn, so do not wait or run it twice. ${ROUTINE_WHAT}`,
+  {
+    name: z.string().max(64).describe('The routine\'s slug, as routine_list shows it'),
+  },
+  async (args) => callRoutine('run', args, (d) => formatRoutineRunAck(d, args.name)),
+);
+
+async function sessionControlCall(route, body, name) {
+  try {
+    const postRes = await fetch(`${BRIDGE_API}${route}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ roomId: ROOM_ID, ...body }),
+    });
+    const data = await postRes.json().catch(() => ({}));
+    if (!postRes.ok) {
+      return { content: [{ type: 'text', text: `${name} failed: ${data.error || `HTTP ${postRes.status}`}` }] };
+    }
+    const waking = data.target_waking === true
+      ? ' The target box is asleep and is being woken; the action applies once it is up, which takes a few minutes.'
+      : '';
+    return { content: [{ type: 'text', text: `Sent to the target session's bridge.${waking} It applies at that session's next idle point (parked if it is mid-turn); the outcome arrives here as a later notice — do not poll, and do not send it again.` }] };
+  } catch (err) {
+    return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
+  }
+}
 
 server.tool(
   'restart_session',
@@ -789,7 +989,7 @@ server.tool(
 
 server.tool(
   'item_get',
-  "Read one item in full: its body and its whole comment thread — the user's answers, attachments, voice-note transcripts and status changes.",
+  "Read one item in full: its body and its whole comment thread — the user's answers, attachments, voice-note transcripts and status changes. File attachments are downloaded to disk and each is listed with the absolute path to Read it from.",
   { id: z.string().describe("Item id ('it_…') or '#12'") },
   async (args) => callItems('get', args, formatItemDetail),
 );
@@ -853,7 +1053,7 @@ server.tool(
 async function callMissions(name, args, render) {
   const payload = { roomId: ROOM_ID, ...args };
   if (name === 'start' || name === 'post' || name === 'create') {
-    payload.idem_key = missionIdemKey({ op: name, roomId: ROOM_ID, kind: args?.kind, title: args?.title, body: args?.body });
+    payload.idem_key = missionIdemKey({ op: name, roomId: ROOM_ID, kind: args?.kind, title: args?.title, body: args?.body, mission: args?.mission });
   }
   try {
     const res = await fetch(`${BRIDGE_API}/missions/${name}`, {
@@ -869,67 +1069,99 @@ async function callMissions(name, args, render) {
     return { content: [{ type: 'text', text: `${missionToolName(name)} failed: ${err.message}` }] };
   }
 }
-const missionToolName = (op) => ({ start: 'mission_start', create: 'mission_create', post: 'milestone_post', update: 'mission_update', join: 'mission_join', get: 'mission_get', close: 'mission_close' }[op] || `mission_${op}`);
+const missionToolName = (op) => ({ start: 'mission_start', create: 'mission_create', post: 'milestone_post', update: 'mission_update', join: 'mission_join', leave: 'mission_leave', get: 'mission_get', close: 'mission_close' }[op] || `mission_${op}`);
 
 server.tool(
   'mission_start',
-  "Start the mission for this conversation — the human-readable record of one piece of work, shared by every agent and app of this user. Do this as soon as you know what the work is (usually right after the user's first substantive input): name it and state the goal in body, with the whole conversation as context. Milestones are refused until the conversation has a mission. If it already has one this returns it unchanged.",
+  "Start the mission for this conversation — the human-readable record of one piece of work, shared by every agent and app of this user. Do this as soon as you know what the work is (usually right after the user's first substantive input): name it and state the goal in body, with the whole conversation as context. Milestones are refused until the conversation has a mission. If it already has a current mission this returns that one unchanged; to move on to different work, mission_create the new mission and mission_join it. Run project_list first and pass project: N when the work belongs to an existing project.",
   {
     title: z.string().describe('One line, ≤200 chars — what the work is'),
     body: z.string().optional().describe('Markdown ≤32 KiB — the goal and the standing description'),
+    project: z.number().int().min(1).optional().describe('A project number from project_list to file the mission in'),
   },
   async (args) => callMissions('start', args, formatStartAck),
 );
 
 server.tool(
   'mission_create',
-  "Create a mission WITHOUT joining this conversation to it (an unassigned mission) — for work you are handing to another agent. Assign it by starting a session with agent_session_start and mission: N, or by asking a running agent (agent_chat_start) to mission_join N. mission_start is the one that creates AND joins, for your own work. Returns the mission number.",
+  "Create a mission WITHOUT joining this conversation to it (an unassigned mission) — for work you are handing to another agent, or new work you will mission_join yourself. Assign it by starting a session with agent_session_start and mission: N, or by asking a running agent (agent_chat_start) to mission_join N. mission_start is the one that creates AND joins, for your own work when this conversation has no mission yet. Pass project: N to file it in a project. Returns the mission number.",
   {
     title: z.string().describe('One line, ≤200 chars — what the work is'),
     body: z.string().optional().describe('Markdown ≤32 KiB — the goal: what done looks like, constraints, links'),
+    project: z.number().int().min(1).optional().describe('A project number from project_list to file the mission in'),
   },
   async (args) => callMissions('create', args, formatCreateAck),
 );
 
 server.tool(
   'milestone_post',
-  "Post a milestone: a checkpoint on this conversation's mission that is also a jump target back to this exact point in the transcript. kind 'user_input' whenever an input from the user starts or redirects work (skip typos, one-word answers, clarifications) — the user's stated purpose is to get back to their last input easily. kind 'progress' as often as useful: a landed PR, a diagnosis, a decision, a phase done. There is no cap. Refused with an instruction if the conversation has no mission yet.",
+  "Post a milestone: a checkpoint on this conversation's current mission that is also a jump target back to this exact point in the transcript. kind 'user_input' whenever an input from the user starts or redirects work (skip typos, one-word answers, clarifications) — the user's stated purpose is to get back to their last input easily. kind 'progress' as often as useful: a landed PR, a diagnosis, a decision, a phase done. There is no cap. Pass `mission` to post to another mission this conversation is on (mission_get lists them). Refused with an instruction if the conversation has no mission yet.",
   {
     kind: z.enum(['user_input', 'progress']),
     title: z.string().describe('One line, ≤200 chars'),
     body: z.string().optional().describe('Markdown ≤32 KiB — what happened, in a sentence or two'),
+    mission: z.number().int().min(1).optional().describe('A mission this conversation is on; omit for the current mission'),
   },
   async (args) => callMissions('post', args, formatMilestoneAck),
 );
 
 server.tool(
   'mission_update',
-  "Rename this conversation's mission or rewrite its standing description (title and/or body). Use it when the work changes shape.",
+  "Rename a mission, rewrite its standing description, or file it in a project (project: N; null takes it out — a mission is in one project or none). Default: this conversation's current mission. Pass `mission` to change another mission — e.g. the Coordinator applying a filing the user approved.",
   {
     title: z.string().optional().describe('≤200 chars'),
     body: z.string().optional().describe('Markdown ≤32 KiB'),
+    project: z.number().int().min(1).nullable().optional().describe('A project number from project_list, or null to take the mission out of its project'),
+    mission: z.number().int().min(1).optional().describe("Another mission's number; omit for this conversation's current mission"),
   },
-  async (args) => callMissions('update', args, (d) => missionLine(d.mission)),
+  async (args) => callMissions('update', args, formatUpdateAck),
+);
+
+server.tool(
+  'mission_status',
+  "Set the mission's status — one short paragraph (≤600 chars) saying where the work is, what's next, and anything blocked or waiting on the user. It is the headline on the mission's card in the apps, so write it for the user at a glance, not as a log. Replace it whenever that picture changes: after a progress milestone, when you get blocked, when you hand off. Pass `mission` only to set another mission's status (the Coordinator does this).",
+  {
+    status: z.string().describe('One short paragraph, ≤600 characters'),
+    mission: z.number().int().min(1).optional().describe("Another mission's number (the Coordinator); omit for this conversation's mission"),
+  },
+  async (args) => callMissions('status', args, formatStatusAck),
+);
+
+server.tool(
+  'mission_list',
+  "List the user's missions — open by default, state: 'closed' for closed ones — each with its counts, its status (when and by whom) and its last milestone. The Coordinator uses it to find every mission whose status to refresh.",
+  { state: z.enum(['open', 'closed']).optional().describe("Default 'open'") },
+  async (args) => callMissions('list', args, formatMissionList),
 );
 
 server.tool(
   'mission_join',
-  'Attach this conversation to an existing mission by number (e.g. work handed over from another session). Items filed here from now on belong to that mission.',
+  "Join a mission by number and make it this conversation's current mission — milestones and new items go there by default. Use it when you move on to other work (mission_create the new mission first if it does not exist yet), or to pick up work handed over from another session. The missions this conversation was already on stay linked; mission_leave ends one.",
   { num: z.number().int().min(1).describe('The mission number, e.g. 61') },
-  async (args) => callMissions('join', args, (d) => missionLine(d.mission)),
+  async (args) => callMissions('join', args, formatJoinAck),
+);
+
+server.tool(
+  'mission_leave',
+  "End this conversation's link to a mission you are done with while the mission itself goes on (closing it is mission_close). If it was the current mission, the most recently joined remaining one becomes current, or none. The link stays in the mission's history.",
+  { num: z.number().int().min(1).describe('The mission number to leave') },
+  async (args) => callMissions('leave', args, formatLeaveAck),
 );
 
 server.tool(
   'mission_get',
-  "Read a mission: its milestones newest first, open items (awaiting the user first) and conversations. Default: this conversation's mission.",
+  "Read a mission: its milestones newest first, open items (awaiting the user first) and conversations. Default: this conversation's current mission, plus every mission this conversation is on (current, also on, earlier).",
   { num: z.number().int().min(1).optional().describe('A mission number; omit for this conversation\'s mission') },
   async (args) => callMissions('get', args, formatMissionDetail),
 );
 
 server.tool(
   'mission_close',
-  "Close this conversation's mission when the work is DONE (not when the session ends), with a summary. Refuses while items are open: close each with a real resolution, or item_move it to the mission it belongs to. Items awaiting the user block you outright — only they can clear those.",
-  { summary: z.string().describe('Markdown ≤32 KiB — how it went, what shipped, what is left') },
+  "Close this conversation's mission when the work is DONE (not when the session ends), with a summary. Refuses while items are open: close each with a real resolution, or item_move it to the mission it belongs to. Items awaiting the user block you outright — only they can clear those. Pass `mission` to close another mission by number — one this conversation is also on, or (the Coordinator) any mission whose session has gone; the same open-item rules apply, so resolve or move its items first.",
+  {
+    summary: z.string().describe('Markdown ≤32 KiB — how it went, what shipped, what is left'),
+    mission: z.number().int().min(1).optional().describe("Another mission's number — one this conversation is also on, or the Coordinator's; omit for this conversation's current mission"),
+  },
   async (args) => callMissions('close', args, (d) => missionLine(d.mission)),
 );
 
@@ -941,6 +1173,97 @@ server.tool(
     mission: z.number().int().min(1).nullable().describe('Target mission number, or null to detach'),
   },
   async (args) => callItems('move', args, (d) => itemLine(d.item)),
+);
+
+// --- Projects (spec 2026-09-30 projects §5) ---
+//
+// Same shape as callMissions: the bridge loopback (index.js mounts
+// lib/projects-tools.js at /projects/<op>), a 409 rendered as the next move,
+// other errors through the journal-error mapper — never isError, never raw
+// JSON. project_create carries an idempotency key the model never sees.
+async function callProjects(name, args, render) {
+  const payload = { roomId: ROOM_ID, ...args };
+  if (name === 'create') payload.idem_key = missionIdemKey({ op: 'project_create', roomId: ROOM_ID, title: args?.title, body: args?.body });
+  try {
+    const res = await fetch(`${BRIDGE_API}/projects/${name}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (res.status === 409) return { content: [{ type: 'text', text: `project_${name} failed: ${formatProjectBlocked(data)}` }] };
+    if (!res.ok) return { content: [{ type: 'text', text: `project_${name} failed: ${formatProjectJournalError(name, data) || `HTTP ${res.status}`}` }] };
+    return { content: [{ type: 'text', text: render(data) }] };
+  } catch (err) {
+    return { content: [{ type: 'text', text: `project_${name} failed: ${err.message}` }] };
+  }
+}
+
+const PROJECT_WHAT = 'A Project is the user\'s tracker object that groups related missions (e.g. "Promo launch" groups the launch-day mission, the promo branch and SEO phase 2) — not a working directory, and nothing to do with ~/.claude/projects. A mission is in one project or none.';
+
+server.tool(
+  'project_list',
+  `List the user's projects — open by default, state: 'closed' for closed ones — each with its status, its missions' activity (running / waiting / idle / quiet, and closed), needs-you and open-item counts, and when it last moved. Run it before you file a mission and before project_create: file into an existing project when one fits. ${PROJECT_WHAT}`,
+  { state: z.enum(['open', 'closed']).optional().describe("Default 'open'") },
+  async (args) => callProjects('list', args, formatProjectList),
+);
+
+server.tool(
+  'project_get',
+  "Read a project: its missions with their status, items awaiting the user across them, the latest milestones and sessions per box. Default: the project of this conversation's current mission.",
+  { num: z.number().int().min(1).optional().describe("A project number; omit for the project of this conversation's current mission") },
+  async (args) => callProjects('get', args, formatProjectDetail),
+);
+
+server.tool(
+  'project_create',
+  `Create a project — only after project_list shows none that fits (the Coordinator merges duplicates). Then file missions into it with mission_update project: N, or mission_start / mission_create with project: N. Returns the project number. ${PROJECT_WHAT}`,
+  {
+    title: z.string().describe('One line, ≤200 chars — what the missions in it add up to'),
+    body: z.string().optional().describe('Markdown ≤32 KiB — the goal, and what belongs in it'),
+  },
+  async (args) => callProjects('create', args, formatProjectCreateAck),
+);
+
+server.tool(
+  'project_update',
+  'Rename a project or rewrite its description (the goal it groups missions under).',
+  {
+    num: z.number().int().min(1).describe('The project number'),
+    title: z.string().optional().describe('≤200 chars'),
+    body: z.string().optional().describe('Markdown ≤32 KiB'),
+  },
+  async (args) => callProjects('update', args, (d) => projectLine(d.project)),
+);
+
+server.tool(
+  'project_status',
+  "Set a project's status — one short paragraph (≤600 chars) summing up its missions: what is moving, what waits on the user, the next date or blocker. The headline on the project's card in the apps; the Coordinator writes these in its status sweep.",
+  {
+    num: z.number().int().min(1).describe('The project number'),
+    status: z.string().describe('One short paragraph, ≤600 characters'),
+  },
+  async (args) => callProjects('status', args, formatProjectStatusAck),
+);
+
+server.tool(
+  'project_close',
+  "Close a finished project with a summary. The Coordinator only (the journal allows it to the Coordinator alone). Refused while missions in it are open — only the user closes a project with open missions.",
+  {
+    num: z.number().int().min(1).describe('The project number'),
+    summary: z.string().describe('Markdown ≤32 KiB — what the project delivered'),
+  },
+  async (args) => callProjects('close', args, (d) => projectLine(d.project)),
+);
+
+server.tool(
+  'project_merge',
+  'Merge project #num into project #into: every mission in #num moves to #into, and #num closes as "Merged into #into" (its number keeps pointing there). The Coordinator only — for near-duplicate projects; report each merge to the user.',
+  {
+    num: z.number().int().min(1).describe('The project to fold away'),
+    into: z.number().int().min(1).describe('The project to keep'),
+  },
+  async (args) => callProjects('merge', args, (d) => formatProjectMergeAck(d, args)),
 );
 
 // --- Memories (spec 2026-09-27 memories): the user's shared agent memory ---
@@ -961,24 +1284,25 @@ async function callMemory(name, args, render) {
   }
 }
 
-const MEMORY_WHAT = "The user's memories are their standing rules and facts about how they want their agents to work (which boxes to avoid, which model to use, how to report), saved in the journal, shared by every session on every box, and read by the Coordinator at the start of each of its sessions.";
+const MEMORY_WHAT = "The user's memories are their standing rules and facts about how they want their agents to work (which boxes to avoid, which model to use, how to report), saved in the journal, shared by every session on every box, and listed under \"Your memories\" in every session's instructions at spawn. Each has a scope: 'global' (every session), 'coordinator' (the user's Coordinator only) or 'repo:<name>' (sessions working in that repo); a session is given the global memories, its repo's, and all of them when it is the Coordinator.";
 
 server.tool(
   'memory_save',
-  `Save or update one of the user's memories. ${MEMORY_WHAT} Save a memory the moment the user states such a rule — one memory per rule — and confirm in one line. The \`description\` is the one line the Coordinator sees at spawn, so write it as the actionable rule itself; put the why and the how in \`body\`. The same \`name\` overwrites the WHOLE memory, so send the body back when updating one. Not for project or code facts an ordinary session should keep in its own Claude Code memory directory.`,
+  `Save or update one of the user's memories. ${MEMORY_WHAT} Save a memory the moment the user states such a rule — one memory per rule — and confirm in one line. The \`description\` is the one line every session sees at spawn, so write it as the actionable rule itself; put the why and the how in \`body\`. The same \`name\` overwrites the WHOLE memory, so send the body back when updating one. Not for project or code facts an ordinary session should keep in its own Claude Code memory directory.`,
   {
     name: z.string().describe("Kebab-case slug, unique per user: lowercase letters, digits and dashes, ≤64 chars, e.g. 'avoid-eric-and-fatima'. Reuse an existing name to update it."),
-    description: z.string().describe('One line, ≤200 chars: the rule as the Coordinator should read it.'),
+    description: z.string().describe('One line, ≤200 chars: the rule as every session should read it.'),
     body: z.string().optional().describe('Markdown, ≤8 KB: **Why:** and **How to apply:**. Omitted on an update clears the stored body — send it back.'),
     type: z.enum(['user', 'feedback', 'project', 'reference']).optional().describe("Defaults to 'feedback' (how the user wants work done). 'user' = who they are; 'project' = ongoing work or constraints; 'reference' = a pointer (URL, dashboard, ticket)."),
+    scope: z.string().optional().describe("Who the memory is for: 'global' (every session; the default on create), 'coordinator' (a rule only the Coordinator acts on: sweeps, compaction, usage limits, box capacity) or 'repo:<name>' (a rule about one repo's workflow, e.g. 'repo:yearbook-app' — the bare repo name). Omitted on an update keeps the stored scope."),
   },
   async (args) => callMemory('save', args, formatSaveAck),
 );
 
 server.tool(
   'memory_list',
-  `List the user's memories: name, type, description and when each was last updated. ${MEMORY_WHAT} Call it before deciding anything a standing rule might cover if your instructions do not already carry the list.`,
-  {},
+  `List the user's memories: name, type, scope, description and when each was last updated. ${MEMORY_WHAT} Without \`all\` an ordinary session gets the memories in its own scopes and a count of the rest; the Coordinator always gets every one. Call it before deciding anything a standing rule might cover if your instructions do not already carry the list.`,
+  { all: z.boolean().optional().describe('true = every memory in every scope, not only the ones for this session.') },
   async (args) => callMemory('list', args, formatMemoryList),
 );
 
@@ -1018,14 +1342,18 @@ async function callReminders(name, args, render) {
 
 server.tool(
   'reminder_create',
-  "Schedule a durable reminder to yourself: at the fire time the bridge delivers `text` into THIS conversation as a new turn (⏰ Reminder #N …), resuming the session if it was reaped. Unlike CronCreate / ScheduleWakeup, which live in this process and die at the bridge's idle reap (~1 h), on a restart, and when this dev box idle-stops, a reminder is persisted by the bridge, re-armed after a restart, and known to the host: the box may go to sleep meanwhile and is started again a few minutes before the reminder fires. Use this for anything further out than about an hour. The user sees a card with Send-now / Cancel buttons. Pass exactly one of `in` or `at`. A turn in progress or a background job you started that is still running already holds this session and this box awake (up to 8 hours from your last output), so a reminder is not needed for that. Set hold_awake: true ONLY when the work between now and then must not be interrupted across quiet gaps between turns (a watch, a long download you are not a parent of): it keeps this box from idle-stopping and this session from being reaped until the reminder fires, which costs shared host memory for every hour of it.",
+  "Schedule a durable reminder to yourself: at the fire time the bridge delivers `text` into THIS conversation as a new turn (⏰ Reminder #N …), resuming the session if it was reaped. Unlike CronCreate / ScheduleWakeup, which live in this process and die at the bridge's idle reap (~1 h), on a restart, and when this dev box idle-stops, a reminder is persisted by the bridge, re-armed after a restart, and known to the host: the box may go to sleep meanwhile and is started again a few minutes before the reminder fires. Use this for anything further out than about an hour. The user sees a card with Send-now / Cancel buttons. Pass exactly one of `in` or `at`. For standing check-ins (a morning and an evening sweep, say) pass `at` with `repeat: \"daily\"` and a `tz` such as \"Europe/London\": it fires at that wall-clock time every day, 08:00 staying 08:00 across the clock changes, and keeps its number until reminder_cancel ends it — set it once, never re-create it after each fire. A turn in progress or a background job you started that is still running already holds this session and this box awake (up to 8 hours from your last output), so a reminder is not needed for that. Set hold_awake: true ONLY when the work between now and then must not be interrupted across quiet gaps between turns (a watch, a long download you are not a parent of): it keeps this box from idle-stopping and this session from being reaped until the reminder fires, which costs shared host memory for every hour of it.",
   {
     text: z.string().min(1).max(2000).describe('What to tell yourself when it fires — write it for your future self, with enough context to act on'),
     in: z.string().optional().describe('Delay: 30s, 45m, 2h, 1d, 1h30m (5 s to 7 d)'),
-    at: z.string().optional().describe("Clock time on this box: 09:00, 14:30, 9pm, 12:10am — the next occurrence"),
-    hold_awake: z.boolean().optional().describe('Keep this box awake and this session un-reaped until it fires. Default false: the box may sleep and is woken for it.'),
+    at: z.string().optional().describe("Clock time on this box (or in `tz`): 09:00, 14:30, 9pm, 12:10am — the next occurrence"),
+    // Plain strings, not an enum: the bridge's own validation words the
+    // rejection (lib/reminder-tools.js), which zod's would not.
+    repeat: z.string().optional().describe('"daily" to fire at `at` every day until cancelled. Needs `at`; not with `in` or hold_awake.'),
+    tz: z.string().optional().describe('IANA time zone for `at`, e.g. "Europe/London". Default: this box\'s own zone.'),
+    hold_awake: z.boolean().optional().describe('Keep this box awake and this session un-reaped until it fires. Default false: the box may sleep and is woken for it. Not with repeat.'),
   },
-  async (args) => callReminders('create', args, (d) => `Reminder set: ${formatReminderLine(d.reminder)}${d.reminder.hold_awake ? ' — the box stays awake until then.' : ' — the box may sleep and will be woken for it.'}`),
+  async (args) => callReminders('create', args, (d) => `Reminder set: ${formatReminderLine(d.reminder)}${d.reminder.hold_awake ? ' — the box stays awake until then.' : d.reminder.repeat ? ' — it repeats every day until reminder_cancel; the box may sleep and will be woken for each one.' : ' — the box may sleep and will be woken for it.'}`),
 );
 
 server.tool(

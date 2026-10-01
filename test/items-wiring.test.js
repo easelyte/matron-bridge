@@ -33,6 +33,16 @@ describe('items tracker wiring', () => {
     expect(askUser).toMatch(/payload\.idem_key = itemIdemKey\(/);
   });
 
+  it('hands the item attachment saver to both the 📌 turn router and the item_get handler', () => {
+    // Without this an attachment on an item reaches the agent as a name only
+    // and the user has to send the file again in chat.
+    expect(index).toContain('const saveItemAttachments = createItemAttachmentSaver({');
+    const turn = index.slice(index.indexOf('const itemTurnRouter = createItemTurnRouter({'), index.indexOf('function journalOnItem('));
+    expect(turn).toContain('saveAttachments: saveItemAttachments,');
+    const tools = index.slice(index.indexOf('const itemsHandlers = createItemsHandlers({'), index.indexOf('const missionsHandlers'));
+    expect(tools).toContain('saveAttachments: saveItemAttachments,');
+  });
+
   it('registers all eight item_* tools, each posting through callItems', () => {
     for (const t of TOOLS) {
       expect(askUser, `item_${t} is not registered`).toContain(`'item_${t}',`);

@@ -1025,3 +1025,107 @@ describe('composeSpawnOpeningTurn mission line', () => {
     expect(without).not.toMatch(/mission/);
   });
 });
+
+describe('local_memories / local_memory_get', () => {
+  // The module itself is covered in test/local-memories.test.js; here the
+  // dispatcher: folder sourcing, param handling and the ok/error mapping.
+  const stub = () => {
+    const calls = { index: [], get: [] };
+    return {
+      calls,
+      localMemories: {
+        index: (args) => { calls.index.push(args); return { home: '/home/dan', claude_md: [], projects: [] }; },
+        get: (args) => {
+          calls.get.push(args);
+          if (args.path === '/home/dan/.claude/CLAUDE.md') return { ok: true, result: { path: args.path, body: 'g', offset: args.offset, next_offset: null } };
+          return { ok: false, error: { code: 'forbidden' } };
+        },
+      },
+    };
+  };
+
+  it('local_memories answers the index built over the picker\'s folder history plus the default workdir', () => {
+    const { calls, localMemories } = stub();
+    const { handler, responses } = harness({
+      localMemories,
+      listPersistedSessions: () => [{ workdir: '/w/old', lastUsed: 1 }, { workdir: '/w/new', lastUsed: 9 }],
+      listRememberedFolders: () => [{ path: '/w/mid', lastUsed: 5 }],
+    });
+    handler(REQ('local_memories', {}));
+    expect(responses).toEqual([{ requestId: 'r1', toDeviceId: 7, ok: true, result: { home: '/home/dan', claude_md: [], projects: [] } }]);
+    expect(calls.index).toEqual([{ folders: ['/w/new', '/w/mid', '/w/old', '/home/dan'], offset: 0 }]);
+  });
+
+  it('local_memories passes `project` and `offset` through and refuses malformed ones', () => {
+    const { calls, localMemories } = stub();
+    const { handler, responses } = harness({ localMemories });
+    handler(REQ('local_memories', { project: '-home-dan-repo', offset: 30 }, 'a'));
+    handler(REQ('local_memories', { project: 42 }, 'b'));
+    handler(REQ('local_memories', null, 'c'));
+    handler(REQ('local_memories', { offset: -1 }, 'd'));
+    handler(REQ('local_memories', { offset: '5' }, 'e'));
+    handler(REQ('local_memories', { claude_md_offset: 12 }, 'f'));
+    handler(REQ('local_memories', { claude_md_offset: -1 }, 'g'));
+    handler(REQ('local_memories', { claude_md_offset: 1, project: '-x' }, 'h'));
+    expect(calls.index).toEqual([
+      { folders: ['/home/dan'], project: '-home-dan-repo', offset: 30 },
+      { folders: ['/home/dan'], offset: 0 },
+      { folders: ['/home/dan'], offset: 0, claudeMdOffset: 12 },
+    ]);
+    expect(responses.map((r) => [r.requestId, r.ok, r.error?.code ?? null])).toEqual([
+      ['a', true, null], ['b', false, 'bad_request'], ['c', true, null], ['d', false, 'bad_request'], ['e', false, 'bad_request'],
+      ['f', true, null], ['g', false, 'bad_request'], ['h', false, 'bad_request'],
+    ]);
+  });
+
+  it('local_memory_get relays the module\'s result, its offset, and its error code verbatim', () => {
+    const { calls, localMemories } = stub();
+    const { handler, responses } = harness({ localMemories });
+    handler(REQ('local_memory_get', { path: '/home/dan/.claude/CLAUDE.md', offset: 10 }, 'a'));
+    handler(REQ('local_memory_get', { path: '/home/dan/.claude/CLAUDE.md' }, 'b'));
+    handler(REQ('local_memory_get', { path: '/etc/passwd' }, 'c'));
+    handler(REQ('local_memory_get', undefined, 'd'));
+    expect(calls.get.map((c) => [c.path, c.offset, c.folders])).toEqual([
+      ['/home/dan/.claude/CLAUDE.md', 10, ['/home/dan']],
+      ['/home/dan/.claude/CLAUDE.md', 0, ['/home/dan']],
+      ['/etc/passwd', 0, ['/home/dan']],
+      [undefined, 0, ['/home/dan']],
+    ]);
+    expect(responses[0]).toEqual({ requestId: 'a', toDeviceId: 7, ok: true, result: { path: '/home/dan/.claude/CLAUDE.md', body: 'g', offset: 10, next_offset: null } });
+    expect(responses[1].result.offset).toBe(0);
+    expect(responses[2]).toEqual({ requestId: 'c', toDeviceId: 7, ok: false, error: { code: 'forbidden' } });
+    expect(responses[3].error.code).toBe('forbidden');
+  });
+
+  it('a throwing module still yields exactly one internal reply', () => {
+    const { handler, responses } = harness({
+      localMemories: { index: () => { throw new Error('disk on fire'); }, get: () => { throw new Error('disk on fire'); } },
+    });
+    handler(REQ('local_memories', {}, 'a'));
+    handler(REQ('local_memory_get', { path: '/x' }, 'b'));
+    expect(responses.map((r) => [r.requestId, r.ok, r.error.code])).toEqual([['a', false, 'internal'], ['b', false, 'internal']]);
+  });
+
+  it('with no stub, the default module reads a real home: unknown paths are forbidden, nothing is written', () => {
+    const { handler, responses } = harness();
+    handler(REQ('local_memory_get', { path: '/etc/passwd' }));
+    expect(responses[0]).toEqual({ requestId: 'r1', toDeviceId: 7, ok: false, error: { code: 'forbidden' } });
+  });
+});
+
+describe('session_control', () => {
+  it('hands the params and the sender device id to controlSession and relays its answer', async () => {
+    const calls = [];
+    const { handler, responses } = harness({
+      controlSession: (params, meta) => { calls.push({ params, meta }); return { ok: true, result: { applied: 'now' } }; },
+    });
+    await handler({ request_id: 'r1', from_device_id: 0, method: 'session_control', params: { convo_id: 'c', action: 'alert', message: 'm' } });
+    expect(calls).toEqual([{ params: { convo_id: 'c', action: 'alert', message: 'm' }, meta: { fromDeviceId: 0 } }]);
+    expect(responses[0]).toMatchObject({ requestId: 'r1', toDeviceId: 0, ok: true, result: { applied: 'now' } });
+  });
+  it('relays a refusal as the error body', async () => {
+    const { handler, responses } = harness({ controlSession: () => ({ ok: false, error: { code: 'forbidden', detail: 'x' } }) });
+    await handler(REQ('session_control', { convo_id: 'c', action: 'alert', message: 'm' }));
+    expect(responses[0]).toMatchObject({ ok: false, error: { code: 'forbidden', detail: 'x' } });
+  });
+});

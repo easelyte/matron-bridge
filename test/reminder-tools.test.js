@@ -136,3 +136,81 @@ describe('reminderView / formatReminderLine', () => {
     expect(formatReminderLine(u)).toContain('set by the user with /timer');
   });
 });
+
+// repeat: "daily" + tz. A fixed UTC instant and named zones, so these hold
+// in any host TZ: 2026-09-30 05:00Z is 06:00 BST in London.
+describe('daily repeating reminders (repeat + tz)', () => {
+  const T = Date.parse('2026-09-30T05:00:00Z');
+  function daily() {
+    const store = createTimerStore({ load: () => null, save: () => {}, now: () => T, setTimer: () => 1, clearTimer: () => {}, onFire: () => {} });
+    const announce = vi.fn(async () => {});
+    const h = createReminderHandlers({
+      sessions: new Map([['!r:s', { journalConvoId: 'c1' }]]),
+      journalConvoIdFor: (s) => s.journalConvoId, timerStore: store, now: () => T, announce,
+    });
+    return { h, store, announce };
+  }
+  const create = (h, extra) => h.create({ roomId: '!r:s', text: 'run the mission and project status sweep', ...extra });
+
+  it('creates a daily reminder at a wall-clock time in the named zone', async () => {
+    const { h, store, announce } = daily();
+    const r = await create(h, { at: '08:00', repeat: 'daily', tz: 'Europe/London' });
+    expect(r.status).toBe(201);
+    expect(r.body.reminder).toMatchObject({ repeat: 'daily', at: '08:00', tz: 'Europe/London', fire_at: '2026-09-30T07:00:00.000Z', in_ms: 2 * HOUR });
+    expect(store.listForConvo('c1')[0].repeat).toEqual({ kind: 'daily', hour: 8, minute: 0, tz: 'Europe/London' });
+    expect(announce).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({ repeat: expect.objectContaining({ kind: 'daily' }) }));
+  });
+
+  it('tz defaults to this box\'s own zone, stored by name so the list can say which', async () => {
+    const { h } = daily();
+    const r = await create(h, { at: '17:00', repeat: 'daily' });
+    expect(r.status).toBe(201);
+    expect(r.body.reminder.tz).toBe(Intl.DateTimeFormat().resolvedOptions().timeZone);
+  });
+
+  it('tz also applies to a one-shot `at`', async () => {
+    const { h } = daily();
+    const r = await create(h, { at: '09:00', tz: 'America/New_York' });
+    expect(r.status).toBe(201);
+    // 05:00Z is 01:00 EDT; 09:00 EDT is 13:00Z.
+    expect(r.body.reminder.fire_at).toBe('2026-09-30T13:00:00.000Z');
+    expect(r.body.reminder.repeat).toBeUndefined();
+  });
+
+  it('rejects repeat with `in`, without `at`, an unknown repeat, a bad tz, tz with `in`, and hold_awake with repeat', async () => {
+    const { h, store } = daily();
+    const err = async (extra) => {
+      const r = await create(h, extra);
+      expect(r.status, JSON.stringify(extra)).toBe(400);
+      return r.body.error;
+    };
+    expect(await err({ in: '2h', repeat: 'daily' })).toBe("repeat: \"daily\" needs 'at' (a clock time such as 08:00), not 'in' — it fires at that time every day");
+    expect(await err({ repeat: 'daily' })).toBe("repeat: \"daily\" needs 'at' (a clock time such as 08:00), not 'in' — it fires at that time every day");
+    expect(await err({ at: '08:00', repeat: 'weekly' })).toBe('repeat must be "daily" (got "weekly")');
+    expect(await err({ at: '08:00', repeat: true })).toBe('repeat must be "daily" (got true)');
+    expect(await err({ at: '08:00', repeat: 'daily', tz: 'Mars/Olympus_Mons' })).toBe('tz must be an IANA time zone such as Europe/London or America/New_York (got "Mars/Olympus_Mons")');
+    expect(await err({ at: '08:00', tz: '+01:00' })).toMatch(/^tz must be an IANA time zone/);
+    expect(await err({ in: '2h', tz: 'Europe/London' })).toBe("tz only applies to 'at' — 'in' is a duration, the same in every zone");
+    expect(await err({ at: '08:00', repeat: 'daily', hold_awake: true })).toBe('hold_awake cannot be combined with repeat — a daily reminder would keep the box awake for good; the box is woken for each check-in anyway');
+    expect(await err({ at: '25:00', repeat: 'daily', tz: 'Europe/London' })).toMatch(/^'at' must be a clock time/);
+    expect(store.listForConvo('c1')).toEqual([]);
+  });
+
+  it('list shows a repeating reminder as repeating, with its next fire', async () => {
+    const { h } = daily();
+    await create(h, { at: '08:00', repeat: 'daily', tz: 'Europe/London' });
+    const r = await h.list({ roomId: '!r:s' });
+    expect(r.body.reminders.map(formatReminderLine)).toEqual([
+      '#1 — daily at 08:00 Europe/London, next in 2h (2026-09-30T07:00:00.000Z, set by you): "run the mission and project status sweep"',
+    ]);
+  });
+
+  it('cancel ends it for good', async () => {
+    const { h, store } = daily();
+    const a = await create(h, { at: '08:00', repeat: 'daily', tz: 'Europe/London' });
+    const c = await h.cancel({ roomId: '!r:s', id: a.body.reminder.id });
+    expect(c.status).toBe(200);
+    expect(c.body.cancelled[0]).toMatchObject({ id: a.body.reminder.id, repeat: 'daily' });
+    expect(store.listForConvo('c1')).toEqual([]);
+  });
+});

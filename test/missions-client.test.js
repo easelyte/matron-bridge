@@ -56,4 +56,28 @@ describe('createMissionsClient', () => {
     const none = createMissionsClient({ baseUrl: '', token: 't', fetchImpl });
     expect(await none.list({})).toEqual({ status: 0, data: { error: 'journal unreachable' } });
   });
+
+  it('leave and conversationMissions go to the spec 2026-09-30 routes', async () => {
+    const { fetchImpl, calls } = fakeFetch(() => ({ status: 200, body: { missions: [] } }));
+    const c = createMissionsClient({ baseUrl: 'https://j', token: 't', fetchImpl });
+    await c.leave(61, { convo_id: 'c1' });
+    await c.conversationMissions('c 1');
+    expect(calls.map((x) => `${x.init.method} ${x.url}`)).toEqual([
+      'POST https://j/missions/61/leave',
+      'GET https://j/conversations/c%201/missions',
+    ]);
+    expect(JSON.parse(calls[0].init.body)).toEqual({ convo_id: 'c1' });
+    expect(calls[1].init.body).toBeUndefined();
+  });
+
+  it('get accepts { history } and appends ?history=1 (spec 2026-09-30 §5, ruling R6)', async () => {
+    const { fetchImpl, calls } = fakeFetch(() => ({ status: 200, body: { mission: {} } }));
+    const c = createMissionsClient({ baseUrl: 'https://j', token: 't', fetchImpl });
+    await c.get(61);
+    await c.get(61, { history: true });
+    expect(calls.map((x) => x.url)).toEqual([
+      'https://j/missions/61',
+      'https://j/missions/61?history=1',
+    ]);
+  });
 });

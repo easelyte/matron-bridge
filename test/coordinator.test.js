@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { readFileSync } from 'node:fs';
+import { readFileSync, readdirSync } from 'node:fs';
 import {
   createCoordinatorLookup,
   loadCoordinatorBlock,
@@ -179,9 +179,81 @@ describe('coordinator block file', () => {
     expect(block).toMatch(/kind: "question"/);
     expect(block).toMatch(/Never call `mission_start` or `mission_join` for this conversation/);
   });
+
+  it('the fallback brief also forbids filing or closing missions without the user', () => {
+    expect(FALLBACK_COORDINATOR_BLOCK).toContain('Never move missions between projects, close them, or close a project without the user\'s answer.');
+  });
+});
+
+describe('playbook directory (spec 2026-10-01 coordinator routines)', () => {
+  const root = new URL('../coordinator/', import.meta.url);
+  const files = (sub) => readdirSync(new URL(sub, root)).filter((n) => n.endsWith('.md')).sort();
+  it('has one procedure per standard task and one section per starter routine', () => {
+    const procedures = files('procedures/').map((n) => readFileSync(new URL(`procedures/${n}`, root), 'utf8'));
+    const heads = procedures.map((t) => t.split('\n')[0]);
+    for (const want of ['sweep', 'triage a consent request', 'unstick a session', 'close missions', 'refresh mission and project statuses', 'file projects', 'infrastructure alert', 'tell the user what they missed', 'hand work to the merge train or the deploy owner']) {
+      expect(heads.some((h) => h === `## Procedure: ${want}`), want).toBe(true);
+    }
+    const routines = files('routines/');
+    expect(routines).toEqual(['context-over.md', 'daily-sweep.md', 'deploy-window.md', 'disk-low.md', 'project-status.md', 'session-health.md', 'stalled-session.md', 'unseen-digest.md']);
+    for (const n of routines) {
+      const text = readFileSync(new URL(`routines/${n}`, root), 'utf8');
+      expect(text.split('\n')[0]).toMatch(new RegExp(`^## Routine: ${n.replace(/\.md$/, '')} — `));
+    }
+  });
+  it('the preamble explains routines and the tools, and no longer tells the Coordinator to arm check-in reminders', () => {
+    const block = readFileSync(new URL('../BRIDGE_COORDINATOR.md', import.meta.url), 'utf8');
+    expect(block).toMatch(/## Your playbook and routines/);
+    expect(block).toMatch(/\[routine <name>, fired by the journal at <time>\]/);
+    expect(block).toMatch(/routine_list/);
+    expect(block).toMatch(/routine_update/);
+    expect(block).toMatch(/routine_run/);
+    expect(block).not.toMatch(/## Check-ins/);
+    expect(block).not.toMatch(/repeat: "daily"/);
+  });
+  it('the playbook stays generic: it names the user\'s memories, never one user\'s rules', () => {
+    for (const sub of ['procedures/', 'routines/']) {
+      for (const n of files(sub)) {
+        const text = readFileSync(new URL(`${sub}${n}`, root), 'utf8');
+        expect(text, n).not.toMatch(/yearbook|deploy-1|greg|dan-mac|bev\b/i);
+      }
+    }
+  });
 });
 
 describe('loadCoordinatorBlock', () => {
+  it('appends every .md under <dir>/procedures then <dir>/routines, in name order; a missing directory only warns', () => {
+    const fs = {
+      '/x': '# brief\n',
+      '/d/procedures/20-b.md': 'B', '/d/procedures/10-a.md': ' A \n', '/d/procedures/notes.txt': 'no',
+      '/d/routines/daily-sweep.md': 'R1', '/d/routines/empty.md': '  ',
+    };
+    const dirs = { '/d/procedures': ['notes.txt', '20-b.md', '10-a.md'], '/d/routines': ['empty.md', 'daily-sweep.md'] };
+    const readFile = (p) => { if (!(p in fs)) throw new Error('ENOENT'); return fs[p]; };
+    const readDir = (d) => { if (!(d in dirs)) throw new Error('ENOENT'); return dirs[d]; };
+    expect(loadCoordinatorBlock({ readFile, path: '/x', dir: '/d', readDir })).toBe('# brief\n\nA\n\nB\n\nR1');
+    const log = { warn: vi.fn() };
+    expect(loadCoordinatorBlock({ readFile, path: '/x', dir: '/nope', readDir, log })).toBe('# brief');
+    expect(log.warn).toHaveBeenCalledTimes(2);
+    // No dir: exactly the old behaviour.
+    expect(loadCoordinatorBlock({ readFile, path: '/x' })).toBe('# brief');
+    // An unreadable preamble falls back to the built-in brief but keeps the playbook (review finding 5).
+    const fallbackRead = (p) => { if (p === '/x') throw new Error('x'); return readFile(p); };
+    expect(loadCoordinatorBlock({ readFile: fallbackRead, path: '/x', dir: '/d', readDir, log })).toBe(`${FALLBACK_COORDINATOR_BLOCK}\n\nA\n\nB\n\nR1`);
+    expect(loadCoordinatorBlock({ readFile: () => { throw new Error('x'); }, path: '/x', log })).toBe(FALLBACK_COORDINATOR_BLOCK);
+  });
+  it('the real files load into one block that starts with the preamble and ends with the last routine', () => {
+    const block = loadCoordinatorBlock({
+      readFile: (p) => readFileSync(p, 'utf8'),
+      path: new URL('../BRIDGE_COORDINATOR.md', import.meta.url).pathname,
+      dir: new URL('../coordinator', import.meta.url).pathname,
+      readDir: (d) => readdirSync(d),
+    });
+    expect(block).toMatch(/^# You are this user's Coordinator/);
+    expect(block).toMatch(/## Procedure: sweep/);
+    expect(block).toMatch(/## Routine: unseen-digest/);
+    expect(block.indexOf('## Procedure: sweep')).toBeLessThan(block.indexOf('## Routine: daily-sweep'));
+  });
   it('trims the file; falls back (and warns) when unreadable or empty', () => {
     expect(loadCoordinatorBlock({ readFile: () => '  hi \n', path: '/x' })).toBe('hi');
     const warns = [];
@@ -207,10 +279,25 @@ describe('claudeCoordinatorArgs', () => {
   });
 });
 
-describe('memory block plumbing (spec 2026-09-27 memories)', () => {
-  it('an ordinary session is byte-identical with a memoryBlock given', () => {
-    expect(claudeCoordinatorArgs({ coordinator: false, basePrompt: 'BASE', block: 'BLOCK', memoryBlock: 'MEM' }).appendSystemPrompt).toBe('BASE');
-    expect(codexCoordinatorOptions({ coordinator: false, baseInstructions: 'B', block: 'K', baseSandbox: 'x', memoryBlock: 'MEM' }).developerInstructions).toBe('B');
+describe('memory block plumbing (spec 2026-09-27 memories; every session since 2026-09-29)', () => {
+  it('an ordinary session gets the memory block after the base prompt on all three spawn paths', () => {
+    const r = claudeCoordinatorArgs({ coordinator: false, basePrompt: 'BASE', block: 'BLOCK', baseDisallowed: ['AskUserQuestion'], memoryBlock: 'MEM' });
+    expect(r.appendSystemPrompt).toBe('BASE\n\nMEM');
+    expect(r.disallowedTools).toEqual(['AskUserQuestion']);
+    const c = codexCoordinatorOptions({ coordinator: false, baseInstructions: 'B', block: 'K', baseSandbox: 'x', memoryBlock: 'MEM' });
+    expect(c.developerInstructions).toBe('B\n\nMEM');
+    expect(c.sandbox).toBe('x');
+  });
+  it('an ordinary session never sees the Coordinator brief, with or without a memory block', () => {
+    for (const memoryBlock of ['MEM', '', undefined]) {
+      expect(claudeCoordinatorArgs({ coordinator: false, basePrompt: 'BASE', block: 'BLOCK', memoryBlock }).appendSystemPrompt).not.toContain('BLOCK');
+      expect(codexCoordinatorOptions({ coordinator: false, baseInstructions: 'B', block: 'K', baseSandbox: 'x', memoryBlock }).developerInstructions).not.toContain('K');
+    }
+  });
+  it('an empty memory block appends nothing, so a prompt without memories is byte-identical to before', () => {
+    expect(claudeCoordinatorArgs({ coordinator: false, basePrompt: 'BASE', block: 'BLOCK', memoryBlock: '' }).appendSystemPrompt).toBe('BASE');
+    expect(claudeCoordinatorArgs({ coordinator: false, basePrompt: 'BASE', block: 'BLOCK' }).appendSystemPrompt).toBe('BASE');
+    expect(codexCoordinatorOptions({ coordinator: false, baseInstructions: 'B', block: 'K', baseSandbox: 'x', memoryBlock: '' }).developerInstructions).toBe('B');
   });
   it('the Coordinator gets the memory block after the brief on all three paths; an empty block appends nothing', () => {
     expect(claudeCoordinatorArgs({ coordinator: true, basePrompt: 'BASE', block: 'BLOCK', memoryBlock: 'MEM' }).appendSystemPrompt).toBe('BASE\n\nBLOCK\n\nMEM');
@@ -223,12 +310,33 @@ describe('memory block plumbing (spec 2026-09-27 memories)', () => {
 });
 
 describe('renderMemoryBlock', () => {
-  const m = (name, description = `Rule ${name}.`, type = 'feedback') => ({ id: `me_${name}`, name, type, description });
-  it('lists name (type): description per memory, sorted by name', () => {
+  const m = (name, description = `Rule ${name}.`, type = 'feedback', scope) => ({ id: `me_${name}`, name, type, description, ...(scope ? { scope } : {}) });
+  it('lists name (type, scope): description per memory, sorted by name, and says which scopes are listed', () => {
     const out = renderMemoryBlock({ known: true, memories: [m('b-two'), m('a-one', 'Never use eric.', 'user')] });
     expect(out.startsWith('## Your memories\n\n')).toBe(true);
     expect(out).toContain('memory_save');
-    expect(out.endsWith('\n- a-one (user): Never use eric.\n- b-two (feedback): Rule b-two.')).toBe(true);
+    expect(out).toContain('Listed here: the global memories only (this session has no repo).\n');
+    expect(out).not.toContain('left out');
+    expect(out.endsWith('\n- a-one (user, global): Never use eric.\n- b-two (feedback, global): Rule b-two.')).toBe(true);
+  });
+  it('an ordinary session gets global and its repo, and is told what was left out and how to see it', () => {
+    const memories = [m('c-rule', 'Compact.', 'feedback', 'coordinator'), m('app-rule', 'Train.', 'project', 'repo:yearbook-app'), m('infra-rule', 'Infra.', 'project', 'repo:yearbook-infra'), m('g-rule'), m('odd', 'Odd.', 'feedback', 'team:ops')];
+    const out = renderMemoryBlock({ known: true, memories }, { coordinator: false, repo: 'yearbook-app' });
+    expect(out).toContain("Listed here: the global memories and the memories for repo:yearbook-app (this session's repo). 3 in other scopes (coordinator, repo:yearbook-infra, team:ops) are left out; memory_list with all: true shows every memory.\n");
+    expect(out.endsWith('\n- app-rule (project, repo:yearbook-app): Train.\n- g-rule (feedback, global): Rule g-rule.')).toBe(true);
+    expect(out).not.toContain('c-rule');
+    const one = renderMemoryBlock({ known: true, memories: [m('c-rule', 'Compact.', 'feedback', 'coordinator'), m('g-rule')] }, { repo: 'x' });
+    expect(one).toContain('1 in other scopes (coordinator) is left out');
+    const none = renderMemoryBlock({ known: true, memories: [m('c-rule', 'Compact.', 'feedback', 'coordinator')] }, { repo: 'x' });
+    expect(none).toMatch(/1 in other scopes \(coordinator\) is left out.*\n\nNone of them applies to this session\.$/s);
+    expect(none).not.toMatch(/no memories yet/);
+  });
+  it('the Coordinator gets every memory with its scope and is told so', () => {
+    const memories = [m('c-rule', 'Compact.', 'feedback', 'coordinator'), m('app-rule', 'Train.', 'project', 'repo:yearbook-app'), m('g-rule')];
+    const out = renderMemoryBlock({ known: true, memories }, { coordinator: true, repo: 'danbarker' });
+    expect(out).toContain('You are the Coordinator, so every memory is listed with its scope');
+    expect(out).not.toContain('left out');
+    expect(out.endsWith('\n- app-rule (project, repo:yearbook-app): Train.\n- c-rule (feedback, coordinator): Compact.\n- g-rule (feedback, global): Rule g-rule.')).toBe(true);
   });
   it('known and empty says there are none; unknown says to call memory_list and never claims none', () => {
     expect(renderMemoryBlock({ known: true, memories: [] })).toMatch(/You have no memories yet\.$/);
@@ -239,7 +347,7 @@ describe('renderMemoryBlock', () => {
   });
   it('flattens multi-line fields and skips junk entries', () => {
     const out = renderMemoryBlock({ known: true, memories: [m('x', 'line one\nline  two'), null, { name: '' }, 'junk'] });
-    expect(out).toContain('- x (feedback): line one line two');
+    expect(out).toContain('- x (feedback, global): line one line two');
     expect(out.split('\n- ')).toHaveLength(2);
   });
   it('caps the block at 16 KB and says how many were left out', () => {

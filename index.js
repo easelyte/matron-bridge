@@ -1,7 +1,7 @@
 import dotenv from 'dotenv';
 dotenv.config({ override: true });
 import { spawn, execFileSync } from 'child_process';
-import { transcribeAudio, transcribeAudioSegments } from './lib/transcribe.js';
+import { transcribeAudio, transcribeAudioSegments, resolveWhisperPrompt, makeWhisperPrompt } from './lib/transcribe.js';
 import { extractVideoFrames, videoFramesMessage } from './lib/video-frames.js';
 import { prepareInlineImage, appendInlineImageBlocks } from './lib/inline-image.js';
 import { createSendAttachmentHandler, resolveAndUploadLocalFile } from './lib/send-attachment.js';
@@ -10,9 +10,18 @@ import { createItemsHandlers } from './lib/items-tools.js';
 import { createReminderHandlers } from './lib/reminder-tools.js';
 import { createMissionsClient } from './lib/missions-client.js';
 import { createMissionsHandlers } from './lib/missions-tools.js';
+import { createProjectsClient } from './lib/projects-client.js';
+import { createProjectsHandlers } from './lib/projects-tools.js';
+import { createConsentClient } from './lib/consent-client.js';
+import { createConsentHandlers, formatConsentNudge } from './lib/consent-tools.js';
+import { createUnseenClient } from './lib/unseen-client.js';
+import { createUnseenHandlers, formatUnseenNudge } from './lib/unseen-tools.js';
+import { createRoutinesClient } from './lib/routines-client.js';
+import { createRoutineHandlers } from './lib/routines-tools.js';
 import { createMemoryClient } from './lib/memory-client.js';
 import { createMemoryHandlers } from './lib/memory-tools.js';
 import { createMemoryLookup } from './lib/memory-lookup.js';
+import { createRepoNameLookup } from './lib/repo-name.js';
 import { createCoordinatorLookup, loadCoordinatorBlock, claudeCoordinatorArgs, codexCoordinatorOptions, explicitModelFlag, explicitModelFlagForResume, coordinatorTurnText, planCoordinatorTransition, decideCoordinatorEvent, withCoordinatorModel, recreateSpawnModel, renderMemoryBlock } from './lib/coordinator.js';
 import { createServer } from 'http';
 import { createHmac, randomUUID, randomBytes } from 'crypto';
@@ -68,6 +77,7 @@ import {
 // day unit); timer feedback uses the lib's day-aware one so "/timer 7d"
 // reads "7d", not "168h".
 import { parseTimerCommand, formatDuration as formatTimerDuration, createTimerStore, timerCancelButton, timerSendNowButton, keepAwakeMarker } from './lib/timer-command.js';
+import { formatRepeat } from './lib/daily-repeat.js';
 import { sleepConfig, sleepButtons, sleepCardText, performSleep, runSleepCommand, SLEEP_NOT_CONFIGURED } from './lib/sleep-command.js';
 import { promptButtons, promptResponseForButton } from './lib/prompt-buttons.js';
 import { parseOptionReply } from './lib/prompt-reply.js';
@@ -120,6 +130,7 @@ import { createMediaDedupLedger } from './lib/media-dedup-ledger.js';
 import { createJournalPublisher, FLUSH_TIMEOUT_MS, deriveMediaHttpBaseUrl } from './lib/journal-publisher.js';
 import { createSessionStateLatch } from './lib/journal-session-state.js';
 import { createRpcRequestHandler } from './lib/journal-rpc.js';
+import { createLocalMemories } from './lib/local-memories.js';
 import { buildActivity, buildLimits, buildDisk } from './lib/spawn-capacity.js';
 import { buildBoxVitals, createCodexLimitsRefresher, BOX_STATUS_REPUBLISH_MS } from './lib/box-status.js';
 import { createOpsSnapshot, readHostSection } from './lib/ops-snapshot.js';
@@ -155,6 +166,7 @@ import {
 } from './lib/permission-registry.js';
 import { createJournalMediaRouter } from './lib/journal-media.js';
 import { createItemTurnRouter } from './lib/items-turn.js';
+import { createItemAttachmentSaver } from './lib/item-attachments.js';
 import { createSecretRequests, isOwnSecretFileName } from './lib/secret-requests.js';
 import { attachQueuedCleanup, markJournalOrigin, planQueueFlush, runQueuedCleanup } from './lib/queue-flush.js';
 import { queueFlushNotice } from './lib/queue-flush-notice.js';
@@ -168,7 +180,11 @@ import { SUMMARY_MIN_NEW } from './lib/summary-pass.js';
 import { activityStateChanged, truncateActivityDetail, shouldResumeThinkingAfterTool } from './lib/journal-activity.js';
 import { streamRefFor } from './lib/journal-stream.js';
 import { contextFullToNative, briefContextReport } from './lib/context-command.js';
-import { buildSessionStatus, contextTokensFromAssistantEvent, postCompactContextTokens, compactTriggerFrom, contextGaugeText, emailFromClaudeConfig, isSidechainEvent, reconcileModelForWindow, hostVitals, startCpuSampler, stopCpuSampler, cpuPercent, ramPercent, cpuSampledAtMs, statusRepaintDue } from './lib/session-status.js';
+import { buildSessionStatus, contextTokensFromAssistantEvent, postCompactContextTokens, compactTriggerFrom, contextGaugeText, sessionContextWindow, emailFromClaudeConfig, isSidechainEvent, reconcileModelForWindow, hostVitals, startCpuSampler, stopCpuSampler, cpuPercent, ramPercent, cpuSampledAtMs, statusRepaintDue } from './lib/session-status.js';
+import { stallFromAssistantEvent, stallResetsAt } from './lib/stall-detector.js';
+import { planSessionControl, validateControlParams, controlNotice, authorizeControl, mergeParkedSlot, JOURNAL_DEVICE_ID, JOURNAL_ONLY_ACTIONS, CONTROL_KINDS, TURN_STARTING_OPS, occupied as controlOccupied } from './lib/session-control.js';
+import { createSessionControlHandlers } from './lib/session-control-client.js';
+import { armFromStall, dueResumes, autoResumeDue, shouldCompactBefore, AUTO_RESUME_TEXT, BAD_MODEL_RECOVERY_TEXT } from './lib/auto-resume.js';
 import {
   AGENT_CLAUDE,
   AGENT_CODEX,
@@ -203,6 +219,7 @@ import { CodexTelemetryReader, codexUsageFor } from './lib/codex-telemetry.js';
 const DEFAULT_BRIDGE_CLAUDE_MD_PATH = path.join(__dirname, 'BRIDGE_CLAUDE.md');
 const DEFAULT_BRIDGE_CODEX_MD_PATH = path.join(__dirname, 'BRIDGE_CODEX.md');
 const DEFAULT_BRIDGE_COORDINATOR_MD_PATH = path.join(__dirname, 'BRIDGE_COORDINATOR.md');
+const DEFAULT_BRIDGE_COORDINATOR_DIR = path.join(__dirname, 'coordinator');
 const FALLBACK_BRIDGE_PROMPT = 'You are running through a remote Matron bridge. The user interacts through chat, not a terminal.';
 const FALLBACK_CODEX_BRIDGE_PROMPT = 'You are running through Matron chat. Work within the configured sandbox. Use native approval requests for actions requiring extra permission. Never post secrets in chat.';
 
@@ -420,6 +437,11 @@ try {
 }
 const WHISPER_MODEL_PATH = process.env.WHISPER_MODEL_PATH || path.join(os.homedir(), '.local/share/whisper-cpp/models/ggml-small.bin');
 const WHISPER_LANGUAGE = process.env.WHISPER_LANGUAGE || 'en';
+const WHISPER_PROMPT = resolveWhisperPrompt();
+// Resolved per note: the vocabulary above plus the fleet's box names from the
+// journal roster (lib/transcribe.js makeWhisperPrompt), once journalPublisher
+// exists below.
+let whisperPrompt = async () => WHISPER_PROMPT;
 
 // Server label for room names: "dev-3" → "3", fallback to SERVER_LABEL env var
 const SERVER_LABEL = process.env.SERVER_LABEL || (() => {
@@ -482,6 +504,9 @@ const SECRET_REQUESTS_FILE = path.join(os.homedir(), '.matron-bridge-secrets.jso
 const BRIDGE_CLAUDE_MD_PATH = process.env.BRIDGE_CLAUDE_MD_PATH || DEFAULT_BRIDGE_CLAUDE_MD_PATH;
 const BRIDGE_CODEX_MD_PATH = process.env.BRIDGE_CODEX_MD_PATH || DEFAULT_BRIDGE_CODEX_MD_PATH;
 const BRIDGE_COORDINATOR_MD_PATH = process.env.BRIDGE_COORDINATOR_MD_PATH || DEFAULT_BRIDGE_COORDINATOR_MD_PATH;
+// The playbook directory (spec 2026-10-01 coordinator routines): one file
+// per procedure and per routine, appended to BRIDGE_COORDINATOR.md at boot.
+const BRIDGE_COORDINATOR_DIR = process.env.BRIDGE_COORDINATOR_DIR || DEFAULT_BRIDGE_COORDINATOR_DIR;
 
 function loadBridgeSystemPrompt() {
   try {
@@ -511,6 +536,8 @@ const CODEX_BRIDGE_PROMPT = loadCodexBridgePrompt();
 const COORDINATOR_BLOCK = loadCoordinatorBlock({
   readFile: (p) => fs.readFileSync(p, 'utf-8'),
   path: BRIDGE_COORDINATOR_MD_PATH,
+  dir: BRIDGE_COORDINATOR_DIR,
+  readDir: (d) => fs.readdirSync(d),
   log: console,
 });
 
@@ -571,6 +598,33 @@ const missionsClient = createMissionsClient({
   token: _journalToken,
 });
 
+// Projects (spec 2026-09-30 projects): same base URL and token; the
+// project_* tools.
+const projectsClient = createProjectsClient({
+  baseUrl: journalHttpBase,
+  token: _journalToken,
+});
+
+// Coordinator consent approval (spec 2026-09-29 coordinator consent): same
+// base URL and token; the consent_list / consent_decide tools.
+const consentClient = createConsentClient({
+  baseUrl: journalHttpBase,
+  token: _journalToken,
+});
+
+// Read state (spec: matron-journal 2026-09-30 read state): same base URL and
+// token; the unseen_list / unseen_mine / unseen_flag tools.
+const unseenClient = createUnseenClient({
+  baseUrl: journalHttpBase,
+  token: _journalToken,
+});
+// Coordinator routines (spec: matron-journal 2026-10-01 coordinator
+// routines): the routine_* tools' journal client.
+const routinesClient = createRoutinesClient({
+  baseUrl: journalHttpBase,
+  token: _journalToken,
+});
+
 // Memories (spec 2026-09-27): same base URL and token; the memory_* tools.
 const memoryClient = createMemoryClient({
   baseUrl: journalHttpBase,
@@ -620,16 +674,24 @@ const coordinatorLookup = createCoordinatorLookup({
   log: console,
 });
 
-// The user's memories, cached for the Coordinator's spawn (spec 2026-09-27
-// memories, "The index at spawn"): lib/memory-lookup.js, refreshed on every
-// hello_ok, on every `coordinator` and `memory` event, and throttled behind
-// every spawn. memoryBlockNow() renders whatever the cache holds for the
-// three spawn builders and the live `assigned` turn.
+// The user's memories, cached for every session's spawn (spec 2026-09-27
+// memories, "The index at spawn"; every session, not only the Coordinator,
+// since 2026-09-29): lib/memory-lookup.js, refreshed on every hello_ok, on
+// every `memory` event, on every `coordinator` event with role `assigned`,
+// and throttled behind every spawn.
+// memoryBlockNow({ coordinator, workdir }) renders whatever the cache holds
+// for the three spawn builders (a resume goes through the same builders)
+// and the live `assigned` turn — the memories in that session's audience
+// (spec 2026-10-01 memory scopes): the global ones, its repo's (the repo
+// name of its workdir, lib/repo-name.js), and every one for the
+// Coordinator. One user per bridge token, so this is the session owner's
+// memories only.
 const memoryLookup = createMemoryLookup({
   baseUrl: journalHttpBase,
   token: _journalToken,
 });
-const memoryBlockNow = () => renderMemoryBlock(memoryLookup.snapshot());
+const repoNames = createRepoNameLookup();
+const memoryBlockNow = ({ coordinator, workdir }) => renderMemoryBlock(memoryLookup.snapshot(), { coordinator: coordinator === true, repo: repoNames.nameFor(workdir) });
 
 // NOTE (easelyte fork): upstream's summary-model-nag is intentionally dropped
 // here. This fork generates titles/summaries via a codex exec one-shot
@@ -679,6 +741,9 @@ let agentInvites = null;
 // pattern as agentInvites above; constructed next to agentChatHandlers, well
 // after journalPublisher and agentRooms exist.
 let agentSpawnHandlers = null;
+// Coordinator session control, calling side (lib/session-control-client.js);
+// constructed beside agentSpawnHandlers.
+let sessionControlHandlers = null;
 // onEvent is wired to journalHandleInboundEvent, defined later in this file
 // (function declarations are fully hoisted, so the forward reference is
 // safe — onEvent is only ever CALLED once the socket is live, long after the
@@ -845,13 +910,28 @@ const journalPublisher = createJournalPublisher({
   // Agent-spawn ephemeral frames (kind:'spawn') — thunked for the same
   // reason as onInviteFrame: agentSpawnHandlers is constructed later.
   onSpawnFrame: (frame) => agentSpawnHandlers?.onSpawnFrame(frame),
+  // Coordinator session-control relay frames (kind:'session_control').
+  onSessionControlFrame: (frame) => sessionControlHandlers?.onSessionControlFrame(frame),
+  // Coordinator consent nudges (kind:'consent'): another agent's ask parked.
+  onConsentFrame: (frame) => journalHandleConsentFrame(frame),
+  // Unseen nudges (kind:'unseen'): important things the user hasn't seen.
+  onUnseenFrame: (frame) => journalHandleUnseenFrame(frame),
   // Spawn correlation tries first (its waiters are request_id-keyed, same
   // style as agent-invites' own onOpError) — a `true` return means it owned
   // and consumed the ref, so the invite manager never sees it. Op-error refs
   // are never shared between the two managers, so this ordering is not a
   // race, just "ask the spawn side first."
-  onOpError: (e) => { warnRejectedConvoUpsert(e); if (agentSpawnHandlers?.onOpError?.(e)) return; agentInvites?.onOpError(e); },
+  onOpError: (e) => { warnRejectedConvoUpsert(e); if (sessionControlHandlers?.onOpError?.(e)) return; if (agentSpawnHandlers?.onOpError?.(e)) return; agentInvites?.onOpError(e); },
   ...(JOURNAL_STREAM_INTERVAL_MS ? { streamIntervalMs: JOURNAL_STREAM_INTERVAL_MS } : {}),
+});
+// Voice-note vocabulary: the built-in words (or WHISPER_PROMPT) plus this
+// user's box names from the journal roster, cached ten minutes at a time.
+whisperPrompt = makeWhisperPrompt({
+  base: WHISPER_PROMPT,
+  fetchNames: async () => {
+    const r = await journalPublisher.fetchRoster();
+    return (r?.agents || []).map((a) => a?.name);
+  },
 });
 // Used to skip the per-session buffering/bookkeeping entirely when the
 // publisher is a disabled no-op (its methods are already safe no-ops; this
@@ -1052,6 +1132,19 @@ function persistSession(roomId, sessionId, workdir, originRoomId, extra, { failL
   if (live && Number.isInteger(live.peerHandledWatermark)) {
     derived.peerHandledWatermark = live.peerHandledWatermark;
   }
+  // A usage-limit stall must survive a restart (a fleet deploy lands exactly
+  // when a stalled session is idle): carried here, restored on resume, and
+  // cleared by the next real assistant record.
+  if (live) derived._stall = live._stall || null;
+  // Parked Coordinator controls and the automatic carry-on survive a restart
+  // the same way (spec 2026-09-29 coordinator session control, Decisions).
+  if (live) derived._deferredControls = live._deferredControls || null;
+  if (live) derived._autoResume = live._autoResume || null;
+  if (live) derived._badModelRecovered = !!live._badModelRecovered;
+  if (live) derived._autoResumeRetries = live._autoResumeRetries || 0;
+  // The last gauge, so a resumed session knows whether to compact before it
+  // carries on (lib/auto-resume.js shouldCompactBefore).
+  if (live && Number.isFinite(live._lastContextTokens)) derived._lastContextTokens = live._lastContextTokens;
   const activeAgent = normalizeAgent(extra?.agent || live?.agent || existing.agent);
   const existingAgent = normalizeAgent(existing.agent) || (existing.sessionId ? AGENT_CLAUDE : null);
   const historyLength = live?.chatHistory?.length || existing.chatHistory?.length || 0;
@@ -1343,10 +1436,18 @@ const journalRpcHandler = createRpcRequestHandler({
   // lowest tier so a priority peer can preempt it, per the operator >
   // peer-priority > peer-coalesced > autonomous precedence.
   injectTurn: (session, text) => sendTextToSession(session, text, { skipJournalMirror: true, turnTier: 'autonomous' }),
+  // Coordinator session control (lib/session-control.js): resolve or resume
+  // the target, park while occupied, apply through the /model, /switch,
+  // /compact and turn-injection paths. Late-bound like joinMission.
+  controlSession: (params, meta) => journalControlSession(params, meta),
   // Spawn onto a mission: join the new conversation before its opening turn
   // (lib/journal-rpc.js start). Late-bound — missionsHandlers is constructed
   // further down; this only runs once the socket is live.
   joinMission: (session, num) => missionsHandlers.join({ roomId: session.roomId, num }),
+  // Read-only `local_memories` / `local_memory_get`: this box's CLAUDE.md
+  // files and ~/.claude/projects/*/memory/ (lib/local-memories.js). The
+  // repo list is the picker's own folder history.
+  localMemories: createLocalMemories({ homeDir: os.homedir() }),
   serverLabel: SERVER_LABEL,
   log: console,
 });
@@ -1939,14 +2040,17 @@ async function refreshCodexTelemetry(session, { force = false } = {}) {
 // in-flight promise (resolving true when the cache gained fresh lines) when
 // a fetch is running, or null when the cache is still fresh — callers use
 // the promise to repaint the status frame once new numbers land.
-function refreshUsageLimits(cwd) {
+// `force` skips the freshness check (never the in-flight dedupe): a
+// usage-limit stall means the cached meters are wrong by definition, and
+// the reset time the roster shows must come from a fetch made after it.
+function refreshUsageLimits(cwd, { force = false } = {}) {
   // The cache exists solely to feed status frames — with the journal
   // disabled nothing consumes it, and each refresh boots a claude process.
   if (!JOURNAL_ENABLED) return null;
   // Codex lines ride the same triggers on their own throttle (fire-and-forget).
   refreshCodexLimits();
   if (usageLimitsCache.inflight) return usageLimitsCache.inflight;
-  if (Date.now() - usageLimitsCache.attemptedAt < LIMITS_REFRESH_MS) return null;
+  if (!force && Date.now() - usageLimitsCache.attemptedAt < LIMITS_REFRESH_MS) return null;
   usageLimitsCache.inflight = fetchUsageLimitsText(cwd)
     .then((raw) => {
       const parsed = parseUsageLimits(raw);
@@ -2012,9 +2116,13 @@ function journalStatus(session) {
   const status = buildSessionStatus({
     model: isCodex ? codexOptions.model : session.currentModel || session.initData?.model,
     contextTokens: session._lastContextTokens,
-    // Codex supplies its real window; an unknown window must not use Claude's fallback.
-    contextWindow: isCodex ? session._codexContextWindow || null : undefined,
+    // Codex supplies its real window; an unknown window must not use Claude's
+    // fallback. Claude's is settled from the chosen alias, the id and the
+    // gauge (lib/session-status.js sessionContextWindow).
+    contextWindow: isCodex ? session._codexContextWindow || null
+      : sessionContextWindow({ model: session.currentModel || session.initData?.model, alias: session._modelAlias, contextTokens: session._lastContextTokens }),
     limits: isCodex ? (session._codexMetadata?.limits || []) : (usageLimitsCache.lines || []),
+    stall: session._stall || undefined,
     modelOptions: isCodex ? codexOptions.modelOptions : modelOptions(),
     effortLevels: isCodex ? codexOptions.effortLevels : effortOptions(),
     effort: isCodex ? codexOptions.effort : trackedEffort(session),
@@ -2363,7 +2471,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     resumeSessionId, presetId: options.presetSessionId, mintId: randomUUID,
     transcriptExists: (id) => fs.existsSync(transcriptPathFor(cwd, id)),
   });
-  const printCoord = claudeCoordinatorArgs({ coordinator: !!options.coordinator, basePrompt: BRIDGE_SYSTEM_PROMPT, block: COORDINATOR_BLOCK, baseDisallowed: ['AskUserQuestion'], memoryBlock: memoryBlockNow() });
+  const printCoord = claudeCoordinatorArgs({ coordinator: !!options.coordinator, basePrompt: BRIDGE_SYSTEM_PROMPT, block: COORDINATOR_BLOCK, baseDisallowed: ['AskUserQuestion'], memoryBlock: memoryBlockNow({ coordinator: !!options.coordinator, workdir: cwd }) });
   const args = [
     '--print',
     '--verbose',
@@ -2492,6 +2600,19 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     // Captured from system init event
     initData: null,
     currentModel: printModel || null,
+    // The alias this session was started with (`opus[1m]`), kept because
+    // currentModel is overwritten by the transcript's plain model id.
+    _modelAlias: printModel || null,
+    _stall: resumeSessionId ? (persistedMode?._stall || null) : null,
+    // Parked controls, the armed carry-on and the recovery flag belong to
+    // the ROOM (conversation), not to one process: restored whether this is
+    // a resume or a fresh process for the same room (a recreate, a first
+    // spawn of a switched-to agent).
+    _deferredControls: persistedMode?._deferredControls || null,
+    _autoResume: persistedMode?._autoResume || null,
+    _badModelRecovered: !!persistedMode?._badModelRecovered,
+    _autoResumeRetries: persistedMode?._autoResumeRetries || 0,
+    _lastContextTokens: Number.isFinite(persistedMode?._lastContextTokens) ? persistedMode._lastContextTokens : undefined,
     // Accumulated usage stats
     totalUsage: { input_tokens: 0, output_tokens: 0, cache_read: 0, cache_create: 0, cost_usd: 0 },
     turnCount: 0,
@@ -2616,7 +2737,9 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
           session._sessionConfirmed ? session.claudeSessionId : null,
           {
             agent: session.agent,
-            model: session.currentModel || undefined,
+            // The alias the session was started with, not the transcript's
+            // plain id: `opus[1m]` must survive a crash restart.
+            model: session._modelAlias || session.currentModel || undefined,
             mcpExtras: session.mcpExtras,
             // Same not-yet-persisted rationale as mcpExtras above: carry the
             // live --bypass/--auto choice explicitly so a crash restart can't
@@ -2750,7 +2873,7 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
       console.warn(`[show-file] disabled for ${roomId}: failed to pin allowed roots (${error.message})`);
     }
   }
-  const codexCoord = codexCoordinatorOptions({ coordinator: !!options.coordinator, baseInstructions: CODEX_BRIDGE_PROMPT, block: COORDINATOR_BLOCK, baseSandbox: CODEX_SANDBOX_MODE, memoryBlock: memoryBlockNow() });
+  const codexCoord = codexCoordinatorOptions({ coordinator: !!options.coordinator, baseInstructions: CODEX_BRIDGE_PROMPT, block: COORDINATOR_BLOCK, baseSandbox: CODEX_SANDBOX_MODE, memoryBlock: memoryBlockNow({ coordinator: !!options.coordinator, workdir: cwd }) });
   const Adapter = CODEX_APP_SERVER ? CodexAppServerSession : CodexExecSession;
   const codex = new Adapter({
     cwd,
@@ -2815,6 +2938,11 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
     firstMessageCaptured: false,
     initData: null,
     currentModel: model || null,
+    _stall: null,
+    // A control parked on a Codex session survives a restart too (decision C).
+    _deferredControls: persisted?._deferredControls || null,
+    _autoResume: persisted?._autoResume || null,
+    _lastContextTokens: Number.isFinite(persisted?._lastContextTokens) ? persisted._lastContextTokens : undefined,
     totalUsage: { input_tokens: 0, output_tokens: 0, cache_read: 0, cache_create: 0, cost_usd: 0 },
     turnCount: 0,
     chatHistory: [],
@@ -3242,7 +3370,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
   // buildSessionSettings('iv') (lib/session-settings.js), and any TUI prompt
   // outside it is surfaced by lib/prompt-detector.js. Upstream's iv
   // guardRootBypass(true) branch is deliberately not adopted.
-  const ivCoord = claudeCoordinatorArgs({ coordinator: !!options.coordinator, basePrompt: BRIDGE_SYSTEM_PROMPT, block: COORDINATOR_BLOCK, memoryBlock: memoryBlockNow() });
+  const ivCoord = claudeCoordinatorArgs({ coordinator: !!options.coordinator, basePrompt: BRIDGE_SYSTEM_PROMPT, block: COORDINATOR_BLOCK, memoryBlock: memoryBlockNow({ coordinator: !!options.coordinator, workdir: cwd }) });
   const claudeArgs = [...identity.cliArgs];
   claudeArgs.push(
     // AskUserQuestion is allowed in iv-mode: the TUI prompt detector
@@ -3334,6 +3462,13 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     firstMessageCaptured: false,
     initData: null,
     currentModel: model || null,
+    _modelAlias: model || null,
+    _stall: resumeSessionId ? (persistedForRoom?._stall || null) : null,
+    _deferredControls: persistedForRoom?._deferredControls || null,
+    _autoResume: persistedForRoom?._autoResume || null,
+    _badModelRecovered: !!persistedForRoom?._badModelRecovered,
+    _autoResumeRetries: persistedForRoom?._autoResumeRetries || 0,
+    _lastContextTokens: Number.isFinite(persistedForRoom?._lastContextTokens) ? persistedForRoom._lastContextTokens : undefined,
     totalUsage: { input_tokens: 0, output_tokens: 0, cache_read: 0, cache_create: 0, cost_usd: 0 },
     turnCount: 0,
     chatHistory: [],
@@ -4313,7 +4448,11 @@ function setupSubagentWatcher(session, workdir, sessionId) {
   session.subagentConvos = createSubagentConvoTracker({
     publisher: journalPublisher,
     getParentConvoId: () => journalConvoIdFor(session),
+    // The parent's settled window (alias, id and gauge) and its model: a
+    // same-family child inherits the window (lib/session-status.js
+    // subagentContextWindow).
     getParentModel: () => session.currentModel || session.initData?.model,
+    getParentWindow: () => contextWindowForSession(session),
     runningStore: subagentRunningStore,
     log: console,
   });
@@ -4590,7 +4729,68 @@ function handleClaudeEvent(session, event) {
       // own usage is deliberately NOT used: it's cumulative across all the
       // turn's API calls (see lib/session-status.js), which is how the gauge
       // once read 2m/1m.
+      // Usage-limit stall (spec 2026-09-29 coordinator session control §3):
+      // the record Claude writes when the account meter is exhausted ends
+      // the turn with nothing else, so every parent assistant record either
+      // sets or clears the flag. The reset time is read from the shared
+      // limits cache at the moment of the stall (the meter that just
+      // filled); published at once so the roster shows the stall without
+      // waiting for a turn end that may not come.
+      const stall = stallFromAssistantEvent(event);
       const assistantCtxTokens = contextTokensFromAssistantEvent(event);
+      if (stall) {
+        // The error record's own model is a placeholder; the session's
+        // current model is the one that hit the limit. `since` is the first
+        // stall, not the latest retry while still limited.
+        session._stall = {
+          ...stall,
+          model: stall.model || session.currentModel || undefined,
+          since: session._stall?.since ?? Date.now(),
+          resets_at: stallResetsAt(usageLimitsCache.lines),
+        };
+        journalStatus(session);
+        if (stall.kind === 'bad_model') {
+          // §4: one automatic recovery — default model, then carry on.
+          recoverBadModel(session);
+        } else {
+          // §4: the bridge carries the session on by itself once the meter
+          // resets (armFromStall keeps a Coordinator's message for the same
+          // stall). Re-armed below when the forced refresh brings the real
+          // reset time.
+          session._autoResume = armFromStall(session._stall, session._autoResume, Date.now(), session._autoResumeRetries || 0);
+          if (session._autoResume?.retry) session._autoResumeRetries = session._autoResume.retry;
+          persistControlState(session);
+        }
+        // The cached meters predate the stall by definition — fetch fresh
+        // ones past the cache TTL and republish once the reset time is known.
+        const refresh = refreshUsageLimits(session.workdir || DEFAULT_WORKDIR, { force: true });
+        if (refresh) {
+          refresh.then((updated) => {
+            if (!updated || !session.alive || !session._stall) return;
+            session._stall.resets_at = stallResetsAt(usageLimitsCache.lines);
+            if (session._stall.kind === 'usage_limit') {
+              session._autoResume = armFromStall(session._stall, session._autoResume, Date.now(), session._autoResumeRetries || 0);
+              if (session._autoResume?.retry) session._autoResumeRetries = session._autoResume.retry;
+              persistControlState(session);
+            }
+            journalStatus(session);
+          });
+        }
+      } else if (assistantCtxTokens) {
+        // Only a record with real usage — an answer the API accepted, which
+        // proves the limit has lifted — clears a stall. A stall record has
+        // zero usage, and so does anything synthetic; a restored stall on a
+        // resumed session therefore survives until Claude really answers
+        // (a resume-time filler that reaches the API counts, because it
+        // could only have been served past the limit).
+        session._stall = null;
+        if (session._autoResume || session._badModelRecovered || session._autoResumeRetries) {
+          session._autoResume = null;
+          session._badModelRecovered = false;
+          session._autoResumeRetries = 0;
+          persistControlState(session);
+        }
+      }
       if (assistantCtxTokens) {
         session._lastContextTokens = assistantCtxTokens;
         // Live header: repaint mid-turn so a long tool-heavy turn doesn't
@@ -8425,9 +8625,13 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
             : `No timer #${parsed.which} in this conversation. /timer lists the active ones.`);
           break;
         }
+        // Daily check-ins (reminder_create repeat: "daily") end for good
+        // here, so `cancel all` names them rather than folding them into a
+        // count the user may read as one-shot timers.
+        const daily = cancelled.filter(t => t.repeat).length;
         await sendReply(cancelled.length === 1
-          ? `🚫 Cancelled timer #${cancelled[0].id} ("${cancelled[0].text}").`
-          : `🚫 Cancelled ${cancelled.length} timers.`);
+          ? `🚫 Cancelled timer #${cancelled[0].id} ("${cancelled[0].text}").${cancelled[0].repeat ? ' It will not repeat.' : ''}`
+          : `🚫 Cancelled ${cancelled.length} timers${daily ? ` (including ${daily} daily check-in${daily === 1 ? '' : 's'})` : ''}.`);
         break;
       }
       // 'list'
@@ -8436,7 +8640,11 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         await sendReply('No timers set. Usage: /timer <duration|time> <message> — e.g. /timer 2h hey, /timer 30m /compact, or /timer 09:00 standup.');
         break;
       }
-      const lines = active.map(t => `#${t.id} — in ${formatTimerDuration(t.fireAt - Date.now())}: "${t.text}"`);
+      // A daily reminder the agent set (reminder_create repeat: "daily") shows
+      // up here too; say it repeats, and that "in" is its next fire.
+      const lines = active.map(t => t.repeat
+        ? `#${t.id} — ${formatRepeat(t.repeat)}, next in ${formatTimerDuration(t.fireAt - Date.now())}: "${t.text}"`
+        : `#${t.id} — in ${formatTimerDuration(t.fireAt - Date.now())}: "${t.text}"`);
       await sendReply(`⏰ Timers for this conversation:\n${lines.join('\n')}\n\n/timer cancel <id|all> to cancel.`);
       break;
     }
@@ -9079,7 +9287,7 @@ function isCanonicalLiveSession(session) {
 
 const journalMediaRouter = createJournalMediaRouter({
   fetchMedia: (blobRef) => journalPublisher.fetchMedia(blobRef),
-  transcribe: (buffer, mime) => transcribeAudio(buffer, mime, { modelPath: WHISPER_MODEL_PATH, language: WHISPER_LANGUAGE }),
+  transcribe: async (buffer, mime) => transcribeAudio(buffer, mime, { modelPath: WHISPER_MODEL_PATH, language: WHISPER_LANGUAGE, prompt: await whisperPrompt() }),
   // A video becomes a directory of timestamped key-frame JPEGs plus one text
   // turn listing them — claude Reads frames selectively, so a long recording
   // costs context only for the frames actually opened. Frames land next to
@@ -9100,7 +9308,7 @@ const journalMediaRouter = createJournalMediaRouter({
     let narration = null;
     if (result.hasAudio) {
       try {
-        narration = await transcribeAudioSegments(buffer, mime, { modelPath: WHISPER_MODEL_PATH, language: WHISPER_LANGUAGE });
+        narration = await transcribeAudioSegments(buffer, mime, { modelPath: WHISPER_MODEL_PATH, language: WHISPER_LANGUAGE, prompt: await whisperPrompt() });
       } catch (e) {
         console.warn(`[journal-media] video narration transcription failed for ${safeName}: ${e.message} — delivering frames without it`);
       }
@@ -9211,9 +9419,20 @@ async function journalQueueMedia(session, { blocks, mirrorToJournal, preview, fu
 // journal — the marker IS the durable record, so injecting passes
 // skipJournalMirror and the queued entry passes mirrorToJournal:false; a
 // mirror would show the user their own reply back as a second message.
+// A file attached to a tracker item is downloaded for the agent — by the 📌
+// turn and by item_get — into the same place a file sent in chat lands (iv
+// upload dir for a PTY session, ~/matron-files/<repo>/ otherwise), so the
+// user never has to send an item's attachment a second time in chat.
+const saveItemAttachments = createItemAttachmentSaver({
+  fetchMedia: (blobRef) => journalPublisher.fetchMedia(blobRef),
+  dirFor: (session) => (session?.iv ? ivUploadDir(session.roomId) : matronFilesDir(session?.workdir)),
+  log: console,
+});
+
 const itemTurnRouter = createItemTurnRouter({
   fetchMedia: (blobRef) => journalPublisher.fetchMedia(blobRef),
-  transcribe: (buffer, mime) => transcribeAudio(buffer, mime, { modelPath: WHISPER_MODEL_PATH, language: WHISPER_LANGUAGE }),
+  saveAttachments: saveItemAttachments,
+  transcribe: async (buffer, mime) => transcribeAudio(buffer, mime, { modelPath: WHISPER_MODEL_PATH, language: WHISPER_LANGUAGE, prompt: await whisperPrompt() }),
   injectBlocks: (session, blocks) => sendToSession(session, blocks, { skipJournalMirror: true }),
   queueText: (session, { text, preview }) => journalQueueMedia(session, {
     blocks: [{ type: 'text', text }],
@@ -9354,7 +9573,8 @@ async function journalOnCoordinator(convoId, { role }) {
     session._coordinatorPending = role;
     if (session.busy && !session._deferredCommandText) session._deferredCommandText = '!restart --force';
   }
-  await deliverCoordinatorTurn(sessions.get(roomId) || session, coordinatorTurnText(role, COORDINATOR_BLOCK, memoryBlockNow()));
+  const target = sessions.get(roomId) || session;
+  await deliverCoordinatorTurn(target, coordinatorTurnText(role, COORDINATOR_BLOCK, memoryBlockNow({ coordinator: role === 'assigned', workdir: target?.workdir })));
 }
 
 // The injected assigned/released turn. Same inject-or-queue rule as a
@@ -9719,6 +9939,10 @@ async function carryOnConvo(convoId, session, _sendReply) {
 // of the send: journalRouteTextToSession's delivery paths all skip the
 // journal mirror (they assume the client already has its own send row,
 // which a timer-fired message never does).
+// A daily reminder (record.repeat) is delivered exactly like a one-shot; the
+// store has already kept it and re-arms it for the next occurrence right
+// after this is kicked off (lib/timer-command.js fireRepeating) — the notice
+// says so, so the user knows it will come back.
 async function fireTimer(record) {
   let session = findSessionByClaudeSessionId(record.convoId);
   if (!session || !session.alive) session = journalResumeConvo(record.convoId);
@@ -9730,7 +9954,8 @@ async function fireTimer(record) {
   if (record.source === 'agent') {
     // Set by the agent through reminder_create: the delivered turn says so,
     // or the model reads its own reminder as something the user just typed.
-    journalPublishNotice(journalConvoIdFor(session), `⏰ Reminder #${record.id} (set by the agent): "${record.text}"`);
+    const repeats = record.repeat ? `, ${formatRepeat(record.repeat)}` : '';
+    journalPublishNotice(journalConvoIdFor(session), `⏰ Reminder #${record.id} (set by the agent${repeats}): "${record.text}"`);
     await journalRouteTextToSession(session,
       `⏰ Reminder #${record.id} — you set this ${formatTimerDuration(Date.now() - record.createdAt)} ago: ${record.text}`);
     return;
@@ -9794,11 +10019,16 @@ function formatTimerFireAt(record) {
 // Send-now / Cancel card a typed /timer gets, so the user can see and undo
 // what their agent scheduled from the phone. Falls back to a plain notice
 // where the session cannot publish picker frames.
+// A daily reminder's card says so, and what its two buttons do to it: Send
+// now is an extra delivery (the schedule stands), Cancel ends it for good.
 async function announceAgentReminder(session, record) {
   const hold = record.holdAwake ? ' It keeps this box awake (and the session un-reaped) until then.' : '';
-  const summary =
-    `⏰ The agent set itself reminder #${record.id} — in ${formatTimerDuration(record.fireAt - Date.now())} ` +
-    `(at ${formatTimerFireAt(record)}): "${record.text}".${hold}`;
+  const summary = record.repeat
+    ? `⏰ The agent set itself a daily reminder #${record.id} — ${formatRepeat(record.repeat)}, ` +
+      `first in ${formatTimerDuration(record.fireAt - Date.now())} (at ${formatTimerFireAt(record)}): "${record.text}". ` +
+      'Send now delivers it once extra and never moves the schedule; Cancel stops it for good.'
+    : `⏰ The agent set itself reminder #${record.id} — in ${formatTimerDuration(record.fireAt - Date.now())} ` +
+      `(at ${formatTimerFireAt(record)}): "${record.text}".${hold}`;
   if (session.sendButtonMessage) {
     await session.sendButtonMessage(
       summary,
@@ -9855,15 +10085,17 @@ function cancelTimerFromButton(session, timerId, sendReply) {
     sendReply(`No timer #${timerId} in this conversation — it may have already fired or been cancelled. /timer lists the active ones.`);
     return;
   }
-  sendReply(`🚫 Cancelled timer #${cancelled[0].id} ("${cancelled[0].text}").`);
+  sendReply(`🚫 Cancelled timer #${cancelled[0].id} ("${cancelled[0].text}").${cancelled[0].repeat ? ' It will not repeat.' : ''}`);
 }
 
 // A tap on the same card's Send-now button (value timer:send:<id>): deliver
 // the scheduled message immediately instead of waiting out the delay. The
-// store's fireNow routes through the SAME fire path as a natural expiry, so
+// store's fireNow routes through the SAME delivery (onFire) as a natural expiry, so
 // delivery gets the "⏰ Timer #N: sending …" notice and the auto-resume
 // behavior for free — no extra success reply needed here. Only the
-// nothing-matched case (already fired / cancelled elsewhere) speaks.
+// nothing-matched case (already fired / cancelled elsewhere) speaks. A daily
+// reminder is delivered and its schedule is left untouched (lib/timer-command.js
+// fireNow) — a tap just before an occurrence still gets that occurrence too.
 function sendTimerNowFromButton(session, timerId, sendReply) {
   const convoId = journalConvoIdFor(session);
   const fired = convoId ? timerStore.fireNow(convoId, timerId) : null;
@@ -9998,8 +10230,336 @@ function sessionOccupiedForRoomDelivery(session) {
 // journalOnRoomFrame self-heal): flush the coalesced room inbox ONLY when
 // the session is genuinely free, by the SAME composite predicate that routes
 // deliver()'s busy/idle branches — so the two can never disagree.
+// --- Automatic carry-on (lib/auto-resume.js, spec §4, decision D) ---
+//
+// A Claude session stalled on a usage limit carries itself on when the
+// meter resets: the stall arms `session._autoResume` (persisted), a
+// one-minute sweep fires due slots on live sessions and on persisted ones
+// with no live session (a box the journal woke for exactly this), and the
+// delivery is a resume if needed, a /compact when the last gauge was high,
+// then the carry-on text as a turn. A session whose model became
+// unavailable gets one recovery: the default model, then carry on.
+const AUTO_RESUME_SWEEP_MS = 60_000;
+
+function contextWindowForSession(session) {
+  if (session.agent === AGENT_CODEX) return session._codexContextWindow || null;
+  return sessionContextWindow({ model: session.currentModel || session.initData?.model, alias: session._modelAlias, contextTokens: session._lastContextTokens });
+}
+
+async function fireAutoResume(roomId, convoId, slot) {
+  let session = sessions.get(roomId);
+  if (!session || !session.alive) session = convoId ? journalResumeConvo(convoId, '⏳ The usage limit has reset — resuming this session to carry on.') : null;
+  if (!session) {
+    debug(`auto-resume: ${roomId} could not be resumed`);
+    return;
+  }
+  // A resume hold, a running turn or an open prompt: not now. The slot
+  // stays armed and the next sweep tries again — routing into a hold would
+  // merge the /compact and the carry-on into one typed line.
+  if (controlOccupied(session)) return;
+  session._autoResume = null;
+  persistControlState(session);
+  // A deferred model recovery is retried as a recovery, not as a turn on
+  // the still-unavailable model.
+  if (slot.kind === 'bad_model') { recoverBadModel(session); return; }
+  postControlNotice(session, slot.kind === 'model_recovery'
+    ? '🕒 Model switched — carrying on.'
+    : slot.source === 'coordinator'
+      ? '🕒 The usage limit has reset — sending the Coordinator\'s carry-on now.'
+      : '🕒 The usage limit has reset — carrying on automatically.');
+  try {
+    if (shouldCompactBefore(session._lastContextTokens, contextWindowForSession(session))) {
+      await journalRouteTextToSession(session, '/compact');
+    }
+    await journalRouteTextToSession(sessions.get(roomId) || session, slot.text || (slot.kind === 'model_recovery' ? BAD_MODEL_RECOVERY_TEXT : AUTO_RESUME_TEXT));
+  } catch (e) {
+    console.warn(`[auto-resume] carry-on failed for ${roomId}: ${e.message}`);
+    // A thrown delivery must not lose the carry-on: put the slot back for
+    // the next sweep unless something newer was armed meanwhile.
+    const live = sessions.get(roomId) || session;
+    if (!live._autoResume) { live._autoResume = slot; persistControlState(live); }
+  }
+}
+
+function runAutoResumeSweep(now = Date.now()) {
+  const seen = new Set();
+  for (const [roomId, session] of sessions) {
+    if (!session.alive || !session._autoResume) continue;
+    seen.add(roomId);
+    if (autoResumeDue(session._autoResume, now)) void fireAutoResume(roomId, journalConvoIdFor(session), session._autoResume);
+  }
+  let records;
+  try { records = loadPersistedSessions(); } catch { return; }
+  for (const due of dueResumes(records, now)) {
+    if (seen.has(due.roomId) || sessions.get(due.roomId)?.alive) continue;
+    void fireAutoResume(due.roomId, due.convoId, due.slot);
+  }
+}
+
+function startAutoResumeSweep() {
+  const timer = setInterval(() => { try { runAutoResumeSweep(); } catch (e) { console.warn(`[auto-resume] sweep failed: ${e.message}`); } }, AUTO_RESUME_SWEEP_MS);
+  if (typeof timer.unref === 'function') timer.unref();
+  return timer;
+}
+
+// A session that was waiting for its limit to reset has just been moved to
+// another model: the reason to wait is gone, so the armed carry-on fires at
+// the next sweep instead of at the old reset time (Bugbot: it would
+// otherwise inject a turn hours later into a session that had moved on).
+function bringAutoResumeForward(session) {
+  if (!session?._autoResume) return;
+  session._autoResume = { ...session._autoResume, at: new Date().toISOString() };
+  persistControlState(session);
+}
+
+// §4: the model this session was on is unavailable here. Once per stall:
+// switch to the default model (explicit:false — a later assignment may
+// change it again) and carry on; a second failure is left for a human.
+function recoverBadModel(session) {
+  if (session.agent === AGENT_CODEX) return;
+  if (session._badModelRecovered) {
+    postControlNotice(session, '⚠️ The default model is not available either — this session needs a person (or the Coordinator) to pick a model with /model.');
+    return;
+  }
+  const ctx = journalSessionCommandCtx(session);
+  const switched = !controlOccupied(session)
+    && applyModelSwitch(session.roomId, session, 'default', { sendReply: ctx.sendReply, sendHtml: ctx.sendHtml, explicit: false });
+  if (!switched) {
+    // Refused (a resume hold, a busy turn, a TUI not ready): the one
+    // recovery is NOT spent. Retry through the sweep in a minute — the
+    // carry-on will hit the bad model again and land back here, free.
+    session._autoResume = { at: new Date(Date.now() + 60_000).toISOString(), kind: 'bad_model', text: BAD_MODEL_RECOVERY_TEXT };
+    persistControlState(session);
+    postControlNotice(session, '🛠 The model this session was on is no longer available — the switch to the default model will be retried in a minute.');
+    return;
+  }
+  // A print-mode switch recreated the process: the state must land on the
+  // REPLACEMENT session (it restored the persisted slot and flag), not on
+  // the dead object, or the replacement recovers again and fires a second
+  // carry-on.
+  const next = sessions.get(session.roomId) || session;
+  next._badModelRecovered = true;
+  // The carry-on (with a /compact first when the gauge is high) goes
+  // through the sweep, not now: an interactive switch has just typed
+  // /model into the PTY and a second line on its heels would land on top
+  // of it (Bugbot), and a print-mode switch has just recreated the
+  // process. The slot replaces any earlier one, so exactly one carry-on
+  // follows, once the session is settled and free.
+  next._autoResume = { at: new Date().toISOString(), kind: 'model_recovery', text: BAD_MODEL_RECOVERY_TEXT };
+  persistControlState(next);
+  postControlNotice(next, '🛠 The model this session was on is no longer available — switched to the default model; carrying on once the switch has settled.');
+}
+
+// --- Coordinator session control, target side (lib/session-control.js) ---
+//
+// The journal relays a session_control RPC only from the user's Coordinator.
+// The session it aims at is usually NOT live (idle-reaped, or on a box that
+// was just woken), so it is resumed on demand exactly as a user's message
+// would resume it; then the planner decides: apply now, park until the
+// session is free (one slot per action kind, persisted, drained from
+// maybeFlushRoomDelivery — the shared "session is free" gate), schedule a
+// carry-on for the usage-limit reset, or refuse. Every outcome leaves a
+// notice in the session's own chat (decision B).
+function boxLabelForControl() {
+  try { return journalPublisher.identity?.()?.name || SERVER_LABEL || os.hostname(); } catch { return SERVER_LABEL || 'this box'; }
+}
+
+function postControlNotice(session, text) {
+  const n = notice('info', text);
+  if (session && typeof session.sendHtml === 'function') {
+    try { session.sendHtml(n.plain, n.html); return; } catch { /* fall through */ }
+  }
+  journalPublishNotice(journalConvoIdFor(session), text);
+}
+
+function persistControlState(session) {
+  if (!session?.roomId) return;
+  try { persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId); } catch (e) { debug(`session-control: persist failed: ${e.message}`); }
+}
+
+async function journalControlSession(rawParams, { fromDeviceId } = {}) {
+  const v = validateControlParams(rawParams);
+  if (!v.ok) return { ok: false, error: { code: v.code, ...(v.detail ? { detail: v.detail } : {}) } };
+  const params = v.params;
+  // A journal-originated alert must come from the journal itself and aim
+  // at the journal's CURRENT Coordinator (never a spawn-time flag, see
+  // journalHandleConsentFrame). Checked before the target is resolved, so
+  // a refused alert never resumes a session. The cached role can be cold
+  // or stale (a box woken to take this very alert has only kicked its
+  // GET /coordinator off, not awaited it — Bugbot), so a journal alert that
+  // does not match the cache waits for one forced refresh before it is
+  // refused. Only from device 0: a forged sender never costs a journal GET.
+  let coordinator = coordinatorLookup.snapshot();
+  if (JOURNAL_ONLY_ACTIONS.has(params.action) && fromDeviceId === JOURNAL_DEVICE_ID && (!coordinator.known || coordinator.convoId !== params.convoId)) {
+    coordinator = await coordinatorLookup.refresh({ force: true });
+  }
+  const denied = authorizeControl({ params, fromDeviceId, coordinatorConvoId: coordinator.convoId });
+  if (denied) return { ok: false, error: denied };
+  let session = findSessionByClaudeSessionId(params.convoId);
+  if (!session || !session.alive) session = journalResumeConvo(params.convoId, JOURNAL_RESUME_NOTICE);
+  if (!session) {
+    const known = Object.values(loadPersistedSessions()).some((p) => p && (p.journalConvoId === params.convoId || p.sessionId === params.convoId));
+    return { ok: false, error: { code: known ? 'gone' : 'not_found' } };
+  }
+  const box = boxLabelForControl();
+  const plan = planSessionControl({ params, session, canSwitch: canSwitchAgent });
+  switch (plan.kind) {
+    case 'error':
+      postControlNotice(session, controlNotice(params, { error: plan.detail || plan.code, agent: session.agent }));
+      return { ok: false, error: { code: plan.code, ...(plan.detail ? { detail: plan.detail } : {}) } };
+    case 'park':
+      // The id is what the drain settles by: a print-mode recreate rebuilds
+      // the session (and its restored slots) from persisted JSON, so object
+      // identity cannot tell "the slot I applied" from "a newer one".
+      // Parked alerts are appended to one another, never replaced
+      // (mergeParkedSlot); every other kind is latest-wins.
+      session._deferredControls = { ...(session._deferredControls || {}), [plan.slot.kind]: { ...mergeParkedSlot(session._deferredControls?.[plan.slot.kind], plan.slot), id: randomUUID() } };
+      persistControlState(session);
+      postControlNotice(session, controlNotice(params, { phase: 'deferred', agent: session.agent }));
+      return { ok: true, result: { applied: 'deferred', box } };
+    case 'schedule':
+      session._autoResume = { at: plan.at, text: plan.text, kind: 'usage_limit', source: 'coordinator' };
+      persistControlState(session);
+      postControlNotice(session, controlNotice(params, { phase: 'scheduled', resetsAt: plan.at, agent: session.agent }));
+      return { ok: true, result: { applied: 'scheduled', at: plan.at, box } };
+    case 'apply': {
+      postControlNotice(session, controlNotice(params, { phase: 'now', agent: session.agent }));
+      const r = await applyControlSteps(session, plan.steps);
+      if (!r.ok) {
+        postControlNotice(sessions.get(session.roomId) || session, controlNotice(params, { error: r.error.detail || r.error.code, agent: session.agent }));
+        return { ok: false, error: r.error };
+      }
+      return { ok: true, result: { applied: 'now', box, ...(r.detail ? { detail: r.detail } : {}) } };
+    }
+    default:
+      return { ok: false, error: { code: 'internal' } };
+  }
+}
+
+// Runs the planner's steps through the existing paths: /switch
+// (switchAgentSession, idle-only), /model (applyModelSwitch — a print-mode
+// switch recreates the process, so later steps re-read the room's session),
+// /compact (journalRouteTextToSession: Codex native, Claude typed/stdin) and
+// a Coordinator-attributed turn (sendTextToSession). Replies these paths
+// make land in the session chat via its command context.
+async function applyControlSteps(session, steps) {
+  let current = session;
+  const ctx = journalSessionCommandCtx(current);
+  let startedTurn = false;
+  for (const step of steps) {
+    if (!current || !current.alive) return { ok: false, error: { code: 'gone', detail: 'the session ended mid-action' } };
+    if (step.op === 'switch_agent') {
+      // The model rides INTO the switch: switchAgentSession creates the new
+      // backend's session on agentSessions[target].model, so write it there
+      // first rather than typing /model into a session still starting up.
+      if (step.model) {
+        const persisted = getPersistedSession(current.roomId) || {};
+        const historyLength = Array.isArray(current.chatHistory) ? current.chatHistory.length : 0;
+        const targetState = { ...getPersistedAgentState(persisted, step.agent, historyLength), model: step.agent === AGENT_CLAUDE ? normalizeModelArg(step.model) : step.model };
+        persistSession(current.roomId, current.claudeSessionId, current.workdir, current.originRoomId,
+          { agentSessions: mergeAgentStates(persisted.agentSessions, { [step.agent]: targetState }) });
+      }
+      const next = await switchAgentSession(current.roomId, step.agent, { sendReply: ctx.sendReply });
+      if (!next) return { ok: false, error: { code: 'unsupported', detail: 'the agent switch was refused' } };
+      current = next;
+    } else if (step.op === 'set_model') {
+      if (!applyModelSwitch(current.roomId, current, step.model, { sendReply: ctx.sendReply, sendHtml: ctx.sendHtml, explicit: true })) {
+        return { ok: false, error: { code: 'unsupported', detail: 'the model switch was refused' } };
+      }
+      current = sessions.get(current.roomId) || current;
+    } else if (step.op === 'compact') {
+      await journalRouteTextToSession(current, '/compact');
+      startedTurn = true;
+    } else if (step.op === 'carry_on') {
+      if (!sendTextToSession(current, step.text, { skipJournalMirror: true })) {
+        return { ok: false, error: { code: 'gone', detail: 'the session would not take a turn' } };
+      }
+      startedTurn = true;
+    }
+  }
+  return { ok: true, startedTurn };
+}
+
+// Parked slots, drained at the shared free gate (maybeFlushRoomDelivery) in
+// CONTROL_KINDS order — a turn and a compact first (they ride the queue a
+// print-mode recreate carries), the model/agent switch last. Returns true
+// when something was started, so the caller leaves room delivery to the
+// next seam rather than injecting into a turn this drain just began.
+function drainDeferredControls(session) {
+  const slots = session?._deferredControls;
+  if (!slots || typeof slots !== 'object' || session._drainingControls) return false;
+  const kinds = CONTROL_KINDS.filter((k) => slots[k] && slots[k].params);
+  if (!kinds.length) { session._deferredControls = null; return false; }
+  // A slot stays parked (and persisted) until it has been applied, refused
+  // or scheduled — a bridge that stops mid-drain restores it and drains it
+  // again rather than losing it (CodeRabbit). The in-memory flag keeps the
+  // seams from starting a second drain meanwhile. A slot a newer request
+  // parks during the drain replaces the old object and is left for the
+  // next seam (latest wins, never double-applied).
+  session._drainingControls = true;
+  const settle = (target, kind) => {
+    const held = target._deferredControls && target._deferredControls[kind];
+    if (held && (held === slots[kind] || (held.id && held.id === slots[kind].id))) {
+      const rest = { ...target._deferredControls };
+      delete rest[kind];
+      target._deferredControls = Object.keys(rest).length ? rest : null;
+    }
+    persistControlState(target);
+  };
+  void (async () => {
+    let current = session;
+    let startedTurn = false;
+    try {
+      for (let i = 0; i < kinds.length; i++) {
+        const kind = kinds[i];
+        current = sessions.get(current.roomId) || current;
+        // Once a slot has started a turn the rest wait for the next seam.
+        if (startedTurn) continue;
+        const { params } = slots[kind];
+        const plan = planSessionControl({ params, session: current, canSwitch: canSwitchAgent });
+        if (plan.kind === 'apply') {
+          postControlNotice(current, controlNotice(params, { phase: 'applied', agent: current.agent }));
+          const r = await applyControlSteps(current, plan.steps);
+          current = sessions.get(current.roomId) || current;
+          settle(current, kind);
+          if (!r.ok) postControlNotice(current, controlNotice(params, { error: r.error.detail || r.error.code, agent: current.agent }));
+          else if (r.startedTurn || plan.steps.some((st) => TURN_STARTING_OPS.has(st.op))) startedTurn = true;
+        } else if (plan.kind === 'park') {
+          // Still not free for this one (an agent switch needs a fully idle
+          // session): it simply stays in its slot for the next seam.
+        } else if (plan.kind === 'error') {
+          settle(current, kind);
+          postControlNotice(current, controlNotice(params, { error: plan.detail || plan.code, agent: current.agent }));
+        } else if (plan.kind === 'schedule') {
+          current._autoResume = { at: plan.at, text: plan.text, kind: 'usage_limit', source: 'coordinator' };
+          settle(current, kind);
+          postControlNotice(current, controlNotice(params, { phase: 'scheduled', resetsAt: plan.at, agent: current.agent }));
+        }
+      }
+    } finally {
+      current._drainingControls = false;
+      session._drainingControls = false;
+      persistControlState(current);
+      // Nothing started a turn, so no seam follows: give room delivery the
+      // gate it was refused above (still-parked slots are left alone here).
+      if (!startedTurn && !sessionOccupiedForRoomDelivery(current)) flushRoomInbox(current);
+    }
+  })().catch((e) => { try { console.warn(`[session-control] drain failed for ${session.roomId}: ${e.message}`); } catch { /* never throw from a seam */ } });
+  return true;
+}
+
 function maybeFlushRoomDelivery(session) {
   if (sessionOccupiedForRoomDelivery(session)) return;
+  // A parked Coordinator control goes first; it may start a turn, in which
+  // case the room inbox waits for the next seam — and when it does not,
+  // drainDeferredControls calls flushRoomInbox itself once it is done.
+  if (drainDeferredControls(session)) return;
+  flushRoomInbox(session);
+}
+
+// The room-delivery half of the free gate (lib/room-delivery.js flush +
+// the outcome notice), callable on its own by the control drain above.
+function flushRoomInbox(session) {
   // A priority peer is awaiting delivery (loop #688 F3): it outranks any pending
   // peer-coalesced room batch, so flush the peer inbox FIRST. Each flush injects
   // a turn (busy=true), and only one can go per turn-end; without this the
@@ -11353,6 +11913,7 @@ const itemsHandlers = createItemsHandlers({
   client: itemsClient,
   uploadLocalFile: (session, reqPath, opts) => resolveAndUploadLocalFile({ session, reqPath, publisher: journalPublisher, ...opts }),
   webBaseUrl: WEB_BASE_URL,
+  saveAttachments: saveItemAttachments,
 });
 
 const missionsHandlers = createMissionsHandlers({
@@ -11361,11 +11922,115 @@ const missionsHandlers = createMissionsHandlers({
   client: missionsClient,
 });
 
+// The seven project_* tool routes (lib/projects-tools.js), mounted below.
+// project_get with no num reads this conversation's current mission through
+// the missions resolver (one cache). project_close / project_merge are the
+// Coordinator's: the same test as the consent tools — the spawn-time flag,
+// or the journal's current role holder (a session that gained the role live
+// keeps coordinator:false until it respawns).
+const projectsHandlers = createProjectsHandlers({
+  sessions,
+  journalConvoIdFor,
+  client: projectsClient,
+  missionsClient,
+  resolveMission: (session, convoId) => missionsHandlers.resolveMission(session, convoId),
+  isCoordinator: (session, convoId) => session?.coordinator === true || (!!convoId && coordinatorLookup.snapshot().convoId === convoId),
+});
+
+// The two consent_* tool routes (lib/consent-tools.js), mounted below.
+const consentHandlers = createConsentHandlers({
+  sessions,
+  journalConvoIdFor,
+  client: consentClient,
+  // The journal's current role holder counts too (Bugbot): a session that
+  // gained the role live keeps coordinator:false until it respawns.
+  isCoordinator: (session, convoId) => session?.coordinator === true || (!!convoId && coordinatorLookup.snapshot().convoId === convoId),
+});
+
+// A journal `{kind:'consent', event:'pending'}` frame (spec 2026-09-29
+// coordinator consent): another agent's chat or spawn ask has parked for the
+// user, and this box hosts the Coordinator. Hand it to the Coordinator
+// session as a turn — resumed from its persisted record when it was
+// idle-reaped, the same wake a user's message gives it, so a parked ask is
+// decided promptly rather than at the next sweep — and leave the same text
+// as a notice in its chat so the user sees what it was told. The
+// Coordinator is the journal's CURRENT role holder (coordinatorLookup, kept
+// fresh by every `coordinator` event), never a session's spawn-time flag: a
+// session that just gained the role carries `coordinator: false` until it
+// respawns, and one that just lost it still carries true (Bugbot). The
+// frame is dropped when this box has no Coordinator (a stale route: the
+// journal re-reads the role on every ask) or its session cannot be brought
+// back.
+function journalHandleConsentFrame(frame) {
+  if (!frame || frame.event !== 'pending') return;
+  const text = formatConsentNudge(frame);
+  if (!text) return;
+  const { convoId } = coordinatorLookup.snapshot();
+  if (!convoId) {
+    console.warn('[consent] a consent nudge arrived but the journal lists no Coordinator on this box');
+    return;
+  }
+  let session = findSessionByClaudeSessionId(convoId);
+  if (!session || !session.alive) session = journalResumeConvo(convoId, JOURNAL_RESUME_NOTICE);
+  if (!session) {
+    console.warn(`[consent] a consent nudge arrived but the Coordinator conversation ${convoId} has no session on this box to give it to`);
+    return;
+  }
+  journalPublishNotice(journalConvoIdFor(session), text);
+  deliverCoordinatorTurn(session, text).catch((e) => console.warn(`[consent] nudge delivery failed: ${e.message}`));
+}
+
+// The three unseen_* tool routes (lib/unseen-tools.js), mounted below.
+const unseenHandlers = createUnseenHandlers({
+  sessions,
+  journalConvoIdFor,
+  client: unseenClient,
+  isCoordinator: (session, convoId) => session?.coordinator === true || (!!convoId && coordinatorLookup.snapshot().convoId === convoId),
+});
+
+// The three routine_* tool routes (lib/routines-tools.js), mounted below.
+// The journal gates every write to the Coordinator; this refuses a
+// non-Coordinator first, counting the journal's current role holder.
+const routineHandlers = createRoutineHandlers({
+  sessions,
+  journalConvoIdFor,
+  client: routinesClient,
+  isCoordinator: (session, convoId) => session?.coordinator === true || (!!convoId && coordinatorLookup.snapshot().convoId === convoId),
+});
+
+// A journal `{kind:'unseen', event:'pending'}` frame (spec: matron-journal
+// 2026-09-30 read state): important things the user hasn't seen for 2 h or
+// more. Delivered to the Coordinator exactly like a consent nudge — resumed
+// if idle-reaped, the same text left as a notice in its chat.
+function journalHandleUnseenFrame(frame) {
+  if (!frame || frame.event !== 'pending') return;
+  const text = formatUnseenNudge(frame);
+  if (!text) return;
+  const { convoId } = coordinatorLookup.snapshot();
+  if (!convoId) {
+    console.warn('[unseen] an unseen nudge arrived but the journal lists no Coordinator on this box');
+    return;
+  }
+  let session = findSessionByClaudeSessionId(convoId);
+  if (!session || !session.alive) session = journalResumeConvo(convoId, JOURNAL_RESUME_NOTICE);
+  if (!session) {
+    console.warn(`[unseen] an unseen nudge arrived but the Coordinator conversation ${convoId} has no session on this box to give it to`);
+    return;
+  }
+  journalPublishNotice(journalConvoIdFor(session), text);
+  deliverCoordinatorTurn(session, text).catch((e) => console.warn(`[unseen] nudge delivery failed: ${e.message}`));
+}
+
 // The four memory_* tool routes (lib/memory-tools.js), mounted below.
+// memory_list's audience (spec 2026-10-01 memory scopes): the same
+// Coordinator test as the consent and projects tools, and the repo name of
+// the session's workdir.
 const memoryHandlers = createMemoryHandlers({
   sessions,
   journalConvoIdFor,
   client: memoryClient,
+  isCoordinator: (session, convoId) => session?.coordinator === true || (!!convoId && coordinatorLookup.snapshot().convoId === convoId),
+  repoFor: (session) => repoNames.nameFor(session?.workdir),
 });
 
 // Plan approvals mirrored into the tracker (lib/plan-approval-items.js,
@@ -11398,6 +12063,17 @@ const reminderHandlers = createReminderHandlers({
 // frames. Constructed exactly once, here — the factory starts an unref'd
 // hourly tombstone sweep with no dispose hook, so a second instantiation
 // would leak a duplicate timer.
+// Coordinator session control, calling side: the three tools' handlers.
+// Results (which can take minutes when the target box has to wake) land
+// as a notice in the Coordinator's own chat.
+sessionControlHandlers = createSessionControlHandlers({
+  sessions,
+  publisher: journalPublisher,
+  journalConvoIdFor,
+  notify: (convoId, text) => journalPublishNotice(convoId, text),
+  log: console,
+});
+
 agentSpawnHandlers = createAgentSpawnHandlers({
   sessions,
   publisher: journalPublisher,
@@ -11898,6 +12574,15 @@ const apiServer = createServer(async (req, res) => {
         return;
       }
 
+      if (url.pathname === '/session-set-model' || url.pathname === '/session-compact' || url.pathname === '/session-carry-on') {
+        const handler = url.pathname === '/session-set-model' ? (d) => sessionControlHandlers.setModel(d)
+          : url.pathname === '/session-compact' ? (d) => sessionControlHandlers.compact(d)
+            : (d) => sessionControlHandlers.carryOn(d);
+        await respondAgentChatRoute(res, data, handler,
+          (status, b) => debug(`${url.pathname} ${status} ${b.request_id || b.error || ''}`));
+        return;
+      }
+
       if (url.pathname === '/agent-session-start') {
         await respondAgentChatRoute(res, data, agentSpawnHandlers.sessionStart,
           (status, b) => debug(`agent-session-start ${status} ${b.spawn_id || ''} ${b.status || b.error || ''}`));
@@ -11930,13 +12615,49 @@ const apiServer = createServer(async (req, res) => {
         return;
       }
 
-      // The seven mission_* / milestone_post tool routes; same one-matcher
+      // The ten mission_* / milestone_post tool routes; same one-matcher
       // allowlist shape as /items above.
-      const missionsRoute = url.pathname.match(/^\/missions\/(start|create|post|update|join|get|close)$/);
+      const missionsRoute = url.pathname.match(/^\/missions\/(start|create|post|update|status|join|leave|get|list|close)$/);
       if (missionsRoute) {
         const name = missionsRoute[1];
         await respondAgentChatRoute(res, data, missionsHandlers[name],
           (status, b) => debug(`missions/${name} ${status} ${b.error || (b.mission ? `#${b.mission.num ?? '?'}` : 'ok')}`));
+        return;
+      }
+
+      // The seven project_* tool routes; same one-matcher allowlist shape.
+      const projectsRoute = url.pathname.match(/^\/projects\/(list|get|create|update|status|close|merge)$/);
+      if (projectsRoute) {
+        const name = projectsRoute[1];
+        await respondAgentChatRoute(res, data, projectsHandlers[name],
+          (status, b) => debug(`projects/${name} ${status} ${b.error || (b.project ? `#${b.project.num ?? '?'}` : b.projects ? `${b.projects.length} projects` : 'ok')}`));
+        return;
+      }
+
+      // The three unseen_* tool routes; same one-matcher allowlist shape.
+      const unseenRoute = url.pathname.match(/^\/unseen\/(list|mine|flag)$/);
+      if (unseenRoute) {
+        const name = unseenRoute[1];
+        await respondAgentChatRoute(res, data, unseenHandlers[name],
+          (status, b) => debug(`unseen/${name} ${status} ${b.error || (b.entries ? `${b.entries.length} unseen` : 'ok')}`));
+        return;
+      }
+
+      // The three routine_* tool routes; same one-matcher allowlist shape.
+      const routineRoute = url.pathname.match(/^\/routine\/(list|update|run)$/);
+      if (routineRoute) {
+        const name = routineRoute[1];
+        await respondAgentChatRoute(res, data, routineHandlers[name],
+          (status, b) => debug(`routine/${name} ${status} ${b.error || (b.routines ? `${b.routines.length} routines` : b.routine ? b.routine.name : 'ok')}`));
+        return;
+      }
+
+      // The two consent_* tool routes; same one-matcher allowlist shape.
+      const consentRoute = url.pathname.match(/^\/consent\/(list|decide)$/);
+      if (consentRoute) {
+        const name = consentRoute[1];
+        await respondAgentChatRoute(res, data, consentHandlers[name],
+          (status, b) => debug(`consent/${name} ${status} ${b.error || (b.pending ? `${b.pending.length} pending` : 'ok')}`));
         return;
       }
 
@@ -12523,12 +13244,12 @@ function applyModelSwitch(roomId, session, arg, { sendReply, sendHtml, explicit 
   if (session.agent === AGENT_CODEX) {
     if (session.busy) {
       sendReply('Finish or interrupt the current Codex turn before switching models.');
-      return;
+      return false;
     }
     const requested = String(arg || '').trim();
     if (!requested || /\s/.test(requested)) {
       sendReply('Usage: /model <model-id> (or /model default)');
-      return;
+      return false;
     }
     const model = requested.toLowerCase() === 'default' ? null : requested;
     session.currentModel = model;
@@ -12543,7 +13264,7 @@ function applyModelSwitch(roomId, session, arg, { sendReply, sendHtml, explicit 
     sendReply(model
       ? `Codex model set to ${model}; it will apply on the next turn.`
       : 'Codex model reset to the local config default; it will apply on the next turn.');
-    return;
+    return true;
   }
   if (session.iv) {
     // Interactive: type /model into the live TUI. The MODEL is not persisted
@@ -12557,12 +13278,19 @@ function applyModelSwitch(roomId, session, arg, { sendReply, sendHtml, explicit 
       // A person's pick replaces any Coordinator model still pending on the
       // session: a later restart must carry what they chose.
       if (explicit) session._coordinatorModel = null;
+      // An ACCEPTED switch away from the exhausted model lifts a usage-limit
+      // stall (a refused one must not); if the new model is out of allowance
+      // too, its next record re-flags it. Published so the roster clears.
+      session._stall = null;
+      session._modelAlias = normalizeModelArg(arg);
+      bringAutoResumeForward(session);
       persistSession(roomId, session.claudeSessionId, session.workdir, session.originRoomId, {
         ...(explicit ? explicitModelFlag(arg) : { modelExplicit: false }),
         ...(explicit ? {} : { model: normalizeModelArg(arg) }),
       });
+      journalStatus(session);
     }
-    return;
+    return switched;
   }
   const decision = planPrintModelSwitch(session, arg, {
     hasInflightMedia: !!journalMediaRouter.hasInflightMedia?.(session),
@@ -12589,17 +13317,23 @@ function applyModelSwitch(roomId, session, arg, { sendReply, sendHtml, explicit 
     } else {
       sendReply(decision.message);
     }
-    return;
+    return true;
   }
   if (!decision.ok) {
     sendReply(decision.message);
-    return;
+    return false;
   }
   sendReply(decision.message);
+  // Accepted: the stall lifts with the model (see the interactive branch);
+  // persisted as null here so the recreated session resumes unstalled and
+  // its spawn frame clears the roster.
+  session._stall = null;
+  bringAutoResumeForward(session);
   persistSession(roomId, session.claudeSessionId, session.workdir, session.originRoomId,
     { model: decision.normalized, ...(explicit ? explicitModelFlag(decision.normalized) : { modelExplicit: false }) });
   const next = recreateSession(roomId, { model: decision.normalized }, { sendReply, sendHtml });
   if (next) next.currentModel = decision.normalized;
+  return true;
 }
 
 // Apply a /mode switch (interactive <-> print) for a room: gate via
@@ -12713,7 +13447,9 @@ function recreateSession(roomId, overrides, { sendReply, sendHtml }) {
     // A Coordinator model still pending on the session (journalOnCoordinator
     // could not respawn it) beats the live model, which in iv mode keeps
     // reading as the old one — see recreateSpawnModel.
-    model: recreateSpawnModel({ agent: existing.agent, currentModel: existing.currentModel, pendingModel: existing._coordinatorModel }),
+    // The started-with alias beats the transcript id (which never carries
+    // [1m]) so a recreate keeps a 1M session's window.
+    model: recreateSpawnModel({ agent: existing.agent, currentModel: existing._modelAlias || existing.currentModel, pendingModel: existing._coordinatorModel }),
     ...overrides,
   });
   next.sendCallback = sendReply;
@@ -13188,6 +13924,8 @@ async function main() {
   } else {
     console.log('Session idle timeout: disabled');
   }
+  // Independent of the idle reaper: armed carry-ons must fire either way.
+  startAutoResumeSweep();
   // Re-arm persisted /timer schedules (overdue ones fire after a short
   // grace — see lib/timer-command.js OVERDUE_GRACE_MS).
   const rearmed = timerStore.init();

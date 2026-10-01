@@ -5,24 +5,35 @@ const m = { id: 'me_1', name: 'avoid-eric', type: 'feedback', description: 'Neve
 
 describe('memory renderers', () => {
   it('memoryLine: name, type, description, updated time and who', () => {
-    expect(memoryLine(m)).toBe('`avoid-eric` (feedback): Never use eric. — updated 1970-01-01T00:00:02.000Z by user');
+    expect(memoryLine(m)).toBe('`avoid-eric` (feedback, global): Never use eric. — updated 1970-01-01T00:00:02.000Z by user');
+    expect(memoryLine({ ...m, scope: 'repo:yearbook-app' })).toContain('(feedback, repo:yearbook-app)');
   });
   it('formatMemoryList: one line per memory, or a placeholder', () => {
     expect(formatMemoryList({ memories: [m, { ...m, name: 'b' }] }).split('\n')).toHaveLength(2);
     expect(formatMemoryList({ memories: [] })).toBe('(no memories yet)');
     expect(formatMemoryList(null)).toBe('(no memories yet)');
   });
+  it('formatMemoryList: a filtered answer ends with how many were left out and how to see them', () => {
+    const out = formatMemoryList({ memories: [m], scopes: ['global', 'repo:x'], omitted: 3, omitted_scopes: ['coordinator', 'repo:y'] });
+    expect(out.split('\n')).toHaveLength(2);
+    expect(out.endsWith('… 3 more in other scopes (coordinator, repo:y) — memory_list with all: true lists them.')).toBe(true);
+    expect(formatMemoryList({ memories: [], scopes: ['global'], omitted: 2, omitted_scopes: ['coordinator'] }))
+      .toBe("(none in this session's scopes: global)\n… 2 more in other scopes (coordinator) — memory_list with all: true lists them.");
+    expect(formatMemoryList({ memories: [m], scopes: null, omitted: 0, omitted_scopes: [] }).split('\n')).toHaveLength(1);
+  });
   it('formatMemoryDetail: the fields then the body', () => {
     const out = formatMemoryDetail({ memory: m });
     expect(out).toContain('name: avoid-eric');
     expect(out).toContain('type: feedback');
+    expect(out).toContain('scope: global');
+    expect(formatMemoryDetail({ memory: { ...m, scope: 'coordinator' } })).toContain('scope: coordinator');
     expect(out).toContain('origin conversation: c1');
     expect(out.endsWith('\n\n**Why:** reserved.')).toBe(true);
     expect(formatMemoryDetail({ memory: { ...m, body: '', origin_convo_id: null } })).toContain('(no body)');
   });
   it('formatSaveAck says created or updated; formatDeleteAck names the memory', () => {
-    expect(formatSaveAck({ memory: m, created: true })).toBe('Saved memory `avoid-eric` (created): Never use eric.');
-    expect(formatSaveAck({ memory: m, created: false })).toBe('Saved memory `avoid-eric` (updated): Never use eric.');
+    expect(formatSaveAck({ memory: m, created: true })).toBe('Saved memory `avoid-eric` (created, scope global): Never use eric.');
+    expect(formatSaveAck({ memory: { ...m, scope: 'repo:yearbook-app' }, created: false })).toBe('Saved memory `avoid-eric` (updated, scope repo:yearbook-app): Never use eric.');
     expect(formatDeleteAck({ memory: m })).toBe('Deleted memory `avoid-eric`');
   });
   it('unknown shapes degrade, never throw', () => {

@@ -71,12 +71,12 @@ describe('subagentTitle', () => {
 });
 
 describe('subagent child context window', () => {
-  function run({ parentModel, childModel, inputTokens, withGetter = true }) {
+  function run({ parentModel, parentWindow, childModel, inputTokens, withGetter = true }) {
     const publisher = makePublisher();
     const tracker = createSubagentConvoTracker({
       publisher,
       getParentConvoId: () => 'parent-uuid',
-      ...(withGetter ? { getParentModel: () => parentModel } : {}),
+      ...(withGetter ? { getParentModel: () => parentModel, getParentWindow: () => parentWindow } : {}),
       log: { warn() {} },
     });
     tracker.discover('agent-1', { label: 'x', agentType: null });
@@ -87,42 +87,45 @@ describe('subagent child context window', () => {
   }
 
   it('a same-family child of an opus[1m] parent inherits the 1M window', () => {
-    const ctx = run({ parentModel: 'claude-opus-5-5[1m]', childModel: 'claude-opus-5-5', inputTokens: 300_000 });
+    const ctx = run({ parentModel: 'claude-opus-5-5', parentWindow: 1_000_000, childModel: 'claude-opus-5-5', inputTokens: 300_000 });
     expect(ctx.window).toBe(1_000_000);
     expect(ctx.pct).toBe(30);
   });
 
   it('a different-family child (haiku under opus[1m]) keeps its own 200k window', () => {
-    const ctx = run({ parentModel: 'claude-opus-5-5[1m]', childModel: 'claude-haiku-4-5', inputTokens: 50_000 });
+    const ctx = run({ parentModel: 'claude-opus-5-5', parentWindow: 1_000_000, childModel: 'claude-haiku-4-5', inputTokens: 50_000 });
     expect(ctx.window).toBe(200_000);
     expect(ctx.pct).toBe(25);
   });
 
-  it('without getParentModel, a footprint above 200k widens the window to 1M', () => {
+  it('without the parent getters, a footprint above 200k widens the window to 1M', () => {
     const ctx = run({ childModel: 'claude-opus-5-5', inputTokens: 250_000, withGetter: false });
     expect(ctx.window).toBe(1_000_000);
     expect(ctx.pct).toBe(25);
   });
 
-  it('a parent without [1m] leaves a same-family child at 200k', () => {
-    const ctx = run({ parentModel: 'claude-opus-5-5', childModel: 'claude-opus-5-5', inputTokens: 100_000 });
+  it('a 200k parent leaves a same-family child at 200k', () => {
+    const ctx = run({ parentModel: 'claude-opus-5-5', parentWindow: 200_000, childModel: 'claude-opus-5-5', inputTokens: 100_000 });
     expect(ctx.window).toBe(200_000);
     expect(ctx.pct).toBe(50);
   });
 
   it('a later parent model switch does not shrink a running child\'s inherited window', () => {
     const publisher = makePublisher();
-    let parentModel = 'claude-opus-5-5[1m]';
+    let parentModel = 'claude-opus-5-5';
+    let parentWindow = 1_000_000;
     const tracker = createSubagentConvoTracker({
       publisher,
       getParentConvoId: () => 'parent-uuid',
       getParentModel: () => parentModel,
+      getParentWindow: () => parentWindow,
       log: { warn() {} },
     });
     tracker.discover('agent-1', { label: 'x', agentType: null });
     const ev = () => subagentAssistantEvent({ model: 'claude-opus-5-5', usage: { input_tokens: 100_000 } });
     tracker.onEvent('agent-1', { event: ev() });
-    parentModel = 'claude-fable-5';
+    // The parent switches opus[1m] -> opus: its settled window drops to 200k.
+    parentWindow = 200_000;
     tracker.onEvent('agent-1', { event: ev() });
     const ctx = publisher.calls.publishStatus.filter(s => s.convoId === 'parent-uuid:sub:agent-1').at(-1).status.context;
     expect(ctx.window).toBe(1_000_000);
@@ -134,7 +137,8 @@ describe('subagent child context window', () => {
     const tracker = createSubagentConvoTracker({
       publisher,
       getParentConvoId: () => 'parent-uuid',
-      getParentModel: () => 'claude-opus-5-5[1m]',
+      getParentModel: () => 'claude-opus-5-5',
+      getParentWindow: () => 1_000_000,
       log: { warn() {} },
     });
     tracker.discover('agent-1', { label: 'x', agentType: null });

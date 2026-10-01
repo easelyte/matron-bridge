@@ -10,7 +10,7 @@ const ROSTER = {
     { device_id: 7, name: 'dev-2' },
   ],
   conversations: [
-    { id: 'convo-remote', title: 'Remote work', session_state: 'running', summary: 'porting the app', agent_device_id: 7, last_ts: 111, agent_kind: 'codex' },
+    { id: 'convo-remote', title: 'Remote work', session_state: 'running', summary: 'porting the app', agent_device_id: 7, last_ts: 111, agent_kind: 'codex', status: { model: 'claude-opus-5-5', context: { tokens: 87000, window: 1000000, pct: 9 }, reported_at: 111 }, extra: 'dropped' },
     { id: 'convo-self', title: 'Local work', session_state: 'running', summary: null, agent_device_id: 1, last_ts: 222, agent_kind: 'claude' },
     { id: 'convo-orphan', title: 'No agent', session_state: 'ended', summary: '', agent_device_id: null, last_ts: 333 }, // no agent_kind → maps to null
   ],
@@ -205,7 +205,7 @@ describe('createAgentChatHandlers', () => {
       expect(res.body.agents).toEqual([{ device_id: 7, name: 'dev-2' }]);
       expect(res.body.conversations).toEqual([
         // summary blanked by default — AGENT_ROSTER_SUMMARY_ENABLED is off (loop #554 B4).
-        { id: 'convo-remote', title: 'Remote work', session_state: 'running', summary: '', agent_device_id: 7, last_ts: 111, agent_kind: 'codex' },
+        { id: 'convo-remote', title: 'Remote work', session_state: 'running', summary: '', agent_device_id: 7, last_ts: 111, agent_kind: 'codex', status: { model: 'claude-opus-5-5', context: { tokens: 87000, window: 1000000, pct: 9 }, reported_at: 111 } },
         { id: 'convo-self', title: 'Local work', session_state: 'running', summary: '', agent_device_id: 1, last_ts: 222, agent_kind: 'claude' },
         { id: 'convo-orphan', title: 'No agent', session_state: 'ended', summary: '', agent_device_id: null, last_ts: 333, agent_kind: null }, // #619 T-1.3: forwarded, null when journal omits it
       ]);
@@ -1253,7 +1253,7 @@ describe('createAgentChatHandlers', () => {
       const res = await handlers.chatJoin({ roomId: '!sess', room_id: 'room-1', justification: 'user handed me this room' });
       expect(res.status).toBe(200);
       expect(res.body).toMatchObject({ room_id: 'room-1', status: 'pending_busy' });
-      expect(invites.join).toHaveBeenCalledWith({ roomId: 'room-1', justification: 'user handed me this room' });
+      expect(invites.join).toHaveBeenCalledWith({ roomId: 'room-1', justification: 'user handed me this room', fromConvoId: 'convo-sess' });
       expect(rooms.get('room-1')).toMatchObject({ role: 'guest', state: 'pending', sessionRoomId: '!sess' });
     });
 

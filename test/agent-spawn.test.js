@@ -335,6 +335,21 @@ describe('createAgentSpawnHandlers', () => {
       expect(ctx.notices[0].text).toMatch(/declined/);
     });
 
+    // decided_by (journal "Coordinator → Consent approval"): the user's
+    // Coordinator answered the card — the parent must not hear "the user".
+    it('decided_by coordinator — declined and started name the Coordinator and its reason, one-lined', async () => {
+      const ctx = await armStarted();
+      ctx.handlers.onSpawnFrame({ kind: 'spawn', event: 'outcome', request_id: 'row-1', outcome: 'declined', decided_by: 'coordinator', reason: 'eric is a last-resort box\nuse dev-2' });
+      expect(ctx.notices[0].text).toMatch(/declined on the user's behalf \(decided by the user's Coordinator: eric is a last-resort box ⏎ use dev-2\)\./);
+      expect(ctx.notices[0].text).not.toMatch(/the user declined/);
+      const ctx2 = await armStarted();
+      ctx2.handlers.onSpawnFrame({ kind: 'spawn', event: 'outcome', request_id: 'row-1', outcome: 'started', child_convo_id: 'child-1', decided_by: 'coordinator', reason: 'follows the box rules' });
+      expect(ctx2.notices[0].text).toContain("session started on the target box (decided by the user's Coordinator: follows the box rules), detached");
+      const ctx3 = await armStarted();
+      ctx3.handlers.onSpawnFrame({ kind: 'spawn', event: 'outcome', request_id: 'row-1', outcome: 'started', child_convo_id: 'child-1', decided_by: 'user' });
+      expect(ctx3.notices[0].text).not.toMatch(/Coordinator/);
+    });
+
     it('outcome with no pending context — notifyParent still called, session null, no throw', async () => {
       const ctx = mk();
       expect(() => ctx.handlers.onSpawnFrame({ kind: 'spawn', event: 'outcome', request_id: 'unknown-row', outcome: 'expired' })).not.toThrow();

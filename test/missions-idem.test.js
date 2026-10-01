@@ -44,6 +44,17 @@ describe('missionIdemKey', () => {
     const candidates = new Set([before, after].map((now) => missionIdemKey({ op: 'start', roomId: '!r:s', title: 'M', now })));
     expect(candidates.has(key)).toBe(true);
   });
+
+  it('a named mission joins the key only when given — keys without it are unchanged', async () => {
+    const { createHash } = await import('node:crypto');
+    const bucket = Math.floor(base.now / 600_000);
+    const legacy = createHash('sha256').update(`post|!r:s|progress|Landed PR|the diff|${bucket}`).digest('hex');
+    expect(missionIdemKey(base)).toBe(legacy);
+    expect(missionIdemKey({ ...base, mission: undefined })).toBe(legacy);
+    expect(missionIdemKey({ ...base, mission: 3 })).not.toBe(legacy);
+    expect(missionIdemKey({ ...base, mission: 3 })).not.toBe(missionIdemKey({ ...base, mission: 4 }));
+    expect(missionIdemKey({ ...base, mission: 3 })).toBe(missionIdemKey({ ...base, mission: 3 }));
+  });
 });
 
 describe('itemIdemKey (loop #763)', () => {

@@ -173,6 +173,7 @@ For `SCOPE=system` setups, replace `gui/$UID` with `system` and `~/Library/Launc
 | `REVEAL_RATE_LIMIT` | Viewer requests per minute for `POST /sensitive/reveal`, counted separately so shell loads cannot exhaust it | `30` |
 | `WHISPER_MODEL_PATH` | whisper.cpp model for voice-note transcription | `~/.local/share/whisper-cpp/models/ggml-small.bin` |
 | `WHISPER_LANGUAGE` | Voice-note transcription language | `en` |
+| `WHISPER_PROMPT` | Vocabulary hint passed to whisper-cli as `--prompt`: names and terms it should spell right (box names, `sudo`, `PR`). Set it to your own list, or to the empty string to send no prompt | _(built-in Matron vocabulary)_ |
 | `OPENAI_API_KEY` | Optional OpenAI API key; when set, preferred for conversation titles and rolling TOC summaries (using `gpt-6-luna` by default) | — |
 | `GEMINI_API_KEY` | Optional Gemini API key; used as fallback summarizer when `OPENAI_API_KEY` is unset; both key and summary features are skipped when both are empty | — |
 | `SUMMARY_MODEL` | Overrides the active provider's default model for titles and summaries; applies to whichever of OpenAI or Gemini is configured | — |

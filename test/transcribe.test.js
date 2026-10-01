@@ -21,12 +21,15 @@ vi.mock('fs', () => ({
     // otherwise. vi.clearAllMocks() wipes implementations, so each suite's
     // beforeEach restores it.
     existsSync: vi.fn(() => true),
+    // The prompt guard reads the WAV's size for its duration; 16 kHz mono
+    // 16-bit is 32000 bytes a second. Tests override per case.
+    statSync: vi.fn(() => ({ size: 44 + 32000 * 3 })),
   },
 }));
 
 import { execFile } from 'child_process';
 import fs from 'fs';
-import { transcribeAudio, transcribeAudioSegments, parseWhisperSegments, MIME_TO_EXT, TRANSCRIBE_UNAVAILABLE } from '../lib/transcribe.js';
+import { transcribeAudio, transcribeAudioSegments, parseWhisperSegments, resolveWhisperPrompt, makeWhisperPrompt, promptLooksTruncated, DEFAULT_WHISPER_PROMPT, MIME_TO_EXT, TRANSCRIBE_UNAVAILABLE } from '../lib/transcribe.js';
 
 function mockExecFile(ffmpegResult, whisperResult) {
   const customFn = execFile[Symbol.for('nodejs.util.promisify.custom')];
@@ -67,6 +70,7 @@ describe('transcribeAudio', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     fs.existsSync.mockImplementation(() => true);
+    fs.statSync.mockImplementation(() => ({ size: 44 + 32000 * 3 }));
     execFileCalls.length = 0;
   });
 
@@ -273,6 +277,195 @@ describe('transcribeAudio', () => {
     const whisperCall = execFileCalls.find(c => c.cmd.includes('whisper-cli'));
     expect(whisperCall.args).toContain('de');
   });
+
+  it('passes the vocabulary prompt to whisper-cli as --prompt', async () => {
+    mockExecFile({ stdout: '' }, { stdout: 'Dan-mac can get the sudo password.' });
+
+    await transcribeAudio(fakeBuffer, 'audio/ogg', { ...CONFIG, prompt: 'Matron, dan-mac, sudo.' });
+
+    const whisperCall = execFileCalls.find(c => c.cmd.includes('whisper-cli'));
+    const i = whisperCall.args.indexOf('--prompt');
+    expect(i).toBeGreaterThan(-1);
+    expect(whisperCall.args[i + 1]).toBe('Matron, dan-mac, sudo.');
+  });
+
+  it('omits --prompt entirely when the prompt is empty or absent', async () => {
+    mockExecFile({ stdout: '' }, { stdout: 'text' });
+    await transcribeAudio(fakeBuffer, 'audio/ogg', { ...CONFIG, prompt: '' });
+    await transcribeAudio(fakeBuffer, 'audio/ogg', CONFIG);
+
+    for (const call of execFileCalls.filter(c => c.cmd.includes('whisper-cli'))) {
+      expect(call.args).not.toContain('--prompt');
+    }
+  });
+});
+
+describe('prompt guard', () => {
+  const fakeBuffer = Buffer.from('fake audio data');
+  const words = (n) => Array.from({ length: n }, (_, i) => `w${i}`).join(' ');
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    fs.existsSync.mockImplementation(() => true);
+    execFileCalls.length = 0;
+  });
+
+  it('promptLooksTruncated: under 0.4 words a second past eight seconds', () => {
+    expect(promptLooksTruncated(words(16), 124)).toBe(true);
+    expect(promptLooksTruncated(words(300), 124)).toBe(false);
+    expect(promptLooksTruncated('', 7)).toBe(false);
+    expect(promptLooksTruncated(words(4), 8)).toBe(false);
+    expect(promptLooksTruncated(words(3), 8)).toBe(true);
+  });
+
+  it('reruns without the prompt when the prompted transcript is implausibly short, and keeps the fuller one', async () => {
+    fs.statSync.mockImplementation(() => ({ size: 44 + 32000 * 124 }));
+    const customFn = execFile[Symbol.for('nodejs.util.promisify.custom')];
+    customFn.mockImplementation((cmd, args) => {
+      execFileCalls.push({ cmd, args });
+      if (cmd === 'ffmpeg') return Promise.resolve({ stdout: '', stderr: '' });
+      return Promise.resolve({ stdout: args.includes('--prompt') ? words(16) : words(300), stderr: '' });
+    });
+
+    const text = await transcribeAudio(fakeBuffer, 'audio/ogg', { ...CONFIG, prompt: 'Matron.' });
+
+    const whisperCalls = execFileCalls.filter((c) => c.cmd.includes('whisper-cli'));
+    expect(whisperCalls).toHaveLength(2);
+    expect(whisperCalls[0].args).toContain('--prompt');
+    expect(whisperCalls[1].args).not.toContain('--prompt');
+    expect(text.split(' ')).toHaveLength(300);
+  });
+
+  it('keeps the prompted transcript when the rerun says no more', async () => {
+    fs.statSync.mockImplementation(() => ({ size: 44 + 32000 * 60 }));
+    mockExecFile({ stdout: '' }, { stdout: 'Just a few words here.' });
+    const text = await transcribeAudio(fakeBuffer, 'audio/ogg', { ...CONFIG, prompt: 'Matron.' });
+    expect(execFileCalls.filter((c) => c.cmd.includes('whisper-cli'))).toHaveLength(2);
+    expect(text).toBe('Just a few words here.');
+  });
+
+  it('never reruns a plausible transcript, a short clip, or an unprompted run', async () => {
+    fs.statSync.mockImplementation(() => ({ size: 44 + 32000 * 60 }));
+    mockExecFile({ stdout: '' }, { stdout: words(150) });
+    await transcribeAudio(fakeBuffer, 'audio/ogg', { ...CONFIG, prompt: 'Matron.' });
+    fs.statSync.mockImplementation(() => ({ size: 44 + 32000 * 5 }));
+    mockExecFile({ stdout: '' }, { stdout: 'Hi.' });
+    await transcribeAudio(fakeBuffer, 'audio/ogg', { ...CONFIG, prompt: 'Matron.' });
+    fs.statSync.mockImplementation(() => ({ size: 44 + 32000 * 60 }));
+    await transcribeAudio(fakeBuffer, 'audio/ogg', CONFIG);
+    expect(execFileCalls.filter((c) => c.cmd.includes('whisper-cli'))).toHaveLength(3);
+  });
+
+  it('keeps the prompted transcript when the unprompted rerun itself fails', async () => {
+    fs.statSync.mockImplementation(() => ({ size: 44 + 32000 * 124 }));
+    const customFn = execFile[Symbol.for('nodejs.util.promisify.custom')];
+    customFn.mockImplementation((cmd, args) => {
+      execFileCalls.push({ cmd, args });
+      if (cmd === 'ffmpeg') return Promise.resolve({ stdout: '', stderr: '' });
+      if (args.includes('--prompt')) return Promise.resolve({ stdout: words(16), stderr: '' });
+      return Promise.reject(Object.assign(new Error('timed out'), { killed: true }));
+    });
+    const text = await transcribeAudio(fakeBuffer, 'audio/ogg', { ...CONFIG, prompt: 'Matron.' });
+    expect(execFileCalls.filter((c) => c.cmd.includes('whisper-cli'))).toHaveLength(2);
+    expect(text.split(' ')).toHaveLength(16);
+  });
+
+  it('narration: no rerun when the prompted output is the silence hallucination, so a quiet recording stays empty', async () => {
+    fs.statSync.mockImplementation(() => ({ size: 44 + 32000 * 60 }));
+    const customFn = execFile[Symbol.for('nodejs.util.promisify.custom')];
+    customFn.mockImplementation((cmd, args) => {
+      execFileCalls.push({ cmd, args });
+      if (cmd === 'ffmpeg') return Promise.resolve({ stdout: '', stderr: '' });
+      const line = (t) => `[00:00:01.000 --> 00:00:02.000]  ${t}`;
+      return Promise.resolve({ stdout: args.includes('--prompt') ? line('you') : line(words(40)), stderr: '' });
+    });
+    const segments = await transcribeAudioSegments(fakeBuffer, 'video/mp4', { ...CONFIG, prompt: 'Matron.' });
+    expect(execFileCalls.filter((c) => c.cmd.includes('whisper-cli'))).toHaveLength(1);
+    expect(segments).toEqual([]);
+  });
+
+  it('guards the timestamped (video narration) run on the spoken words, not the timestamps', async () => {
+    fs.statSync.mockImplementation(() => ({ size: 44 + 32000 * 60 }));
+    const customFn = execFile[Symbol.for('nodejs.util.promisify.custom')];
+    customFn.mockImplementation((cmd, args) => {
+      execFileCalls.push({ cmd, args });
+      if (cmd === 'ffmpeg') return Promise.resolve({ stdout: '', stderr: '' });
+      const line = (t) => `[00:00:01.000 --> 00:00:02.000]  ${t}`;
+      return Promise.resolve({ stdout: args.includes('--prompt') ? line('only this one sentence') : [line(words(60)), line(words(60))].join('\n'), stderr: '' });
+    });
+    const segments = await transcribeAudioSegments(fakeBuffer, 'video/mp4', { ...CONFIG, prompt: 'Matron.' });
+    expect(execFileCalls.filter((c) => c.cmd.includes('whisper-cli'))).toHaveLength(2);
+    expect(segments).toHaveLength(2);
+  });
+});
+
+describe('resolveWhisperPrompt', () => {
+  it('unset WHISPER_PROMPT means the built-in vocabulary', () => {
+    // An explicit undefined still triggers the default parameter, which reads
+    // the real environment, so the test's own env is isolated here.
+    const saved = process.env.WHISPER_PROMPT;
+    delete process.env.WHISPER_PROMPT;
+    try {
+      expect(resolveWhisperPrompt()).toBe(DEFAULT_WHISPER_PROMPT);
+      expect(DEFAULT_WHISPER_PROMPT.length).toBeGreaterThan(0);
+    } finally {
+      if (saved !== undefined) process.env.WHISPER_PROMPT = saved;
+    }
+  });
+
+  it('an explicitly empty WHISPER_PROMPT turns the prompt off', () => {
+    expect(resolveWhisperPrompt('')).toBe('');
+    expect(resolveWhisperPrompt('   ')).toBe('');
+  });
+
+  it("an operator's own vocabulary replaces the default, trimmed", () => {
+    expect(resolveWhisperPrompt('  Acme, widget-2.  ')).toBe('Acme, widget-2.');
+  });
+});
+
+describe('makeWhisperPrompt', () => {
+  it('appends the fleet box names, deduped and sorted, to the base prompt', async () => {
+    const prompt = makeWhisperPrompt({ base: 'Matron.', fetchNames: async () => ['pat', 'dan-mac', 'greg', 'pat'] });
+    expect(await prompt()).toBe('Matron. dan-mac, greg, pat.');
+  });
+
+  it('drops names that are not hostname-shaped, so a name cannot smuggle text into the prompt', async () => {
+    const prompt = makeWhisperPrompt({ base: 'Matron.', fetchNames: async () => ['bev', 'evil --prompt x', '', 42, null] });
+    expect(await prompt()).toBe('Matron. bev.');
+  });
+
+  it('caches the names for ttlMs, then refreshes', async () => {
+    let t = 0; let calls = 0;
+    const prompt = makeWhisperPrompt({ base: 'Matron.', ttlMs: 1000, now: () => t, fetchNames: async () => { calls++; return calls === 1 ? ['pat'] : ['pat', 'bev']; } });
+    expect(await prompt()).toBe('Matron. pat.');
+    t = 500;
+    expect(await prompt()).toBe('Matron. pat.');
+    expect(calls).toBe(1);
+    t = 1000;
+    expect(await prompt()).toBe('Matron. bev, pat.');
+    expect(calls).toBe(2);
+  });
+
+  it('a failed or null roster falls back to the base prompt and keeps the last good names', async () => {
+    let t = 0; let mode = 'fail';
+    const prompt = makeWhisperPrompt({ base: 'Matron.', ttlMs: 10, now: () => t, fetchNames: async () => { if (mode === 'fail') throw new Error('no journal'); if (mode === 'null') return null; return ['pat']; } });
+    expect(await prompt()).toBe('Matron.');
+    t = 10; mode = 'ok';
+    expect(await prompt()).toBe('Matron. pat.');
+    t = 20; mode = 'null';
+    expect(await prompt()).toBe('Matron. pat.');
+  });
+
+  it('an empty base means no prompt at all, names included, and never calls the roster', async () => {
+    let calls = 0;
+    const prompt = makeWhisperPrompt({ base: '', fetchNames: async () => { calls++; return ['pat']; } });
+    expect(await prompt()).toBe('');
+    expect(calls).toBe(0);
+  });
+
+  it('works without a roster source', async () => {
+    expect(await makeWhisperPrompt({ base: 'Matron.' })()).toBe('Matron.');
+  });
 });
 
 describe('parseWhisperSegments', () => {
@@ -310,6 +503,7 @@ describe('transcribeAudioSegments', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     fs.existsSync.mockImplementation(() => true);
+    fs.statSync.mockImplementation(() => ({ size: 44 + 32000 * 3 }));
     execFileCalls.length = 0;
   });
 
@@ -322,6 +516,16 @@ describe('transcribeAudioSegments', () => {
     expect(segments).toEqual([{ start: 0, text: 'hello there, watch this closely' }]);
     const whisperCall = execFileCalls.find((c) => c.cmd.includes('whisper-cli'));
     expect(whisperCall.args).not.toContain('--no-timestamps');
+  });
+
+  it('passes the vocabulary prompt to whisper-cli here too', async () => {
+    mockExecFile(
+      { stdout: '', stderr: '' },
+      { stdout: '[00:00:00.000 --> 00:00:03.000]  open the Matron app' },
+    );
+    await transcribeAudioSegments(fakeBuffer, 'video/mp4', { ...CONFIG, prompt: 'Matron.' });
+    const whisperCall = execFileCalls.find((c) => c.cmd.includes('whisper-cli'));
+    expect(whisperCall.args.slice(whisperCall.args.indexOf('--prompt'))).toEqual(['--prompt', 'Matron.']);
   });
 
   it('accepts a video container: input keeps the video extension, ffmpeg drops the video track', async () => {

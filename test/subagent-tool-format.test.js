@@ -113,6 +113,13 @@ describe('subagentToolStep', () => {
     expect(subagentToolStep(undefined, {})).toBeNull();
   });
 
+  it('accepts every tool name the body accepts', () => {
+    for (const name of ['9tool', 'my tool', 'x'.repeat(120)]) {
+      expect(formatSubagentToolBody(name, {})).toBe(`🔧 ${name}`);
+      expect(subagentToolStep(name, {})).toEqual({ tool: name });
+    }
+  });
+
   it('is published with the body on the subagent text event', () => {
     const here = path.dirname(fileURLToPath(import.meta.url));
     const source = fs.readFileSync(path.join(here, '..', 'index.js'), 'utf8');

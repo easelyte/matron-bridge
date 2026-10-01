@@ -13,6 +13,7 @@ describe('reminders wiring', () => {
   const askUser = readFileSync(new URL('../ask-user.js', import.meta.url), 'utf8');
   const claudeMd = readFileSync(new URL('../BRIDGE_CLAUDE.md', import.meta.url), 'utf8');
   const codexMd = readFileSync(new URL('../BRIDGE_CODEX.md', import.meta.url), 'utf8');
+  const coordinatorMd = readFileSync(new URL('../BRIDGE_COORDINATOR.md', import.meta.url), 'utf8');
 
   it('mounts the three /reminders routes through the shared handler map', () => {
     const m = index.match(/url\.pathname\.match\(\/\^\\\/reminders\\\/\(([a-z|]+)\)\$\/\)/);
@@ -57,5 +58,50 @@ describe('reminders wiring', () => {
       expect(md).toContain('hold_awake');
     }
     expect(claudeMd).toMatch(/CronCreate/);
+  });
+
+  it('reminder_create offers repeat + tz as plain strings, so the bridge (not zod) words the rejection', () => {
+    const create = askUser.slice(askUser.indexOf("'reminder_create',"), askUser.indexOf("'reminder_list',"));
+    expect(create).toMatch(/repeat: z\.string\(\)\.optional\(\)/);
+    expect(create).toMatch(/tz: z\.string\(\)\.optional\(\)/);
+    // The description is a double-quoted JS string, so its quotes are escaped.
+    expect(create).toMatch(/repeat: \\"daily\\"/);
+    expect(create).toMatch(/standing check-ins/);
+  });
+
+  it('every surface that renders a reminder says when it repeats', () => {
+    // The chat card (Send-now / Cancel), the /timer list, the fire notice
+    // and the Cancel-button reply all go through formatRepeat.
+    const announce = index.slice(index.indexOf('async function announceAgentReminder'), index.indexOf('async function announceAgentReminder') + 1500);
+    expect(announce).toMatch(/record\.repeat/);
+    expect(announce).toMatch(/formatRepeat\(record\.repeat\)/);
+    const list = index.slice(index.indexOf("const active = timerStore.listForConvo(convoId);"), index.indexOf("const active = timerStore.listForConvo(convoId);") + 700);
+    expect(list).toMatch(/formatRepeat\(t\.repeat\)/);
+    const fire = index.slice(index.indexOf('async function fireTimer'), index.indexOf('async function fireTimer') + 1600);
+    expect(fire).toMatch(/formatRepeat\(record\.repeat\)/);
+    const cancelBtn = index.slice(index.indexOf('function cancelTimerFromButton'), index.indexOf('function cancelTimerFromButton') + 900);
+    expect(cancelBtn).toMatch(/\.repeat/);
+  });
+
+  it('the Coordinator no longer arms check-in reminders: routines (journal-owned) replace them, and duplicates are cancelled', () => {
+    // Spec 2026-10-01 coordinator routines: the Check-ins section is gone.
+    expect(coordinatorMd).not.toContain('## Check-ins');
+    expect(coordinatorMd).not.toContain('repeat: "daily"');
+    const i = coordinatorMd.indexOf('## Your playbook and routines');
+    expect(i, 'BRIDGE_COORDINATOR.md has no routines section').toBeGreaterThan(-1);
+    const block = coordinatorMd.slice(i);
+    expect(block).toContain('routine_list');
+    expect(block).toContain('routine_update');
+    expect(block).toContain('routine_run');
+    expect(block).toMatch(/never set `reminder_create` reminders for routine work/);
+    expect(block).toMatch(/cancel it with `reminder_cancel`/);
+    // One-off check-backs are still reminders; a standing cadence is a routine.
+    expect(block).toMatch(/Keep `reminder_create` for one-off check-backs/);
+  });
+
+  it('/timer cancel all says how many of the cancelled were daily check-ins', () => {
+    const cancel = index.slice(index.indexOf("if (parsed.kind === 'cancel') {"), index.indexOf("if (parsed.kind === 'cancel') {") + 1200);
+    expect(cancel).toMatch(/filter\(t => t\.repeat\)\.length/);
+    expect(cancel).toMatch(/including \$\{daily\} daily check-in/);
   });
 });

@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { createItemsHandlers } from '../lib/items-tools.js';
 
-function fixture(clientOverrides = {}) {
+function fixture(clientOverrides = {}, extra = {}) {
   const session = { roomId: '!r:s', workdir: '/w', journalConvoId: 'c1' };
   const sessions = new Map([['!r:s', session]]);
   const client = {
@@ -18,7 +18,7 @@ function fixture(clientOverrides = {}) {
   const uploadLocalFile = vi.fn(async (_s, p) => p.endsWith('.png')
     ? { ok: true, media: { blob_ref: 'b-' + p, mime: 'image/png', name: p, size: 3, isImage: true } }
     : { ok: false, status: 404, body: { error: `file not found: ${p}` } });
-  const h = createItemsHandlers({ sessions, journalConvoIdFor: (s) => s?.journalConvoId ?? null, client, uploadLocalFile });
+  const h = createItemsHandlers({ sessions, journalConvoIdFor: (s) => s?.journalConvoId ?? null, client, uploadLocalFile, ...extra });
   return { h, client, session, uploadLocalFile };
 }
 
@@ -193,6 +193,31 @@ describe('items handlers', () => {
     const { h, client } = fixture();
     await h.list({ roomId: '!r:s', cursor: 'cur_1', limit: 10 });
     expect(client.list.mock.calls[0][0]).toMatchObject({ cursor: 'cur_1', limit: 10 });
+  });
+
+  it('get: downloads each comment\'s file attachments through saveAttachments and returns their paths', async () => {
+    const thread = { item: { id: 'it_1' }, comments: [
+      { id: 'ic_1', body: 'x', attachments: [{ blob_ref: 'b1', name: 'audit.csv', mime: 'text/csv', size: 3 }] },
+      { id: 'ic_2', body: 'y', attachments: [] },
+    ] };
+    const saveAttachments = vi.fn(async (_s, atts) => atts.map((a) => ({ ...a, path: `/files/${a.name}` })));
+    const { h, session } = fixture({ get: vi.fn(async () => ({ status: 200, data: thread })) }, { saveAttachments });
+    const r = await h.get({ roomId: '!r:s', id: 'it_1' });
+    expect(r.status).toBe(200);
+    expect(saveAttachments).toHaveBeenCalledTimes(1);
+    expect(saveAttachments.mock.calls[0][0]).toBe(session);
+    expect(r.body.comments[0].attachments[0].path).toBe('/files/audit.csv');
+    expect(r.body.comments[1]).toBe(thread.comments[1]);
+    // The journal's own object is not mutated.
+    expect(thread.comments[0].attachments[0]).not.toHaveProperty('path');
+  });
+
+  it('get: a saver failure or its absence leaves the thread as the journal sent it', async () => {
+    const thread = { item: { id: 'it_1' }, comments: [{ id: 'ic_1', body: 'x', attachments: [{ blob_ref: 'b1', name: 'a.csv', mime: 'text/csv' }] }] };
+    const { h } = fixture({ get: vi.fn(async () => ({ status: 200, data: thread })) }, { saveAttachments: vi.fn(async () => { throw new Error('boom'); }) });
+    expect((await h.get({ roomId: '!r:s', id: 'it_1' })).body.comments[0]).toBe(thread.comments[0]);
+    const { h: h2 } = fixture({ get: vi.fn(async () => ({ status: 200, data: thread })) });
+    expect((await h2.get({ roomId: '!r:s', id: 'it_1' })).body).toBe(thread);
   });
 
   it('get / close / reopen / reorder pass through; journal status 0 becomes 502', async () => {

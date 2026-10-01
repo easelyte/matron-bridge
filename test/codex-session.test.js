@@ -306,7 +306,7 @@ describe('Codex bridge wiring', () => {
     // recreateSpawnModel (lib/coordinator.js, unit-tested in
     // test/coordinator.test.js); recreateSession must route through it.
     expect(recreateBody).toContain(
-      'model: recreateSpawnModel({ agent: existing.agent, currentModel: existing.currentModel, pendingModel: existing._coordinatorModel }),',
+      'model: recreateSpawnModel({ agent: existing.agent, currentModel: existing._modelAlias || existing.currentModel, pendingModel: existing._coordinatorModel }),',
     );
   });
 

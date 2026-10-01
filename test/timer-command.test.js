@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import {
-  parseDuration, parseClockTime, formatDuration, parseTimerCommand, createTimerStore,
+  parseDuration, parseClockTime, parseClockHourMinute, formatDuration, parseTimerCommand, createTimerStore,
   timerCancelButton, timerSendNowButton, keepAwakeMarker, MIN_TIMER_MS, MAX_TIMER_MS, OVERDUE_GRACE_MS,
 } from '../lib/timer-command.js';
 
@@ -256,8 +256,8 @@ describe('timerSendNowButton', () => {
 });
 
 // Harness: fake clock + captured timers, no real time or fs.
-function makeStore({ persisted, onFire = () => {} } = {}) {
-  let clock = 1_000_000;
+function makeStore({ persisted, onFire = () => {}, start = 1_000_000 } = {}) {
+  let clock = start;
   const scheduled = new Map(); // handle -> { fn, delay }
   let nextHandle = 1;
   const saves = [];
@@ -494,5 +494,196 @@ describe('holdAwakeMarker', () => {
     expect(store.holdAwakeMarker()).toEqual({ until: now + 60_000, reminders: 1 });
     store.cancel('c1', 1);
     expect(store.holdAwakeMarker()).toBeNull();
+  });
+});
+
+describe('parseClockHourMinute', () => {
+  it('is the clock grammar parseClockTime accepts, as an hour and a minute', () => {
+    expect(parseClockHourMinute('08:00')).toEqual({ hour: 8, minute: 0 });
+    expect(parseClockHourMinute('17:05')).toEqual({ hour: 17, minute: 5 });
+    expect(parseClockHourMinute('9pm')).toEqual({ hour: 21, minute: 0 });
+    expect(parseClockHourMinute('12:10am')).toEqual({ hour: 0, minute: 10 });
+    for (const bad of ['25:00', '13pm', '9', 'soon', '', null]) expect(parseClockHourMinute(bad)).toBeNull();
+  });
+});
+
+// Daily repeating reminders (reminder_create repeat: "daily"). The clock is
+// real UTC instants and the zone is named, so these hold in any host TZ.
+describe('daily repeating reminders', () => {
+  const utc = (iso) => Date.parse(iso);
+  const LONDON_8AM = { kind: 'daily', hour: 8, minute: 0, tz: 'Europe/London' };
+  // 2026-10-24 06:00Z = 07:00 BST, the day before the clocks go back.
+  const START = utc('2026-10-24T06:00:00Z');
+  const addDaily = (h, extra = {}) => h.store.add({
+    convoId: 'c1', roomId: 'r1', text: 'run the sweep', delayMs: utc('2026-10-24T07:00:00Z') - START,
+    source: 'agent', repeat: LONDON_8AM, ...extra,
+  });
+  // The armed delay of the one pending handle.
+  const armed = (h) => [...h.scheduled.values()].map(t => t.delay);
+
+  it('persists the repeat on the record, next to the fireAt the host greps', () => {
+    const h = makeStore({ start: START });
+    const rec = addDaily(h);
+    expect(rec.repeat).toEqual(LONDON_8AM);
+    expect(h.saves.at(-1).timers[0]).toMatchObject({ id: rec.id, fireAt: utc('2026-10-24T07:00:00Z'), repeat: LONDON_8AM });
+    // The host's wake probe is `grep -o '"fireAt": *[0-9]*'` over the file:
+    // exactly one fireAt per record, the next fire, and nothing else that
+    // matches it.
+    const json = JSON.stringify(h.saves.at(-1), null, 2);
+    expect(json.match(/"fireAt": *[0-9]*/g)).toEqual([`"fireAt": ${utc('2026-10-24T07:00:00Z')}`]);
+  });
+
+  it('on fire: delivers, then keeps the same record (same id) re-armed for the next occurrence, across the clock change', () => {
+    const fired = [];
+    const h = makeStore({ start: START, onFire: (r) => fired.push({ ...r }) });
+    const rec = addDaily(h);
+    h.tick(HOUR);
+    expect(fired).toHaveLength(1);
+    expect(fired[0]).toMatchObject({ id: rec.id, text: 'run the sweep', fireAt: utc('2026-10-24T07:00:00Z') });
+    // 08:00 GMT on the 25th is 08:00Z — 25 hours later, same wall clock.
+    const [next] = h.store.listForConvo('c1');
+    expect(next).toMatchObject({ id: rec.id, fireAt: utc('2026-10-25T08:00:00Z'), repeat: LONDON_8AM });
+    expect(h.saves.at(-1).timers).toEqual([expect.objectContaining({ id: rec.id, fireAt: utc('2026-10-25T08:00:00Z') })]);
+    expect(armed(h)).toEqual([25 * HOUR]);
+
+    h.tick(25 * HOUR);
+    expect(fired.map(f => f.id)).toEqual([rec.id, rec.id]);
+    expect(h.store.listForConvo('c1')[0].fireAt).toBe(utc('2026-10-26T08:00:00Z'));
+  });
+
+  it('delivers BEFORE the re-arm is persisted: a crash in between replays the fire, it never loses the schedule', () => {
+    let onDiskAtFire = null;
+    const h = makeStore({
+      start: START,
+      onFire: () => { onDiskAtFire = h.saves.at(-1).timers.map(t => ({ id: t.id, fireAt: t.fireAt })); },
+    });
+    const rec = addDaily(h);
+    h.tick(HOUR);
+    // What a crash inside onFire would leave on disk: the record, still due
+    // at the occurrence being delivered.
+    expect(onDiskAtFire).toEqual([{ id: rec.id, fireAt: utc('2026-10-24T07:00:00Z') }]);
+  });
+
+  it('a throwing delivery still re-arms', () => {
+    const h = makeStore({ start: START, onFire: () => { throw new Error('boom'); } });
+    addDaily(h);
+    expect(() => h.tick(HOUR)).not.toThrow();
+    expect(h.store.listForConvo('c1')[0].fireAt).toBe(utc('2026-10-25T08:00:00Z'));
+  });
+
+  it('survives a restart: the re-armed record is re-armed from disk and keeps its id and repeat', () => {
+    const h = makeStore({ start: START });
+    const rec = addDaily(h);
+    h.tick(HOUR);
+    const onDisk = h.saves.at(-1);
+
+    const fired = [];
+    const h2 = makeStore({ start: utc('2026-10-24T12:00:00Z'), persisted: JSON.parse(JSON.stringify(onDisk)), onFire: (r) => fired.push(r.id) });
+    expect(h2.store.init()).toBe(1);
+    expect(armed(h2)).toEqual([utc('2026-10-25T08:00:00Z') - utc('2026-10-24T12:00:00Z')]);
+    h2.tick(utc('2026-10-25T08:00:00Z') - utc('2026-10-24T12:00:00Z'));
+    expect(fired).toEqual([rec.id]);
+    expect(h2.store.listForConvo('c1')[0]).toMatchObject({ id: rec.id, repeat: LONDON_8AM, fireAt: utc('2026-10-26T08:00:00Z') });
+    // New ids still don't collide with the repeating one.
+    expect(h2.store.add({ convoId: 'c1', text: 'x', delayMs: HOUR }).id).toBe(rec.id + 1);
+  });
+
+  it('a restart between the fire and the re-arm fires it again once (duplicate, not lost), then re-arms', () => {
+    // The file as a crash inside onFire leaves it: the occurrence just
+    // delivered is still the pending fireAt.
+    const persisted = { nextId: 2, timers: [{ id: 1, convoId: 'c1', roomId: 'r1', text: 'run the sweep', createdAt: START, fireAt: utc('2026-10-24T07:00:00Z'), source: 'agent', repeat: LONDON_8AM }] };
+    const fired = [];
+    const h = makeStore({ start: utc('2026-10-24T07:00:30Z'), persisted, onFire: (r) => fired.push(r.id) });
+    h.store.init();
+    h.tick(OVERDUE_GRACE_MS);
+    expect(fired).toEqual([1]);
+    expect(h.store.listForConvo('c1')[0].fireAt).toBe(utc('2026-10-25T08:00:00Z'));
+  });
+
+  it('missed occurrences while the box slept fire ONCE, then the next future occurrence is armed — no burst', () => {
+    // Due three days ago; the bridge comes back at 12:00 BST on the 24th.
+    const persisted = { nextId: 5, timers: [{ id: 4, convoId: 'c1', roomId: 'r1', text: 'run the sweep', createdAt: 0, fireAt: utc('2026-10-21T07:00:00Z'), source: 'agent', repeat: LONDON_8AM }] };
+    const fired = [];
+    const h = makeStore({ start: utc('2026-10-24T11:00:00Z'), persisted, onFire: (r) => fired.push(r.id) });
+    h.store.init();
+    h.tick(OVERDUE_GRACE_MS);
+    expect(fired).toEqual([4]);
+    expect(h.store.listForConvo('c1')[0].fireAt).toBe(utc('2026-10-25T08:00:00Z'));
+    expect(armed(h)).toHaveLength(1);
+    h.tick(HOUR);
+    expect(fired).toEqual([4]);
+  });
+
+  it('cancel stops it for good', () => {
+    const fired = [];
+    const h = makeStore({ start: START, onFire: (r) => fired.push(r.id) });
+    const rec = addDaily(h);
+    h.tick(HOUR);
+    expect(h.store.cancel('c1', rec.id).map(t => t.id)).toEqual([rec.id]);
+    expect(h.saves.at(-1).timers).toEqual([]);
+    expect(h.scheduled.size).toBe(0);
+    h.tick(3 * 24 * HOUR);
+    expect(fired).toEqual([rec.id]);
+  });
+
+  it('Send-now delivers it now and keeps the schedule it already had', () => {
+    const fired = [];
+    const h = makeStore({ start: START, onFire: (r) => fired.push(r.id) });
+    const rec = addDaily(h);
+    h.tick(10 * MINUTE);
+    expect(h.store.fireNow('c1', rec.id)).toEqual(expect.objectContaining({ id: rec.id }));
+    expect(fired).toEqual([rec.id]);
+    // Today's 08:00 is still ahead, so it still comes — the tap was an extra
+    // delivery, not a skip.
+    expect(h.store.listForConvo('c1')[0].fireAt).toBe(utc('2026-10-24T07:00:00Z'));
+    expect(h.scheduled.size).toBe(1);
+    h.tick(50 * MINUTE);
+    expect(fired).toEqual([rec.id, rec.id]);
+    expect(h.store.listForConvo('c1')[0].fireAt).toBe(utc('2026-10-25T08:00:00Z'));
+  });
+
+  it('Send-now never moves the schedule, even a tap within MIN_TIMER_MS of the occurrence: that occurrence still fires', () => {
+    const fired = [];
+    const h = makeStore({ start: START, onFire: (r) => fired.push(r.id) });
+    const rec = addDaily(h);
+    // 2 s before today's 08:00 BST (07:00Z) — inside the minimum gap.
+    h.tick(HOUR - 2_000);
+    const savesBefore = h.saves.length;
+    const handlesBefore = [...h.scheduled.keys()];
+    h.store.fireNow('c1', rec.id);
+    expect(fired).toEqual([rec.id]);
+    // Record, armed handle and file all untouched: a pure extra delivery.
+    expect(h.store.listForConvo('c1')[0].fireAt).toBe(utc('2026-10-24T07:00:00Z'));
+    expect([...h.scheduled.keys()]).toEqual(handlesBefore);
+    expect(h.saves.length).toBe(savesBefore);
+    h.tick(2_000);
+    expect(fired).toEqual([rec.id, rec.id]);
+    expect(h.store.listForConvo('c1')[0].fireAt).toBe(utc('2026-10-25T08:00:00Z'));
+  });
+
+  it('Send-now on a repeating record survives a throwing delivery and keeps it armed', () => {
+    const h = makeStore({ start: START, onFire: () => { throw new Error('boom'); } });
+    const rec = addDaily(h);
+    expect(h.store.fireNow('c1', rec.id)).toEqual(expect.objectContaining({ id: rec.id }));
+    expect(h.scheduled.size).toBe(1);
+    expect(h.store.listForConvo('c1')[0].fireAt).toBe(utc('2026-10-24T07:00:00Z'));
+  });
+
+  it('never holds the box awake: a repeating record is left out of the keep-awake marker', () => {
+    const h = makeStore({ start: START });
+    addDaily(h, { holdAwake: true });
+    expect(h.store.holdAwakeMarker()).toBeNull();
+    expect(h.store.holdAwakeUntil('c1')).toBeNull();
+    expect(keepAwakeMarker([{ fireAt: 5, holdAwake: true, repeat: LONDON_8AM }])).toBeNull();
+  });
+
+  it('a persisted repeat that no longer parses degrades to a one-shot: it fires once and is removed', () => {
+    const persisted = { nextId: 2, timers: [{ id: 1, convoId: 'c1', text: 'x', createdAt: 0, fireAt: START + HOUR, repeat: { kind: 'daily', hour: 8, minute: 0, tz: 'Gone/Zone' } }] };
+    const fired = [];
+    const h = makeStore({ start: START, persisted, onFire: (r) => fired.push(r.id) });
+    h.store.init();
+    h.tick(HOUR);
+    expect(fired).toEqual([1]);
+    expect(h.store.listForConvo('c1')).toEqual([]);
   });
 });

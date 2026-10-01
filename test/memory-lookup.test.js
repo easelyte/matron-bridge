@@ -52,7 +52,7 @@ describe('createMemoryLookup', () => {
     await l.refresh({ force: true });
     expect(l.snapshot()).toEqual({ known: false, memories: [] });
     expect(warns).toHaveLength(1);
-    expect(warns[0]).toMatch(/memories unknown; the Coordinator is told to call memory_list/);
+    expect(warns[0]).toMatch(/memories unknown; sessions are told to call memory_list/);
   });
 
   it('a failure after a good answer keeps the last known list', async () => {

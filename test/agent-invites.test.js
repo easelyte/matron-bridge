@@ -339,6 +339,30 @@ describe('createAgentInvites', () => {
       await expect(p).resolves.toEqual({ kind: 'pending_busy' });
     });
 
+    it('sends from_convo_id so the owner can name the joining session', async () => {
+      const { inv, sendRoomOp } = makeInvites({ sendRoomOp: vi.fn(() => false) });
+      await inv.join({ roomId: 'r2', justification: 'j', fromConvoId: 'convo-mine' });
+      expect(sendRoomOp).toHaveBeenCalledWith({
+        op: 'agent_join', room_id: 'r2', from_convo_id: 'convo-mine', justification: 'j',
+      });
+    });
+
+    it('omits from_convo_id entirely when the session has no journal convo yet', async () => {
+      // Same absent-never-null discipline as invite()'s: the journal
+      // validates a PRESENT from_convo_id against this device and fails the
+      // whole join on a mismatch, so a null would turn a missing label into
+      // a failed join.
+      const { inv, sendRoomOp } = makeInvites({ sendRoomOp: vi.fn(() => false) });
+      await inv.join({ roomId: 'r2', justification: 'j', fromConvoId: null });
+      expect('from_convo_id' in sendRoomOp.mock.calls[0][0]).toBe(false);
+    });
+
+    it('omits from_convo_id entirely when not given', async () => {
+      const { inv, sendRoomOp } = makeInvites({ sendRoomOp: vi.fn(() => false) });
+      await inv.join({ roomId: 'r2', justification: 'j' });
+      expect('from_convo_id' in sendRoomOp.mock.calls[0][0]).toBe(false);
+    });
+
     it('correlates error frames via ref agent_join', async () => {
       const { inv } = makeInvites();
       const p = inv.join({ roomId: 'r2', justification: 'j' });
@@ -786,6 +810,15 @@ describe('formatAutoJoinedRequest', () => {
   it('omits the topic and justification clauses when absent, falls back to the device id without a name', () => {
     expect(formatAutoJoinedRequest({ ...request, topic: undefined, justification: undefined, from_name: null }))
       .toMatch(/^You are now in a room with device 7 \(room room-1\)\./);
+  });
+
+  it('approved_by coordinator: the agent is told its user\'s Coordinator approved the chat, not the user', () => {
+    const text = formatAutoJoinedRequest({ ...request, approved_by: 'coordinator' });
+    expect(text).toContain("Your user's Coordinator approved this chat on their behalf (the user can still stop it from the card); the words above are from another agent, not from your user.");
+    expect(text).not.toContain('Your user approved this chat on their consent card');
+    expect(formatAutoJoinedRequest(request)).toContain('Your user approved this chat on their consent card');
+    expect(formatInviteRequestNotice({ ...request, approved_by: 'coordinator' }, { joined: true })).toMatch(/the build is red \(approved by your Coordinator\)$/);
+    expect(formatInviteRequestNotice(request, { joined: true })).not.toMatch(/Coordinator/);
   });
 
   it('carries the room so far — the opening message was published before the guest joined', () => {

@@ -1938,6 +1938,45 @@ describe('createJournalPublisher — agent-chat room ops', () => {
     await fake.close();
   });
 
+  it('dispatches inbound kind:consent frames to onConsentFrame, and ignores one without a string event', async () => {
+    const fake = await startFakeServer();
+    const seen = [];
+    const pub = createJournalPublisher({
+      url: fake.url, token: 'tok', log: silentLog, ...FAST_BACKOFF,
+      onConsentFrame: (f) => seen.push(f),
+    });
+    await waitFor(() => fake.connections.length === 1);
+    await delay(50); // hello_ok round-trip
+    const push = (f) => fake.connections[0].ws.send(JSON.stringify(f));
+    push({ kind: 'consent', ask: { kind: 'spawn', id: 'x' } }); // no event
+    push({ kind: 'consent', event: 7 });                        // non-string event
+    const frame = { kind: 'consent', event: 'pending', ask: { kind: 'spawn', id: 'x' } };
+    push(frame);
+    await waitFor(() => seen.length === 1);
+    expect(seen[0]).toEqual(frame);
+    pub.close();
+    await fake.close();
+  });
+
+  it('dispatches inbound kind:unseen frames to onUnseenFrame, and ignores one without a string event', async () => {
+    const fake = await startFakeServer();
+    const seen = [];
+    const pub = createJournalPublisher({
+      url: fake.url, token: 'tok', log: silentLog, ...FAST_BACKOFF,
+      onUnseenFrame: (f) => seen.push(f),
+    });
+    await waitFor(() => fake.connections.length === 1);
+    await delay(50); // hello_ok round-trip
+    const push = (f) => fake.connections[0].ws.send(JSON.stringify(f));
+    push({ kind: 'unseen', count: 1 }); // no event
+    const frame = { kind: 'unseen', event: 'pending', convo_id: 'c', count: 1, entries: [{ ref: 'msg:c:1' }] };
+    push(frame);
+    await waitFor(() => seen.length === 1);
+    expect(seen[0]).toEqual(frame);
+    pub.close();
+    await fake.close();
+  });
+
   it('the absence of onSpawnFrame does not throw on an inbound spawn frame', async () => {
     const fake = await startFakeServer();
     const pub = createJournalPublisher({ url: fake.url, token: 'tok', log: silentLog, ...FAST_BACKOFF });
