@@ -53,7 +53,7 @@ describe('New Chat agent switch wiring (source inspection)', () => {
 
   it('hands the handler a live Codex-availability check and the transport flag', () => {
     const src = handlerWiring();
-    expect(src).toMatch(/codexAvailable: \(\) => detectCodexBinary\(\)/);
+    expect(src).toMatch(/codexAvailable: \(\) => process\.platform !== 'win32' && detectCodexBinary\(\)/);
     expect(src).toMatch(/codexAppServer: CODEX_APP_SERVER/);
     expect(indexSource).toMatch(/import \{[^}]*\bdetectCodexBinary\b[^}]*\} from '\.\/lib\/codex-paths\.js'/);
   });

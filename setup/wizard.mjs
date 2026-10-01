@@ -264,7 +264,11 @@ async function main() {
   console.log('');
   console.log('Next steps:');
   console.log('  npm start                     # run the bridge in this terminal');
-  console.log('  sudo bash setup/service.sh    # or install it as an always-on service');
+  if (process.platform === 'win32') {
+    console.log('  setup\\service.ps1             # or register it to start at logon (Scheduled Task)');
+  } else {
+    console.log('  sudo bash setup/service.sh    # or install it as an always-on service');
+  }
   console.log('');
   rl.close();
 }

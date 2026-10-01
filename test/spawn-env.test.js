@@ -1,6 +1,7 @@
 // Behavioral tests for the agent-session child envs (lib/spawn-env.js):
 // assert what the child gets rather than how index.js spells the literal.
 import { describe, it, expect } from 'vitest';
+import path from 'node:path';
 import { buildClaudeSpawnEnv, buildCodexSpawnEnv, pathWithNodeBin } from '../lib/spawn-env.js';
 
 const EXEC = '/opt/node/bin/node';
@@ -28,6 +29,7 @@ function claude(overrides = {}) {
     permissionToken: 'session-permission',
     baseEnv: BRIDGE_ENV,
     execPath: EXEC,
+    pathDelimiter: ':',
     roomId: '!room:example',
     apiPort: 8787,
     journalProxyHeaderFile: '/tmp/matron-journal-proxy-x/header',
@@ -197,6 +199,13 @@ describe('buildClaudeSpawnEnv permission-card keys (fork)', () => {
 
 describe('pathWithNodeBin', () => {
   it('matches whole PATH entries, not substrings', () => {
-    expect(pathWithNodeBin('/opt/node/bin-old:/usr/bin', EXEC)).toBe('/opt/node/bin:/opt/node/bin-old:/usr/bin');
+    expect(pathWithNodeBin('/opt/node/bin-old:/usr/bin', EXEC, ':')).toBe('/opt/node/bin:/opt/node/bin-old:/usr/bin');
+  });
+
+  it('uses ; on Windows and leaves an already-present dir alone', () => {
+    const exec = 'C:\\nodejs\\node.exe';
+    const dir = path.dirname(exec);
+    expect(pathWithNodeBin('C:\\Windows;C:\\Git\\bin', exec, ';')).toBe(`${dir};C:\\Windows;C:\\Git\\bin`);
+    expect(pathWithNodeBin(`C:\\Windows;${dir}`, exec, ';')).toBe(`C:\\Windows;${dir}`);
   });
 });

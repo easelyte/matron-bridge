@@ -210,6 +210,6 @@ describe('index.js child spawns are scoped', () => {
     const start = indexSrc.indexOf('function fetchUsageLimitsText(');
     expect(start).toBeGreaterThan(-1);
     expect(indexSrc.slice(start, start + 2000)).toMatch(/env: stripJournalCreds\(\{ \.\.\.process\.env, CLAUDECODE: '' \}\)/);
-    expect(indexSrc).toMatch(/execFileSync\('ps', [^\n]*env: stripJournalCreds\(\)/);
+    expect(indexSrc).toMatch(/execFileSync\(file, ptArgs, [^\n]*env: stripJournalCreds\(\)/);
   });
 });

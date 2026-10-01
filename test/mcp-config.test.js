@@ -165,6 +165,19 @@ describe('buildMcpServers — repo-relative command resolution (xvfb-wrap.sh)', 
       '-y', 'chrome-devtools-mcp', '--no-usage-statistics',
     ]);
   });
+
+  it('on Windows the wrapper is unwrapped too (no Xvfb there either)', () => {
+    const { config } = buildMcpServers({
+      baseConfig: BASE_WRAP,
+      extras: ['browser'],
+      platform: 'win32',
+      askUserBaseDir: 'C:/bridge',
+    });
+    expect(config.mcpServers['chrome-devtools'].command).toBe('npx');
+    expect(config.mcpServers['chrome-devtools'].args).toEqual([
+      '-y', 'chrome-devtools-mcp', '--no-usage-statistics',
+    ]);
+  });
 });
 
 describe('buildMcpServers', () => {

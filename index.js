@@ -87,6 +87,10 @@ import {
   setupCodexWatcherForSession,
 } from './lib/codex-watcher-setup.js';
 import { detectCodexBinary, launchWithCodexSinkEnv, pruneStaleCodexSinks, removeCodexSinkForSession } from './lib/codex-paths.js';
+import { liveLogDir, liveLogPath as liveLogPathFor } from './lib/live-log-dir.js';
+import { killProcessTree } from './lib/process-kill.js';
+import { processTableCommand } from './lib/process-table.js';
+import { installShutdownToken, decideShutdown } from './lib/shutdown-endpoint.js';
 import { createSubagentConvoTracker } from './lib/subagent-convos.js';
 import { createQueuedReleaseOutbox } from './lib/queued-release-outbox.js';
 import { createSubagentRunningStore } from './lib/subagent-running-store.js';
@@ -546,7 +550,7 @@ const COORDINATOR_BLOCK = loadCoordinatorBlock({
 const _rawLiveOutputTtl = parseInt(process.env.MATRON_LIVE_OUTPUT_TTL || '86400', 10);
 const LIVE_OUTPUT_TTL = Number.isFinite(_rawLiveOutputTtl) && _rawLiveOutputTtl > 0 ? _rawLiveOutputTtl : 86400;
 const liveOutputStore = createLiveOutputStore({ ttlSeconds: LIVE_OUTPUT_TTL });
-sweepOrphanedLogs('/tmp', LIVE_OUTPUT_TTL);
+sweepOrphanedLogs(liveLogDir(), LIVE_OUTPUT_TTL);
 setInterval(() => liveOutputStore.gcExpired(), 60_000).unref();
 if (!HMAC_SECRET || !VIEWER_BASE_URL) {
   console.warn('[viewer] HMAC_SECRET or VIEWER_BASE_URL unset — file links and secure secret/sensitive-data links disabled');
@@ -658,6 +662,13 @@ if (journalHttpBase) {
     console.warn(`[journal] could not write the read-proxy header file; journal search is unavailable to sessions: ${e.message}`);
   }
 }
+// Windows: the per-boot token that gates POST /shutdown, written where
+// restart.ps1 reads it (%LOCALAPPDATA%\matron-bridge\shutdown.token).
+const SHUTDOWN_TOKEN = process.platform === 'win32' ? installShutdownToken() : null;
+if (SHUTDOWN_TOKEN) {
+  process.once('exit', () => { try { fs.rmSync(SHUTDOWN_TOKEN.file, { force: true }); } catch { /* best effort */ } });
+}
+
 const journalReadProxy = createJournalReadProxy({
   baseUrl: journalHttpBase,
   token: _journalToken,
@@ -1407,7 +1418,9 @@ const journalRpcHandler = createRpcRequestHandler({
   // `agent: 'codex'` start accepted) only when this box can spawn it. Read
   // per request — a handful of realpath calls — so installing codex later
   // shows up without a bridge restart.
-  codexAvailable: () => detectCodexBinary(),
+  // Codex is Linux/macOS-only (the producer shim needs symlinks, /proc and
+  // POSIX process groups — see the Windows design spec's non-goals).
+  codexAvailable: () => process.platform !== 'win32' && detectCodexBinary(),
   codexAppServer: CODEX_APP_SERVER,
   expandHome,
   // Capacity thunks (2026-08-10 capacity spec): answered from cache, never
@@ -2358,7 +2371,18 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   }
   workdir = guarded.cwd;
   const persistedMode = getPersistedSession(roomId);
-  const agent = resolveAgent({ option: options.agent, persisted: persistedMode?.agent, fallback: DEFAULT_AGENT });
+  let agent = resolveAgent({ option: options.agent, persisted: persistedMode?.agent, fallback: DEFAULT_AGENT });
+  if (agent === AGENT_CODEX && process.platform === 'win32') {
+    // Codex is Linux/macOS-only (Windows design spec, non-goals). Fall back
+    // to Claude visibly rather than throw: createSession's callers are not
+    // wrapped, and a silent switch would be the worse surprise.
+    console.warn(`[agent] ${roomId}: the Codex backend is not available on Windows; starting a Claude session instead`);
+    const cw = notice('warning', 'The Codex backend is not available on Windows — starting a Claude session instead.',
+      'The Codex backend is not available on Windows — starting a Claude session instead.');
+    Promise.resolve(sendToRoom(roomId, cw.plain, cw.html)).catch(() => {});
+    agent = AGENT_CLAUDE;
+    options = { ...options, agent: AGENT_CLAUDE };
+  }
   const coordinator = coordinatorRoleAtSpawn(roomId, resumeSessionId, options, persistedMode);
   options = { ...options, coordinator };
   // A Claude session that changes cwd mid-flight (EnterWorktree is the common
@@ -2534,6 +2558,8 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
       cwd,
       env: configuredEnv,
       stdio: ['pipe', 'pipe', 'pipe'],
+      // No console window per session on Windows (no-op elsewhere).
+      windowsHide: true,
     }),
   });
 
@@ -4967,12 +4993,12 @@ function handleClaudeEvent(session, event) {
             // later `system.task_started` event). So we don't try to parse the
             // marker out of input.command — instead we predict the log path
             // deterministically from `block.id`, which matches what the hook
-            // writes (`/tmp/matron-cmd-<tool_use_id>.log`). If MATRON_BASH_TEE
+            // writes (`<liveLogDir>/matron-cmd-<tool_use_id>.log`). If MATRON_BASH_TEE
             // was disabled at spawn, the file won't exist and the viewer will
             // show its "Output expired" / WS-failed state.
             const displayCommand = input.command;
             const liveToolUseId = block.id;
-            const liveLogPath = `/tmp/matron-cmd-${liveToolUseId}.log`;
+            const liveLogPath = liveLogPathFor(liveToolUseId);
 
             const cmd = displayCommand.length > 100
               ? displayCommand.slice(0, 100) + '…'
@@ -7117,6 +7143,7 @@ function fetchUsageLimitsText(cwd) {
     const proc = spawn('claude', ['-p', '/usage', '--output-format', 'text'], {
       cwd,
       stdio: ['ignore', 'pipe', 'pipe'],
+      windowsHide: true,
       // Every other claude spawn in this file clears CLAUDECODE (Bugbot
       // finding #6) — without it, a `claude` child inherits CLAUDECODE from
       // this process's own environment and can behave as though it's
@@ -7134,7 +7161,7 @@ function fetchUsageLimitsText(cwd) {
     let settled = false;
     const finish = (fn, arg) => { if (!settled) { settled = true; clearTimeout(timer); fn(arg); } };
     const timer = setTimeout(() => {
-      try { proc.kill('SIGKILL'); } catch { /* already gone */ }
+      void killProcessTree(proc.pid, 'SIGKILL', { kill: (sig) => { try { proc.kill(sig); } catch { /* already gone */ } }, log: debug });
       finish(reject, new Error('timed out'));
     }, 30000);
     proc.stdout.on('data', (d) => { stdout += d; });
@@ -12303,6 +12330,25 @@ const apiServer = createServer(async (req, res) => {
     return;
   }
 
+  // POST /shutdown — Windows only (lib/shutdown-endpoint.js): the supervised
+  // stop path where no SIGTERM can reach a hidden background process. Same
+  // gracefulShutdown as the signal handlers. Token-gated; 404 elsewhere.
+  if (url.pathname === '/shutdown') {
+    if (process.platform !== 'win32') {
+      res.writeHead(404);
+      res.end(JSON.stringify({ error: 'not found' }));
+      return;
+    }
+    const decision = decideShutdown({ headers: req.headers, token: SHUTDOWN_TOKEN?.token });
+    res.writeHead(decision.status, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(decision.body));
+    if (decision.shutdown) {
+      console.log('[shutdown] POST /shutdown accepted — shutting down');
+      setImmediate(() => { void gracefulShutdown('http'); });
+    }
+    return;
+  }
+
   let body = '';
   let bodyBytes = 0;
   let showFileBodyTooLarge = false;
@@ -13762,7 +13808,8 @@ function killSession(session, signal = 'SIGTERM', { preserveQueue = false } = {}
       session.codex.kill(signal);
     }
     else if (session.iv) session.iv.kill(signal);
-    else if (session.proc) session.proc.kill(signal);
+    // Windows: the whole tree (MCP servers, tool shells) — lib/process-kill.js.
+    else if (session.proc) void killProcessTree(session.proc.pid, signal, { kill: (sig) => session.proc.kill(sig), log: debug });
   } catch (e) {
     debug(`killSession error: ${e.message}`);
   }
@@ -13775,12 +13822,17 @@ function sessionChildPid(session) {
   return Number.isInteger(pid) ? pid : null;
 }
 
-// `ps` rather than /proc so the same call works on the macOS bridges. Fails
-// closed to an empty table: with no table there are no work children, and
-// the idle clock rules as it did before — never the other way round.
+// `ps` rather than /proc so the same call works on the macOS bridges, and
+// Get-CimInstance on Windows (lib/process-table.js) in the same line shape.
+// Fails closed to an empty table: with no table there are no work children,
+// and the idle clock rules as it did before — never the other way round.
 function readProcessTable() {
   try {
-    return parseProcessTable(execFileSync('ps', ['-axo', 'pid=,ppid=,args='], { encoding: 'utf8', timeout: 5000, maxBuffer: 16 * 1024 * 1024, env: stripJournalCreds() }));
+    const { file, args: ptArgs } = processTableCommand();
+    // execFileSync blocks the event loop: 5 s for ps as before; PowerShell
+    // needs a cold start, so Windows gets 15 s.
+    const timeout = process.platform === 'win32' ? 15000 : 5000;
+    return parseProcessTable(execFileSync(file, ptArgs, { encoding: 'utf8', timeout, maxBuffer: 16 * 1024 * 1024, env: stripJournalCreds(), windowsHide: true }));
   } catch (e) {
     debug(`readProcessTable failed: ${e.message}`);
     return [];
@@ -14057,3 +14109,6 @@ async function gracefulShutdown(signal) {
 
 process.on('SIGINT', () => { void gracefulShutdown('SIGINT'); });
 process.on('SIGTERM', () => { void gracefulShutdown('SIGTERM'); });
+// Windows: Ctrl+Break in a console run. SIGTERM can be listened for but is
+// never delivered there; the supervised path is POST /shutdown instead.
+if (process.platform === 'win32') process.on('SIGBREAK', () => { void gracefulShutdown('SIGBREAK'); });

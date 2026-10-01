@@ -1,0 +1,4 @@
+# LF everywhere, including Windows checkouts: the bridge reads its own
+# markdown (BRIDGE_*.md, coordinator/) and the hooks line by line, and
+# Git for Windows' autocrlf default would hand it CRLF.
+* text=auto eol=lf

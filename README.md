@@ -24,6 +24,8 @@ This project is licensed under AGPLv3. For alternative licensing, contact [licen
 
 **macOS:** [Homebrew](https://brew.sh), Xcode Command Line Tools (`xcode-select --install`), and `brew install node@22`. For voice notes: `setup/install-whisper.sh` will run `brew install whisper-cpp ffmpeg` automatically.
 
+**Windows (10 1809+ / Server 2019+):** [Node.js 22+](https://nodejs.org) (`winget install OpenJS.NodeJS.LTS`), [Git for Windows](https://git-scm.com/downloads/win) (`winget install Git.Git` — Git Bash is what gives Claude Code its Bash tool; without it sessions get the PowerShell tool and live Bash output is off), and Claude Code via the native installer (`irm https://claude.ai/install.ps1 | iex`), logged in (`claude`) as the user who will run the bridge. If Claude Code cannot find Git Bash, set `CLAUDE_CODE_GIT_BASH_PATH` in `%USERPROFILE%\.claude\settings.json` (see the [Claude Code setup docs](https://code.claude.com/docs/en/setup#set-up-on-windows)). Not available on Windows: the Codex backend and voice-note transcription.
+
 For public file and secret viewer links on macOS, install `cloudflared` if you want to publish the local viewer through Cloudflare Tunnel:
 
 ```bash
@@ -101,9 +103,29 @@ After editing `.env`, re-run `setup/service.sh` (on macOS, launchd has no
 `EnvironmentFile` equivalent — values are inlined into the plist at install
 time).
 
+### Windows
+
+From PowerShell (not elevated), as the user who will run the bridge:
+
+```powershell
+setup\install.ps1       # checks node/git/claude, npm install, runs the wizard (or seeds .env)
+setup\service.ps1       # registers two Scheduled Tasks at logon and starts them
+```
+
+The tasks (`\Matron\matron-bridge` and `\Matron\matron-bridge-viewer`) run in
+your **desktop session**, so a Claude session on that box can drive GUI
+applications; the flip side is that the bridge only runs while you are logged
+on. For an unattended machine, configure auto-logon. `index.js` loads `.env`
+itself, so after editing `.env` just run `.\restart.ps1`.
+
+Print mode (the default) is the supported session mode on Windows. `/iv`
+(interactive TUI mode) runs through ConPTY, which re-renders Claude Code's
+terminal output, and is best effort: if prompts are not detected, switch back
+with `/iv off`.
+
 ## Publishing the viewer
 
-The service installer starts two units on both Linux and macOS: the bridge and the local file viewer. The viewer listens on `127.0.0.1:$MATRON_VIEWER_PORT` and powers file links, secure secret requests, and one-time sensitive-data links.
+The service installer starts two units on Linux, macOS and Windows: the bridge and the local file viewer. The viewer listens on `127.0.0.1:$MATRON_VIEWER_PORT` and powers file links, secure secret requests, and one-time sensitive-data links.
 
 To make those links usable from Matron clients, set `VIEWER_BASE_URL` to a public HTTPS URL that forwards to the local viewer (e.g. via a Cloudflare named tunnel or your own reverse proxy pointed at `127.0.0.1:$MATRON_VIEWER_PORT`). The bridge no longer ships its own Cloudflare tunnel helper — provisioning the tunnel/DNS is a dev-box-level concern, not something this repo manages.
 
@@ -141,6 +163,25 @@ The installer also manages `matron-bridge-viewer` — substitute that unit name 
 | Uninstall | `launchctl bootout gui/$UID/chat.matron.matron-bridge && rm ~/Library/LaunchAgents/chat.matron.matron-bridge.plist` |
 
 For `SCOPE=system` setups, replace `gui/$UID` with `system` and `~/Library/LaunchAgents` with `/Library/LaunchDaemons`.
+
+**Windows (Scheduled Tasks):**
+
+| Action | Command |
+|---|---|
+| Status | `Get-ScheduledTask -TaskPath '\Matron\' \| Select TaskName, State` |
+| Restart | `.\restart.ps1` (graceful: `POST /shutdown`, then the task is started again) |
+| Deploy latest | `.\deploy.ps1` (`-DryRun` to preflight only) |
+| Logs | `Get-Content -Wait "$env:LOCALAPPDATA\matron-bridge\logs\matron-bridge.log"` |
+| Stop | `.\restart.ps1 -StopOnly` (graceful; disables the task until the next `.\restart.ps1`) |
+| Uninstall | `setup\service.ps1 -Uninstall` |
+
+The task restarts the bridge within a minute if it exits with a non-zero
+code, and a five-minute watchdog trigger relaunches it whenever it is not
+running (a no-op while it is). A plain `Stop-ScheduledTask` is therefore
+undone within five minutes; use `-StopOnly`, which disables the task.
+`restart.ps1` run from inside a bridge session (a Claude tool call,
+`deploy.ps1`) hands itself to a one-shot Scheduled Task a few seconds out,
+because Task Scheduler would otherwise stop it along with the bridge.
 
 ## Config (.env)
 

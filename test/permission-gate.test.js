@@ -37,21 +37,30 @@ function gateCommand(settings) {
 
 describe('buildPrintSessionSettings', () => {
   it('gated: adds the MCP permission gate hook next to the bridge hooks', () => {
-    const settings = buildPrintSessionSettings({ bypass: false, hooksDir: HOOKS_DIR, apiPort: 9802, roomId: 'room-1' });
+    const settings = buildPrintSessionSettings({ bypass: false, hooksDir: HOOKS_DIR, apiPort: 9802, roomId: 'room-1', platform: 'linux' });
     // Pinned on: the inline --settings layer outranks the project and user
     // settings files, so an on-disk `disableAllHooks: true` cannot switch the
     // gate off (verified against the real CLI below).
     expect(settings.disableAllHooks).toBe(false);
     expect(settings.permissions.allow).toEqual(['mcp__ask-user', 'mcp__show-file']);
-    expect(settings.hooks.PreCompact[0].hooks[0].command).toBe(path.join(HOOKS_DIR, 'compact-notify.sh'));
+    expect(settings.hooks.PreCompact[0].hooks[0].command).toBe(path.posix.join(HOOKS_DIR, 'compact-notify.sh'));
     expect(settings.hooks.PreToolUse[0]).toEqual({
       matcher: 'Bash',
-      hooks: [{ type: 'command', command: path.join(HOOKS_DIR, 'matron-bash-tee.sh') }],
+      hooks: [{ type: 'command', command: path.posix.join(HOOKS_DIR, 'matron-bash-tee.sh') }],
     });
     const gate = gateCommand(settings);
     expect(gate.type).toBe('command');
-    expect(gate.command).toBe(`node '${GATE_HOOK}' --port '9802' --room 'room-1'`);
+    expect(gate.command).toBe(`node '${path.posix.join(HOOKS_DIR, 'permission-gate.mjs')}' --port '9802' --room 'room-1'`);
     expect(gate.timeout).toBeGreaterThan(10);
+  });
+
+  it('win32: every bridge hook is exec form — node.exe + the .mjs port + literal args, no shell', () => {
+    const settings = buildPrintSessionSettings({ bypass: false, hooksDir: HOOKS_DIR, apiPort: 9802, roomId: 'room 1', platform: 'win32', execPath: 'C:\\nodejs\\node.exe' });
+    expect(settings.hooks.PreCompact[0].hooks[0]).toEqual({ type: 'command', command: 'C:\\nodejs\\node.exe', args: [path.win32.join(HOOKS_DIR, 'compact-notify.mjs')], timeout: 5 });
+    expect(settings.hooks.PreToolUse[0].hooks[0]).toEqual({ type: 'command', command: 'C:\\nodejs\\node.exe', args: [path.win32.join(HOOKS_DIR, 'matron-bash-tee.mjs')] });
+    const gate = gateCommand(settings);
+    expect(gate.command).toBe('C:\\nodejs\\node.exe');
+    expect(gate.args).toEqual([path.win32.join(HOOKS_DIR, 'permission-gate.mjs'), '--port', '9802', '--room', 'room 1']);
   });
 
   it('bypass: no gate hook (nothing is gated)', () => {
@@ -62,7 +71,7 @@ describe('buildPrintSessionSettings', () => {
   });
 
   it('quotes the hooks dir and room id for the shell', () => {
-    const settings = buildPrintSessionSettings({ bypass: false, hooksDir: "/opt/it's here/hooks", apiPort: 9802, roomId: "!a'b;$(x)" });
+    const settings = buildPrintSessionSettings({ bypass: false, hooksDir: "/opt/it's here/hooks", apiPort: 9802, roomId: "!a'b;$(x)", platform: 'linux' });
     expect(gateCommand(settings).command)
       .toBe(`node '/opt/it'\\''s here/hooks/permission-gate.mjs' --port '9802' --room '!a'\\''b;$(x)'`);
   });

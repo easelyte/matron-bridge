@@ -7,6 +7,11 @@ OS="$(uname -s)"
 case "$OS" in
   Linux)  exec bash "$SCRIPT_DIR/service-linux.sh" "$@" ;;
   Darwin) exec bash "$SCRIPT_DIR/service-macos.sh" "$@" ;;
+  MINGW*|MSYS*|CYGWIN*)
+    echo "ERROR: this is a Git Bash / MSYS shell on Windows." >&2
+    echo "On Windows, run setup\\service.ps1 from PowerShell instead." >&2
+    exit 1
+    ;;
   *)
     echo "ERROR: unsupported OS: $OS" >&2
     echo "Supported: Linux, Darwin (macOS)" >&2

@@ -141,6 +141,8 @@ describe('runSleepCommand', () => {
       child,
       timers,
       spawn: vi.fn(() => child),
+      // The POSIX shape is what these tests pin; the Windows one has its own case.
+      platform: 'linux',
       setTimer: (fn, ms) => { timers.push({ fn, ms }); return 'handle'; },
       fire: () => timers.forEach(t => t.fn()),
     };
@@ -151,6 +153,14 @@ describe('runSleepCommand', () => {
     runSleepCommand('poweroff', h);
     expect(h.spawn).toHaveBeenCalledWith('/bin/sh', ['-c', 'poweroff'],
       expect.objectContaining({ detached: true }));
+  });
+
+  it('runs the command through PowerShell on Windows', () => {
+    const h = harness();
+    runSleepCommand('Stop-Computer -Force', { ...h, platform: 'win32' });
+    expect(h.spawn).toHaveBeenCalledWith('powershell.exe',
+      ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-Command', 'Stop-Computer -Force'],
+      expect.objectContaining({ detached: true, windowsHide: true }));
   });
 
   it('rejects when the spawn itself fails, instead of crashing the bridge', async () => {

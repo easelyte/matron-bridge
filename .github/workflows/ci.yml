@@ -45,3 +45,32 @@ jobs:
 
       - name: High-severity dependency audit
         run: npm run audit:high
+
+  test-windows:
+    name: Test on Windows (Node.js 22.x)
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version: 22.x
+          cache: npm
+
+      # node-pty ships win32 prebuilds, so this needs no build tools.
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Syntax check
+        run: npm run check
+
+      # vitest.config.js excludes the POSIX-only suites on win32 (bash hook
+      # scripts, Xvfb wrapper, the Codex shim); everything else runs.
+      - name: Test
+        run: npm test

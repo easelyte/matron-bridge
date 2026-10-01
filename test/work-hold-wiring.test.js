@@ -65,7 +65,9 @@ describe('work in flight holds the session and the box', () => {
 
   it('reads the process table with ps, failing closed to an empty table', () => {
     const body = fnBody('readProcessTable');
-    expect(body).toMatch(/execFileSync\('ps', \['-axo', 'pid=,ppid=,args='\]/);
+    // The command comes from lib/process-table.js (ps on POSIX, Get-CimInstance on Windows).
+    expect(body).toMatch(/const \{ file, args: ptArgs \} = processTableCommand\(\)/);
+    expect(body).toMatch(/execFileSync\(file, ptArgs,/);
     expect(body).toMatch(/return parseProcessTable\(/);
     expect(body).toMatch(/catch[\s\S]*return \[\];/);
   });
