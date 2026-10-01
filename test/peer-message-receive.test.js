@@ -673,6 +673,21 @@ describe('journalOnPeerMessage priority preemption (loop #688 consumer half)', (
     }
   });
 
+  it('a priority peer still jumps explicitly tiered room notices (invite FYI, spawn outcome)', () => {
+    for (const tier of ['peer-coalesced', 'autonomous']) {
+      const target = session({ busy: true, turnTier: 'autonomous' });
+      const runtime = makeRuntime({ target, markBusyOnInject: true });
+      runtime.roomDelivery.deliver(target, target.roomId, {
+        roomId: 'room-x', roomTitle: 'coord', from: 'bridge', body: 'room notice', tier,
+      });
+      runtime.journalOnPeerMessage(priorityFrame({ payload: { body: 'urgent' } }));
+      target.busy = false;
+      runtime.maybeFlushRoomDelivery(target);
+      assert.equal(runtime.injectCalls.at(-1)[1].includes('urgent'), true, `tier=${tier}`);
+      assert.equal(runtime.roomDelivery.pendingCount(target.roomId), 1, `tier=${tier}`);
+    }
+  });
+
   it('delivers to the live session when the pre-delivery flush replaced it', () => {
     const target = session();
     const runtime = makeRuntime({ target });

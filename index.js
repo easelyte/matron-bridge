@@ -10571,9 +10571,10 @@ function flushRoomInbox(session) {
   // survives that, so it is consulted too.
   // Operator content in the queued room batch still outranks a priority peer
   // (operator > peer-priority, lib/peer-priority.js), so the peer only jumps
-  // a room batch that is purely agent-origin.
+  // a room batch with no operator-tier member (roomBatchTier's classifier:
+  // agent frames, invite/lifecycle FYIs and spawn outcomes are below it).
   const priorityPeerPending = session._priorityPreemptPending || peerDelivery.pendingSome(session.roomId, (m) => m.priority === true);
-  if (priorityPeerPending && !roomDelivery.pendingSome(session.roomId, (m) => m.fromAgent !== true)) {
+  if (priorityPeerPending && !roomDelivery.pendingSome(session.roomId, (m) => roomBatchTier([m]) === null)) {
     session._priorityPreemptPending = false;
     peerDelivery.flush(session, session.roomId);
     if (sessionOccupiedForRoomDelivery(session)) return; // peer turn started; room batch waits
