@@ -632,6 +632,47 @@ describe('journalOnPeerMessage priority preemption (loop #688 consumer half)', (
     assert.equal(runtime.injectCalls[1][1].includes('room work'), true);
   });
 
+  it('still flushes the priority peer first after the session object was replaced (agent switch / recreate)', () => {
+    const target = session({ busy: true, turnTier: 'autonomous' });
+    const runtime = makeRuntime({ target, markBusyOnInject: true });
+    runtime.roomDelivery.deliver(target, target.roomId, {
+      roomId: 'room-x', roomTitle: 'coord', from: 'peer (agent)', body: 'room work', fromAgent: true,
+    });
+    runtime.journalOnPeerMessage(priorityFrame({ payload: { body: 'urgent' } }));
+    // A drained agent switch replaces the session: the flag stays on the old
+    // object, the inboxes (keyed by roomId) carry over.
+    const replacement = session({ busy: false });
+    target.alive = false;
+    runtime.sessions.set(target.roomId, replacement);
+    runtime.maybeFlushRoomDelivery(replacement);
+    assert.equal(runtime.injectCalls.length, 1);
+    assert.equal(runtime.injectCalls[0][0], replacement);
+    assert.equal(runtime.injectCalls[0][1].includes('urgent'), true);
+    assert.equal(runtime.roomDelivery.pendingCount(target.roomId), 1);
+  });
+
+  it('delivers to the live session when the pre-delivery flush replaced it', () => {
+    const target = session();
+    const runtime = makeRuntime({ target });
+    const replacement = session();
+    // Stand-in for a parked control drained by maybeFlushRoomDelivery that
+    // swaps the session synchronously (flushRoomInbox reads this flag).
+    let swapped = false;
+    Object.defineProperty(target, '_priorityPreemptPending', {
+      configurable: true,
+      get() {
+        if (!swapped) { swapped = true; target.alive = false; runtime.sessions.set(target.roomId, replacement); }
+        return false;
+      },
+      set() {},
+    });
+    runtime.journalOnPeerMessage(peerFrame({ seq: 7 }));
+    assert.equal(swapped, true);
+    assert.equal(runtime.injectCalls.length, 1);
+    assert.equal(runtime.injectCalls[0][0], replacement);
+    assert.equal(replacement.peerHandledWatermark, 7);
+  });
+
   it('tags a coalesced flush as peer-priority when the batch contains any priority peer', () => {
     const target = session({ busy: true, turnTier: 'operator' });
     const runtime = makeRuntime({ target });

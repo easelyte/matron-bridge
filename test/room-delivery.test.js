@@ -51,6 +51,18 @@ describe('createRoomDelivery', () => {
     expect(delivery.pendingCount('k1')).toBe(0);
   });
 
+  it('pendingSome reports whether any queued message matches, and survives a throwing predicate', () => {
+    const { delivery } = makeDelivery();
+    const busy = { alive: true, busy: true };
+    expect(delivery.pendingSome('k1', () => true)).toBe(false);
+    delivery.deliver(busy, 'k1', msg({ body: 'a' }));
+    delivery.deliver(busy, 'k1', msg({ body: 'b', priority: true }));
+    expect(delivery.pendingSome('k1', (m) => m.priority === true)).toBe(true);
+    expect(delivery.pendingSome('k1', (m) => m.body === 'zzz')).toBe(false);
+    expect(delivery.pendingSome('k1', () => { throw new Error('x'); })).toBe(false);
+    expect(delivery.pendingSome('k2', () => true)).toBe(false);
+  });
+
   it('idle session with no room title falls back to roomId', () => {
     const { delivery, injectTurn } = makeDelivery();
     const session = { alive: true, busy: false };

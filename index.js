@@ -10566,7 +10566,10 @@ function flushRoomInbox(session) {
   // ordinary path below flushes a pending room batch first when one exists,
   // leaving the priority peer — the very message that caused the preemption —
   // behind for another whole turn, inverting peer-priority > peer-coalesced.
-  if (session._priorityPreemptPending) {
+  // The flag lives on the session object, which a drained agent switch or
+  // print-mode recreate replaces; the pending peer inbox (keyed by roomId)
+  // survives that, so it is consulted too.
+  if (session._priorityPreemptPending || peerDelivery.pendingSome(session.roomId, (m) => m.priority === true)) {
     session._priorityPreemptPending = false;
     peerDelivery.flush(session, session.roomId);
     if (sessionOccupiedForRoomDelivery(session)) return; // peer turn started; room batch waits
@@ -10678,7 +10681,7 @@ function awaitRoomMessage(chatRoomId, ms, sessionKey) {
 // journal-convo reverse lookup (including after a native session resume).
 // Offline targets stay journal-visible but are not resumed or injected in v1.
 function journalOnPeerMessage(frame) {
-  const session = findSessionByClaudeSessionId(frame.convo_id);
+  let session = findSessionByClaudeSessionId(frame.convo_id);
   if (!session || !session.alive) {
     logPeerMessageDelivery(frame.convo_id, frame.seq, 'skipped-offline');
     return;
@@ -10689,6 +10692,15 @@ function journalOnPeerMessage(frame) {
   // Drain older peer frames before accepting this one so a newly arrived
   // frame can never overtake the backlog.
   maybeFlushRoomDelivery(session);
+  // The flush above may drain a parked Coordinator control (a deferred /model
+  // or agent switch) that replaces this session synchronously. Re-resolve, or
+  // the watermark below would record handoff to a dead session that
+  // peerDelivery.deliver then refuses — the message lost and never replayed.
+  session = findSessionByClaudeSessionId(frame.convo_id);
+  if (!session || !session.alive) {
+    logPeerMessageDelivery(frame.convo_id, frame.seq, 'skipped-offline');
+    return;
+  }
 
   // The watermark records HANDOFF, not eventual injection. A busy session's
   // in-memory queue is best-effort: after a crash the queued item may be gone,
@@ -10812,7 +10824,7 @@ function deliverRoomFrameTo(room, frame) {
   }
   if (!body) return;
   let session = sessions.get(room.sessionRoomId);
-  const live = !!(session && session.alive);
+  let live = !!(session && session.alive);
   // The user's copy of the peer's message. The agent-facing injection below
   // passes skipJournalMirror (the message is durable in the room convo), so
   // without this the session conversation shows the agent's REPLY to a peer
@@ -10838,7 +10850,13 @@ function deliverRoomFrameTo(room, frame) {
   // Runs BEFORE this message's own notice so the journal reads in the order
   // things happened: any ⏳ from an earlier batch is closed by its 📨 above
   // the 💬 line for the message that arrived after it.
-  if (live) maybeFlushRoomDelivery(session);
+  if (live) {
+    maybeFlushRoomDelivery(session);
+    // A drained Coordinator control can replace the session synchronously
+    // (deferred /model or agent switch): deliver to whatever is live now.
+    session = sessions.get(room.sessionRoomId);
+    live = !!(session && session.alive);
+  }
   const echoFrom = roomEchoLabel(sender, from);
   const roomTitle = room.title || room.topic || null;
   // Mute gate (2026-08-19). agent_chat_mute replaced agent_chat_leave as the
