@@ -288,6 +288,67 @@ describe('SubagentWatcher workflow runs', () => {
     expect(warnings.some(m => m.includes('final scan') && m.includes('ENOTDIR'))).toBe(true);
   });
 
+  it('a run dir that vanishes before the completion scan is retried, not taken as "no more agents"', async () => {
+    const { w, runDir, starts } = mk({ copyRun: true });
+    w.watchWorkflowRun(RUN_ID, { intervalMs: 20 });
+    const tmp = runDir + '.moved';
+    fs.renameSync(runDir, tmp);
+    w.workflowRunByTask.set('t10', RUN_ID);
+    expect(w.noteWorkflowCompleted(undefined, 't10')).toBe(true);
+    expect(w.workflowRuns.get(RUN_ID)?.completing).toBe(true);
+    fs.renameSync(tmp, runDir);
+    addAgent(runDir, 'back1', { description: 'b', phase: 'P' });
+    expect(await waitFor(() => w.workflowRuns.size === 0)).toBe(true);
+    expect(starts.map(s => s.agentId)).toContain('back1');
+  });
+
+  it('a run that never wrote anything completes immediately (ENOENT before first sight is not a failure)', () => {
+    const { w } = mk();
+    w.watchWorkflowRun(RUN_ID, { intervalMs: 20 });
+    w.workflowRunByTask.set('t11', RUN_ID);
+    expect(w.noteWorkflowCompleted(undefined, 't11')).toBe(true);
+    expect(w.workflowRuns.size).toBe(0);
+  });
+
+  it('bounds journal ingestion: an oversized result is never buffered whole, and still settles its agent', () => {
+    const { w, runDir, done, warnings } = mk();
+    addAgent(runDir, 'big1', { description: 'big', phase: 'P' });
+    addAgent(runDir, 'after1', { description: 'after', phase: 'P' });
+    const huge = 'x'.repeat(3 * 1024 * 1024); // 3 MB result
+    journal(runDir, { type: 'started', agentId: 'big1' });
+    journal(runDir, { type: 'result', key: 'k', agentId: 'big1', result: huge });
+    journal(runDir, { type: 'result', agentId: 'after1', result: 'ok' });
+    w.watchWorkflowRun(RUN_ID, { intervalMs: 100000 });
+    const run = w.workflowRuns.get(RUN_ID);
+    let maxPartial = 0;
+    for (let i = 0; i < 40 && run.journalOffset < fs.statSync(path.join(runDir, 'journal.jsonl')).size; i++) {
+      w._tickWorkflowRun(RUN_ID);
+      maxPartial = Math.max(maxPartial, run.journalPartial.length);
+    }
+    expect(maxPartial).toBeLessThanOrEqual(64 * 1024);
+    expect(done).toContain('big1');
+    expect(done).toContain('after1'); // the record after the oversized one still parses
+    expect(warnings.some(m => m.includes('journal record over'))).toBe(true);
+  });
+
+  it('reassembles a multibyte character split across journal chunks', () => {
+    const { w, runDir, done } = mk();
+    addAgent(runDir, 'utf1', { description: 'u', phase: 'P' });
+    // Pad so a 3-byte char straddles the 256 KB chunk boundary.
+    const prefix = JSON.stringify({ type: 'started', agentId: 'pad', note: 'a'.repeat(50000) }) + '\n';
+    let body = prefix.repeat(5);
+    const need = 256 * 1024 - Buffer.byteLength(body) - 30;
+    body += JSON.stringify({ type: 'started', agentId: 'pad2', n: 'b'.repeat(Math.max(0, need)) + '€€€€' }) + '\n';
+    fs.mkdirSync(runDir, { recursive: true });
+    fs.writeFileSync(path.join(runDir, 'journal.jsonl'), body);
+    journal(runDir, { type: 'result', agentId: 'utf1' });
+    w.watchWorkflowRun(RUN_ID, { intervalMs: 100000 });
+    for (let i = 0; i < 5; i++) w._tickWorkflowRun(RUN_ID);
+    const run = w.workflowRuns.get(RUN_ID);
+    expect(run.started.has('pad2')).toBe(true);
+    expect(done).toContain('utf1');
+  });
+
   it('warns when a Workflow tool_result names no run', () => {
     const { w, warnings } = mk();
     w.noteWorkflowToolUse('toolu_wf6', {});
@@ -409,7 +470,9 @@ describe('index.js workflow seam (source inspection)', () => {
   it('handleClaudeEvent routes every non-sidechain parent event through routeWorkflowStreamEvent, and subagent-done finishes the child', () => {
     const body = src.slice(src.indexOf('function handleClaudeEvent('));
     const guard = body.indexOf('if (isSidechainEvent(event)) return;');
-    const seam = body.indexOf('routeWorkflowStreamEvent(session.subagentWatcher, event);');
+    // Statement level of handleClaudeEvent (two-space indent, previous
+    // non-comment line closes a statement) — not nested in a conditional.
+    const seam = body.indexOf('\n  routeWorkflowStreamEvent(session.subagentWatcher, event);\n');
     const sw = body.indexOf('switch (event.type)');
     expect(guard).toBeGreaterThan(-1);
     expect(seam).toBeGreaterThan(guard);
