@@ -607,7 +607,15 @@ describe('index.js wiring', () => {
   it('journalStatus publishes the effective extras (session choice + machine default) on every frame', () => {
     const start = src.indexOf('function journalStatus(');
     const body = src.slice(start, src.indexOf('\nfunction ', start + 1));
-    expect(body).toContain('extras: effectiveExtras(Array.isArray(session.mcpExtras) ? session.mcpExtras : [], DEFAULT_MCP_EXTRAS)');
+    expect(body).toContain(': effectiveExtras(Array.isArray(session.mcpExtras) ? session.mcpExtras : [], DEFAULT_MCP_EXTRAS)');
+  });
+
+  it('journalStatus publishes no extras for legacy Codex exec, which spawns with an empty MCP config', () => {
+    const start = src.indexOf('function journalStatus(');
+    const body = src.slice(start, src.indexOf('\nfunction ', start + 1));
+    expect(body).toMatch(/extras: isCodex && !CODEX_APP_SERVER\s*\n\s*\? \[\]/);
+    // ...and the exec adapter really gets no MCP config, which is why.
+    expect(src).toContain('config: CODEX_APP_SERVER ? codexMcpConfig({');
   });
 
   it('journalStatus uses provider-specific model and effort options', () => {

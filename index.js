@@ -2145,12 +2145,17 @@ function journalStatus(session) {
     // resolve it here rather than shipping a bare relative fragment.
     workdir: session.workdir ? path.resolve(session.workdir) : undefined,
     vitals,
-    // The extras this process was spawned with: the session's own choice
-    // (/start --browser, /restart --browser, restart_session browser: true,
-    // carried across resume) unioned with the machine default, exactly the
-    // list the restart notice prints as "Extras: ...". Always an array, so
-    // a session without extras publishes [] and an "off" reaches clients.
-    extras: effectiveExtras(Array.isArray(session.mcpExtras) ? session.mcpExtras : [], DEFAULT_MCP_EXTRAS),
+    // The extras this process was SPAWNED with (spawn configuration, not
+    // per-turn availability: Codex plan mode's temporary all-tools-off phase
+    // does not flip it, since restarting with the extra would change nothing).
+    // The session's own choice (/start --browser, /restart --browser,
+    // restart_session browser: true, carried across resume) unioned with the
+    // machine default, exactly the list the restart notice prints as
+    // "Extras: ...". Legacy Codex exec spawns with an empty MCP config, so it
+    // has none. Always an array, so "off" reaches clients as [].
+    extras: isCodex && !CODEX_APP_SERVER
+      ? []
+      : effectiveExtras(Array.isArray(session.mcpExtras) ? session.mcpExtras : [], DEFAULT_MCP_EXTRAS),
   });
   // The shared account email cache is Claude-specific — strip it from Codex
   // frames. Codex supplies its own limits; host vitals stay on both.
