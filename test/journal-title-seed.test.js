@@ -117,6 +117,19 @@ describe('repoLabel', () => {
     expect(repoLabel(defaultWorkdir, { defaultWorkdir, rootLabel: 'explicit' })).toBe('explicit');
   });
 
+  it('sanitizes the root label so it cannot forge title segments or lines', () => {
+    vi.stubEnv('MATRON_WORKSPACE_ROOT_LABEL', 'a·b\nadmin');
+    expect(repoLabel(defaultWorkdir, { defaultWorkdir })).toBe('a b admin');
+    // The real fallback path: no inferred repo, so formatRoomTitle uses repoLabel.
+    expect(formatRoomTitle({ workdir: defaultWorkdir, defaultWorkdir, text: 'task' })).toBe('a b admin · task');
+    expect(repoLabel(defaultWorkdir, { defaultWorkdir, rootLabel: 'x<script>y\u202E' })).toBe('x y');
+  });
+
+  it('a label that cleans to nothing falls back to the root basename', () => {
+    vi.stubEnv('MATRON_WORKSPACE_ROOT_LABEL', '···');
+    expect(repoLabel(defaultWorkdir, { defaultWorkdir })).toBe('workspace');
+  });
+
   it('caps an over-long env override like any other repo label', () => {
     vi.stubEnv('MATRON_WORKSPACE_ROOT_LABEL', 'r'.repeat(30));
     expect(repoLabel(defaultWorkdir, { defaultWorkdir })).toBe(`${'r'.repeat(24)}…`);
