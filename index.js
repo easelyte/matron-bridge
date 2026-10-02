@@ -2145,6 +2145,12 @@ function journalStatus(session) {
     // resolve it here rather than shipping a bare relative fragment.
     workdir: session.workdir ? path.resolve(session.workdir) : undefined,
     vitals,
+    // The extras this process was spawned with: the session's own choice
+    // (/start --browser, /restart --browser, restart_session browser: true,
+    // carried across resume) unioned with the machine default, exactly the
+    // list the restart notice prints as "Extras: ...". Always an array, so
+    // a session without extras publishes [] and an "off" reaches clients.
+    extras: effectiveExtras(Array.isArray(session.mcpExtras) ? session.mcpExtras : [], DEFAULT_MCP_EXTRAS),
   });
   // The shared account email cache is Claude-specific — strip it from Codex
   // frames. Codex supplies its own limits; host vitals stay on both.

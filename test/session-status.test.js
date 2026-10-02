@@ -314,6 +314,26 @@ describe('buildSessionStatus', () => {
     expect(status.effort_levels).toEqual([]);
   });
 
+  it('publishes the session extras as an array (browser tools on)', () => {
+    const status = buildSessionStatus({ model: 'claude-fable-5', extras: ['browser', 'share'] });
+    expect(status.extras).toEqual(['browser', 'share']);
+  });
+
+  it('publishes EMPTY extras as [] so an "off" state reaches clients', () => {
+    expect(buildSessionStatus({ model: 'claude-fable-5', extras: [] }).extras).toEqual([]);
+  });
+
+  it('omits extras when the caller has no opinion (subagent / helper frames)', () => {
+    expect('extras' in buildSessionStatus({ model: 'claude-fable-5' })).toBe(false);
+    expect('extras' in buildSessionStatus({ model: 'claude-fable-5', extras: undefined })).toBe(false);
+    expect('extras' in buildSessionStatus({ model: 'claude-fable-5', extras: null })).toBe(false);
+  });
+
+  it('keeps only non-empty string extras, deduped in order', () => {
+    expect(buildSessionStatus({ extras: ['browser', '', null, 3, 'browser', 'circleci'] }).extras)
+      .toEqual(['browser', 'circleci']);
+  });
+
   it('omits the lists only when the caller has no opinion at all (old bridges, subagent frames)', () => {
     const status = buildSessionStatus({ model: 'claude-fable-5' });
     expect('model_options' in status).toBe(false);
@@ -582,6 +602,12 @@ describe('index.js wiring', () => {
     const body = src.slice(start, end);
     expect(body).toContain('buildSessionStatus(');
     expect(body).toContain('publishStatus(');
+  });
+
+  it('journalStatus publishes the effective extras (session choice + machine default) on every frame', () => {
+    const start = src.indexOf('function journalStatus(');
+    const body = src.slice(start, src.indexOf('\nfunction ', start + 1));
+    expect(body).toContain('extras: effectiveExtras(Array.isArray(session.mcpExtras) ? session.mcpExtras : [], DEFAULT_MCP_EXTRAS)');
   });
 
   it('journalStatus uses provider-specific model and effort options', () => {
