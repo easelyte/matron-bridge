@@ -377,6 +377,49 @@ describe('SubagentWatcher workflow runs', () => {
     expect(starts.length).toBe(2);
   });
 
+  it('a task-id-only completion that beats its launch result: the late result gets its cards, then stops', () => {
+    const { w, starts, done } = mk({ copyRun: true });
+    w.noteWorkflowToolUse('toolu_wf20', {});
+    // No tool_use_id on the notice, and the run id is not known yet.
+    expect(w.noteWorkflowCompleted(undefined, 'wjug1ouu0')).toBe(false);
+    expect(w.noteWorkflowResult('toolu_wf20', LAUNCH_TEXT)).toBe(RUN_ID);
+    expect(starts.map(s => s.agentId).sort()).toEqual([A1, A2].sort());
+    expect(new Set(done)).toEqual(new Set([A1, A2]));
+    expect(w.workflowRuns.size).toBe(0); // not left watching until the 24h cap
+    expect(w.workflowRunByTask.size).toBe(0);
+    expect(w.workflowRunByToolUse.size).toBe(0);
+    // The tombstone is consumed: a duplicate late result does nothing more.
+    expect(w.noteWorkflowResult('toolu_wf20', LAUNCH_TEXT)).toBeNull();
+    expect(starts.length).toBe(2);
+  });
+
+  it('a task-id-only completion that beats the launch result of a resumed run stops the watch', () => {
+    const { w, starts } = mk({ copyRun: true });
+    w.noteWorkflowToolUse('toolu_wf21', { resumeFromRunId: RUN_ID });
+    expect(w.workflowRuns.has(RUN_ID)).toBe(true);
+    expect(w.noteWorkflowCompleted(undefined, 'wjug1ouu0')).toBe(false);
+    expect(w.noteWorkflowResult('toolu_wf21', LAUNCH_TEXT)).toBe(RUN_ID);
+    expect(w.workflowRuns.size).toBe(0);
+    expect(starts).toEqual([]); // cached agents were snapshotted, never replayed
+    // The finished run is tombstoned: a stray re-delivered result cannot re-open it.
+    w.noteWorkflowToolUse('toolu_wf22', {});
+    expect(w.noteWorkflowResult('toolu_wf22', LAUNCH_TEXT)).toBeNull();
+    expect(w.workflowRuns.size).toBe(0);
+  });
+
+  it('task-id tombstones are only taken while a Workflow launch is pending, and are bounded', () => {
+    const { w } = mk({ copyRun: true });
+    // Background Bash/Agent notices with no Workflow in flight leave no trace.
+    expect(w.noteWorkflowCompleted(undefined, 'bg-bash-1')).toBe(false);
+    expect(w.completedWorkflowTasks.size).toBe(0);
+    w.noteWorkflowToolUse('toolu_wf23', {});
+    for (let i = 0; i < 300; i++) w.noteWorkflowCompleted(undefined, `bg-${i}`);
+    expect(w.completedWorkflowTasks.size).toBeLessThanOrEqual(256);
+    // A launch whose task id was never tombstoned starts a normal live watch.
+    expect(w.noteWorkflowResult('toolu_wf23', LAUNCH_TEXT)).toBe(RUN_ID);
+    expect(w.workflowRuns.has(RUN_ID)).toBe(true);
+  });
+
   it('warns when a Workflow tool_result names no run', () => {
     const { w, warnings } = mk();
     w.noteWorkflowToolUse('toolu_wf6', {});
