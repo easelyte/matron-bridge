@@ -364,13 +364,17 @@ describe('SubagentWatcher workflow runs', () => {
     expect(w.workflowRuns.has(RUN_ID)).toBe(true);
   });
 
-  it('a fresh run whose completion beats its launch result is not watched afterwards', () => {
-    const { w, starts } = mk({ copyRun: true });
+  it('a fast fresh run whose completion beats its launch result still gets its cards, then stops', () => {
+    const { w, starts, done } = mk({ copyRun: true });
     w.noteWorkflowToolUse('toolu_wf9', {});
-    expect(w.noteWorkflowCompleted('toolu_wf9', 'wjug1ouu0')).toBe(false); // nothing to stop yet
-    expect(w.noteWorkflowResult('toolu_wf9', LAUNCH_TEXT)).toBeNull();
+    expect(w.noteWorkflowCompleted('toolu_wf9', 'wjug1ouu0')).toBe(false); // run id not known yet
+    expect(w.noteWorkflowResult('toolu_wf9', LAUNCH_TEXT)).toBe(RUN_ID);
+    expect(starts.map(s => s.agentId).sort()).toEqual([A1, A2].sort());
+    expect(new Set(done)).toEqual(new Set([A1, A2])); // run is over: every card settles
     expect(w.workflowRuns.size).toBe(0);
-    expect(starts).toEqual([]);
+    // A duplicate late result does nothing more.
+    expect(w.noteWorkflowResult('toolu_wf9', LAUNCH_TEXT)).toBeNull();
+    expect(starts.length).toBe(2);
   });
 
   it('warns when a Workflow tool_result names no run', () => {
