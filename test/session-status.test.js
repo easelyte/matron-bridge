@@ -14,6 +14,7 @@ import {
   compactTriggerFrom,
   contextGaugeText,
   buildSessionStatus,
+  publishedExtras,
   emailFromClaudeConfig,
   statusRepaintDue,
   STATUS_REPAINT_MS,
@@ -227,6 +228,23 @@ describe('contextGaugeText', () => {
     expect(contextGaugeText(null, 'claude-opus-4-8')).toBeNull();
     expect(contextGaugeText(0, 'claude-opus-4-8')).toBeNull();
     expect(contextGaugeText(undefined, 'claude-fable-5')).toBeNull();
+  });
+});
+
+describe('publishedExtras', () => {
+  const known = ['browser', 'share', 'circleci'];
+  it('unions the session choice with machine defaults, session first, deduped', () => {
+    expect(publishedExtras({ requested: ['browser'], defaults: ['share', 'browser'], known })).toEqual(['browser', 'share']);
+  });
+  it('drops a persisted name whose mcpExtras block no longer exists (spawn filters it too)', () => {
+    expect(publishedExtras({ requested: ['gone', 'browser'], defaults: [], known })).toEqual(['browser']);
+  });
+  it('is [] for a session without extras, and for a non-array requested', () => {
+    expect(publishedExtras({ requested: [], known })).toEqual([]);
+    expect(publishedExtras({ requested: undefined, known })).toEqual([]);
+  });
+  it('is [] when the transport spawns with no MCP config (legacy Codex exec)', () => {
+    expect(publishedExtras({ requested: ['browser'], defaults: ['share'], known, noMcp: true })).toEqual([]);
   });
 });
 
@@ -604,17 +622,11 @@ describe('index.js wiring', () => {
     expect(body).toContain('publishStatus(');
   });
 
-  it('journalStatus publishes the effective extras (session choice + machine default) on every frame', () => {
+  it('journalStatus publishes extras through publishedExtras with the spawn inputs', () => {
     const start = src.indexOf('function journalStatus(');
     const body = src.slice(start, src.indexOf('\nfunction ', start + 1));
-    expect(body).toContain(': effectiveExtras(Array.isArray(session.mcpExtras) ? session.mcpExtras : [], DEFAULT_MCP_EXTRAS)');
-  });
-
-  it('journalStatus publishes no extras for legacy Codex exec, which spawns with an empty MCP config', () => {
-    const start = src.indexOf('function journalStatus(');
-    const body = src.slice(start, src.indexOf('\nfunction ', start + 1));
-    expect(body).toMatch(/extras: isCodex && !CODEX_APP_SERVER\s*\n\s*\? \[\]/);
-    // ...and the exec adapter really gets no MCP config, which is why.
+    expect(body).toMatch(/extras: publishedExtras\(\{\s*requested: session\.mcpExtras,\s*defaults: DEFAULT_MCP_EXTRAS,\s*known: KNOWN_MCP_EXTRAS,\s*noMcp: isCodex && !CODEX_APP_SERVER,/);
+    // ...and legacy exec really gets no MCP config, which is why noMcp.
     expect(src).toContain('config: CODEX_APP_SERVER ? codexMcpConfig({');
   });
 

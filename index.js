@@ -184,7 +184,7 @@ import { SUMMARY_MIN_NEW } from './lib/summary-pass.js';
 import { activityStateChanged, truncateActivityDetail, shouldResumeThinkingAfterTool } from './lib/journal-activity.js';
 import { streamRefFor } from './lib/journal-stream.js';
 import { contextFullToNative, briefContextReport } from './lib/context-command.js';
-import { buildSessionStatus, contextTokensFromAssistantEvent, postCompactContextTokens, compactTriggerFrom, contextGaugeText, sessionContextWindow, emailFromClaudeConfig, isSidechainEvent, reconcileModelForWindow, hostVitals, startCpuSampler, stopCpuSampler, cpuPercent, ramPercent, cpuSampledAtMs, statusRepaintDue } from './lib/session-status.js';
+import { buildSessionStatus, publishedExtras, contextTokensFromAssistantEvent, postCompactContextTokens, compactTriggerFrom, contextGaugeText, sessionContextWindow, emailFromClaudeConfig, isSidechainEvent, reconcileModelForWindow, hostVitals, startCpuSampler, stopCpuSampler, cpuPercent, ramPercent, cpuSampledAtMs, statusRepaintDue } from './lib/session-status.js';
 import { stallFromAssistantEvent, stallResetsAt } from './lib/stall-detector.js';
 import { planSessionControl, validateControlParams, controlNotice, authorizeControl, mergeParkedSlot, JOURNAL_DEVICE_ID, JOURNAL_ONLY_ACTIONS, CONTROL_KINDS, TURN_STARTING_OPS, occupied as controlOccupied } from './lib/session-control.js';
 import { createSessionControlHandlers } from './lib/session-control-client.js';
@@ -2145,17 +2145,14 @@ function journalStatus(session) {
     // resolve it here rather than shipping a bare relative fragment.
     workdir: session.workdir ? path.resolve(session.workdir) : undefined,
     vitals,
-    // The extras this process was SPAWNED with (spawn configuration, not
-    // per-turn availability: Codex plan mode's temporary all-tools-off phase
-    // does not flip it, since restarting with the extra would change nothing).
-    // The session's own choice (/start --browser, /restart --browser,
-    // restart_session browser: true, carried across resume) unioned with the
-    // machine default, exactly the list the restart notice prints as
-    // "Extras: ...". Legacy Codex exec spawns with an empty MCP config, so it
-    // has none. Always an array, so "off" reaches clients as [].
-    extras: isCodex && !CODEX_APP_SERVER
-      ? []
-      : effectiveExtras(Array.isArray(session.mcpExtras) ? session.mcpExtras : [], DEFAULT_MCP_EXTRAS),
+    // Spawn-time extras, filtered like the spawn itself (see publishedExtras).
+    // Always an array, so "off" reaches clients as [].
+    extras: publishedExtras({
+      requested: session.mcpExtras,
+      defaults: DEFAULT_MCP_EXTRAS,
+      known: KNOWN_MCP_EXTRAS,
+      noMcp: isCodex && !CODEX_APP_SERVER,
+    }),
   });
   // The shared account email cache is Claude-specific — strip it from Codex
   // frames. Codex supplies its own limits; host vitals stay on both.
