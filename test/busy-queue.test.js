@@ -2095,7 +2095,7 @@ describe('#165 index.js prompt-reply handler — value-shape classification reti
     // other reply — including one whose label is literally `interrupt` /
     // `cancel:2` — flows through to journalRoutePromptReply and the "answered:"
     // echo. No value-shape early-return sits between classify and route.
-    // (easelyte fork: the "answered:" echo is emitted via the shared
+    // (fork: the "answered:" echo is emitted via the shared
     // journalEchoPromptAnswer helper — which permission-cards also reuses —
     // rather than inline, so assert the helper call instead of the string.)
     expect(body).toMatch(/queuedRelease\.state === 'live'/);

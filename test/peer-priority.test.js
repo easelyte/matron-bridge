@@ -8,8 +8,8 @@ import {
   shouldPreemptForPriorityPeer,
 } from '../lib/peer-priority.js';
 
-// Loop #688 consumer half: the precedence gate that decides whether an inbound
-// priority peer-message preempts the running turn. Operator-approved precedence,
+// Consumer half: the precedence gate that decides whether an inbound
+// priority peer-message preempts the running turn. Agreed precedence,
 // highest to lowest: operator > peer-priority > peer-coalesced > autonomous.
 
 describe('turn-tier precedence', () => {
@@ -100,7 +100,7 @@ describe('roomBatchTier', () => {
   });
 });
 
-describe('roomBatchTier — explicit per-message tier + coalescing precedence (loop #688 seam-tiering, R3 F2)', () => {
+describe('roomBatchTier — explicit per-message tier + coalescing precedence (seam-tiering)', () => {
   // The room-delivery inbox is a SINGLE per-session inbox that coalesces every
   // room-flavoured injection — real peer room frames, invite/join requests,
   // room-lifecycle FYIs, and spawn outcomes — into one turn. Seams that are not
@@ -142,7 +142,7 @@ describe('roomBatchTier — explicit per-message tier + coalescing precedence (l
     expect(roomBatchTier([{ tier: 1 }])).toBeNull();
   });
 
-  it('operator provenance is DOMINANT: an explicit lower tier can never downgrade a fromAgent:false operator frame (Codex F1)', () => {
+  it('operator provenance is DOMINANT: an explicit lower tier can never downgrade a fromAgent:false operator frame', () => {
     // A contradictory { fromAgent: false, tier: <lower> } shape must stay
     // operator-protected — the classifier enforces the invariant, not producer
     // discipline. No producer builds this shape today; this pins it total.

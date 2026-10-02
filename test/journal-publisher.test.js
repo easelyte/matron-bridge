@@ -323,8 +323,8 @@ describe('createJournalPublisher', () => {
     }
   });
 
-  it('onLocalSendComplete fires from the LOCAL ws.send write callback, not a server commit ack (loop #754)', async () => {
-    // Contract honesty (loop #754): there is NO application-level per-frame server ack on this WS
+  it('onLocalSendComplete fires from the LOCAL ws.send write callback, not a server commit ack', async () => {
+    // Contract honesty: there is NO application-level per-frame server ack on this WS
     // publish path. onLocalSendComplete fires when ws.send's write callback fires — i.e. once the
     // frame has left THIS PROCESS'S local socket buffer — NOT once the server has persisted it.
     // Prove it with a transport that confirms the local write for a publish frame but never forwards
@@ -358,7 +358,7 @@ describe('createJournalPublisher', () => {
     expect(fired).toBe(true);
 
     // ...yet the server NEVER received the publish frame. onLocalSendComplete is a local-send
-    // signal, not a durability/commit ack — the exact false-confidence the #754 rename kills.
+    // signal, not a durability/commit ack — the exact false-confidence the rename removes.
     await new Promise((r) => setTimeout(r, 50));
     expect(fake.received.some((f) => f.op === 'publish')).toBe(false);
 
@@ -452,7 +452,7 @@ describe('createJournalPublisher', () => {
     pub.close();
   });
 
-  // loop #554: the summary reconnect repair uses the best-effort path
+  // The summary reconnect repair uses the best-effort path
   // specifically because it must not evict the outage backlog.
   it('carries summary on the best-effort upsert without evicting queued traffic', async () => {
     const port = await getFreePort();
@@ -478,7 +478,7 @@ describe('createJournalPublisher', () => {
     pub.close();
   });
 
-  // loop #554 R3-F2: a RETAINED repair drains at the queue tail, so it can land
+  // A RETAINED repair drains at the queue tail, so it can land
   // after a newer ordinary update of the same field and roll it back. Derived
   // state opts out of retention and is re-offered from live state instead.
   it('retain:false refuses instead of holding a stale repair behind the backlog', async () => {

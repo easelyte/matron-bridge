@@ -21,7 +21,7 @@ describe('isolated test home', () => {
   });
 
   it('Claude project + subagent dirs resolve under the fake home', () => {
-    const workdir = '/root/.openclaw/workspace';
+    const workdir = '/home/user/workspace';
     expect(under(projectDirFor(workdir), os.homedir())).toBe(true);
     expect(under(subagentsDirFor(workdir, 'sid-1'), os.homedir())).toBe(true);
     expect(under(projectDirFor(workdir), realHome)).toBe(false);

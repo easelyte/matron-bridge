@@ -882,7 +882,7 @@ describe('composeSpawnOpeningTurn', () => {
   });
 });
 
-describe('start idempotency (#482)', () => {
+describe('start idempotency', () => {
   it('a retried start with the same idempotency_key spawns once and re-answers the same convo_id', () => {
     let n = 0;
     const calls = [];

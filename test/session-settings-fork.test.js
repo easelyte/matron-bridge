@@ -1,4 +1,4 @@
-// easelyte fork delta: withForkPrintSettings composes the fork's print-session
+// fork delta: withForkPrintSettings composes the fork's print-session
 // settings (tool allow-list + permission-card hook) onto upstream's
 // buildPrintSessionSettings without double-gating a gated session.
 import { describe, expect, it } from 'vitest';

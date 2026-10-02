@@ -120,7 +120,7 @@ describe('readFileGuarded — path-safety rejections (same vocabulary as edit_fi
   });
 });
 
-describe('readFileGuarded — utf8 round-trip guard (F2)', () => {
+describe('readFileGuarded — utf8 round-trip guard', () => {
   it('refuses a file with invalid utf-8 bytes (would not round-trip -> not_text)', async () => {
     const file = path.join(root, 'binary.dat');
     // 0xff is not valid utf-8; decoding -> U+FFFD -> re-encodes to DIFFERENT bytes.
@@ -155,7 +155,7 @@ describe('readFileGuarded — size guard', () => {
     expect(MAX_READ_BYTES).toBeLessThan(16 * 1024);
   });
 
-  it('rejects a file whose SERIALIZED response would exceed the frame budget (F3), even under the raw cap', async () => {
+  it('rejects a file whose SERIALIZED response would exceed the frame budget, even under the raw cap', async () => {
     // A file just under the raw read cap but whose JSON-escaped body exceeds the
     // response budget must fail loud as too_large, not produce a droppable frame.
     // Control chars expand ~6x under JSON escaping (\u00XX), so a modest raw file

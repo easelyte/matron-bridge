@@ -469,7 +469,7 @@ describe('createAgentSpawnHandlers', () => {
     });
   });
 
-  // #690 F1 — same-box spawn room binding. When the parent spawns a session on
+  // Same-box spawn room binding. When the parent spawns a session on
   // its OWN box, this bridge is BOTH the parent's bridge and the target bridge,
   // so the target-side `start` handler (index.js bindSpawnRoom) has already
   // bound the CHILD session as the primary binding on THIS registry before the
@@ -477,7 +477,7 @@ describe('createAgentSpawnHandlers', () => {
   // binding into the guest slot (the same-bridge local-room field) rather than
   // clobbering sessionRoomId with the parent — otherwise the room is no longer a
   // local room and the child cannot route its report back to the parent.
-  describe('same-box spawn room binding (#690 F1)', () => {
+  describe('same-box spawn room binding', () => {
     // Arm a pending spawn against a caller-supplied handler context (so the test
     // can wire a real createAgentRooms), then resolve the started outcome.
     async function armStartedWith(overrides) {
@@ -555,7 +555,7 @@ describe('createAgentSpawnHandlers', () => {
       expect(rooms.bindingFor('room-cross', 'child-remote')).toBeNull();
     });
 
-    // Provenance hardening (#690 F1, Codex review): the promotion must not fire
+    // Provenance hardening: the promotion must not fire
     // on any single-ended record that merely happens to sit at the room id.
     it('does NOT promote a single-ended record whose session is not live on this bridge', async () => {
       const rooms = createAgentRooms();
@@ -693,7 +693,7 @@ describe('index.js + ask-user.js spawn wiring (source inspection)', () => {
     expect(args).toMatch(/getDisk: \(\) => buildDisk\(\{ path: DEFAULT_WORKDIR \}\)/);
     expect(args).toMatch(/bindSpawnRoom: \(roomId, session\) => \{[\s\S]{0,200}agentRooms\.record\(roomId, \{ role: 'guest', state: 'joined', sessionRoomId: session\.roomId \}\)/);
     expect(args).toMatch(/unbindSpawnRoom: \(roomId\) => agentRooms\.remove\(roomId\)/);
-    // The spawned task's opening turn is tagged autonomous (loop #688) so a
+    // The spawned task's opening turn is tagged autonomous so a
     // priority peer can preempt it.
     expect(args).toMatch(/injectTurn: \(session, text\) => sendTextToSession\(session, text, \{ skipJournalMirror: true, turnTier: 'autonomous' \}\)/);
     expect(args).toMatch(/serverLabel: SERVER_LABEL,/);

@@ -27,7 +27,7 @@ describe('processName (contract §2.1: never the full command line)', () => {
     expect(processName(['node', '/usr/bin/codex', 'exec', 'prompt text'])).toBe('node codex');
   });
 
-  it('never names a flag operand (review F1): only provable script paths', () => {
+  it('never names a flag operand: only provable script paths', () => {
     expect(processName(['python3', '-W', 'ignore:sk_live_123', '/srv/worker.py'])).toBe('python3');
     expect(processName(['python3', '-X', 'sk_live_customer.py'])).toBe('python3');
     expect(processName(['python3', '-X', 'dev', '/srv/worker.py'])).toBe('python3');
@@ -241,7 +241,7 @@ describe('readHostSection', () => {
     expect(JSON.stringify(h)).not.toMatch(/SECRET|TOKEN|secret/);
   });
 
-  it('detects the kernel page size so 64 KiB-page hosts keep their processes (review F2)', async () => {
+  it('detects the kernel page size so 64 KiB-page hosts keep their processes', async () => {
     const f = fakeProc();
     const readText = async (file) => {
       if (file === '/proc/self/stat') return '1 (node) S 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 100 1000000 320';
@@ -278,7 +278,7 @@ describe('readHostSection', () => {
     expect(h.live_sessions).toBe(0);
   });
 
-  it('a failed required /proc probe is unavailable, never zeros (review round 3 F3)', async () => {
+  it('a failed required /proc probe is unavailable, never zeros', async () => {
     for (const bad of ['/proc/meminfo', '/proc/uptime', '/proc/loadavg']) {
       const f = fakeProc();
       const readText = async (file) => { if (file === bad) throw new Error('EIO'); return f.readText(file); };
@@ -292,7 +292,7 @@ describe('readHostSection', () => {
     }
   });
 
-  it('bounds concurrent /proc reads (review round 3 F4)', async () => {
+  it('bounds concurrent /proc reads', async () => {
     let inFlight = 0;
     let peak = 0;
     await mapLimit(Array.from({ length: 500 }, (_, i) => i), 32, async () => {
@@ -306,7 +306,7 @@ describe('readHostSection', () => {
     expect(seen).toEqual([1, 2, 3]);
   });
 
-  it('a failed disk probe is unavailable, not a different shape (review round 2 F3)', async () => {
+  it('a failed disk probe is unavailable, not a different shape', async () => {
     await expect(readHostSection(baseDeps(fakeProc(), { getDisk: () => { throw new Error('x'); } })))
       .rejects.toMatchObject({ code: 'unavailable', detail: 'disk probe failed' });
     await expect(readHostSection(baseDeps(fakeProc(), { getDisk: () => null })))

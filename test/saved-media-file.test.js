@@ -117,7 +117,7 @@ describe('writeSavedMediaFile — temp-then-rename durability', () => {
     // The dir fsync is a SECONDARY barrier that runs after the file is already
     // fsync'd and installed. A storage-class error there must be swallowed —
     // propagating it would fail an upload whose bytes are durable and leave the
-    // installed target orphaned behind a failure notice (round-3 F2).
+    // installed target orphaned behind a failure notice.
     const finalPath = path.join(dir, 'd.bin');
     const real = fs;
     let fsyncCalls = 0;

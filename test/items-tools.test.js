@@ -41,7 +41,7 @@ describe('items handlers', () => {
     expect(client.create).not.toHaveBeenCalled();
   });
 
-  // Loop #763: supersedes existence is a journal DB lookup, so a bad id 400s the
+  // Supersedes existence is a journal DB lookup, so a bad id 400s the
   // create AFTER uploadAll — orphaning the blob. With attachments present the
   // bridge pre-checks the target exists BEFORE uploading.
   it('create: bad supersedes with attachments fails BEFORE uploading (no orphan)', async () => {
@@ -62,7 +62,7 @@ describe('items handlers', () => {
     expect(client.create.mock.calls[0][0]).toMatchObject({ supersedes: 'it_2' });
   });
 
-  // Loop #763 multi-attachment atomicity: all paths are validated (local gates
+  // Multi-attachment atomicity: all paths are validated (local gates
   // only) before ANY blob is uploaded, so a bad path among several cannot orphan
   // the earlier, already-uploaded ones.
   it('create: validates all attachment paths before uploading any blob', async () => {
@@ -310,7 +310,7 @@ describe('items handlers', () => {
   });
 
   it('create: rejects invalid labels BEFORE uploading any attachment (no orphaned blob)', async () => {
-    // Regression (loop #759 re-cut): the journal 400s labels > 50 / empty / > 40 chars, but the
+    // Regression: the journal 400s labels > 50 / empty / > 40 chars, but the
     // bridge used to forward them unvalidated AFTER uploadAll — so an invalid request uploaded the
     // blob, then got 400'd, permanently orphaning it. Validate before the upload.
     const { h, client, uploadLocalFile } = fixture();
@@ -377,9 +377,9 @@ describe('items handlers', () => {
   });
 });
 
-describe('items handlers Files deep link (loop #739)', () => {
-  const WEB = 'https://bridge.easelyte.ai';
-  const WORK = '/root/.openclaw/workspace';
+describe('items handlers Files deep link', () => {
+  const WEB = 'https://matron.example.com';
+  const WORK = '/home/user/workspace';
 
   function webFixture(webBaseUrl) {
     const session = { roomId: '!r:s', workdir: WORK, journalConvoId: 'c1' };
@@ -401,41 +401,41 @@ describe('items handlers Files deep link (loop #739)', () => {
 
   it('create: appends a Files deep link line per attachment to the body when webBaseUrl is set', async () => {
     const { h, client } = webFixture(WEB);
-    await h.create({ roomId: '!r:s', kind: 'task', title: 'Handoff', body: 'draft is ready', attachments: ['dan-offer.md'] });
+    await h.create({ roomId: '!r:s', kind: 'task', title: 'Handoff', body: 'draft is ready', attachments: ['report.md'] });
     const sent = client.create.mock.calls[0][0];
     expect(sent.body).toBe(
-      `draft is ready\n\n📁 Open dan-offer.md in Files: ${WEB}/#files=${encodeURIComponent(`${WORK}/dan-offer.md`)}`,
+      `draft is ready\n\n📁 Open report.md in Files: ${WEB}/#files=${encodeURIComponent(`${WORK}/report.md`)}`,
     );
     // The attachment record itself is unchanged (deep link is additive, not a replacement).
-    expect(sent.attachments).toEqual([{ blob_ref: 'b-dan-offer.md', mime: 'text/markdown', name: 'dan-offer.md', size: 3 }]);
+    expect(sent.attachments).toEqual([{ blob_ref: 'b-report.md', mime: 'text/markdown', name: 'report.md', size: 3 }]);
   });
 
   it('create: an attachment-only item gets a body built from just the deep link', async () => {
     const { h, client } = webFixture(WEB);
-    await h.create({ roomId: '!r:s', kind: 'task', title: 'Handoff', attachments: ['dan-offer.md'] });
+    await h.create({ roomId: '!r:s', kind: 'task', title: 'Handoff', attachments: ['report.md'] });
     expect(client.create.mock.calls[0][0].body).toBe(
-      `📁 Open dan-offer.md in Files: ${WEB}/#files=${encodeURIComponent(`${WORK}/dan-offer.md`)}`,
+      `📁 Open report.md in Files: ${WEB}/#files=${encodeURIComponent(`${WORK}/report.md`)}`,
     );
   });
 
   it('comment: appends the deep link to the comment body when webBaseUrl is set', async () => {
     const { h, client } = webFixture(WEB);
-    await h.comment({ roomId: '!r:s', id: 'it_1', body: 'see attached', attachments: ['dan-offer.md'] });
+    await h.comment({ roomId: '!r:s', id: 'it_1', body: 'see attached', attachments: ['report.md'] });
     expect(client.comment.mock.calls[0][1].body).toBe(
-      `see attached\n\n📁 Open dan-offer.md in Files: ${WEB}/#files=${encodeURIComponent(`${WORK}/dan-offer.md`)}`,
+      `see attached\n\n📁 Open report.md in Files: ${WEB}/#files=${encodeURIComponent(`${WORK}/report.md`)}`,
     );
   });
 
   it('leaves the body untouched (plain-path fallback) when webBaseUrl is unset', async () => {
     const { h, client } = webFixture('');
-    await h.create({ roomId: '!r:s', kind: 'task', title: 'Handoff', body: 'draft is ready', attachments: ['dan-offer.md'] });
+    await h.create({ roomId: '!r:s', kind: 'task', title: 'Handoff', body: 'draft is ready', attachments: ['report.md'] });
     expect(client.create.mock.calls[0][0].body).toBe('draft is ready');
   });
 });
 
-describe('items handlers deep-link body bound (loop #739, F2)', () => {
-  const WEB = 'https://bridge.easelyte.ai';
-  const WORK = '/root/.openclaw/workspace';
+describe('items handlers deep-link body bound', () => {
+  const WEB = 'https://matron.example.com';
+  const WORK = '/home/user/workspace';
   const BODY_MAX = 32768;
 
   function webFixture() {
@@ -444,7 +444,7 @@ describe('items handlers deep-link body bound (loop #739, F2)', () => {
     const client = { create: vi.fn(async () => ({ status: 201, data: { item: { id: 'it_1', num: 1 } } })) };
     const uploadLocalFile = vi.fn(async () => ({
       ok: true,
-      media: { blob_ref: 'b1', mime: 'text/markdown', name: 'dan-offer.md', size: 3, isImage: false, absPath: `${WORK}/dan-offer.md`, workdir: WORK },
+      media: { blob_ref: 'b1', mime: 'text/markdown', name: 'report.md', size: 3, isImage: false, absPath: `${WORK}/report.md`, workdir: WORK },
     }));
     const h = createItemsHandlers({ sessions, journalConvoIdFor: (s) => s?.journalConvoId ?? null, client, uploadLocalFile, webBaseUrl: WEB });
     return { h, client };
@@ -453,7 +453,7 @@ describe('items handlers deep-link body bound (loop #739, F2)', () => {
   it('drops the deep-link trailer rather than pushing a max-length body over the journal limit', async () => {
     const { h, client } = webFixture();
     const body = 'x'.repeat(BODY_MAX); // exactly at the contract max — valid, but no room for a trailer
-    const r = await h.create({ roomId: '!r:s', kind: 'task', title: 'Big', body, attachments: ['dan-offer.md'] });
+    const r = await h.create({ roomId: '!r:s', kind: 'task', title: 'Big', body, attachments: ['report.md'] });
     expect(r.status).toBe(201);
     const sent = client.create.mock.calls[0][0];
     expect(sent.body).toBe(body); // unchanged — trailer skipped
@@ -464,15 +464,15 @@ describe('items handlers deep-link body bound (loop #739, F2)', () => {
 
   it('still appends the trailer when there is room under the limit', async () => {
     const { h, client } = webFixture();
-    const r = await h.create({ roomId: '!r:s', kind: 'task', title: 'Small', body: 'short', attachments: ['dan-offer.md'] });
+    const r = await h.create({ roomId: '!r:s', kind: 'task', title: 'Small', body: 'short', attachments: ['report.md'] });
     expect(r.status).toBe(201);
-    expect(client.create.mock.calls[0][0].body).toContain('📁 Open dan-offer.md in Files:');
+    expect(client.create.mock.calls[0][0].body).toContain('📁 Open report.md in Files:');
   });
 });
 
-describe('items handlers deep-link byte-bound + multi-trailer (loop #739, AR-12 F1/F2)', () => {
-  const WEB = 'https://bridge.easelyte.ai';
-  const WORK = '/root/.openclaw/workspace';
+describe('items handlers deep-link byte-bound + multi-trailer', () => {
+  const WEB = 'https://matron.example.com';
+  const WORK = '/home/user/workspace';
   const BODY_MAX = 32768;
 
   function webFixtureMulti() {
@@ -492,10 +492,10 @@ describe('items handlers deep-link byte-bound + multi-trailer (loop #739, AR-12 
     // Choose a body length such that appending the trailer stays within BODY_MAX code units but
     // would exceed BODY_MAX bytes — the emoji costs +2 bytes over its 2 code units. If the bound
     // were code-unit based, the trailer would be (wrongly) appended and the byte length exceed max.
-    const trailer = `\n\n📁 Open dan-offer.md in Files: ${WEB}/#files=${encodeURIComponent(`${WORK}/dan-offer.md`)}`;
+    const trailer = `\n\n📁 Open report.md in Files: ${WEB}/#files=${encodeURIComponent(`${WORK}/report.md`)}`;
     const trailerBytes = Buffer.byteLength(trailer, 'utf8');
     const body = 'x'.repeat(BODY_MAX - trailerBytes + 1); // +1 byte over once the trailer is added
-    const r = await h.create({ roomId: '!r:s', kind: 'task', title: 'B', body, attachments: ['dan-offer.md'] });
+    const r = await h.create({ roomId: '!r:s', kind: 'task', title: 'B', body, attachments: ['report.md'] });
     expect(r.status).toBe(201);
     const sent = client.create.mock.calls[0][0];
     expect(Buffer.byteLength(sent.body, 'utf8')).toBeLessThanOrEqual(BODY_MAX);

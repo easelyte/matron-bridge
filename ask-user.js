@@ -21,7 +21,7 @@ import { formatRoutineList, formatRoutineUpdateAck, formatRoutineRunAck } from '
 // Route to whichever bridge spawned us: explicit BRIDGE_API_URL wins, else the
 // per-session MATRON_BRIDGE_API_PORT exported by the bridge at spawn (journal=9812,
 // old Matrix bridge=9802), else the legacy default. Prevents the inbound-secret
-// flow from posting to the wrong bridge process after the journal cutover (loop #504/#549).
+// flow from posting to the wrong bridge process after the journal cutover.
 const BRIDGE_API = process.env.BRIDGE_API_URL
   || (process.env.MATRON_BRIDGE_API_PORT && `http://127.0.0.1:${process.env.MATRON_BRIDGE_API_PORT}`)
   || 'http://127.0.0.1:9802';
@@ -931,7 +931,7 @@ server.tool(
 async function callItems(name, args, render) {
   const payload = { roomId: ROOM_ID, ...args };
   // The two minting/appending item ops carry an idempotency key the model never
-  // sees or supplies (loop #763 F2): a harness-retried item_create/item_comment
+  // sees or supplies: a harness-retried item_create/item_comment
   // would otherwise duplicate the item/comment AND re-upload its attachment blob
   // (permanently orphaning the first upload — retention.js never reaps it). The
   // key is derived from the call (op, room, content, +id for comments) inside a

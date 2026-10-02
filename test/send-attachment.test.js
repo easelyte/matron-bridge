@@ -369,8 +369,8 @@ describe('resolveAndUploadLocalFile', () => {
   });
 });
 
-describe('createSendAttachmentHandler Files deep link (loop #739)', () => {
-  const WEB = 'https://bridge.easelyte.ai';
+describe('createSendAttachmentHandler Files deep link', () => {
+  const WEB = 'https://matron.example.com';
 
   function fixtureWithWeb(webBaseUrl) {
     const { workdir, publisher, published, uploads, sessions } = makeFixture();

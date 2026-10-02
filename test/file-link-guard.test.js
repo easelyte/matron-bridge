@@ -23,7 +23,7 @@ describe('isSensitivePath', () => {
     '/w/proj/secrets', '/w/proj/secret', '/w/prod.env/x.dat', '/w/tokens.json/x.dat',
     '/w/app.key/nested/file.txt',
     // 2026-09-27 hardening (maintainer review of the File Explorer stack)
-    '/root/.secrets', '/root/.secrets/req-abc.txt', '/root/.anton/approval_grant_secret',
+    '/root/.secrets', '/root/.secrets/req-abc.txt', '/root/.agent/approval_grant_secret',
     '/root/.supabase/access-token', '/etc/matron/agent-token', '/w/agent_token.json',
     '/opt/matron/journal/data/bridge-agent-token.txt', '/opt/matron/journal/data/bridge-agent-creds.txt',
     '/root/.claude-matrix-sessions.json', '/root/.claude-matrix-config.json', '/root/.matron-bridge-secrets.json',
@@ -600,12 +600,12 @@ describe('pinAllowedRootIdentities', () => {
 });
 
 describe('buildFilesDeepLink', () => {
-  const WEB = 'https://bridge.easelyte.ai';
-  const WORK = '/root/.openclaw/workspace';
+  const WEB = 'https://matron.example.com';
+  const WORK = '/home/user/workspace';
 
   it('mints a token-less #files= hash link for an in-root, non-sensitive file', () => {
-    const link = buildFilesDeepLink(`${WORK}/dan-offer.md`, WORK, WEB);
-    expect(link).toBe(`${WEB}/#files=${encodeURIComponent(`${WORK}/dan-offer.md`)}`);
+    const link = buildFilesDeepLink(`${WORK}/report.md`, WORK, WEB);
+    expect(link).toBe(`${WEB}/#files=${encodeURIComponent(`${WORK}/report.md`)}`);
     // No token/HMAC in the URL — auth is the operator's web session.
     expect(link).not.toContain('token=');
   });
@@ -650,7 +650,7 @@ describe('buildFilesDeepLink', () => {
 });
 
 describe('appendFilesDeepLink', () => {
-  const LINK = 'https://bridge.easelyte.ai/#files=%2Fx%2Fa.md';
+  const LINK = 'https://matron.example.com/#files=%2Fx%2Fa.md';
 
   it('appends a labelled link line after existing caption text', () => {
     const out = appendFilesDeepLink('here is the doc', LINK);

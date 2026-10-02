@@ -57,7 +57,7 @@ describe('missionIdemKey', () => {
   });
 });
 
-describe('itemIdemKey (loop #763)', () => {
+describe('itemIdemKey', () => {
   const NOW = 1789056600000;
   const create = { op: 'item_create', roomId: '!r:s', now: NOW, args: { kind: 'task', title: 'Ship it', body: 'do the thing' } };
   const comment = { op: 'item_comment', roomId: '!r:s', now: NOW, args: { id: 'it_7', body: 'progress note' } };
@@ -85,7 +85,7 @@ describe('itemIdemKey (loop #763)', () => {
     expect(itemIdemKey({ ...create, args: { ...create.args, body: 'a different body' } })).not.toBe(key);
   });
 
-  it('differs when ONLY a non-content field differs — distinct mutations must not share a key (Codex F2)', () => {
+  it('differs when ONLY a non-content field differs — distinct mutations must not share a key', () => {
     const key = itemIdemKey(create);
     expect(itemIdemKey({ ...create, args: { ...create.args, attachments: ['a.png'] } })).not.toBe(key);
     expect(itemIdemKey({ ...create, args: { ...create.args, labels: ['ui'] } })).not.toBe(key);

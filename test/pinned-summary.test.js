@@ -337,7 +337,7 @@ describe('updatePinnedSummary title flow and log levels', () => {
   it('threads an LLM-inferred REPO override into formatRoomTitle', async () => {
     const d = deps({
       codexOneShot: vi.fn().mockResolvedValue(
-        success('TITLE: harden RLS gate\nREPO: snafu-studio\nSUMMARY: done'),
+        success('TITLE: harden RLS gate\nREPO: my-app\nSUMMARY: done'),
       ),
     });
 
@@ -348,35 +348,35 @@ describe('updatePinnedSummary title flow and log levels', () => {
       workdir: '/srv/project',
       text: 'harden RLS gate',
       defaultWorkdir: '/srv/default',
-      repo: 'snafu-studio',
+      repo: 'my-app',
     });
   });
 
   it('falls back to the activity-inferred repo when the model omits REPO', async () => {
     const d = deps({
       codexOneShot: vi.fn().mockResolvedValue(success('TITLE: some work\nSUMMARY: done')),
-      inferRepo: () => 'goodfellow',
+      inferRepo: () => 'api-server',
     });
 
     await updatePinnedSummary(session(), d);
 
     expect(d.formatRoomTitle).toHaveBeenCalledWith(
-      expect.objectContaining({ text: 'some work', repo: 'goodfellow' }),
+      expect.objectContaining({ text: 'some work', repo: 'api-server' }),
     );
   });
 
   it('lets the model REPO override win over the activity-inferred repo', async () => {
     const d = deps({
       codexOneShot: vi.fn().mockResolvedValue(
-        success('TITLE: some work\nREPO: easelyte/goodfellow\nSUMMARY: done'),
+        success('TITLE: some work\nREPO: acme/api-server\nSUMMARY: done'),
       ),
-      inferRepo: () => 'goodfellow',
+      inferRepo: () => 'api-server',
     });
 
     await updatePinnedSummary(session(), d);
 
     expect(d.formatRoomTitle).toHaveBeenCalledWith(
-      expect.objectContaining({ text: 'some work', repo: 'easelyte/goodfellow' }),
+      expect.objectContaining({ text: 'some work', repo: 'acme/api-server' }),
     );
   });
 
@@ -466,7 +466,7 @@ describe('production dependency-wiring contract', () => {
 });
 
 
-// --- loop #554 phase 1: journal publish ---
+// --- journal publish ---
 
 describe('summaryForJournal', () => {
   const bullets = (count, size = 100) =>
@@ -599,7 +599,7 @@ describe('makeJournalSummaryPublisher', () => {
     },
   );
 
-  // loop #554 R3/R4: a refused frame was neither sent nor retained. Recording
+  // A refused frame was neither sent nor retained. Recording
   // the hint there would suppress the retry meant to recover it — and the
   // caller needs 'refused' distinguishable from 'skipped' to know to come back.
   it('reports a refusal, leaves the hint unset, and retries the same digest', () => {
@@ -738,7 +738,7 @@ describe('updatePinnedSummary journal publish seam', () => {
     expect(d.updateRoomName).toHaveBeenCalledTimes(1);
   });
 
-  // loop #554 F2: persistSession is fail-OPEN (index.js savePersistedSessions
+  // persistSession is fail-OPEN (index.js savePersistedSessions
   // logs and returns rather than throwing), so a publish that ran first could
   // leave the journal holding text the session store never recorded — and the
   // next resume would back-fill the older persisted digest over it.

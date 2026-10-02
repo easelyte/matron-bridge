@@ -258,7 +258,7 @@ describe('shareAgentMedia dedup ledger', () => {
     expect(result).toEqual(expect.objectContaining({ deduped: false }));
   });
 
-  it('still dedups via a locally-computed hash when the journal omits sha256 (F2 version skew)', async () => {
+  it('still dedups via a locally-computed hash when the journal omits sha256 (version skew)', async () => {
     const dedupLedger = makeLedger();
     const content = Buffer.from('same-bytes');
 
@@ -276,7 +276,7 @@ describe('shareAgentMedia dedup ledger', () => {
     expect(r2).toEqual(expect.objectContaining({ media_id: 'media-partial-1', deduped: true }));
   });
 
-  it('dedups an empty-string caption against an absent caption (F5 payload-equivalent)', async () => {
+  it('dedups an empty-string caption against an absent caption (payload-equivalent)', async () => {
     const dedupLedger = makeLedger();
     const first = makeDeps();
     await share(first, { token: 'tok-1', caption: '', deps: { ...first, dedupLedger } });
@@ -351,8 +351,8 @@ describe('parseShowFileUploadTimeoutMs', () => {
   });
 });
 
-describe('shareAgentMedia Files deep link (loop #739)', () => {
-  const WEB = 'https://bridge.easelyte.ai';
+describe('shareAgentMedia Files deep link', () => {
+  const WEB = 'https://matron.example.com';
 
   it('appends a Files deep link to the caption when webBaseUrl is set', async () => {
     const deps = makeDeps({ realPath: '/work/report.pdf', content: Buffer.from('pdf bytes') });
@@ -382,8 +382,8 @@ describe('shareAgentMedia Files deep link (loop #739)', () => {
   });
 });
 
-describe('shareAgentMedia deep link across multiple pinned roots (loop #739, F3)', () => {
-  const WEB = 'https://bridge.easelyte.ai';
+describe('shareAgentMedia deep link across multiple pinned roots', () => {
+  const WEB = 'https://matron.example.com';
 
   it('mints the link for a file under a SECONDARY pinned root, not just roots[0]', async () => {
     const realPath = '/artifacts/report.pdf';

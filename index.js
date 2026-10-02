@@ -300,7 +300,7 @@ const HOST_VITALS_SAMPLE_MS = parseInt(process.env.HOST_VITALS_SAMPLE_MS || '200
 const HOST_VITALS_DELTA_PCT = parseInt(process.env.HOST_VITALS_DELTA_PCT || '4', 10);
 const HOST_VITALS_HEARTBEAT_MS = parseInt(process.env.HOST_VITALS_HEARTBEAT_MS || '30000', 10);
 let _hostVitalsPushHandle = null;
-// box_status heartbeat (loop #542 phase B): re-publish every
+// box_status heartbeat: re-publish every
 // BOX_STATUS_REPUBLISH_MS so the journal's persisted vitals stay fresh.
 let _boxStatusRepublishHandle = null;
 let _lastVitalsPublished = null; // { cpu, ram, at } of the last emitted frame
@@ -456,8 +456,8 @@ const SERVER_LABEL = process.env.SERVER_LABEL || (() => {
 })();
 const HMAC_SECRET = process.env.HMAC_SECRET || '';
 const VIEWER_BASE_URL = process.env.VIEWER_BASE_URL || '';
-// Base URL of the matron-web client (prod: https://bridge.easelyte.ai). Used to mint token-less
-// hash deep links into the web Files pane (`${WEB_BASE_URL}/#files=<enc>`, loop #739) for
+// Base URL of the matron-web client (e.g. https://matron.example.com). Used to mint token-less
+// hash deep links into the web Files pane (`${WEB_BASE_URL}/#files=<enc>`) for
 // doc handoffs — auth is the operator's existing web session, so no HMAC. Unset → deep links are
 // dormant and every handover surface falls back to the plain path.
 const WEB_BASE_URL = process.env.WEB_BASE_URL || '';
@@ -470,7 +470,7 @@ const SHOW_FILE_GLOBAL_BYTE_BUDGET = SHOW_FILE_MAX_IN_FLIGHT * SHOW_FILE_MAX_BYT
 // reserves before an upload and releases in its finally). An object so the
 // extracted handler can mutate it by reference.
 const showFileBudget = { inFlight: 0, reservedBytes: 0 };
-// Content-identity dedup ledger for show_file (loop #667): a repeat publish of the
+// Content-identity dedup ledger for show_file: a repeat publish of the
 // same file within the TTL window (typically an LLM agent re-calling show_file
 // after an error) returns the prior media_id instead of re-publishing a duplicate
 // bubble. Process-lifetime singleton; bounded by TTL + LRU cap; fail-open.
@@ -559,7 +559,7 @@ if (!WEB_BASE_URL) {
   // Fail-visible, not fail-fast: dormancy is the intended safe default (the web Files-deep-link
   // consumer may not be deployed yet — a link to it would only 404 the hash). Warn so an operator
   // who expects deep links can see why handoffs are falling back to plain paths.
-  console.warn('[files-deeplink] WEB_BASE_URL unset — doc handoffs omit the "Open in Files" deep link and fall back to the plain path (set it to the web client base, e.g. https://bridge.easelyte.ai, once the matron-web deep-link build is deployed)');
+  console.warn('[files-deeplink] WEB_BASE_URL unset — doc handoffs omit the "Open in Files" deep link and fall back to the plain path (set it to the web client base, e.g. https://matron.example.com, once the matron-web deep-link build is deployed)');
 }
 
 // Journal dual-post (migration off Matrix — see matron-journal's protocol
@@ -704,7 +704,7 @@ const memoryLookup = createMemoryLookup({
 const repoNames = createRepoNameLookup();
 const memoryBlockNow = ({ coordinator, workdir }) => renderMemoryBlock(memoryLookup.snapshot(), { coordinator: coordinator === true, repo: repoNames.nameFor(workdir) });
 
-// NOTE (easelyte fork): upstream's summary-model-nag is intentionally dropped
+// NOTE (fork): upstream's summary-model-nag is intentionally dropped
 // here. This fork generates titles/summaries via a codex exec one-shot
 // (lib/pinned-summary.js + lib/codex-oneshot.js), not the Gemini summaryModel,
 // so summarization is NOT off and the "no summary model" per-box tracker nag
@@ -791,7 +791,7 @@ function handleJournalReconnect() {
   memoryLookup.refresh({ force: true });
 }
 
-// Repair the summary publish hint across a connection epoch (loop #554 F3).
+// Repair the summary publish hint across a connection epoch.
 // makeJournalSummaryPublisher records "already sent" on ENQUEUE, not on
 // acceptance — so a frame evicted by queue overflow during an outage would be
 // suppressed forever on a session that then went quiet (the next pass produces
@@ -843,7 +843,7 @@ function retrySessionSummaryRepairs() {
   if (_summaryRepairPending) republishSessionSummaries();
 }
 
-// Fail-loud backstop for the summary clamp (loop #554 §5.3). summaryForJournal
+// Fail-loud backstop for the summary clamp. summaryForJournal
 // is supposed to make the journal's SUMMARY_MAX_CHARS unreachable; if a
 // convo_upsert is rejected anyway the server drops the WHOLE frame — title,
 // agent_kind and session_state with it — and the publisher's own logging is
@@ -1106,7 +1106,7 @@ function savePersistedSessionsOrThrow(data) {
 // not take the bridge down mid-turn), but no longer fail-SILENT to its caller:
 // persistSession forwards this so a caller that is about to publish derived
 // state elsewhere can decline to let the remote copy get ahead of the durable
-// one (loop #554 F2).
+// one.
 function savePersistedSessions(data) {
   try {
     savePersistedSessionsOrThrow(data);
@@ -1358,7 +1358,7 @@ function journalStartSessionForRpc({ workdir, mcpExtras, model = null, agent = n
   return session;
 }
 
-// Guarded file-edit backend (loop #548 backend slice). Scope the edit surface
+// Guarded file-edit backend. Scope the edit surface
 // to the same root set show_file already trusts — the default workdir plus any
 // configured artifact roots — pinned ONCE here at the trusted boundary (same
 // pinAllowedRootsSync the per-session show_file path uses), never rebuilt from
@@ -1372,7 +1372,7 @@ for (const { root, reason } of fileRpcRoots.refused) {
 }
 const editAllowedRoots = pinAllowedRootsSync(fileRpcRoots.kept);
 
-// ops_snapshot RPC backend (loop #542 phase B, lib/ops-snapshot.js). `host`
+// ops_snapshot RPC backend (lib/ops-snapshot.js). `host`
 // is computed here from /proc; the other sections run MATRON_OPS_SNAPSHOT_CMD
 // (whitespace-split, no shell) + `--section <s>` in MATRON_OPS_SNAPSHOT_CWD or
 // the default workdir. Unset command -> those sections answer not_configured.
@@ -1435,7 +1435,7 @@ const journalRpcHandler = createRpcRequestHandler({
   // Which account a new session here would burn quota against, so the chooser
   // can tell boxes on different logins apart. Same cache as the status frames.
   getAccountEmail: () => getAccountEmail(),
-  // Ops page (loop #542 phase B): read-only host/ops sections.
+  // Ops page: read-only host/ops sections.
   opsSnapshot,
   // Spawn-room wiring (2026-08-09 agent-spawn spec). agentRooms is declared
   // later in this file (~:7223) — these arrows only dereference it at call
@@ -1445,7 +1445,7 @@ const journalRpcHandler = createRpcRequestHandler({
     agentRooms.record(roomId, { role: 'guest', state: 'joined', sessionRoomId: session.roomId });
   },
   unbindSpawnRoom: (roomId) => agentRooms.remove(roomId),
-  // A spawned task's opening turn is autonomous work (loop #688): tag it the
+  // A spawned task's opening turn is autonomous work: tag it the
   // lowest tier so a priority peer can preempt it, per the operator >
   // peer-priority > peer-coalesced > autonomous precedence.
   injectTurn: (session, text) => sendTextToSession(session, text, { skipJournalMirror: true, turnTier: 'autonomous' }),
@@ -1528,7 +1528,7 @@ function journalPublish(session, method, payload, options) {
     if (!session._journalConvoEstablished) {
       session._journalConvoEstablished = true;
       if (method !== 'upsertConvo') {
-        // Carry the backend kind on the bootstrap upsert too (loop #619), so a
+        // Carry the backend kind on the bootstrap upsert too, so a
         // convo first touched by a non-upsert publish (e.g. an assistant notice
         // before the first state transition) is marked codex/claude immediately.
         journalPublisher.upsertConvo(convoId, { title: session._journalTitleHint, agentKind: session.agent });
@@ -1707,7 +1707,7 @@ function journalUpsertConvo(session, opts, options) {
       session.originRoomId, { journalTitleHint: opts.title });
   }
   // Stamp the backend kind on every session-scoped upsert so clients can mark
-  // codex vs claude on top-level conversation rows (loop #619). session.agent
+  // codex vs claude on top-level conversation rows. session.agent
   // ('claude' | 'codex') is set at session creation; a caller that already
   // supplied agentKind wins. agent_kind is COALESCE-sticky server-side, so
   // re-sending it on each state transition is idempotent.
@@ -1776,7 +1776,7 @@ function journalSessionState(session, state) {
   // The record is deliberately NOT settled here on local-send completion. There is no per-frame
   // server commit ack on this WS path, and the publisher's onLocalSendComplete fires when the frame
   // leaves the local socket buffer, NOT when the server persists it (see journal-publisher pump()).
-  // Settling on that callback was the loop #754 bug: a `done` frame whose write callback fired but
+  // Settling on that callback was the earlier bug: a `done` frame whose write callback fired but
   // whose connection dropped before the server committed cleared the outbox record, leaving the row
   // stuck `running` with nothing left to reconcile — a permanent, unrecoverable "Thinking".
   //
@@ -1811,7 +1811,7 @@ function journalSessionState(session, state) {
 }
 
 // Repair the session_state latch across a connection epoch — the exact analogue of
-// republishSessionSummaries below, for the same defect (loop #554 F3, now #575's residual).
+// republishSessionSummaries below, for the same defect.
 //
 // journalSessionState records "already sent" on ENQUEUE, not on acceptance: it advances
 // session._journalState and then hands the frame to the durable queue, which DROPS THE OLDEST
@@ -2825,7 +2825,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
         // so its established flag carries as well.
         restarted._journalBuffer = session._journalBuffer;
         restarted._journalTitleHint = session._journalTitleHint;
-        restarted._fallbackTitleApplied = session._fallbackTitleApplied; // preserve fallback ownership so a repo upgrade survives restart (F2r3)
+        restarted._fallbackTitleApplied = session._fallbackTitleApplied; // preserve fallback ownership so a repo upgrade survives restart
         restarted._fallbackTitleValue = session._fallbackTitleValue;
         restarted._journalState = session._journalState;
         restarted._journalConvoEstablished = session._journalConvoEstablished;
@@ -3399,7 +3399,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
   // Fresh sessions pre-assign --session-id so the transcript path is known
   // before spawn; resumes pass --resume only. The exclusivity rule lives in
   // planSessionIdentity.
-  // easelyte fork delta: interactive sessions pass no bypass / permission-mode
+  // fork delta: interactive sessions pass no bypass / permission-mode
   // flag — permissions come from the full tool allow-list in
   // buildSessionSettings('iv') (lib/session-settings.js), and any TUI prompt
   // outside it is surfaced by lib/prompt-detector.js. Upstream's iv
@@ -3660,7 +3660,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
         // Carry journal-mirror state (see the matching print-mode block).
         restarted._journalBuffer = session._journalBuffer;
         restarted._journalTitleHint = session._journalTitleHint;
-        restarted._fallbackTitleApplied = session._fallbackTitleApplied; // preserve fallback ownership so a repo upgrade survives restart (F2r3)
+        restarted._fallbackTitleApplied = session._fallbackTitleApplied; // preserve fallback ownership so a repo upgrade survives restart
         restarted._fallbackTitleValue = session._fallbackTitleValue;
         restarted._journalState = session._journalState;
         restarted._journalConvoEstablished = session._journalConvoEstablished;
@@ -4402,7 +4402,7 @@ function submitAnswer(session, answerText, { mirrorToJournal = true } = {}) {
     bumpTurnGeneration(session);
     // Operator turn (answering a prompt): reset the tier so a stale peer tier
     // left by a previous turn can never let a priority peer preempt this
-    // operator work (loop #688 — the turnTier leak F1). null = operator-rank,
+    // operator work (the turnTier leak). null = operator-rank,
     // protected. This is a direct busy=true seam that bypasses sendToSession.
     session.turnTier = null;
     inflightMarker.noteTurnStart(journalConvoIdFor(session), session.roomId);
@@ -4507,7 +4507,7 @@ function teardownSubagentTracking(session) {
     session.codexWatcher.stop().catch(() => {});
     session.codexWatcher = null;
   }
-  // #632: reclaim this session's codex-viz sink dir on teardown. The sink lives
+  // Reclaim this session's codex-viz sink dir on teardown. The sink lives
   // outside Claude Code's pruned project tree, so without this it lingers until
   // the boot-time age-based sweep (pruneStaleCodexSinks, still the backstop).
   // Guard on the same viz env gate that created the sink + wired the watcher
@@ -4738,7 +4738,7 @@ function handleClaudeEvent(session, event) {
   // Re-home the subagent watcher when the session changes cwd mid-flight
   // (EnterWorktree). Claude relocates the subagents dir to the new cwd's
   // project-dir encoding, so a watcher frozen on the spawn cwd polls a stale
-  // path and subagent cards stop rendering (loop #631). Stream events carry the
+  // path and subagent cards stop rendering. Stream events carry the
   // live per-entry cwd; track the last one seen so we only act on a real move,
   // then let the watcher re-point (a no-op when the encoded dir is unchanged).
   if (session.subagentWatcher && typeof event.cwd === 'string' && event.cwd
@@ -4934,11 +4934,11 @@ function handleClaudeEvent(session, event) {
 
         // Activity-based repo signal for journal titles: which repo this session
         // is actually working in (edits win over reads). The cwd is useless here
-        // — cross-repo work is rooted in son-of-anton and reaches siblings by
+        // — cross-repo work is rooted in the workspace root and reaches siblings by
         // path — so we infer from tool file paths. STAGE the signal here keyed
         // by tool_use id; it is committed only once the tool_result confirms
         // success (see the 'user' case), so a denied or failed Edit never counts
-        // as activity (F2). Bounded so denials/orphans that never produce a
+        // as activity. Bounded so denials/orphans that never produce a
         // result cannot grow the map without limit.
         const repoSignals = toolRepoSignals(toolName, input, DEFAULT_WORKDIR);
         if (repoSignals.length && block.id) {
@@ -5345,7 +5345,7 @@ function handleClaudeEvent(session, event) {
         // becomes known, so repaint here rather than making the header wait
         // for the first turn end. Unthrottled: init fires once per spawn.
         journalStatus(session);
-        // Which turn generation the CLI has actually OPENED (Codex R2 F1).
+        // Which turn generation the CLI has actually OPENED.
         // Print mode emits exactly one system/init per TURN — verified against
         // the live CLI: init, result, init, result across two sequential turns
         // on one session id. The bridge bumps turnGeneration when it WRITES a
@@ -5355,7 +5355,7 @@ function handleClaudeEvent(session, event) {
         // returns an ordinary success receipt for it (#429) — so this stamp is
         // what tells printModeInterrupt whether an ack can be believed. If a CLI
         // version ever stops emitting per-turn init, the stamp goes stale, acks
-        // are never trusted, and interrupts degrade to their pre-#701 10s
+        // are never trusted, and interrupts degrade to their pre-ack 10s
         // behaviour: a fail-safe direction, never a worse one. Deliberately
         // placed after journalStatus so the header-repaint wiring assertion in
         // test/session-status.test.js keeps its adjacency window.
@@ -5566,7 +5566,7 @@ function handleClaudeEvent(session, event) {
           // Commit a staged repo signal (see the 'assistant' tool_use case)
           // once its result lands. Only a NON-error result counts — a failed or
           // denied Edit/Write must not name the session for work that never
-          // happened (F2). Either way the pending entry is drained.
+          // happened. Either way the pending entry is drained.
           if (block.type === 'tool_result' && block.tool_use_id
               && session._pendingRepoSignals?.has(block.tool_use_id)) {
             const staged = session._pendingRepoSignals.get(block.tool_use_id);
@@ -5575,7 +5575,7 @@ function handleClaudeEvent(session, event) {
               if (!session.repoScores) session.repoScores = emptyRepoScores();
               if (commitRepoSignals(session.repoScores, staged)) {
                 // Upgrade a repo-less fallback title now that we know the repo
-                // (F1r2). No-op unless the fallback was applied without a repo
+                // No-op unless the fallback was applied without a repo
                 // and still owns the title — see applyFallbackTitle's guard.
                 applyFallbackTitle(session, {
                   serverLabel: SERVER_LABEL,
@@ -5669,7 +5669,7 @@ function handleClaudeEvent(session, event) {
       break;
     }
 
-    // The CLI's acknowledgement of an interrupt we sent (loop #701). Before
+    // The CLI's acknowledgement of an interrupt we sent. Before
     // this case these lines fell through to `default: break` and were dropped,
     // so the bridge's only signal was "did a `result` arrive within 10s" — and
     // that 10s wedge is the sole door into the turn-overlap window (busy
@@ -5686,7 +5686,7 @@ function handleClaudeEvent(session, event) {
       const pending = session.pendingInterrupt;
       if (!pending) break;
       if (applyInterruptAck(pending, event)) {
-        // Routine, and deliberately NOT the `[wedge]` prefix (Codex R1 F2):
+        // Routine, and deliberately NOT the `[wedge]` prefix:
         // `[wedge]` is the alertable "the overlap window opened" signal, and a
         // successful ack is the opposite of that. Tagging both the same would
         // make every ordinary interrupt look like an incident to a grep or an
@@ -5711,7 +5711,7 @@ function handleClaudeEvent(session, event) {
         // (we send none today) or the CLI changed the envelope shape — in which
         // case the ack silently stops matching and the 10s path quietly comes
         // back. Cheap drift detector for the external contract this whole case
-        // depends on (Codex R1 F3, narrow part). The already-acked duplicate is
+        // depends on. The already-acked duplicate is
         // NOT logged here: applyInterruptAck returns false for it too, but it
         // does match, so it falls through both branches.
         console.warn(
@@ -5926,7 +5926,7 @@ function sendToSession(session, contentBlocks, { skipJournalMirror = false, turn
   session.toolCalls = [];
   session.busy = true;
   bumpTurnGeneration(session);
-  // Record the tier of the turn now starting (loop #688 consumer half). Peer
+  // Record the tier of the turn now starting. Peer
   // injections tag 'peer-priority'/'peer-coalesced'; an unmarked turn leaves
   // this null, which the precedence gate treats as operator-rank (protected) —
   // so a priority peer never preempts a turn we did not positively classify as
@@ -6898,7 +6898,7 @@ async function updateRoomName(roomId, name) {
   if (journalSession) journalUpsertConvo(journalSession, { title: name });
 }
 
-// Publishes the CLAMPED digest onto the conversation row (loop #554 B3).
+// Publishes the CLAMPED digest onto the conversation row.
 // Kill switch SUMMARY_JOURNAL_PUBLISH=0 and the don't-re-send-unchanged rule
 // live in lib/pinned-summary.js so they are testable without this entrypoint.
 // Values reaching here are already clamped — by the publish seam inside
@@ -7747,8 +7747,8 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       });
       // Restore + normalize the activity-inferred repo signal BEFORE titling so
       // a rehydrated session names its journal from prior activity, not a bare
-      // basename (F1). normalizeRepoScores hardens against version-skewed
-      // persisted state reaching the event path (F5).
+      // basename. normalizeRepoScores hardens against version-skewed
+      // persisted state reaching the event path.
       const resumeRepoScores = normalizeRepoScores(resumePersisted?.repoScores);
       const roomName = formatRoomTitle({
         serverLabel: SERVER_LABEL,
@@ -7786,7 +7786,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       // Rename after the session exists (not before) so updateRoomName's
       // roomId -> session lookup — used to journal-mirror the title — finds it.
       await updateRoomName(sessionRoomId, roomName);
-      // Backfill the restored digest onto the journal row (loop #554 B5).
+      // Backfill the restored digest onto the journal row.
       // Without this a resumed session's already-earned summary would not
       // reach the server until the next 5-message summary pass — and for the
       // 24 sessions that already carry text on this box, not until each one is
@@ -9304,7 +9304,7 @@ function journalOnText(session, body, { username }) {
 // location and attached to the next prompt. buildSavedMediaBlocks handles the
 // caption in both modes — iv folds it into the upload annotation (ivHandled),
 // SDK leads with it as a text block — so the orchestrator must NOT append it
-// again (an earlier easelyte design tail-appended in SDK mode; that was
+// again (an earlier fork design tail-appended in SDK mode; that was
 // superseded on the 2026-07-20 upstream sync). Fire-and-forget: the
 // orchestrator's returned function never throws/rejects (it swallows
 // internally), matching the router's contract for routeMediaToSession.
@@ -9887,7 +9887,7 @@ function journalResumeConvo(convoId, noticeText = JOURNAL_RESUME_NOTICE) {
   return null;
 }
 
-// Canonical HTTP-side permission registry. Keys are the full P56 tuple with
+// Canonical HTTP-side permission registry. Keys are the full permission tuple with
 // a NUL separator (`convo_id + "\0" + tool_use_id`);
 // journalConvoIdFor(session) and inbound
 // frame.convo_id provide the same stable conversation identity without
@@ -10603,7 +10603,7 @@ function maybeFlushRoomDelivery(session) {
 // The room-delivery half of the free gate (lib/room-delivery.js flush +
 // the outcome notice), callable on its own by the control drain above.
 function flushRoomInbox(session) {
-  // A priority peer is awaiting delivery (loop #688 F3): it outranks any pending
+  // A priority peer is awaiting delivery: it outranks any pending
   // peer-coalesced room batch, so flush the peer inbox FIRST. Each flush injects
   // a turn (busy=true), and only one can go per turn-end; without this the
   // ordinary path below flushes a pending room batch first when one exists,
@@ -10646,7 +10646,7 @@ function flushRoomInbox(session) {
 // room convo — mirroring it into the session convo would duplicate it.
 const roomDelivery = createRoomDelivery({
   isBusy: sessionOccupiedForRoomDelivery,
-  // Tag the injected turn's tier by sender provenance (loop #688 F2): a purely
+  // Tag the injected turn's tier by sender provenance: a purely
   // agent-origin room batch is a coordinating peer turn (peer-coalesced,
   // preemptable by a priority peer), while any operator (user:) message in the
   // batch keeps it operator-protected (null). deliverRoomFrameTo stamps
@@ -10664,7 +10664,7 @@ const PEER_UNTRUSTED_MARKER =
 function formatPeerDelivery(messages, { droppedCount = 0 } = {}) {
   const lines = messages.map((message) => {
     const kind = message.from_kind == null ? '' : ` (${oneLine(message.from_kind)})`;
-    // A priority peer message (loop #688) is marked in the injected line so the receiving
+    // A priority peer message is marked in the injected line so the receiving
     // agent can weigh it — the label rides inside the existing bracket, never a barge-in.
     const priorityMark = message.priority === true ? 'PRIORITY ' : '';
     return `[${priorityMark}peer «${oneLine(message.from_name)}»${kind} · ${PEER_UNTRUSTED_MARKER}] ${oneLine(message.body)}`;
@@ -10684,13 +10684,12 @@ function logPeerMessageDelivery(convo, seq, decision) {
 
 const peerDelivery = createRoomDelivery({
   isBusy: sessionOccupiedForRoomDelivery,
-  // R501 §9 is layered: formatPeerDelivery marks this ordinary role:'user'
+  // Peer-message safety is layered: formatPeerDelivery marks this ordinary role:'user'
   // turn as hostile-by-default, while the deployment-conditional downstream
   // MATRON_PERMISSION_CARDS gate covers tool calls. When that gate is off, the
   // in-band marker is the sole control; peers gain no capability or elevation.
   //
-  // The injected turn is tagged with its priority tier (loop #688 consumer
-  // half): a batch carrying any priority peer message runs as a 'peer-priority'
+  // The injected turn is tagged with its priority tier: a batch carrying any priority peer message runs as a 'peer-priority'
   // turn, otherwise 'peer-coalesced'. sendToSession stamps this onto
   // session.turnTier so a LATER inbound priority peer can decide, by the
   // operator > peer-priority > peer-coalesced > autonomous precedence, whether
@@ -10777,12 +10776,12 @@ function journalOnPeerMessage(frame) {
   });
   // A priority peer queued behind a running turn (coalesced, not injected idle)
   // must be delivered ahead of any lower-tier room batch at the turn-end flush
-  // (loop #688 F3) — whether or not it also preempts (iv coalesces without
+  // — whether or not it also preempts (iv coalesces without
   // interrupting). maybeFlushRoomDelivery reads and clears this flag.
   if (payload.priority === true && decision === 'coalesced') {
     session._priorityPreemptPending = true;
   }
-  // Consumer half (loop #688): a priority peer that arrives MID-TURN preempts
+  // Consumer half: a priority peer that arrives MID-TURN preempts
   // the running turn ONLY IF it outranks it by the operator > peer-priority >
   // peer-coalesced > autonomous precedence. It was just coalesced into the
   // pending inbox above; interrupting the running turn makes the turn-end seam
@@ -10792,11 +10791,11 @@ function journalOnPeerMessage(frame) {
   //
   // Guard on the message still being queued: a priority body over the peer
   // inbox's byte cap self-evicts on delivery (room-delivery's while-loop), so
-  // interrupting would kill the running turn with nothing left to inject (F5).
+  // interrupting would kill the running turn with nothing left to inject.
   // The busy branch always coalesced above, so pendingCount > 0 means the
   // priority message (or peers coalesced with it) survived and is deliverable.
   //
-  // iv-mode is excluded from auto-preemption (F2 round-2 / F1): its PTY turn
+  // iv-mode is excluded from auto-preemption: its PTY turn
   // lifecycle has no turn-generation-correlated Stop hook, so cancelling a turn
   // and clearing busy could let the canceled turn's late, session-id-keyed hook
   // end a replacement turn and paste input over it. Print-mode Claude and Codex
@@ -10810,8 +10809,8 @@ function journalOnPeerMessage(frame) {
     runningTier: session.turnTier,
   }) && !(session.iv && session.iv.alive) && peerDelivery.pendingCount(session.roomId) > 0) {
     // Report the real interrupt outcome, not merely that we decided to preempt
-    // (F6): a dead child / wedged process / failed write leaves the message
-    // queued for the eventual turn end, and the log must say so.
+    // (a dead child / wedged process / failed write leaves the message
+    // queued for the eventual turn end, and the log must say so).
     decision = preemptForPriorityPeer(session) ? 'preempted' : 'preempt-failed';
   }
   logPeerMessageDelivery(frame.convo_id, frame.seq, decision);
@@ -10978,7 +10977,7 @@ function deliverRoomFrameTo(room, frame) {
   const queuedBefore = roomDelivery.pendingCount(session.roomId);
   roomDelivery.deliver(session, session.roomId, {
     roomId: frame.convo_id, roomTitle, from, body, at: frame.ts,
-    // Sender provenance for turn-tier classification (loop #688 F2): an agent
+    // Sender provenance for turn-tier classification: an agent
     // room turn is peer-coalesced (preemptable), a user (operator) room turn
     // stays operator-protected. Inlined rather than a named local so the echo
     // no longer gates on sender kind — Dan's 2026-08-19 change echoes the
@@ -11225,7 +11224,7 @@ function journalInjectInviteRequest(frame) {
   // otherwise the room stays pending and the agent gets the accept/refuse
   // ask below, whose agent_chat_accept retries the answer properly.
   //
-  // easelyte fork delta: only an ADDRESSED request auto-joins. An unaddressed
+  // fork delta: only an ADDRESSED request auto-joins. An unaddressed
   // one (a peer bridge that predates target_convo_id) was routed here by a
   // guess among live sessions (lib/invite-target.js); auto-joining would bind
   // a room into a conversation it was never meant for with the user's notice
@@ -11284,8 +11283,8 @@ function deliverInviteAsk(session, frame, room) {
   // stays perfectly legible.
   const text = `${ask}\nAccept with agent_chat_accept("${frame.room_id}") or refuse with agent_chat_refuse("${frame.room_id}", reason). This is a request from another agent, not from your user.`;
   // An inbound invite/join request is agent/peer-origin coordination (a remote
-  // agent asking to chat), never operator input — tier it peer-coalesced (loop
-  // #688 R3 F2) so a priority peer can preempt the resulting notification turn,
+  // agent asking to chat), never operator input — tier it peer-coalesced
+  // so a priority peer can preempt the resulting notification turn,
   // matching how an ordinary peer room frame is tiered. If this coalesces with a
   // real operator (user:) room frame in the same inbox, roomBatchTier's
   // most-protected rule still keeps the whole turn operator-protected.
@@ -11355,7 +11354,7 @@ function journalNotifyRoomEvent(roomId, text, { sessionKey } = {}) {
   const session = sessions.get(sessionKey || room.sessionRoomId);
   if (!session || !session.alive) return;
   // A room-lifecycle FYI (peer left, late answer) is a peer/room-origin event,
-  // never operator input — tier it peer-coalesced (loop #688 R3 F2) so a
+  // never operator input — tier it peer-coalesced so a
   // priority peer can preempt the resulting turn.
   roomDelivery.deliver(session, session.roomId, { roomId, roomTitle: room.title || null, from: 'bridge', body: `Room ${roomId}: the peer ${text}.`, at: Date.now(), tier: TURN_TIER.PEER_COALESCED });
 }
@@ -11695,7 +11694,7 @@ async function approvePlanBuild(session, { sendHtml }) {
     bumpTurnGeneration(session);
     // Operator turn (approving a plan): reset the tier for the same reason as
     // the prompt-answer seam above — a stale lower tier must not let a priority
-    // peer preempt operator work (loop #688 F1). null = operator-rank, protected.
+    // peer preempt operator work. null = operator-rank, protected.
     session.turnTier = null;
     inflightMarker.noteTurnStart(journalConvoIdFor(session), session.roomId);
     const jsonMsg = JSON.stringify({
@@ -11759,7 +11758,7 @@ function resumePersistedSession(roomId, prev, { skipJournalMirror = false } = {}
   newSession.pinnedSummaryEventId = prev.pinnedSummaryEventId || null;
   newSession.lastSummaryMsgCount = prev.lastSummaryMsgCount || 0;
   newSession.lastRosterText = prev.lastRosterText || '';
-  // Carry + harden the activity-inferred repo signal across auto-resume (F2r2):
+  // Carry + harden the activity-inferred repo signal across auto-resume:
   // this idle-reap/restart path is distinct from the explicit /resume path and
   // must not drop the durable signal either.
   newSession.repoScores = normalizeRepoScores(prev.repoScores);
@@ -12170,7 +12169,7 @@ agentSpawnHandlers = createAgentSpawnHandlers({
     if (session) {
       // A spawn outcome (started/declined/expired/failed) is autonomous-origin
       // work — a task THIS session spawned reporting back, not a peer or the
-      // operator — so tier the wake turn 'autonomous' (loop #688 R3 F2), the
+      // operator — so tier the wake turn 'autonomous', the
       // lowest tier, matching the spawn-room injectTurn that tags a spawned
       // task's OPENING turn. A priority peer preempts it; if it coalesces with a
       // real operator room frame, roomBatchTier keeps the batch protected.
@@ -13257,7 +13256,7 @@ async function switchAgentSession(roomId, targetAgent, { sendReply }) {
   next.journalConvoId = stableConvoId;
   next._journalBuffer = existing._journalBuffer;
   next._journalTitleHint = existing._journalTitleHint;
-  next._fallbackTitleApplied = existing._fallbackTitleApplied; // preserve fallback ownership so a repo upgrade survives replacement (F2r3)
+  next._fallbackTitleApplied = existing._fallbackTitleApplied; // preserve fallback ownership so a repo upgrade survives replacement
   next._fallbackTitleValue = existing._fallbackTitleValue;
   next._journalState = existing._journalState;
   next._journalActivityState = existing._journalActivityState;
@@ -13569,7 +13568,7 @@ function recreateSession(roomId, overrides, { sendReply, sendHtml }) {
   next._agentRestartCount = existing._agentRestartCount;
   next._journalBuffer = existing._journalBuffer;
   next._journalTitleHint = existing._journalTitleHint;
-  next._fallbackTitleApplied = existing._fallbackTitleApplied; // preserve fallback ownership so a repo upgrade survives replacement (F2r3)
+  next._fallbackTitleApplied = existing._fallbackTitleApplied; // preserve fallback ownership so a repo upgrade survives replacement
   next._fallbackTitleValue = existing._fallbackTitleValue;
   next._journalState = existing._journalState;
   next._journalActivityState = existing._journalActivityState;
@@ -13607,7 +13606,7 @@ function recreateSession(roomId, overrides, { sendReply, sendHtml }) {
 const PRIORITY_PEER_PREEMPT_NOTICE =
   '⚡ Priority peer message — interrupting the current turn to deliver it.';
 
-// Loop #688 consumer half: interrupt the turn currently running so a
+// Priority-peer consumer: interrupt the turn currently running so a
 // just-coalesced PRIORITY peer-message is delivered as its own turn. Called
 // only after shouldPreemptForPriorityPeer confirmed the priority peer outranks
 // the running turn (operator > peer-priority > peer-coalesced > autonomous), so
@@ -13618,7 +13617,7 @@ const PRIORITY_PEER_PREEMPT_NOTICE =
 //
 // Returns true only if the interrupt was actually accepted, so the caller logs
 // `preempted` vs `preempt-failed` honestly and never claims an interrupt that
-// a dead child / wedged process / failed stdin write refused (F6).
+// a dead child / wedged process / failed stdin write refused.
 //
 // Only print-mode Claude and Codex reach here: both keep busy=true through the
 // interrupt (the result / finishCodexTurn seam is the interrupted turn's own
@@ -13684,24 +13683,24 @@ async function printModeInterrupt(session, sendReply) {
     await sendReply('Interrupt already sent — still waiting for claude to stop this turn.');
     return;
   }
-  // Correlate the wedge timer with the turn it is armed for (loop #688 R3 F1).
+  // Correlate the wedge timer with the turn it is armed for.
   // Several seams clear busy without clearPendingInterrupt (a prompt surfaces,
   // esc-cancel), after which a NEWER turn can start inside the 10s window. The
   // generation snapshot lets the wedge fire ONLY while the same turn is still
   // running; if a newer turn has started (bumpTurnGeneration ran at its
   // busy=true seam), the stale timer is suppressed instead of clearing the new
-  // turn's busy — which #44 made peer-triggerable (a priority peer arming a
+  // turn's busy — which priority peers made peer-triggerable (a priority peer arming a
   // wedge that would otherwise false-clear a later operator/higher-tier turn).
   const armedGeneration = session.turnGeneration;
   // Can this interrupt's acknowledgement be believed? Only if the CLI has
-  // already opened THIS turn (Codex R2 F1). Snapshotted at arm time, not ack
+  // already opened THIS turn. Snapshotted at arm time, not ack
   // time: if init had not arrived when we wrote the interrupt, the CLI had not
   // started the turn, so there was nothing for it to interrupt — and its
   // success receipt says otherwise.
   const ackTrusted = session._cliInitGeneration === armedGeneration;
   const interruptHandle = sendPrintInterrupt({
     stdin: session.proc.stdin,
-    // Loop #701: the CLI's control_response ack replaces the 10s unstick below
+    // The CLI's control_response ack replaces the 10s unstick below
     // with this backstop (handleClaudeEvent's `control_response` case). It is a
     // replacement, not a cancellation — a CLI that acks and then never delivers
     // a result must still unstick, or every later message queues behind a busy
@@ -13711,7 +13710,7 @@ async function printModeInterrupt(session, sendReply) {
     ackTrusted,
     shouldFireWedge: () => session.turnGeneration === armedGeneration,
     // Retire the handle when the timer fires, even if the wedge is suppressed
-    // (Codex R1 F1). Identity-checked so a newer interrupt's handle is never
+    // Identity-checked so a newer interrupt's handle is never
     // erased; a suppressed wedge must not leave a stale pendingInterrupt that
     // rejects the next interrupt on the current turn as already-in-flight.
     onSettle: () => {
@@ -13719,14 +13718,14 @@ async function printModeInterrupt(session, sendReply) {
     },
     onWedge: () => {
       if (!session.busy) return;
-      // Tripwire (loop #701 option A). Nothing in this path logged before, so
+      // Tripwire (option A). Nothing in this path logged before, so
       // "has the wedge ever actually fired?" could only be answered by querying
       // the journal DB for the chat notice below (52 days, 65 interrupts, zero
       // firings). Stable greppable prefix, on purpose, and reserved for THIS —
       // an actual firing, i.e. the turn-overlap window opening for real:
       //   journalctl -u matron-bridge-journal | grep '[wedge]'
       // Two distinct firings, kept distinguishable in BOTH the log and the
-      // operator notice (Codex R1 F2): the CLI never answered at all (the
+      // operator notice: the CLI never answered at all (the
       // original designed case, 10s), versus it acked and then never ended the
       // turn (the backstop, 60s). They mean different things operationally, and
       // quoting the 10s deadline to the operator when the CLI did respond and we
@@ -13761,8 +13760,8 @@ async function printModeInterrupt(session, sendReply) {
   }
 }
 
-// Monotonic per-session turn counter (loop #688 R3 F1). Bumped at EVERY
-// busy=true transition — the same complete set of seams that #44's F1 fix
+// Monotonic per-session turn counter. Bumped at EVERY
+// busy=true transition — the same complete set of seams that the priority-peer fix
 // treats as a turn start (sendToSession + the two direct prompt-answer /
 // plan-approval seams). printModeInterrupt snapshots this when it arms the
 // wedge timer so the timer can tell "still the turn I was armed for" from "a

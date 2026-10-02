@@ -3,7 +3,7 @@ import { describe, expect, it } from 'vitest';
 
 // Source-text assertions on index.js, same idiom as test/inflight-wiring.test.js.
 // index.js has no unit-test harness (importing it boots a bridge), so the
-// loop-#701 wiring — "consume the interrupt's control_response ack" and the
+// interrupt-ack wiring — "consume the interrupt's control_response ack" and the
 // [wedge] tripwire — has no behavioural coverage there. The decision logic
 // itself IS behaviourally covered in test/print-interrupt.test.js; these pin the
 // couplings that only exist at the call site and that regress silently:
@@ -15,7 +15,7 @@ import { describe, expect, it } from 'vitest';
 //                                        a live wedge;
 //   - lose the [wedge] console.warn   -> "has this ever fired?" needs a journal
 //                                        DB query again (it did, for 52 days).
-describe('interrupt-ack backstop wiring (loop #701)', () => {
+describe('interrupt-ack backstop wiring', () => {
   const src = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
 
   function bodyOf(startNeedle, endNeedle) {
@@ -41,7 +41,7 @@ describe('interrupt-ack backstop wiring (loop #701)', () => {
     expect(
       body,
       'handleClaudeEvent must have a `case \'control_response\':`. Every stdout JSON line lands '
-      + 'here; before #701 control_response fell through to `default: break` and the CLI\'s ~17ms '
+      + 'here; before the ack wiring, control_response fell through to `default: break` and the CLI\'s ~17ms '
       + 'interrupt acknowledgement was discarded. That ack is the only signal that distinguishes '
       + '"the CLI is wedged" (what the 10s unstick is for) from "the CLI heard us and is stopping" '
       + '(where clearing busy opens the turn-overlap window that can silently eat the operator\'s '
@@ -59,7 +59,7 @@ describe('interrupt-ack backstop wiring (loop #701)', () => {
     expect(body).toContain('const pending = session.pendingInterrupt;');
   });
 
-  // Codex R1 F2. The whole value of the tripwire is that `[wedge]` means one
+  // The whole value of the tripwire is that `[wedge]` means one
   // thing: the unstick actually fired and the turn-overlap window is open. A
   // routine interrupt ack is the OPPOSITE outcome and happens on every single
   // interrupt (~1/day), so tagging it `[wedge]` too would make the grep — and
@@ -99,10 +99,10 @@ describe('interrupt-ack backstop wiring (loop #701)', () => {
   it('keeps the wedge purely additive: the no-ack path still clears busy', () => {
     const body = bodyOf('async function printModeInterrupt(', '\nfunction bumpTurnGeneration(');
 
-    // #701 is a timing change only. If the busy-clear ever disappears from
+    // The ack wiring is a timing change only. If the busy-clear ever disappears from
     // onWedge, a wedged CLI queues the operator's messages behind a flag
-    // nothing will clear — strictly worse than the bug #701 fixes. And the
-    // shouldFireWedge generation gate from #688/#44 must survive untouched.
+    // nothing will clear — strictly worse than the bug the ack wiring fixes. And the
+    // shouldFireWedge generation gate must survive untouched.
     expect(body).toContain('session.busy = false;');
     expect(body).toContain('shouldFireWedge: () => session.turnGeneration === armedGeneration');
     // The "Deliberately NO noteTurnEnd" stance is load-bearing and is stated in
@@ -113,14 +113,14 @@ describe('interrupt-ack backstop wiring (loop #701)', () => {
       'onWedge must NOT call inflightMarker.noteTurnEnd — see the comment in printModeInterrupt. '
       + 'The wedge is a defensive unstick after an unacknowledged interrupt, not a turn end; '
       + 'clearing the marker here would drop the carry-on card for a turn that really was '
-      + 'interrupted. #701 does not change that.',
+      + 'interrupted. The ack wiring does not change that.',
     ).not.toContain('inflightMarker.noteTurnEnd(');
   });
 
   it('logs a greppable [wedge] tripwire when the wedge actually fires', () => {
     const body = bodyOf('async function printModeInterrupt(', '\nfunction bumpTurnGeneration(');
 
-    // Option A of the #701 scoping analysis. There was no console.* anywhere in
+    // There was no console.* anywhere in
     // the wedge path, which is why answering "has this ever fired?" required a
     // journal DB query over 52 days of events. The prefix must stay stable and
     // greppable: `journalctl -u matron-bridge-journal | grep '\[wedge\]'`.
@@ -133,10 +133,10 @@ describe('interrupt-ack backstop wiring (loop #701)', () => {
     expect(body).toContain('session.roomId');
   });
 
-  // Codex R2 F1. The blocker this closes: an interrupt armed before the CLI
+  // The defect this closes: an interrupt armed before the CLI
   // emitted this turn's system/init is dropped, but still acked, so promoting
   // that receipt would defer recovery from 10s to 60s for a turn that was never
-  // interrupted — the only way #701 could be worse than origin/main.
+  // interrupted — the only way the ack wiring could be worse than before.
   it('only trusts an ack for a turn the CLI had actually opened', () => {
     const initCase = bodyOf("      if (event.subtype === 'init') {", '\n    case ');
     expect(
@@ -159,7 +159,7 @@ describe('interrupt-ack backstop wiring (loop #701)', () => {
     expect(ackCase).toContain('!pending.ackTrusted');
   });
 
-  // Codex R1 F2, second half. The wedge now has two deadlines. Telling the
+  // The wedge now has two deadlines. Telling the
   // operator "No response after 10s" when the CLI DID respond and we then
   // waited 60s is misleading recovery evidence — it points them at the wrong
   // failure. Both the log line and the chat notice must be derived from the

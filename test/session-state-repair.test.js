@@ -187,7 +187,7 @@ describe('retirement settles against the RECORDED state (no publish loop)', () =
   });
 });
 
-describe('loop #754: the transition publish does NOT settle on local send — reconcile is the authority', () => {
+describe('the transition publish does NOT settle on local send — reconcile is the authority', () => {
   let dir;
   let file;
 
@@ -213,7 +213,7 @@ describe('loop #754: the transition publish does NOT settle on local send — re
     const outbox = createRunStateOutbox({ file, log: silent });
 
     // journalSessionState write-aheads the terminal transition, then publishes `done`. Under the
-    // #754 fix it deliberately does NOT settle on the publisher's onLocalSendComplete callback,
+    // fix it deliberately does NOT settle on the publisher's onLocalSendComplete callback,
     // because that callback fires when the frame leaves the local socket buffer, NOT when the
     // server persists it. Model exactly that: note the transition, "publish" it, and do NOT settle.
     outbox.note('c1', 'done');
@@ -441,11 +441,11 @@ describe('index.js wiring', () => {
     throw new Error(`unterminated ${signature}`);
   }
 
-  it('write-ahead records to the DURABLE outbox but does NOT settle eagerly on local send (loop #754)', () => {
+  it('write-ahead records to the DURABLE outbox but does NOT settle eagerly on local send', () => {
     const body = sliceFunction('function journalSessionState(');
     expect(body).toContain('runStateOutbox.note(');
     expect(body).toContain('planTransition(');
-    // Loop #754: the transition publish must NOT clear the durable record on the publisher's
+    // The transition publish must NOT clear the durable record on the publisher's
     // local-send callback — that callback fires when the frame leaves the local socket, not when
     // the server commits it, so settling there strands a lost-after-send `done` forever. The
     // reconnect reconciliation sweep (republishSessionStates) is the sole settle authority.

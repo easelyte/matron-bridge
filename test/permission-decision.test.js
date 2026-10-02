@@ -275,7 +275,7 @@ describe('permission hook spawn environment wiring (source inspection)', () => {
 
   // What the child env carries (MATRON_PERMISSION_CARDS snapshot, the
   // per-session MATRON_PERMISSION_TOKEN, print-only) is asserted on the built env
-  // in test/spawn-env.test.js (loop #784). Here: only that the print path mints
+  // in test/spawn-env.test.js. Here: only that the print path mints
   // a token and hands it to the builder, and the iv path never does.
   it('mints a per-session permission token only for print sessions', () => {
     expect(printSpawn).toContain('const permissionToken = randomUUID();');

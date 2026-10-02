@@ -123,7 +123,7 @@ describe('createAgentChatHandlers', () => {
       });
       expect(res).toEqual({ status: 200, body: { queued: true } });
       // fromConvo is the caller's JOURNAL convo id (journalConvoIdFor stub → 'convo-sess'),
-      // NOT the roomId '!sess' (F2) and NOT the model-forged value (spoof ignored).
+      // NOT the roomId '!sess' and NOT the model-forged value (spoof ignored).
       expect(calls).toEqual([{
         call: 'sendPeerMessage',
         args: { targetConvo: 'convo-remote', fromConvo: 'convo-sess', body: 'coordinate this' },
@@ -143,7 +143,7 @@ describe('createAgentChatHandlers', () => {
       ]);
     });
 
-    it('409s when the session has no journal convo bound yet (F2 fail-loud)', async () => {
+    it('409s when the session has no journal convo bound yet (fail-loud)', async () => {
       const { handlers, sessions } = makeFixture();
       sessions.set('!nocvo', { busy: false, alive: true }); // no convoId → journalConvoIdFor null
       const res = await handlers.agentMessage({ roomId: '!nocvo', target_convo: 'convo-remote', body: 'x' });
@@ -165,7 +165,7 @@ describe('createAgentChatHandlers', () => {
     it('lists same-box and cross-box sessions with state, raw kind, and only the caller flagged as self', async () => {
       const conversations = [
         // caller's own JOURNAL convo id is 'convo-sess' (journalConvoIdFor stub → s.convoId),
-        // NOT the roomId '!sess' — is_self must key on the journal convo id (F2).
+        // NOT the roomId '!sess' — is_self must key on the journal convo id.
         { id: 'convo-sess', title: 'This session', session_state: 'running', agent_device_id: 1, agent_kind: 'claude' },
         { id: 'convo-same-box', title: 'Same box peer', session_state: 'waiting', agent_device_id: 1, agent_kind: null },
         { id: 'convo-cross-box', title: 'Cross box peer', session_state: 'done', agent_device_id: 7, agent_kind: 'codex' },
@@ -204,10 +204,10 @@ describe('createAgentChatHandlers', () => {
       expect(res.body.self).toEqual({ device_id: 1, name: 'mac' });
       expect(res.body.agents).toEqual([{ device_id: 7, name: 'dev-2' }]);
       expect(res.body.conversations).toEqual([
-        // summary blanked by default — AGENT_ROSTER_SUMMARY_ENABLED is off (loop #554 B4).
+        // summary blanked by default — AGENT_ROSTER_SUMMARY_ENABLED is off.
         { id: 'convo-remote', title: 'Remote work', session_state: 'running', summary: '', agent_device_id: 7, last_ts: 111, agent_kind: 'codex', status: { model: 'claude-opus-5-5', context: { tokens: 87000, window: 1000000, pct: 9 }, reported_at: 111 } },
         { id: 'convo-self', title: 'Local work', session_state: 'running', summary: '', agent_device_id: 1, last_ts: 222, agent_kind: 'claude' },
-        { id: 'convo-orphan', title: 'No agent', session_state: 'ended', summary: '', agent_device_id: null, last_ts: 333, agent_kind: null }, // #619 T-1.3: forwarded, null when journal omits it
+        { id: 'convo-orphan', title: 'No agent', session_state: 'ended', summary: '', agent_device_id: null, last_ts: 333, agent_kind: null }, // forwarded, null when journal omits it
       ]);
     });
 
@@ -230,7 +230,7 @@ describe('createAgentChatHandlers', () => {
       expect(res.body.error).toMatch(/journal unreachable/i);
     });
 
-    // loop #554 B4: phase 1 starts writing a 20-bullet digest into
+    // Phase 1 starts writing a 20-bullet digest into
     // conversations.summary. Whether PEER agents should see the operator's
     // session digest is an open product/privacy call, so the roster stays
     // empty — today's observed behaviour, 0 of 2056 rows populated — until
@@ -314,7 +314,7 @@ describe('createAgentChatHandlers', () => {
       expect(out.endsWith('…')).toBe(true);
     });
 
-    // loop #554 R2-F3: a continuation line is where "…but it is blocked on X"
+    // A continuation line is where "…but it is blocked on X"
     // lands. Dropping it hands peers a blurb that reads like plain success.
     it('keeps a wrapped bullet whole instead of dropping its continuation', () => {
       expect(rosterBlurb('• Deployment attempted\nBlocked: credentials unavailable'))

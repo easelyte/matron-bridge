@@ -1,4 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
+import { beforeEach, afterEach } from 'vitest';
 import {
   seedJournalTitle,
   applyFallbackTitle,
@@ -94,10 +95,31 @@ describe('seedJournalTitle (workdir-sourced)', () => {
 });
 
 describe('repoLabel', () => {
-  const defaultWorkdir = '/home/dan/son-of-anton';
+  const defaultWorkdir = '/home/dan/workspace';
+  // Keep the ambient environment out of the default-label assertions.
+  beforeEach(() => { vi.stubEnv('MATRON_WORKSPACE_ROOT_LABEL', ''); });
+  afterEach(() => { vi.unstubAllEnvs(); });
 
-  it('uses son-of-anton for the default workdir', () => {
-    expect(repoLabel(defaultWorkdir, { defaultWorkdir })).toBe('son-of-anton');
+  it('uses the workspace root basename for the default workdir', () => {
+    expect(repoLabel(defaultWorkdir, { defaultWorkdir })).toBe('workspace');
+    expect(repoLabel('/srv/monorepo', { defaultWorkdir: '/srv/monorepo' })).toBe('monorepo');
+  });
+
+  it('MATRON_WORKSPACE_ROOT_LABEL overrides the default workdir label', () => {
+    vi.stubEnv('MATRON_WORKSPACE_ROOT_LABEL', 'main-repo');
+    expect(repoLabel(defaultWorkdir, { defaultWorkdir })).toBe('main-repo');
+    // Any other workdir still uses its own basename.
+    expect(repoLabel('/home/dan/yearbook-app', { defaultWorkdir })).toBe('yearbook-app');
+  });
+
+  it('an explicit rootLabel option wins over the env override', () => {
+    vi.stubEnv('MATRON_WORKSPACE_ROOT_LABEL', 'from-env');
+    expect(repoLabel(defaultWorkdir, { defaultWorkdir, rootLabel: 'explicit' })).toBe('explicit');
+  });
+
+  it('caps an over-long env override like any other repo label', () => {
+    vi.stubEnv('MATRON_WORKSPACE_ROOT_LABEL', 'r'.repeat(30));
+    expect(repoLabel(defaultWorkdir, { defaultWorkdir })).toBe(`${'r'.repeat(24)}…`);
   });
 
   it('uses the workdir basename for another repo', () => {
@@ -113,7 +135,7 @@ describe('formatRoomTitle', () => {
   const options = {
     serverLabel: 'VPS',
     workdir: '/home/dan/yearbook-app',
-    defaultWorkdir: '/home/dan/son-of-anton',
+    defaultWorkdir: '/home/dan/workspace',
   };
 
   it('formats the server and repo without text or a session id', () => {
@@ -142,9 +164,9 @@ describe('formatRoomTitle', () => {
 
   it('uses an LLM-inferred repo override in place of the workdir basename', () => {
     // workdir is yearbook-app (the session cwd) but the real work targets
-    // snafu-studio — the override wins.
-    expect(formatRoomTitle({ ...options, text: 'fix RLS gate', repo: 'snafu-studio' })).toBe(
-      'snafu-studio · fix RLS gate',
+    // my-app — the override wins.
+    expect(formatRoomTitle({ ...options, text: 'fix RLS gate', repo: 'my-app' })).toBe(
+      'my-app · fix RLS gate',
     );
   });
 
@@ -160,7 +182,7 @@ describe('formatRoomTitle', () => {
     expect(formatRoomTitle({ ...options, repo: null })).toBe('yearbook-app');
   });
 
-  it('sanitizes an untrusted repo label at the sink (F3)', () => {
+  it('sanitizes an untrusted repo label at the sink', () => {
     // A filesystem-derived label could contain the `·` separator, bidi/control
     // chars, or angle brackets and forge/reorder title segments. formatRoomTitle
     // must clean every repo source, not trust the caller.
@@ -175,7 +197,7 @@ describe('formatRoomTitle', () => {
 
 describe('extractRepoOverride', () => {
   it('extracts a clean repo label from a REPO: line', () => {
-    expect(extractRepoOverride('TITLE: work\nREPO: snafu-studio\nSUMMARY: done')).toBe('snafu-studio');
+    expect(extractRepoOverride('TITLE: work\nREPO: my-app\nSUMMARY: done')).toBe('my-app');
   });
 
   it('returns a short label unchanged (under the 24-char cap)', () => {
@@ -263,7 +285,7 @@ describe('applyFallbackTitle (repo-aware first-user-message naming)', () => {
   const deps = () => ({
     serverLabel: 'VPS',
     workdir: '/home/dan/proj',
-    defaultWorkdir: '/home/dan/son-of-anton',
+    defaultWorkdir: '/home/dan/workspace',
     updateRoomName: vi.fn(),
   });
 
@@ -304,33 +326,33 @@ describe('applyFallbackTitle (repo-aware first-user-message naming)', () => {
   const hintTrackingDeps = (session) => ({
     serverLabel: 'VPS',
     workdir: '/home/dan/proj',
-    defaultWorkdir: '/home/dan/son-of-anton',
+    defaultWorkdir: '/home/dan/workspace',
     updateRoomName: vi.fn((_roomId, name) => { session._journalTitleHint = name; }),
   });
 
-  it('upgrades a repo-less fallback once a repo signal arrives (F1r2)', () => {
+  it('upgrades a repo-less fallback once a repo signal arrives', () => {
     const session = { roomId: '!abc', claudeSessionId: 'f0aa', chatHistory: [{ role: 'user', text: 'fix it' }] };
     const d = hintTrackingDeps(session);
     // First application: no repo yet → titled from the workdir basename.
     expect(applyFallbackTitle(session, d)).toBe(true);
     expect(d.updateRoomName).toHaveBeenLastCalledWith('!abc', '[f0] proj · fix it');
-    // A tool result commits goodfellow activity → the fallback upgrades.
-    expect(applyFallbackTitle(session, { ...d, repo: 'goodfellow' })).toBe(true);
-    expect(d.updateRoomName).toHaveBeenLastCalledWith('!abc', '[f0] goodfellow · fix it');
+    // A tool result commits api-server activity → the fallback upgrades.
+    expect(applyFallbackTitle(session, { ...d, repo: 'api-server' })).toBe(true);
+    expect(d.updateRoomName).toHaveBeenLastCalledWith('!abc', '[f0] api-server · fix it');
     // Same repo again → no redundant rename.
-    expect(applyFallbackTitle(session, { ...d, repo: 'goodfellow' })).toBe(false);
+    expect(applyFallbackTitle(session, { ...d, repo: 'api-server' })).toBe(false);
     expect(d.updateRoomName).toHaveBeenCalledTimes(2);
   });
 
-  it('corrects a read-then-write session: weak read does not lock the repo (F1r3)', () => {
+  it('corrects a read-then-write session: weak read does not lock the repo', () => {
     const session = { roomId: '!abc', claudeSessionId: 'f0aa', chatHistory: [{ role: 'user', text: 'fix it' }] };
     const d = hintTrackingDeps(session);
-    // First committed signal is a READ of son-of-anton (dominant with no writes).
-    expect(applyFallbackTitle(session, { ...d, repo: 'son-of-anton' })).toBe(true);
-    expect(d.updateRoomName).toHaveBeenLastCalledWith('!abc', '[f0] son-of-anton · fix it');
-    // A later WRITE makes goodfellow dominant — the title MUST correct, not lock.
-    expect(applyFallbackTitle(session, { ...d, repo: 'goodfellow' })).toBe(true);
-    expect(d.updateRoomName).toHaveBeenLastCalledWith('!abc', '[f0] goodfellow · fix it');
+    // First committed signal is a READ of the workspace root (dominant with no writes).
+    expect(applyFallbackTitle(session, { ...d, repo: 'workspace' })).toBe(true);
+    expect(d.updateRoomName).toHaveBeenLastCalledWith('!abc', '[f0] workspace · fix it');
+    // A later WRITE makes api-server dominant — the title MUST correct, not lock.
+    expect(applyFallbackTitle(session, { ...d, repo: 'api-server' })).toBe(true);
+    expect(d.updateRoomName).toHaveBeenLastCalledWith('!abc', '[f0] api-server · fix it');
   });
 
   it('does not upgrade if a later title (e.g. a codex pass) replaced ours', () => {
@@ -338,8 +360,8 @@ describe('applyFallbackTitle (repo-aware first-user-message naming)', () => {
     const d = hintTrackingDeps(session);
     expect(applyFallbackTitle(session, d)).toBe(true);
     // Simulate a codex summary pass winning the title in between.
-    session._journalTitleHint = 'goodfellow · Codex-authored title';
-    expect(applyFallbackTitle(session, { ...d, repo: 'goodfellow' })).toBe(false);
+    session._journalTitleHint = 'api-server · Codex-authored title';
+    expect(applyFallbackTitle(session, { ...d, repo: 'api-server' })).toBe(false);
     expect(d.updateRoomName).toHaveBeenCalledTimes(1); // only the initial fallback
   });
 
@@ -348,9 +370,9 @@ describe('applyFallbackTitle (repo-aware first-user-message naming)', () => {
     // commit path before any fallback; it should title WITH the repo immediately.
     const session = { roomId: '!abc', claudeSessionId: 'f0aa', chatHistory: [{ role: 'user', text: 'fix it' }] };
     const d = hintTrackingDeps(session);
-    expect(applyFallbackTitle(session, { ...d, repo: 'goodfellow' })).toBe(true);
-    expect(d.updateRoomName).toHaveBeenLastCalledWith('!abc', '[f0] goodfellow · fix it');
-    expect(session._fallbackTitleValue).toBe('[f0] goodfellow · fix it');
+    expect(applyFallbackTitle(session, { ...d, repo: 'api-server' })).toBe(true);
+    expect(d.updateRoomName).toHaveBeenLastCalledWith('!abc', '[f0] api-server · fix it');
+    expect(session._fallbackTitleValue).toBe('[f0] api-server · fix it');
   });
 
   it('strips tags, collapses whitespace, and truncates to 60 chars with an ellipsis', () => {

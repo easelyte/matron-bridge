@@ -213,7 +213,7 @@ describe('applyFileEdit — size guard', () => {
   });
 });
 
-describe('applyFileEdit — preserves file mode (F2)', () => {
+describe('applyFileEdit — preserves file mode', () => {
   it('keeps a private 0600 file at 0600 after a content edit', async () => {
     const file = path.join(root, 'secret.conf');
     writeFileSync(file, 'PASSWORD=old\n');
@@ -232,7 +232,7 @@ describe('applyFileEdit — preserves file mode (F2)', () => {
   });
 });
 
-describe('applyFileEdit — expected_sha256 compare-and-swap (F3)', () => {
+describe('applyFileEdit — expected_sha256 compare-and-swap', () => {
   const sha = (s) => createHash('sha256').update(s).digest('hex');
 
   it('applies the edit when expected_sha256 matches the live content', async () => {

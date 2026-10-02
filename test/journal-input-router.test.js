@@ -2174,13 +2174,13 @@ describe('index.js agent-chat room wiring (source inspection)', () => {
     // agentSpawnHandlers; onOpError tries the spawn side FIRST (its `true`
     // return means it consumed the ref) before falling through to invites.
     expect(args).toMatch(/onSpawnFrame: \(frame\) => agentSpawnHandlers\?\.onSpawnFrame\(frame\)/);
-    // warnRejectedConvoUpsert runs first and is observational only (loop #554
-    // §5.3) — it never consumes the ref, so the spawn-then-invites ordering
+    // warnRejectedConvoUpsert runs first and is observational only
+    // — it never consumes the ref, so the spawn-then-invites ordering
     // below is unchanged.
     expect(args).toMatch(/onOpError: \(e\) => \{ warnRejectedConvoUpsert\(e\); if \(sessionControlHandlers\?\.onOpError\?\.\(e\)\) return; if \(agentSpawnHandlers\?\.onOpError\?\.\(e\)\) return; agentInvites\?\.onOpError\(e\); \}/);
   });
 
-  // loop #554 F3: the publish hint records ENQUEUE, not acceptance, so a frame
+  // The publish hint records ENQUEUE, not acceptance, so a frame
   // lost to queue overflow during an outage would be deduped away forever on a
   // session that then went quiet. The outage is the failure window, so the
   // reconnect is the repair point.
@@ -2201,7 +2201,7 @@ describe('index.js agent-chat room wiring (source inspection)', () => {
       const start = src.indexOf('createJournalPublisher({');
       const args = src.slice(start, src.indexOf('log: console,', start) + 2000);
       // Matches the summary retry's PRESENCE in onSendCapacity rather than pinning the whole
-      // line: other repairs share this hook (the run-state repair joined it for #575), and an
+      // line: other repairs share this hook (the run-state repair joined it too), and an
       // exact-line match would fail on an unrelated addition while proving nothing more.
       const capacity = /onSendCapacity: \(\) => \{([^}]*)\}/.exec(args);
       expect(capacity).not.toBeNull();
@@ -2243,8 +2243,8 @@ describe('index.js agent-chat room wiring (source inspection)', () => {
 
     // EVERY summary write — live pass, resume backfill, reconnect repair — uses
     // the non-evicting, non-retaining transport. Evicting would cost a queued
-    // user message to publish a digest (R4-F1); retaining would let a held
-    // snapshot drain at the tail and roll back a newer digest (R3-F2).
+    // user message to publish a digest; retaining would let a held
+    // snapshot drain at the tail and roll back a newer digest.
     it('routes every summary write through the non-evicting best-effort path', () => {
       const start = src.indexOf('makeJournalSummaryPublisher({');
       expect(start).toBeGreaterThan(-1);
@@ -2262,7 +2262,7 @@ describe('index.js agent-chat room wiring (source inspection)', () => {
     });
   });
 
-  // loop #554 F2: persistSession is fail-open. It must still REPORT, so the
+  // persistSession is fail-open. It must still REPORT, so the
   // summary publish can decline to get ahead of the durable copy.
   describe('persistSession reports durability', () => {
     const fn = src.slice(
