@@ -34,7 +34,7 @@ describe('buildLimits with codex lines (contract §1)', () => {
     expect(out).toEqual({ as_of: 9, lines: codex(1) });
   });
 
-  it('stamps the merged block with its OLDEST sample (review round 3 F1)', () => {
+  it('stamps the merged block with its OLDEST sample', () => {
     expect(buildLimits({ lines: claude(1), fetchedAt: 500 }, { lines: codex(1), fetchedAt: 100 }).as_of).toBe(100);
     expect(buildLimits({ lines: claude(1), fetchedAt: 100 }, { lines: codex(1), fetchedAt: 500 }).as_of).toBe(100);
     // Codex lines all dropped (cap / invalid) -> only Claude's time counts.
@@ -148,7 +148,7 @@ describe('createCodexLimitsRefresher', () => {
     read.mockResolvedValueOnce({ limits: [], limitsError: 'Codex app server is unavailable.' });
     await expect(r.refresh()).resolves.toBe(false);
     expect(r.cache.lines).toEqual(codex(2));
-    // as_of stays the time the lines were measured (review round 2 F2)...
+    // as_of stays the time the lines were measured...
     expect(r.cache.fetchedAt).toBe(1_000_000);
     expect(buildLimits(null, r.cache).as_of).toBe(1_000_000);
     // ...while the failed attempt still counts for the throttle.

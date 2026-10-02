@@ -237,7 +237,7 @@ describe('buildAgentHandoffPrompt', () => {
 });
 
 // switchAgentSession lives in index.js and leans on module-scope session state,
-// so it can't be imported. Pin the queue-carry wiring (#537) by source
+// so it can't be imported. Pin the queue-carry wiring by source
 // inspection, matching the index.js-inspection tests in busy-queue.test.js.
 describe('index.js switchAgentSession — queued-message carry (source inspection)', () => {
   it('carries queuedMessages + queueNotifications into the replacement agent session', () => {

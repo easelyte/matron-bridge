@@ -110,7 +110,7 @@ describe('sendPrintInterrupt', () => {
     expect(sendPrintInterrupt({ stdin, onWedge: () => {} })).toBeNull();
   });
 
-  // Turn-generation correlation (loop #688 R3 F1). The wedge timer is armed for
+  // Turn-generation correlation. The wedge timer is armed for
   // one specific turn; if that turn has ended and a newer turn is now running
   // when the timer fires, the wedge must be SUPPRESSED — clearing busy then
   // would falsely end the newer (possibly operator or higher-priority) turn.
@@ -175,7 +175,7 @@ describe('sendPrintInterrupt', () => {
     });
   });
 
-  // onSettle retires the caller's handle at fire time (Codex R1 F1). A
+  // onSettle retires the caller's handle at fire time. A
   // suppressed wedge must still release session.pendingInterrupt, or the next
   // interrupt on the current turn is rejected as already-in-flight.
   describe('onSettle handle retirement', () => {
@@ -228,7 +228,7 @@ describe('sendPrintInterrupt', () => {
 });
 
 // ---------------------------------------------------------------------------
-// Interrupt acknowledgement backstop (loop #701).
+// Interrupt acknowledgement backstop.
 //
 // The CLI answers our control_request with a control_response carrying OUR
 // request_id in ~17ms. The bridge used to drop that line on the floor, so the
@@ -323,7 +323,7 @@ describe('interrupt ack backstop', () => {
   });
 
   // Requirement 2: the no-ack regression guard. This is the behaviour the wedge
-  // was designed for and #701 must not weaken it.
+  // was designed for and the ack backstop must not weaken it.
   it('no ack: the 10s wedge fires exactly as it does today', () => {
     vi.useFakeTimers();
     try {
@@ -473,7 +473,7 @@ describe('interrupt ack backstop', () => {
       vi.advanceTimersByTime(60_000);
       expect(onWedge).not.toHaveBeenCalled();
       // ...but the handle is still retired, so the next interrupt is not
-      // rejected as already-in-flight (Codex R1 F1 on #688).
+      // rejected as already-in-flight.
       expect(onSettle).toHaveBeenCalledTimes(1);
     } finally {
       vi.useRealTimers();
@@ -485,7 +485,7 @@ describe('interrupt ack backstop', () => {
     expect(applyInterruptAck(undefined, { type: 'control_response', response: { request_id: 'x' } })).toBe(false);
   });
 
-  // Codex R2 F1. An interrupt written before the CLI emitted this turn's
+  // An interrupt written before the CLI emitted this turn's
   // system/init is silently DROPPED, and the CLI answers it with an ordinary
   // success receipt anyway (open upstream bug claude-agent-sdk-typescript#429,
   // reproduced on CLI 2.1.241; our own probe measured a ~6.9s first-turn init

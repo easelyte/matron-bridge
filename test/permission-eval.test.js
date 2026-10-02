@@ -24,7 +24,7 @@ function expandWorkdir(p) {
   if (p.startsWith('~/') || p.startsWith('~\\')) return path.join(os.homedir(), p.slice(2));
   return path.resolve(p);
 }
-const PRODUCTION_WORKDIR = expandWorkdir(process.env.DEFAULT_WORKDIR || '/root/.openclaw/workspace');
+const PRODUCTION_WORKDIR = expandWorkdir(process.env.DEFAULT_WORKDIR || '/home/user/workspace');
 const PRODUCTION_SETTINGS_LOCAL = path.join(PRODUCTION_WORKDIR, '.claude', 'settings.local.json');
 
 // Which settings file the live-allowlist test reads: the live file when readable, the
@@ -112,7 +112,7 @@ describe('permission snapshot', () => {
     expect(expandWorkdir('~')).toBe(os.homedir());
     expect(expandWorkdir('~/')).toBe(os.homedir());
     expect(expandWorkdir('~/ws')).toBe(path.join(os.homedir(), 'ws'));
-    expect(expandWorkdir('/root/.openclaw/workspace')).toBe('/root/.openclaw/workspace');
+    expect(expandWorkdir('/home/user/workspace')).toBe('/home/user/workspace');
   });
 
   it('classifies the live Webflow allowlist when present, otherwise the committed fixture', ({ skip }) => {

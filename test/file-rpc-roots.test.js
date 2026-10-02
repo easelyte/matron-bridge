@@ -7,7 +7,7 @@ import { filterFileRpcRoots } from '../lib/file-rpc-roots.js';
 describe('filterFileRpcRoots (read_file / edit_file roots)', () => {
   const base = realpathSync(mkdtempSync(path.join(tmpdir(), 'file-rpc-roots-')));
   const home = path.join(base, 'home', 'u');
-  const ws = path.join(home, '.openclaw', 'workspace');
+  const ws = path.join(home, 'projects', 'workspace');
   const other = path.join(base, 'srv');
   mkdirSync(ws, { recursive: true });
   mkdirSync(other, { recursive: true });

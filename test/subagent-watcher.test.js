@@ -34,8 +34,8 @@ describe('subagentsDirFor', () => {
 
 // When a session changes cwd mid-flight (EnterWorktree), Claude Code re-homes
 // the subagents dir to the NEW cwd's project encoding. The watcher must follow,
-// or it keeps polling the stale spawn-cwd dir and subagent cards stop rendering
-// (loop #631). repoint() recomputes this.dir, re-snapshots the new dir (so a
+// or it keeps polling the stale spawn-cwd dir and subagent cards stop rendering.
+// repoint() recomputes this.dir, re-snapshots the new dir (so a
 // prior instance's files there aren't replayed), and KEEPS the seen set so
 // already-emitted cards don't duplicate.
 describe('SubagentWatcher.repoint (cwd rehome / EnterWorktree)', () => {
@@ -47,13 +47,13 @@ describe('SubagentWatcher.repoint (cwd rehome / EnterWorktree)', () => {
     removeProjectRoots(projectRoots);
   });
 
-  const uniqueWorkdir = tag => `/tmp/bridge631-${tag}-${process.pid}-${Math.random().toString(36).slice(2)}`;
+  const uniqueWorkdir = tag => `/tmp/subagent-watcher-${tag}-${process.pid}-${Math.random().toString(36).slice(2)}`;
 
   // The real subagents dir for (workdir, sessionId), created on disk. Registers
   // projectDirFor(workdir) (…/projects/<enc>) for teardown — never a dirname
   // chain, which is one level short of ~/.claude/projects itself.
   const mkSubagentsDir = (workdir, sessionId) =>
-    makeSubagentsDir(workdir, sessionId, projectRoots, { prefix: '-tmp-bridge631-' });
+    makeSubagentsDir(workdir, sessionId, projectRoots, { prefix: '-tmp-subagent-watcher-' });
 
   it('re-points this.dir to the new workdir and preserves the seen set', () => {
     const sessionId = `sid-${Math.random().toString(36).slice(2)}`;

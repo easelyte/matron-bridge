@@ -166,7 +166,7 @@ describe('buildCodexSpawnEnv', () => {
   });
 });
 
-// easelyte fork delta: permission cards (MATRON_PERMISSION_CARDS /
+// fork delta: permission cards (MATRON_PERMISSION_CARDS /
 // MATRON_PERMISSION_TOKEN) reach print sessions only.
 describe('buildClaudeSpawnEnv permission-card keys (fork)', () => {
   it('print: snapshots MATRON_PERMISSION_CARDS and injects the per-session permission token', () => {

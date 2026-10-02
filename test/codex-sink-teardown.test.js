@@ -1,4 +1,4 @@
-// easelyte fork delta (#632): per-session codex-viz sink-dir teardown.
+// fork delta: per-session codex-viz sink-dir teardown.
 import { describe, expect, it, vi } from 'vitest';
 import path from 'node:path';
 import { removeCodexSinkForSession } from '../lib/codex-paths.js';

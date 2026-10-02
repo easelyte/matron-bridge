@@ -379,7 +379,7 @@ const REAL_CODEX = (() => {
 // the real one.
 const LIVE_CODEX_SMOKE = process.env.MATRON_LIVE_CODEX_SMOKE === '1';
 
-describe.skipIf(!REAL_CODEX || !LIVE_CODEX_SMOKE)('producer shim — live smoke (T-1.7)', () => {
+describe.skipIf(!REAL_CODEX || !LIVE_CODEX_SMOKE)('producer shim — live smoke', () => {
   it('resolves the real bin + json flag and writes a decoder-shaped transcript', () => {
     const dir = makeDir();
     const sink = path.join(dir, 'sink');

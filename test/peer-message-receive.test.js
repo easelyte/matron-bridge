@@ -95,7 +95,7 @@ function makeRuntime({ target = session(), persistImpl, markBusyOnInject = false
   // interrupt is stubbed to a spy so the receive path can be tested without a
   // live PTY / Codex process. It returns the accepted/failed boolean the real
   // preemptForPriorityPeer returns, which drives the preempted/preempt-failed
-  // decision (F6).
+  // decision.
   const preemptForPriorityPeer = (session) => { preemptCalls.push(session); return preemptResult; };
   const runtime = buildPeerRuntime(
     sessions,
@@ -463,7 +463,7 @@ describe('journalOnPeerMessage receive behavior', () => {
   });
 });
 
-describe('journalOnPeerMessage priority preemption (loop #688 consumer half)', () => {
+describe('journalOnPeerMessage priority preemption', () => {
   // Operator-approved precedence, highest to lowest:
   //   operator > peer-priority > peer-coalesced > autonomous
   // A priority peer arriving MID-TURN preempts the running turn only if it
@@ -567,7 +567,7 @@ describe('journalOnPeerMessage priority preemption (loop #688 consumer half)', (
     assert.equal(runtime.decisionLogs().at(-1).decision, 'coalesced');
   });
 
-  it('logs preempt-failed (not preempted) when the interrupt is refused (F6)', () => {
+  it('logs preempt-failed (not preempted) when the interrupt is refused', () => {
     const target = session({ busy: true, turnTier: 'autonomous' });
     const runtime = makeRuntime({ target, preemptResult: false });
     runtime.journalOnPeerMessage(priorityFrame());
@@ -577,7 +577,7 @@ describe('journalOnPeerMessage priority preemption (loop #688 consumer half)', (
     assert.equal(runtime.peerDelivery.pendingCount(target.roomId), 1);
   });
 
-  it('does NOT interrupt when the priority body self-evicts past the byte cap (F5)', () => {
+  it('does NOT interrupt when the priority body self-evicts past the byte cap', () => {
     // A single body over the 16 KiB peer-inbox cap is appended then evicted by
     // room-delivery's while-loop, so nothing is left to inject; interrupting
     // the running turn would kill it with no replacement. 5000 × 4-byte glyph
@@ -600,7 +600,7 @@ describe('journalOnPeerMessage priority preemption (loop #688 consumer half)', (
     assert.deepEqual(priority.injectCalls[0][2], { skipJournalMirror: true, turnTier: 'peer-priority' });
   });
 
-  it('flushes a pending priority peer BEFORE a lower-tier room batch at turn end (F3)', () => {
+  it('flushes a pending priority peer BEFORE a lower-tier room batch at turn end', () => {
     // A lower-tier turn is running with a queued agent-room (peer-coalesced)
     // batch; a priority peer then arrives and preempts. At turn end the priority
     // peer must be delivered first, not left behind the room batch.
@@ -757,12 +757,12 @@ describe('agent_sessions peer metadata', () => {
   });
 });
 
-// Loop #688 R3 F2 — seam-tiering completeness. Every room-flavoured injection
+// Seam-tiering completeness. Every room-flavoured injection
 // seam that can carry a genuinely agent/peer/autonomous-origin turn must stamp
 // an explicit tier so a priority peer can preempt it per the operator >
 // peer-priority > peer-coalesced > autonomous precedence — while any seam that
 // can carry a real OPERATOR turn stays operator-protected (never preemptable).
-describe('injection-seam tier classification (loop #688 R3 F2)', () => {
+describe('injection-seam tier classification', () => {
   // End-to-end compile of the room-lifecycle FYI seam with the REAL roomBatchTier
   // wired into a fake roomDelivery exactly as production's injectTurn does. Proves
   // the injected turn is peer-coalesced (an agent-origin FYI is preemptable).

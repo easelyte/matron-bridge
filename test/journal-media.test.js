@@ -329,7 +329,7 @@ describe('createJournalMediaRouter — busy session queues instead of injecting'
   });
 });
 
-describe('createJournalMediaRouter — session torn down during async prep (#537 canonicality guard)', () => {
+describe('createJournalMediaRouter — session torn down during async prep (canonicality guard)', () => {
   const busySession = { claudeSessionId: 'convo-1', roomId: '!r:s', busy: true };
 
   it('a session already gone at fetch time drops a saved file EARLY — before the disk-writing build (no orphan file)', async () => {
@@ -385,7 +385,7 @@ describe('createJournalMediaRouter — session torn down during async prep (#537
     expect(deps.publishNotice).not.toHaveBeenCalled();
   });
 
-  it('publishes the drop notice to the STABLE journal convo id, not the native session id (survives an agent switch) (#537 F1)', async () => {
+  it('publishes the drop notice to the STABLE journal convo id, not the native session id (survives an agent switch)', async () => {
     // After a switch the captured session keeps journalConvoId (the server-known
     // conversation) but its claudeSessionId is the new native id. The notice
     // must target journalConvoId, or the journal server rejects the publish and
@@ -399,7 +399,7 @@ describe('createJournalMediaRouter — session torn down during async prep (#537
     expect(deps.publishNotice.mock.calls[0][0]).toBe('stable-convo');
   });
 
-  it('fails loud at construction when isCanonicalSession is not wired (#537 F3)', () => {
+  it('fails loud at construction when isCanonicalSession is not wired', () => {
     expect(() => createJournalMediaRouter({
       fetchMedia: vi.fn(), transcribe: vi.fn(), buildSavedBlocks: vi.fn(),
       injectText: vi.fn(), injectBlocks: vi.fn(), echoToRoom: vi.fn(), publishNotice: vi.fn(),

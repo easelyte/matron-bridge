@@ -55,4 +55,4 @@ Errors (`error.code`):
 | `too_large` | the result cannot be trimmed under 12,000 bytes |
 
 The full wire contract, including each extras section's `data` shape, is
-tracked with the matron-web Ops page (loop #542 phase B).
+tracked with the matron-web Ops page.
