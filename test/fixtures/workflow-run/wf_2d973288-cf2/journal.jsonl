@@ -1,4 +1,4 @@
 {"type": "launched"}
 {"type": "started", "key": "v2:3b5ca2b3353e9640e33b5220902acf593e983e9387e5b0494ca8d85d234bfd8c", "agentId": "a52c8df92c72f79d6", "label": "b1-type-primitives", "phase": "Fix batches"}
 {"type": "started", "key": "v2:e6f472f269d84971cfc1cf89deb47b4452884fb6873ba51d58d275eb09c1122b", "agentId": "ad9f6e2caf6fcfc05", "label": "b2-tables-pills", "phase": "Fix batches"}
-{"type": "result", "key": "v2:3b5ca2b3353e9640e33b5220902acf593e983e9387e5b0494ca8d85d234bfd8c", "agentId": "a52c8df92c72f79d6", "result": "PR: https://github.com/easelyte/snafu-studio/pull/218. Squas (fixture: truncated)"}
+{"type": "result", "key": "v2:3b5ca2b3353e9640e33b5220902acf593e983e9387e5b0494ca8d85d234bfd8c", "agentId": "a52c8df92c72f79d6", "result": "PR opened and squash-merged. (fixture: truncated)"}

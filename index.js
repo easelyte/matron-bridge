@@ -4493,7 +4493,7 @@ function setupSubagentWatcher(session, workdir, sessionId) {
   session.subagentWatcher = new SubagentWatcher({ workdir, sessionId });
   session.subagentWatcher.on('subagent-start', payload => handleSubagentStart(session, payload));
   session.subagentWatcher.on('subagent-event', payload => handleSubagentEvent(session, payload));
-  // Workflow-tool agents settle one by one from the run's journal (loop #798).
+  // Workflow-tool agents settle one by one from the run's journal.
   session.subagentWatcher.on('subagent-done', ({ agentId }) => session.subagentConvos?.finishAgent(agentId));
   session.subagentWatcher.snapshot();
 }
@@ -4749,7 +4749,7 @@ function handleClaudeEvent(session, event) {
     }
   }
 
-  // Workflow-tool runs (loop #798): the Workflow tool_use, its launch
+  // Workflow-tool runs: the Workflow tool_use, its launch
   // tool_result (run id) and the run's task_notification drive per-run
   // discovery of subagents/workflows/<runId>/ agents. One seam; the routing
   // lives in lib/subagent-watcher.js where it is tested with real event shapes.

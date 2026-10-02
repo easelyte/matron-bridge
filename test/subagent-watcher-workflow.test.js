@@ -1,4 +1,4 @@
-// Workflow-tool subagent discovery (loop #798).
+// Workflow-tool subagent discovery.
 //
 // Agents launched by Claude Code's Workflow tool write to
 //   <session>/subagents/workflows/<runId>/agent-<id>.jsonl (+ .meta.json, journal.jsonl)
@@ -83,13 +83,13 @@ describe('SubagentWatcher workflow runs', () => {
     removeProjectRoots(projectRoots);
   });
 
-  const uniqueWorkdir = () => `/tmp/bridge798-${process.pid}-${Math.random().toString(36).slice(2)}`;
+  const uniqueWorkdir = () => `/tmp/bridge-wf-${process.pid}-${Math.random().toString(36).slice(2)}`;
 
   // A watcher whose subagents dir exists; copyRun copies the fixture run in.
   const mk = ({ copyRun = false } = {}) => {
     const sessionId = `sid-${Math.random().toString(36).slice(2)}`;
     const workdir = uniqueWorkdir();
-    const dir = makeSubagentsDir(workdir, sessionId, projectRoots, { prefix: '-tmp-bridge798-' });
+    const dir = makeSubagentsDir(workdir, sessionId, projectRoots, { prefix: '-tmp-bridge-wf-' });
     const runDir = path.join(dir, 'workflows', RUN_ID);
     if (copyRun) fs.cpSync(path.join(FIXTURE, RUN_ID), runDir, { recursive: true });
     const warnings = [];
@@ -496,8 +496,8 @@ describe('routeWorkflowStreamEvent: parent stream -> sidebar child cards', () =>
 
   it('drives a real Workflow tool_use, launch result and task_notification to published running/done children', () => {
     const sessionId = `sid-${Math.random().toString(36).slice(2)}`;
-    const workdir = `/tmp/bridge798r-${process.pid}-${Math.random().toString(36).slice(2)}`;
-    const dir = makeSubagentsDir(workdir, sessionId, projectRoots, { prefix: '-tmp-bridge798r-' });
+    const workdir = `/tmp/bridge-wf-resume-${process.pid}-${Math.random().toString(36).slice(2)}`;
+    const dir = makeSubagentsDir(workdir, sessionId, projectRoots, { prefix: '-tmp-bridge-wf-resume-' });
     fs.cpSync(path.join(FIXTURE, RUN_ID), path.join(dir, 'workflows', RUN_ID), { recursive: true });
 
     const upserts = [];
@@ -538,8 +538,8 @@ describe('routeWorkflowStreamEvent: parent stream -> sidebar child cards', () =>
 
   it('a task_notification without tool_use_id that beats the launch result still ends the run (stream shapes)', () => {
     const sessionId = `sid-${Math.random().toString(36).slice(2)}`;
-    const workdir = `/tmp/bridge798r-${process.pid}-${Math.random().toString(36).slice(2)}`;
-    const dir = makeSubagentsDir(workdir, sessionId, projectRoots, { prefix: '-tmp-bridge798r-' });
+    const workdir = `/tmp/bridge-wf-resume-${process.pid}-${Math.random().toString(36).slice(2)}`;
+    const dir = makeSubagentsDir(workdir, sessionId, projectRoots, { prefix: '-tmp-bridge-wf-resume-' });
     fs.cpSync(path.join(FIXTURE, RUN_ID), path.join(dir, 'workflows', RUN_ID), { recursive: true });
     const w = new SubagentWatcher({ workdir, sessionId, log: { warn() {} } });
     watchers.push(w);
@@ -562,7 +562,7 @@ describe('routeWorkflowStreamEvent: parent stream -> sidebar child cards', () =>
 
   it('never throws on junk and ignores a null watcher', () => {
     expect(() => routeWorkflowStreamEvent(null, { type: 'user' })).not.toThrow();
-    const w = new SubagentWatcher({ workdir: '/tmp/x798', sessionId: 's', log: { warn() {} } });
+    const w = new SubagentWatcher({ workdir: '/tmp/x-wf', sessionId: 's', log: { warn() {} } });
     expect(() => routeWorkflowStreamEvent(w, null)).not.toThrow();
     expect(() => routeWorkflowStreamEvent(w, { type: 'assistant', message: { content: 'str' } })).not.toThrow();
     expect(() => routeWorkflowStreamEvent(w, { type: 'user', message: { content: [null] } })).not.toThrow();
