@@ -14,6 +14,7 @@ import {
   compactTriggerFrom,
   contextGaugeText,
   buildSessionStatus,
+  publishedExtras,
   emailFromClaudeConfig,
   statusRepaintDue,
   STATUS_REPAINT_MS,
@@ -230,6 +231,23 @@ describe('contextGaugeText', () => {
   });
 });
 
+describe('publishedExtras', () => {
+  const known = ['browser', 'share', 'circleci'];
+  it('unions the session choice with machine defaults, session first, deduped', () => {
+    expect(publishedExtras({ requested: ['browser'], defaults: ['share', 'browser'], known })).toEqual(['browser', 'share']);
+  });
+  it('drops a persisted name whose mcpExtras block no longer exists (spawn filters it too)', () => {
+    expect(publishedExtras({ requested: ['gone', 'browser'], defaults: [], known })).toEqual(['browser']);
+  });
+  it('is [] for a session without extras, and for a non-array requested', () => {
+    expect(publishedExtras({ requested: [], known })).toEqual([]);
+    expect(publishedExtras({ requested: undefined, known })).toEqual([]);
+  });
+  it('is [] when the transport spawns with no MCP config (legacy Codex exec)', () => {
+    expect(publishedExtras({ requested: ['browser'], defaults: ['share'], known, noMcp: true })).toEqual([]);
+  });
+});
+
 describe('buildSessionStatus', () => {
   it('assembles model, context gauge, and limits into one frame payload', () => {
     const status = buildSessionStatus({
@@ -312,6 +330,26 @@ describe('buildSessionStatus', () => {
     const status = buildSessionStatus({ model: 'gpt-5.6-codex', modelOptions: [], effortLevels: [] });
     expect(status.model_options).toEqual([]);
     expect(status.effort_levels).toEqual([]);
+  });
+
+  it('publishes the session extras as an array (browser tools on)', () => {
+    const status = buildSessionStatus({ model: 'claude-fable-5', extras: ['browser', 'share'] });
+    expect(status.extras).toEqual(['browser', 'share']);
+  });
+
+  it('publishes EMPTY extras as [] so an "off" state reaches clients', () => {
+    expect(buildSessionStatus({ model: 'claude-fable-5', extras: [] }).extras).toEqual([]);
+  });
+
+  it('omits extras when the caller has no opinion (subagent / helper frames)', () => {
+    expect('extras' in buildSessionStatus({ model: 'claude-fable-5' })).toBe(false);
+    expect('extras' in buildSessionStatus({ model: 'claude-fable-5', extras: undefined })).toBe(false);
+    expect('extras' in buildSessionStatus({ model: 'claude-fable-5', extras: null })).toBe(false);
+  });
+
+  it('keeps only non-empty string extras, deduped in order', () => {
+    expect(buildSessionStatus({ extras: ['browser', '', null, 3, 'browser', 'circleci'] }).extras)
+      .toEqual(['browser', 'circleci']);
   });
 
   it('omits the lists only when the caller has no opinion at all (old bridges, subagent frames)', () => {
@@ -582,6 +620,14 @@ describe('index.js wiring', () => {
     const body = src.slice(start, end);
     expect(body).toContain('buildSessionStatus(');
     expect(body).toContain('publishStatus(');
+  });
+
+  it('journalStatus publishes extras through publishedExtras with the spawn inputs', () => {
+    const start = src.indexOf('function journalStatus(');
+    const body = src.slice(start, src.indexOf('\nfunction ', start + 1));
+    expect(body).toMatch(/extras: publishedExtras\(\{\s*requested: session\.mcpExtras,\s*defaults: DEFAULT_MCP_EXTRAS,\s*known: KNOWN_MCP_EXTRAS,\s*noMcp: isCodex && !CODEX_APP_SERVER,/);
+    // ...and legacy exec really gets no MCP config, which is why noMcp.
+    expect(src).toContain('config: CODEX_APP_SERVER ? codexMcpConfig({');
   });
 
   it('journalStatus uses provider-specific model and effort options', () => {
