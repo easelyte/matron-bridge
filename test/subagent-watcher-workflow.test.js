@@ -415,8 +415,10 @@ describe('SubagentWatcher workflow runs', () => {
     w.noteWorkflowToolUse('toolu_wf23', {});
     for (let i = 0; i < 300; i++) w.noteWorkflowCompleted(undefined, `bg-${i}`);
     expect(w.completedWorkflowTasks.size).toBeLessThanOrEqual(256);
-    // Overflow is never silent.
-    expect(warnings.some(m => /tombstone full/.test(m) && m.includes('bg-0'))).toBe(true);
+    // Overflow is never silent, and warns once (counted after that).
+    expect(warnings.filter(m => /tombstone full/.test(m))).toHaveLength(1);
+    expect(warnings.find(m => /tombstone full/.test(m))).toContain('bg-0');
+    expect(w.taskTombstoneEvictions).toBe(300 - 256);
     // Notices that carry a tool_use_id (real background Agent/Bash ones) never
     // occupy the task tombstone.
     w.completedWorkflowTasks.clear();
