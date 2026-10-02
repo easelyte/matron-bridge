@@ -16,6 +16,7 @@ import {
   parseWorkflowLaunchResult,
   workflowAgentLabel,
   isWorkflowRunId,
+  routeWorkflowStreamEvent,
 } from '../lib/subagent-watcher.js';
 import { createSubagentConvoTracker } from '../lib/subagent-convos.js';
 import { makeSubagentsDir, removeProjectRoots } from './helpers/project-root.js';
@@ -227,23 +228,71 @@ describe('SubagentWatcher workflow runs', () => {
     expect(starts.map(s => s.agentId)).toEqual(['rerun1']);
   });
 
-  it('idle backstop: stops once every started agent has a result and the run is quiet', async () => {
-    const { w, runDir, done } = mk();
-    addAgent(runDir, 'x1', { description: 'x', phase: 'P' });
-    journal(runDir, { type: 'started', agentId: 'x1' });
-    journal(runDir, { type: 'result', agentId: 'x1' });
-    w.watchWorkflowRun(RUN_ID, { intervalMs: 20, idleStopMs: 0 });
-    expect(await waitFor(() => w.workflowRuns.size === 0)).toBe(true);
-    expect(done).toEqual(['x1']);
+  it('a quiet run between phases backs off but keeps discovering (never idle-stops)', async () => {
+    const { w, runDir, starts, done } = mk();
+    addAgent(runDir, 'p1', { description: 'phase-one', phase: 'One' });
+    journal(runDir, { type: 'started', agentId: 'p1' });
+    journal(runDir, { type: 'result', agentId: 'p1' });
+    w.watchWorkflowRun(RUN_ID, { intervalMs: 20, idleStopMs: 0, idleIntervalMs: 100 });
+    expect(await waitFor(() => done.includes('p1'))).toBe(true);
+    await settle(300); // well past the idle threshold
+    expect(w.workflowRuns.has(RUN_ID)).toBe(true);
+    // Next phase spawns after the quiet gap: still discovered.
+    addAgent(runDir, 'p2', { description: 'phase-two', phase: 'Two' });
+    expect(await waitFor(() => starts.some(s => s.agentId === 'p2'))).toBe(true);
+    expect(starts.find(s => s.agentId === 'p2').label).toBe('phase-two · Two');
   });
 
-  it('idle backstop does not fire while a started agent has no result', async () => {
+  it('idle back-off: a quiet run scans only once per idleIntervalMs', () => {
     const { w, runDir } = mk();
-    addAgent(runDir, 'y1', { description: 'y', phase: 'P' });
-    journal(runDir, { type: 'started', agentId: 'y1' });
-    w.watchWorkflowRun(RUN_ID, { intervalMs: 20, idleStopMs: 0 });
-    await settle(150);
-    expect(w.workflowRuns.has(RUN_ID)).toBe(true);
+    addAgent(runDir, 'q1', { description: 'q', phase: 'P' });
+    journal(runDir, { type: 'started', agentId: 'q1' });
+    journal(runDir, { type: 'result', agentId: 'q1' });
+    w.watchWorkflowRun(RUN_ID, { intervalMs: 100000, idleStopMs: 0, idleIntervalMs: 500000 });
+    const run = w.workflowRuns.get(RUN_ID);
+    let scans = 0;
+    const orig = w._scanWorkflowRun.bind(w);
+    w._scanWorkflowRun = r => { scans += 1; return orig(r); };
+    for (let i = 0; i < 4; i++) w._tickWorkflowRun(RUN_ID);
+    expect(run.idleEvery).toBe(5);
+    expect(scans).toBe(0);
+    w._tickWorkflowRun(RUN_ID); // 5th tick
+    expect(scans).toBe(1);
+  });
+
+  it('a completion whose final scan cannot read the run dir retries, then discovers the late agent', async () => {
+    const { w, dir, runDir, starts, done } = mk();
+    fs.mkdirSync(path.join(dir, 'workflows'), { recursive: true });
+    fs.writeFileSync(runDir, 'not a dir'); // readdir -> ENOTDIR
+    w.noteWorkflowToolUse('toolu_wf5', {});
+    w.noteWorkflowResult('toolu_wf5', LAUNCH_TEXT);
+    w.workflowRuns.get(RUN_ID).timer && clearInterval(w.workflowRuns.get(RUN_ID).timer);
+    w.workflowRuns.get(RUN_ID).timer = setInterval(() => w._tickWorkflowRun(RUN_ID), 20);
+    expect(w.noteWorkflowCompleted('toolu_wf5', 'wjug1ouu0')).toBe(true);
+    expect(w.workflowRuns.get(RUN_ID)?.completing).toBe(true); // not taken as "no agents"
+    fs.rmSync(runDir);
+    addAgent(runDir, 'late9', { description: 'late', phase: 'P' });
+    expect(await waitFor(() => w.workflowRuns.size === 0)).toBe(true);
+    expect(starts.map(s => s.agentId)).toEqual(['late9']);
+    expect(done).toEqual(['late9']);
+  });
+
+  it('a final scan that never recovers warns and stops after its retry window', async () => {
+    const { w, dir, runDir, warnings } = mk();
+    fs.mkdirSync(path.join(dir, 'workflows'), { recursive: true });
+    fs.writeFileSync(runDir, 'not a dir');
+    w.watchWorkflowRun(RUN_ID, { intervalMs: 20, finalRetryMs: 60 });
+    w.workflowRunByTask.set('t9', RUN_ID);
+    expect(w.noteWorkflowCompleted(undefined, 't9')).toBe(true);
+    expect(await waitFor(() => w.workflowRuns.size === 0)).toBe(true);
+    expect(warnings.some(m => m.includes('final scan') && m.includes('ENOTDIR'))).toBe(true);
+  });
+
+  it('warns when a Workflow tool_result names no run', () => {
+    const { w, warnings } = mk();
+    w.noteWorkflowToolUse('toolu_wf6', {});
+    expect(w.noteWorkflowResult('toolu_wf6', 'Error: workflow script failed to parse')).toBeNull();
+    expect(warnings.some(m => m.includes('toolu_wf6') && m.includes('Run ID'))).toBe(true);
   });
 
   it('lifetime cap: stops and warns when no completion ever arrives', async () => {
@@ -296,12 +345,75 @@ describe('subagent convo tracker finishAgent', () => {
   });
 });
 
-describe('index.js workflow wiring (source inspection)', () => {
+describe('routeWorkflowStreamEvent: parent stream -> sidebar child cards', () => {
+  const projectRoots = [];
+  const watchers = [];
+  afterEach(async () => {
+    for (const w of watchers.splice(0)) { try { await w.stop(); } catch { /* ignore */ } }
+    removeProjectRoots(projectRoots);
+  });
+
+  it('drives a real Workflow tool_use, launch result and task_notification to published running/done children', () => {
+    const sessionId = `sid-${Math.random().toString(36).slice(2)}`;
+    const workdir = `/tmp/bridge798r-${process.pid}-${Math.random().toString(36).slice(2)}`;
+    const dir = makeSubagentsDir(workdir, sessionId, projectRoots, { prefix: '-tmp-bridge798r-' });
+    fs.cpSync(path.join(FIXTURE, RUN_ID), path.join(dir, 'workflows', RUN_ID), { recursive: true });
+
+    const upserts = [];
+    const publisher = { upsertConvo: (id, o) => { upserts.push({ id, ...o }); return true; }, publishStatus: () => true };
+    const conv = createSubagentConvoTracker({ publisher, getParentConvoId: () => 'parent-x', log: { warn() {} } });
+    const w = new SubagentWatcher({ workdir, sessionId, log: { warn() {} } });
+    watchers.push(w);
+    // Same wiring as setupSubagentWatcher in index.js.
+    w.on('subagent-start', p => conv.discover(p.agentId, p));
+    w.on('subagent-done', ({ agentId }) => conv.finishAgent(agentId));
+    w.snapshot();
+
+    // Stream-json shapes as Claude Code emits them on the parent stream.
+    routeWorkflowStreamEvent(w, {
+      type: 'assistant',
+      message: { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_R', name: 'Workflow', input: { script: 'x' } }] },
+    });
+    routeWorkflowStreamEvent(w, {
+      type: 'user',
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_R', content: LAUNCH_TEXT }] },
+    });
+    const state = () => {
+      const last = {};
+      for (const u of upserts) last[u.id] = { ...(last[u.id] || {}), ...u };
+      return last;
+    };
+    expect(state()[`parent-x:sub:${A1}`]).toMatchObject({ title: 'b1-type-primitives · Fix batches', sessionState: 'done', parentConvoId: 'parent-x' });
+    expect(state()[`parent-x:sub:${A2}`]).toMatchObject({ title: 'b2-tables-pills · Fix batches', sessionState: 'running' });
+
+    // An unrelated background task's notification leaves the run alone.
+    routeWorkflowStreamEvent(w, { type: 'system', subtype: 'task_notification', task_id: 'bgbash', tool_use_id: 'toolu_bash', status: 'completed' });
+    expect(w.workflowRuns.has(RUN_ID)).toBe(true);
+
+    routeWorkflowStreamEvent(w, { type: 'system', subtype: 'task_notification', task_id: 'wjug1ouu0', tool_use_id: 'toolu_R', status: 'completed' });
+    expect(w.workflowRuns.size).toBe(0);
+    expect(state()[`parent-x:sub:${A2}`].sessionState).toBe('done');
+  });
+
+  it('never throws on junk and ignores a null watcher', () => {
+    expect(() => routeWorkflowStreamEvent(null, { type: 'user' })).not.toThrow();
+    const w = new SubagentWatcher({ workdir: '/tmp/x798', sessionId: 's', log: { warn() {} } });
+    expect(() => routeWorkflowStreamEvent(w, null)).not.toThrow();
+    expect(() => routeWorkflowStreamEvent(w, { type: 'assistant', message: { content: 'str' } })).not.toThrow();
+    expect(() => routeWorkflowStreamEvent(w, { type: 'user', message: { content: [null] } })).not.toThrow();
+  });
+});
+
+describe('index.js workflow seam (source inspection)', () => {
   const src = fs.readFileSync(path.join(HERE, '..', 'index.js'), 'utf8');
-  it('routes the Workflow tool_use, its tool_result, task_notification and subagent-done', () => {
-    expect(src).toMatch(/toolName === 'Workflow'\) \{[\s\S]{0,400}noteWorkflowToolUse\(block\.id, input\)/);
-    expect(src).toMatch(/noteWorkflowResult\(block\.tool_use_id, block\.content\)/);
-    expect(src).toMatch(/subtype === 'task_notification'[\s\S]{0,1200}noteWorkflowCompleted\(event\.tool_use_id, event\.task_id\)/);
+  it('handleClaudeEvent routes every non-sidechain parent event through routeWorkflowStreamEvent, and subagent-done finishes the child', () => {
+    const body = src.slice(src.indexOf('function handleClaudeEvent('));
+    const guard = body.indexOf('if (isSidechainEvent(event)) return;');
+    const seam = body.indexOf('routeWorkflowStreamEvent(session.subagentWatcher, event);');
+    const sw = body.indexOf('switch (event.type)');
+    expect(guard).toBeGreaterThan(-1);
+    expect(seam).toBeGreaterThan(guard);
+    expect(seam).toBeLessThan(sw);
     expect(src).toMatch(/on\('subagent-done', \(\{ agentId \}\) => session\.subagentConvos\?\.finishAgent\(agentId\)\)/);
   });
 });
