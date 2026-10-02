@@ -408,13 +408,20 @@ describe('SubagentWatcher workflow runs', () => {
   });
 
   it('task-id tombstones are only taken while a Workflow launch is pending, and are bounded', () => {
-    const { w } = mk({ copyRun: true });
+    const { w, warnings } = mk({ copyRun: true });
     // Background Bash/Agent notices with no Workflow in flight leave no trace.
     expect(w.noteWorkflowCompleted(undefined, 'bg-bash-1')).toBe(false);
     expect(w.completedWorkflowTasks.size).toBe(0);
     w.noteWorkflowToolUse('toolu_wf23', {});
     for (let i = 0; i < 300; i++) w.noteWorkflowCompleted(undefined, `bg-${i}`);
     expect(w.completedWorkflowTasks.size).toBeLessThanOrEqual(256);
+    // Overflow is never silent.
+    expect(warnings.some(m => /tombstone full/.test(m) && m.includes('bg-0'))).toBe(true);
+    // Notices that carry a tool_use_id (real background Agent/Bash ones) never
+    // occupy the task tombstone.
+    w.completedWorkflowTasks.clear();
+    w.noteWorkflowCompleted('toolu_bash', 'bg-bash-2');
+    expect(w.completedWorkflowTasks.size).toBe(0);
     // A launch whose task id was never tombstoned starts a normal live watch.
     expect(w.noteWorkflowResult('toolu_wf23', LAUNCH_TEXT)).toBe(RUN_ID);
     expect(w.workflowRuns.has(RUN_ID)).toBe(true);
@@ -525,6 +532,30 @@ describe('routeWorkflowStreamEvent: parent stream -> sidebar child cards', () =>
     routeWorkflowStreamEvent(w, { type: 'system', subtype: 'task_notification', task_id: 'wjug1ouu0', tool_use_id: 'toolu_R', status: 'completed' });
     expect(w.workflowRuns.size).toBe(0);
     expect(state()[`parent-x:sub:${A2}`].sessionState).toBe('done');
+  });
+
+  it('a task_notification without tool_use_id that beats the launch result still ends the run (stream shapes)', () => {
+    const sessionId = `sid-${Math.random().toString(36).slice(2)}`;
+    const workdir = `/tmp/bridge798r-${process.pid}-${Math.random().toString(36).slice(2)}`;
+    const dir = makeSubagentsDir(workdir, sessionId, projectRoots, { prefix: '-tmp-bridge798r-' });
+    fs.cpSync(path.join(FIXTURE, RUN_ID), path.join(dir, 'workflows', RUN_ID), { recursive: true });
+    const w = new SubagentWatcher({ workdir, sessionId, log: { warn() {} } });
+    watchers.push(w);
+    const done = new Set();
+    w.on('subagent-done', ({ agentId }) => done.add(agentId));
+    w.snapshot();
+    routeWorkflowStreamEvent(w, {
+      type: 'assistant',
+      message: { role: 'assistant', content: [{ type: 'tool_use', id: 'toolu_T', name: 'Workflow', input: { script: 'x' } }] },
+    });
+    // The real run's notice (task id = the launch text's `Task ID:`), minus its tool_use_id.
+    routeWorkflowStreamEvent(w, { type: 'system', subtype: 'task_notification', task_id: 'wjug1ouu0', status: 'completed' });
+    routeWorkflowStreamEvent(w, {
+      type: 'user',
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'toolu_T', content: LAUNCH_TEXT }] },
+    });
+    expect(w.workflowRuns.size).toBe(0);
+    expect(done).toEqual(new Set([A1, A2]));
   });
 
   it('never throws on junk and ignores a null watcher', () => {
