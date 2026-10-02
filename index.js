@@ -4485,6 +4485,8 @@ function setupSubagentWatcher(session, workdir, sessionId) {
   session.subagentWatcher = new SubagentWatcher({ workdir, sessionId });
   session.subagentWatcher.on('subagent-start', payload => handleSubagentStart(session, payload));
   session.subagentWatcher.on('subagent-event', payload => handleSubagentEvent(session, payload));
+  // Workflow-tool agents settle one by one from the run's journal (loop #798).
+  session.subagentWatcher.on('subagent-done', ({ agentId }) => session.subagentConvos?.finishAgent(agentId));
   session.subagentWatcher.snapshot();
 }
 
@@ -5107,6 +5109,11 @@ function handleClaudeEvent(session, event) {
               session.subagentConvos?.noteTaskStarted(block.id);
               session.subagentWatcher.notifyTaskStarted();
             }
+          } else if (toolName === 'Workflow') {
+            // Workflow agents live under subagents/workflows/<runId>/ and spawn
+            // over the whole run, so the Task burst can't find them (loop #798).
+            // Record the call; its launch tool_result carries the run id.
+            session.subagentWatcher?.noteWorkflowToolUse(block.id, input);
           } else if (toolName === 'TodoWrite') {
             const todos = (input.todos || []).map(t => {
               const icon = t.status === 'completed' ? '✅' : t.status === 'in_progress' ? '🔄' : '⬚';
@@ -5418,6 +5425,8 @@ function handleClaudeEvent(session, event) {
         if (event.task_id) {
           session.subagentConvos?.noteTaskCompleted(event.task_id, event.tool_use_id);
         }
+        // A Workflow run finished: final scan, settle its agents, stop its poll.
+        session.subagentWatcher?.noteWorkflowCompleted(event.tool_use_id, event.task_id);
         // Deliberately NOT surfaced in chat: the background task's tool_use
         // (Bash / Agent / Workflow) already renders as a tool-call panel in
         // every client, so a "✅ Task: <summary>" message is pure
@@ -5584,6 +5593,9 @@ function handleClaudeEvent(session, event) {
             // A Task tool_result means the subagent it spawned has completed —
             // finish that child convo (no-op for every non-Task tool_result).
             session.subagentConvos?.noteTaskResult(block.tool_use_id);
+            // A Workflow launch result names its run — start watching it (no-op
+            // for every tool_result that doesn't answer a Workflow call).
+            session.subagentWatcher?.noteWorkflowResult(block.tool_use_id, block.content);
             const entry = liveOutputStore.get(block.tool_use_id);
             // Only pay for the blockText join + three regex scans below when
             // something will actually consume the result: either the

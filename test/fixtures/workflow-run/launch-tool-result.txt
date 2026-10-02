@@ -1,0 +1,9 @@
+Workflow launched in background. Task ID: wjug1ouu0
+Summary: Four parallel PRs fixing SNAFU Studio live-app vs redesign audit findings
+Transcript dir: <SESSION_DIR>/subagents/workflows/wf_2d973288-cf2
+Script file: <SESSION_DIR>/workflows/scripts/snafu-audit-fix-batches-wf_2d973288-cf2.js
+(Edit this file with Write/Edit and re-invoke Workflow with {scriptPath: "<SESSION_DIR>/workflows/scripts/snafu-audit-fix-batches-wf_2d973288-cf2.js"} to iterate without resending the script.)
+Run ID: wf_2d973288-cf2
+To resume after editing the script: Workflow({scriptPath: "<SESSION_DIR>/workflows/scripts/snafu-audit-fix-batches-wf_2d973288-cf2.js", resumeFromRunId: "wf_2d973288-cf2"}) — completed agents return cached results (cached results may themselves be empty — inspect journal.jsonl before assuming there is something to recover).
+
+You will be notified when it completes. Use /workflows to watch live progress.
