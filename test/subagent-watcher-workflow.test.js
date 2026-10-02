@@ -349,6 +349,30 @@ describe('SubagentWatcher workflow runs', () => {
     expect(done).toContain('utf1');
   });
 
+  it('a completion that beats its launch result is final: the late result does not re-open the run', () => {
+    const { w, starts } = mk({ copyRun: true });
+    // Resume: watched from the tool_use with a snapshot (no cards for cached agents).
+    w.noteWorkflowToolUse('toolu_wf7', { resumeFromRunId: RUN_ID });
+    expect(w.noteWorkflowCompleted('toolu_wf7', 'wjug1ouu0')).toBe(true);
+    expect(w.workflowRuns.size).toBe(0);
+    // The launch result arrives late: no fresh, un-snapshotted watch.
+    expect(w.noteWorkflowResult('toolu_wf7', LAUNCH_TEXT)).toBeNull();
+    expect(w.workflowRuns.size).toBe(0);
+    expect(starts).toEqual([]);
+    // A later deliberate resume of the same run is watched again.
+    expect(w.noteWorkflowToolUse('toolu_wf8', { resumeFromRunId: RUN_ID })).toBe(RUN_ID);
+    expect(w.workflowRuns.has(RUN_ID)).toBe(true);
+  });
+
+  it('a fresh run whose completion beats its launch result is not watched afterwards', () => {
+    const { w, starts } = mk({ copyRun: true });
+    w.noteWorkflowToolUse('toolu_wf9', {});
+    expect(w.noteWorkflowCompleted('toolu_wf9', 'wjug1ouu0')).toBe(false); // nothing to stop yet
+    expect(w.noteWorkflowResult('toolu_wf9', LAUNCH_TEXT)).toBeNull();
+    expect(w.workflowRuns.size).toBe(0);
+    expect(starts).toEqual([]);
+  });
+
   it('warns when a Workflow tool_result names no run', () => {
     const { w, warnings } = mk();
     w.noteWorkflowToolUse('toolu_wf6', {});
