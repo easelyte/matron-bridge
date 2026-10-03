@@ -47,11 +47,13 @@ if [ ! -f "$REPO_DIR/.env" ]; then
     # BSD sed requires an explicit empty backup-suffix argument after -i.
     sed -i '' "s/^HMAC_SECRET=$/HMAC_SECRET=$HMAC/" "$REPO_DIR/.env"
     sed -i '' "s|^DEFAULT_WORKDIR=.*$|DEFAULT_WORKDIR=$HOME|" "$REPO_DIR/.env"
-    echo "⚠️  Edit .env to set JOURNAL_WS_URL, JOURNAL_TOKEN_FILE (or JOURNAL_TOKEN), ALLOWED_USER_IDS, etc."
-    echo "    (or run 'npm run setup' from a terminal for the guided version)"
+    echo "⚠️  Edit .env to set JOURNAL_WS_URL, ALLOWED_USER_IDS, etc., then run 'npm run pair'"
+    echo "    from a terminal to pair with the Matron app by QR code (or set JOURNAL_TOKEN_FILE /"
+    echo "    JOURNAL_TOKEN to a token minted with matron-admin)."
+    echo "    Or run 'npm run setup' from a terminal for the guided version."
   fi
 else
-  echo ".env already exists — run 'npm run setup' to change it."
+  echo ".env already exists — run 'npm run setup' to change it, or 'npm run pair' to re-pair the agent token."
   chmod 600 "$REPO_DIR/.env"
 fi
 

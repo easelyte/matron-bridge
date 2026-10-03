@@ -4,6 +4,7 @@ import { PassThrough } from 'node:stream';
 import vm from 'node:vm';
 import { describe, expect, it, vi } from 'vitest';
 import { CodexExecSession } from '../lib/codex-session.js';
+import { armReplyRef, settleReplyRef } from '../lib/journal-stream.js';
 
 // Exercise the real bridge handlers without importing index.js, whose
 // top-level code connects to the journal and starts the production bridge.
@@ -41,6 +42,7 @@ function harness() {
     // Fork additions: flushResponse's fallback-title call passes the
     // activity-inferred repo (lib/repo-infer.js) + the default workdir.
     dominantRepo: () => null, DEFAULT_WORKDIR: '/workspace',
+    armReplyRef, settleReplyRef,
   });
   vm.runInContext(['codexToolIndicator', 'handleCodexEvent', 'flushResponse'].map(functionSource).join('\n'), context);
   codex.on('event', event => context.handleCodexEvent(session, event));

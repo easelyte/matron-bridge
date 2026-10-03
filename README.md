@@ -18,7 +18,7 @@ This project is licensed under AGPLv3. For alternative licensing, contact [licen
 
 - Node.js 22+
 - Claude Code CLI and/or Codex CLI installed and authenticated
-- A [matron-journal](https://github.com/Matronhq/matron-journal) server and an agent token for the bridge (`matron-admin agent add <user> <device-name>` on the journal server)
+- A [matron-journal](https://github.com/Matronhq/matron-journal) server, plus the Matron app signed in to it (to pair the bridge by QR code) or an agent token minted on the journal server with `matron-admin agent add <user> <device-name>`
 
 **Linux (Ubuntu/Debian):** `apt-get install nodejs npm` (or use nvm). For voice notes: `setup/install-whisper.sh` will install the rest.
 
@@ -36,11 +36,29 @@ brew install cloudflared
 
 ```bash
 npm install
-npm run setup   # guided: asks for your journal URL + agent token, tests the connection, writes .env
+npm run setup   # guided: asks for your journal URL, pairs with the Matron app (or takes a pasted token), tests the connection, writes .env
 npm start
 ```
 
-The wizard stores the agent token in a gitignored `.journal-token` file (mode 600),
+To get the agent token, the wizard shows a pairing code as a QR code in the terminal. In the
+Matron app, open **Settings -> Devices -> Add Agent -> Scan QR** (or type the code) and name
+the agent; the bridge picks up the token by itself, so nobody copies it around. If you'd
+rather mint the token on the journal server (`matron-admin agent add <user> <device-name>`),
+choose the paste option instead.
+
+To pair (or re-pair) without going through the rest of the wizard, for example after the
+agent was revoked in the app:
+
+```bash
+npm run pair                          # uses JOURNAL_WS_URL from .env
+npm run pair -- --server https://journal.example.com
+npm run pair -- --force               # replace a token that still works (pairs a NEW agent)
+```
+
+`npm run pair` refuses to replace a token that still connects unless you pass `--force`.
+Remote journals must use https/wss: the token comes back in the pairing response.
+
+The wizard and `npm run pair` store the agent token in a gitignored `.journal-token` file (mode 600),
 generates `HMAC_SECRET`, and leaves every other setting on its documented default.
 Re-run it any time to change answers; the previous `.env` is backed up to `.env.bak`.
 
@@ -183,6 +201,22 @@ undone within five minutes; use `-StopOnly`, which disables the task.
 `deploy.ps1`) hands itself to a one-shot Scheduled Task a few seconds out,
 because Task Scheduler would otherwise stop it along with the bridge.
 
+**Self-restart onto new code (every platform):** a deploy that finds a live
+session (`deploy.sh --dry-run`, yearbook-infra's `update-bridges`) leaves the
+new code on disk and the old process running. The bridge notices by itself:
+it polls its checkout's HEAD reflog, lets a landed update settle for five
+minutes (so `npm install` has finished), proves the tree boots with the same
+preflight the deploy scripts run, and then exits for the supervisor to
+relaunch it at the first poll where no session is mid-turn. A running turn
+is never cut off: the bridge keeps waiting and logs a warning every 30
+minutes. A box that would rather force the restart after a while sets
+`MATRON_CODE_UPDATE_FORCE_AFTER_MS`; the interrupted chats then carry on by
+themselves (`MATRON_CODE_UPDATE_AUTO_CARRY_ON=0` gives them the "Carry on"
+card instead). Sessions between turns resume with their history on their next turn,
+as with any restart. The exit code is 75, non-zero on purpose: launchd only
+relaunches after a non-zero exit. See
+`docs/superpowers/specs/2026-10-02-code-update-restart-design.md`.
+
 ## Config (.env)
 
 | Variable | Description | Default |
@@ -193,6 +227,12 @@ because Task Scheduler would otherwise stop it along with the bridge.
 | `MATRON_DEFAULT_MODEL` | Claude model for fresh starts when none is picked (New Chat picker, `/start` without `--model`); an alias such as `fable`, `opus`, `sonnet` or a full `claude-*` name. The `default` alias resolves to this too. Resumed rooms keep their own model. Claude only; reported to the picker as `default_model`. | `fable` |
 | `SESSION_IDLE_TIMEOUT_MS` | Idle time after which a session is silently reaped (next user message auto-resumes it). Set to `0` to disable, or `86400000` to restore the previous 24h default. | `3600000` (1 hour) |
 | `SESSION_IDLE_CHECK_MS` | How often the reaper scans for idle sessions | `300000` (5 minutes) |
+| `MATRON_CODE_UPDATE_RESTART` | Restart the bridge by itself once newer code is on disk in its checkout (see "Self-restart onto new code" above). `0`/`false`/`off` disables it. | on |
+| `MATRON_CODE_UPDATE_POLL_MS` | How often the checkout's HEAD reflog is read for new code | `60000` (1 minute) |
+| `MATRON_CODE_UPDATE_SETTLE_MS` | How old a HEAD move must be before the new tree is preflighted and trusted (the deploy's `npm install` runs after the pull) | `300000` (5 minutes) |
+| `MATRON_CODE_UPDATE_WARN_EVERY_MS` | How often the bridge logs that it is still waiting for a running turn before it can restart onto new code | `1800000` (30 minutes) |
+| `MATRON_CODE_UPDATE_FORCE_AFTER_MS` | Opt-in: after this long waiting for a running turn, restart anyway (the turn is cut off and carries on by itself, see the next row). `0` never forces. | `0` (never) |
+| `MATRON_CODE_UPDATE_AUTO_CARRY_ON` | After a forced self-restart (`MATRON_CODE_UPDATE_FORCE_AFTER_MS`) that cut turns off, resume those chats automatically with an `[auto-continue after bridge update]` turn instead of publishing a "Carry on" card. `0`/`false`/`off` keeps the card. | on |
 | `BASH_DEFAULT_TIMEOUT_MS` | Default timeout for a bridge-spawned Claude session's Bash tool call when the model sets none. Raises Claude Code's 120000 (2 min) built-in so long Codex reviews / test suites aren't SIGTERM'd mid-run. Positive integer ms; out-of-range (>`3600000` = 1h) is clamped, malformed is ignored. Applies at session spawn — restart to take effect. | `1200000` (20 min) |
 | `BASH_MAX_TIMEOUT_MS` | Ceiling for an explicit per-call Bash timeout in a bridge-spawned Claude session. Same parsing/clamping/restart semantics as `BASH_DEFAULT_TIMEOUT_MS`; raised to the resolved default if set lower. | `1800000` (30 min) |
 | `BRIDGE_CLAUDE_MD_PATH` | Optional markdown file appended to bridge-spawned Claude sessions for bridge-specific guidance | `BRIDGE_CLAUDE.md` |
@@ -218,6 +258,8 @@ because Task Scheduler would otherwise stop it along with the bridge.
 | `OPENAI_API_KEY` | Optional OpenAI API key; when set, preferred for conversation titles and rolling TOC summaries (using `gpt-6-luna` by default) | — |
 | `GEMINI_API_KEY` | Optional Gemini API key; used as fallback summarizer when `OPENAI_API_KEY` is unset; both key and summary features are skipped when both are empty | — |
 | `SUMMARY_MODEL` | Overrides the active provider's default model for titles and summaries; applies to whichever of OpenAI or Gemini is configured | — |
+
+Voice notes sent in chat are transcribed by the journal at upload when it has a cloud speech-to-text key (`MATRON_STT_AZURE_KEY`, see the journal's protocol doc): the bridge asks `GET /media/:id/transcript` first and only runs its own whisper when the journal has no words for the note (no key, an older journal, or a failed job).
 
 ## Memory & MCP tuning
 
@@ -297,7 +339,7 @@ What rides the journal connection:
 | `JOURNAL_CONTROL_CONVO_ID` | Stable convo id for session-management commands | `bridge-<hostname>` |
 | `JOURNAL_STREAM_INTERVAL_MS` | Streaming-overlay coalescing floor (at most one in-progress frame per conversation+message per window) | `200` |
 
-Provision the agent token on the journal server with `matron-admin agent add <user> <device-name>`.
+Get the agent token by pairing with the Matron app (`npm run pair`, or the first option in `npm run setup`), or provision it on the journal server with `matron-admin agent add <user> <device-name>`.
 
 The journal also exposes an HTTP **search API** (`GET /search?q=` on the https base derived from `JOURNAL_WS_URL`, authenticated with the same agent token) that full-text searches every one of the user's conversations across all their devices, plus an `around_seq` context mode on `GET /convo/:id/messages` for reading prose around a hit. Bridge sessions are told how to use it in `BRIDGE_CLAUDE.md` / `BRIDGE_CODEX.md`; the full spec lives in matron-journal's [`docs/protocol.md`](https://github.com/Matronhq/matron-journal/blob/master/docs/protocol.md) ("Journal search").
 

@@ -195,7 +195,8 @@ describe('missions wiring', () => {
     expect(slice('mission_create', 'milestone_post')).toMatch(/project: z\.number\(\)\.int\(\)\.min\(1\)\.optional\(\)/);
     expect(slice('milestone_post', 'mission_update')).toMatch(/mission: z\.number\(\)\.int\(\)\.min\(1\)\.optional\(\)/);
     const update = slice('mission_update', 'mission_status');
-    expect(update).toMatch(/project: z\.number\(\)\.int\(\)\.min\(1\)\.nullable\(\)\.optional\(\)/);
+    expect(update).toMatch(/project: z\.number\(\)\.int\(\)\.min\(1\)\.optional\(\)/);
+    expect(update).not.toMatch(/nullable/);
     expect(update).toMatch(/mission: z\.number\(\)\.int\(\)\.min\(1\)\.optional\(\)/);
     expect(slice('mission_leave', 'mission_get')).toMatch(/num: z\.number\(\)\.int\(\)\.min\(1\)/);
     expect(slice('mission_join', 'mission_leave')).not.toMatch(/already belongs/);

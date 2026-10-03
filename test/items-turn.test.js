@@ -213,6 +213,8 @@ describe('createItemTurnRouter', () => {
     expect(deps.queueText).toHaveBeenCalledTimes(1);
     expect(deps.queueText.mock.calls[0][1]).toMatchObject({ preview: '📌 #12 Which auth library?' });
     expect(deps.queueText.mock.calls[0][1].text).toContain('dan replied');
+    // The card names the reply it holds, so the item thread can show it queued.
+    expect(deps.queueText.mock.calls[0][1].source).toEqual({ item_id: base.item_id, comment_id: 'ic' });
     expect(deps.injectBlocks).not.toHaveBeenCalled();
   });
 

@@ -327,6 +327,17 @@ describe('createAgentSpawnHandlers', () => {
       expect(text).toContain('Link it for the user as [title](matron://convo/child-1).');
     });
 
+    // model / model_reason: the target started the child on Opus because no
+    // model was named and the box is out of Fable.
+    it('started on a Fable-limit fallback — the notice says which model and why; unknown reasons stay silent', async () => {
+      const ctx = await armStarted();
+      ctx.handlers.onSpawnFrame({ kind: 'spawn', event: 'outcome', request_id: 'row-1', outcome: 'started', child_convo_id: 'child-1', model: 'opus', model_reason: 'fable_limit' });
+      expect(ctx.notices[0].text).toContain('session started on the target box on Opus — Fable limit reached, detached');
+      const ctx2 = await armStarted();
+      ctx2.handlers.onSpawnFrame({ kind: 'spawn', event: 'outcome', request_id: 'row-1', outcome: 'started', child_convo_id: 'child-1', model: 'opus', model_reason: 'mystery' });
+      expect(ctx2.notices[0].text).not.toMatch(/Opus/);
+    });
+
     it('declined — notifyParent text contains declined; rooms.record NOT called', async () => {
       const ctx = await armStarted();
       ctx.handlers.onSpawnFrame({ kind: 'spawn', event: 'outcome', request_id: 'row-1', outcome: 'declined' });

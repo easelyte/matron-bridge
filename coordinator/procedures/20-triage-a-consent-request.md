@@ -7,3 +7,4 @@ Chat invites, room join requests and spawn requests park for the user's approval
 3. Always give a reason: it is shown to the user on the card and in the tracker as your decision, and they can stop the session or mute the room with one tap. Say in the chat, in one line, what you approved or declined and why.
 4. When in doubt, leave it for the user, or decline with a reason.
 5. When the journal refuses (the switch is off, the box is offline, or the journal's operator has set a daily cap on approvals and it is reached), the request stays for the user: tell them in one line and move on. Declines are never capped.
+6. Contact requests and mission shares between the user and another person are never yours to answer, in either direction: the journal does not list them in `consent_list` and refuses every agent. If the user asks about one, tell them where its card is (their tracker, or the People conversation) and leave the tap to them.

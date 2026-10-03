@@ -68,11 +68,13 @@ if (-not (Test-Path $envFile)) {
     $content = $content -replace '(?m)^DEFAULT_WORKDIR=.*$', "DEFAULT_WORKDIR=$($env:USERPROFILE -replace '\\', '/')"
     # UTF-8 without BOM (Windows PowerShell's -Encoding utf8 writes one).
     [IO.File]::WriteAllText($envFile, $content, (New-Object System.Text.UTF8Encoding $false))
-    Write-Host '  Edit .env to set JOURNAL_WS_URL, JOURNAL_TOKEN_FILE (or JOURNAL_TOKEN), ALLOWED_USER_IDS, etc.'
-    Write-Host "  (or run 'npm run setup' from a terminal for the guided version)"
+    Write-Host "  Edit .env to set JOURNAL_WS_URL, ALLOWED_USER_IDS, etc., then run 'npm run pair'"
+    Write-Host '  from a terminal to pair with the Matron app by QR code (or set JOURNAL_TOKEN_FILE /'
+    Write-Host '  JOURNAL_TOKEN to a token minted with matron-admin).'
+    Write-Host "  Or run 'npm run setup' from a terminal for the guided version."
   }
 } else {
-  Write-Host ".env already exists - run 'npm run setup' to change it."
+  Write-Host ".env already exists - run 'npm run setup' to change it, or 'npm run pair' to re-pair the agent token."
 }
 # chmod 600 equivalent: only this user can read .env (best effort).
 & icacls.exe $envFile /inheritance:r /grant:r "$($env:USERNAME):F" *> $null

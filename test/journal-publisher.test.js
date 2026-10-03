@@ -1253,6 +1253,43 @@ describe('createJournalPublisher', () => {
     await httpServer.close();
   });
 
+  it('fetchTranscript: asks GET /media/:id/transcript?wait=20 with Bearer auth and returns the answer', async () => {
+    const httpServer = await startFakeHttpServer((entry, res) => {
+      if (entry.url === '/media/vn-1/transcript?wait=20') {
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ status: 'done', transcript: 'hello' }));
+      } else {
+        res.writeHead(404); res.end();
+      }
+    });
+    const pub = createJournalPublisher({ url: `ws://127.0.0.1:${httpServer.port}/ws`, token: 'tok-t', log: silentLog, ...FAST_BACKOFF });
+    expect(await pub.fetchTranscript('vn-1')).toEqual({ status: 'done', transcript: 'hello' });
+    const reqs = httpServer.received.filter(r => r.url && r.url.startsWith('/media/vn-1/transcript'));
+    expect(reqs.length).toBe(1);
+    expect(reqs[0].headers['authorization']).toBe('Bearer tok-t');
+    pub.close();
+    await httpServer.close();
+  });
+
+  it('fetchTranscript: a 404 (older journal, or not yours) is a quiet null; other errors warn; a blank ref makes no call', async () => {
+    let code = 404;
+    const httpServer = await startFakeHttpServer((_entry, res) => { res.writeHead(code); res.end('{}'); });
+    const warnings = [];
+    const log = { warn: (...a) => warnings.push(a.join(' ')), error: () => {} };
+    const pub = createJournalPublisher({ url: `ws://127.0.0.1:${httpServer.port}/ws`, token: 'tok', log, ...FAST_BACKOFF });
+    warnings.length = 0;
+    expect(await pub.fetchTranscript('old')).toBeNull();
+    expect(warnings.filter(w => /fetchTranscript/.test(w)).length).toBe(0);
+    code = 500;
+    expect(await pub.fetchTranscript('x')).toBeNull();
+    expect(warnings.filter(w => /fetchTranscript/.test(w)).length).toBe(1);
+    const before = httpServer.received.length;
+    expect(await pub.fetchTranscript('')).toBeNull();
+    expect(httpServer.received.length).toBe(before);
+    pub.close();
+    await httpServer.close();
+  });
+
   it('fetchMedia: a missing/blank blob_ref resolves null and warns, without any HTTP call', async () => {
     const httpServer = await startFakeHttpServer();
     const wsUrl = `ws://127.0.0.1:${httpServer.port}/ws`;

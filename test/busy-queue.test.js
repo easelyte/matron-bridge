@@ -565,6 +565,27 @@ describe('notifyQueuedMessage', () => {
     });
   });
 
+  // Spec 2026-10-01 (item thread queued replies): a queued tracker reply's
+  // card names the item and comment it holds, so the item's thread can show
+  // that reply as queued and offer this card's own Send now.
+  it('structured path: a tracker source rides on the card as `item`; a malformed or absent one adds nothing', async () => {
+    async function payloadFor(source) {
+      const sendButtonMessage = vi.fn(async () => '$tile');
+      const session = makeSession({ sendButtonMessage, queueNotifications: [] });
+      await notifyQueuedMessage(session, 'p', {
+        sendReply: vi.fn(), queueRelease: { noteQueued: vi.fn() }, convoId: 'convo-1', fullText: 'f', source,
+      });
+      const args = sendButtonMessage.mock.calls[0];
+      return args[args.length - 1];
+    }
+    expect((await payloadFor({ item_id: 'it_1', comment_id: 'ic_2' })).item).toEqual({ item_id: 'it_1', comment_id: 'ic_2' });
+    expect((await payloadFor({ item_id: 'it_1' })).item).toEqual({ item_id: 'it_1' });
+    expect((await payloadFor({ item_id: 'it_1', comment_id: 7 })).item).toEqual({ item_id: 'it_1' });
+    expect('item' in (await payloadFor(null))).toBe(false);
+    expect('item' in (await payloadFor({ comment_id: 'ic_2' }))).toBe(false);
+    expect('item' in (await payloadFor({ item_id: '' }))).toBe(false);
+  });
+
   // A client that predates `kind: 'queued_release'` renders the classic
   // {question, options, mode} prompt shape. Without a mirrored `options`
   // array the card degrades to a free-text answer box whose reply the router

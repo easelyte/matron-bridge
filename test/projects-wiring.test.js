@@ -197,7 +197,8 @@ describe('projects wiring', () => {
         expect(section, name).toContain(DEFINITION);
         expect(section.split(DEFINITION).length - 1, name).toBe(1);
         expect(section, name).toContain('When you start a mission, run `project_list` and file it into the project it belongs to');
-        expect(section, name).toContain('Create one with `project_create` only when none fits');
+        expect(section, name).toContain('the mission gets a project of its own with the same name');
+        expect(section, name).toContain('it can never be taken out of one');
       }
     });
 
@@ -231,9 +232,9 @@ describe('projects wiring', () => {
       expect(coord).toContain('After the missions, refresh the projects: `project_list`, then for each open project `project_get N` and `project_status` with `num: N`');
       expect(coord).toContain('`project_merge` with `num` the one to fold away and `into` the one to keep');
       expect(coord).toContain('Report each merge in your reply: `Merged #A title into #B title — why`.');
-      expect(coord).toContain('Then file ONE question (`item_create`, `kind: "question"`) proposing which missions `mission_list` shows with "no project" go into which project, and which quiet missions to close.');
-      expect(coord).toContain('Never move a mission into, out of or between projects, and never close a mission, without the user\'s answer.');
-      expect(coord).toContain('`mission_update` with `mission: N` and `project: P` (or `null`)');
+      expect(coord).toContain('Then file ONE question (`item_create`, `kind: "question"`) proposing which one-mission projects (a mission in a project of its own, made because none was named) belong in a bigger project, and which quiet missions to close.');
+      expect(coord).toContain('Never move a mission between projects, fold a one-mission project into another, or close a mission without the user\'s answer.');
+      expect(coord).toContain('`project_merge` to fold a one-mission project into the bigger one (or `mission_update` with `mission: N` and `project: P` to move one mission)');
       expect(coord).toMatch(/`project_list` for every open project/);
     });
   });

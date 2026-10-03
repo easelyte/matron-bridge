@@ -15,8 +15,12 @@ import { formatMemoryList, formatMemoryDetail, formatSaveAck, formatDeleteAck } 
 import { formatReminderLine } from './lib/reminder-tools.js';
 import { rosterLine } from './lib/roster-format.js';
 import { formatPendingList, formatDecideAck } from './lib/consent-tools.js';
+import {
+  formatContactList, formatContactAddAck, formatContactEndAck, formatGrantList, formatShareAck, formatUnshareAck,
+  formatSharedMissionList, formatSharedMissionDetail, formatSharingError,
+} from './lib/sharing-format.js';
 import { formatUnseenList, formatUnseenMine, formatFlagAck } from './lib/unseen-tools.js';
-import { formatRoutineList, formatRoutineUpdateAck, formatRoutineRunAck } from './lib/routines-tools.js';
+import { formatRoutineList, formatRoutineUpdateAck, formatRoutineRunAck, formatRoutineCreateAck, formatRoutineDeleteAck } from './lib/routines-tools.js';
 
 // Route to whichever bridge spawned us: explicit BRIDGE_API_URL wins, else the
 // per-session MATRON_BRIDGE_API_PORT exported by the bridge at spawn (journal=9812,
@@ -426,7 +430,7 @@ server.tool(
     workdir: z.string().describe('Absolute working directory on the target box, from agent_boxes folders'),
     task: z.string().max(2000).describe('The task prompt. Shown VERBATIM on the user\'s consent card and executed verbatim as the new session\'s first turn — write it for both audiences.'),
     topic: z.string().max(200).optional().describe('Optional short room/session title'),
-    model: z.string().optional().describe('Optional Claude model alias for the new session: default, opus, opus[1m], sonnet, sonnet[1m], haiku, opusplan, fable (or a full claude-* model name). Omit to use the target box\'s own default — only set it if the user asked for a specific model.'),
+    model: z.string().optional().describe('Optional Claude model alias for the new session: default, opus, opus[1m], sonnet, sonnet[1m], haiku, opusplan, fable (or a full claude-* model name). Omit to use the target box\'s own default (a box at its Fable weekly limit starts the session on Opus instead) — only set it if the user asked for a specific model.'),
     link: z.boolean().optional().describe('Open a chat room between this session and the new one, and have it report its outcome there. Default false: the spawned session is detached and simply does its task. Set true only when you need its results back here.'),
     mission: z.number().int().min(1).optional().describe('Mission number the new session joins before its first turn — e.g. one you made with mission_create. The consent card shows it.'),
   },
@@ -582,9 +586,10 @@ server.tool(
 );
 
 // --- Coordinator routines (spec: matron-journal 2026-10-01 coordinator routines) ---
-// routine_list / routine_update / routine_run go through the bridge loopback
-// (index.js mounts lib/routines-tools.js at /routine/<op>); the journal
-// allows all three to the Coordinator alone. Create and delete stay in the apps.
+// routine_list / routine_update / routine_run / routine_create /
+// routine_delete go through the bridge loopback (index.js mounts
+// lib/routines-tools.js at /routine/<op>); the journal allows the writes to
+// the Coordinator alone.
 const ROUTINE_WHAT = "A routine is a prompt the journal owns and fires into the Coordinator conversation, on a schedule or when a trigger trips (a session past a context threshold, a session stalled on a usage limit, a box low on disk), as a turn starting `[routine <name>, fired by the journal …]`, waking the box if needed — nothing in any conversation keeps it alive, so never set reminders for routine work. Coordinator only.";
 
 async function callRoutine(name, args, render) {
@@ -611,7 +616,7 @@ server.tool(
 
 server.tool(
   'routine_update',
-  `Pause (enabled: false), resume (enabled: true) or edit one routine — its title, schedule (five cron fields, in tz), zone, prompt, or for a triggered routine its trigger threshold. ${ROUTINE_WHAT} The schedule must fire at least 15 minutes apart. Resuming or rescheduling recomputes the next fire from now. The user creates and deletes routines in the apps (Settings ▸ Coordinator ▸ Routines); only change one when the user asks or the playbook says to.`,
+  `Pause (enabled: false), resume (enabled: true) or edit one routine — its title, schedule (five cron fields, in tz), zone, prompt, or for a triggered routine its trigger threshold. ${ROUTINE_WHAT} The schedule must fire at least 15 minutes apart. Resuming or rescheduling recomputes the next fire from now. A routine cannot switch between schedule and trigger, nor be renamed: delete it and create it afresh. Only change one when the user asks or the playbook says to.`,
   {
     name: z.string().max(64).describe('The routine\'s slug, as routine_list shows it'),
     title: z.string().max(200).optional().describe('One line'),
@@ -631,6 +636,30 @@ server.tool(
     name: z.string().max(64).describe('The routine\'s slug, as routine_list shows it'),
   },
   async (args) => callRoutine('run', args, (d) => formatRoutineRunAck(d, args.name)),
+);
+
+server.tool(
+  'routine_create',
+  `Create a routine: a new slug, a one-line title, the prompt the journal fires, and either a schedule (five cron fields in tz, at least 15 minutes apart) or a trigger. ${ROUTINE_WHAT} Create one only when the user asks for it or agrees to it; keep the prompt one line pointing at a playbook section or a memory, so editing the procedure never means editing the routine. The user sees it in the apps as created by the Coordinator.`,
+  {
+    name: z.string().max(64).describe('New slug: lowercase letters, digits and dashes, e.g. "exception-triage"'),
+    title: z.string().max(200).describe('One line, shown in the apps'),
+    schedule: z.string().max(64).optional().describe('Five cron fields: minute hour day-of-month month day-of-week, e.g. "30 8,16 * * *" (08:30 and 16:30). Give this or trigger.'),
+    trigger: z.object({ kind: z.enum(['context_over', 'stalled', 'disk_under']), pct: z.number().int().min(1).max(99).optional(), reset_minutes: z.number().int().min(0).optional() }).optional().describe('Instead of a schedule: the rule it fires on — context_over/disk_under take pct, stalled takes reset_minutes'),
+    tz: z.string().max(64).optional().describe('IANA zone the schedule is in; default Europe/London'),
+    prompt: z.string().max(2000).describe('The turn text the journal fires, e.g. "Routine exception-triage: follow the exception-triage-routine memory."'),
+    enabled: z.boolean().optional().describe('Default true; false creates it paused'),
+  },
+  async (args) => callRoutine('create', args, formatRoutineCreateAck),
+);
+
+server.tool(
+  'routine_delete',
+  `Delete one routine for good: the journal stops firing it and the apps drop it from the list. ${ROUTINE_WHAT} Delete only when the user asks; to stop one for a while, pause it with routine_update (enabled: false) instead.`,
+  {
+    name: z.string().max(64).describe('The routine\'s slug, as routine_list shows it'),
+  },
+  async (args) => callRoutine('delete', args, () => formatRoutineDeleteAck(args.name)),
 );
 
 async function sessionControlCall(route, body, name) {
@@ -1073,7 +1102,7 @@ const missionToolName = (op) => ({ start: 'mission_start', create: 'mission_crea
 
 server.tool(
   'mission_start',
-  "Start the mission for this conversation — the human-readable record of one piece of work, shared by every agent and app of this user. Do this as soon as you know what the work is (usually right after the user's first substantive input): name it and state the goal in body, with the whole conversation as context. Milestones are refused until the conversation has a mission. If it already has a current mission this returns that one unchanged; to move on to different work, mission_create the new mission and mission_join it. Run project_list first and pass project: N when the work belongs to an existing project.",
+  "Start the mission for this conversation — the human-readable record of one piece of work, shared by every agent and app of this user. Do this as soon as you know what the work is (usually right after the user's first substantive input): name it and state the goal in body, with the whole conversation as context. Milestones are refused until the conversation has a mission. If it already has a current mission this returns that one unchanged; to move on to different work, mission_create the new mission and mission_join it. Run project_list first and pass project: N when the work belongs to an existing project; leave it out only when none fits, and the mission gets a project of its own with the same name.",
   {
     title: z.string().describe('One line, ≤200 chars — what the work is'),
     body: z.string().optional().describe('Markdown ≤32 KiB — the goal and the standing description'),
@@ -1084,7 +1113,7 @@ server.tool(
 
 server.tool(
   'mission_create',
-  "Create a mission WITHOUT joining this conversation to it (an unassigned mission) — for work you are handing to another agent, or new work you will mission_join yourself. Assign it by starting a session with agent_session_start and mission: N, or by asking a running agent (agent_chat_start) to mission_join N. mission_start is the one that creates AND joins, for your own work when this conversation has no mission yet. Pass project: N to file it in a project. Returns the mission number.",
+  "Create a mission WITHOUT joining this conversation to it (an unassigned mission) — for work you are handing to another agent, or new work you will mission_join yourself. Assign it by starting a session with agent_session_start and mission: N, or by asking a running agent (agent_chat_start) to mission_join N. mission_start is the one that creates AND joins, for your own work when this conversation has no mission yet. Pass project: N to file it in an existing project; without one it gets a project of its own with the same name. Returns the mission number.",
   {
     title: z.string().describe('One line, ≤200 chars — what the work is'),
     body: z.string().optional().describe('Markdown ≤32 KiB — the goal: what done looks like, constraints, links'),
@@ -1107,11 +1136,11 @@ server.tool(
 
 server.tool(
   'mission_update',
-  "Rename a mission, rewrite its standing description, or file it in a project (project: N; null takes it out — a mission is in one project or none). Default: this conversation's current mission. Pass `mission` to change another mission — e.g. the Coordinator applying a filing the user approved.",
+  "Rename a mission, rewrite its standing description, or move it to another project (project: N — every mission is in exactly one project, so it can move but never be taken out). Default: this conversation's current mission. Pass `mission` to change another mission — e.g. the Coordinator applying a filing the user approved.",
   {
     title: z.string().optional().describe('≤200 chars'),
     body: z.string().optional().describe('Markdown ≤32 KiB'),
-    project: z.number().int().min(1).nullable().optional().describe('A project number from project_list, or null to take the mission out of its project'),
+    project: z.number().int().min(1).optional().describe('A project number from project_list to move the mission to'),
     mission: z.number().int().min(1).optional().describe("Another mission's number; omit for this conversation's current mission"),
   },
   async (args) => callMissions('update', args, formatUpdateAck),
@@ -1130,8 +1159,13 @@ server.tool(
 server.tool(
   'mission_list',
   "List the user's missions — open by default, state: 'closed' for closed ones — each with its counts, its status (when and by whom) and its last milestone. The Coordinator uses it to find every mission whose status to refresh.",
-  { state: z.enum(['open', 'closed']).optional().describe("Default 'open'") },
-  async (args) => callMissions('list', args, formatMissionList),
+  {
+    state: z.enum(['open', 'closed']).optional().describe("Default 'open'"),
+    shared: z.boolean().optional().describe('true = the missions OTHER PEOPLE share with the user (read-only), instead of the user\'s own'),
+  },
+  async (args) => (args.shared
+    ? callSharing('shared_list', 'mission_list', {}, formatSharedMissionList)
+    : callMissions('list', args, formatMissionList)),
 );
 
 server.tool(
@@ -1151,8 +1185,13 @@ server.tool(
 server.tool(
   'mission_get',
   "Read a mission: its milestones newest first, open items (awaiting the user first) and conversations. Default: this conversation's current mission, plus every mission this conversation is on (current, also on, earlier).",
-  { num: z.number().int().min(1).optional().describe('A mission number; omit for this conversation\'s mission') },
-  async (args) => callMissions('get', args, formatMissionDetail),
+  {
+    num: z.number().int().min(1).optional().describe('A mission number; omit for this conversation\'s mission'),
+    shared_by: z.string().max(64).optional().describe('To read a mission another person shares with the user: their user name, with num = THEIR mission number (mission_list shared: true lists both). Read-only.'),
+  },
+  async (args) => (args.shared_by
+    ? callSharing('shared_get', 'mission_get', args, formatSharedMissionDetail)
+    : callMissions('get', args, formatMissionDetail)),
 );
 
 server.tool(
@@ -1173,6 +1212,85 @@ server.tool(
     mission: z.number().int().min(1).nullable().describe('Target mission number, or null to detach'),
   },
   async (args) => callItems('move', args, (d) => itemLine(d.item)),
+);
+
+// --- Contacts and mission sharing between people (spec: matron-journal
+// 2026-10-02 matron-to-matron sharing, phase 1) ---
+// The bridge loopback (index.js mounts lib/sharing-tools.js at
+// /sharing/<op>); the journal is the gate. `tool` is the name the model
+// called, for the failure line.
+const SHARING_WHAT = "Contacts are other PEOPLE (other Matron users), not the user's own agents or boxes. Two people become contacts only when one asks and the other accepts, and a contact can then be offered a mission to read. Your ask never reaches the other person by itself: the user gets a card (in this conversation and in their tracker) and only their own tap sends it on; then the other person gets a card of their own. You cannot approve either card and neither can the Coordinator, so do not wait on the result: say in one line that it is with the user and carry on.";
+
+async function callSharing(name, tool, args, render) {
+  try {
+    const res = await fetch(`${BRIDGE_API}/sharing/${name}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ roomId: ROOM_ID, ...args }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) return { content: [{ type: 'text', text: `${tool} failed: ${res.status === 409 || [400, 403, 404].includes(res.status) ? formatSharingError(name, data) : (data.error || `HTTP ${res.status}`)}` }] };
+    return { content: [{ type: 'text', text: render(data) }] };
+  } catch (err) {
+    return { content: [{ type: 'text', text: `${tool} failed: ${err.message}` }] };
+  }
+}
+
+server.tool(
+  'contact_list',
+  `List the user's contacts and where each stands (contact, requested, waiting for the user). ${SHARING_WHAT} Pass users: true to also list the other users on this journal who could be asked.`,
+  { users: z.boolean().optional().describe('Also list the other users on this journal') },
+  async (args) => callSharing('contact_list', 'contact_list', args, formatContactList),
+);
+
+server.tool(
+  'contact_add',
+  `Ask another user on this journal to be the user's contact. ${SHARING_WHAT} Use it only when the user asked for it or clearly wants to share with that person.`,
+  { user: z.string().max(64).describe('The other user\'s name on this journal (contact_list users: true lists them)') },
+  async (args) => callSharing('contact_add', 'contact_add', args, formatContactAddAck),
+);
+
+server.tool(
+  'contact_remove',
+  'Remove a contact, or withdraw a contact request that has not been answered. Every mission shared between the two people, in either direction, ends at once. Becoming contacts again needs a new request and a new accept, so do it only when the user asks.',
+  { contact: z.string().max(128).describe('A contact name or id from contact_list') },
+  async (args) => callSharing('contact_remove', 'contact_remove', args, formatContactEndAck('Removed')),
+);
+
+server.tool(
+  'contact_block',
+  'Block a person: removes them as a contact, ends every share between the two, and their future contact requests never reach the user. Only the user can unblock, in the app. Do it only when the user asks.',
+  { contact: z.string().max(128).describe('A contact name or id from contact_list') },
+  async (args) => callSharing('contact_block', 'contact_block', args, formatContactEndAck('Blocked')),
+);
+
+server.tool(
+  'mission_share',
+  `Offer a mission to one of the user's contacts to read. They will see the mission's title, description and status, its milestones as text and its items with their comments and attachments, live, until either side ends it. They cannot change anything, and conversation transcripts, tool output, memories, secrets and box names never cross. ${SHARING_WHAT} Read-only is the only level so far.`,
+  {
+    contact: z.string().max(128).describe('A contact name or id from contact_list — they must already be a contact'),
+    mission: z.number().int().min(1).optional().describe("A mission number; omit for this conversation's current mission"),
+    level: z.enum(['read']).optional().describe("Default and only level: 'read'"),
+  },
+  async (args) => callSharing('share', 'mission_share', args, formatShareAck),
+);
+
+server.tool(
+  'mission_unshare',
+  "End a mission share: one the user gave (the contact can no longer read it, at once) or one given to the user (it leaves their shared list). Pass grant (an id from mission_shares), or contact and mission for a share the user gave.",
+  {
+    grant: z.string().max(128).optional().describe('A grant id from mission_shares'),
+    contact: z.string().max(128).optional().describe('The contact a mission of the user\'s is shared with'),
+    mission: z.number().int().min(1).optional().describe("With contact: the mission number; omit for this conversation's current mission"),
+  },
+  async (args) => callSharing('unshare', 'mission_unshare', args, formatUnshareAck),
+);
+
+server.tool(
+  'mission_shares',
+  "List mission shares in both directions: what the user shares with whom, what is shared with the user, and what is still waiting for an answer. Read a mission shared with the user with mission_get shared_by + num.",
+  {},
+  async () => callSharing('shares', 'mission_shares', {}, formatGrantList),
 );
 
 // --- Projects (spec 2026-09-30 projects §5) ---
@@ -1199,7 +1317,7 @@ async function callProjects(name, args, render) {
   }
 }
 
-const PROJECT_WHAT = 'A Project is the user\'s tracker object that groups related missions (e.g. "Promo launch" groups the launch-day mission, the promo branch and SEO phase 2) — not a working directory, and nothing to do with ~/.claude/projects. A mission is in one project or none.';
+const PROJECT_WHAT = 'A Project is the user\'s tracker object that groups related missions (e.g. "Promo launch" groups the launch-day mission, the promo branch and SEO phase 2) — not a working directory, and nothing to do with ~/.claude/projects. Every mission is in exactly one project: the one named when it started, or one of its own with the same name.';
 
 server.tool(
   'project_list',

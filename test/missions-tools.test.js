@@ -746,7 +746,7 @@ describe('missions handlers', () => {
       expect(rc.status).toBe(404); expect(rc.body.error).toBe(text);
     });
 
-    it('update with project: number or null; project alone is enough; other values are 400', async () => {
+    it('update with project: a number moves the mission; project alone is enough; null (unfiling) and other values are 400', async () => {
       const filed = { id: 'ms_1', num: 61, title: 'M', state: 'open', project_id: 'pj_7', project_num: 7 };
       const { h, client, session } = fixture({ update: vi.fn(async () => ({ status: 200, data: { mission: filed } })) });
       session.missionId = 'ms_1';
@@ -756,8 +756,10 @@ describe('missions handlers', () => {
       expect((await h.update({ roomId: '!r:s', project: 0 })).status).toBe(400);
       expect((await h.update({ roomId: '!r:s', project: '#7' })).status).toBe(400);
       expect((await h.update({ roomId: '!r:s', project: 7 })).status).toBe(200);
-      expect((await h.update({ roomId: '!r:s', project: null })).status).toBe(200);
-      expect(client.update.mock.calls).toEqual([['ms_1', { project: 7 }], ['ms_1', { project: null }]]);
+      const unfile = await h.update({ roomId: '!r:s', project: null });
+      expect(unfile.status).toBe(400);
+      expect(unfile.body.error).toMatch(/never be taken out/);
+      expect(client.update.mock.calls).toEqual([['ms_1', { project: 7 }]]);
     });
 
     it('update with mission: by number, never resolves or touches the cache', async () => {

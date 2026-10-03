@@ -1,25 +1,42 @@
 #!/usr/bin/env node
 // Interactive first-run setup: asks for the handful of values the bridge
 // can't guess (journal URL, agent token, allowed user), tests the journal
-// connection with a real hello handshake, and writes .env. Everything else
+// connection with a real hello handshake, and writes .env. The agent token
+// comes from QR pairing with the Matron app (default) or is pasted after
+// minting it with matron-admin. Everything else
 // keeps the .env.example defaults. Re-running is safe: existing answers
 // become the defaults and the old .env is backed up first.
 //
 // Run with: npm run setup
 
 import { createInterface } from 'node:readline';
-import { randomBytes } from 'node:crypto';
 import fs from 'node:fs';
-import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import WebSocket from 'ws';
+import { writeTokenFile, PairingError } from '../lib/journal-pairing.js';
+import {
+  ENV_PATH,
+  TOKEN_PATH,
+  readIfExists,
+  parseEnv,
+  buildEnv,
+  normalizeJournalUrl,
+  isLocalHost,
+  tokenEnv,
+  strandedTokenFile,
+  hmacSecretFor,
+  writeEnvFile,
+  testConnection,
+  pairWithApp,
+} from './common.mjs';
 
-const REPO_DIR = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
-const ENV_PATH = path.join(REPO_DIR, '.env');
-const EXAMPLE_PATH = path.join(REPO_DIR, '.env.example');
-const TOKEN_PATH = path.join(REPO_DIR, '.journal-token');
+// Re-exported: the wizard's unit tests (and anything else that grew up
+// importing them from here) keep working after the move to common.mjs.
+export { parseEnv, buildEnv, normalizeJournalUrl };
 
 let rl;
+// Set while QR pairing is waiting, so Ctrl-C cancels the pairing (back to the
+// token menu) instead of quitting the whole wizard.
+let pairAbort = null;
 
 // Empty answers (or all-whitespace ones) keep the previous default, so every
 // prompt behaves the same on Enter.
@@ -73,80 +90,43 @@ async function askYesNo(question, defYes) {
   return answer.startsWith('y');
 }
 
-// Read a file that may legitimately not exist yet (a first run has no .env).
-// Reading and handling ENOENT avoids the existsSync-then-read race.
-function readIfExists(p) {
+// Token source menu answer -> 'pair' | 'paste' | null (unrecognised).
+// Enter takes the default, pairing.
+export function tokenMethod(answer) {
+  const a = answer.trim().toLowerCase();
+  if (a === '' || a === '1' || a === 'p' || a === 'pair') return 'pair';
+  if (a === '2' || a === 'paste' || a === 't' || a === 'token') return 'paste';
+  return null;
+}
+
+// Pair with the Matron app; resolves to the token, or '' when the user
+// cancelled with Ctrl-C or the journal refused (the reason is printed).
+async function pairToken(journalUrl) {
+  pairAbort = new AbortController();
   try {
-    return fs.readFileSync(p, 'utf8');
+    const token = await pairWithApp({ journalUrl, signal: pairAbort.signal });
+    // Store it right away: the journal hands the token over exactly once,
+    // and a Ctrl-C at a later prompt must not lose a freshly minted agent.
+    try {
+      writeTokenFile(TOKEN_PATH, token);
+    } catch (e) {
+      console.log(`\nPaired, but saving the token to ${TOKEN_PATH} failed: ${e.message}`);
+      console.log('Revoke the new agent in the Matron app (Settings -> Devices), fix the problem, and pair again.');
+      return '';
+    }
+    console.log('');
+    console.log(`Paired. Agent token stored in ${TOKEN_PATH}.`);
+    return token;
   } catch (e) {
-    if (e.code === 'ENOENT') return '';
-    throw e;
+    if (e.name === 'AbortError') console.log('\nPairing cancelled.');
+    else {
+      const hint = e instanceof PairingError ? '' : ' (is the journal URL right, and is the server reachable?)';
+      console.log(`\nPairing failed: ${e.message}${hint}`);
+    }
+    return '';
+  } finally {
+    pairAbort = null;
   }
-}
-
-export function parseEnv(text) {
-  const out = {};
-  for (const line of text.split('\n')) {
-    const m = /^([A-Z0-9_]+)=(.*)$/.exec(line);
-    if (m) out[m[1]] = m[2];
-  }
-  return out;
-}
-
-// Accepts https://journal.example.com, wss://…/ws, or a bare hostname, and
-// normalizes to the wss://host[:port]/ws form the bridge expects.
-export function normalizeJournalUrl(input) {
-  let s = input.trim().replace(/\/+$/, '');
-  if (!/^[a-z]+:\/\//i.test(s)) s = `wss://${s}`;
-  s = s.replace(/^http:\/\//i, 'ws://').replace(/^https:\/\//i, 'wss://');
-  let url;
-  try { url = new URL(s); } catch { return null; }
-  if (url.protocol !== 'ws:' && url.protocol !== 'wss:') return null;
-  if (url.pathname === '' || url.pathname === '/') url.pathname = '/ws';
-  return url;
-}
-
-function isLocalHost(hostname) {
-  return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1';
-}
-
-// The wizard's answers layered over the previous .env, rendered onto the
-// .env.example template so comments and unrelated keys survive.
-export function buildEnv(example, existing, owned) {
-  let env = example;
-  const applied = { ...existing, ...owned };
-  for (const [key, value] of Object.entries(applied)) {
-    const line = `${key}=${value}`;
-    const re = new RegExp(`^${key}=.*$`, 'm');
-    // Function replacement: a string replacement interprets `$&`, `$$`, `$'`
-    // and friends inside the value, silently rewriting a secret or path that
-    // contains them on every re-run.
-    env = re.test(env) ? env.replace(re, () => line) : `${env}${line}\n`;
-  }
-  return env;
-}
-
-// One live-only hello against the journal: proves the URL resolves, TLS
-// works, and the token is a valid agent token. Resolves to the agent name
-// on success, throws with a readable reason otherwise.
-function testConnection(url, token) {
-  return new Promise((resolve, reject) => {
-    const ws = new WebSocket(url, { handshakeTimeout: 8000 });
-    const timer = setTimeout(() => {
-      try { ws.terminate(); } catch { /* already down */ }
-      reject(new Error('timed out waiting for the journal to answer'));
-    }, 10000);
-    const done = (fn, arg) => { clearTimeout(timer); try { ws.close(); } catch { /* closing */ } fn(arg); };
-    ws.on('open', () => ws.send(JSON.stringify({ op: 'hello', token, cursor: null })));
-    ws.on('message', (data) => {
-      let msg;
-      try { msg = JSON.parse(data.toString()); } catch { return; }
-      if (msg && msg.op === 'hello_ok') done(resolve, msg.name || '(unnamed agent)');
-      else if (msg && msg.op === 'error') done(reject, new Error(`journal rejected the hello (${msg.code || 'unknown error'}) — check the agent token`));
-    });
-    ws.on('close', (code) => done(reject, new Error(`connection closed (code ${code}) — usually a bad or revoked agent token`)));
-    ws.on('error', (err) => done(reject, err));
-  });
 }
 
 async function main() {
@@ -162,16 +142,25 @@ async function main() {
   // historySize 0: readline keeps every answer in its up-arrow history, which
   // would let a later prompt in the same run recall the token askHidden hid.
   rl = createInterface({ input: process.stdin, output: process.stdout, historySize: 0, terminal: true });
+  // In terminal mode readline swallows Ctrl-C itself: cancel a waiting
+  // pairing, otherwise quit (without a listener readline would just close,
+  // stranding the pairing poll loop with no way to stop it).
+  rl.on('SIGINT', () => {
+    if (pairAbort) { pairAbort.abort(); return; }
+    process.stdout.write('\n');
+    rl.close();
+    process.exit(130);
+  });
 
   console.log('');
   console.log('=== Matron Bridge setup ===');
   console.log('');
-  console.log('You need a running matron-journal server and an agent token for this');
-  console.log('machine (create one there with: node bin/matron-admin agent add <name>).');
+  console.log('You need a running matron-journal server. This machine gets its agent');
+  console.log('token by pairing with the Matron app (scan a QR code), or you can paste one');
+  console.log('minted on the journal server with: matron-admin agent add <user> <name>.');
   console.log('');
 
   const existing = parseEnv(readIfExists(ENV_PATH));
-  const example = fs.readFileSync(EXAMPLE_PATH, 'utf8');
 
   // --- journal URL ---
   let journalUrl;
@@ -190,12 +179,23 @@ async function main() {
 
   // --- agent token ---
   let token = '';
-  const haveStoredToken = existing.JOURNAL_TOKEN_FILE && fs.existsSync(existing.JOURNAL_TOKEN_FILE);
-  if (haveStoredToken) {
-    const keep = await askYesNo(`Keep the agent token already stored in ${existing.JOURNAL_TOKEN_FILE}?`, true);
-    if (keep) token = fs.readFileSync(existing.JOURNAL_TOKEN_FILE, 'utf8').trim();
+  // A token paired by an earlier run that was interrupted before .env was
+  // written counts as stored too: re-pairing would mint a second agent.
+  const storedTokenFile = existing.JOURNAL_TOKEN_FILE || strandedTokenFile(existing);
+  if (storedTokenFile && fs.existsSync(storedTokenFile)) {
+    const keep = await askYesNo(`Keep the agent token already stored in ${storedTokenFile}?`, true);
+    if (keep) token = fs.readFileSync(storedTokenFile, 'utf8').trim();
   }
   while (!token) {
+    console.log('How should this machine get its agent token?');
+    console.log('  1) Pair with the Matron app — scan a QR code (default)');
+    console.log('  2) Paste a token minted with matron-admin');
+    const method = tokenMethod(await ask('Choose 1 or 2', '1'));
+    if (!method) { console.log('Please answer 1 or 2.'); continue; }
+    if (method === 'pair') {
+      token = await pairToken(journalUrl);
+      continue;
+    }
     token = await askHidden('Agent token (input hidden)');
     if (!token) console.log('The agent token is required — the bridge cannot start without it.');
   }
@@ -227,36 +227,20 @@ async function main() {
   const agent = (await ask('Default coding agent, claude or codex', existing.MATRON_DEFAULT_AGENT || 'claude'))
     .toLowerCase() === 'codex' ? 'codex' : 'claude';
   const workdir = await ask('Default working directory for new sessions', existing.DEFAULT_WORKDIR || '~/');
-  const hmac = existing.HMAC_SECRET || randomBytes(32).toString('hex');
+  const hmac = hmacSecretFor(existing);
 
   // --- write files ---
-  fs.writeFileSync(TOKEN_PATH, `${token}\n`, { mode: 0o600 });
-  fs.chmodSync(TOKEN_PATH, 0o600);
+  writeTokenFile(TOKEN_PATH, token);
 
   const owned = {
-    JOURNAL_WS_URL: journalUrl,
-    JOURNAL_TOKEN_FILE: TOKEN_PATH,
-    JOURNAL_TOKEN: '',
+    ...tokenEnv(journalUrl),
     ALLOWED_USER_IDS: allowed,
     MATRON_DEFAULT_AGENT: agent,
     DEFAULT_WORKDIR: workdir,
     HMAC_SECRET: hmac,
   };
 
-  const env = buildEnv(example, existing, owned);
-
-  // Copy and handle ENOENT rather than existsSync-then-copy: the check-then-
-  // act pair is a race (CodeQL js/file-system-race), and "no previous .env"
-  // is the only outcome the check was guarding.
-  try {
-    fs.copyFileSync(ENV_PATH, `${ENV_PATH}.bak`);
-    console.log(`(previous .env backed up to .env.bak)`);
-  } catch (e) {
-    if (e.code !== 'ENOENT') throw e;
-  }
-  fs.writeFileSync(ENV_PATH, env, { mode: 0o600 });
-  fs.chmodSync(ENV_PATH, 0o600);
-
+  if (writeEnvFile(existing, owned)) console.log('(previous .env backed up to .env.bak)');
   console.log('');
   console.log(`Wrote ${ENV_PATH}`);
   console.log(`Agent token stored in ${TOKEN_PATH} (mode 600, gitignored)`);

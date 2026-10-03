@@ -131,6 +131,7 @@ describe('missions-format', () => {
     expect(formatBlocked({ error: 'not_linked' })).toBe(text);
     // R4 (2026-09-30 preflight): a closed or merged project on start/create/update.
     expect(formatBlocked({ error: 'conflict', blocked_by: 'project_closed' })).toMatch(/^that project is closed/);
+    expect(formatBlocked({ error: 'conflict', blocked_by: 'project_required' })).toMatch(/^every mission is in a project/);
   });
 
   it('statusLine is exported for the project renderers', () => {

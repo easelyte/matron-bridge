@@ -98,21 +98,22 @@ describe('subagent child context window', () => {
     expect(ctx.pct).toBe(25);
   });
 
-  it('without the parent getters, a footprint above 200k widens the window to 1M', () => {
-    const ctx = run({ childModel: 'claude-opus-5-5', inputTokens: 250_000, withGetter: false });
+  it('without the parent getters, a footprint above 200k widens a 200k-default child to 1M', () => {
+    const ctx = run({ childModel: 'claude-opus-4-6', inputTokens: 250_000, withGetter: false });
     expect(ctx.window).toBe(1_000_000);
     expect(ctx.pct).toBe(25);
   });
 
-  it('a 200k parent leaves a same-family child at 200k', () => {
-    const ctx = run({ parentModel: 'claude-opus-5-5', parentWindow: 200_000, childModel: 'claude-opus-5-5', inputTokens: 100_000 });
+  it('a 200k parent leaves a same-family 200k-default child at 200k', () => {
+    const ctx = run({ parentModel: 'claude-opus-4-6', parentWindow: 200_000, childModel: 'claude-opus-4-6', inputTokens: 100_000 });
     expect(ctx.window).toBe(200_000);
     expect(ctx.pct).toBe(50);
   });
 
   it('a later parent model switch does not shrink a running child\'s inherited window', () => {
     const publisher = makePublisher();
-    let parentModel = 'claude-opus-5-5';
+    // A 200k-default Opus, so the child's own id cannot supply the 1M.
+    let parentModel = 'claude-opus-4-6';
     let parentWindow = 1_000_000;
     const tracker = createSubagentConvoTracker({
       publisher,
@@ -122,7 +123,7 @@ describe('subagent child context window', () => {
       log: { warn() {} },
     });
     tracker.discover('agent-1', { label: 'x', agentType: null });
-    const ev = () => subagentAssistantEvent({ model: 'claude-opus-5-5', usage: { input_tokens: 100_000 } });
+    const ev = () => subagentAssistantEvent({ model: 'claude-opus-4-6', usage: { input_tokens: 100_000 } });
     tracker.onEvent('agent-1', { event: ev() });
     // The parent switches opus[1m] -> opus: its settled window drops to 200k.
     parentWindow = 200_000;
@@ -160,7 +161,8 @@ describe('subagent child context window', () => {
     tracker.discover('agent-1', { label: 'x', agentType: null });
     tracker.onEvent('agent-1', { event: subagentAssistantEvent({ model: 'claude-opus-5-5' }) });
     const st = publisher.calls.publishStatus.filter(s => s.convoId === 'parent-uuid:sub:agent-1').at(-1).status;
-    expect(st.context.window).toBe(200_000);
+    // Falls back to the child's own id, which is natively 1M for Opus 5.5.
+    expect(st.context.window).toBe(1_000_000);
   });
 });
 

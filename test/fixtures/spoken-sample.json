@@ -1,0 +1,14 @@
+[
+  {
+    "role": "user",
+    "text": "The nightly export to the accounts system failed again last night. Can you find out why and fix it?"
+  },
+  {
+    "role": "assistant",
+    "text": "I'll read last night's run log first, then the export code."
+  },
+  {
+    "role": "assistant",
+    "text": "Found it. The export failed because the accounts API now rejects any batch over 500 rows, and last night's batch had 1,240. I've changed `lib/export/batch.js` to split batches at 500 and added a test; all 212 tests pass. The change is in PR #418 (https://github.com/example/app/pull/418).\n\n| Night | Rows | Result |\n|---|---|---|\n| Mon | 310 | ok |\n| Tue | 480 | ok |\n| Wed | 1,240 | failed |\n\nTwo things need deciding:\n\n1. **Re-run last night's export now, or wait for tonight's run?** Re-running now sends Wednesday's 1,240 rows today, but the accounts team is in month-end close and asked not to receive data between 9 and 5. Waiting means Wednesday's rows arrive with Thursday's, about 14 hours late.\n2. **Merge the PR myself, or wait for a review?** It is a six-line change with a test.\n\nOne caveat: I could not find the API's limit documented anywhere, so 500 comes from the error message. If the real limit is lower the export will fail again tonight; I added a log line so we would see why."
+  }
+]

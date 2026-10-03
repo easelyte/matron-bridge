@@ -674,3 +674,64 @@ describe('createJournalMediaRouter — video (frame extraction)', () => {
     });
   });
 });
+
+describe('createJournalMediaRouter — transcript from the journal (transcribed at upload)', () => {
+  const voice = { type: 'file', blobRef: 'vn-1', contentType: 'audio/mp4', name: 'note.m4a' };
+
+  it("uses the journal's words: no audio fetched, no local whisper, same wording as a local transcript", async () => {
+    const fetchTranscript = vi.fn(async () => ({ status: 'done', transcript: '  deploy the journal  ' }));
+    const { route, deps } = makeRouter({ fetchTranscript });
+    await route(session, voice, ctx);
+    expect(fetchTranscript).toHaveBeenCalledWith('vn-1');
+    expect(deps.fetchMedia).not.toHaveBeenCalled();
+    expect(deps.transcribe).not.toHaveBeenCalled();
+    expect(deps.injectText).toHaveBeenCalledWith(session, '[Voice note transcription]: deploy the journal');
+    expect(deps.echoToRoom).toHaveBeenLastCalledWith(session, '🎤 dan (Matron): deploy the journal', expect.any(String));
+  });
+
+  it('a busy session queues the journal transcript exactly like a local one', async () => {
+    const fetchTranscript = vi.fn(async () => ({ status: 'done', transcript: 'later please' }));
+    const { route, deps } = makeRouter({ fetchTranscript });
+    await route({ ...session, busy: true }, voice, ctx);
+    expect(deps.injectText).not.toHaveBeenCalled();
+    expect(deps.queueMedia).toHaveBeenCalledWith(expect.anything(), expect.objectContaining({
+      mirrorToJournal: true, fullText: '[Voice note transcription]: later please', preview: '🎤 later please',
+    }));
+  });
+
+  it.each([
+    ['failed', { status: 'failed' }],
+    ['none (journal has no cloud transcriber)', { status: 'none' }],
+    ['still pending after the wait', { status: 'pending' }],
+    ['done but empty', { status: 'done', transcript: '   ' }],
+    ['null (older journal, network error)', null],
+  ])('falls back to fetch + local whisper when the journal answer is %s', async (_label, answer) => {
+    const { route, deps } = makeRouter({
+      fetchTranscript: vi.fn(async () => answer),
+      fetchMedia: vi.fn(async () => ({ buffer: Buffer.from('a'), contentType: 'audio/mp4' })),
+    });
+    await route(session, voice, ctx);
+    expect(deps.fetchMedia).toHaveBeenCalledWith('vn-1');
+    expect(deps.transcribe).toHaveBeenCalledTimes(1);
+    expect(deps.injectText).toHaveBeenCalledWith(session, '[Voice note transcription]: hello world');
+  });
+
+  it('a throwing fetchTranscript falls back too (the router never throws)', async () => {
+    const { route, deps } = makeRouter({
+      fetchTranscript: vi.fn(async () => { throw new Error('boom'); }),
+      fetchMedia: vi.fn(async () => ({ buffer: Buffer.from('a'), contentType: 'audio/mp4' })),
+    });
+    await route(session, voice, ctx);
+    expect(deps.transcribe).toHaveBeenCalledTimes(1);
+    expect(deps.injectText).toHaveBeenCalledTimes(1);
+  });
+
+  it('is not asked for files, images, or audio the frame did not declare as audio', async () => {
+    const fetchTranscript = vi.fn(async () => ({ status: 'done', transcript: 'x' }));
+    const { route } = makeRouter({ fetchTranscript });
+    await route(session, { type: 'file', blobRef: 'f', contentType: 'application/pdf', name: 'a.pdf' }, ctx);
+    await route(session, { type: 'image', blobRef: 'i', contentType: 'image/png', name: 'a.png' }, ctx);
+    await route(session, { type: 'file', blobRef: 'o', contentType: 'application/octet-stream', name: 'a.bin' }, ctx);
+    expect(fetchTranscript).not.toHaveBeenCalled();
+  });
+});

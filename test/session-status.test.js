@@ -55,26 +55,44 @@ describe('subagentContextWindow', () => {
     expect(subagentContextWindow({ childModel: 'claude-haiku-4-5', parentModel: 'claude-opus-5-5', parentWindow: 1_000_000, contextTokens: 50_000 })).toBe(200_000);
   });
   it('stays 200k when the parent\'s window is 200k', () => {
-    expect(subagentContextWindow({ childModel: 'claude-opus-5-5', parentModel: 'claude-opus-5-5', parentWindow: 200_000, contextTokens: 100_000 })).toBe(200_000);
+    expect(subagentContextWindow({ childModel: 'claude-opus-4-6', parentModel: 'claude-opus-4-6', parentWindow: 200_000, contextTokens: 100_000 })).toBe(200_000);
   });
   it('reads the child\'s own id and gauge like any session: [1m], a 1M family, or a footprint above 200k', () => {
-    expect(subagentContextWindow({ childModel: 'claude-opus-5-5', contextTokens: 250_000 })).toBe(1_000_000);
+    expect(subagentContextWindow({ childModel: 'claude-opus-4-6', contextTokens: 250_000 })).toBe(1_000_000);
     expect(subagentContextWindow({ childModel: 'claude-fable-5', parentModel: 'claude-opus-5-5', parentWindow: 200_000 })).toBe(1_000_000);
-    expect(subagentContextWindow({ childModel: 'claude-opus-5-5', parentModel: 'claude-opus-5-5' })).toBe(200_000);
+    expect(subagentContextWindow({ childModel: 'claude-opus-4-6', parentModel: 'claude-opus-4-6' })).toBe(200_000);
   });
 });
 
 describe('contextWindowFor', () => {
-  it('gives 1m-class models their full window', () => {
+  // Claude Code's own model table (bundle 2.1.280, context.native_1m): Opus
+  // 4.7 and later, Sonnet 5, Fable and Mythos have a 1M window; Opus 4.0–4.6,
+  // Sonnet 4.x and Haiku 4.5 have 200k unless started with the [1m] marker.
+  it('gives natively-1M models their full window from the bare transcript id', () => {
+    expect(contextWindowFor('claude-opus-5-5')).toBe(1_000_000);
+    expect(contextWindowFor('claude-opus-5')).toBe(1_000_000);
+    expect(contextWindowFor('claude-opus-4-8')).toBe(1_000_000);
+    expect(contextWindowFor('claude-opus-4-7')).toBe(1_000_000);
+    expect(contextWindowFor('claude-sonnet-5')).toBe(1_000_000);
+    expect(contextWindowFor('claude-fable-5-1')).toBe(1_000_000);
     expect(contextWindowFor('claude-fable-5')).toBe(1_000_000);
     expect(contextWindowFor('claude-mythos-5')).toBe(1_000_000);
-    expect(contextWindowFor('claude-sonnet-4-5[1m]')).toBe(1_000_000);
   });
 
-  it('defaults everything else to 200k', () => {
-    expect(contextWindowFor('claude-opus-4-8')).toBe(200_000);
+  it('keeps the 200k models at 200k, [1m] marker aside', () => {
+    expect(contextWindowFor('claude-opus-4-6')).toBe(200_000);
+    expect(contextWindowFor('claude-opus-4-1-20250805')).toBe(200_000);
+    expect(contextWindowFor('claude-opus-4-20250514')).toBe(200_000);
+    expect(contextWindowFor('claude-sonnet-4-6')).toBe(200_000);
+    expect(contextWindowFor('claude-sonnet-4-5[1m]')).toBe(1_000_000);
     expect(contextWindowFor('claude-haiku-4-5-20251001')).toBe(200_000);
+    expect(contextWindowFor('claude-3-5-sonnet-20241022')).toBe(200_000);
     expect(contextWindowFor('<synthetic>')).toBe(200_000);
+  });
+
+  it('reads provider spellings of the same ids', () => {
+    expect(contextWindowFor('us.anthropic.claude-opus-5-5')).toBe(1_000_000);
+    expect(contextWindowFor('claude-opus-4-6@20260101')).toBe(200_000);
   });
 
   it('handles a missing model', () => {
@@ -109,20 +127,44 @@ describe('reconcileModelForWindow', () => {
 });
 
 describe('sessionContextWindow', () => {
-  it('trusts the [1m] alias the session was started with over the plain transcript id', () => {
+  it('a [1m] alias is 1M whatever the id says', () => {
+    expect(sessionContextWindow({ model: 'claude-sonnet-4-6', alias: 'sonnet[1m]' })).toBe(1_000_000);
     expect(sessionContextWindow({ model: 'claude-opus-5-5', alias: 'opus[1m]' })).toBe(1_000_000);
-    expect(sessionContextWindow({ model: 'claude-opus-5-5', alias: 'opus' })).toBe(200_000);
+  });
+  it('the plain `opus` alias is NOT 200k: Claude Code resolves it to Opus 5.5, a native-1M model (308k/200k on the roster, 3 Oct 2026)', () => {
+    expect(sessionContextWindow({ model: 'claude-opus-5-5', alias: 'opus', contextTokens: 120_000 })).toBe(1_000_000);
+    expect(sessionContextWindow({ model: 'claude-opus-5-5', alias: 'opus', contextTokens: 308_000 })).toBe(1_000_000);
+    expect(sessionContextWindow({ model: 'claude-opus-5-5', alias: 'default', contextTokens: 120_000 })).toBe(1_000_000);
+    expect(sessionContextWindow({ model: 'claude-opus-5-5' })).toBe(1_000_000);
     expect(sessionContextWindow({ model: 'claude-fable-5-1', alias: 'fable' })).toBe(1_000_000);
   });
-  it('a named alias is decisive: a stale gauge from the old window does not keep a switched-to 200k model at 1M', () => {
-    expect(sessionContextWindow({ model: 'claude-opus-5-5', alias: 'opus', contextTokens: 291_000 })).toBe(200_000);
-    expect(sessionContextWindow({ model: 'claude-opus-5-5', alias: 'default', contextTokens: 291_000 })).toBe(1_000_000);
-    expect(sessionContextWindow({ model: 'claude-fable-5-1', alias: 'default' })).toBe(1_000_000);
+  it('the id settles the window for the 200k models, and `sonnet`/`haiku` aliases stay 200k', () => {
+    expect(sessionContextWindow({ model: 'claude-opus-4-6', alias: 'opus' })).toBe(200_000);
+    expect(sessionContextWindow({ model: 'claude-sonnet-4-6', alias: 'sonnet' })).toBe(200_000);
+    expect(sessionContextWindow({ model: 'claude-haiku-4-5', alias: 'haiku' })).toBe(200_000);
   });
-  it('treats a gauge above 200k as proof of a 1M window when nothing names a size', () => {
-    expect(sessionContextWindow({ model: 'claude-opus-5-5', contextTokens: 291_000 })).toBe(1_000_000);
-    expect(sessionContextWindow({ model: 'claude-opus-5-5', contextTokens: 200_000 })).toBe(200_000);
-    expect(sessionContextWindow({ model: 'claude-opus-5-5', contextTokens: NaN })).toBe(200_000);
+  it('before the first transcript id, a family alias stands in for the model it resolves to', () => {
+    expect(sessionContextWindow({ alias: 'opus' })).toBe(1_000_000);
+    expect(sessionContextWindow({ alias: 'fable' })).toBe(1_000_000);
+    expect(sessionContextWindow({ alias: 'sonnet' })).toBe(200_000);
+    expect(sessionContextWindow({ alias: 'haiku' })).toBe(200_000);
+  });
+  it('`opusplan` is a mixed alias (Opus in plan mode, Sonnet otherwise): the id decides, and it rests on Sonnet before any id', () => {
+    expect(sessionContextWindow({ model: 'claude-sonnet-4-6', alias: 'opusplan', contextTokens: 50_000 })).toBe(200_000);
+    expect(sessionContextWindow({ model: 'claude-opus-5-5', alias: 'opusplan', contextTokens: 50_000 })).toBe(1_000_000);
+    expect(sessionContextWindow({ alias: 'opusplan' })).toBe(200_000);
+    expect(sessionContextWindow({ model: 'claude-sonnet-4-6', alias: 'opusplan[1m]' })).toBe(1_000_000);
+  });
+  it('a switch to another family makes the previous id stale: the alias decides until the new id arrives', () => {
+    // opus[1m] -> sonnet: the alias is sonnet, the last assistant record still
+    // says claude-opus-5-5 and the gauge still belongs to the old window.
+    expect(sessionContextWindow({ model: 'claude-opus-5-5', alias: 'sonnet', contextTokens: 291_000 })).toBe(200_000);
+    expect(sessionContextWindow({ model: 'claude-sonnet-4-6', alias: 'opus', contextTokens: 50_000 })).toBe(1_000_000);
+  });
+  it('treats a gauge above 200k as proof of a 1M window when nothing else names one', () => {
+    expect(sessionContextWindow({ model: 'claude-opus-4-6', contextTokens: 291_000 })).toBe(1_000_000);
+    expect(sessionContextWindow({ model: 'claude-opus-4-6', contextTokens: 200_000 })).toBe(200_000);
+    expect(sessionContextWindow({ model: 'claude-opus-4-6', contextTokens: NaN })).toBe(200_000);
     expect(sessionContextWindow({})).toBe(200_000);
   });
 });
@@ -213,7 +255,7 @@ describe('compactTriggerFrom', () => {
 
 describe('contextGaugeText', () => {
   it('formats tokens over the model window ("24k/200k")', () => {
-    expect(contextGaugeText(24_313, 'claude-opus-4-8')).toBe('24k/200k');
+    expect(contextGaugeText(24_313, 'claude-haiku-4-5')).toBe('24k/200k');
   });
 
   it('keeps one decimal under 10k and formats 1m-class windows', () => {
@@ -221,7 +263,7 @@ describe('contextGaugeText', () => {
   });
 
   it('passes sub-1k counts through raw', () => {
-    expect(contextGaugeText(950, 'claude-opus-4-8')).toBe('950/200k');
+    expect(contextGaugeText(950, 'claude-haiku-4-5')).toBe('950/200k');
   });
 
   it('returns null without a usable token count so callers fall back to non-numeric wording', () => {
@@ -273,8 +315,8 @@ describe('buildSessionStatus', () => {
   });
 
   it('rounds pct and clamps it to 100', () => {
-    expect(buildSessionStatus({ model: 'claude-opus-4-8', contextTokens: 1_000 }).context.pct).toBe(1);
-    expect(buildSessionStatus({ model: 'claude-opus-4-8', contextTokens: 300_000 }).context.pct).toBe(100);
+    expect(buildSessionStatus({ model: 'claude-haiku-4-5', contextTokens: 1_000 }).context.pct).toBe(1);
+    expect(buildSessionStatus({ model: 'claude-haiku-4-5', contextTokens: 300_000 }).context.pct).toBe(100);
   });
 
   it('includes the session workdir when known, omits it otherwise', () => {

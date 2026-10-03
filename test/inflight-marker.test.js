@@ -73,7 +73,7 @@ describe('takeStale', () => {
     const { marker } = harness({ initial: { 'convo-a': prev(940_000) } });
     const stale = marker.takeStale(6 * 3600 * 1000);
     expect(stale).toEqual([{
-      convoId: 'convo-a', roomId: 'room-x', startedAt: 935_000, touchedAt: 940_000, ageMs: 60_000,
+      convoId: 'convo-a', roomId: 'room-x', bootId: 'boot-1', startedAt: 935_000, touchedAt: 940_000, ageMs: 60_000,
     }]);
   });
 
@@ -161,7 +161,7 @@ describe('takeStale when the clear cannot be written', () => {
 
     const second = harness({ initial: first.state.data, bootId: 'boot-3' });
     expect(second.marker.takeStale(60_000)).toEqual([
-      { convoId: 'convo-1', roomId: 'room-1', startedAt: 999_000, touchedAt: 999_000, ageMs: 1_000 },
+      { convoId: 'convo-1', roomId: 'room-1', bootId: 'boot-1', startedAt: 999_000, touchedAt: 999_000, ageMs: 1_000 },
     ]);
     expect(second.state.data).toEqual({});  // this boot's clear did land
   });

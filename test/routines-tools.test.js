@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { createRoutineHandlers, describeSchedule, describeTrigger, formatRoutineList, formatRoutineLine, formatRoutineUpdateAck, formatRoutineRunAck, formatJournalRoutinesError, validateUpdateFields } from '../lib/routines-tools.js';
+import { createRoutineHandlers, describeSchedule, describeTrigger, formatRoutineList, formatRoutineLine, formatRoutineUpdateAck, formatRoutineRunAck, formatRoutineCreateAck, formatRoutineDeleteAck, formatJournalRoutinesError, validateUpdateFields, validateCreateFields } from '../lib/routines-tools.js';
 import { createRoutinesClient } from '../lib/routines-client.js';
 
 const NOW = Date.parse('2026-10-01T10:00:00Z'); // 11:00 BST
@@ -7,10 +7,12 @@ const sweep = { id: 'rt_01', name: 'daily-sweep', title: 'Daily sweep', schedule
 const health = { id: 'rt_02', name: 'session-health', title: 'Session health check', schedule: '0 */2 * * *', tz: 'Europe/London', prompt: 'p', enabled: false, origin: 'seed', next_at: null, last_fired_at: null, last_outcome: null };
 const window_ = { id: 'rt_03', name: 'deploy-window', title: 'Evening deploy window', schedule: '30 18 * * 1-5', tz: 'Europe/London', prompt: 'p', enabled: true, origin: 'user', next_at: Date.parse('2026-10-01T17:30:00Z'), last_fired_at: null, last_outcome: 'missed' };
 
-function fixture({ coordinator = true, list = { status: 200, data: { routines: [sweep, health, window_] } }, update = { status: 200, data: { routine: { ...sweep, enabled: false, next_at: null } } }, run = { status: 202, data: { accepted: true } } } = {}) {
+const triage = { name: 'exception-triage', title: 'Exception and alert triage', schedule: '30 8,16 * * *', tz: 'Europe/London', prompt: 'Routine exception-triage: follow the exception-triage-routine memory.' };
+
+function fixture({ coordinator = true, list = { status: 200, data: { routines: [sweep, health, window_] } }, update = { status: 200, data: { routine: { ...sweep, enabled: false, next_at: null } } }, run = { status: 202, data: { accepted: true } }, create = { status: 201, data: { routine: { ...sweep, id: 'rt_new', name: 'exception-triage', title: 'Exception and alert triage', schedule: '30 8,16 * * *', origin: 'agent', last_fired_at: null, last_outcome: null } } }, remove = { status: 200, data: { ok: true } } } = {}) {
   const session = { roomId: '!r:s', coordinator, journalConvoId: 'c-coord' };
   const sessions = new Map([['!r:s', session]]);
-  const client = { list: vi.fn(async () => list), update: vi.fn(async () => update), run: vi.fn(async () => run) };
+  const client = { list: vi.fn(async () => list), update: vi.fn(async () => update), run: vi.fn(async () => run), create: vi.fn(async () => create), remove: vi.fn(async () => remove) };
   const h = createRoutineHandlers({ sessions, journalConvoIdFor: (s) => s?.journalConvoId ?? null, client, now: () => NOW });
   return { h, client, session };
 }
@@ -18,7 +20,7 @@ function fixture({ coordinator = true, list = { status: 200, data: { routines: [
 describe('routine handlers', () => {
   it('refuse a non-Coordinator session before any journal call, and the usual session guards', async () => {
     const { h, client } = fixture({ coordinator: false });
-    for (const call of [h.list({ roomId: '!r:s' }), h.update({ roomId: '!r:s', name: 'daily-sweep', enabled: false }), h.run({ roomId: '!r:s', name: 'daily-sweep' })]) {
+    for (const call of [h.list({ roomId: '!r:s' }), h.update({ roomId: '!r:s', name: 'daily-sweep', enabled: false }), h.run({ roomId: '!r:s', name: 'daily-sweep' }), h.create({ roomId: '!r:s', ...triage }), h.remove({ roomId: '!r:s', name: 'daily-sweep' })]) {
       const r = await call;
       expect(r.status).toBe(403);
       expect(r.body.error).toMatch(/not the Coordinator/);
@@ -26,6 +28,8 @@ describe('routine handlers', () => {
     expect(client.list).not.toHaveBeenCalled();
     expect(client.update).not.toHaveBeenCalled();
     expect(client.run).not.toHaveBeenCalled();
+    expect(client.create).not.toHaveBeenCalled();
+    expect(client.remove).not.toHaveBeenCalled();
     expect((await h.list({})).status).toBe(400);
     expect((await h.list({ roomId: '!other' })).status).toBe(404);
     const noConvo = fixture();
@@ -78,6 +82,53 @@ describe('routine handlers', () => {
     expect(r.status).toBe(202);
     expect(r.body).toEqual({ accepted: true });
     expect(client.run.mock.calls[0]).toEqual(['daily-sweep', { convo_id: 'c-coord' }]);
+  });
+});
+
+describe('routine create and delete', () => {
+  it('create validates with reasons, then POSTs the fields with the Coordinator convo_id', async () => {
+    const { h, client } = fixture();
+    expect((await h.create({ roomId: '!r:s', ...triage, name: 'Exception Triage' })).body.error).toMatch(/lowercase letters, digits and dashes/);
+    expect((await h.create({ roomId: '!r:s', ...triage, title: undefined })).body.error).toMatch(/title is required/);
+    expect((await h.create({ roomId: '!r:s', ...triage, prompt: undefined })).body.error).toMatch(/prompt is required/);
+    expect((await h.create({ roomId: '!r:s', ...triage, title: null })).body.error).toMatch(/title is required/);
+    expect((await h.create({ roomId: '!r:s', ...triage, prompt: null })).body.error).toMatch(/prompt is required/);
+    expect((await h.create({ roomId: '!r:s', ...triage, schedule: undefined })).body.error).toMatch(/schedule or a trigger/);
+    expect((await h.create({ roomId: '!r:s', ...triage, trigger: { kind: 'disk_under', pct: 20 } })).body.error).toMatch(/not both/);
+    expect((await h.create({ roomId: '!r:s', ...triage, schedule: 'twice daily' })).body.error).toMatch(/five cron fields/);
+    expect((await h.create({ roomId: '!r:s', ...triage, origin: 'user' })).body.error).toMatch(/not a routine field/);
+    expect(client.create).not.toHaveBeenCalled();
+    const r = await h.create({ roomId: '!r:s', ...triage, title: ' Exception and alert triage ' });
+    expect(r.status).toBe(201);
+    expect(client.create.mock.calls[0]).toEqual([{ ...triage, convo_id: 'c-coord' }]);
+    // A triggered routine and a paused one; tz may be left to the journal.
+    await h.create({ roomId: '!r:s', name: 'disk-tight', title: 'Disk tight', prompt: 'p', trigger: { kind: 'disk_under', pct: 10 }, enabled: false });
+    expect(client.create.mock.calls[1]).toEqual([{ name: 'disk-tight', title: 'Disk tight', prompt: 'p', trigger: { kind: 'disk_under', pct: 10 }, enabled: false, convo_id: 'c-coord' }]);
+    // Journal refusals become sentences; an older journal says to deploy.
+    expect((await fixture({ create: { status: 409, data: { error: 'conflict', blocked_by: 'name' } } }).h.create({ roomId: '!r:s', ...triage })).body.error).toMatch(/already exists/);
+    expect((await fixture({ create: { status: 400, data: { error: 'bad_request' } } }).h.create({ roomId: '!r:s', ...triage, schedule: '* * * * *' })).body.error).toMatch(/15 minutes apart/);
+    expect((await fixture({ create: { status: 404, data: { error: 'not_found' } } }).h.create({ roomId: '!r:s', ...triage })).body.error).toMatch(/\/routines routes yet/);
+  });
+
+  it('delete checks the name, then DELETEs with the Coordinator convo_id', async () => {
+    const { h, client } = fixture();
+    expect((await h.remove({ roomId: '!r:s', name: 'bad name' })).status).toBe(400);
+    expect(client.remove).not.toHaveBeenCalled();
+    const r = await h.remove({ roomId: '!r:s', name: 'daily-sweep' });
+    expect(r).toEqual({ status: 200, body: { ok: true } });
+    expect(client.remove.mock.calls[0]).toEqual(['daily-sweep', { convo_id: 'c-coord' }]);
+    expect((await fixture({ remove: { status: 404, data: { error: 'not_found' } } }).h.remove({ roomId: '!r:s', name: 'nope' })).body.error).toMatch(/^no routine named "nope"/);
+    // A journal from before Coordinator deletes refuses every agent.
+    expect((await fixture({ remove: { status: 403, data: { error: 'forbidden' } } }).h.remove({ roomId: '!r:s', name: 'daily-sweep' })).body.error).toMatch(/deploy the journal update/);
+  });
+
+  it('acks and validateCreateFields', () => {
+    const created = { ...sweep, name: 'exception-triage', title: 'Exception and alert triage', schedule: '30 8,16 * * *', next_at: Date.now() + 3_600_000, last_fired_at: null, last_outcome: null };
+    expect(formatRoutineCreateAck({ routine: created })).toMatch(/^Created exception-triage\. - exception-triage — Exception and alert triage · daily at 08:30 and 16:30 Europe\/London · next in 1 h/);
+    expect(formatRoutineCreateAck({ routine: { ...created, enabled: false } })).toMatch(/^Created exception-triage, paused/);
+    expect(formatRoutineDeleteAck('daily-sweep')).toMatch(/^Deleted daily-sweep/);
+    expect(validateCreateFields({ ...triage, roomId: 'r' })).toEqual({ ok: true, value: triage });
+    expect(validateCreateFields({ ...triage, tz: undefined }).value).toEqual({ name: triage.name, title: triage.title, schedule: triage.schedule, prompt: triage.prompt });
   });
 });
 
@@ -143,10 +194,14 @@ describe('createRoutinesClient', () => {
     expect(await c.list()).toEqual({ status: 200, data: { routines: [] } });
     await c.update('daily-sweep', { enabled: false, convo_id: 'c' });
     await c.run('a/b', { convo_id: 'c' });
+    await c.create({ name: 'x', convo_id: 'c' });
+    await c.remove('x', { convo_id: 'c' });
     expect(calls).toEqual([
       ['http://j/routines', 'GET', undefined],
       ['http://j/routines/daily-sweep', 'PATCH', JSON.stringify({ enabled: false, convo_id: 'c' })],
       ['http://j/routines/a%2Fb/run', 'POST', JSON.stringify({ convo_id: 'c' })],
+      ['http://j/routines', 'POST', JSON.stringify({ name: 'x', convo_id: 'c' })],
+      ['http://j/routines/x', 'DELETE', JSON.stringify({ convo_id: 'c' })],
     ]);
     expect(fetchImpl.mock.calls[0][1].headers.Authorization).toBe('Bearer t');
     expect(await createRoutinesClient({ baseUrl: '', token: 't' }).list()).toEqual({ status: 0, data: { error: 'journal unreachable' } });

@@ -96,6 +96,14 @@ describe('consent formatting', () => {
     expect(text).toContain('consent_decide(kind: "spawn", id: "sp-1", decision: approve|decline, reason: …)');
     expect(text.split('\n')).toHaveLength(4);
   });
+  it('formatPendingAsk: a no-model spawn onto a Fable-maxed box says it will run on Opus; a named model wins', () => {
+    const { model: _, ...noModel } = spawnAsk;
+    const text = formatPendingAsk({ ...noModel, fallback_model: 'opus', fallback_reason: 'fable_limit' }, { now: NOW });
+    expect(text).toContain('directory: /home/dan/proj · model: opus — the box is at its Fable weekly limit · joins mission #61');
+    const named = formatPendingAsk({ ...spawnAsk, fallback_model: 'opus', fallback_reason: 'fable_limit' }, { now: NOW });
+    expect(named).toContain('· model: opus[1m] · joins');
+    expect(named).not.toMatch(/Fable weekly limit/);
+  });
   it('formatPendingAsk: a chat invite names both sides, the topic, the justification and the call; a join names the room', () => {
     const text = formatPendingAsk(chatAsk, { now: NOW });
     expect(text).toContain('chat room-1/12 — 3 h ago: dev-2 — session "Dev 2" [c-2] asks to chat with eric — session "Eric session" about "review" (box online)');

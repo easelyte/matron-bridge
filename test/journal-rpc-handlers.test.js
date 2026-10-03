@@ -672,6 +672,96 @@ describe('start', () => {
       expect('model' in calls[0]).toBe(false);
     });
 
+    // Fable-limit fallback (lib/fable-fallback.js): asked only when no model
+    // was named on a Claude start; its answer runs the session and the
+    // reply names the swap so the journal can tell the parent.
+    describe('start model fallback', () => {
+      const OPUS = { model: 'opus', reason: 'fable_limit' };
+
+      it('no model named: the fallback model runs and the reply says so', () => {
+        const calls = [];
+        const { handler, responses } = harness({
+          startSession: (args) => { calls.push(args); return { claudeSessionId: 'c1' }; },
+          startModelFallback: () => OPUS,
+        });
+        handler(REQ('start', {}));
+        expect(calls[0].model).toBe('opus');
+        expect(responses[0]).toMatchObject({ ok: true, result: { convo_id: 'c1', model: 'opus', model_reason: 'fable_limit' } });
+      });
+
+      it('an explicit model always wins — the fallback is not even asked', () => {
+        const calls = [];
+        let asked = 0;
+        const { handler, responses } = harness({
+          startSession: (args) => { calls.push(args); return { claudeSessionId: 'c1' }; },
+          startModelFallback: () => { asked++; return OPUS; },
+        });
+        handler(REQ('start', { model: 'fable' }));
+        expect(asked).toBe(0);
+        expect(calls[0].model).toBe('fable');
+        expect(responses[0].result).toEqual({ convo_id: 'c1' });
+      });
+
+      it('not asked for a Codex start', () => {
+        let asked = 0;
+        const calls = [];
+        const { handler } = harness({
+          defaultAgent: 'codex',
+          startSession: (args) => { calls.push(args); return { claudeSessionId: 'c1' }; },
+          startModelFallback: () => { asked++; return OPUS; },
+        });
+        handler(REQ('start', {}));
+        expect(asked).toBe(0);
+        expect('model' in calls[0]).toBe(false);
+      });
+
+      it('null, a throw, or a junk answer: the box default runs and the reply is unchanged', () => {
+        for (const startModelFallback of [
+          () => null,
+          () => { throw new Error('boom'); },
+          () => ({ model: 'gpt-5', reason: 'fable_limit' }),
+          () => ({ model: 'opus' }),
+        ]) {
+          const calls = [];
+          const { handler, responses } = harness({
+            startSession: (args) => { calls.push(args); return { claudeSessionId: 'c1' }; },
+            startModelFallback,
+          });
+          handler(REQ('start', {}));
+          expect('model' in calls[0]).toBe(false);
+          expect(responses[0]).toMatchObject({ ok: true, result: { convo_id: 'c1' } });
+          expect(responses[0].result).not.toHaveProperty('model_reason');
+        }
+      });
+
+      it('a promised answer is awaited before the session starts', async () => {
+        const calls = [];
+        let release;
+        const { handler, responses } = harness({
+          startSession: (args) => { calls.push(args); return { claudeSessionId: 'c1' }; },
+          startModelFallback: () => new Promise((resolve) => { release = resolve; }),
+        });
+        handler(REQ('start', {}));
+        expect(calls).toHaveLength(0);
+        release(OPUS);
+        await vi.waitFor(() => expect(responses).toHaveLength(1));
+        expect(calls[0].model).toBe('opus');
+        expect(responses[0].result).toMatchObject({ model: 'opus', model_reason: 'fable_limit' });
+      });
+
+      it('a rejected promise starts on the box default', async () => {
+        const calls = [];
+        const { handler, responses } = harness({
+          startSession: (args) => { calls.push(args); return { claudeSessionId: 'c1' }; },
+          startModelFallback: () => Promise.reject(new Error('usage fetch failed')),
+        });
+        handler(REQ('start', {}));
+        await vi.waitFor(() => expect(responses).toHaveLength(1));
+        expect(responses[0].ok).toBe(true);
+        expect('model' in calls[0]).toBe(false);
+      });
+    });
+
     it('bad_model on an unknown alias — and no session is spawned', () => {
       const calls = [];
       const { handler, responses } = harness({

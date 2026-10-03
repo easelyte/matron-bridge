@@ -14,6 +14,8 @@ import { createProjectsClient } from './lib/projects-client.js';
 import { createProjectsHandlers } from './lib/projects-tools.js';
 import { createConsentClient } from './lib/consent-client.js';
 import { createConsentHandlers, formatConsentNudge } from './lib/consent-tools.js';
+import { createSharingClient } from './lib/sharing-client.js';
+import { createSharingHandlers } from './lib/sharing-tools.js';
 import { createUnseenClient } from './lib/unseen-client.js';
 import { createUnseenHandlers, formatUnseenNudge } from './lib/unseen-tools.js';
 import { createRoutinesClient } from './lib/routines-client.js';
@@ -91,6 +93,16 @@ import { liveLogDir, liveLogPath as liveLogPathFor } from './lib/live-log-dir.js
 import { killProcessTree } from './lib/process-kill.js';
 import { processTableCommand } from './lib/process-table.js';
 import { installShutdownToken, decideShutdown } from './lib/shutdown-endpoint.js';
+import {
+  createCodeUpdateWatcher, resolveGitDir, readHeadReflog, defaultPreflight,
+  restartEnabled as codeUpdateRestartEnabled, parseMs as parseCodeUpdateMs,
+  autoCarryOnEnabled as codeUpdateAutoCarryOnEnabled, writeSelfRestartStamp, takeSelfRestartStamp, selectAutoCarryOn,
+  AUTO_CARRY_ON_TEXT as CODE_UPDATE_AUTO_CARRY_ON_TEXT, AUTO_CARRY_ON_DELAY_MS as CODE_UPDATE_AUTO_CARRY_ON_DELAY_MS,
+  RESTART_EXIT_CODE as CODE_UPDATE_EXIT_CODE,
+  DEFAULT_POLL_MS as CODE_UPDATE_POLL_DEFAULT_MS, DEFAULT_SETTLE_MS as CODE_UPDATE_SETTLE_DEFAULT_MS,
+  DEFAULT_WARN_EVERY_MS as CODE_UPDATE_WARN_EVERY_DEFAULT_MS, DEFAULT_FORCE_AFTER_MS as CODE_UPDATE_FORCE_AFTER_DEFAULT_MS,
+  parseMsOrOff as parseCodeUpdateMsOrOff,
+} from './lib/code-update-restart.js';
 import { createSubagentConvoTracker } from './lib/subagent-convos.js';
 import { createQueuedReleaseOutbox } from './lib/queued-release-outbox.js';
 import { createSubagentRunningStore } from './lib/subagent-running-store.js';
@@ -182,13 +194,14 @@ import { codexOneShot } from './lib/codex-oneshot.js';
 import { makeJournalSummaryPublisher, summaryForJournal, summaryJournalPublishEnabled, updatePinnedSummary } from './lib/pinned-summary.js';
 import { SUMMARY_MIN_NEW } from './lib/summary-pass.js';
 import { activityStateChanged, truncateActivityDetail, shouldResumeThinkingAfterTool } from './lib/journal-activity.js';
-import { streamRefFor } from './lib/journal-stream.js';
+import { streamRefFor, armReplyRef, settleReplyRef } from './lib/journal-stream.js';
 import { contextFullToNative, briefContextReport } from './lib/context-command.js';
 import { buildSessionStatus, publishedExtras, contextTokensFromAssistantEvent, postCompactContextTokens, compactTriggerFrom, contextGaugeText, sessionContextWindow, emailFromClaudeConfig, isSidechainEvent, reconcileModelForWindow, hostVitals, startCpuSampler, stopCpuSampler, cpuPercent, ramPercent, cpuSampledAtMs, statusRepaintDue } from './lib/session-status.js';
 import { stallFromAssistantEvent, stallResetsAt } from './lib/stall-detector.js';
+import { spawnModelFallback, stallModelFallback, isFableModel } from './lib/fable-fallback.js';
 import { planSessionControl, validateControlParams, controlNotice, authorizeControl, mergeParkedSlot, JOURNAL_DEVICE_ID, JOURNAL_ONLY_ACTIONS, CONTROL_KINDS, TURN_STARTING_OPS, occupied as controlOccupied } from './lib/session-control.js';
 import { createSessionControlHandlers } from './lib/session-control-client.js';
-import { armFromStall, dueResumes, autoResumeDue, shouldCompactBefore, AUTO_RESUME_TEXT, BAD_MODEL_RECOVERY_TEXT } from './lib/auto-resume.js';
+import { armFromStall, dueResumes, autoResumeDue, shouldCompactBefore, AUTO_RESUME_TEXT, BAD_MODEL_RECOVERY_TEXT, FABLE_SWITCH_TEXT } from './lib/auto-resume.js';
 import {
   AGENT_CLAUDE,
   AGENT_CODEX,
@@ -313,6 +326,22 @@ let _lastVitalsPublished = null; // { cpu, ram, at } of the last emitted frame
 // long to hold memory for an idle session), and 1h would mean restarting the
 // bridge before a long meeting silently loses the card.
 const RESTART_CARRY_ON_MAX_AGE_MS = parseInt(process.env.MATRON_RESTART_CARRY_ON_MAX_AGE_MS || '21600000', 10);
+// Restart onto new code by itself (lib/code-update-restart.js): poll the
+// checkout's HEAD reflog, let a landed update settle, then exit for the
+// supervisor at the first poll with no session mid-turn — never while a
+// turn runs (deploy-1's production deploy was killed by the old 30 min cap
+// on 2026-10-03), unless MATRON_CODE_UPDATE_FORCE_AFTER_MS opts a box in.
+// MATRON_CODE_UPDATE_RESTART=0 switches it off.
+const CODE_UPDATE_RESTART = codeUpdateRestartEnabled(process.env.MATRON_CODE_UPDATE_RESTART);
+const CODE_UPDATE_POLL_MS = parseCodeUpdateMs(process.env.MATRON_CODE_UPDATE_POLL_MS, CODE_UPDATE_POLL_DEFAULT_MS);
+const CODE_UPDATE_SETTLE_MS = parseCodeUpdateMs(process.env.MATRON_CODE_UPDATE_SETTLE_MS, CODE_UPDATE_SETTLE_DEFAULT_MS);
+const CODE_UPDATE_WARN_EVERY_MS = parseCodeUpdateMs(process.env.MATRON_CODE_UPDATE_WARN_EVERY_MS, CODE_UPDATE_WARN_EVERY_DEFAULT_MS);
+const CODE_UPDATE_FORCE_AFTER_MS = parseCodeUpdateMsOrOff(process.env.MATRON_CODE_UPDATE_FORCE_AFTER_MS, CODE_UPDATE_FORCE_AFTER_DEFAULT_MS);
+// A self-restart that had to cut turns off (FORCE_AFTER, opt-in) leaves this
+// stamp; the next boot resumes those chats by itself instead of carding
+// them. MATRON_CODE_UPDATE_AUTO_CARRY_ON=0 keeps the tap.
+const CODE_UPDATE_AUTO_CARRY_ON = codeUpdateAutoCarryOnEnabled(process.env.MATRON_CODE_UPDATE_AUTO_CARRY_ON);
+const SELF_RESTART_STAMP_FILE = path.join(os.homedir(), '.matron-bridge-self-restart.json');
 
 // Resume-readiness gate (iv-mode). A freshly-spawned `claude --resume` takes
 // several seconds to load the transcript — and longer if it auto-compacts —
@@ -612,6 +641,14 @@ const projectsClient = createProjectsClient({
 // Coordinator consent approval (spec 2026-09-29 coordinator consent): same
 // base URL and token; the consent_list / consent_decide tools.
 const consentClient = createConsentClient({
+  baseUrl: journalHttpBase,
+  token: _journalToken,
+});
+
+// Contacts and grants (spec: matron-journal 2026-10-02 matron-to-matron
+// sharing, phase 1): same base URL and token; the contact_* and
+// mission_share tools and the shared reads of mission_list / mission_get.
+const sharingClient = createSharingClient({
   baseUrl: journalHttpBase,
   token: _journalToken,
 });
@@ -1152,6 +1189,7 @@ function persistSession(roomId, sessionId, workdir, originRoomId, extra, { failL
   if (live) derived._deferredControls = live._deferredControls || null;
   if (live) derived._autoResume = live._autoResume || null;
   if (live) derived._badModelRecovered = !!live._badModelRecovered;
+  if (live) derived._fableStallSwitched = !!live._fableStallSwitched;
   if (live) derived._autoResumeRetries = live._autoResumeRetries || 0;
   // The last gauge, so a resumed session knows whether to compact before it
   // carries on (lib/auto-resume.js shouldCompactBefore).
@@ -1457,6 +1495,11 @@ const journalRpcHandler = createRpcRequestHandler({
   // (lib/journal-rpc.js start). Late-bound — missionsHandlers is constructed
   // further down; this only runs once the socket is live.
   joinMission: (session, num) => missionsHandlers.join({ roomId: session.roomId, num }),
+  // Fable-limit fallback (lib/fable-fallback.js): a no-model start on a box
+  // whose Fable weekly meter is spent runs on Opus instead of stalling on
+  // its first turn. Late-bound like joinMission (usageLimitsCache is
+  // declared further down).
+  startModelFallback: () => startModelFallbackFromLimits(),
   // Read-only `local_memories` / `local_memory_get`: this box's CLAUDE.md
   // files and ~/.claude/projects/*/memory/ (lib/local-memories.js). The
   // repo list is the picker's own folder history.
@@ -1994,8 +2037,9 @@ function publishEditDiffToConvo(session, convoId, toolName, input) {
 const LIMITS_REFRESH_MS = parseInt(process.env.LIMITS_REFRESH_MS || '300000', 10); // 5 min
 // fetchedAt = when the held lines were measured (box_status limits.as_of);
 // attemptedAt = last fetch attempt, success or failure (the throttle). Kept
-// apart so a failed refresh never re-stamps old quotas as fresh.
-const usageLimitsCache = { lines: null, fetchedAt: 0, attemptedAt: 0, inflight: null };
+// apart so a failed refresh never re-stamps old quotas as fresh. okAt mirrors
+// fetchedAt (upstream's name for the same instant; its freshness checks read it).
+const usageLimitsCache = { lines: null, fetchedAt: 0, attemptedAt: 0, okAt: 0, inflight: null };
 const codexAccountReader = createCodexAccountReader();
 // Codex quota lines for box_status (wire contract 2026-09-26 §1): the
 // account-scoped `account/rateLimits/read` query via the shared reader, on the
@@ -2071,6 +2115,7 @@ function refreshUsageLimits(cwd, { force = false } = {}) {
       if (parsed.ok) {
         usageLimitsCache.lines = parsed.lines;
         usageLimitsCache.fetchedAt = usageLimitsCache.attemptedAt;
+        usageLimitsCache.okAt = usageLimitsCache.fetchedAt;
         // Fresh numbers: the journal's copy of this box's status is stale
         // the moment they land.
         publishBoxStatus('limits refresh');
@@ -2084,6 +2129,29 @@ function refreshUsageLimits(cwd, { force = false } = {}) {
     })
     .finally(() => { usageLimitsCache.inflight = null; });
   return usageLimitsCache.inflight;
+}
+
+// The reading a no-model start decides its model on. A cache this fresh is
+// used as it stands; an older one (the box may have idled for hours while
+// other boxes on the same account spent the meter) is refreshed first — a
+// /usage one-shot takes ~10 s — after which whatever the cache holds
+// decides. Budget against the journal's 30 s start timeout: this wait (12 s)
+// plus the mission pre-join's joinDeadlineMs (5 s) run in sequence before
+// the reply; startSession itself returns at spawn, not at Claude's boot.
+// Raise either and the sum must stay well under 30 s, or the journal fails
+// a spawn this bridge goes on to start.
+const START_LIMITS_FRESH_MS = 15 * 60 * 1000;
+const START_LIMITS_WAIT_MS = 12_000;
+function startModelFallbackFromLimits() {
+  const decide = () => spawnModelFallback({ defaultModel: DEFAULT_MODEL, lines: usageLimitsCache.lines });
+  // Nothing to fall back from: skip the /usage spawn entirely.
+  if (!isFableModel(DEFAULT_MODEL)) return null;
+  if (usageLimitsCache.lines && Date.now() - usageLimitsCache.okAt < START_LIMITS_FRESH_MS) return decide();
+  const refresh = refreshUsageLimits(DEFAULT_WORKDIR, { force: true });
+  if (!refresh) return decide();
+  let timer;
+  const deadline = new Promise((resolve) => { timer = setTimeout(resolve, START_LIMITS_WAIT_MS); timer.unref?.(); });
+  return Promise.race([refresh.catch(() => false), deadline]).then(() => { clearTimeout(timer); return decide(); });
 }
 
 // Logged-in account email for the status frame, read from ~/.claude.json's
@@ -2645,6 +2713,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     _deferredControls: persistedMode?._deferredControls || null,
     _autoResume: persistedMode?._autoResume || null,
     _badModelRecovered: !!persistedMode?._badModelRecovered,
+    _fableStallSwitched: !!persistedMode?._fableStallSwitched,
     _autoResumeRetries: persistedMode?._autoResumeRetries || 0,
     _lastContextTokens: Number.isFinite(persistedMode?._lastContextTokens) ? persistedMode._lastContextTokens : undefined,
     // Accumulated usage stats
@@ -3501,6 +3570,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     _deferredControls: persistedForRoom?._deferredControls || null,
     _autoResume: persistedForRoom?._autoResume || null,
     _badModelRecovered: !!persistedForRoom?._badModelRecovered,
+    _fableStallSwitched: !!persistedForRoom?._fableStallSwitched,
     _autoResumeRetries: persistedForRoom?._autoResumeRetries || 0,
     _lastContextTokens: Number.isFinite(persistedForRoom?._lastContextTokens) ? persistedForRoom._lastContextTokens : undefined,
     totalUsage: { input_tokens: 0, output_tokens: 0, cache_read: 0, cache_create: 0, cost_usd: 0 },
@@ -4816,6 +4886,9 @@ function handleClaudeEvent(session, event) {
               persistControlState(session);
             }
             journalStatus(session);
+            // Decided on these fresh meters, after the carry-on is armed: a
+            // switch brings it forward, no switch leaves it for the reset.
+            if (session._stall.kind === 'usage_limit') switchFableStall(session);
           });
         }
       } else if (assistantCtxTokens) {
@@ -4826,9 +4899,10 @@ function handleClaudeEvent(session, event) {
         // (a resume-time filler that reaches the API counts, because it
         // could only have been served past the limit).
         session._stall = null;
-        if (session._autoResume || session._badModelRecovered || session._autoResumeRetries) {
+        if (session._autoResume || session._badModelRecovered || session._fableStallSwitched || session._autoResumeRetries) {
           session._autoResume = null;
           session._badModelRecovered = false;
+          session._fableStallSwitched = false;
           session._autoResumeRetries = 0;
           persistControlState(session);
         }
@@ -5834,14 +5908,14 @@ function flushResponse(session) {
   }
 
   // Arm the durable ref for the very next journal mirror (the first chunk's
-  // sendToRoom) so the streamed overlay retires by ref. Only when an overlay is
-  // actually open for this session (print-mode streamed this message) AND a
-  // callback will drive sendToRoom synchronously — otherwise the arm would leak
-  // onto a later, unrelated publish. journalStreamClear (at turn-end) clears
-  // any overlay this flush didn't retire.
-  if (session._journalStreamRef && session.sendCallback) {
-    session._journalDurableRef = session._journalStreamRef;
-  }
+  // sendToRoom): the streamed overlay's ref when one is open, so the overlay
+  // retires by ref, otherwise a fresh one, so every reply's text event can be
+  // pointed at (the summary pass's spoken_ref — see lib/journal-stream.js).
+  // Only when a callback will drive sendToRoom synchronously; settleReplyRef
+  // below disarms a fresh ref that no text event took, so it cannot leak onto
+  // a later, unrelated publish. journalStreamClear (at turn-end) clears any
+  // overlay this flush didn't retire.
+  const armedReply = armReplyRef(session);
 
   if (session.sendCallback) {
     const chunks = splitMessage(text);
@@ -5849,6 +5923,10 @@ function flushResponse(session) {
       session.sendCallback(chunk);
     }
   }
+  // Remember which ref this reply's text event carried (session._lastReplyRef)
+  // for the turn-end summary pass — unless the pass will never see this reply
+  // (code only, kept out of chatHistory above).
+  settleReplyRef(session, armedReply, { summarised: Boolean(cleanText) });
   // Bump idle clock whenever we have assistant text to flush, regardless
   // of whether a callback is wired. The guard above is about output
   // delivery; the activity timestamp is about session liveness.
@@ -9331,6 +9409,9 @@ function isCanonicalLiveSession(session) {
 const journalMediaRouter = createJournalMediaRouter({
   fetchMedia: (blobRef) => journalPublisher.fetchMedia(blobRef),
   transcribe: async (buffer, mime) => transcribeAudio(buffer, mime, { modelPath: WHISPER_MODEL_PATH, language: WHISPER_LANGUAGE, prompt: await whisperPrompt() }),
+  // A journal with a cloud transcriber has the words already; this box's
+  // whisper is the fallback (older journal, no key, failed or slow job).
+  fetchTranscript: (blobRef) => journalPublisher.fetchTranscript(blobRef),
   // A video becomes a directory of timestamped key-frame JPEGs plus one text
   // turn listing them — claude Reads frames selectively, so a long recording
   // costs context only for the frames actually opened. Frames land next to
@@ -9426,7 +9507,7 @@ const journalMediaRouter = createJournalMediaRouter({
 // immediate sendTextToSession); a saved file/image is marked journal-origin so
 // it never re-mirrors. Async: notifyQueuedMessage awaits the tile send, exactly
 // like the text path.
-async function journalQueueMedia(session, { blocks, mirrorToJournal, preview, fullText, cleanup }) {
+async function journalQueueMedia(session, { blocks, mirrorToJournal, preview, fullText, cleanup, source = null }) {
   if (!session.queuedMessages) session.queuedMessages = [];
   const entry = [...blocks];
   if (!mirrorToJournal) markJournalOrigin(entry);
@@ -9449,6 +9530,7 @@ async function journalQueueMedia(session, { blocks, mirrorToJournal, preview, fu
       fullText,
       // Same capability gate as the text path above.
       allowSendOne: session.agent !== AGENT_CODEX,
+      source,
     });
   } catch (e) {
     console.warn(`[journal-media] queued-tile notify failed (media is queued): ${e.message}`);
@@ -9477,11 +9559,12 @@ const itemTurnRouter = createItemTurnRouter({
   saveAttachments: saveItemAttachments,
   transcribe: async (buffer, mime) => transcribeAudio(buffer, mime, { modelPath: WHISPER_MODEL_PATH, language: WHISPER_LANGUAGE, prompt: await whisperPrompt() }),
   injectBlocks: (session, blocks) => sendToSession(session, blocks, { skipJournalMirror: true }),
-  queueText: (session, { text, preview }) => journalQueueMedia(session, {
+  queueText: (session, { text, preview, source }) => journalQueueMedia(session, {
     blocks: [{ type: 'text', text }],
     mirrorToJournal: false,
     preview,
     fullText: text,
+    source,
   }),
   publishNotice: journalPublishNotice,
   // The journal strips any client-supplied transcript, so a voice note on an
@@ -9943,10 +10026,14 @@ function sleepingConvoIdFor(roomId) {
 // would surface as an unhandled rejection rather than as a message to the
 // user. Same stance as journalRouteTextToSession's other non-awaiting caller,
 // the router's routeTextToSession adapter.
-async function carryOnConvo(convoId, session, _sendReply) {
+// `text` is what the resumed session receives; `resumeNotice` is what the
+// chat is told while it comes back (the automatic path after a self-restart
+// says why — the default "session was idle, your message will be delivered"
+// copy would be wrong there: no message is coming).
+async function carryOnConvo(convoId, session, _sendReply, text = 'carry on', resumeNotice = undefined) {
   try {
     let target = session && session.alive ? session : findSessionByClaudeSessionId(convoId);
-    if (!target || !target.alive) target = journalResumeConvo(convoId);
+    if (!target || !target.alive) target = journalResumeConvo(convoId, resumeNotice);
     if (!target) {
       // A carry-on tap always originates in a Matron journal chat (the card
       // is only ever published there — see publishRestartCarryOnCards), so
@@ -9960,7 +10047,7 @@ async function carryOnConvo(convoId, session, _sendReply) {
       journalPublishNotice(convoId, '⚠️ That conversation can no longer be found or resumed.');
       return;
     }
-    await journalRouteTextToSession(target, 'carry on');
+    await journalRouteTextToSession(target, text);
   } catch (e) {
     console.warn(`[inflight] carry-on delivery failed for convo=${convoId}: ${e.message}`);
     journalPublishNotice(convoId, `⚠️ Could not carry on: ${e.message}`);
@@ -10305,6 +10392,17 @@ async function fireAutoResume(roomId, convoId, slot) {
   // A deferred model recovery is retried as a recovery, not as a turn on
   // the still-unavailable model.
   if (slot.kind === 'bad_model') { recoverBadModel(session); return; }
+  // Likewise a deferred Fable-stall switch: retried, and when it no longer
+  // applies the session goes back to waiting for its reset.
+  if (slot.kind === 'fable_switch') {
+    // The slot it displaced (a Coordinator's after_limit_reset message
+    // among them) comes back when the switch is off.
+    if (!switchFableStall(session, { retry: slot.retry || 0, prior: slot.prior || null }) && !session._autoResume && session._stall) {
+      session._autoResume = armFromStall(session._stall, slot.prior || null, Date.now(), session._autoResumeRetries || 0);
+      persistControlState(session);
+    }
+    return;
+  }
   postControlNotice(session, slot.kind === 'model_recovery'
     ? '🕒 Model switched — carrying on.'
     : slot.source === 'coordinator'
@@ -10341,6 +10439,61 @@ function runAutoResumeSweep(now = Date.now()) {
 
 function startAutoResumeSweep() {
   const timer = setInterval(() => { try { runAutoResumeSweep(); } catch (e) { console.warn(`[auto-resume] sweep failed: ${e.message}`); } }, AUTO_RESUME_SWEEP_MS);
+  if (typeof timer.unref === 'function') timer.unref();
+  return timer;
+}
+
+// Restart onto new code by itself — lib/code-update-restart.js has the
+// policy and the why. A rollout that found a live session here left the
+// new code on disk and the old process running; this is the "next natural
+// restart" it was deferred to. The checkout is the directory index.js runs
+// from. "Mid-turn" is session.busy, the same flag the loopback /sessions
+// list reports and restart_session parks on. A restart is the ordinary
+// SIGTERM path (gracefulShutdown: every session killed, the journal outbox
+// flushed) with a non-zero exit so every supervisor relaunches the bridge;
+// an idle session resumes with its history on its next turn, an
+// interrupted one gets a carry-on card at boot (publishRestartCarryOnCards).
+function startCodeUpdateWatcher() {
+  if (!CODE_UPDATE_RESTART) {
+    console.log('[code-update] self-restart onto new code: OFF (MATRON_CODE_UPDATE_RESTART)');
+    return null;
+  }
+  const gitDir = resolveGitDir(__dirname);
+  const boot = gitDir ? readHeadReflog(gitDir) : null;
+  if (!boot) {
+    console.log(`[code-update] self-restart onto new code: OFF (no HEAD reflog under ${__dirname})`);
+    return null;
+  }
+  const watcher = createCodeUpdateWatcher({
+    readHead: () => readHeadReflog(gitDir),
+    busySessions: () => { let n = 0; for (const [, s] of sessions) if (s.alive && s.busy) n++; return n; },
+    preflight: () => defaultPreflight(__dirname),
+    restart: (info) => {
+      if (shuttingDown) return;
+      console.log(`[code-update] exiting ${CODE_UPDATE_EXIT_CODE} for the supervisor to relaunch onto ${info.sha.slice(0, 7)}${info.forced ? ` (${info.busy} session(s) mid-turn)` : ''}`);
+      // Only a forced restart interrupts anything, so only it stamps. A
+      // stamp that cannot be written costs nothing but the automatic
+      // part: the interrupted chats get their card as before.
+      if (info.forced) {
+        try {
+          writeSelfRestartStamp(SELF_RESTART_STAMP_FILE, { bootId: BRIDGE_BOOT_ID, sha: info.sha, busy: info.busy });
+        } catch (e) {
+          try { console.warn(`[code-update] could not write ${SELF_RESTART_STAMP_FILE}: ${e?.message ?? e} — interrupted chats will get a carry-on card instead`); } catch { /* logging must never throw */ }
+        }
+      }
+      void gracefulShutdown('code-update', { exitCode: CODE_UPDATE_EXIT_CODE });
+    },
+    log: (m) => console.log(m),
+    warn: (m) => console.warn(m),
+    bootSha: boot.sha,
+    settleMs: CODE_UPDATE_SETTLE_MS,
+    warnEveryMs: CODE_UPDATE_WARN_EVERY_MS,
+    forceAfterMs: CODE_UPDATE_FORCE_AFTER_MS,
+  });
+  console.log(`[code-update] self-restart onto new code: ON (running ${boot.sha.slice(0, 7)}; poll ${CODE_UPDATE_POLL_MS}ms, settle ${CODE_UPDATE_SETTLE_MS}ms, ${CODE_UPDATE_FORCE_AFTER_MS > 0 ? `forced after ${CODE_UPDATE_FORCE_AFTER_MS}ms` : 'never mid-turn'})`);
+  const timer = setInterval(() => {
+    watcher.tick().catch(e => { try { console.warn(`[code-update] tick failed: ${e?.message ?? e}`); } catch { /* logging must never throw */ } });
+  }, CODE_UPDATE_POLL_MS);
   if (typeof timer.unref === 'function') timer.unref();
   return timer;
 }
@@ -10391,6 +10544,50 @@ function recoverBadModel(session) {
   next._autoResume = { at: new Date().toISOString(), kind: 'model_recovery', text: BAD_MODEL_RECOVERY_TEXT };
   persistControlState(next);
   postControlNotice(next, '🛠 The model this session was on is no longer available — switched to the default model; carrying on once the switch has settled.');
+}
+
+// Fable stall, reset far off (lib/fable-fallback.js stallModelFallback):
+// move the session to Opus and carry on rather than sit until the weekly
+// reset. explicit:false like the bad-model recovery — the bridge picked it,
+// not a person, so a later Coordinator assignment may change it. Returns
+// true when the switch went through (or was parked for the turn's end).
+const FABLE_SWITCH_MAX_RETRIES = 3;
+function switchFableStall(session, { retry = 0, prior = undefined } = {}) {
+  if (session.agent === AGENT_CODEX || !session.alive || !session._stall) return false;
+  // Once per stall, like the bad-model recovery: an interactive switch
+  // reports success once /model is typed, so a TUI that stayed on Fable
+  // would stall again and switch again on every carry-on. Cleared by the
+  // next real answer.
+  if (session._fableStallSwitched) return false;
+  // The slot this switch displaces: the reset carry-on, possibly carrying a
+  // Coordinator's message. A retry passes the one it already held.
+  const displaced = prior === undefined ? session._autoResume : prior;
+  const fb = stallModelFallback({ stall: session._stall, model: session._modelAlias || session.currentModel, lines: usageLimitsCache.lines });
+  if (!fb) return false;
+  const when = fb.resetsAt ? ` (Fable resets ${new Date(fb.resetsAt).toUTCString().replace(/:\d\d GMT$/, ' UTC')})` : '';
+  const ctx = journalSessionCommandCtx(session);
+  const switched = !controlOccupied(session)
+    && applyModelSwitch(session.roomId, session, fb.model, { sendReply: ctx.sendReply, sendHtml: ctx.sendHtml, explicit: false });
+  if (!switched) {
+    // Refused (a resume hold, a busy turn, a TUI not ready): try again in a
+    // minute, a few times, then fall back to waiting for the reset.
+    if (retry >= FABLE_SWITCH_MAX_RETRIES) return false;
+    session._autoResume = { at: new Date(Date.now() + 60_000).toISOString(), kind: 'fable_switch', retry: retry + 1, ...(displaced ? { prior: displaced } : {}) };
+    persistControlState(session);
+    return false;
+  }
+  // As in recoverBadModel: a print-mode switch recreated the process, so
+  // the carry-on slot lands on the replacement, and goes through the sweep
+  // once the switch has settled.
+  const next = sessions.get(session.roomId) || session;
+  next._fableStallSwitched = true;
+  // A Coordinator's carry-on for this stall is still the message to send:
+  // the switch is what lifts the limit.
+  const text = displaced?.source === 'coordinator' && displaced.text ? displaced.text : FABLE_SWITCH_TEXT;
+  next._autoResume = { at: new Date().toISOString(), kind: 'model_recovery', text };
+  persistControlState(next);
+  postControlNotice(next, `🛠 Fable weekly limit reached${when} — switched this session to Opus; carrying on once the switch has settled.`);
+  return true;
 }
 
 // --- Coordinator session control, target side (lib/session-control.js) ---
@@ -12002,6 +12199,16 @@ const projectsHandlers = createProjectsHandlers({
   isCoordinator: (session, convoId) => session?.coordinator === true || (!!convoId && coordinatorLookup.snapshot().convoId === convoId),
 });
 
+// The contact_* / mission_share tool routes (lib/sharing-tools.js), mounted
+// below at /sharing/<op>. No Coordinator gate: any session may ask, and no
+// session — the Coordinator included — may answer (the journal refuses).
+const sharingHandlers = createSharingHandlers({
+  sessions,
+  journalConvoIdFor,
+  client: sharingClient,
+  resolveMission: (session, convoId) => missionsHandlers.resolveMission(session, convoId),
+});
+
 // The two consent_* tool routes (lib/consent-tools.js), mounted below.
 const consentHandlers = createConsentHandlers({
   sessions,
@@ -12053,7 +12260,7 @@ const unseenHandlers = createUnseenHandlers({
   isCoordinator: (session, convoId) => session?.coordinator === true || (!!convoId && coordinatorLookup.snapshot().convoId === convoId),
 });
 
-// The three routine_* tool routes (lib/routines-tools.js), mounted below.
+// The routine_* tool routes (lib/routines-tools.js), mounted below.
 // The journal gates every write to the Coordinator; this refuses a
 // non-Coordinator first, counting the journal's current role holder.
 const routineHandlers = createRoutineHandlers({
@@ -12727,12 +12934,23 @@ const apiServer = createServer(async (req, res) => {
         return;
       }
 
-      // The three routine_* tool routes; same one-matcher allowlist shape.
-      const routineRoute = url.pathname.match(/^\/routine\/(list|update|run)$/);
+      // The routine_* tool routes; same one-matcher allowlist shape. The
+      // delete tool's handler is `remove` (delete is a reserved word).
+      const routineRoute = url.pathname.match(/^\/routine\/(list|update|run|create|delete)$/);
       if (routineRoute) {
         const name = routineRoute[1];
-        await respondAgentChatRoute(res, data, routineHandlers[name],
+        await respondAgentChatRoute(res, data, routineHandlers[name === 'delete' ? 'remove' : name],
           (status, b) => debug(`routine/${name} ${status} ${b.error || (b.routines ? `${b.routines.length} routines` : b.routine ? b.routine.name : 'ok')}`));
+        return;
+      }
+
+      // The contact_* / mission_share tool routes; same one-matcher
+      // allowlist shape.
+      const sharingRoute = url.pathname.match(/^\/sharing\/(contact_list|contact_add|contact_remove|contact_block|share|unshare|shares|shared_list|shared_get)$/);
+      if (sharingRoute) {
+        const name = sharingRoute[1];
+        await respondAgentChatRoute(res, data, sharingHandlers[name],
+          (status, b) => debug(`sharing/${name} ${status} ${b.error || b.blocked_by || 'ok'}`));
         return;
       }
 
@@ -13952,12 +14170,35 @@ function publishRestartCarryOnCards() {
     console.warn(`[inflight] boot reconciliation failed: ${e.message}`);
     return;
   }
+  // The stamp is taken (read and removed) whether or not anything is stale,
+  // so a stale stamp from an earlier boot can never claim a later crash's
+  // interruptions.
+  const stamp = takeSelfRestartStamp(SELF_RESTART_STAMP_FILE);
   if (!stale.length) return;
   const persisted = loadPersistedSessions();
   const resumable = new Set(Object.values(persisted)
     .flatMap(rec => [rec?.journalConvoId, rec?.sessionId])
     .filter(Boolean));
+  // The previous process's self-restart onto new code cut these turns off;
+  // with the option on they carry on by themselves (lib/code-update-restart.js
+  // AUTO_CARRY_ON_TEXT), after the journal socket has said hello and the
+  // cards below have gone out. Everything else — a crash, a deploy's own
+  // restart, the option off — keeps the tap.
+  const { auto, card } = selectAutoCarryOn(stale, stamp, { enabled: CODE_UPDATE_AUTO_CARRY_ON });
+  const autoResumable = auto.filter(rec => resumable.has(rec.convoId) && isResumeConvoId(rec.convoId));
+  if (autoResumable.length) {
+    try { console.log(`[code-update] ${autoResumable.length} chat(s) cut off by the self-restart onto ${String(stamp.sha || '').slice(0, 7)} carry on by themselves in ${CODE_UPDATE_AUTO_CARRY_ON_DELAY_MS}ms`); } catch { /* logging must never throw */ }
+    setTimeout(() => {
+      for (const rec of autoResumable) {
+        const notice = `🔄 The bridge restarted itself onto new code while this chat was mid-turn (interrupted ${formatInterruptedAgo(rec.ageMs)}) — resuming it to carry on automatically.`;
+        void carryOnConvo(rec.convoId, null, null, CODE_UPDATE_AUTO_CARRY_ON_TEXT, notice);
+      }
+    }, CODE_UPDATE_AUTO_CARRY_ON_DELAY_MS);
+  }
+  const autoSet = new Set(autoResumable);
   for (const rec of stale) {
+    if (autoSet.has(rec)) continue;
+    void card;
     // No persisted session record means there is nothing for a tap to resume,
     // so a card would be a dead button. Drop it.
     if (!resumable.has(rec.convoId)) {
@@ -14057,6 +14298,9 @@ async function main() {
   // queues frames FIFO until hello_ok, exactly as the eager control-convo
   // upsert above relies on, so nothing is dropped by publishing here.
   publishRestartCarryOnCards();
+  // After the carry-on cards: a self-restart for new code must never land
+  // before the previous process's interruptions have been surfaced.
+  startCodeUpdateWatcher();
 }
 
 // Read cached CPU + instant RAM and emit one host_vitals frame (no convo_id).
@@ -14093,15 +14337,17 @@ main().catch(err => {
 // socket can't hang shutdown), so a clean restart delivers pending releases
 // inline; anything still unsettled is durable in the outbox and reconciled on
 // next boot.
+// `exitCode` is 0 for a stop and CODE_UPDATE_EXIT_CODE for a self-restart
+// onto new code: launchd relaunches only after a non-zero exit.
 let shuttingDown = false;
-async function gracefulShutdown(signal) {
+async function gracefulShutdown(signal, { exitCode = 0 } = {}) {
   if (shuttingDown) return;
   shuttingDown = true;
   if (signal === 'SIGINT') console.log('\nShutting down...');
   if (_hostVitalsPushHandle) { clearInterval(_hostVitalsPushHandle); _hostVitalsPushHandle = null; }
   if (_boxStatusRepublishHandle) { clearInterval(_boxStatusRepublishHandle); _boxStatusRepublishHandle = null; }
   // Everything is inside try/finally so a throw from ANY step (sampler, session
-  // kill, or the flush) still reaches process.exit(0). Previously stopCpuSampler
+  // kill, or the flush) still reaches process.exit(exitCode). Previously stopCpuSampler
   // / killSession ran outside the try, so a throw there rejected the promise the
   // signal handlers ignore, and the process never exited (unhandled rejection).
   try {
@@ -14118,7 +14364,7 @@ async function gracefulShutdown(signal) {
   } catch (e) {
     try { console.warn(`[shutdown] failed: ${e?.message ?? String(e)}`); } catch { /* ignore */ }
   } finally {
-    process.exit(0);
+    process.exit(exitCode);
   }
 }
 

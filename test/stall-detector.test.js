@@ -65,8 +65,8 @@ describe('buildSessionStatus stall', () => {
 
 describe('contextGaugeText window override', () => {
   it('uses an explicit window over the model-derived one, and ignores a bad one', () => {
-    expect(contextGaugeText(87000, 'claude-opus-5-5', 1000000)).toBe('87k/1m');
-    expect(contextGaugeText(87000, 'claude-opus-5-5', 0)).toBe('87k/200k');
-    expect(contextGaugeText(87000, 'claude-opus-5-5')).toBe('87k/200k');
+    expect(contextGaugeText(87000, 'claude-sonnet-4-6', 1000000)).toBe('87k/1m');
+    expect(contextGaugeText(87000, 'claude-sonnet-4-6', 0)).toBe('87k/200k');
+    expect(contextGaugeText(87000, 'claude-sonnet-4-6')).toBe('87k/200k');
   });
 });

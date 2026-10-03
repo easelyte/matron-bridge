@@ -208,6 +208,8 @@ describe('playbook directory (spec 2026-10-01 coordinator routines)', () => {
     expect(block).toMatch(/routine_list/);
     expect(block).toMatch(/routine_update/);
     expect(block).toMatch(/routine_run/);
+    expect(block).toMatch(/routine_create/);
+    expect(block).toMatch(/routine_delete/);
     expect(block).not.toMatch(/## Check-ins/);
     expect(block).not.toMatch(/repeat: "daily"/);
   });

@@ -37,7 +37,7 @@ describe('box status wiring', () => {
     // ...and the publisher flush that waits for the room-op write to be
     // confirmed (lib/journal-publisher.js sendRoomOp/flush) still runs after
     // it, before process.exit — otherwise the report races the exit.
-    expect(shutdown).toMatch(/publishBoxStatus\('shutdown'\);[\s\S]*?await journalPublisher\.flush\(\{ timeoutMs: FLUSH_TIMEOUT_MS \}\);[\s\S]*?process\.exit\(0\);/);
+    expect(shutdown).toMatch(/publishBoxStatus\('shutdown'\);[\s\S]*?await journalPublisher\.flush\(\{ timeoutMs: FLUSH_TIMEOUT_MS \}\);[\s\S]*?process\.exit\(exitCode\);/);
   });
 
   it('adds the vitals block from the shared host sampler (contract §1)', () => {
