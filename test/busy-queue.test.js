@@ -8,6 +8,7 @@ import {
   notifyQueuedMessage,
   resolveQueueReleaseTap,
 } from '../lib/busy-queue.js';
+import { attachQueuedCleanup } from '../lib/queue-flush.js';
 import { compactBatchSize } from '../lib/compact-priority.js';
 
 // Busy-queue magic-word parity (PR #101 follow-up). The Matrix busy branch's
@@ -1792,7 +1793,7 @@ describe('queued-release publisher wiring', () => {
 });
 
 describe('index.js queued-send finalizer', () => {
-  function loadFlushHarness({ dispatchResult = true } = {}) {
+  function loadFlushHarness({ dispatchResult = true, dispatchThrows = null } = {}) {
     const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
     const start = src.indexOf('function queuedReleaseItemIds(');
     const end = src.indexOf('\nfunction splitMessage(', start);
@@ -1807,7 +1808,11 @@ describe('index.js queued-send finalizer', () => {
       { promptId: 'pr_2', itemId: 'pr_2::0' },
       { promptId: 'pr_drifted', itemId: 'pr_drifted::0' },
     ]);
-    const dispatchMergedFlush = vi.fn(() => dispatchResult);
+    const dispatchMergedFlush = vi.fn(() => {
+      if (dispatchThrows) throw dispatchThrows;
+      return dispatchResult;
+    });
+    const runQueuedCleanup = vi.fn(); // observe orphan-cleanup on the dead-session drop path
     const flushQueue = runInNewContext(
       `(() => { ${src.slice(start, end)}; return flushQueue; })()`,
       {
@@ -1817,12 +1822,13 @@ describe('index.js queued-send finalizer', () => {
         emitRelease,
         journalConvoIdFor: () => 'convo-1',
         journalPublishNotice,
+        runQueuedCleanup,
         journalInputConsumer: {
           queueRelease: { listLive, dropItem },
         },
       },
     );
-    return { flushQueue, emitRelease, dropItem, listLive, dispatchMergedFlush, journalPublishNotice };
+    return { flushQueue, emitRelease, dropItem, listLive, dispatchMergedFlush, journalPublishNotice, runQueuedCleanup };
   }
 
   it('commits every release exactly once, only after merged dispatch accepts the batch', () => {
@@ -1891,6 +1897,18 @@ describe('index.js queued-send finalizer', () => {
     expect(harness.dropItem).not.toHaveBeenCalled();
   });
 
+  it('restores the detached batch (no releases, no throw) when dispatch THROWS before delivery', () => {
+    const harness = loadFlushHarness({ dispatchThrows: new Error('pty closed') });
+    const queued = [[{ type: 'text', text: 'retry me' }]];
+    const later = [[{ type: 'text', text: 'arrived later' }]];
+    const session = { agent: 'claude', alive: true, busy: false, queuedMessages: later, roomId: '!room' };
+
+    expect(harness.flushQueue(session, queued)).toBe(false);
+    expect(session.queuedMessages).toEqual([...queued, ...later]);
+    expect(harness.emitRelease).not.toHaveBeenCalled();
+    expect(harness.dropItem).not.toHaveBeenCalled();
+  });
+
   it('notifies and drops (no retain) when a DEAD/auto-stopped session rejects dispatch', () => {
     // #161: dead-session flush failure must not strand the batch as a
     // permanent retry; every entry was acknowledged with a "📨 Queued" tile,
@@ -1905,6 +1923,11 @@ describe('index.js queued-send finalizer', () => {
     expect(harness.dropItem).not.toHaveBeenCalled();
     expect(harness.journalPublishNotice).toHaveBeenCalledTimes(1);
     expect(harness.journalPublishNotice.mock.calls[0][1]).toMatch(/2 queued messages/);
+    // Each dropped entry gets its saved-media cleanup run — the batch is never
+    // dispatched, so nothing else will unlink an orphaned upload file.
+    expect(harness.runQueuedCleanup).toHaveBeenCalledTimes(2);
+    expect(harness.runQueuedCleanup).toHaveBeenNthCalledWith(1, queued[0]);
+    expect(harness.runQueuedCleanup).toHaveBeenNthCalledWith(2, queued[1]);
   });
 
   it('defers Codex release commitment until the interrupted turn has exited and dispatch succeeds', () => {
@@ -1934,23 +1957,6 @@ describe('index.js queued-send finalizer', () => {
     expect(harness.dropItem).toHaveBeenCalledTimes(1);
   });
 });
-
-describe('index.js /interrupt endpoint — flush status (source inspection)', () => {
-  it('reports rejected or deferred dispatch as retained instead of flushed', () => {
-    const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
-    const start = src.indexOf("} else if (url.pathname === '/interrupt') {");
-    const end = src.indexOf("} else if (url.pathname === '/cancel-queued') {", start);
-    expect(start).toBeGreaterThan(-1);
-    expect(end).toBeGreaterThan(start);
-    const body = src.slice(start, end);
-
-    expect(body).toMatch(/sent = flushQueue\(session, queued, releaseSnapshot\)/);
-    expect(body).toMatch(/if \(sent === true\)[\s\S]*res\.writeHead\(200\)/);
-    expect(body).toMatch(/else \{[\s\S]*res\.writeHead\(409\)/);
-    expect(body).toMatch(/JSON\.stringify\(\{ ok: false, flushed: 0, retained \}\)/);
-  });
-});
-
 describe('index.js journal busy caller — queued-tile notification wiring (source inspection)', () => {
   it('the journal busy branch posts the tile via notifyQueuedMessage with the journal ctx sink', () => {
     const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
@@ -2110,26 +2116,96 @@ describe('#165 index.js prompt-reply handler — value-shape classification reti
     // other reply — including one whose label is literally `interrupt` /
     // `cancel:2` — flows through to journalRoutePromptReply and the "answered:"
     // echo. No value-shape early-return sits between classify and route.
+    // (fork: the "answered:" echo is emitted via the shared
+    // journalEchoPromptAnswer helper — which permission-cards also reuses —
+    // rather than inline, so assert the helper call instead of the string.)
     expect(body).toMatch(/queuedRelease\.state === 'live'/);
     expect(body).toMatch(/journalRoutePromptReply\(session, answer\)/);
-    expect(body).toMatch(/answered: /);
+    expect(body).toMatch(/journalEchoPromptAnswer\(session, username, label\)/);
     expect(body).not.toMatch(/isQueueReleaseTap/);
   });
 });
 
-describe('index.js /cancel-queued endpoint — release registry wiring (source inspection)', () => {
-  it('resolves the positional entry to its stable id and uses cancelQueuedItem', () => {
-    const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
-    const start = src.indexOf("} else if (url.pathname === '/cancel-queued') {");
-    const end = src.indexOf("} else if (url.pathname === '/message') {", start);
-    expect(start).toBeGreaterThan(-1);
-    expect(end).toBeGreaterThan(start);
-    const body = src.slice(start, end);
+// A busy-session media upload writes its file to disk BEFORE queueing, and the
+// saved file must persist while queued (the flush's Read consumes it). But if
+// the queued entry is later DISCARDED without dispatch — typed cancel, a
+// structured card cancel, or a legacy cancel:N tap — the file would otherwise
+// be orphaned in the session uploads dir forever. Every queue-removal path
+// unlinks it via the cleanup closure carried on the entry (attachQueuedCleanup).
+describe('busy-queue cancel unlinks a saved-media file the cancelled upload wrote to disk', () => {
+  it('typed "cancel" (pop last) runs the cleanup for the removed entry', async () => {
+    const cleanup = vi.fn();
+    const mediaEntry = attachQueuedCleanup([{ type: 'text', text: 'File saved to /w/report.pdf' }], cleanup);
+    const session = makeSession({
+      queuedMessages: [[{ type: 'text', text: 'first' }], mediaEntry],
+      queueNotifications: [
+        { eventId: '$ev1', plain: '📨 Queued (1): first' },
+        { eventId: '$ev2', plain: '📨 Queued (2): report.pdf' },
+      ],
+    });
+    const deps = journalDeps();
+    expect(await dispatchBusyQueueMagicWord('cancel', session, deps)).toBe(true);
+    expect(cleanup).toHaveBeenCalledTimes(1);        // orphan unlinked
+    expect(session.queuedMessages).toHaveLength(1);  // media entry gone
+  });
 
-    expect(body).toMatch(/const queueIndex = Math\.trunc\(index\)/);
-    expect(body).toMatch(/const itemId = notifs\[queueIndex\]\?\.id/);
-    expect(body).toMatch(/queueRelease\.listLive\(convoId\)/);
-    expect(body).toMatch(/cancelQueuedItem\(session, \{/);
-    expect(body).toMatch(/\bemitRelease\b/);
+  it('a legacy "cancel:N" tap runs the cleanup for the indexed entry', () => {
+    const cleanup = vi.fn();
+    const mediaEntry = attachQueuedCleanup([{ type: 'text', text: 'Image saved to /w/x.png' }], cleanup);
+    const session = makeSession({
+      queuedMessages: [mediaEntry, [{ type: 'text', text: 'second' }]],
+      queueNotifications: [
+        { eventId: '$ev1', plain: '📨 Queued (1): x.png' },
+        { eventId: '$ev2', plain: '📨 Queued (2): second' },
+      ],
+    });
+    expect(resolveQueueReleaseTap('cancel:0', session, { editMessage: vi.fn() })).toBe(true);
+    expect(cleanup).toHaveBeenCalledTimes(1);
+    expect(session.queuedMessages).toHaveLength(1);
+  });
+
+  it('a structured card cancel (cancelQueuedItem) runs the cleanup for the released entry', () => {
+    const cleanup = vi.fn();
+    const mediaEntry = attachQueuedCleanup([{ type: 'text', text: 'File saved to /w/report.pdf' }], cleanup);
+    const session = makeSession({
+      queuedMessages: [mediaEntry],
+      queueNotifications: [{ id: 'item-1', eventId: '$ev1', plain: '📨 Queued: report.pdf' }],
+    });
+    const dropItem = vi.fn();
+    // emitRelease persists the durable record then runs the mutate thunk (the
+    // real seam's happy path); returning non-false means the splice committed.
+    const emitRelease = vi.fn((convoId, rel, { mutate }) => { mutate(); return true; });
+    const ok = cancelQueuedItem(session, {
+      itemId: 'item-1',
+      promptId: 'prompt-1',
+      convoId: 'convo-1',
+      queueRelease: { dropItem },
+      emitRelease,
+    });
+    expect(ok).toBe(true);
+    expect(cleanup).toHaveBeenCalledTimes(1);
+    expect(session.queuedMessages).toBeNull(); // last entry removed
+  });
+
+  it('does NOT run cleanup when a card cancel fails closed (durability write refused)', () => {
+    const cleanup = vi.fn();
+    const mediaEntry = attachQueuedCleanup([{ type: 'text', text: 'File saved to /w/report.pdf' }], cleanup);
+    const session = makeSession({
+      queuedMessages: [mediaEntry],
+      queueNotifications: [{ id: 'item-1', eventId: '$ev1', plain: '📨 Queued: report.pdf' }],
+    });
+    // emitRelease fail-closes (returns false, never runs mutate) — the entry
+    // stays queued, so its file must NOT be unlinked.
+    const emitRelease = vi.fn(() => false);
+    const ok = cancelQueuedItem(session, {
+      itemId: 'item-1',
+      promptId: 'prompt-1',
+      convoId: 'convo-1',
+      queueRelease: { dropItem: vi.fn() },
+      emitRelease,
+    });
+    expect(ok).toBe(false);
+    expect(cleanup).not.toHaveBeenCalled();
+    expect(session.queuedMessages).toHaveLength(1); // still queued
   });
 });

@@ -10,5 +10,8 @@ node_modules
 mcp-config-generated*.json
 mcp-config.local.json
 journal-cursor.json
+.codex-session-tmp/
+.env.bak*
 
 node_modules
+run-state-outbox.json

@@ -166,7 +166,7 @@ describe('codex watcher isolation', () => {
     const bestEffortCalls = [];
     const publisher = {
       // Simulates a journal outage: enqueues but never acknowledges delivery
-      // (onDelivered is captured, never invoked).
+      // (onLocalSendComplete is captured, never invoked).
       publishTextBestEffort(convoId, payload, options) {
         bestEffortCalls.push({ convoId, payload, options });
         return true;

@@ -2199,7 +2199,31 @@ describe('index.js agent-chat room wiring (source inspection)', () => {
     // agentSpawnHandlers; onOpError tries the spawn side FIRST (its `true`
     // return means it consumed the ref) before falling through to invites.
     expect(args).toMatch(/onSpawnFrame: \(frame\) => agentSpawnHandlers\?\.onSpawnFrame\(frame\)/);
-    expect(args).toMatch(/onOpError: \(e\) => \{ if \(sessionControlHandlers\?\.onOpError\?\.\(e\)\) return; if \(agentSpawnHandlers\?\.onOpError\?\.\(e\)\) return; agentInvites\?\.onOpError\(e\); \}/);
+    // warnRejectedConvoUpsert runs first and is observational only
+    // — it never consumes the ref, so the spawn-then-invites ordering
+    // below is unchanged.
+    expect(args).toMatch(/onOpError: \(e\) => \{ warnRejectedConvoUpsert\(e\); if \(sessionControlHandlers\?\.onOpError\?\.\(e\)\) return; if \(agentSpawnHandlers\?\.onOpError\?\.\(e\)\) return; agentInvites\?\.onOpError\(e\); \}/);
+  });
+
+  // persistSession is fail-open. It must still REPORT, so the
+  // summary publish can decline to get ahead of the durable copy.
+  describe('persistSession reports durability', () => {
+    const fn = src.slice(
+      src.indexOf('function savePersistedSessions('),
+      src.indexOf('\n}', src.indexOf('function savePersistedSessions(')),
+    );
+
+    it('returns true on a successful write and false on a caught failure', () => {
+      expect(fn).toMatch(/savePersistedSessionsOrThrow\(data\);\n\s*return true;/);
+      expect(fn).toMatch(/return false;/);
+    });
+
+    it('persistSession forwards the result on both the fail-open and fail-loud paths', () => {
+      const start = src.indexOf('function persistSession(');
+      const persist = src.slice(start, src.indexOf('\nfunction getPersistedSession(', start));
+      expect(persist).toMatch(/if \(!failLoud\) return savePersistedSessions\(data\);/);
+      expect(persist).toMatch(/savePersistedSessionsOrThrow\(data\);\n\s*return true;/);
+    });
   });
 });
 

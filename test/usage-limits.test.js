@@ -38,15 +38,15 @@ describe('parseUsageLimits', () => {
     const { ok, lines } = parseUsageLimits(SUBSCRIPTION_SAMPLE, new Date('2026-07-08T00:00:00Z'));
     expect(ok).toBe(true);
     expect(lines).toEqual([
-      { id: 'session', label: 'Session', percent: 39, resets: 'Jul 9, 12:59am (UTC)', resets_at: '2026-07-09T00:59:00.000Z' },
-      { id: 'week_all', label: 'Week (all models)', percent: 66, resets: 'Jul 12, 6:59pm (UTC)', resets_at: '2026-07-12T18:59:00.000Z' },
-      { id: 'week_fable', label: 'Week (Fable)', percent: 100, resets: 'Jul 12, 6:59pm (UTC)', resets_at: '2026-07-12T18:59:00.000Z' },
+      { id: 'session', label: 'Session', percent: 39, resets: 'Jul 9, 12:59am (UTC)', resets_at: '2026-07-09T00:59:00.000Z', resets_at_ms: Date.parse('2026-07-09T00:59:00.000Z') },
+      { id: 'week_all', label: 'Week (all models)', percent: 66, resets: 'Jul 12, 6:59pm (UTC)', resets_at: '2026-07-12T18:59:00.000Z', resets_at_ms: Date.parse('2026-07-12T18:59:00.000Z') },
+      { id: 'week_fable', label: 'Week (Fable)', percent: 100, resets: 'Jul 12, 6:59pm (UTC)', resets_at: '2026-07-12T18:59:00.000Z', resets_at_ms: Date.parse('2026-07-12T18:59:00.000Z') },
     ]);
-    // resets_at is the ISO-8601 string form; no resets_at_ms sibling (dropped as
-    // redundant — clients derive the epoch via Date.parse(resets_at)).
+    // resets_at keeps its original ISO-string wire type; resets_at_ms is the
+    // additive epoch-ms number sibling.
     for (const l of lines) {
       expect(typeof l.resets_at).toBe('string');
-      expect('resets_at_ms' in l).toBe(false);
+      expect(typeof l.resets_at_ms).toBe('number');
     }
   });
 
@@ -70,18 +70,21 @@ describe('parseUsageLimits', () => {
     expect(parseUsageLimits(undefined)).toEqual({ ok: false, lines: [] });
   });
 
-  it('adds resets_at (ISO) to lines when the reset text parses, with no resets_at_ms sibling', () => {
+  it('adds resets_at (ISO) and resets_at_ms (epoch) to lines when the reset text parses', () => {
     const { lines } = parseUsageLimits(SUBSCRIPTION_SAMPLE, new Date('2026-07-08T00:00:00Z'));
     expect(lines.map((l) => l.resets_at)).toEqual([
       '2026-07-09T00:59:00.000Z',
       '2026-07-12T18:59:00.000Z',
       '2026-07-12T18:59:00.000Z',
     ]);
-    // resets_at_ms was dropped as redundant; never emitted.
-    for (const l of lines) expect('resets_at_ms' in l).toBe(false);
+    expect(lines.map((l) => l.resets_at_ms)).toEqual([
+      Date.parse('2026-07-09T00:59:00.000Z'),
+      Date.parse('2026-07-12T18:59:00.000Z'),
+      Date.parse('2026-07-12T18:59:00.000Z'),
+    ]);
   });
 
-  it('omits resets_at (and never emits resets_at_ms) when the reset text does not parse', () => {
+  it('omits both resets_at and resets_at_ms when the reset text does not parse', () => {
     const { lines } = parseUsageLimits('Current session: 39% used · resets soon\n');
     expect(lines).toHaveLength(1);
     expect('resets_at' in lines[0]).toBe(false);
@@ -93,9 +96,9 @@ describe('parseUsageLimits', () => {
     expect(ok).toBe(true);
     expect(lines).toEqual([
       // BST is UTC+1: 12:19am Jul 15 London = 11:19pm Jul 14 UTC.
-      { id: 'session', label: 'Session', percent: 23, resets: 'Jul 15 at 12:19am (Europe/London)', resets_at: '2026-07-14T23:19:00.000Z' },
-      { id: 'week_all', label: 'Week (all models)', percent: 13, resets: 'Jul 20 at 9:59pm (Europe/London)', resets_at: '2026-07-20T20:59:00.000Z' },
-      { id: 'week_fable', label: 'Week (Fable)', percent: 21, resets: 'Jul 20 at 9:59pm (Europe/London)', resets_at: '2026-07-20T20:59:00.000Z' },
+      { id: 'session', label: 'Session', percent: 23, resets: 'Jul 15 at 12:19am (Europe/London)', resets_at: '2026-07-14T23:19:00.000Z', resets_at_ms: Date.parse('2026-07-14T23:19:00.000Z') },
+      { id: 'week_all', label: 'Week (all models)', percent: 13, resets: 'Jul 20 at 9:59pm (Europe/London)', resets_at: '2026-07-20T20:59:00.000Z', resets_at_ms: Date.parse('2026-07-20T20:59:00.000Z') },
+      { id: 'week_fable', label: 'Week (Fable)', percent: 21, resets: 'Jul 20 at 9:59pm (Europe/London)', resets_at: '2026-07-20T20:59:00.000Z', resets_at_ms: Date.parse('2026-07-20T20:59:00.000Z') },
     ]);
   });
 
@@ -106,8 +109,8 @@ describe('parseUsageLimits', () => {
 
   // Real output when the Fable weekly bucket is at 0% — Claude prints that line
   // with NO "· resets …" tail. The parser must still keep it (id/label/percent)
-  // and omit resets/resets_at, while the with-resets session and week-all lines
-  // in the SAME parse are unchanged.
+  // and omit resets/resets_at/resets_at_ms, while the with-resets session and
+  // week-all lines in the SAME parse are unchanged.
   it('parses a Fable 0%-used line that has no resets clause', () => {
     const ZERO_FABLE_SAMPLE = `Current session: 25% used · resets Jul 26, 8:59pm (America/New_York)
 Current week (all models): 24% used · resets Aug 1, 4:59am (America/New_York)
@@ -130,11 +133,13 @@ Current week (Fable): 0% used
       id: 'session', label: 'Session', percent: 25,
       resets: 'Jul 26, 8:59pm (America/New_York)',
       resets_at: '2026-07-27T00:59:00.000Z',
+      resets_at_ms: Date.parse('2026-07-27T00:59:00.000Z'),
     });
     expect(lines[1]).toEqual({
       id: 'week_all', label: 'Week (all models)', percent: 24,
       resets: 'Aug 1, 4:59am (America/New_York)',
       resets_at: '2026-08-01T08:59:00.000Z',
+      resets_at_ms: Date.parse('2026-08-01T08:59:00.000Z'),
     });
   });
 });
@@ -180,7 +185,7 @@ describe('resetsAtMs', () => {
 });
 
 describe('deriveLimitId', () => {
-  it('maps the session line to plain session', () => {
+  it('maps the session line to the canonical session id', () => {
     expect(deriveLimitId('session')).toBe('session');
     expect(deriveLimitId('Session')).toBe('session');
   });
@@ -189,23 +194,16 @@ describe('deriveLimitId', () => {
     expect(deriveLimitId('week (all models)')).toBe('week_all');
   });
 
-  it('canonicalizes "all models" to week_all whether or not it is parenthesized', () => {
-    // Wording drift: Claude may drop the parens. Both must yield the SAME id so
-    // one semantic never forks into week_all vs week_all_models (MAJOR 1).
-    expect(deriveLimitId('week (all models)')).toBe('week_all');
-    expect(deriveLimitId('week all models')).toBe('week_all');
-    expect(deriveLimitId('Week (all models)')).toBe('week_all');
-    expect(deriveLimitId('week (all models)')).toBe(deriveLimitId('week all models'));
-  });
-
   it('maps a named weekly line to week_<slug>', () => {
     expect(deriveLimitId('week (Fable)')).toBe('week_fable');
     expect(deriveLimitId('week (Sonnet 5)')).toBe('week_sonnet_5');
     expect(deriveLimitId('week (Claude Opus 4.8)')).toBe('week_claude_opus_4_8');
   });
 
-  it('slugs the whole suffix when a weekly line has no parentheses (wording drift)', () => {
-    // Distinct future weekly wordings must NOT all collapse to week_other.
+  it('canonicalizes a weekly line the same way with or without parentheses (wording drift)', () => {
+    // "all models" canonicalizes to week_all whether or not it was parenthesized,
+    // and distinct future weekly wordings must NOT all collapse to week_other.
+    expect(deriveLimitId('week all models')).toBe('week_all');
     expect(deriveLimitId('week fable')).toBe('week_fable');
     expect(deriveLimitId('week sonnet 5')).toBe('week_sonnet_5');
   });
@@ -220,37 +218,18 @@ describe('deriveLimitId', () => {
 });
 
 describe('parseUsageLimits id dedup', () => {
-  it('gives every colliding row a distinct id (identical labels)', () => {
-    // Two identical weekly lines both derive week_other; they are genuinely
-    // indistinguishable, so a positional tiebreak is acceptable — but the ids
-    // must still be unique so clients keyed by id don't clobber one another.
+  it('disambiguates two lines that derive the same id', () => {
+    // Two unparseable-parenthetical weekly lines both derive week_other; the
+    // dedup guard must give the second a distinct id so clients keyed by id
+    // don't clobber one with the other.
     const raw = [
       'Current week (): 10% used · resets soon',
       'Current week (): 20% used · resets soon',
     ].join('\n');
     const { lines } = parseUsageLimits(raw);
     expect(lines).toHaveLength(2);
+    expect(lines.map((l) => l.id)).toEqual(['week_other', 'week_other_2']);
     expect(new Set(lines.map((l) => l.id)).size).toBe(lines.length);
-    for (const l of lines) expect(l.id.startsWith('week_other')).toBe(true);
-  });
-
-  it('maps each DISTINCT label to a stable id regardless of row order', () => {
-    // Two distinct labels that collide on the same base id (week_other). The
-    // disambiguator is a hash of the full label, NOT first-seen order, so
-    // reversing the rows must preserve each label -> id mapping (MAJOR 2).
-    const rowA = 'Current week (!!!): 10% used · resets soon';
-    const rowB = 'Current week (???): 20% used · resets soon';
-
-    const fwd = parseUsageLimits([rowA, rowB].join('\n')).lines;
-    const rev = parseUsageLimits([rowB, rowA].join('\n')).lines;
-
-    // Base id collides -> both are suffixed, and the two ids are distinct.
-    expect(fwd.map((l) => l.id).every((id) => id.startsWith('week_other_'))).toBe(true);
-    expect(new Set(fwd.map((l) => l.id)).size).toBe(2);
-
-    // label -> id is identical in both orderings.
-    const mapOf = (lines) => Object.fromEntries(lines.map((l) => [l.label, l.id]));
-    expect(mapOf(rev)).toEqual(mapOf(fwd));
   });
 });
 

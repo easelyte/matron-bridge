@@ -15,12 +15,19 @@ const BRIDGE_ENV = Object.freeze({
   SUMMARY_ANTHROPIC_API_KEY: 'summary-test-key',
   OPENAI_API_KEY: 'sk-user',
   SHOW_FILE_TOKEN: 'inherited-show-file',
+  // Fork delta: permission cards.
+  MATRON_PERMISSION_TOKEN: 'inherited-permission',
+  MATRON_PERMISSION_CARDS: '1',
   CLAUDECODE: '1',
   MCP_TOOL_TIMEOUT: '600000',
 });
 
+// Fork delta: buildClaudeSpawnEnv takes a required mode ('print' | 'iv');
+// the shared expectations below run in print mode.
 function claude(overrides = {}) {
   return buildClaudeSpawnEnv({
+    mode: 'print',
+    permissionToken: 'session-permission',
     baseEnv: BRIDGE_ENV,
     execPath: EXEC,
     pathDelimiter: ':',
@@ -157,6 +164,37 @@ describe('buildCodexSpawnEnv', () => {
 
   it('rejects a non-object base env', () => {
     expect(() => codex({ baseEnv: 'nope' })).toThrow(TypeError);
+  });
+});
+
+// fork delta: permission cards (MATRON_PERMISSION_CARDS /
+// MATRON_PERMISSION_TOKEN) reach print sessions only.
+describe('buildClaudeSpawnEnv permission-card keys (fork)', () => {
+  it('print: snapshots MATRON_PERMISSION_CARDS and injects the per-session permission token', () => {
+    const env = claude({ mode: 'print' });
+    expect(env.MATRON_PERMISSION_CARDS).toBe('1');
+    expect(env.MATRON_PERMISSION_TOKEN).toBe('session-permission');
+    const off = claude({ mode: 'print', baseEnv: { ...BRIDGE_ENV, MATRON_PERMISSION_CARDS: undefined } });
+    expect(off.MATRON_PERMISSION_CARDS).toBe('');
+  });
+
+  it('iv: carries neither permission-card key, even when the bridge env has them', () => {
+    const env = claude({ mode: 'iv' });
+    expect('MATRON_PERMISSION_CARDS' in env).toBe(false);
+    expect('MATRON_PERMISSION_TOKEN' in env).toBe(false);
+  });
+
+  it('iv: otherwise the same shape as print (credentials stripped, wiring set)', () => {
+    const env = claude({ mode: 'iv' });
+    expect('JOURNAL_TOKEN' in env).toBe(false);
+    expect('HMAC_SECRET' in env).toBe(false);
+    expect(env.MATRON_JOURNAL_PROXY_HEADER_FILE).toBe('/tmp/matron-journal-proxy-x/header');
+    expect(env.SHOW_FILE_TOKEN).toBe('session-show-file');
+  });
+
+  it('rejects an unknown or missing mode', () => {
+    expect(() => claude({ mode: 'exec' })).toThrow(RangeError);
+    expect(() => claude({ mode: undefined })).toThrow(RangeError);
   });
 });
 

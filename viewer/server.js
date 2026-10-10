@@ -3,7 +3,7 @@ import { rateLimit } from 'express-rate-limit';
 import { watch as fsWatch, existsSync, readFileSync, statSync, openSync, readSync, closeSync } from 'fs';
 import path from 'path';
 import { WebSocketServer } from 'ws';
-import { generateSignedUrl, verifyToken } from '../lib/viewer-tokens.js';
+import { generateSignedUrl, verifyToken, scopeFromToken } from '../lib/viewer-tokens.js';
 import { validateAndOpen, FileLinkDenied, MAX_DOWNLOAD_BYTES } from '../lib/file-link-guard.js';
 export { generateSignedUrl, verifyToken };
 
@@ -313,11 +313,13 @@ app.get('/view', async (req, res) => {
 
   try {
     // Serve-time boundary (lib/file-link-guard.js): fd-pinned symlink,
-    // sensitivity, workdir-containment, and size checks. Legacy tokens
-    // without a workdir still get everything but containment. Every
-    // rejection — denied, missing, oversize — is a uniform 404 so the
-    // response leaks nothing about why.
-    const { content, realPath } = await validateAndOpen(data.path, { workdir: data.workdir });
+    // sensitivity, scope-containment, and size checks. scopeFromToken prefers
+    // the token's PINNED root identity over its bare workdir pathname, so a
+    // workdir swapped out after the link was minted is rejected rather than
+    // followed. Legacy tokens without a workdir still get everything but
+    // containment. Every rejection — denied, missing, oversize — is a uniform
+    // 404 so the response leaks nothing about why.
+    const { content, realPath } = await validateAndOpen(data.path, scopeFromToken(data));
     res.type('html').send(renderHtml(path.basename(realPath), content.toString('utf-8')));
   } catch (err) {
     if (!(err instanceof FileLinkDenied)) console.error('Error reading file:', err);
@@ -349,7 +351,7 @@ app.get('/download', downloadLimiter, async (req, res) => {
 
   try {
     const { content, realPath } = await validateAndOpen(data.path, {
-      workdir: data.workdir,
+      ...scopeFromToken(data),
       maxBytes: MAX_DOWNLOAD_BYTES,
     });
     // Keep the header a plain quoted ASCII token: strip anything that could
@@ -365,55 +367,6 @@ app.get('/download', downloadLimiter, async (req, res) => {
 });
 
 const BRIDGE_API_PORT = process.env.MATRON_BRIDGE_API_PORT || 9802;
-
-app.get('/action', async (req, res) => {
-  const { token } = req.query;
-  if (!token) return res.status(400).send('Missing token');
-
-  const data = verifyToken(token);
-  if (!data) return res.status(403).send('Invalid or expired token');
-
-  const { action, roomId, index } = data;
-  if (!action || !roomId) return res.status(400).send('Invalid action token');
-
-  try {
-    let endpoint, body, label;
-    if (action === 'interrupt') {
-      endpoint = '/interrupt';
-      body = { roomId };
-      label = '⚡ Sending queued messages';
-    } else if (action === 'cancel') {
-      endpoint = '/cancel-queued';
-      body = { roomId, index };
-      label = '✕ Cancelled';
-    } else {
-      return res.status(400).send('Unknown action');
-    }
-
-    const resp = await fetch(`http://127.0.0.1:${BRIDGE_API_PORT}${endpoint}`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    });
-
-    if (!resp.ok) {
-      const err = await resp.text();
-      const safeErr = err.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
-      return res.type('html').send(`<!DOCTYPE html><html><body><h2>Action failed</h2><p>${safeErr}</p></body></html>`);
-    }
-
-    res.type('html').send(`<!DOCTYPE html>
-<html>
-<head><meta charset="utf-8"><title>Action performed</title>
-<style>body{margin:0;display:flex;align-items:center;justify-content:center;min-height:100vh;background:#0d1117;color:#e6edf3;font-family:-apple-system,BlinkMacSystemFont,sans-serif;}
-.card{text-align:center;padding:40px;}</style></head>
-<body><div class="card"><h2>${label}</h2><p>Action performed. You can close this tab.</p></div></body>
-</html>`);
-  } catch (err) {
-    console.error('Action proxy error:', err);
-    res.status(500).send('Failed to reach bridge API');
-  }
-});
 
 app.get('/secret', (req, res) => {
   const { token } = req.query;

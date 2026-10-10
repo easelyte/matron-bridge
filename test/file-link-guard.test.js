@@ -6,7 +6,8 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import {
   isSensitivePath, checkFileLink, validateAndOpen, pinAllowedRoots, pinAllowedRootsSync,
-  FileLinkDenied, MAX_VIEW_BYTES,
+  pinAllowedRootIdentities, FileLinkDenied, MAX_VIEW_BYTES,
+  buildFilesDeepLink, appendFilesDeepLink,
 } from '../lib/file-link-guard.js';
 
 describe('isSensitivePath', () => {
@@ -21,6 +22,17 @@ describe('isSensitivePath', () => {
     '/w/secret/note.txt', '/w/credentials/token.dat',
     '/w/proj/secrets', '/w/proj/secret', '/w/prod.env/x.dat', '/w/tokens.json/x.dat',
     '/w/app.key/nested/file.txt',
+    // 2026-09-27 hardening (maintainer review of the File Explorer stack)
+    '/root/.secrets', '/root/.secrets/req-abc.txt', '/root/.agent/approval_grant_secret',
+    '/root/.supabase/access-token', '/etc/matron/agent-token', '/w/agent_token.json',
+    '/opt/matron/journal/data/bridge-agent-token.txt', '/opt/matron/journal/data/bridge-agent-creds.txt',
+    '/root/.claude-matrix-sessions.json', '/root/.claude-matrix-config.json', '/root/.matron-bridge-secrets.json',
+    '/root/.matron-bridge-timers.json', '/root/.claude-queued-release-outbox.json',
+    '/root/.claude-run-state-outbox.json', '/root/.claude-subagent-running.json',
+    '/opt/matron/bridge-journal/run-state-outbox.json', '/opt/matron/bridge-journal/journal-cursor.json',
+    '/root/.bash_history', '/root/.python_history',
+    '/root/.codex/auth.json', '/root/.codex', '/root/.config/gh/hosts.yml', '/root/auth.json',
+    '/root/.git-credentials', '/root/.pgpass', '/root/.claude.json', '/home/u/.gcloud/x', '/home/u/.azure/y',
   ])('flags %s', (p) => {
     expect(isSensitivePath(p)).toBe(true);
   });
@@ -29,6 +41,9 @@ describe('isSensitivePath', () => {
     '/w/index.js', '/w/env.md', '/w/configuration.json', '/w/package.json',
     '/w/README.md', '/w/awsome/notes.txt', '/w/keyboard.js',
     '/w/secretary/notes.txt', '/w/credentialing/doc.md',
+    '/w/lib/secret-requests.js', '/w/tokenizer.js', '/w/docs/agent-token.md', '/w/src/credit.js',
+    '/w/history.md', '/w/lib/journal-cursor.js', '/w/test/run-state-outbox.test.js', '/w/configure.js',
+    '/w/.claude/skills/x/SKILL.md',
   ])('allows %s', (p) => {
     expect(isSensitivePath(p)).toBe(false);
   });
@@ -348,5 +363,314 @@ describe('validateAndOpen', () => {
 
   it('exports a 5MB default cap', () => {
     expect(MAX_VIEW_BYTES).toBe(5 * 1024 * 1024);
+  });
+});
+
+// The Linux deployment resolves an open descriptor's real path through
+// /proc/self/fd, which the kernel answers from the descriptor itself — no
+// path re-walk, nothing to race. Platforms without procfs (macOS) have to
+// re-resolve the pathname, and that re-walk is what these tests pin: the
+// resolved name must be PROVEN to still name the descriptor we hold.
+describe('fdRealPath (non-procfs platforms)', () => {
+  let dir, outside;
+  const withPlatform = async (value, fn) => {
+    const original = Object.getOwnPropertyDescriptor(process, 'platform');
+    Object.defineProperty(process, 'platform', { value, configurable: true });
+    try {
+      return await fn();
+    } finally {
+      Object.defineProperty(process, 'platform', original);
+    }
+  };
+
+  beforeAll(() => {
+    dir = mkdtempSync(path.join(tmpdir(), 'flg-race-work-'));
+    outside = mkdtempSync(path.join(tmpdir(), 'flg-race-outside-'));
+    mkdirSync(path.join(dir, 'decoy'));
+    writeFileSync(path.join(dir, 'decoy', 'doc.txt'), 'harmless decoy\n');
+    writeFileSync(path.join(outside, 'doc.txt'), 'STOLEN SECRET\n');
+    // `swap` starts out pointing outside the workdir; the race flips it back
+    // in-scope after open() so a bare realpath() would report an in-scope name
+    // for a descriptor that is holding the out-of-scope file.
+    symlinkSync(outside, path.join(dir, 'swap'));
+  });
+  afterAll(() => {
+    for (const d of [dir, outside]) {
+      try { rmSync(d, { recursive: true, force: true }); } catch {}
+    }
+  });
+
+  it('serves a normal in-scope file unchanged when there is no race', async () => {
+    await withPlatform('darwin', async () => {
+      const { content, realPath } = await validateAndOpen(
+        path.join(dir, 'decoy', 'doc.txt'), { workdir: dir },
+      );
+      expect(content.toString('utf-8')).toBe('harmless decoy\n');
+      expect(realPath).toBe(path.join(dir, 'decoy', 'doc.txt'));
+    });
+  });
+
+  it('refuses to serve a descriptor whose parent directory was swapped after open', async () => {
+    const swapLink = path.join(dir, 'swap');
+    const actualOpen = fsp.open.bind(fsp);
+    // Perform the swap INSIDE the open() call so the race is deterministic
+    // rather than timing-dependent: the descriptor is already pinned to the
+    // out-of-scope file, and every later pathname walk sees the in-scope dir.
+    const openSpy = vi.spyOn(fsp, 'open').mockImplementation(async (...args) => {
+      const fd = await actualOpen(...args);
+      rmSync(swapLink, { force: true });
+      symlinkSync(path.join(dir, 'decoy'), swapLink);
+      return fd;
+    });
+    try {
+      await withPlatform('darwin', async () => {
+        let denial;
+        try {
+          await validateAndOpen(path.join(dir, 'swap', 'doc.txt'), { workdir: dir });
+        } catch (err) {
+          denial = err;
+        }
+        expect(denial).toBeInstanceOf(FileLinkDenied);
+        expect(denial.reason).toBe('path-race');
+      });
+    } finally {
+      openSpy.mockRestore();
+      rmSync(swapLink, { force: true });
+      symlinkSync(outside, swapLink);
+    }
+  });
+
+  it('refuses when the resolved name is replaced by a symlink before the identity check', async () => {
+    const victim = path.join(dir, 'victim.txt');
+    writeFileSync(victim, 'victim\n');
+    const actualRealpath = fsp.realpath.bind(fsp);
+    const realpathSpy = vi.spyOn(fsp, 'realpath').mockImplementation(async (...args) => {
+      const resolved = await actualRealpath(...args);
+      if (resolved === victim) {
+        rmSync(victim, { force: true });
+        symlinkSync(path.join(dir, 'decoy', 'doc.txt'), victim);
+      }
+      return resolved;
+    });
+    try {
+      await withPlatform('darwin', async () => {
+        let denial;
+        try {
+          await validateAndOpen(victim, { workdir: dir });
+        } catch (err) {
+          denial = err;
+        }
+        expect(denial).toBeInstanceOf(FileLinkDenied);
+        expect(denial.reason).toBe('path-race');
+      });
+    } finally {
+      realpathSpy.mockRestore();
+      rmSync(victim, { force: true });
+    }
+  });
+
+  it('denies rather than throwing raw when the pathname vanishes before it resolves', async () => {
+    const doomed = path.join(dir, 'doomed.txt');
+    writeFileSync(doomed, 'doomed\n');
+    const actualOpen = fsp.open.bind(fsp);
+    const openSpy = vi.spyOn(fsp, 'open').mockImplementation(async (...args) => {
+      const fd = await actualOpen(...args);
+      rmSync(doomed, { force: true });
+      return fd;
+    });
+    try {
+      await withPlatform('darwin', async () => {
+        let denial;
+        try {
+          await validateAndOpen(doomed, { workdir: dir });
+        } catch (err) {
+          denial = err;
+        }
+        expect(denial).toBeInstanceOf(FileLinkDenied);
+        expect(denial.reason).toBe('unreadable');
+      });
+    } finally {
+      openSpy.mockRestore();
+      rmSync(doomed, { force: true });
+    }
+  });
+
+  it('keeps the procfs answer on Linux — no pathname re-walk, no identity check', async () => {
+    const realpathSpy = vi.spyOn(fsp, 'realpath');
+    try {
+      // workdir containment needs one realpath of the WORKDIR; the point is
+      // that the target's real path never goes through realpath() on Linux.
+      const { realPath } = await validateAndOpen(path.join(dir, 'decoy', 'doc.txt'), {});
+      expect(realPath).toBe(path.join(dir, 'decoy', 'doc.txt'));
+      expect(realpathSpy).not.toHaveBeenCalled();
+    } finally {
+      realpathSpy.mockRestore();
+    }
+  });
+});
+
+// A pathname is not an authorization boundary. pinAllowedRoots{,Sync} resolve
+// one at a trusted moment and RETAIN the identity they approved; these tests
+// pin the third constructor, which rebuilds that capability from an identity
+// that travelled across a boundary (a signed viewer token).
+describe('pinAllowedRootIdentities', () => {
+  let dir, outside;
+  beforeAll(() => {
+    dir = mkdtempSync(path.join(tmpdir(), 'flg-ident-work-'));
+    outside = mkdtempSync(path.join(tmpdir(), 'flg-ident-outside-'));
+    writeFileSync(path.join(dir, 'ok.txt'), 'in scope\n');
+    writeFileSync(path.join(outside, 'ok.txt'), 'OUT OF SCOPE\n');
+  });
+  afterAll(() => {
+    for (const d of [dir, outside]) {
+      try { rmSync(d, { recursive: true, force: true }); } catch {}
+    }
+  });
+
+  const identitiesFor = (p) => pinAllowedRootsSync([p]).roots
+    .map(({ realPath, dev, ino }) => ({ realPath, dev, ino }));
+
+  it('is interchangeable with pinAllowedRootsSync for an unchanged root', async () => {
+    const allowedRoots = pinAllowedRootIdentities(identitiesFor(dir));
+    const { content, realPath } = await validateAndOpen(path.join(dir, 'ok.txt'), { allowedRoots });
+    expect(content.toString('utf-8')).toBe('in scope\n');
+    expect(realPath).toBe(path.join(dir, 'ok.txt'));
+  });
+
+  it('survives a JSON round-trip, which is the point of carrying identities', async () => {
+    const carried = JSON.parse(JSON.stringify(identitiesFor(dir)));
+    const allowedRoots = pinAllowedRootIdentities(carried);
+    const { content } = await validateAndOpen(path.join(dir, 'ok.txt'), { allowedRoots });
+    expect(content.toString('utf-8')).toBe('in scope\n');
+  });
+
+  it('rejects the root once its directory is replaced by a different one', async () => {
+    const swapRoot = mkdtempSync(path.join(tmpdir(), 'flg-ident-swap-'));
+    const realDir = path.join(swapRoot, 'work');
+    mkdirSync(realDir);
+    writeFileSync(path.join(realDir, 'ok.txt'), 'in scope\n');
+    const allowedRoots = pinAllowedRootIdentities(identitiesFor(realDir));
+
+    // Rename the pinned directory away and drop a symlink to elsewhere in its
+    // place — the classic move that a bare pathname boundary follows.
+    renameSync(realDir, path.join(swapRoot, 'work.bak'));
+    symlinkSync(outside, realDir);
+
+    try {
+      let denial;
+      try {
+        await validateAndOpen(path.join(realDir, 'ok.txt'), { allowedRoots });
+      } catch (err) {
+        denial = err;
+      }
+      expect(denial).toBeInstanceOf(FileLinkDenied);
+      expect(denial.reason).toBe('bad-workdir');
+    } finally {
+      rmSync(swapRoot, { recursive: true, force: true });
+    }
+  });
+
+  it('refuses an empty capability — no roots is a broken scope, not an open one', async () => {
+    for (const empty of [[], null, undefined]) {
+      expect(() => pinAllowedRootIdentities(empty))
+        .toThrowError(expect.objectContaining({ reason: 'bad-workdir' }));
+    }
+    // The hazard it prevents: an empty branded capability reaches
+    // validateAndOpen's pinned-root branch with nothing to compare, and with
+    // no workdir there is no containment left either.
+    const { content } = await validateAndOpen(path.join(outside, 'ok.txt'), {
+      allowedRoots: pinAllowedRootsSync([]),
+    });
+    expect(content.toString('utf-8')).toBe('OUT OF SCOPE\n');
+  });
+
+  it('fails closed on a malformed identity rather than degrading to no scope', () => {
+    const malformed = [
+      [{}],
+      [{ realPath: 'relative/path', dev: 1, ino: 2 }],
+      [{ realPath: '/abs', dev: 'one', ino: 2 }],
+      [{ realPath: '/abs', dev: 1 }],
+      [null],
+    ];
+    for (const identities of malformed) {
+      expect(() => pinAllowedRootIdentities(identities))
+        .toThrowError(expect.objectContaining({ reason: 'bad-workdir' }));
+    }
+  });
+});
+
+describe('buildFilesDeepLink', () => {
+  const WEB = 'https://matron.example.com';
+  const WORK = '/home/user/workspace';
+
+  it('mints a token-less #files= hash link for an in-root, non-sensitive file', () => {
+    const link = buildFilesDeepLink(`${WORK}/report.md`, WORK, WEB);
+    expect(link).toBe(`${WEB}/#files=${encodeURIComponent(`${WORK}/report.md`)}`);
+    // No token/HMAC in the URL — auth is the operator's web session.
+    expect(link).not.toContain('token=');
+  });
+
+  it('url-encodes a path with spaces so the fragment stays a single token', () => {
+    const p = `${WORK}/my notes.md`;
+    const link = buildFilesDeepLink(p, WORK, WEB);
+    expect(link).toBe(`${WEB}/#files=${encodeURIComponent(p)}`);
+    expect(link).toContain('%20');
+  });
+
+  it('strips a trailing slash from the web base URL', () => {
+    const link = buildFilesDeepLink(`${WORK}/a.md`, WORK, `${WEB}/`);
+    expect(link).toBe(`${WEB}/#files=${encodeURIComponent(`${WORK}/a.md`)}`);
+  });
+
+  it('returns null when the web base URL is unset (feature dormant)', () => {
+    expect(buildFilesDeepLink(`${WORK}/a.md`, WORK, '')).toBeNull();
+    expect(buildFilesDeepLink(`${WORK}/a.md`, WORK, undefined)).toBeNull();
+  });
+
+  it('returns null (plain-path fallback) for a target outside the workdir/read-root', () => {
+    expect(buildFilesDeepLink('/etc/passwd', WORK, WEB)).toBeNull();
+  });
+
+  it('returns null (plain-path fallback) for a sensitive-looking file even inside the root', () => {
+    expect(buildFilesDeepLink(`${WORK}/.env`, WORK, WEB)).toBeNull();
+    expect(buildFilesDeepLink(`${WORK}/secrets.json`, WORK, WEB)).toBeNull();
+  });
+
+  it('returns null for a relative or empty path', () => {
+    expect(buildFilesDeepLink('relative/a.md', WORK, WEB)).toBeNull();
+    expect(buildFilesDeepLink('', WORK, WEB)).toBeNull();
+  });
+
+  it('gates on sensitive names with no workdir given (containment optional, sensitivity always)', () => {
+    expect(buildFilesDeepLink(`${WORK}/a.md`, null, WEB)).toBe(
+      `${WEB}/#files=${encodeURIComponent(`${WORK}/a.md`)}`,
+    );
+    expect(buildFilesDeepLink(`${WORK}/id_rsa`, null, WEB)).toBeNull();
+  });
+});
+
+describe('appendFilesDeepLink', () => {
+  const LINK = 'https://matron.example.com/#files=%2Fx%2Fa.md';
+
+  it('appends a labelled link line after existing caption text', () => {
+    const out = appendFilesDeepLink('here is the doc', LINK);
+    expect(out).toBe(`here is the doc\n\n📁 Open in Files: ${LINK}`);
+  });
+
+  it('uses the file name in the label when given', () => {
+    const out = appendFilesDeepLink('here is the doc', LINK, 'a.md');
+    expect(out).toBe(`here is the doc\n\n📁 Open a.md in Files: ${LINK}`);
+  });
+
+  it('returns only the link line when the caption is empty', () => {
+    expect(appendFilesDeepLink('', LINK)).toBe(`📁 Open in Files: ${LINK}`);
+    expect(appendFilesDeepLink(undefined, LINK)).toBe(`📁 Open in Files: ${LINK}`);
+  });
+
+  it('returns the text verbatim when there is no link (plain-path fallback)', () => {
+    expect(appendFilesDeepLink('plain body', null)).toBe('plain body');
+    expect(appendFilesDeepLink('plain body', undefined)).toBe('plain body');
+    expect(appendFilesDeepLink('', null)).toBe('');
+    expect(appendFilesDeepLink(undefined, null)).toBe('');
   });
 });

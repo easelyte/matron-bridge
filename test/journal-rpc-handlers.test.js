@@ -610,6 +610,47 @@ describe('start', () => {
       expect(warns.some((w) => /mission #61/.test(w) && /closed/.test(w))).toBe(true);
     });
 
+    it('mission_num: a duplicate start during a pending join waits for the real outcome — never "ok" for a child that is then stopped', async () => {
+      let releaseJoin;
+      const joinMission = vi.fn(() => new Promise((resolve) => { releaseJoin = () => resolve({ status: 200, body: {} }); }));
+      let started = 0;
+      const { handler, responses, stopped } = spawnHarness({
+        joinMission,
+        startSession: () => { started++; return { roomId: 'sess-key', journalConvoId: 'convo-9' }; },
+        injectTurn: () => false, // opening turn refused -> the child is stopped
+      });
+      handler(REQ('start', { prompt: 'do the thing', mission_num: 64, idempotency_key: 'k' }, 'a'));
+      handler(REQ('start', { prompt: 'do the thing', mission_num: 64, idempotency_key: 'k' }, 'b'));
+      await Promise.resolve();
+      expect(responses).toHaveLength(0); // the duplicate is NOT answered while the first is pending
+      releaseJoin();
+      await vi.waitFor(() => expect(responses).toHaveLength(2));
+      expect(started).toBe(1);
+      expect(stopped).toHaveLength(1);
+      for (const r of responses) expect(r.ok).toBe(false);
+      expect(responses.map((r) => r.requestId).sort()).toEqual(['a', 'b']);
+      expect(responses.find((r) => r.requestId === 'b').error.code).toBe('spawn_failed');
+    });
+
+    it('mission_num: a duplicate during a pending join gets the same convo once it succeeds, and a later retry is served from cache', async () => {
+      let releaseJoin;
+      const joinMission = vi.fn(() => new Promise((resolve) => { releaseJoin = () => resolve({ status: 200, body: {} }); }));
+      let started = 0;
+      const { handler, responses } = spawnHarness({
+        joinMission,
+        startSession: () => { started++; return { roomId: 'sess-key', journalConvoId: 'convo-9' }; },
+      });
+      handler(REQ('start', { prompt: 'do the thing', mission_num: 64, idempotency_key: 'k' }, 'a'));
+      handler(REQ('start', { prompt: 'do the thing', mission_num: 64, idempotency_key: 'k' }, 'b'));
+      releaseJoin();
+      await vi.waitFor(() => expect(responses).toHaveLength(2));
+      for (const r of responses) expect(r).toMatchObject({ ok: true, result: { convo_id: 'convo-9' } });
+      handler(REQ('start', { prompt: 'do the thing', mission_num: 64, idempotency_key: 'k' }, 'c'));
+      expect(responses[2]).toEqual({ requestId: 'c', toDeviceId: 7, ok: true, result: { convo_id: 'convo-9' } });
+      expect(started).toBe(1);
+      expect(joinMission).toHaveBeenCalledTimes(1);
+    });
+
     it('mission_num must be a positive integer; nothing is spawned otherwise', () => {
       let started = 0;
       const { handler, responses } = spawnHarness({ startSession: () => { started += 1; return { journalConvoId: 'c' }; } });
@@ -1005,6 +1046,98 @@ describe('composeSpawnOpeningTurn', () => {
     expect(text).not.toMatch(/report progress/);
     expect(text).toMatch(/agent_chat_start/);
     expect(text).toMatch(/The user can read everything you write/);
+  });
+});
+
+describe('start idempotency', () => {
+  it('a retried start with the same idempotency_key spawns once and re-answers the same convo_id', () => {
+    let n = 0;
+    const calls = [];
+    const { handler, responses } = harness({
+      startSession: (args) => { calls.push(args); return { claudeSessionId: `session-${++n}` }; },
+    });
+    // Client retries after not hearing back — fresh request_id, SAME key.
+    handler(REQ('start', { workdir: '~/app', idempotency_key: 'abc' }, 'r1'));
+    handler(REQ('start', { workdir: '~/app', idempotency_key: 'abc' }, 'r2'));
+    expect(calls).toHaveLength(1); // spawned exactly once
+    expect(responses).toHaveLength(2); // but both requests answered
+    expect(responses[0]).toEqual({ requestId: 'r1', toDeviceId: 7, ok: true, result: { convo_id: 'session-1' } });
+    expect(responses[1]).toEqual({ requestId: 'r2', toDeviceId: 7, ok: true, result: { convo_id: 'session-1' } });
+  });
+
+  it('a transport-duplicated frame (same request_id, no key) spawns once', () => {
+    let n = 0;
+    const calls = [];
+    const { handler, responses } = harness({
+      startSession: (args) => { calls.push(args); return { claudeSessionId: `session-${++n}` }; },
+    });
+    handler(REQ('start', {}, 'dup'));
+    handler(REQ('start', {}, 'dup')); // at-least-once transport redelivers the exact frame
+    expect(calls).toHaveLength(1);
+    expect(responses).toHaveLength(2);
+    expect(responses[0].result.convo_id).toBe('session-1');
+    expect(responses[1].result.convo_id).toBe('session-1');
+  });
+
+  it('distinct idempotency_keys spawn separately', () => {
+    let n = 0;
+    const calls = [];
+    const { handler } = harness({
+      startSession: (args) => { calls.push(args); return { claudeSessionId: `session-${++n}` }; },
+    });
+    handler(REQ('start', { idempotency_key: 'a' }, 'r1'));
+    handler(REQ('start', { idempotency_key: 'b' }, 'r2'));
+    expect(calls).toHaveLength(2);
+  });
+
+  it('a failed start is NOT cached — a retry with the same key re-attempts and can succeed', () => {
+    let attempt = 0;
+    const calls = [];
+    const { handler, responses } = harness({
+      startSession: (args) => {
+        calls.push(args);
+        if (++attempt === 1) throw new Error('transient spawn failure');
+        return { claudeSessionId: 'session-ok' };
+      },
+    });
+    handler(REQ('start', { idempotency_key: 'k' }, 'r1'));
+    expect(responses[0].error).toEqual({ code: 'spawn_failed', detail: 'transient spawn failure' });
+    handler(REQ('start', { idempotency_key: 'k' }, 'r2')); // retry same key
+    expect(calls).toHaveLength(2); // re-attempted, not served from cache
+    expect(responses[1]).toEqual({ requestId: 'r2', toDeviceId: 7, ok: true, result: { convo_id: 'session-ok' } });
+  });
+
+  it('a start whose opening turn is refused drops its dedup entry — a retry re-spawns instead of answering the dead convo', () => {
+    let n = 0;
+    let refuse = true;
+    const calls = [];
+    const stopped = [];
+    const { handler, responses } = harness({
+      startSession: (args) => { calls.push(args); return { claudeSessionId: `session-${++n}` }; },
+      stopSession: (s) => stopped.push(s),
+      injectTurn: () => !refuse,
+    });
+    handler(REQ('start', { prompt: 'do it', idempotency_key: 'k' }, 'r1'));
+    expect(responses[0].error.code).toBe('spawn_failed');
+    expect(stopped).toHaveLength(1);
+    refuse = false;
+    handler(REQ('start', { prompt: 'do it', idempotency_key: 'k' }, 'r2'));
+    expect(calls).toHaveLength(2);
+    expect(responses[1]).toEqual({ requestId: 'r2', toDeviceId: 7, ok: true, result: { convo_id: 'session-2' } });
+  });
+
+  it('the dedup cache is bounded — the oldest key evicts and re-spawns', () => {
+    let n = 0;
+    const calls = [];
+    const { handler } = harness({
+      startDedupCap: 2,
+      startSession: (args) => { calls.push(args); return { claudeSessionId: `s${++n}` }; },
+    });
+    handler(REQ('start', { idempotency_key: 'k1' }, 'a'));
+    handler(REQ('start', { idempotency_key: 'k2' }, 'b'));
+    handler(REQ('start', { idempotency_key: 'k3' }, 'c')); // evicts k1
+    handler(REQ('start', { idempotency_key: 'k1' }, 'd')); // k1 gone -> re-spawns
+    expect(calls).toHaveLength(4);
   });
 });
 

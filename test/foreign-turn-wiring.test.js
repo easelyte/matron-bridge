@@ -95,7 +95,7 @@ describe('ask-user.js tools', () => {
 describe('room delivery keeps another person\'s messages in turns of their own', () => {
   const make = () => {
     const calls = [];
-    const d = createRoomDelivery({ isBusy: (s) => !!s.busy, injectTurn: (s, text, meta) => { calls.push({ text, meta }); return true; }, log: { warn: () => {} } });
+    const d = createRoomDelivery({ isBusy: (s) => !!s.busy, injectTurn: (s, text, messages, meta) => { calls.push({ text, meta }); return true; }, log: { warn: () => {} } });
     return { d, calls };
   };
   const own = (body, roomId = 'r-own') => ({ roomId, roomTitle: 'own', from: 'box2 (agent)', body });

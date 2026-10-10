@@ -1,8 +1,19 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, afterEach } from 'vitest';
 import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import { computeEditDiff } from '../lib/edit-diff.js';
+
+// Temp dirs are removed after each test so the suite leaves nothing in /tmp.
+const tmpDirs = [];
+async function mkTmp() {
+  const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'editdiff-'));
+  tmpDirs.push(dir);
+  return dir;
+}
+afterEach(async () => {
+  await Promise.all(tmpDirs.splice(0).map((dir) => fs.rm(dir, { recursive: true, force: true })));
+});
 
 describe('computeEditDiff', () => {
   it('Edit: line diff of old_string -> new_string with hunk header and counts', async () => {
@@ -31,7 +42,7 @@ describe('computeEditDiff', () => {
   });
 
   it('Write: diffs against existing on-disk content', async () => {
-    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'editdiff-'));
+    const dir = await mkTmp();
     const f = path.join(dir, 'a.txt');
     await fs.writeFile(f, 'one\ntwo\nthree\n');
     const r = await computeEditDiff('Write', { file_path: f, content: 'one\nTWO\nthree\n' }, dir);
@@ -43,7 +54,7 @@ describe('computeEditDiff', () => {
   });
 
   it('Write: absent file -> newFile all-additions', async () => {
-    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'editdiff-'));
+    const dir = await mkTmp();
     const r = await computeEditDiff('Write', {
       file_path: path.join(dir, 'nope.txt'), content: 'hello\nworld\n',
     }, dir);
@@ -55,7 +66,7 @@ describe('computeEditDiff', () => {
   });
 
   it('Write: relative file_path resolves against workdir', async () => {
-    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'editdiff-'));
+    const dir = await mkTmp();
     await fs.writeFile(path.join(dir, 'rel.txt'), 'a\n');
     const r = await computeEditDiff('Write', { file_path: 'rel.txt', content: 'b\n' }, dir);
     expect(r.newFile).toBe(false);
@@ -101,7 +112,7 @@ describe('computeEditDiff', () => {
   });
 
   it('returns synchronously — not a Promise — so diff publishes keep stream order', async () => {
-    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'editdiff-'));
+    const dir = await mkTmp();
     const f = path.join(dir, 'sync.txt');
     await fs.writeFile(f, 'old\n');
     // Write is the only path with file I/O; if it ever goes async again,
@@ -114,7 +125,7 @@ describe('computeEditDiff', () => {
   });
 
   it('Write over a file larger than 1 MB -> null (sync read cap)', async () => {
-    const dir = await fs.mkdtemp(path.join(os.tmpdir(), 'editdiff-'));
+    const dir = await mkTmp();
     const f = path.join(dir, 'big.txt');
     await fs.writeFile(f, 'x'.repeat(1024 * 1024 + 1));
     const r = computeEditDiff('Write', { file_path: f, content: 'tiny\n' }, dir);

@@ -136,7 +136,7 @@ describe('formatAndRoute', () => {
           args: [
             ctx.convoId,
             { body: finalMessage, from: 'assistant' },
-            { idemKey: 'run-1:final', onDelivered: expect.any(Function) },
+            { idemKey: 'run-1:final', onLocalSendComplete: expect.any(Function) },
           ],
         },
         { method: 'publishActivity', args: [ctx.convoId, 'idle'] },
@@ -319,7 +319,7 @@ describe('formatAndRoute', () => {
         args: [
           ctx.convoId,
           { body: 'The durable result', from: 'assistant' },
-          { idemKey: 'run-1:final', onDelivered: expect.any(Function) },
+          { idemKey: 'run-1:final', onLocalSendComplete: expect.any(Function) },
         ],
       },
     ]);
@@ -336,7 +336,7 @@ describe('formatAndRoute', () => {
     });
     ctx.publisher.publishText = (_convoId, _payload, options) => {
       expect(retained.has(ctx.runId)).toBe(true);
-      options.onDelivered();
+      options.onLocalSendComplete();
       return true;
     };
 

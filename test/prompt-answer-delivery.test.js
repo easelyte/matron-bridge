@@ -20,7 +20,7 @@ describe('writePromptAnswer', () => {
       },
     };
 
-    expect(writePromptAnswer(session, 'answer\n', { onDelivered: delivered })).toBe(true);
+    expect(writePromptAnswer(session, 'answer\n', { onLocalSendComplete: delivered })).toBe(true);
     expect(session._pendingPromptAnswerDelivery).toBeTruthy();
     expect(delivered).not.toHaveBeenCalled();
 
@@ -38,7 +38,7 @@ describe('writePromptAnswer', () => {
       proc: { stdin: { write: vi.fn((_payload, cb) => { callback = cb; return true; }) } },
     };
 
-    writePromptAnswer(session, 'answer\n', { onDelivered: delivered, onError: failed });
+    writePromptAnswer(session, 'answer\n', { onLocalSendComplete: delivered, onError: failed });
     callback(new Error('broken pipe'));
 
     expect(delivered).not.toHaveBeenCalled();
@@ -53,7 +53,7 @@ describe('writePromptAnswer', () => {
       proc: { stdin: { write: vi.fn((_payload, cb) => { callback = cb; return false; }) } },
     };
 
-    expect(writePromptAnswer(session, 'answer\n', { onDelivered: delivered })).toBe(true);
+    expect(writePromptAnswer(session, 'answer\n', { onLocalSendComplete: delivered })).toBe(true);
     expect(delivered).not.toHaveBeenCalled();
     expect(session._pendingPromptAnswerDelivery).toBeTruthy();
 
@@ -70,7 +70,7 @@ describe('writePromptAnswer', () => {
       proc: { stdin: { write: vi.fn(() => { throw new Error('closed'); }) } },
     };
 
-    expect(writePromptAnswer(session, 'answer\n', { onDelivered: delivered, onError: failed })).toBe(false);
+    expect(writePromptAnswer(session, 'answer\n', { onLocalSendComplete: delivered, onError: failed })).toBe(false);
     expect(delivered).not.toHaveBeenCalled();
     expect(failed).toHaveBeenCalledWith(expect.objectContaining({ message: 'closed' }));
     expect(session._pendingPromptAnswerDelivery).toBeNull();
@@ -92,7 +92,7 @@ describe('sendDelayedPromptAnswer', () => {
     expect(sendDelayedPromptAnswer(session, {
       response: { kind: 'numbered', key: '2' },
       text: 'custom answer',
-      onDelivered: () => actions.push('record'),
+      onLocalSendComplete: () => actions.push('record'),
     })).toBe(true);
     expect(actions).toEqual(['select']);
     expect(session._pendingPromptAnswerDelivery).toBeTruthy();
@@ -118,7 +118,7 @@ describe('sendDelayedPromptAnswer', () => {
     sendDelayedPromptAnswer(session, {
       response: { kind: 'numbered', key: '2' },
       text: 'custom answer',
-      onDelivered: delivered,
+      onLocalSendComplete: delivered,
       onError: failed,
     });
     vi.advanceTimersByTime(250);
@@ -142,7 +142,7 @@ describe('sendDelayedPromptAnswer', () => {
     expect(sendDelayedPromptAnswer(session, {
       response: { kind: 'numbered', key: '2' },
       text: 'custom answer',
-      onDelivered: delivered,
+      onLocalSendComplete: delivered,
       onError: failed,
     })).toBe(false);
     expect(delivered).not.toHaveBeenCalled();

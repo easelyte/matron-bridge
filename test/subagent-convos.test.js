@@ -21,9 +21,9 @@ function makePublisher() {
     calls,
     upsertConvo(convoId, opts, options) {
       calls.upsertConvo.push({ convoId, opts });
-      // Simulate immediate confirmed delivery so onDelivered-gated cleanup
+      // Simulate immediate confirmed delivery so onLocalSendComplete-gated cleanup
       // (subagent finish() store removal) runs synchronously in tests.
-      try { options?.onDelivered?.(); } catch { /* mirror publisher's swallow */ }
+      try { options?.onLocalSendComplete?.(); } catch { /* mirror publisher's swallow */ }
     },
     publishStatus(convoId, status) { calls.publishStatus.push({ convoId, status }); },
     publishText(convoId, payload) { calls.publishText.push({ convoId, payload }); },
@@ -746,14 +746,14 @@ describe('createSubagentConvoTracker', () => {
     });
 
     it('a stale premature-finish callback cannot erase the record re-armed by a corrective revival', () => {
-      // Deferring publisher: capture each finish frame's onDelivered so we
+      // Deferring publisher: capture each finish frame's onLocalSendComplete so we
       // can fire the stale one AFTER the corrective revival re-arms the record.
       const deferred = [];
       const publisher = {
         calls: { upsertConvo: [] },
         upsertConvo(convoId, opts, options) {
           this.calls.upsertConvo.push({ convoId, opts });
-          if (options?.onDelivered) deferred.push(options.onDelivered);
+          if (options?.onLocalSendComplete) deferred.push(options.onLocalSendComplete);
         },
         publishStatus() {}, publishText() {}, publishDiff() {},
       };
@@ -886,7 +886,7 @@ describe('createSubagentConvoTracker', () => {
     });
 
     it('keeps the write-ahead record when the done frame is never confirmed delivered', () => {
-      // The real journal publisher only fires onDelivered on CONFIRMED socket
+      // The real journal publisher only fires onLocalSendComplete on CONFIRMED socket
       // delivery. A crash-before-flush / queue-overflow drop means it never
       // fires — the write-ahead record must survive so the next startup/reconnect
       // reconcile re-publishes `done`. The default fake publisher confirms
@@ -895,7 +895,7 @@ describe('createSubagentConvoTracker', () => {
       const neverConfirms = {
         calls: { upsertConvo: [] },
         upsertConvo(convoId, opts /* , options */) {
-          // Deliberately drop `options.onDelivered` on the floor (never call it).
+          // Deliberately drop `options.onLocalSendComplete` on the floor (never call it).
           this.calls.upsertConvo.push({ convoId, opts });
         },
         publishStatus() {},
@@ -1123,7 +1123,7 @@ describe('createSubagentConvoTracker', () => {
         calls: { upsertConvo: [] },
         upsertConvo(convoId, opts, options) {
           this.calls.upsertConvo.push({ convoId, opts });
-          if (options?.onDelivered) deliveries.push(options.onDelivered);
+          if (options?.onLocalSendComplete) deliveries.push(options.onLocalSendComplete);
         },
         publishStatus() {}, publishText() {}, publishDiff() {},
       };
@@ -1153,14 +1153,14 @@ describe('createSubagentConvoTracker', () => {
     });
 
     it('a late done-frame delivery must not erase the record the revive just re-armed', () => {
-      // The finish() frame's onDelivered fires AFTER the resume — removing then
+      // The finish() frame's onLocalSendComplete fires AFTER the resume — removing then
       // would discard the live child's only reconciliation record.
       const deliveries = [];
       const publisher = {
         calls: { upsertConvo: [], publishStatus: [], publishText: [], publishDiff: [] },
         upsertConvo(convoId, opts, options) {
           this.calls.upsertConvo.push({ convoId, opts });
-          if (options?.onDelivered) deliveries.push(options.onDelivered);
+          if (options?.onLocalSendComplete) deliveries.push(options.onLocalSendComplete);
         },
         publishStatus() {}, publishText() {}, publishDiff() {},
       };

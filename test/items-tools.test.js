@@ -41,6 +41,51 @@ describe('items handlers', () => {
     expect(client.create).not.toHaveBeenCalled();
   });
 
+  // Supersedes existence is a journal DB lookup, so a bad id 400s the
+  // create AFTER uploadAll — orphaning the blob. With attachments present the
+  // bridge pre-checks the target exists BEFORE uploading.
+  it('create: bad supersedes with attachments fails BEFORE uploading (no orphan)', async () => {
+    const { h, client, uploadLocalFile } = fixture({ get: vi.fn(async () => ({ status: 404, data: { error: 'not found' } })) });
+    const r = await h.create({ roomId: '!r:s', kind: 'decision', title: 'D', attachments: ['shot.png'], supersedes: 'it_999' });
+    expect(r.status).toBe(400);
+    expect(client.get).toHaveBeenCalledWith('it_999');
+    expect(client.create).not.toHaveBeenCalled();
+    // No actual upload happened — nothing to orphan.
+    expect(uploadLocalFile.mock.calls.every(([, , opts]) => opts?.validateOnly)).toBe(true);
+  });
+
+  it('create: supersedes pre-check is skipped when there are no attachments (nothing to orphan)', async () => {
+    const { h, client } = fixture();
+    await h.create({ roomId: '!r:s', kind: 'decision', title: 'D', supersedes: 'it_2' });
+    expect(client.get).not.toHaveBeenCalled();
+    expect(client.create).toHaveBeenCalled();
+    expect(client.create.mock.calls[0][0]).toMatchObject({ supersedes: 'it_2' });
+  });
+
+  // Multi-attachment atomicity: all paths are validated (local gates
+  // only) before ANY blob is uploaded, so a bad path among several cannot orphan
+  // the earlier, already-uploaded ones.
+  it('create: validates all attachment paths before uploading any blob', async () => {
+    const uploads = [];
+    const uploadLocalFile = vi.fn(async (_s, p, opts) => {
+      if (!opts?.validateOnly) uploads.push(p);
+      if (p.endsWith('.png')) {
+        return { ok: true, media: { blob_ref: 'b-' + p, mime: 'image/png', name: p, size: 3, isImage: true } };
+      }
+      return { ok: false, status: 404, body: { error: `file not found: ${p}` } };
+    });
+    const client = { create: vi.fn(async () => ({ status: 201, data: { item: { id: 'it_1', num: 1 } } })) };
+    const sessions = new Map([['!r:s', { roomId: '!r:s', workdir: '/w', journalConvoId: 'c1' }]]);
+    const h = createItemsHandlers({ sessions, journalConvoIdFor: () => 'c1', client, uploadLocalFile });
+
+    const r = await h.create({ roomId: '!r:s', kind: 'task', title: 'T', attachments: ['ok.png', 'bad.txt'] });
+    expect(r.status).toBe(404);
+    // The valid first file was NEVER actually uploaded — the invalid second path
+    // was caught in the validation pass first.
+    expect(uploads).toEqual([]);
+    expect(client.create).not.toHaveBeenCalled();
+  });
+
   it('create: validates kind and title', async () => {
     const { h } = fixture();
     expect((await h.create({ roomId: '!r:s', kind: 'bug', title: 'T' })).status).toBe(400);
@@ -338,6 +383,57 @@ describe('items handlers', () => {
     expect(client.update).not.toHaveBeenCalled();
   });
 
+  it('create: rejects invalid labels BEFORE uploading any attachment (no orphaned blob)', async () => {
+    // Regression: the journal 400s labels > 50 / empty / > 40 chars, but the
+    // bridge used to forward them unvalidated AFTER uploadAll — so an invalid request uploaded the
+    // blob, then got 400'd, permanently orphaning it. Validate before the upload.
+    const { h, client, uploadLocalFile } = fixture();
+    const r = await h.create({ roomId: '!r:s', kind: 'task', title: 'T', attachments: ['shot.png'], labels: Array.from({ length: 51 }, (_, i) => `l${i}`) });
+    expect(r.status).toBe(400);
+    expect(r.body.error).toMatch(/labels/);
+    expect(uploadLocalFile).not.toHaveBeenCalled();
+    expect(client.create).not.toHaveBeenCalled();
+    // over-long single label
+    expect((await h.create({ roomId: '!r:s', kind: 'task', title: 'T', labels: ['x'.repeat(41)] })).status).toBe(400);
+    // empty / non-string label
+    expect((await h.create({ roomId: '!r:s', kind: 'task', title: 'T', labels: [''] })).status).toBe(400);
+    expect((await h.create({ roomId: '!r:s', kind: 'task', title: 'T', labels: ['  '] })).status).toBe(400);
+    expect((await h.create({ roomId: '!r:s', kind: 'task', title: 'T', labels: [7] })).status).toBe(400);
+    expect((await h.create({ roomId: '!r:s', kind: 'task', title: 'T', labels: 'ui' })).status).toBe(400);
+  });
+
+  it('create: rejects invalid links BEFORE uploading any attachment (no orphaned blob)', async () => {
+    const { h, client, uploadLocalFile } = fixture();
+    const r = await h.create({ roomId: '!r:s', kind: 'task', title: 'T', attachments: ['shot.png'], links: [{ url: 'ftp://x.example/f' }] });
+    expect(r.status).toBe(400);
+    expect(r.body.error).toMatch(/links/);
+    expect(uploadLocalFile).not.toHaveBeenCalled();
+    expect(client.create).not.toHaveBeenCalled();
+    // links must be an array
+    expect((await h.create({ roomId: '!r:s', kind: 'task', title: 'T', links: { url: 'https://x' } })).status).toBe(400);
+    // > 50 links
+    expect((await h.create({ roomId: '!r:s', kind: 'task', title: 'T', links: Array.from({ length: 51 }, () => ({ url: 'https://x.example' })) })).status).toBe(400);
+    // missing / non-string url
+    expect((await h.create({ roomId: '!r:s', kind: 'task', title: 'T', links: [{}] })).status).toBe(400);
+    expect((await h.create({ roomId: '!r:s', kind: 'task', title: 'T', links: [{ url: 5 }] })).status).toBe(400);
+    // over-long url
+    expect((await h.create({ roomId: '!r:s', kind: 'task', title: 'T', links: [{ url: 'https://x.example/' + 'a'.repeat(2049) }] })).status).toBe(400);
+    // non-string / over-long title
+    expect((await h.create({ roomId: '!r:s', kind: 'task', title: 'T', links: [{ url: 'https://x.example', title: 5 }] })).status).toBe(400);
+    expect((await h.create({ roomId: '!r:s', kind: 'task', title: 'T', links: [{ url: 'https://x.example', title: 'x'.repeat(201) }] })).status).toBe(400);
+  });
+
+  it('create: a valid attachment + well-formed labels/links still succeeds and uploads', async () => {
+    const { h, client, uploadLocalFile } = fixture();
+    const labels = Array.from({ length: 50 }, (_, i) => `l${i}`);
+    const links = [{ url: 'https://x.example/a', title: 'A' }, { url: 'http://y.example/b' }];
+    const r = await h.create({ roomId: '!r:s', kind: 'task', title: 'T', attachments: ['shot.png'], labels, links });
+    expect(r.status).toBe(201);
+    expect(uploadLocalFile).toHaveBeenCalled();
+    expect(client.create.mock.calls[0][0]).toMatchObject({ labels, links });
+    expect(client.create.mock.calls[0][0].attachments[0].blob_ref).toBe('b-shot.png');
+  });
+
   it('move: sets or clears the item mission through PATCH; validates the target', async () => {
     const { h, client } = fixture();
     expect((await h.move({ roomId: '!r:s', id: 'it_1' })).status).toBe(400);
@@ -352,5 +448,148 @@ describe('items handlers', () => {
     expect(client.update.mock.calls[1]).toEqual(['#4', { mission: '#62' }]);
     expect((await h.move({ roomId: '!r:s', id: 'it_1', mission: null })).status).toBe(200);
     expect(client.update.mock.calls[2]).toEqual(['it_1', { mission: null }]);
+  });
+});
+
+describe('items handlers Files deep link', () => {
+  const WEB = 'https://matron.example.com';
+  const WORK = '/home/user/workspace';
+
+  function webFixture(webBaseUrl) {
+    const session = { roomId: '!r:s', workdir: WORK, journalConvoId: 'c1' };
+    const sessions = new Map([['!r:s', session]]);
+    const client = {
+      create: vi.fn(async () => ({ status: 201, data: { item: { id: 'it_1', num: 1 } } })),
+      comment: vi.fn(async () => ({ status: 201, data: { item: {}, comment: { id: 'ic_1' } } })),
+      update: vi.fn(async () => ({ status: 200, data: { item: {} } })),
+    };
+    // Mirrors resolveAndUploadLocalFile's media shape, including the resolved absPath + workdir the
+    // deep-link builder needs.
+    const uploadLocalFile = vi.fn(async (_s, p) => ({
+      ok: true,
+      media: { blob_ref: 'b-' + p, mime: 'text/markdown', name: p.split('/').pop(), size: 3, isImage: false, absPath: `${WORK}/${p.split('/').pop()}`, workdir: WORK },
+    }));
+    const h = createItemsHandlers({ sessions, journalConvoIdFor: (s) => s?.journalConvoId ?? null, client, uploadLocalFile, webBaseUrl });
+    return { h, client };
+  }
+
+  it('create: appends a Files deep link line per attachment to the body when webBaseUrl is set', async () => {
+    const { h, client } = webFixture(WEB);
+    await h.create({ roomId: '!r:s', kind: 'task', title: 'Handoff', body: 'draft is ready', attachments: ['report.md'] });
+    const sent = client.create.mock.calls[0][0];
+    expect(sent.body).toBe(
+      `draft is ready\n\n📁 Open report.md in Files: ${WEB}/#files=${encodeURIComponent(`${WORK}/report.md`)}`,
+    );
+    // The attachment record itself is unchanged (deep link is additive, not a replacement).
+    expect(sent.attachments).toEqual([{ blob_ref: 'b-report.md', mime: 'text/markdown', name: 'report.md', size: 3 }]);
+  });
+
+  it('create: an attachment-only item gets a body built from just the deep link', async () => {
+    const { h, client } = webFixture(WEB);
+    await h.create({ roomId: '!r:s', kind: 'task', title: 'Handoff', attachments: ['report.md'] });
+    expect(client.create.mock.calls[0][0].body).toBe(
+      `📁 Open report.md in Files: ${WEB}/#files=${encodeURIComponent(`${WORK}/report.md`)}`,
+    );
+  });
+
+  it('comment: appends the deep link to the comment body when webBaseUrl is set', async () => {
+    const { h, client } = webFixture(WEB);
+    await h.comment({ roomId: '!r:s', id: 'it_1', body: 'see attached', attachments: ['report.md'] });
+    expect(client.comment.mock.calls[0][1].body).toBe(
+      `see attached\n\n📁 Open report.md in Files: ${WEB}/#files=${encodeURIComponent(`${WORK}/report.md`)}`,
+    );
+  });
+
+  it('leaves the body untouched (plain-path fallback) when webBaseUrl is unset', async () => {
+    const { h, client } = webFixture('');
+    await h.create({ roomId: '!r:s', kind: 'task', title: 'Handoff', body: 'draft is ready', attachments: ['report.md'] });
+    expect(client.create.mock.calls[0][0].body).toBe('draft is ready');
+  });
+});
+
+describe('items handlers deep-link body bound', () => {
+  const WEB = 'https://matron.example.com';
+  const WORK = '/home/user/workspace';
+  const BODY_MAX = 32768;
+
+  function webFixture() {
+    const session = { roomId: '!r:s', workdir: WORK, journalConvoId: 'c1' };
+    const sessions = new Map([['!r:s', session]]);
+    const client = { create: vi.fn(async () => ({ status: 201, data: { item: { id: 'it_1', num: 1 } } })) };
+    const uploadLocalFile = vi.fn(async () => ({
+      ok: true,
+      media: { blob_ref: 'b1', mime: 'text/markdown', name: 'report.md', size: 3, isImage: false, absPath: `${WORK}/report.md`, workdir: WORK },
+    }));
+    const h = createItemsHandlers({ sessions, journalConvoIdFor: (s) => s?.journalConvoId ?? null, client, uploadLocalFile, webBaseUrl: WEB });
+    return { h, client };
+  }
+
+  it('drops the deep-link trailer rather than pushing a max-length body over the journal limit', async () => {
+    const { h, client } = webFixture();
+    const body = 'x'.repeat(BODY_MAX); // exactly at the contract max — valid, but no room for a trailer
+    const r = await h.create({ roomId: '!r:s', kind: 'task', title: 'Big', body, attachments: ['report.md'] });
+    expect(r.status).toBe(201);
+    const sent = client.create.mock.calls[0][0];
+    expect(sent.body).toBe(body); // unchanged — trailer skipped
+    expect(sent.body.length).toBeLessThanOrEqual(BODY_MAX);
+    // The attachment still went through; only the convenience link was skipped.
+    expect(sent.attachments).toHaveLength(1);
+  });
+
+  it('still appends the trailer when there is room under the limit', async () => {
+    const { h, client } = webFixture();
+    const r = await h.create({ roomId: '!r:s', kind: 'task', title: 'Small', body: 'short', attachments: ['report.md'] });
+    expect(r.status).toBe(201);
+    expect(client.create.mock.calls[0][0].body).toContain('📁 Open report.md in Files:');
+  });
+});
+
+describe('items handlers deep-link byte-bound + multi-trailer', () => {
+  const WEB = 'https://matron.example.com';
+  const WORK = '/home/user/workspace';
+  const BODY_MAX = 32768;
+
+  function webFixtureMulti() {
+    const session = { roomId: '!r:s', workdir: WORK, journalConvoId: 'c1' };
+    const sessions = new Map([['!r:s', session]]);
+    const client = { create: vi.fn(async () => ({ status: 201, data: { item: { id: 'it_1', num: 1 } } })) };
+    const uploadLocalFile = vi.fn(async (_s, p) => {
+      const name = p.split('/').pop();
+      return { ok: true, media: { blob_ref: 'b-' + name, mime: 'text/markdown', name, size: 3, isImage: false, absPath: `${WORK}/${name}`, workdir: WORK } };
+    });
+    const h = createItemsHandlers({ sessions, journalConvoIdFor: (s) => s?.journalConvoId ?? null, client, uploadLocalFile, webBaseUrl: WEB });
+    return { h, client };
+  }
+
+  it('bounds the final body by UTF-8 BYTES, not code units (📁 is 4 bytes)', async () => {
+    const { h, client } = webFixtureMulti();
+    // Choose a body length such that appending the trailer stays within BODY_MAX code units but
+    // would exceed BODY_MAX bytes — the emoji costs +2 bytes over its 2 code units. If the bound
+    // were code-unit based, the trailer would be (wrongly) appended and the byte length exceed max.
+    const trailer = `\n\n📁 Open report.md in Files: ${WEB}/#files=${encodeURIComponent(`${WORK}/report.md`)}`;
+    const trailerBytes = Buffer.byteLength(trailer, 'utf8');
+    const body = 'x'.repeat(BODY_MAX - trailerBytes + 1); // +1 byte over once the trailer is added
+    const r = await h.create({ roomId: '!r:s', kind: 'task', title: 'B', body, attachments: ['report.md'] });
+    expect(r.status).toBe(201);
+    const sent = client.create.mock.calls[0][0];
+    expect(Buffer.byteLength(sent.body, 'utf8')).toBeLessThanOrEqual(BODY_MAX);
+    expect(sent.body).toBe(body); // trailer skipped — over the byte budget
+  });
+
+  it('skips only the oversized trailer and still appends a later one that fits (continue, not break)', async () => {
+    const { h, client } = webFixtureMulti();
+    const longName = 'a'.repeat(400) + '.md'; // long path/name → big trailer
+    const shortName = 'b.md';                  // short trailer
+    // Body sized so the LONG trailer overflows but the SHORT one fits.
+    const shortTrailer = `\n\n📁 Open ${shortName} in Files: ${WEB}/#files=${encodeURIComponent(`${WORK}/${shortName}`)}`;
+    const longTrailer = `\n\n📁 Open ${longName} in Files: ${WEB}/#files=${encodeURIComponent(`${WORK}/${longName}`)}`;
+    const body = 'x'.repeat(BODY_MAX - Buffer.byteLength(shortTrailer, 'utf8') - 5);
+    // Sanity: the long trailer must not fit on top of body, the short one must.
+    expect(Buffer.byteLength(body + longTrailer, 'utf8')).toBeGreaterThan(BODY_MAX);
+    await h.create({ roomId: '!r:s', kind: 'task', title: 'B', body, attachments: [longName, shortName] });
+    const sent = client.create.mock.calls[0][0];
+    expect(sent.body).toContain(`📁 Open ${shortName} in Files:`); // shorter, later trailer kept
+    expect(sent.body).not.toContain(`📁 Open ${longName} in Files:`); // oversized one skipped
+    expect(Buffer.byteLength(sent.body, 'utf8')).toBeLessThanOrEqual(BODY_MAX);
   });
 });

@@ -401,7 +401,7 @@ describe('Codex outcome deploy-skew repair', () => {
 
 // F7 (T-6.7): a controllable mock publisher that models the best-effort
 // contract precisely — publishTextBestEffort records the call and fires
-// onDelivered only when delivery is enabled (delivery === true). While
+// onLocalSendComplete only when delivery is enabled (delivery === true). While
 // undelivered (outage), the enqueue returns false and the note stays pending,
 // exactly like an eviction into pendingRepairs.
 function makeMockPublisher() {
@@ -411,9 +411,9 @@ function makeMockPublisher() {
     calls,
     setDelivery(value) { delivery = value; },
     publishTextBestEffort(convoId, payload, opts = {}) {
-      const rec = { convoId, payload, idemKey: opts.idemKey, onDelivered: opts.onDelivered };
+      const rec = { convoId, payload, idemKey: opts.idemKey, onLocalSendComplete: opts.onLocalSendComplete };
       calls.push(rec);
-      if (delivery) { rec.onDelivered?.(); return true; }
+      if (delivery) { rec.onLocalSendComplete?.(); return true; }
       return false;
     },
     publishText() { return true; },
@@ -455,7 +455,7 @@ describe('Codex failure-notice durability (F7)', () => {
     expect(tracker.hasPendingCapNote()).toBe(true); // not delivered → still pending
 
     // Delivery of the replay closes the latch; no further pending note.
-    capEmits[1].onDelivered();
+    capEmits[1].onLocalSendComplete();
     expect(tracker.hasPendingCapNote()).toBe(false);
     expect(tracker.pendingCapNote()).toBeNull();
   });
@@ -507,7 +507,7 @@ describe('Codex failure-notice durability (F7)', () => {
     expect(breakerEmits.length).toBeGreaterThanOrEqual(2);
     expect(isolation.pendingBreakerNote()).not.toBeNull(); // undelivered → pending
 
-    breakerEmits[breakerEmits.length - 1].onDelivered();
+    breakerEmits[breakerEmits.length - 1].onLocalSendComplete();
     expect(isolation.pendingBreakerNote()).toBeNull();
   });
 });

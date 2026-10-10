@@ -9,7 +9,7 @@ import { resolvePermissionTimeoutMs, classifyPermissionPostResponse } from './li
 import { formatBox } from './lib/agent-boxes-format.js';
 import { itemLine, formatItemList, formatItemDetail, formatCommentAck, formatHandoverAck, withImageWarnings } from './lib/items-format.js';
 import { formatStartAck, formatCreateAck, formatMilestoneAck, formatMissionDetail, missionLine, formatBlocked, formatJournalError, formatStatusAck, formatMissionList, formatJoinAck, formatLeaveAck, formatUpdateAck } from './lib/missions-format.js';
-import { missionIdemKey } from './lib/missions-idem.js';
+import { missionIdemKey, itemIdemKey } from './lib/missions-idem.js';
 import { projectLine, formatProjectList, formatProjectDetail, formatProjectCreateAck, formatProjectStatusAck, formatProjectMergeAck, formatProjectBlocked, formatProjectJournalError } from './lib/projects-format.js';
 import { formatMemoryList, formatMemoryDetail, formatSaveAck, formatDeleteAck } from './lib/memory-format.js';
 import { formatReminderLine } from './lib/reminder-tools.js';
@@ -23,7 +23,13 @@ import { formatUnseenList, formatUnseenMine, formatFlagAck } from './lib/unseen-
 import { formatRoutineList, formatRoutineUpdateAck, formatRoutineRunAck, formatRoutineCreateAck, formatRoutineDeleteAck } from './lib/routines-tools.js';
 import { formatBriefingPublishAck } from './lib/briefings-tools.js';
 
-const BRIDGE_API = process.env.BRIDGE_API_URL || 'http://127.0.0.1:9802';
+// Route to whichever bridge spawned us: explicit BRIDGE_API_URL wins, else the
+// per-session MATRON_BRIDGE_API_PORT exported by the bridge at spawn (journal=9812,
+// old Matrix bridge=9802), else the legacy default. Prevents the inbound-secret
+// flow from posting to the wrong bridge process after the journal cutover.
+const BRIDGE_API = process.env.BRIDGE_API_URL
+  || (process.env.MATRON_BRIDGE_API_PORT && `http://127.0.0.1:${process.env.MATRON_BRIDGE_API_PORT}`)
+  || 'http://127.0.0.1:9802';
 const ROOM_ID = process.env.BRIDGE_ROOM_ID || null;
 const POLL_INTERVAL_MS = 500;
 // Max wait for a permission tap — the bridge's registry TTL resolves from the
@@ -312,6 +318,60 @@ server.tool(
         ? `\nOther people's sessions (shared with you by their owners; a room with one needs your user's approval AND theirs, and turns their side starts run restricted — see BRIDGE_CLAUDE.md "Rooms with other people"):\n${people.join('\n')}`
         : '';
       return { content: [{ type: 'text', text: `${self}\nOther agents:\n${agents.join('\n') || '- none'}\nConversations:\n${convos.join('\n') || '- none'}${peopleBlock}` }] };
+    } catch (err) {
+      return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
+    }
+  }
+);
+
+server.tool(
+  'agent_sessions',
+  "List this user's addressable agent sessions for direct coordination. Each entry includes its conversation id, title, state, agent kind, and whether it is this session; never target an entry where is_self is true.",
+  {},
+  async () => {
+    try {
+      const postRes = await fetch(`${BRIDGE_API}/agent-sessions`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ roomId: ROOM_ID }),
+      });
+      const data = await postRes.json().catch(() => ({}));
+      if (!postRes.ok) {
+        return { content: [{ type: 'text', text: `agent_sessions failed: ${data.error || `HTTP ${postRes.status}`}` }] };
+      }
+      return { content: [{ type: 'text', text: JSON.stringify(data.sessions || [], null, 2) }] };
+    } catch (err) {
+      return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
+    }
+  }
+);
+
+server.tool(
+  'agent_message',
+  "Send a concise coordination line to another of the operator's agent sessions. Choose target_convo from agent_sessions; use this for outcomes, questions, and decisions rather than running commentary.",
+  {
+    target_convo: z.string().min(1).describe('Conversation id of the target session, from agent_sessions'),
+    body: z.string().min(1).describe('The coordination line to send'),
+    priority: z
+      .boolean()
+      .optional()
+      .describe(
+        "Mark this as a priority message. The target surfaces it with a louder in-timeline marker, and while the target is mid-turn on lower-priority work (a coordinating peer turn, or autonomous work) a priority message may interrupt that turn so it is handled sooner. It never interrupts the operator's own in-progress turn or an equal-priority peer turn, and when the target is idle at a prompt it is delivered normally without interrupting. Use sparingly, for time-sensitive coordination.",
+      ),
+  },
+  async ({ target_convo, body, priority }) => {
+    try {
+      const postRes = await fetch(`${BRIDGE_API}/agent-message`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        // Only serialize priority when true — a normal message carries no priority at any hop.
+        body: JSON.stringify({ roomId: ROOM_ID, target_convo, body, ...(priority === true ? { priority: true } : {}) }),
+      });
+      const data = await postRes.json().catch(() => ({}));
+      if (!postRes.ok) {
+        return { content: [{ type: 'text', text: `agent_message failed: ${data.error || `HTTP ${postRes.status}`}` }] };
+      }
+      return { content: [{ type: 'text', text: JSON.stringify(data) }] };
     } catch (err) {
       return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
     }
@@ -956,6 +1016,33 @@ server.tool(
 // can no longer be resumed (index.js orphanRoomBinding).
 
 server.tool(
+  'agent_chat_invite',
+  "Invite another of the user's agent sessions into a chat room you ALREADY own — the proactive inverse of agent_chat_join. You must be the room's owner (the session that started it with agent_chat_start). Pick the invitee's conversation from agent_roster; the bridge asks its agent, which accepts with agent_chat_accept exactly like a fresh chat request. The invitee must accept — you cannot force-add. Same-box sessions cannot be added this way in v1; invite a session on another box. If the result is pending or pending_busy, do NOT wait or poll: continue your own work — the answer and any replies arrive automatically as later turns.",
+  {
+    room_id: z.string().describe('The id of a room you own and want to invite into'),
+    target_convo_id: z.string().describe('Conversation id of the session to invite, from agent_roster'),
+    topic: z.string().optional().describe('Optional short topic, shown to the invitee with the request'),
+    justification: z.string().describe('Why you want that agent in the room — shown to it with the request'),
+  },
+  async ({ room_id, target_convo_id, topic, justification }) => {
+    try {
+      const postRes = await fetch(`${BRIDGE_API}/agent-chat-invite`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ roomId: ROOM_ID, room_id, target_convo_id, justification, ...(topic ? { topic } : {}) }),
+      });
+      const data = await postRes.json().catch(() => ({}));
+      if (!postRes.ok) {
+        return { content: [{ type: 'text', text: `agent_chat_invite failed: ${data.error || `HTTP ${postRes.status}`}` }] };
+      }
+      return { content: [{ type: 'text', text: describeRoomOutcome(data) }] };
+    } catch (err) {
+      return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
+    }
+  }
+);
+
+server.tool(
   'agent_chat_mute',
   'Mute an agent chat room: its messages stop being delivered to you. Use this when a room has gone wrong — the peer is looping, spamming, or malfunctioning — instead of trying to leave (you cannot: a room stays open for the life of both conversations, across restarts and sleeps). The room stays open and readable with agent_chat_read, you can still post into it, and your user sees why you muted it and can unmute you with one tap.',
   {
@@ -1040,11 +1127,22 @@ server.tool(
 // is testable without a journal). Never isError: a tool result that reads as
 // a sentence keeps the model working instead of retrying blindly.
 async function callItems(name, args, render) {
+  const payload = { roomId: ROOM_ID, ...args };
+  // The two minting/appending item ops carry an idempotency key the model never
+  // sees or supplies: a harness-retried item_create/item_comment
+  // would otherwise duplicate the item/comment AND re-upload its attachment blob
+  // (permanently orphaning the first upload — retention.js never reaps it). The
+  // key is derived from the call (op, room, content, +id for comments) inside a
+  // ten-minute bucket, so a retry replays the existing row instead. See
+  // lib/missions-idem.js.
+  if (name === 'create' || name === 'comment') {
+    payload.idem_key = itemIdemKey({ op: `item_${name}`, roomId: ROOM_ID, args: args || {} });
+  }
   try {
     const res = await fetch(`${BRIDGE_API}/items/${name}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ roomId: ROOM_ID, ...args }),
+      body: JSON.stringify(payload),
     });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) return { content: [{ type: 'text', text: `item_${name} failed: ${data.error || `HTTP ${res.status}`}` }] };

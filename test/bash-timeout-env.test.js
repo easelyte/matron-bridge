@@ -147,6 +147,7 @@ describe('bashTimeoutEnv', () => {
 describe('buildClaudeSpawnEnv wiring', () => {
   const build = (baseEnv) =>
     buildClaudeSpawnEnv({
+      mode: 'print', // fork delta: the builder requires a mode (permission cards)
       baseEnv,
       execPath: '/opt/node/bin/node',
       roomId: '!room:example',

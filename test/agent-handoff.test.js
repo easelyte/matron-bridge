@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'vitest';
+import { readFileSync } from 'fs';
 import {
   buildAgentHandoffPrompt,
   canSwitchAgent,
@@ -30,6 +31,21 @@ describe('canSwitchAgent', () => {
     expect(canSwitchAgent({ ...idleClaude, _pendingPromptAnswerDelivery: true }, 'codex').message).toContain('pending question');
     expect(canSwitchAgent({ ...idleClaude, agent: 'codex', codexPrompts: { active: { kind: 'async-question' } }, _codexAwaitingAnswer: false }, 'claude').message).toContain('pending question');
     expect(canSwitchAgent({ ...idleClaude, pendingPlan: 'plan' }, 'codex').message).toContain('pending plan');
+  });
+
+  it('blocks a switch while an attachment is still being prepared (in-flight media drain)', () => {
+    // A /switch can otherwise proceed while journal-media prep (fetch /
+    // transcribe / save-to-disk) is still running for this conversation. The
+    // switch tears the old session down, the router's canonicality guard then
+    // drops the in-flight attachment — the media is silently lost from the
+    // user's perspective. Gate the switch on in-flight media the same way it
+    // gates on a busy turn or a non-empty queue, so the operator retries once
+    // prep has drained.
+    const res = canSwitchAgent(idleClaude, 'codex', { hasInflightMedia: true });
+    expect(res.ok).toBe(false);
+    expect(res.message).toMatch(/attachment/i);
+    // The default (no in-flight media) must not regress the idle handoff.
+    expect(canSwitchAgent(idleClaude, 'codex', { hasInflightMedia: false })).toEqual({ ok: true, target: 'codex' });
   });
 });
 
@@ -217,5 +233,25 @@ describe('buildAgentHandoffPrompt', () => {
     expect(result.prompt).toContain('message-5');
     expect(result.prompt).toContain('message-7');
     expect(result.omittedMessages).toBe(5);
+  });
+});
+
+// switchAgentSession lives in index.js and leans on module-scope session state,
+// so it can't be imported. Pin the queue-carry wiring by source
+// inspection, matching the index.js-inspection tests in busy-queue.test.js.
+describe('index.js switchAgentSession — queued-message carry (source inspection)', () => {
+  it('carries queuedMessages + queueNotifications into the replacement agent session', () => {
+    const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
+    const start = src.indexOf('async function switchAgentSession(');
+    expect(start).toBeGreaterThan(-1);
+    // Function closes at the first brace in column 0 after the declaration.
+    const end = src.indexOf('\n}\n', start);
+    expect(end).toBeGreaterThan(start);
+    const body = src.slice(start, end);
+
+    // Without these an !agent Claude<->Codex switch silently orphaned any
+    // queued user input (recreateSession carried it, switchAgentSession did not).
+    expect(body).toMatch(/next\.queuedMessages = existing\.queuedMessages/);
+    expect(body).toMatch(/next\.queueNotifications = existing\.queueNotifications/);
   });
 });

@@ -259,6 +259,7 @@ relaunches after a non-zero exit.
 | `MATRON_DUMP_PTY` | When `MATRON_INTERACTIVE_MODE=1`, set to `1` to dump raw PTY bytes for each session to a private per-session temp dir, e.g. `/tmp/iv-pty-XXXXXX/<roomId>.log` (exact path is printed to the bridge log at session start), for debugging stuck-prompt issues | `0` |
 | `HMAC_SECRET` | Shared secret for signed file viewer URLs | — |
 | `VIEWER_BASE_URL` | Public URL for file viewer | — |
+| `WEB_BASE_URL` | Web client base URL for Files deep links. When set, doc handoffs (send_attachment / show_file / item attachments) append an `Open in Files` link (`${WEB_BASE_URL}/#files=<abs>`, so set it to wherever the web app itself is served, including any path prefix); token-less (uses the operator's web session). Unset => handoffs fall back to the plain path. Set only after the matron-web deep-link build is deployed. | — |
 | `LINK_EXPIRY_MS` | Signed URL expiry in ms | `900000` (15 min) |
 | `MATRON_BRIDGE_API_PORT` | Internal API port (hooks, MCP, viewer) | `9802` |
 | `MATRON_VIEWER_PORT` | Local file viewer port | `9803` |
@@ -416,6 +417,7 @@ matron-bridge/
 ├── BRIDGE_CODEX.md       # Extra instructions for bridge-spawned Codex turns
 ├── BRIDGE_NOTICES.md     # Notices block, appended while the user's notices setting is on
 ├── docs/codex.md         # Codex setup, switching, security, and troubleshooting
+├── docs/agent-rpc.md     # Agent RPC methods (recent_folders, start, read/edit_file, ops_snapshot)
 ├── mcp-config.json       # MCP server config for Claude Code
 ├── viewer/               # HMAC-signed file viewer
 ├── setup/                # OS-dispatching installer, service, whisper

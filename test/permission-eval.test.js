@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import {
+  accessSync,
+  constants as fsConstants,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -16,6 +18,31 @@ import {
 } from '../lib/permission-eval.js';
 
 const WEBFLOW_SETTINGS_FIXTURE = path.resolve('test/fixtures/webflow-settings.local.json');
+// Same `~` expansion + resolve as index.js applies to DEFAULT_WORKDIR.
+function expandWorkdir(p) {
+  if (p === '~') return os.homedir();
+  if (p.startsWith('~/') || p.startsWith('~\\')) return path.join(os.homedir(), p.slice(2));
+  return path.resolve(p);
+}
+const PRODUCTION_WORKDIR = expandWorkdir(process.env.DEFAULT_WORKDIR || '/home/user/workspace');
+const PRODUCTION_SETTINGS_LOCAL = path.join(PRODUCTION_WORKDIR, '.claude', 'settings.local.json');
+
+// Which settings file the live-allowlist test reads: the live file when readable, the
+// committed fixture when the live file is absent, and a skip (with the reason) when the
+// live file exists but this user cannot read it (e.g. a non-root runner and root's file).
+// Only ENOENT/ENOTDIR count as absent; any other access error (EACCES on the file or on a
+// parent directory) is a skip, never a silent fall-back to the fixture.
+function resolveLiveSettingsSource(livePath, { access = accessSync } = {}) {
+  try {
+    access(livePath, fsConstants.R_OK);
+  } catch (err) {
+    if (err?.code === 'ENOENT' || err?.code === 'ENOTDIR') {
+      return { sourcePath: WEBFLOW_SETTINGS_FIXTURE };
+    }
+    return { skipReason: `live settings ${livePath} unreadable (${err?.code ?? err?.message})` };
+  }
+  return { sourcePath: livePath };
+}
 
 function webflowAllowRules(settings) {
   return settings.permissions.allow.filter(rule => (
@@ -60,12 +87,48 @@ describe('permission snapshot', () => {
     expect(Object.isFrozen(snapshot.mcpAllow)).toBe(true);
     expect(Object.isFrozen(snapshot.mcpDeny)).toBe(true);
     expect(Object.isFrozen(snapshot.mcpAsk)).toBe(true);
-    expect(webflowTools).toHaveLength(26);
-    expect(webflowTools).not.toContain('mcp__webflow__data_sites_tool');
+    expect(webflowTools).toHaveLength(28);
+    expect(webflowTools).not.toContain('mcp__webflow__data_scripts_tool');
     for (const toolName of webflowTools) {
       expect(classifyPermission(snapshot, toolName), toolName).toBe('allow');
     }
-    expect(classifyPermission(snapshot, 'mcp__webflow__data_sites_tool')).toBe('default-gated');
+    expect(classifyPermission(snapshot, 'mcp__webflow__data_scripts_tool')).toBe('default-gated');
+  });
+
+  it('resolves the live settings source: live when readable, fixture when absent, skip when unreadable', () => {
+    const live = '/srv/workspace/.claude/settings.local.json';
+    const failWith = code => () => { throw Object.assign(new Error(code), { code }); };
+    expect(resolveLiveSettingsSource(live, { access: () => {} })).toEqual({ sourcePath: live });
+    expect(resolveLiveSettingsSource(live, { access: failWith('ENOENT') }))
+      .toEqual({ sourcePath: WEBFLOW_SETTINGS_FIXTURE });
+    expect(resolveLiveSettingsSource(live, { access: failWith('ENOTDIR') }))
+      .toEqual({ sourcePath: WEBFLOW_SETTINGS_FIXTURE });
+    // EACCES covers both an unreadable file and an untraversable parent directory.
+    expect(resolveLiveSettingsSource(live, { access: failWith('EACCES') }))
+      .toEqual({ skipReason: `live settings ${live} unreadable (EACCES)` });
+  });
+
+  it('expands ~ in DEFAULT_WORKDIR the way the bridge does', () => {
+    expect(expandWorkdir('~')).toBe(os.homedir());
+    expect(expandWorkdir('~/')).toBe(os.homedir());
+    expect(expandWorkdir('~/ws')).toBe(path.join(os.homedir(), 'ws'));
+    expect(expandWorkdir('/home/user/workspace')).toBe('/home/user/workspace');
+  });
+
+  it('classifies the live Webflow allowlist when present, otherwise the committed fixture', ({ skip }) => {
+    const { sourcePath, skipReason } = resolveLiveSettingsSource(PRODUCTION_SETTINGS_LOCAL);
+    if (skipReason) skip(skipReason);
+    const fixtureSettings = JSON.parse(readFileSync(WEBFLOW_SETTINGS_FIXTURE, 'utf8'));
+    const settings = JSON.parse(readFileSync(sourcePath, 'utf8'));
+    const fixtureWebflowTools = webflowAllowRules(fixtureSettings);
+    const webflowTools = webflowAllowRules(settings);
+    const snapshot = buildPermissionSnapshot({ sourcePaths: [sourcePath] });
+
+    expect(webflowTools).toEqual(fixtureWebflowTools);
+    for (const toolName of webflowTools) {
+      expect(classifyPermission(snapshot, toolName), toolName).toBe('allow');
+    }
+    expect(classifyPermission(snapshot, 'mcp__webflow__data_scripts_tool')).toBe('default-gated');
   });
 
   it('discovers workspace, local, and user permission layers by default (workdir not in a repository)', () => {
@@ -344,14 +407,27 @@ describe('permission snapshot', () => {
     expect(classifyPermission(snapshot, 'mcp__server__allowed_tool')).toBe('allow');
   });
 
-  it('is empty and certain when no sources are given', () => {
+  it('includes the bridge print-mode MCP permission in every snapshot (fork: lib/session-settings.js allow-list)', () => {
     const snapshot = buildPermissionSnapshot({ sourcePaths: [] });
 
-    expect(snapshot.mcpAllow).toEqual([]);
     expect(snapshot.mcpDeny).toEqual([]);
     expect(snapshot.mcpAsk).toEqual([]);
     expect(snapshot.uncertain).toBe(false);
-    // No hardcoded default grant: an unknown tool is default-gated (fail-closed).
-    expect(classifyPermission(snapshot, 'mcp__show-file__show_file')).toBe('default-gated');
+    expect(classifyPermission(snapshot, 'mcp__show-file__show_file')).toBe('allow');
+    // Anything else is still default-gated (fail-closed).
+    expect(classifyPermission(snapshot, 'mcp__other__tool')).toBe('default-gated');
+  });
+});
+
+describe('print-session snapshot wiring (source inspection)', () => {
+  const indexSource = readFileSync(path.resolve('index.js'), 'utf8');
+  const printSpawn = indexSource.slice(
+    indexSource.indexOf('function createSession('),
+    indexSource.indexOf('// --- Codex programmatic sessions ---'),
+  );
+
+  it('builds one immutable snapshot per print session (read by both the card hook and the classifier)', () => {
+    expect(printSpawn).toContain('permissionSnapshot: buildPermissionSnapshot({ workdir: cwd })');
+    expect((printSpawn.match(/permissionSnapshot[,:]/g) || [])).toHaveLength(1);
   });
 });

@@ -21,7 +21,7 @@ describe('session control wiring (source inspection)', () => {
   it('registers the RPC method and the publisher hooks', () => {
     expect(index).toContain("controlSession: (params, meta) => journalControlSession(params, meta),");
     expect(index).toContain("onSessionControlFrame: (frame) => sessionControlHandlers?.onSessionControlFrame(frame),");
-    expect(index).toMatch(/onOpError: \(e\) => \{ if \(sessionControlHandlers\?\.onOpError\?\.\(e\)\) return; if \(agentSpawnHandlers/);
+    expect(index).toMatch(/onOpError: \(e\) => \{ warnRejectedConvoUpsert\(e\); if \(sessionControlHandlers\?\.onOpError\?\.\(e\)\) return; if \(agentSpawnHandlers/);
   });
   it('resolves or resumes the target, then parks, schedules or applies', () => {
     const fn = body('async function journalControlSession(rawParams, { fromDeviceId } = {}) {', '\nasync function applyControlSteps(');
@@ -80,7 +80,7 @@ describe('session control wiring (source inspection)', () => {
     expect(index).toContain('function flushRoomInbox(session) {');
   });
   it('parked controls and the automatic carry-on persist and are restored on resume', () => {
-    const ps = body('function persistSession(roomId, sessionId, workdir, originRoomId, extra) {', '\nfunction ');
+    const ps = body('function persistSession(roomId, sessionId, workdir, originRoomId, extra, { failLoud = false } = {}) {', '\nfunction ');
     expect(ps).toContain('if (live) derived._deferredControls = live._deferredControls || null;');
     expect(ps).toContain('if (live) derived._autoResume = live._autoResume || null;');
     // Restored for the ROOM, resume or not, in all three builders (Codex too).

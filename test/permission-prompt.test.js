@@ -314,7 +314,9 @@ describe('isRootOutsideSandbox', () => {
   });
 
   it('is false when getuid is unavailable (non-POSIX platforms)', () => {
-    expect(isRootOutsideSandbox({ getuid: undefined, env: {} })).toBe(false);
+    // null, not undefined: undefined would trigger the process.getuid default,
+    // which makes this test fail whenever the suite itself runs as root.
+    expect(isRootOutsideSandbox({ getuid: null, env: {} })).toBe(false);
   });
 });
 

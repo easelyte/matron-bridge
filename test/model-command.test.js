@@ -126,4 +126,20 @@ describe('planPrintModelSwitch', () => {
     expect(d.ok).toBe(false);
     expect(d.message).toMatch(/starting up/i);
   });
+  it('refuses an otherwise-approvable switch while media is in flight (drain gate)', () => {
+    // A print-mode /model switch recreates the claude -p process; doing it
+    // mid-media-prep drops the in-flight attachment at the router's canonicality
+    // guard — same gate as /switch, /restart, /mode. Checked after the busy
+    // defer, so a busy session still parks; only an immediate recreate is blocked.
+    const ready = { busy: false, claudeSessionId: 'abc', _sessionConfirmed: true };
+    const d = planPrintModelSwitch(ready, 'sonnet', { hasInflightMedia: true });
+    expect(d.ok).toBe(false);
+    expect(d.defer).toBeFalsy();
+    expect(d.message).toMatch(/attachment/i);
+    // No regression when nothing is in flight.
+    expect(planPrintModelSwitch(ready, 'sonnet', { hasInflightMedia: false }).ok).toBe(true);
+    expect(planPrintModelSwitch(ready, 'sonnet').ok).toBe(true);
+    // A busy session still parks (defer wins over the media gate).
+    expect(planPrintModelSwitch({ ...ready, busy: true }, 'sonnet', { hasInflightMedia: true }).defer).toBe(true);
+  });
 });

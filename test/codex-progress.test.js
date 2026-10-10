@@ -39,6 +39,9 @@ function harness() {
     recordConversationMessage: (s, role, text) => s.chatHistory.push({ role, text }),
     applyFallbackTitle: vi.fn(), SERVER_LABEL: 'bridge', updateRoomName: vi.fn(),
     splitMessage: text => [text],
+    // Fork additions: flushResponse's fallback-title call passes the
+    // the default workdir.
+    dominantRepo: () => null, DEFAULT_WORKDIR: '/workspace',
     armReplyRef, settleReplyRef,
   });
   vm.runInContext(['codexToolIndicator', 'handleCodexEvent', 'flushResponse'].map(functionSource).join('\n'), context);

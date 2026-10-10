@@ -7,12 +7,14 @@ import {
   contextWindowFor,
   sameModelFamily,
   subagentContextWindow,
+  reconcileModelForWindow,
   contextTokensFromUsage,
   contextTokensFromAssistantEvent,
   postCompactContextTokens,
   compactTriggerFrom,
   contextGaugeText,
   buildSessionStatus,
+  publishedExtras,
   emailFromClaudeConfig,
   statusRepaintDue,
   STATUS_REPAINT_MS,
@@ -96,6 +98,31 @@ describe('contextWindowFor', () => {
   it('handles a missing model', () => {
     expect(contextWindowFor(null)).toBe(200_000);
     expect(contextWindowFor(undefined)).toBe(200_000);
+  });
+});
+
+describe('reconcileModelForWindow', () => {
+  it('keeps the [1m] launch model when the bare stream id would narrow it', () => {
+    // A session launched as e.g. opus-4-6[1m], whose first assistant event
+    // reports the bare 200k-default id, must NOT drop to a 200k window.
+    expect(reconcileModelForWindow('claude-opus-4-6[1m]', 'claude-opus-4-6')).toBe('claude-opus-4-6[1m]');
+    expect(reconcileModelForWindow('claude-sonnet-4-5[1m]', 'claude-sonnet-4-5')).toBe('claude-sonnet-4-5[1m]');
+    // Widen-only also refuses a genuine downgrade in the event path (a real
+    // /model switch flows through its own path, not this reconcile).
+    expect(reconcileModelForWindow('claude-opus-4-6[1m]', 'claude-haiku-4-5')).toBe('claude-opus-4-6[1m]');
+  });
+
+  it('adopts the new model when it widens or matches the window', () => {
+    expect(reconcileModelForWindow('claude-opus-4-8', 'claude-opus-4-8[1m]')).toBe('claude-opus-4-8[1m]');
+    expect(reconcileModelForWindow('claude-opus-4-6', 'claude-opus-4-8')).toBe('claude-opus-4-8');
+    expect(reconcileModelForWindow('claude-fable-5', 'claude-mythos-5')).toBe('claude-mythos-5');
+  });
+
+  it('handles missing sides without narrowing', () => {
+    expect(reconcileModelForWindow(null, 'claude-opus-4-8')).toBe('claude-opus-4-8');
+    expect(reconcileModelForWindow('opus[1m]', null)).toBe('opus[1m]');
+    expect(reconcileModelForWindow(null, null)).toBe(null);
+    expect(reconcileModelForWindow(undefined, undefined)).toBe(null);
   });
 });
 
@@ -246,6 +273,23 @@ describe('contextGaugeText', () => {
   });
 });
 
+describe('publishedExtras', () => {
+  const known = ['browser', 'share', 'circleci'];
+  it('unions the session choice with machine defaults, session first, deduped', () => {
+    expect(publishedExtras({ requested: ['browser'], defaults: ['share', 'browser'], known })).toEqual(['browser', 'share']);
+  });
+  it('drops a persisted name whose mcpExtras block no longer exists (spawn filters it too)', () => {
+    expect(publishedExtras({ requested: ['gone', 'browser'], defaults: [], known })).toEqual(['browser']);
+  });
+  it('is [] for a session without extras, and for a non-array requested', () => {
+    expect(publishedExtras({ requested: [], known })).toEqual([]);
+    expect(publishedExtras({ requested: undefined, known })).toEqual([]);
+  });
+  it('is [] when the transport spawns with no MCP config (legacy Codex exec)', () => {
+    expect(publishedExtras({ requested: ['browser'], defaults: ['share'], known, noMcp: true })).toEqual([]);
+  });
+});
+
 describe('buildSessionStatus', () => {
   it('assembles model, context gauge, and limits into one frame payload', () => {
     const status = buildSessionStatus({
@@ -328,6 +372,26 @@ describe('buildSessionStatus', () => {
     const status = buildSessionStatus({ model: 'gpt-5.6-codex', modelOptions: [], effortLevels: [] });
     expect(status.model_options).toEqual([]);
     expect(status.effort_levels).toEqual([]);
+  });
+
+  it('publishes the session extras as an array (browser tools on)', () => {
+    const status = buildSessionStatus({ model: 'claude-fable-5', extras: ['browser', 'share'] });
+    expect(status.extras).toEqual(['browser', 'share']);
+  });
+
+  it('publishes EMPTY extras as [] so an "off" state reaches clients', () => {
+    expect(buildSessionStatus({ model: 'claude-fable-5', extras: [] }).extras).toEqual([]);
+  });
+
+  it('omits extras when the caller has no opinion (subagent / helper frames)', () => {
+    expect('extras' in buildSessionStatus({ model: 'claude-fable-5' })).toBe(false);
+    expect('extras' in buildSessionStatus({ model: 'claude-fable-5', extras: undefined })).toBe(false);
+    expect('extras' in buildSessionStatus({ model: 'claude-fable-5', extras: null })).toBe(false);
+  });
+
+  it('keeps only non-empty string extras, deduped in order', () => {
+    expect(buildSessionStatus({ extras: ['browser', '', null, 3, 'browser', 'circleci'] }).extras)
+      .toEqual(['browser', 'circleci']);
   });
 
   it('omits the lists only when the caller has no opinion at all (old bridges, subagent frames)', () => {
@@ -442,6 +506,18 @@ describe('host vitals', () => {
     expect('resets_at' in v).toBe(false);
   });
 
+  it('hostVitals keys match the client wire contract exactly (cpu_pct/ram_pct/sampled_at_ms)', () => {
+    // Load-bearing across three repos: matron-web's buildUsageMeters
+    // destructures { cpu_pct, ram_pct, sampled_at_ms } off status.vitals, and
+    // matron-apple's WireModels reads status["vitals"]["cpu_pct"|"ram_pct"].
+    // A rename here silently renders NOTHING on both (Number.isFinite guards
+    // on web, optional decode on iOS) — so the key set is pinned, not sampled.
+    stopCpuSampler();
+    sampleCpuOnce(BASE);
+    sampleCpuOnce(VALID);
+    expect(Object.keys(hostVitals()).sort()).toEqual(['cpu_pct', 'ram_pct', 'sampled_at_ms']);
+  });
+
   it('hostVitals carries a numeric sampled_at_ms so clients can expire stale replays', () => {
     // The publisher replays the last status frame to new viewers, so an idle
     // convo would show an arbitrarily old reading as current without an age
@@ -536,10 +612,16 @@ describe('index.js wiring', () => {
     const start = src.indexOf('function journalStatus(');
     const end = src.indexOf('\nfunction ', start + 1);
     const body = src.slice(start, end);
-    // vitals ride at top level via the buildSessionStatus vitals param.
+    // vitals ride at top level via the buildSessionStatus vitals param — the
+    // surface matron-web (buildUsageMeters reads status.vitals) and
+    // matron-apple (WireModels decodes status["vitals"].cpu_pct/ram_pct)
+    // actually render from.
     expect(body).toContain('hostVitals()');
     expect(body).toMatch(/vitals[,\n]/);
-    // Each provider supplies its own account limits, never host vitals.
+    // Each provider supplies its own account limits, never host vitals. A
+    // synthetic host_cpu/host_ram entry here double-renders CPU/RAM on any
+    // upstream-built client (they already synthesise both from status.vitals)
+    // and displaces a real quota bar on iOS's limits.prefix(3).
     expect(body).not.toContain('hostVitalLimits');
     expect(body).toContain('limits: isCodex ? (session._codexMetadata?.limits || []) : (usageLimitsCache.lines || [])');
   });
@@ -580,6 +662,14 @@ describe('index.js wiring', () => {
     const body = src.slice(start, end);
     expect(body).toContain('buildSessionStatus(');
     expect(body).toContain('publishStatus(');
+  });
+
+  it('journalStatus publishes extras through publishedExtras with the spawn inputs', () => {
+    const start = src.indexOf('function journalStatus(');
+    const body = src.slice(start, src.indexOf('\nfunction ', start + 1));
+    expect(body).toMatch(/extras: publishedExtras\(\{\s*requested: session\.mcpExtras,\s*defaults: DEFAULT_MCP_EXTRAS,\s*known: KNOWN_MCP_EXTRAS,\s*noMcp: isCodex && !CODEX_APP_SERVER,/);
+    // ...and legacy exec really gets no MCP config, which is why noMcp.
+    expect(src).toContain('config: CODEX_APP_SERVER ? codexMcpConfig({');
   });
 
   it('journalStatus uses provider-specific model and effort options', () => {
@@ -741,7 +831,9 @@ describe('index.js header-liveness wiring', () => {
     const pubSrc = readFileSync(fileURLToPath(new URL('../lib/journal-publisher.js', import.meta.url)), 'utf-8');
     expect(pubSrc).toContain('publishStatus() { return false; }'); // noop publisher
     const start = pubSrc.indexOf('publishStatus(convoId, status)');
-    const bodyEnd = pubSrc.indexOf('respondRpc(', start);
+    // Our fork inserts publishHostVitals between publishStatus and respondRpc,
+    // so bound the slice at it to read publishStatus's body alone.
+    const bodyEnd = pubSrc.indexOf('publishHostVitals(', start);
     const pubBody = pubSrc.slice(start, bodyEnd);
     expect(pubBody).toContain('return true;');
     expect(pubBody).toContain('return false;');

@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'fs';
-import { createAgentChatHandlers, probeJoinedRoom } from '../lib/agent-chat.js';
+import { createAgentChatHandlers, probeJoinedRoom, rosterBlurb, rosterSummaryEnabled } from '../lib/agent-chat.js';
 import { createAgentRooms } from '../lib/agent-rooms.js';
 
 const SELF = { deviceId: 1, name: 'mac' };
@@ -28,6 +28,10 @@ function makeFixture(overrides = {}) {
     fetchMessages: async () => ({ events: [] }),
     upsertConvo: (convoId, opts) => calls.push({ call: 'upsertConvo', convoId, opts }),
     publishText: (convoId, payload) => calls.push({ call: 'publishText', convoId, payload }),
+    sendPeerMessage: vi.fn(async (args) => {
+      calls.push({ call: 'sendPeerMessage', args });
+      return { sent: true, seq: 99, duplicate: false, delivered: true, offline: false };
+    }),
     ...overrides.publisher,
   };
   const registry = createAgentRooms({ log: { warn: () => {} } });
@@ -76,6 +80,9 @@ function makeFixture(overrides = {}) {
     deliverLocalInvite, localAnswer, routeLocalRoomMessage, notifyRoomPeer,
     publishSessionNotice, publishMuteCard, retireMuteCard, dropPendingRoomMessages,
     log,
+    // Explicit {} rather than the process.env default, so an ambient
+    // AGENT_ROSTER_SUMMARY_ENABLED on the test box cannot flip these assertions.
+    env: overrides.env ?? {},
   });
   return { handlers, calls, publisher, rooms, invites, sessions, pendingJoin, log, deliverLocalInvite, localAnswer, routeLocalRoomMessage, notifyRoomPeer, publishSessionNotice, publishMuteCard, retireMuteCard, dropPendingRoomMessages };
 }
@@ -84,7 +91,7 @@ describe('createAgentChatHandlers', () => {
   describe('caller-session gate (all handlers)', () => {
     it('rejects a missing or non-string roomId with 400', async () => {
       const { handlers } = makeFixture();
-      for (const h of ['roster', 'chatStart', 'chatSend', 'chatAccept', 'chatRefuse', 'chatJoin', 'chatLeave', 'chatRead']) {
+      for (const h of ['roster', 'agentSessions', 'agentMessage', 'chatStart', 'chatSend', 'chatAccept', 'chatRefuse', 'chatJoin', 'chatLeave', 'chatRead']) {
         expect((await handlers[h]({})).status).toBe(400);
         expect((await handlers[h]({ roomId: 42 })).status).toBe(400);
       }
@@ -98,6 +105,97 @@ describe('createAgentChatHandlers', () => {
     });
   });
 
+  describe('agentMessage', () => {
+    it('rejects a missing target or empty body before the transport emit exists', async () => {
+      const { handlers, calls } = makeFixture();
+
+      expect((await handlers.agentMessage({ roomId: '!sess', body: 'coordinate this' })).status).toBe(400);
+      expect((await handlers.agentMessage({ roomId: '!sess', target_convo: 'convo-remote', body: '' })).status).toBe(400);
+      expect((await handlers.agentMessage({ roomId: '!sess', target_convo: 'convo-remote', body: '   ' })).status).toBe(400);
+      expect(calls).toEqual([]);
+    });
+
+    it('emits with caller-bound attribution and maps transport success to only queued:true', async () => {
+      const { handlers, calls } = makeFixture();
+      const res = await handlers.agentMessage({
+        roomId: '!sess', target_convo: 'convo-remote', body: 'coordinate this',
+        from_convo: 'model-forged',
+      });
+      expect(res).toEqual({ status: 200, body: { queued: true } });
+      // fromConvo is the caller's JOURNAL convo id (journalConvoIdFor stub → 'convo-sess'),
+      // NOT the roomId '!sess' and NOT the model-forged value (spoof ignored).
+      expect(calls).toEqual([{
+        call: 'sendPeerMessage',
+        args: { targetConvo: 'convo-remote', fromConvo: 'convo-sess', body: 'coordinate this' },
+      }]);
+    });
+
+    it('forwards priority to the transport only when the sender set it true, never otherwise', async () => {
+      const { handlers, calls } = makeFixture();
+      await handlers.agentMessage({ roomId: '!sess', target_convo: 'convo-remote', body: 'urgent', priority: true });
+      await handlers.agentMessage({ roomId: '!sess', target_convo: 'convo-remote', body: 'calm', priority: false });
+      await handlers.agentMessage({ roomId: '!sess', target_convo: 'convo-remote', body: 'also calm' });
+      // priority:true carries the key; false/absent carry no key at all (base shape unchanged).
+      expect(calls).toEqual([
+        { call: 'sendPeerMessage', args: { targetConvo: 'convo-remote', fromConvo: 'convo-sess', body: 'urgent', priority: true } },
+        { call: 'sendPeerMessage', args: { targetConvo: 'convo-remote', fromConvo: 'convo-sess', body: 'calm' } },
+        { call: 'sendPeerMessage', args: { targetConvo: 'convo-remote', fromConvo: 'convo-sess', body: 'also calm' } },
+      ]);
+    });
+
+    it('409s when the session has no journal convo bound yet (fail-loud)', async () => {
+      const { handlers, sessions } = makeFixture();
+      sessions.set('!nocvo', { busy: false, alive: true }); // no convoId → journalConvoIdFor null
+      const res = await handlers.agentMessage({ roomId: '!nocvo', target_convo: 'convo-remote', body: 'x' });
+      expect(res.status).toBe(409);
+    });
+
+    it('surfaces transport-horizon exhaustion as uncertain', async () => {
+      const { handlers } = makeFixture({
+        publisher: { sendPeerMessage: vi.fn(async () => ({ queued: false, uncertain: true })) },
+      });
+      const res = await handlers.agentMessage({
+        roomId: '!sess', target_convo: 'convo-remote', body: 'coordinate this',
+      });
+      expect(res).toEqual({ status: 200, body: { queued: false, uncertain: true } });
+    });
+  });
+
+  describe('agentSessions', () => {
+    it('lists same-box and cross-box sessions with state, raw kind, and only the caller flagged as self', async () => {
+      const conversations = [
+        // caller's own JOURNAL convo id is 'convo-sess' (journalConvoIdFor stub → s.convoId),
+        // NOT the roomId '!sess' — is_self must key on the journal convo id.
+        { id: 'convo-sess', title: 'This session', session_state: 'running', agent_device_id: 1, agent_kind: 'claude' },
+        { id: 'convo-same-box', title: 'Same box peer', session_state: 'waiting', agent_device_id: 1, agent_kind: null },
+        { id: 'convo-cross-box', title: 'Cross box peer', session_state: 'done', agent_device_id: 7, agent_kind: 'codex' },
+      ];
+      const { handlers } = makeFixture({
+        publisher: { fetchRoster: async () => ({ ...ROSTER, conversations }) },
+      });
+
+      const res = await handlers.agentSessions({ roomId: '!sess' });
+
+      expect(res).toEqual({
+        status: 200,
+        body: {
+          sessions: [
+            { convo_id: 'convo-sess', title: 'This session', session_state: 'running', agent_kind: 'claude', is_self: true },
+            { convo_id: 'convo-same-box', title: 'Same box peer', session_state: 'waiting', agent_kind: null, is_self: false },
+            { convo_id: 'convo-cross-box', title: 'Cross box peer', session_state: 'done', agent_kind: 'codex', is_self: false },
+          ],
+        },
+      });
+    });
+
+    it('502s when the roster fetch fails', async () => {
+      const { handlers } = makeFixture({ publisher: { fetchRoster: async () => null } });
+      const res = await handlers.agentSessions({ roomId: '!sess' });
+      expect(res.status).toBe(502);
+      expect(res.body.error).toMatch(/journal unreachable/i);
+    });
+  });
+
   describe('roster', () => {
     it('returns self, excludes self from agents, maps conversations (mission_num only when it is a mission number)', async () => {
       const { handlers } = makeFixture();
@@ -106,9 +204,11 @@ describe('createAgentChatHandlers', () => {
       expect(res.body.self).toEqual({ device_id: 1, name: 'mac' });
       expect(res.body.agents).toEqual([{ device_id: 7, name: 'box-2' }]);
       expect(res.body.conversations).toEqual([
-        { id: 'convo-remote', title: 'Remote work', session_state: 'running', summary: 'porting the app', agent_device_id: 7, last_ts: 111, status: { model: 'claude-opus-5-5', context: { tokens: 87000, window: 1000000, pct: 9 }, reported_at: 111 }, mission_num: 61 },
-        { id: 'convo-self', title: 'Local work', session_state: 'running', summary: '', agent_device_id: 1, last_ts: 222 },
-        { id: 'convo-orphan', title: 'No agent', session_state: 'ended', summary: '', agent_device_id: null, last_ts: 333 },
+        // summary blanked by default (AGENT_ROSTER_SUMMARY_ENABLED is off); agent_kind
+        // is forwarded, null when the journal omits it.
+        { id: 'convo-remote', title: 'Remote work', session_state: 'running', summary: '', agent_device_id: 7, last_ts: 111, agent_kind: null, status: { model: 'claude-opus-5-5', context: { tokens: 87000, window: 1000000, pct: 9 }, reported_at: 111 }, mission_num: 61 },
+        { id: 'convo-self', title: 'Local work', session_state: 'running', summary: '', agent_device_id: 1, last_ts: 222, agent_kind: null },
+        { id: 'convo-orphan', title: 'No agent', session_state: 'ended', summary: '', agent_device_id: null, last_ts: 333, agent_kind: null },
       ]);
     });
 
@@ -129,6 +229,106 @@ describe('createAgentChatHandlers', () => {
       const res = await handlers.roster({ roomId: '!sess' });
       expect(res.status).toBe(502);
       expect(res.body.error).toMatch(/journal unreachable/i);
+    });
+
+    // Phase 1 starts writing a 20-bullet digest into
+    // conversations.summary. Whether PEER agents should see the operator's
+    // session digest is an open product/privacy call, so the roster stays
+    // empty — today's observed behaviour, 0 of 2056 rows populated — until
+    // AGENT_ROSTER_SUMMARY_ENABLED is set.
+    it('blanks every conversation summary by default', async () => {
+      const { handlers } = makeFixture({
+        publisher: { fetchRoster: async () => ({
+          agents: ROSTER.agents,
+          conversations: [{ ...ROSTER.conversations[0], summary: '• one\n• two\n• three\n• four' }],
+        }) },
+      });
+      const res = await handlers.roster({ roomId: '!sess' });
+      expect(res.body.conversations[0].summary).toBe('');
+    });
+
+    it.each([['1', true], ['true', true], ['TRUE', true], ['0', false], ['', false], ['yes', false]])(
+      'honours AGENT_ROSTER_SUMMARY_ENABLED=%j',
+      async (value, expected) => {
+        const { handlers } = makeFixture({
+          env: { AGENT_ROSTER_SUMMARY_ENABLED: value },
+          publisher: { fetchRoster: async () => ({
+            agents: ROSTER.agents,
+            conversations: [{ ...ROSTER.conversations[0], summary: '• one\n• two\n• three\n• four' }],
+          }) },
+        });
+        const res = await handlers.roster({ roomId: '!sess' });
+        expect(res.body.conversations[0].summary).toBe(expected ? 'two three four' : '');
+      },
+    );
+
+    it('trims an enabled summary to the newest 3 bullets with the markers stripped', async () => {
+      const digest = Array.from({ length: 13 }, (_, i) => `• bullet ${i}`).join('\n');
+      const { handlers } = makeFixture({
+        env: { AGENT_ROSTER_SUMMARY_ENABLED: '1' },
+        publisher: { fetchRoster: async () => ({
+          agents: ROSTER.agents,
+          conversations: [{ ...ROSTER.conversations[0], summary: digest }],
+        }) },
+      });
+      const res = await handlers.roster({ roomId: '!sess' });
+      expect(res.body.conversations[0].summary).toBe('bullet 10 bullet 11 bullet 12');
+    });
+  });
+
+  describe('rosterSummaryEnabled', () => {
+    it.each([['1', true], ['true', true], [' True ', true], ['0', false], ['', false], ['no', false]])(
+      'reads %j as %s', (value, expected) => {
+        expect(rosterSummaryEnabled({ AGENT_ROSTER_SUMMARY_ENABLED: value })).toBe(expected);
+      },
+    );
+
+    it('is off when the variable is unset', () => {
+      expect(rosterSummaryEnabled({})).toBe(false);
+      expect(rosterSummaryEnabled(undefined)).toBe(rosterSummaryEnabled(process.env));
+    });
+  });
+
+  describe('rosterBlurb', () => {
+    it.each([['empty', ''], ['whitespace', '  \n '], ['null', null], ['undefined', undefined]])(
+      'returns an empty string for %s', (_label, value) => {
+        expect(rosterBlurb(value)).toBe('');
+      },
+    );
+
+    it('keeps the newest 3 bullets, strips the markers, and stays under 300 chars', () => {
+      const digest = Array.from({ length: 13 }, (_, i) => `• bullet number ${i}`).join('\n');
+      const out = rosterBlurb(digest);
+      expect(out).toBe('bullet number 10 bullet number 11 bullet number 12');
+      expect(out).not.toContain('•');
+      expect(out.length).toBeLessThanOrEqual(300);
+    });
+
+    it('passes non-bullet prose through, trimmed', () => {
+      expect(rosterBlurb('  porting the app  ')).toBe('porting the app');
+      expect(rosterBlurb('line one\nline two')).toBe('line one line two');
+    });
+
+    it('caps an oversize blurb at 300 chars with an ellipsis', () => {
+      const out = rosterBlurb(`• ${'x'.repeat(500)}`);
+      expect(out).toHaveLength(300);
+      expect(out.endsWith('…')).toBe(true);
+    });
+
+    // A continuation line is where "…but it is blocked on X"
+    // lands. Dropping it hands peers a blurb that reads like plain success.
+    it('keeps a wrapped bullet whole instead of dropping its continuation', () => {
+      expect(rosterBlurb('• Deployment attempted\nBlocked: credentials unavailable'))
+        .toBe('Deployment attempted Blocked: credentials unavailable');
+    });
+
+    it('counts a wrapped bullet as ONE of the newest three', () => {
+      const digest = '• a\n• b\n• c\ncontinued c\n• d';
+      expect(rosterBlurb(digest)).toBe('b c continued c d');
+    });
+
+    it('drops empty bullets rather than emitting stray spaces', () => {
+      expect(rosterBlurb('• \n• real one\n•  ')).toBe('real one');
     });
   });
 
@@ -1239,11 +1439,14 @@ describe('createAgentChatHandlers', () => {
 describe('index.js routes + ask-user.js tools (source inspection)', () => {
   const ROUTES = [
     ['/agent-roster', 'roster'],
+    ['/agent-sessions', 'agentSessions'],
+    ['/agent-message', 'agentMessage'],
     ['/agent-chat-start', 'chatStart'],
     ['/agent-chat-send', 'chatSend'],
     ['/agent-chat-accept', 'chatAccept'],
     ['/agent-chat-refuse', 'chatRefuse'],
     ['/agent-chat-join', 'chatJoin'],
+    ['/agent-chat-invite', 'chatInvite'],
     // The leave ROUTE stays mounted even though the tool is gone: session
     // eviction still closes a dead session's rooms through chatLeave.
     ['/agent-chat-leave', 'chatLeave'],
@@ -1252,8 +1455,8 @@ describe('index.js routes + ask-user.js tools (source inspection)', () => {
     ['/agent-chat-read', 'chatRead'],
   ];
   const TOOLS = [
-    'agent_roster', 'agent_chat_start', 'agent_chat_send', 'agent_chat_accept',
-    'agent_chat_refuse', 'agent_chat_join', 'agent_chat_read',
+    'agent_roster', 'agent_sessions', 'agent_message', 'agent_chat_start', 'agent_chat_send', 'agent_chat_accept',
+    'agent_chat_refuse', 'agent_chat_join', 'agent_chat_invite', 'agent_chat_read',
     'agent_chat_mute', 'agent_chat_unmute',
   ];
   const indexSrc = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
@@ -1383,7 +1586,8 @@ describe('index.js routes + ask-user.js tools (source inspection)', () => {
     // local binding said 'joined' (answerAwait's contract in lib/agent-invites.js).
     const hand = body.indexOf('deliverAutoJoinedRequest(session, frame, room, { addressed })');
     expect(hand).toBeGreaterThan(-1);
-    expect(body).toMatch(/if \(!isJoin && !frame\.local\) \{[\s\S]{0,1200}deliverAutoJoinedRequest\(session, frame, room, \{ addressed \}\)/);
+    // Fork delta: only an addressed request auto-joins; a guessed target keeps the ask.
+    expect(body).toMatch(/if \(!isJoin && !frame\.local && addressed\) \{[\s\S]{0,1200}deliverAutoJoinedRequest\(session, frame, room, \{ addressed \}\)/);
     expect(strip(body)).not.toMatch(/agentInvites\.answer\(\{ roomId: frame\.room_id, peerDeviceId: null, accept: true/);
     expect(strip(body)).not.toContain("setState(frame.room_id, 'joined')");
     // Ack first (unchanged, it settles the inviter's chatStart waiter), then
@@ -1496,11 +1700,14 @@ describe('index.js routes + ask-user.js tools (source inspection)', () => {
   // must fail here.
   const TOOL_WIRING = [
     ['agent_roster', '/agent-roster', ['roomId: ROOM_ID']],
+    ['agent_sessions', '/agent-sessions', ['roomId: ROOM_ID']],
+    ['agent_message', '/agent-message', ['roomId: ROOM_ID', 'target_convo', 'body']],
     ['agent_chat_start', '/agent-chat-start', ['roomId: ROOM_ID', 'target_convo_id', 'topic', 'justification', 'message']],
     ['agent_chat_send', '/agent-chat-send', ['roomId: ROOM_ID', 'room_id', 'message', 'wait_seconds']],
     ['agent_chat_accept', '/agent-chat-accept', ['roomId: ROOM_ID', 'room_id']],
     ['agent_chat_refuse', '/agent-chat-refuse', ['roomId: ROOM_ID', 'room_id', 'reason']],
     ['agent_chat_join', '/agent-chat-join', ['roomId: ROOM_ID', 'room_id', 'justification']],
+    ['agent_chat_invite', '/agent-chat-invite', ['roomId: ROOM_ID', 'room_id', 'target_convo_id', 'justification']],
     ['agent_chat_mute', '/agent-chat-mute', ['roomId: ROOM_ID', 'room_id', 'reason']],
     ['agent_chat_unmute', '/agent-chat-unmute', ['roomId: ROOM_ID', 'room_id']],
     ['agent_chat_read', '/agent-chat-read', ['roomId: ROOM_ID', 'room_id', 'limit']],
@@ -1517,6 +1724,18 @@ describe('index.js routes + ask-user.js tools (source inspection)', () => {
       expect(block, `${name} fetches ${path}`).toContain('${BRIDGE_API}' + path + '`');
       for (const key of keys) expect(block, `${name} body carries ${key}`).toContain(key);
     }
+  });
+
+  it('exposes target_convo, body, and an optional priority as the model-facing parameters', () => {
+    const block = toolBlock('agent_message');
+    const schema = block.slice(block.indexOf('{'), block.indexOf('async ('));
+    expect(schema).toMatch(/target_convo: z\.string\(\)\.min\(1\)/);
+    expect(schema).toMatch(/body: z\.string\(\)\.min\(1\)/);
+    expect(schema).toMatch(/priority: z\s*\.boolean\(\)\s*\.optional\(\)/);
+    // Attribution stays server-stamped — never model-supplied.
+    expect(schema).not.toMatch(/\bfrom_convo\b|\broomId\b/);
+    expect((schema.match(/^\s+[a-z_]+:/gm) || []).map((line) => line.trim().split(':')[0]))
+      .toEqual(['target_convo', 'body', 'priority']);
   });
 
   it('keeps the no-polling etiquette in the tool descriptions', () => {
@@ -1712,6 +1931,145 @@ describe('local (same-bridge) rooms', () => {
       const f = makeFixture();
       const id = localRoom(f, { guestState: 'pending' });
       expect((await f.handlers.chatRead({ roomId: '!guest', room_id: id })).status).toBe(404);
+    });
+  });
+
+  // agent_chat_invite — the OWNER pulls another session into a room it already
+  // owns, reusing the SAME invites.invite() data layer chatStart uses (against
+  // an existing room id) with no new journal RPC.
+  describe('chatInvite', () => {
+    // A room this bridge OWNS and is joined into, ready to invite a third
+    // party. peerDeviceId 9 is an already-present, DIFFERENT participant, so
+    // inviting device 7 is a genuine additional-participant case.
+    const ownerRoom = (rooms, over = {}) =>
+      rooms.record('room-1', { role: 'owner', state: 'joined', sessionRoomId: '!sess', peerDeviceId: 9, ...over });
+
+    it('happy path: owner invites a remote session, reusing invites.invite() against the EXISTING room', async () => {
+      const { handlers, rooms, invites } = makeFixture();
+      ownerRoom(rooms);
+      const res = await handlers.chatInvite({ roomId: '!sess', room_id: 'room-1', target_convo_id: 'convo-remote', topic: 'triage', justification: 'need eyes' });
+      expect(res).toEqual({ status: 200, body: { room_id: 'room-1', status: 'accepted' } });
+      // The exact reuse the ticket asks for: the existing invite data layer,
+      // an EXISTING room id, the target device resolved off the roster, and
+      // from_convo_id naming the asking session.
+      expect(invites.invite).toHaveBeenCalledTimes(1);
+      expect(invites.invite).toHaveBeenCalledWith({
+        roomId: 'room-1', targetDeviceId: 7, targetConvoId: 'convo-remote',
+        fromConvoId: 'convo-sess', topic: 'triage', justification: 'need eyes',
+      });
+      // The pre-existing room is UNCHANGED — nothing recorded/torn down.
+      expect(rooms.get('room-1')).toMatchObject({ role: 'owner', state: 'joined', peerDeviceId: 9 });
+    });
+
+    it('maps a refusal to status refused and leaves the room untouched', async () => {
+      const { handlers, rooms } = makeFixture({ inviteOutcome: { kind: 'refused', reason: 'heads-down', peerDeviceId: 7 } });
+      ownerRoom(rooms);
+      const res = await handlers.chatInvite({ roomId: '!sess', room_id: 'room-1', target_convo_id: 'convo-remote', justification: 'j' });
+      expect(res).toEqual({ status: 200, body: { room_id: 'room-1', status: 'refused', reason: 'heads-down' } });
+      expect(rooms.get('room-1').state).toBe('joined');
+    });
+
+    it('maps a pending_busy invite outcome without waiting', async () => {
+      const { handlers, rooms } = makeFixture({ inviteOutcome: { kind: 'pending_busy' } });
+      ownerRoom(rooms);
+      const res = await handlers.chatInvite({ roomId: '!sess', room_id: 'room-1', target_convo_id: 'convo-remote', justification: 'j' });
+      expect(res.status).toBe(200);
+      expect(res.body.status).toBe('pending_busy');
+    });
+
+    it('rejects a caller who is NOT a participant of the room (404, no invite sent)', async () => {
+      const { handlers, invites } = makeFixture(); // room-1 never recorded
+      const res = await handlers.chatInvite({ roomId: '!sess', room_id: 'room-1', target_convo_id: 'convo-remote', justification: 'j' });
+      expect(res.status).toBe(404);
+      expect(invites.invite).not.toHaveBeenCalled();
+    });
+
+    it('rejects inviting into a still-PENDING owner room — must be joined first (409, no invite sent)', async () => {
+      const { handlers, rooms, invites } = makeFixture();
+      // Owner started the room but the first guest has not accepted yet.
+      rooms.record('room-1', { role: 'owner', state: 'pending', sessionRoomId: '!sess', peerDeviceId: 9 });
+      const res = await handlers.chatInvite({ roomId: '!sess', room_id: 'room-1', target_convo_id: 'convo-remote', justification: 'j' });
+      expect(res.status).toBe(409);
+      expect(res.body.error).toMatch(/not joined/i);
+      expect(invites.invite).not.toHaveBeenCalled();
+    });
+
+    it('rejects a joined GUEST caller — only the owner may invite (403, no invite sent)', async () => {
+      const { handlers, rooms, invites } = makeFixture();
+      // '!sess' is a guest of room-1, not its owner.
+      rooms.record('room-1', { role: 'guest', state: 'joined', sessionRoomId: '!sess', peerDeviceId: 9 });
+      const res = await handlers.chatInvite({ roomId: '!sess', room_id: 'room-1', target_convo_id: 'convo-remote', justification: 'j' });
+      expect(res.status).toBe(403);
+      expect(res.body.error).toMatch(/only the owner/i);
+      expect(invites.invite).not.toHaveBeenCalled();
+    });
+
+    it('rejects inviting a device that is ALREADY the room participant (409, no invite sent)', async () => {
+      const { handlers, rooms, invites } = makeFixture();
+      ownerRoom(rooms, { peerDeviceId: 7 }); // device 7 (convo-remote's agent) already in
+      const res = await handlers.chatInvite({ roomId: '!sess', room_id: 'room-1', target_convo_id: 'convo-remote', justification: 'j' });
+      expect(res.status).toBe(409);
+      expect(res.body.error).toMatch(/already a participant/i);
+      expect(invites.invite).not.toHaveBeenCalled();
+    });
+
+    it('refuses inviting the caller\'s own conversation (self-invite, 400)', async () => {
+      const { handlers, rooms, sessions } = makeFixture();
+      sessions.set('!self', { busy: false, alive: true, convoId: 'convo-self' });
+      rooms.record('room-1', { role: 'owner', state: 'joined', sessionRoomId: '!self', peerDeviceId: 9 });
+      const res = await handlers.chatInvite({ roomId: '!self', room_id: 'room-1', target_convo_id: 'convo-self', justification: 'j' });
+      expect(res.status).toBe(400);
+      expect(res.body.error).toMatch(/yourself/i);
+    });
+
+    it('refuses a same-bridge target — v1 multi-party rooms are remote-only (400)', async () => {
+      const { handlers, rooms, invites } = makeFixture();
+      ownerRoom(rooms); // caller convo is 'convo-sess'; target convo-self is device 1 = self
+      const res = await handlers.chatInvite({ roomId: '!sess', room_id: 'room-1', target_convo_id: 'convo-self', justification: 'j' });
+      expect(res.status).toBe(400);
+      expect(res.body.error).toMatch(/same-bridge|another box/i);
+      expect(invites.invite).not.toHaveBeenCalled();
+    });
+
+    it('rejects a target conversation with no owning agent (409)', async () => {
+      const { handlers, rooms } = makeFixture();
+      ownerRoom(rooms);
+      const res = await handlers.chatInvite({ roomId: '!sess', room_id: 'room-1', target_convo_id: 'convo-orphan', justification: 'j' });
+      expect(res.status).toBe(409);
+      expect(res.body.error).toMatch(/no owning agent/i);
+    });
+
+    it('rejects an unknown target conversation (404)', async () => {
+      const { handlers, rooms } = makeFixture();
+      ownerRoom(rooms);
+      const res = await handlers.chatInvite({ roomId: '!sess', room_id: 'room-1', target_convo_id: 'nope', justification: 'j' });
+      expect(res.status).toBe(404);
+      expect(res.body.error).toMatch(/no conversation/i);
+    });
+
+    it('validates room_id, target_convo_id, justification and topic type before any side effect', async () => {
+      const { handlers, rooms, invites, publisher } = makeFixture();
+      ownerRoom(rooms);
+      const fetchSpy = vi.spyOn(publisher, 'fetchRoster');
+      // missing room_id
+      expect((await handlers.chatInvite({ roomId: '!sess', target_convo_id: 'convo-remote', justification: 'j' })).status).toBe(400);
+      // non-string room_id
+      expect((await handlers.chatInvite({ roomId: '!sess', room_id: 42, target_convo_id: 'convo-remote', justification: 'j' })).status).toBe(400);
+      // missing target
+      expect((await handlers.chatInvite({ roomId: '!sess', room_id: 'room-1', justification: 'j' })).status).toBe(400);
+      // missing justification
+      expect((await handlers.chatInvite({ roomId: '!sess', room_id: 'room-1', target_convo_id: 'convo-remote' })).status).toBe(400);
+      // non-string topic
+      expect((await handlers.chatInvite({ roomId: '!sess', room_id: 'room-1', target_convo_id: 'convo-remote', justification: 'j', topic: 5 })).status).toBe(400);
+      expect(invites.invite).not.toHaveBeenCalled();
+      expect(fetchSpy).not.toHaveBeenCalled();
+    });
+
+    it('surfaces an unreachable journal roster as 502', async () => {
+      const { handlers, rooms } = makeFixture({ publisher: { fetchRoster: async () => null } });
+      ownerRoom(rooms);
+      const res = await handlers.chatInvite({ roomId: '!sess', room_id: 'room-1', target_convo_id: 'convo-remote', justification: 'j' });
+      expect(res.status).toBe(502);
     });
   });
 });

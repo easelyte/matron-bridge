@@ -62,6 +62,9 @@ function makeRouter(overrides = {}) {
     echoToRoom: vi.fn(),
     publishNotice: vi.fn(),
     escapeHtml: (s) => String(s),
+    // Our fork's stale-session guard is a required dependency; batch
+    // tests aren't exercising it, so default every session to canonical.
+    isCanonicalSession: () => true,
     log: silentLog,
     ...overrides,
   };
