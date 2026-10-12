@@ -62,7 +62,7 @@ async function randomPort() {
 // Run the actual entry point from a disposable source copy: startup writes
 // generated MCP config beside index.js. Where available, bwrap adds a read-only
 // filesystem view, private /tmp and PID namespace. Otherwise own a process group.
-export async function startBridge({ confine = true } = {}) {
+export async function startBridge({ confine = true, interactive = true } = {}) {
   const confined = confine && bwrapAvailable;
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-process-'));
   const checkout = path.join(home, 'bridge');
@@ -125,15 +125,50 @@ catch (error) {
     // repairSpawnHelperOnce only adds spawn-helper exec bits, as npm ci's postinstall already does.
     fs.symlinkSync(path.join(repo, 'node_modules'), path.join(checkout, 'node_modules'), 'dir');
     fs.copyFileSync(path.join(repo, 'test/stub-claude.mjs'), path.join(home, 'stub-claude.mjs'));
+    fs.writeFileSync(path.join(home, 'stub-claude.mjs'),
+      fs.readFileSync(path.join(home, 'stub-claude.mjs'), 'utf8')
+        .replace('function emit(event) {', 'function emit(event) { event.session_id = process.env.STUB_SESSION_ID;')
+        .replace("process.stdout.write('> ');", `process.stdout.write(${JSON.stringify('❯ \n──────\n  ? for shortcuts')});`)
+        .replace('function consume(text) {', `function consume(text) {
+  if (text === '__crash__') process.exit(1);
+  if (text === '__resume_failed__') {
+    emit({ type: 'result', is_error: true, errors: ['No conversation found'] });
+    setTimeout(() => process.exit(1), 500);
+    return;
+  }`));
     // Adapt the existing PTY stub to the transcript location the real bridge tails.
     const shim = `#!${process.execPath}\nimport fs from 'node:fs';
 import path from 'node:path';
-import { transcriptPathFor } from '../bridge/lib/transcript-dir.js';
-const flag = process.argv.indexOf('--session-id');
-if (flag < 0) process.exit(2);
+fs.appendFileSync(process.env.HOME + '/stub-launches', JSON.stringify({ pid: process.pid, args: process.argv.slice(2) }) + '\\n');
+const { transcriptPathFor } = await import('../bridge/lib/transcript-dir.js');
+const flag = process.argv.findIndex(arg => arg === '--session-id' || arg === '--resume');
+if (flag < 0 || !process.argv[flag + 1]) process.exit(2);
+process.env.STUB_SESSION_ID = process.argv[flag + 1];
 process.env.TRANSCRIPT_PATH = transcriptPathFor(process.cwd(), process.argv[flag + 1]);
 fs.mkdirSync(path.dirname(process.env.TRANSCRIPT_PATH), { recursive: true });
-await import('../stub-claude.mjs');\n`;
+fs.appendFileSync(process.env.HOME + '/stub-starts', process.pid + '\\n');
+if (process.argv.includes('--print')) {
+  const { createInterface } = await import('node:readline');
+  const emit = event => {
+    event.session_id = process.env.STUB_SESSION_ID;
+    fs.appendFileSync(process.env.TRANSCRIPT_PATH, JSON.stringify(event) + '\\n');
+    console.log(JSON.stringify(event));
+  };
+  createInterface({ input: process.stdin }).on('line', line => {
+    const event = JSON.parse(line);
+    const text = Array.isArray(event.message.content)
+      ? event.message.content.filter(block => block.type === 'text').map(block => block.text).join('')
+      : event.message.content;
+    if (text === '__resume_failed__') {
+      emit({ type: 'result', is_error: true, errors: ['No conversation found'] });
+      setTimeout(() => process.exit(1), 500);
+      return;
+    }
+    emit({ type: 'user', message: { role: 'user', content: [{ type: 'text', text }] } });
+    emit({ type: 'assistant', message: { role: 'assistant', content: [{ type: 'text', text: 'echo: ' + text }] } });
+    emit({ type: 'result', subtype: 'success' });
+  });
+} else await import('../stub-claude.mjs');\n`;
     fs.writeFileSync(path.join(home, 'bin', 'claude'), shim, { mode: 0o755 });
     journal = new WebSocketServer({ host: '127.0.0.1', port: 0 });
     journal.on('connection', socket => {
@@ -154,7 +189,7 @@ await import('../stub-claude.mjs');\n`;
       JOURNAL_TOKEN: 'harness-only', JOURNAL_CONTROL_CONVO_ID: 'harness-control',
       ALLOWED_USER_IDS: 'harness',
       DEFAULT_WORKDIR: workdir, MATRON_BRIDGE_API_PORT: String(port),
-      MATRON_INTERACTIVE_MODE: '1', MATRON_CODE_UPDATE_RESTART: '0',
+      MATRON_INTERACTIVE_MODE: interactive ? '1' : '0', MATRON_CODE_UPDATE_RESTART: '0',
       SESSION_IDLE_TIMEOUT_MS: '0', MATRON_KEEP_AWAKE: 'off',
       MATRON_LIVE_OUTPUT_TTL: '3153600000', // Keep startup's literal /tmp sweep inert in both modes.
     };
@@ -210,6 +245,14 @@ await import('../stub-claude.mjs');\n`;
     let session;
     return {
       ready: true, confined, home, checkout, port, frames, supervisor, post, sendText,
+      stubLaunches() {
+        const log = path.join(home, 'stub-launches');
+        return fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\n').map(JSON.parse) : [];
+      },
+      stubStarts() {
+        const log = path.join(home, 'stub-starts');
+        return fs.existsSync(log) ? fs.readFileSync(log, 'utf8').trim().split('\n').map(Number) : [];
+      },
       get output() { return output; },
       async startSession() {
         sendText('harness-control', '/start');
@@ -220,11 +263,14 @@ await import('../stub-claude.mjs');\n`;
         sendText(session.claudeSessionId, text);
         const transcript = path.join(home, '.claude', 'projects',
           encodeProjectDir(workdir), `${session.claudeSessionId}.jsonl`);
-        return waitFor(() => {
+        const content = await waitFor(() => {
           if (!fs.existsSync(transcript)) return false;
           const content = fs.readFileSync(transcript, 'utf8');
           return content.includes(`echo: ${text}`) && content;
         }, diagnostics);
+        if (interactive) await post('/turn-end', { session_id: session.claudeSessionId });
+        await waitFor(async () => (await post('/sessions')).some(s => s.alive && !s.busy), diagnostics);
+        return content;
       },
       async terminate() {
         const child = supervisor.child;

@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { EventEmitter } from 'node:events';
-import childProcess, { execFileSync } from 'node:child_process';
+import childProcess, { execFileSync, spawnSync } from 'node:child_process';
 import { describe, expect, it, vi } from 'vitest';
 import { probeConfinement, startBridge, supervise } from './helpers/bridge-process.js';
 
@@ -186,5 +186,76 @@ it('refuses boot timeout and cleans HOME', async () => {
     await resolved?.close();
     copy.mockRestore();
     homes.mockRestore();
+  }
+}, 15000);
+
+it('counts a rejected launch before argument validation', async () => {
+  const bridge = await startBridge({ confine: false });
+  try {
+    const result = spawnSync(path.join(bridge.home, 'bin/claude'), ['--harness-invalid'], {
+      cwd: path.join(bridge.home, 'work'),
+      env: { HOME: bridge.home, PATH: '/usr/bin:/bin' }, timeout: 2000,
+    });
+    expect(result.status).toBe(2);
+    expect(bridge.stubLaunches().filter(launch => launch.args.includes('--harness-invalid'))).toHaveLength(1);
+    expect(bridge.stubStarts()).toEqual([]);
+  } finally {
+    await bridge.close();
+  }
+}, 15000);
+
+it.each([true, false])('counts and starts resumed launches within the crash budget (interactive=%s)', async interactive => {
+  const bridge = await startBridge({ confine: false, interactive });
+  try {
+    const session = await bridge.startSession();
+    await bridge.echo('before crash');
+    const launches = () => bridge.stubLaunches().filter(launch => launch.args.includes(session.claudeSessionId));
+    expect(launches()).toHaveLength(1);
+    // restartCount 0, 1 and 2 restart; 3 exhausts the existing budget.
+    for (let count = 0; count < 3; count++) {
+      const child = launches().at(-1);
+      expect(bridge.stubStarts()).toContain(child.pid);
+      // node-pty reports signal exits as 0; use a nonzero stub exit for PTY.
+      if (interactive) bridge.sendText(session.claudeSessionId, '__crash__');
+      else process.kill(child.pid, 'SIGKILL'); // Only the fixture's recorded child.
+      await vi.waitFor(() => {
+        expect(launches()).toHaveLength(count + 2);
+        const resumed = launches().at(-1);
+        expect(resumed.args).toContain('--resume');
+        expect(resumed.args[resumed.args.indexOf('--resume') + 1]).toBe(session.claudeSessionId);
+        expect(bridge.stubStarts()).toContain(resumed.pid);
+      }, { timeout: 4000, interval: 50 });
+      expect(await bridge.echo(`after crash ${count}`)).toContain(`echo: after crash ${count}`);
+    }
+    if (interactive) bridge.sendText(session.claudeSessionId, '__crash__');
+    else process.kill(launches().at(-1).pid, 'SIGKILL');
+    await vi.waitFor(async () => {
+      expect((await bridge.post('/sessions')).some(s => s.alive)).toBe(false);
+    }, { timeout: 4000, interval: 50 });
+    await new Promise(resolve => setTimeout(resolve, 500));
+    expect(launches()).toHaveLength(4);
+    expect(bridge.supervisor.launches).toBe(1);
+  } finally {
+    await bridge.close();
+  }
+}, 20000);
+
+it.each([true, false])('does not restart after a resume failure (interactive=%s)', async interactive => {
+  const bridge = await startBridge({ confine: false, interactive });
+  try {
+    const session = await bridge.startSession();
+    await bridge.echo('before resume failure');
+    const launches = () => bridge.stubLaunches().filter(launch => launch.args.includes(session.claudeSessionId));
+    bridge.sendText(session.claudeSessionId, '__resume_failed__');
+    await vi.waitFor(() => {
+      expect(bridge.output).toContain('session not found, clearing stale ID');
+    }, { timeout: 4000, interval: 50 });
+    await vi.waitFor(async () => {
+      expect((await bridge.post('/sessions')).some(s => s.alive)).toBe(false);
+    }, { timeout: 4000, interval: 50 });
+    await new Promise(resolve => setTimeout(resolve, 500));
+    expect(launches()).toHaveLength(1);
+  } finally {
+    await bridge.close();
   }
 }, 15000);

@@ -2247,6 +2247,10 @@ function coordinatorRoleAtSpawn(roomId, resumeSessionId, options, persisted) {
   return role.coordinator;
 }
 
+function shouldAutoRestart(exitCode, session, shuttingDown) {
+  return !shuttingDown && exitCode !== 0 && session.restartCount < 3 && !session._resumeFailed;
+}
+
 function createSession(roomId, workdir, resumeSessionId, options = {}) {
   // A persisted workdir can stop existing between spawns (repo renamed,
   // worktree pruned). Node reports a missing spawn cwd as `spawn claude
@@ -2627,7 +2631,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
         journalSessionState(session, 'done');
         journalActivity(session, 'idle');
         journalEvictConvoInput(session);
-      } else if (exitCode !== 0 && session.restartCount < 3 && !session._resumeFailed) {
+      } else if (shouldAutoRestart(exitCode, session, shuttingDown)) {
         // Auto-restart is about to replace `session` outright (no
         // journalSessionState('done') — the convo isn't over, it's
         // respawning) — but viewers still need to stop seeing a stale
@@ -2937,13 +2941,14 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
     if (session.alive) void refreshCodexMetadata(session);
     session.proc = codex.transport === 'app-server' ? codex.child : null;
     if (session._codexTurnFinished) return;
-    if (!session.alive) {
+    if (shuttingDown || !session.alive) {
       // killSession normally performs this synchronously so a replacement
       // session cannot inherit running/thinking state. Keep an exit-side
       // fallback for any future path that marks the session dead directly.
       finishCodexTurn(session, {
         usage: session._codexCompletedUsage,
         discardOutput: true,
+        preserveQueue: shuttingDown,
       });
       return;
     }
@@ -3516,7 +3521,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
         journalSessionState(session, 'done');
         journalActivity(session, 'idle');
         journalEvictConvoInput(session);
-      } else if (exitCode !== 0 && session.restartCount < 3 && !session._resumeFailed) {
+      } else if (shouldAutoRestart(exitCode, session, shuttingDown)) {
         // See the matching print-mode branch's comment: the terminal exit
         // paths already emit idle on restart, this auto-restart branch
         // didn't (Bugbot finding #3).
