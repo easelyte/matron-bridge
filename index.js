@@ -1,5 +1,6 @@
 import dotenv from 'dotenv';
 dotenv.config({ override: true });
+import { BRIDGE_BOOT_AT } from './lib/boot-time.js';
 import { spawn, execFileSync } from 'child_process';
 import { transcribeAudio, transcribeAudioSegments, resolveWhisperPrompt, makeWhisperPrompt } from './lib/transcribe.js';
 import { extractVideoFrames, videoFramesMessage } from './lib/video-frames.js';
@@ -103,7 +104,8 @@ import { detectCodexBinary, launchWithCodexSinkEnv, pruneStaleCodexSinks } from 
 import { hookEntry } from './lib/hook-command.js';
 import { liveLogDir, liveLogPath as liveLogPathFor } from './lib/live-log-dir.js';
 import { killProcessTree } from './lib/process-kill.js';
-import { processTableCommand } from './lib/process-table.js';
+import { processTableCommand, readProcessTableStrict } from './lib/process-table.js';
+import { evaluateQuiet, currentBootSubagents, sessionBackgroundWork } from './lib/restart-quiet.js';
 import { installShutdownToken, decideShutdown } from './lib/shutdown-endpoint.js';
 import { createWakeHandler } from './lib/wake-route.js';
 import {
@@ -3209,10 +3211,10 @@ function finishCodexTurn(session, {
   // a SIGTERM restart erase its own evidence: restart.sh kills with SIGTERM,
   // the handler calls killSession for every live session, and a mid-turn Codex
   // session would delete the very record the next boot needs to offer a
-  // carry-on card. Teardown leaves the marker standing; a genuine end clears
-  // it. A deliberate !stop clears it explicitly at its own call site, before
+  // carry-on card. Teardown leaves the marker standing; a genuine end keeps
+  // only background work. A deliberate !stop clears it explicitly at its own call site, before
   // killSession runs, so that case does not rely on this branch.
-  if (!discardOutput) inflightMarker.noteTurnEnd(journalConvoIdFor(session));
+  if (!discardOutput) inflightMarker.noteTurnEnd(journalConvoIdFor(session), { hasWork: sessionHasBackgroundWork(session) });
   journalSessionState(session, 'waiting');
   journalActivity(session, 'idle');
   maybeSummarizeAtTurnEnd(session);
@@ -3683,7 +3685,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     session.turnCount++;
     session.busy = false;
     // Authoritative iv-mode turn-end seam.
-    inflightMarker.noteTurnEnd(journalConvoIdFor(session));
+    inflightMarker.noteTurnEnd(journalConvoIdFor(session), { hasWork: sessionHasBackgroundWork(session) });
     journalSessionState(session, 'waiting');
     journalActivity(session, 'idle');
     maybeSummarizeAtTurnEnd(session);
@@ -4456,13 +4458,10 @@ function teardownSubagentTracking(session) {
 }
 
 // Reconcile stranded `running` subagent child convos. A child is a
-// ghost when it is persisted `running` (subagentRunningStore) but no LIVE
-// session currently owns its parent convo — i.e. the parent is TERMINAL: the
-// bridge restarted and the parent's claude process died with the old bridge, or
-// the parent stream was lost. At startup the live `sessions` map is empty, so
-// every persisted running child reconciles; on a transient WS reconnect only
-// genuinely orphaned children do (a still-live coordinator parent keeps its
-// children running — see selectStrandedChildren).
+// ghost when it predates this process's boot, even if its parent has resumed,
+// or when no live session owns its parent. Reconnect retries pre-boot repairs
+// whose local send has not completed; current-boot children of live parents
+// remain running.
 //
 // Reconciles purely from PERSISTED state, never from watcher re-discovery:
 // subagent-watcher.snapshot() marks the already-complete agent-*.jsonl "seen",
@@ -4470,15 +4469,19 @@ function teardownSubagentTracking(session) {
 // published frame (convo_upsert, session_state: done) is byte-identical to the
 // live finish() transition, so web clients update the card the same way; here it
 // rides upsertConvoBestEffort, the established reconnect-repair fan-out path.
-function reconcileStrandedSubagents(reason = 'startup') {
+function reconcileStrandedSubagents(reason = 'startup', { beforeBootOnly = false } = {}) {
   if (!JOURNAL_ENABLED) return;
   let entries;
   try {
-    entries = subagentRunningStore.list();
+    const result = subagentRunningStore.listStrict();
+    if (result.ok !== true) throw new Error('subagents unavailable');
+    entries = result.records;
   } catch (e) {
     console.warn(`[subagent-reconcile] list failed: ${e.message}`);
     return;
   }
+  const preBoot = (entry) => Number.isFinite(entry?.addedAt) && entry.addedAt >= 0 && entry.addedAt < BRIDGE_BOOT_AT;
+  if (beforeBootOnly) entries = entries.filter(preBoot);
   if (!entries.length) return;
 
   // Parent convo ids currently owned by a live session — do NOT retire their
@@ -4490,7 +4493,10 @@ function reconcileStrandedSubagents(reason = 'startup') {
     if (convoId) liveParents.add(convoId);
   }
 
-  const { stranded, malformed } = selectStrandedChildren(entries, liveParents);
+  const prior = selectStrandedChildren(entries.filter(preBoot), new Set());
+  const current = selectStrandedChildren(entries.filter((entry) => !preBoot(entry)), liveParents);
+  const stranded = [...prior.stranded, ...current.stranded];
+  const malformed = [...prior.malformed, ...current.malformed];
   // Join each stranded id back to its persisted entry so the repair frame can
   // carry the child's parentConvoId. Reconcile runs precisely when the original
   // `running` upsert may never have been delivered (SIGKILL before flush, socket
@@ -4504,6 +4510,7 @@ function reconcileStrandedSubagents(reason = 'startup') {
   const repairFrames = strandedRepairFrames(entries, stranded);
   let published = 0;
   for (const { childConvoId, parentConvoId } of repairFrames) {
+    const addedAt = entries.find((entry) => entry.childConvoId === childConvoId).addedAt;
     try {
       // Publish `done` and drop the store record ONLY on confirmed delivery
       // a capacity-rejected best-effort send or a
@@ -4514,7 +4521,13 @@ function reconcileStrandedSubagents(reason = 'startup') {
       journalPublisher.upsertConvoBestEffort(
         childConvoId,
         { sessionState: 'done', parentConvoId },
-        { onDelivered: () => subagentRunningStore.remove(childConvoId) },
+        { onDelivered: () => {
+          // A resumed incarnation must survive delivery of an older repair.
+          const result = subagentRunningStore.listStrict();
+          if (result.ok === true && result.records.some((entry) => entry.childConvoId === childConvoId && entry.addedAt === addedAt)) {
+            subagentRunningStore.remove(childConvoId);
+          }
+        } },
       );
       published += 1;
     } catch (e) {
@@ -5184,7 +5197,7 @@ function handleClaudeEvent(session, event) {
       // anything else (queued input, room flush) can start the next turn.
       foreignSessions.end(session);
       // Authoritative print-mode turn-end seam.
-      inflightMarker.noteTurnEnd(journalConvoIdFor(session));
+      inflightMarker.noteTurnEnd(journalConvoIdFor(session), { hasWork: sessionHasBackgroundWork(session) });
       clearPendingInterrupt(session);
       // Print-mode's turn-end (this `case 'result':` block is its equivalent
       // of iv-mode's session.onTurnEnd above) — same 'waiting' transition.
@@ -5400,7 +5413,7 @@ function handleClaudeEvent(session, event) {
             // This branch IS the turn-end for a print-mode session at a manual
             // compact boundary (the iv branch above delegates to onTurnEnd,
             // which clears the marker there).
-            inflightMarker.noteTurnEnd(journalConvoIdFor(session));
+            inflightMarker.noteTurnEnd(journalConvoIdFor(session), { hasWork: sessionHasBackgroundWork(session) });
             clearPendingInterrupt(session);
           }
         } else if (trigger === 'manual') {
@@ -10297,7 +10310,20 @@ function startCodeUpdateWatcher() {
   }
   const watcher = createCodeUpdateWatcher({
     readHead: () => readHeadReflog(gitDir),
-    busySessions: () => { let n = 0; for (const [, s] of sessions) if (s.alive && s.busy) n++; return n; },
+    busySessions: () => {
+      const result = evaluateQuiet({
+        sessions,
+        bootAt: BRIDGE_BOOT_AT,
+        readProcessTable: readProcessTableStrict,
+        listRunningSubagents: () => {
+          const result = subagentRunningStore.listStrict();
+          if (result.ok !== true) throw new Error('subagents unavailable');
+          return result.records;
+        },
+        mcpSignatures: MCP_SERVER_SIGNATURES,
+      });
+      return result.holders.length + (result.probe_error ? 1 : 0);
+    },
     preflight: () => defaultPreflight(__dirname),
     restart: (info) => {
       if (shuttingDown) return;
@@ -13979,7 +14005,7 @@ function killSession(session, signal = 'SIGTERM', { preserveQueue = false } = {}
 // The claude child's pid for every session shape: print mode (child_process),
 // interactive mode (node-pty handle), codex (its own spawn wrapper).
 function sessionChildPid(session) {
-  const pid = session.proc?.pid ?? session.iv?.pty?.pid ?? session.codex?.child?.pid ?? null;
+  const pid = session.proc?.pid ?? session.iv?.pty?.pid ?? session.codex?.child?.pid ?? session.codex?.lastChildPid ?? null;
   return Number.isInteger(pid) ? pid : null;
 }
 
@@ -13997,6 +14023,23 @@ function readProcessTable() {
   } catch (e) {
     debug(`readProcessTable failed: ${e.message}`);
     return [];
+  }
+}
+
+// A failed observation must not erase evidence of background work.
+function sessionHasBackgroundWork(session, observed = readProcessTableStrict) {
+  try {
+    const result = observed();
+    if (result?.ok !== true || !Array.isArray(result.table)) return true;
+    const running = subagentRunningStore.listStrict();
+    if (running.ok !== true) return true;
+    const subagents = currentBootSubagents(running.records, BRIDGE_BOOT_AT);
+    // The completion hook is still running while its turn-end request is handled.
+    const signatures = [...MCP_SERVER_SIGNATURES, ['stop-notify.sh'], ['stop-notify.mjs']];
+    const work = sessionBackgroundWork(session, result.table, subagents, signatures, journalConvoIdFor(session));
+    return work.children || work.subagents;
+  } catch {
+    return true;
   }
 }
 
@@ -14124,6 +14167,22 @@ function rearmPreReapHandoff(session) {
   if (session && session._preReapHandoff) session._preReapHandoff = null;
 }
 
+function startBackgroundMarkerMaintenance() {
+  setInterval(() => {
+    let table;
+    const observed = () => (table ??= readProcessTableStrict());
+    for (const session of sessions.values()) {
+      if (!session.alive || session._autoStopped) continue;
+      const hasWork = sessionHasBackgroundWork(session, observed);
+      session._bgWorkObserved = { at: Date.now(), hasWork };
+      if (session.busy) continue;
+      const convoId = journalConvoIdFor(session);
+      if (hasWork) inflightMarker.refreshBackground(convoId);
+      else inflightMarker.clearBackground(convoId);
+    }
+  }, SESSION_IDLE_CHECK_MS).unref();
+}
+
 function startIdleReaper() {
   setInterval(() => {
     const now = Date.now();
@@ -14237,7 +14296,8 @@ function publishRestartCarryOnCards() {
   // cards below have gone out. Everything else — a crash, a deploy's own
   // restart, the option off — keeps the tap.
   const { auto, card } = selectAutoCarryOn(stale, stamp, { enabled: CODE_UPDATE_AUTO_CARRY_ON });
-  const autoResumable = auto.filter(rec => resumable.has(rec.convoId) && isResumeConvoId(rec.convoId));
+  const autoResumable = auto.filter(rec => resumable.has(rec.convoId) && isResumeConvoId(rec.convoId))
+    .filter(rec => rec.kind !== 'background');
   if (autoResumable.length) {
     try { console.log(`[code-update] ${autoResumable.length} chat(s) cut off by the self-restart onto ${String(stamp.sha || '').slice(0, 7)} carry on by themselves in ${CODE_UPDATE_AUTO_CARRY_ON_DELAY_MS}ms`); } catch { /* logging must never throw */ }
     setTimeout(() => {
@@ -14271,7 +14331,9 @@ function publishRestartCarryOnCards() {
       try { console.warn(`[inflight] skipping carry-on card for convo=${rec.convoId} — id does not match the resume: picker value shape, so a tap would silently no-op`); } catch { /* logging must never throw */ }
       continue;
     }
-    const question = `⚠️ The bridge restarted while this chat was mid-turn — interrupted ${formatInterruptedAgo(rec.ageMs)}. The work stopped where it was.`;
+    const question = rec.kind === 'background'
+      ? `⚠️ The bridge restarted while this chat had background work running — interrupted ${formatInterruptedAgo(rec.ageMs)}. The background work stopped where it was.`
+      : `⚠️ The bridge restarted while this chat was mid-turn — interrupted ${formatInterruptedAgo(rec.ageMs)}. The work stopped where it was.`;
     const published = journalPublishCardForConvo(rec.convoId, {
       question,
       options: [{ id: `resume-${rec.convoId}`, label: '▶️ Carry on', value: `resume:${rec.convoId}` }],
@@ -14289,6 +14351,7 @@ function publishRestartCarryOnCards() {
 }
 
 async function main() {
+  reconcileStrandedSubagents('startup', { beforeBootOnly: true });
   // Ensure secrets directory exists with restricted permissions
   try {
     await fs.promises.mkdir(SECRETS_DIR, { mode: 0o700, recursive: true });
@@ -14301,6 +14364,7 @@ async function main() {
 
   console.log(`Allowed users: ${ALLOWED_USER_IDS.length ? ALLOWED_USER_IDS.join(', ') : 'any'}`);
   console.log(`Default workdir: ${DEFAULT_WORKDIR}`);
+  startBackgroundMarkerMaintenance();
   if (SESSION_IDLE_TIMEOUT_MS > 0) {
     console.log(`Session idle timeout: ${SESSION_IDLE_TIMEOUT_MS}ms (check every ${SESSION_IDLE_CHECK_MS}ms)`);
     startIdleReaper();
