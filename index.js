@@ -1,5 +1,28 @@
 import dotenv from 'dotenv';
+export const PREFLIGHT_PROTOCOL = 'gate/1';
+const PREFLIGHT_MODE = process.env.MATRON_BRIDGE_PREFLIGHT;
+if (PREFLIGHT_MODE !== undefined && !['gate', 'module'].includes(PREFLIGHT_MODE)) {
+  console.error('[preflight] unknown mode');
+  process.exit(2);
+}
+// Static imports have loaded. Rollback checks must not read the checkout's .env.
+if (PREFLIGHT_MODE === 'module') process.exit(0);
 dotenv.config({ override: true });
+if (PREFLIGHT_MODE === 'gate') {
+  try {
+    const lines = fs.readFileSync(path.join(process.cwd(), '.env'), 'utf8').split(/\r?\n/);
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i];
+      if (!line.trim() || line.trimStart().startsWith('#')) continue;
+      if (!/^(export )?[A-Za-z_][A-Za-z0-9_]*=/.test(line)) {
+        throw new Error(`malformed .env line ${i + 1}`);
+      }
+    }
+  } catch (error) {
+    console.error(`[preflight] ${error.code ? 'cannot read .env' : error.message}`);
+    process.exit(1);
+  }
+}
 import { spawn, execFileSync } from 'child_process';
 import { transcribeAudio, transcribeAudioSegments, resolveWhisperPrompt, makeWhisperPrompt } from './lib/transcribe.js';
 import { extractVideoFrames, videoFramesMessage } from './lib/video-frames.js';
@@ -188,7 +211,7 @@ import { queueFlushNotice } from './lib/queue-flush-notice.js';
 import { isCompactCommand, compactBatchSize, hasQueuedCompact } from './lib/compact-priority.js';
 import { attachPendingMediaMirror, pendingMediaMirror } from './lib/media-mirror.js';
 import { seedJournalTitle, applyFallbackTitle, parseTitlePassResponse, withSessionShort, titleMarkerFor, hintIsEarnedTitle, recordTitleEarned } from './lib/journal-title-seed.js';
-import { createSummaryModel } from './lib/summary-model.js';
+import { createSummaryModel, parseSummaryProviders } from './lib/summary-model.js';
 import { createSummaryModelNag } from './lib/summary-model-nag.js';
 import { createLoginExpiryNotice, isLoginExpiredText, loginExpiredFromAssistantEvent, loginExpiredMessage } from './lib/login-expiry.js';
 import { summaryWindow, buildSummaryPrompt, SUMMARY_MIN_NEW, splitSpoken, spokenPayload, spokenRefFor } from './lib/summary-pass.js';
@@ -242,6 +265,36 @@ const FALLBACK_BRIDGE_PROMPT = 'You are running through a remote Matron bridge. 
 const FALLBACK_CODEX_BRIDGE_PROMPT = 'You are running through Matron chat. Work within the configured sandbox. Use native approval requests for actions requiring extra permission. Never post secrets in chat.';
 
 // --- Config ---
+
+const API_PORT = parseInt(process.env.MATRON_BRIDGE_API_PORT || '9802', 10);
+
+// Gate mode rejects values that normal startup would warn about and replace.
+if (PREFLIGHT_MODE === 'gate') {
+  try {
+    if (!Number.isInteger(API_PORT) || API_PORT < 0 || API_PORT > 65535) throw new Error('invalid MATRON_BRIDGE_API_PORT');
+    const env = process.env;
+    const valid = (name, check) => {
+      if (env[name] !== undefined && !check(env[name])) throw new Error(`invalid ${name}`);
+    };
+    valid('MATRON_DEFAULT_AGENT', value => !value || !!normalizeAgent(value));
+    valid('MATRON_DEFAULT_MODEL', value => !value.trim() || isValidModelArg(value));
+    valid('MATRON_DEFAULT_EFFORT', value => !value.trim() || isSpawnEffortArg(value));
+    valid('MATRON_PERMISSION_MODE', value => !value || ['bypass', 'auto'].includes(value));
+    valid('CODEX_SANDBOX_MODE', value => !value || ['read-only', 'workspace-write', 'danger-full-access'].includes(value.trim().toLowerCase()));
+    valid('CODEX_NETWORK_ACCESS', value => !value || normalizeCodexNetworkAccess(value) !== null);
+    parseSummaryProviders(env.SUMMARY_PROVIDERS);
+    valid('SHOW_FILE_UPLOAD_TIMEOUT_MS', value => Number.isInteger(Number(value)) && Number(value) > 0 && Number(value) <= 300000);
+    for (const name of ['MATRON_CODE_UPDATE_POLL_MS', 'MATRON_CODE_UPDATE_SETTLE_MS', 'MATRON_CODE_UPDATE_WARN_EVERY_MS', 'MATRON_CODE_UPDATE_FORCE_AFTER_MS']) {
+      valid(name, value => /^\d+$/.test(value) && Number(value) <= 2147483647 && Number(value) >= (name === 'MATRON_CODE_UPDATE_FORCE_AFTER_MS' ? 0 : 1));
+    }
+    for (const name of ['MATRON_CODE_UPDATE_RESTART', 'MATRON_CODE_UPDATE_AUTO_CARRY_ON']) {
+      valid(name, value => /^(0|1|false|true|off|on|no|yes)$/i.test(value.trim()));
+    }
+  } catch (error) {
+    console.error(`[preflight] ${error.message}`);
+    process.exit(1);
+  }
+}
 
 const ALLOWED_USER_IDS = (process.env.ALLOWED_USER_IDS || '')
   .split(',')
@@ -416,6 +469,7 @@ function loadLocalMcpOverlay() {
   try {
     return JSON.parse(fs.readFileSync(p, 'utf-8'));
   } catch (e) {
+    if (PREFLIGHT_MODE === 'gate') throw new Error('invalid mcp-config.local.json', { cause: e });
     console.warn(`[mcp-config] Ignoring malformed mcp-config.local.json: ${e.message}`);
     return null;
   }
@@ -454,7 +508,7 @@ function mcpConfigPathFor(extras = []) {
 // Eagerly materialise the default (no-extras) config so the file exists on
 // disk by the time any session spawns. Per-extras variants are generated
 // lazily on first use.
-mcpConfigPathFor([]);
+if (!PREFLIGHT_MODE) mcpConfigPathFor([]);
 // Every server a session of this bridge can be running — the always-on set
 // and each extras group, local overlay included — resolved exactly as the
 // spawn resolves them (absolute paths, macify). The idle reaper uses these
@@ -468,6 +522,7 @@ const MCP_SERVER_SIGNATURES = mcpServerSignatures(
 // here keeps /start and /restart from advertising an extra that never loads.
 const DEFAULT_MCP_EXTRAS = DEFAULT_MCP_EXTRAS_RAW.filter((ex) => {
   if (KNOWN_MCP_EXTRAS.includes(ex)) return true;
+  if (PREFLIGHT_MODE === 'gate') throw new Error('invalid MCP_DEFAULT_EXTRAS');
   console.warn(`[mcp-config] MCP_DEFAULT_EXTRAS lists "${ex}" but no mcpExtras["${ex}"] block exists (in mcp-config.json or mcp-config.local.json); it will be ignored.`);
   return false;
 });
@@ -480,7 +535,7 @@ const PLUGIN_CACHE_DIR = process.env.BRIDGE_PLUGIN_CACHE_DIR
   ? expandHome(process.env.BRIDGE_PLUGIN_CACHE_DIR)
   : path.join(os.homedir(), '.claude-matrix-bridge', 'empty-plugin-cache');
 try {
-  fs.mkdirSync(PLUGIN_CACHE_DIR, { recursive: true });
+  if (!PREFLIGHT_MODE) fs.mkdirSync(PLUGIN_CACHE_DIR, { recursive: true });
 } catch (e) {
   console.warn(`[plugin-cache] Could not create ${PLUGIN_CACHE_DIR}: ${e.message}`);
 }
@@ -612,8 +667,10 @@ const NOTICES_BLOCKS = loadNoticesBlock({
 const _rawLiveOutputTtl = parseInt(process.env.MATRON_LIVE_OUTPUT_TTL || '86400', 10);
 const LIVE_OUTPUT_TTL = Number.isFinite(_rawLiveOutputTtl) && _rawLiveOutputTtl > 0 ? _rawLiveOutputTtl : 86400;
 const liveOutputStore = createLiveOutputStore({ ttlSeconds: LIVE_OUTPUT_TTL });
-sweepOrphanedLogs(liveLogDir(), LIVE_OUTPUT_TTL);
-setInterval(() => liveOutputStore.gcExpired(), 60_000).unref();
+if (!PREFLIGHT_MODE) {
+  sweepOrphanedLogs(liveLogDir(), LIVE_OUTPUT_TTL);
+  setInterval(() => liveOutputStore.gcExpired(), 60_000).unref();
+}
 if (!HMAC_SECRET || !VIEWER_BASE_URL) {
   console.warn('[viewer] HMAC_SECRET or VIEWER_BASE_URL unset — file links and secure secret/sensitive-data links disabled');
 }
@@ -630,6 +687,7 @@ function resolveJournalToken() {
     try {
       return fs.readFileSync(file, 'utf-8').trim();
     } catch (e) {
+      if (PREFLIGHT_MODE === 'gate') throw new Error('cannot read JOURNAL_TOKEN_FILE', { cause: e });
       console.warn(`[journal] Could not read JOURNAL_TOKEN_FILE ${file}: ${e.message}`);
       return '';
     }
@@ -637,6 +695,24 @@ function resolveJournalToken() {
   return (process.env.JOURNAL_TOKEN || '').trim();
 }
 const _journalToken = resolveJournalToken();
+if (PREFLIGHT_MODE === 'gate') {
+  if (!JOURNAL_WS_URL || !_journalToken) {
+    console.error('[preflight] JOURNAL_WS_URL and journal token required');
+    process.exit(1);
+  }
+  let journalUrlOk = false;
+  try {
+    const parsed = new URL(JOURNAL_WS_URL);
+    // WebSocket construction throws on other schemes and on a fragment.
+    journalUrlOk = ['ws:', 'wss:'].includes(parsed.protocol) && !parsed.hash;
+  } catch { /* invalid URL */ }
+  if (!journalUrlOk) {
+    console.error('[preflight] invalid JOURNAL_WS_URL (must be a ws: or wss: URL without a fragment)');
+    process.exit(1);
+  }
+  console.error('[preflight] ok');
+  process.exit(0);
+}
 // Task & decision tracker (spec 2026-09-08). One client for the item_* tools
 // and the inbound item-turn router — HTTP
 // against the same host the media routes use, with the same bearer token.
@@ -11828,8 +11904,6 @@ const permissionRegistry = createPermissionRegistry({
 const pendingPlanDecisions = new Map();
 
 // --- Local HTTP API ---
-
-const API_PORT = parseInt(process.env.MATRON_BRIDGE_API_PORT || '9802', 10);
 
 // POST /wake (lib/wake-route.js): wake one configured conversation with one
 // configured text, the way a timer firing does — resuming a reaped session.
