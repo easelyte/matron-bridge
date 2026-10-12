@@ -17,7 +17,7 @@ describe('Codex authentication recovery in the bridge', () => {
       _codexLastError: 'unexpected status 401 Unauthorized: Missing bearer or basic authentication in header, url: https://api.openai.com/v1/responses' };
     const reply = vi.fn();
     const finishCodexTurn = vi.fn(s => { s.busy = false; s._codexTurnFinished = true; });
-    const context = vm.createContext({ codex, session, clearInterval, CODEX_APP_SERVER: true, isCodexAuthError,
+    const context = vm.createContext({ codex, session, clearInterval, shuttingDown: false, CODEX_APP_SERVER: true, isCodexAuthError,
       refreshCodexTelemetry: vi.fn(), refreshCodexMetadata: vi.fn(), finishCodexTurn, offerCodexBuild: vi.fn(),
       runCodexControl: (s, command) => handleCodexControl(s, command, { reply }),
     });
@@ -32,6 +32,46 @@ describe('Codex authentication recovery in the bridge', () => {
     // A duplicate terminal event must not replace the active login.
     codex.emit('turn-exit', { code: 1, sawTurnCompleted: false });
     expect(codex.rpc).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([true, false])('suppresses recovery and queued dispatch during shutdown (auth error=%s)', authError => {
+    for (const shuttingDown of [true, false]) {
+      const codex = Object.assign(new EventEmitter(), { transport: 'app-server' });
+      const queuedMessages = [[{ type: 'text', text: 'follow-up' }]];
+      const session = { codex, alive: true, busy: true, queuedMessages, _codexTurnFinished: false,
+        _codexLastError: authError ? '401 Unauthorized' : 'turn failed', turnCount: 0, toolCalls: [] };
+      const runCodexControl = vi.fn();
+      const flushPendingSessionQueue = vi.fn(s => { s.queuedMessages = null; return true; });
+      const context = vm.createContext({ codex, session, clearInterval, shuttingDown, CODEX_APP_SERVER: true,
+        isCodexAuthError, runCodexControl, flushPendingSessionQueue,
+        refreshCodexTelemetry: vi.fn(), refreshCodexMetadata: vi.fn(), offerCodexBuild: vi.fn(),
+        flushResponse: vi.fn(), journalStreamClear: vi.fn(), journalSessionState: vi.fn(),
+        journalActivity: vi.fn(), maybeSummarizeAtTurnEnd: vi.fn(), journalStatus: vi.fn(),
+        inflightMarker: { noteTurnEnd: vi.fn() }, journalConvoIdFor: vi.fn(),
+        dispatchDeferredCommand: vi.fn(() => false), maybeFlushRoomDelivery: vi.fn(), endRestartNoticeTurn: vi.fn(), sessionHasBackgroundWork: vi.fn(() => false),
+      });
+      const finishStart = source.indexOf('function finishCodexTurn(');
+      vm.runInContext(source.slice(finishStart, source.indexOf('\n}\n', finishStart) + 2), context);
+      const exitStart = source.indexOf("  codex.on('turn-exit',");
+      vm.runInContext(source.slice(exitStart, source.indexOf('\n  });', exitStart) + 6), context);
+      codex.emit('turn-exit', { code: 1, sawTurnCompleted: false });
+      expect(session.busy).toBe(false);
+      expect(session._codexTurnFinished).toBe(true);
+      if (shuttingDown) {
+        expect(runCodexControl).not.toHaveBeenCalled();
+        expect(flushPendingSessionQueue).not.toHaveBeenCalled();
+        expect(session.queuedMessages).toBe(queuedMessages);
+        expect(session.queuedMessages).toEqual([[{ type: 'text', text: 'follow-up' }]]);
+      } else if (authError) {
+        expect(runCodexControl).toHaveBeenCalledExactlyOnceWith(session, '/login');
+        expect(flushPendingSessionQueue).not.toHaveBeenCalled();
+        expect(session.queuedMessages).toBe(queuedMessages);
+      } else {
+        expect(runCodexControl).not.toHaveBeenCalled();
+        expect(flushPendingSessionQueue).toHaveBeenCalledExactlyOnceWith(session);
+        expect(session.queuedMessages).toBeNull();
+      }
+    }
   });
 
   it.each([{ _codexLoginId: 'login' }, { _codexAccountCommandPending: true }])('keeps input out of the model while signing in: %j', state => {

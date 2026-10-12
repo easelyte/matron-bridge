@@ -18,6 +18,7 @@ const WINDOWS_EXCLUDES = [
   'test/codex-liveness.test.js',
   'test/bridge-process.harness.test.js',
   'test/preflight-mode.test.js',
+  'test/bridge-process.g7.test.js',
   'test/codex-completion.test.js',
   'test/codex-redact-publish.test.js',
   // Integration suites that need ffmpeg / a journal.
