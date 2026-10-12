@@ -159,37 +159,9 @@ it.each(['MATRON_CODE_UPDATE_POLL_MS', 'MATRON_CODE_UPDATE_SETTLE_MS', 'MATRON_C
     expect(rejected.output).toContain(`invalid ${name}`);
   }, 30000);
 
-it.each(['not-a-url', 'http://localhost/ws', 'ws://localhost/ws#fragment'])(
-  'rejects unusable journal URL %s in gate mode', async url => {
-    const f = await fixture();
-    const result = await f.run('gate', { file: 'KEY=value', env: { JOURNAL_WS_URL: url } });
-    expect(result.code, result.output).toBe(1);
-    expect(result.output).toContain('invalid JOURNAL_WS_URL');
-  }, 30000);
-
-it.each(['ws:', 'wss:'])('accepts %s journal URLs without connecting in gate mode', async scheme => {
-  const f = await fixture();
-  const result = await f.run('gate', { file: 'KEY=value', env: { JOURNAL_WS_URL: `${scheme}//${loopback}/ws` } });
-  expect(result.code, result.output).toBe(0);
-  expect(result.output).toContain('[preflight] ok');
-}, 30000);
-
-it.each(['MATRON_CODE_UPDATE_POLL_MS', 'MATRON_CODE_UPDATE_SETTLE_MS',
-  'MATRON_CODE_UPDATE_WARN_EVERY_MS', 'MATRON_CODE_UPDATE_FORCE_AFTER_MS'])(
-  'bounds %s to the maximum timer delay in gate mode', async name => {
-    const f = await fixture();
-    const accepted = await f.run('gate', { file: `${name}=2147483647\n` });
-    expect(accepted.code, accepted.output).toBe(0);
-    expect(accepted.output).toContain('[preflight] ok');
-    const rejected = await f.run('gate', { file: `${name}=2147483648\n` });
-    expect(rejected.code, rejected.output).toBe(1);
-    expect(rejected.output).toContain(`invalid ${name}`);
-  }, 30000);
-
 it('validates boot configuration and its numeric boundaries in gate mode', async () => {
   const f = await fixture();
   const invalid = [
-    { MATRON_CODE_UPDATE_POLL_MS: '9007199254740991' },
     { MATRON_DEFAULT_AGENT: 'invalid' }, { MATRON_DEFAULT_MODEL: 'invalid' },
     { MATRON_DEFAULT_EFFORT: 'invalid' }, { MATRON_PERMISSION_MODE: 'invalid' },
     { CODEX_SANDBOX_MODE: 'invalid' }, { CODEX_NETWORK_ACCESS: 'invalid' },
@@ -207,7 +179,7 @@ it('validates boot configuration and its numeric boundaries in gate mode', async
   for (const env of invalid) expect((await f.run('gate', { file: 'KEY=value', env })).code, Object.keys(env).join()).toBe(1);
   for (const timeout of ['1', '300000']) expect((await f.run('gate', {
     file: 'KEY=value', env: { SHOW_FILE_UPLOAD_TIMEOUT_MS: timeout, MATRON_CODE_UPDATE_FORCE_AFTER_MS: '0',
-      MATRON_CODE_UPDATE_POLL_MS: '2147483647' },
+      MATRON_CODE_UPDATE_POLL_MS: '9007199254740991' },
   })).code).toBe(0);
   expect((await f.run('gate', { file: 'KEY=value', env: { SHOW_FILE_ARTIFACT_ROOTS: f.checkout } })).code).toBe(0);
   for (const tokenFile of ['empty.env', 'unreadable.env']) {

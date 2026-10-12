@@ -53,7 +53,9 @@ const buildPeerRuntime = new Function(
   'clearForeignFlag',
   'effortFlowHoldsInput',
   'drainPreReapCompact',
-  `${sourceBetween('function journalConvoIdFor(', '// Reverse lookup for the journal return path:')}
+  `const restartLatch = null;
+   const plannedRestartAvailable = false;
+   ${sourceBetween('function journalConvoIdFor(', '// Reverse lookup for the journal return path:')}
    ${sourceBetween('function findSessionByClaudeSessionId(', '// --- Journal dual-post mirroring ---')}
    ${sourceBetween('function sessionOccupiedForRoomDelivery(', '// Per-room once-listener registry')}
    ${sourceBetween('function journalOnPeerMessage(', '// Router seam: a journal frame in an active room convo')}

@@ -62,7 +62,7 @@ describe('rooms survive session teardown', () => {
     expect(wake).toBeGreaterThan(gate);
     // The muted branch returns before the wake is reached.
     const muted = body.slice(body.indexOf("if (disposition !== 'deliver')"), wake);
-    expect(muted).toMatch(/\n {4}return;\n {2}\}/);
+    expect(muted).toMatch(/\n\s+return;\n\s+\}/);
     // Alice's own message into a muted, sleeping conversation still gets its
     // receipt there, so it does not look lost — without waking it.
     expect(muted).toMatch(/live \? journalConvoIdFor\(session\) : sleepingConvoIdFor\(room\.sessionRoomId\)/);

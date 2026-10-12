@@ -1,0 +1,28 @@
+{
+  "id": "alice",
+  "state": "pending",
+  "requests": [
+    {
+      "request_key": "alice"
+    }
+  ],
+  "pending_since": 400000,
+  "first_request_at": 400000,
+  "last_request_at": 400000,
+  "boot_sha": "boot",
+  "previous_sha": "boot",
+  "expected_sha": null,
+  "participants": [],
+  "notified": {
+    "bob": {
+      "at": 400000,
+      "turnEnded": false
+    }
+  },
+  "verdicts": {},
+  "history_appended": false,
+  "stamp_written": false,
+  "restarting_at": null,
+  "boot_id": "box-a",
+  "boot_phase": null
+}

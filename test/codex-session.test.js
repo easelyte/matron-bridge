@@ -1,5 +1,6 @@
 import { EventEmitter } from 'node:events';
 import { readFileSync } from 'node:fs';
+import { evaluateQuiet } from '../lib/restart-quiet.js';
 import { PassThrough } from 'node:stream';
 import { describe, expect, it, vi } from 'vitest';
 import {
@@ -320,3 +321,33 @@ describe('Codex bridge wiring', () => {
     expect(body).toContain('sessionId: effectiveSessionId');
   });
 });
+
+it.each([[undefined, true], [123, true], [123, false]])('allows quiet observations after a failed child (pid %s, error %s)', (pid, error) => {
+  const child = fakeChild();
+  child.pid = pid;
+  const codex = new CodexExecSession({ spawnImpl: () => child, readProcesses: () => ({ table: [] }) });
+  codex.send([{ type: 'text', text: 'continue' }]);
+  if (error) child.emit('error', new Error('spawn refused'));
+  child.emit('close', 1, null);
+  const options = { sessions: [{ alive: true, codex }], bootAt: 0,
+    readProcessTable: () => ({ ok: true, table: [{ pid: 999, ppid: 1, pgid: 999, sid: 999, startTime: 'other-start' }] }),
+    listRunningSubagents: () => [] };
+  const first = evaluateQuiet(options);
+  expect(evaluateQuiet({ ...options, prev: first }).quiet).toBe(true);
+  expect(codex.workGroups || []).toEqual([]);
+});
+
+it.each([[1, null], [null, 'SIGTERM']])('keeps a surviving worker held after the CLI exits (code %s, signal %s)', (code, signal) => {
+  const child = fakeChild();
+  child.pid = 10;
+  const worker = { pid: 11, ppid: 1, pgid: 10, sid: 10, startTime: 'worker-start', args: 'worker' };
+  const codex = new CodexExecSession({ spawnImpl: () => child,
+    readProcesses: () => ({ table: [{ pid: 10, ppid: 1, pgid: 10, sid: 10, startTime: 'leader-start' }] }) });
+  codex.send([{ type: 'text', text: 'continue' }]);
+  child.emit('close', code, signal);
+  const options = { sessions: [{ alive: true, codex }], bootAt: 0,
+    readProcessTable: () => ({ ok: true, table: [worker] }), listRunningSubagents: () => [] };
+  const first = evaluateQuiet(options);
+  expect(evaluateQuiet({ ...options, prev: first }).quiet).toBe(false);
+});
+

@@ -17,10 +17,11 @@ export function probeConfinement(run = spawnSync) {
 const bwrapAvailable = probeConfinement();
 const delay = ms => new Promise(resolve => setTimeout(resolve, ms));
 
-export function supervise(launch) {
+export function supervise(launch, beforeRelaunch) {
   let stopped = false;
   const supervisor = {
     child: null, launches: 0, exits: [],
+    restart() { stopped = false; start(); },
     stop(signal = 'SIGTERM') {
       stopped = true;
       const child = supervisor.child;
@@ -33,7 +34,10 @@ export function supervise(launch) {
     supervisor.launches++;
     child.once('exit', (code, signal) => {
       supervisor.exits.push({ code, signal });
-      if (!stopped && code === 75) start();
+      if (!stopped && code === 75) {
+        if (beforeRelaunch) Promise.resolve(beforeRelaunch()).then(() => { if (!stopped) start(); });
+        else start();
+      }
     });
   }
   start();
@@ -62,7 +66,7 @@ async function randomPort() {
 // Run the actual entry point from a disposable source copy: startup writes
 // generated MCP config beside index.js. Where available, bwrap adds a read-only
 // filesystem view, private /tmp and PID namespace. Otherwise own a process group.
-export async function startBridge({ confine = true } = {}) {
+export async function startBridge({ confine = true, planned = false, collectMs = 100, backgroundChild = false, crashBeforeHistory = false, beforeRelaunch } = {}) {
   const confined = confine && bwrapAvailable;
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-process-'));
   const checkout = path.join(home, 'bridge');
@@ -118,10 +122,25 @@ catch (error) {
 `);
     fs.mkdirSync(path.join(home, 'bin'));
     // Only code/config inputs; never copy a live .env, overlay or HOME state.
-    for (const name of ['index.js', 'package.json', 'mcp-config.json', 'lib', 'hooks', 'bin', 'scripts',
+    for (const name of ['index.js', 'package.json', 'package-lock.json', '.gitignore', 'mcp-config.json', 'lib', 'hooks', 'bin', 'scripts',
       'coordinator', 'BRIDGE_CLAUDE.md', 'BRIDGE_CODEX.md', 'BRIDGE_COORDINATOR.md', 'BRIDGE_NOTICES.md']) {
       fs.cpSync(path.join(repo, name), path.join(checkout, name), { recursive: true });
     }
+    if (crashBeforeHistory) {
+      const file = path.join(checkout, 'lib/restart-boot.js');
+      const source = fs.readFileSync(file, 'utf8');
+      // Let the accepted PTY submission finish, while keeping history unwritten.
+      const seam = "    onStep('back');";
+      if (!source.includes(seam)) throw new Error('Cannot locate history crash seam');
+      fs.writeFileSync(file, source.replace(seam, seam + "\n    if (process.env.HARNESS_CRASH_BEFORE_HISTORY === '1') { setTimeout(() => process.kill(process.pid, 'SIGKILL'), 1000); return; }"));
+    }
+    const gitEnv = { HOME: home, PATH: process.env.PATH, GIT_CONFIG_NOSYSTEM: '1' };
+    for (const args of [['init'], ['add', '.'], ['-c', 'user.name=alice', '-c', 'user.email=alice',
+      '-c', 'commit.gpgsign=false', 'commit', '-m', 'Disposable checkout']]) {
+      const result = spawnSync('git', args, { cwd: checkout, env: gitEnv, encoding: 'utf8', timeout: 5000 });
+      if (result.status !== 0) throw new Error('Cannot initialize disposable checkout');
+    }
+    if (planned) fs.writeFileSync(path.join(checkout, '.env'), `MATRON_RESTART_COLLECT_MS=${collectMs}\n`);
     // repairSpawnHelperOnce only adds spawn-helper exec bits, as npm ci's postinstall already does.
     fs.symlinkSync(path.join(repo, 'node_modules'), path.join(checkout, 'node_modules'), 'dir');
     fs.copyFileSync(path.join(repo, 'test/stub-claude.mjs'), path.join(home, 'stub-claude.mjs'));
@@ -129,12 +148,35 @@ catch (error) {
     const shim = `#!${process.execPath}\nimport fs from 'node:fs';
 import path from 'node:path';
 import { transcriptPathFor } from '../bridge/lib/transcript-dir.js';
-const flag = process.argv.indexOf('--session-id');
+const flag = process.argv.includes('--session-id') ? process.argv.indexOf('--session-id') : process.argv.indexOf('--resume');
 if (flag < 0) process.exit(2);
 process.env.TRANSCRIPT_PATH = transcriptPathFor(process.cwd(), process.argv[flag + 1]);
 fs.mkdirSync(path.dirname(process.env.TRANSCRIPT_PATH), { recursive: true });
-await import('../stub-claude.mjs');\n`;
-    fs.writeFileSync(path.join(home, 'bin', 'claude'), shim, { mode: 0o755 });
+await import('../stub-claude.mjs');
+process.stdout.write('\\n? for shortcuts\\n');\n`;
+    const sessionSetup = `
+fs.writeFileSync(path.join(process.env.HOME, process.argv[flag + 1] + '.env.json'), JSON.stringify({
+  roomId: process.env.BRIDGE_ROOM_ID, tokenFile: process.env.MATRON_RESTART_ENV_FILE,
+}));
+if (${backgroundChild} && !fs.existsSync(path.join(process.env.HOME, 'child-started'))) {
+  fs.writeFileSync(path.join(process.env.HOME, 'child-started'), process.argv[flag + 1]);
+  const { spawn } = await import('node:child_process');
+  spawn(process.execPath, ['-e', "const fs = require('node:fs'); const path = require('node:path'); setInterval(() => { if (fs.existsSync(path.join(process.env.HOME, 'child-release'))) process.exit(0); }, 25);"], {
+    env: { HOME: process.env.HOME, PATH: process.env.PATH }, stdio: 'ignore',
+  });
+}
+let endedBytes = fs.existsSync(process.env.TRANSCRIPT_PATH) ? fs.statSync(process.env.TRANSCRIPT_PATH).size : 0;
+fs.watchFile(process.env.TRANSCRIPT_PATH, { interval: 25 }, async stat => {
+  if (stat.size <= endedBytes) return;
+  endedBytes = stat.size;
+  const rows = fs.readFileSync(process.env.TRANSCRIPT_PATH, 'utf8').trim().split('\\n').map(JSON.parse);
+  if (rows.at(-1)?.type === 'result') await fetch('http://localhost:' + process.env.MATRON_BRIDGE_API_PORT + '/turn-end', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ session_id: process.argv[flag + 1], transcript_path: process.env.TRANSCRIPT_PATH }),
+  });
+});
+`;
+    fs.writeFileSync(path.join(home, 'bin', 'claude'), shim.replace("await import('../stub-claude.mjs');", (planned ? sessionSetup : '') + "await import('../stub-claude.mjs');"), { mode: 0o755 });
     journal = new WebSocketServer({ host: '127.0.0.1', port: 0 });
     journal.on('connection', socket => {
       socket.on('message', data => {
@@ -159,7 +201,9 @@ await import('../stub-claude.mjs');\n`;
       MATRON_LIVE_OUTPUT_TTL: '3153600000', // Keep startup's literal /tmp sweep inert in both modes.
     };
     supervisor = supervise(() => {
-      const child = confined ? childProcess.spawn('bwrap', ['--die-with-parent', '--unshare-pid', '--as-pid-1', '--info-fd', '3',
+      env.HARNESS_CRASH_BEFORE_HISTORY = crashBeforeHistory && supervisor?.launches === 1 ? '1' : '0';
+      // Keep the namespace init wrapper when testing a self-inflicted crash.
+      const child = confined ? childProcess.spawn('bwrap', ['--die-with-parent', '--unshare-pid', ...(crashBeforeHistory ? [] : ['--as-pid-1']), '--info-fd', '3',
         '--ro-bind', '/', '/', '--dev', '/dev', '--proc', '/proc',
         '--tmpfs', '/tmp', '--bind', home, home, '--ro-bind', readonly, '/tmp/harness-readonly',
         '--chdir', checkout, process.execPath, '--import', path.join(home, 'probe.mjs'), 'index.js'],
@@ -189,11 +233,11 @@ await import('../stub-claude.mjs');\n`;
       child.stderr.on('data', data => { output += data; });
       child.on('error', error => { output += error.message; });
       return child;
-    });
-    async function post(route, body = {}) {
+    }, beforeRelaunch);
+    async function post(route, body = {}, headers = {}) {
       const response = await fetch(`http://127.0.0.1:${port}${route}`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body), signal: AbortSignal.timeout(1000),
+        method: 'POST', headers: { 'Content-Type': 'application/json', ...headers },
+        body: JSON.stringify(body), signal: AbortSignal.timeout(planned ? 5000 : 1000),
       });
       if (!response.ok) throw new Error(`${route}: HTTP ${response.status}`);
       return response.json();
@@ -210,10 +254,18 @@ await import('../stub-claude.mjs');\n`;
     let session;
     return {
       ready: true, confined, home, checkout, port, frames, supervisor, post, sendText,
+      token(file = path.join(home, '.matron-bridge-restart.env')) {
+        return fs.readFileSync(file, 'utf8').trim().split('=')[1];
+      },
+      transcript(id) {
+        const file = path.join(home, '.claude', 'projects', encodeProjectDir(workdir), `${id}.jsonl`);
+        return fs.existsSync(file) ? fs.readFileSync(file, 'utf8').trim().split('\n').map(JSON.parse) : [];
+      },
       get output() { return output; },
       async startSession() {
+        const existing = new Set((await post('/sessions')).map(s => s.claudeSessionId));
         sendText('harness-control', '/start');
-        session = await waitFor(async () => (await post('/sessions')).find(s => s.alive), diagnostics);
+        session = await waitFor(async () => (await post('/sessions')).find(s => s.alive && !existing.has(s.claudeSessionId)), diagnostics);
         return session;
       },
       async echo(text) {
