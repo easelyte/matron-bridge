@@ -36,6 +36,33 @@ it.each([true, false])('keeps the literal /tmp sweep inert (confine=%s)', async 
   }
 }, 15000);
 
+it('commits the working source copy for planned restarts', async () => {
+  const error = new Error('harness launch intercepted');
+  const originalCopy = fs.cpSync;
+  const marker = '// disposable working source';
+  const copy = vi.spyOn(fs, 'cpSync').mockImplementation((source, target, options) => {
+    originalCopy(source, target, options);
+    if (path.basename(source) === 'index.js') fs.appendFileSync(target, `\n${marker}\n`);
+  });
+  let source;
+  let committed;
+  const launch = vi.spyOn(childProcess, 'spawn').mockImplementation((command, args, options) => {
+    source = fs.readFileSync(path.join(options.cwd, 'index.js'), 'utf8');
+    committed = execFileSync('git', ['show', 'HEAD:index.js'], {
+      cwd: options.cwd, encoding: 'utf8', env: { HOME: options.env.HOME, PATH: process.env.PATH },
+    });
+    throw error;
+  });
+  try {
+    await expect(startBridge({ planned: true })).rejects.toThrow(error.message);
+    expect(source.includes(marker)).toBe(true);
+    expect(committed).toBe(source);
+  } finally {
+    launch.mockRestore();
+    copy.mockRestore();
+  }
+}, 15000);
+
 describe('fake bridge supervisor', () => {
   function fixture() {
     const children = [];
@@ -106,6 +133,12 @@ harnessSpawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
   }
   try {
     expect(bridge.ready).toBe(true);
+    expect(fs.existsSync(path.join(bridge.checkout, '.git'))).toBe(true);
+    const head = execFileSync('git', ['rev-parse', 'HEAD'], {
+      cwd: bridge.checkout, encoding: 'utf8', env: { HOME: bridge.home, PATH: '/usr/bin:/bin' },
+    }).trim();
+    const restartState = JSON.parse(fs.readFileSync(path.join(bridge.home, '.matron-bridge-restart-state.json'), 'utf8'));
+    expect(restartState.boot_sha).toBe(head);
     if (fallback) {
       expect(bridge.supervisor.child.spawnargs[0]).toBe(process.execPath);
       expect(bridge.confined).toBe(false);

@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from 'vitest';
+import { afterEach, describe, it, expect, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -21,12 +21,11 @@ import {
   selectAutoCarryOn,
 } from '../lib/code-update-restart.js';
 
-// A bridge restarting ITSELF onto new code. A rollout that finds a live
-// session updates the checkout and defers the restart; a bridge whose
-// session is always live (the Coordinator's box) therefore never updates.
-// The watcher reads HEAD's reflog, waits for the deploy to settle, proves
-// the tree boots, and then exits for the supervisor at the first quiet
-// moment — or after the deferral cap regardless.
+import { createPlannedRestart } from '../lib/planned-restart.js';
+import { createPlannedRestartState, supersedesWatcherRequests } from '../lib/planned-restart-state.js';
+
+// Planned requests use the real store in a throwaway root. The force-path
+// tests inject preflight and shutdown so no live process is affected.
 
 const OLD = 'a'.repeat(40);
 const NEW = 'b'.repeat(40);
@@ -43,10 +42,128 @@ function harness({ head, busy = 0, preflightOk = true, now = T0, bootSha = OLD, 
     log: (m) => state.log.push(m),
     warn: (m) => state.warn.push(m),
     bootSha,
+    forceAfterMs: Number.MAX_SAFE_INTEGER,
     ...opts,
   });
   return { state, watcher };
 }
+
+const requestRoots = [];
+afterEach(() => { for (const root of requestRoots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
+
+function requestFixture() {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'code-request-'));
+  requestRoots.push(root);
+  const file = path.join(root, 'state.json');
+  const store = createPlannedRestartState({ file });
+  const addRequest = vi.fn(request => store.addRequest(request, undefined, {
+    supersede: supersedesWatcherRequests(request),
+  }));
+  const fixture = harness({ head: { sha: NEW, at: T0 - DEFAULT_SETTLE_MS }, busy: 2, addRequest, forceAfterMs: 0 });
+  return { ...fixture, file, store, addRequest };
+}
+
+describe('code update planned requests', () => {
+  it('requests each settled sha once without restarting or preflighting', async () => {
+    const { state, watcher, store, addRequest } = requestFixture();
+    expect((await watcher.tick()).action).toBe('requested');
+    expect(store.getState().requests).toEqual([{ origin: 'watcher', reason: 'code update', sha: NEW, request_key: `code-update:${NEW}` }]);
+    for (let i = 0; i < 5; i++) await watcher.tick();
+    state.head = { sha: 'c'.repeat(40), at: T0 - DEFAULT_SETTLE_MS };
+    await watcher.tick();
+    state.head = { sha: NEW, at: T0 - DEFAULT_SETTLE_MS };
+    await watcher.tick();
+    expect(addRequest).toHaveBeenCalledTimes(3);
+    expect(state.restarts).toEqual([]);
+    expect(state.preflights).toBe(0);
+  });
+
+  it('supersedes rolled-back watcher requests while preserving operator requests', async () => {
+    const { state, watcher, store, addRequest } = requestFixture();
+    const fixed = 'c'.repeat(40);
+    const operator = { reason: 'code update', sha: 'd'.repeat(40), request_key: 'bob' };
+    store.persistBootSha(OLD);
+    store.addRequest(operator);
+    await watcher.tick();
+    state.head = { sha: OLD, at: T0 - DEFAULT_SETTLE_MS };
+    await watcher.tick();
+    state.head = { sha: fixed, at: T0 - DEFAULT_SETTLE_MS };
+    await watcher.tick();
+    const gate = createPlannedRestart({ repoDir: 'checkout', stateStore: store,
+      git: args => {
+        if (args[0] === 'rev-parse') return state.head.sha;
+        if (args[0] === 'status') return '';
+        if (args[0] === 'merge-base') return args[2] === args[3]
+          || ([OLD, operator.sha].includes(args[2]) && args[3] === fixed);
+        throw new Error('unexpected git command');
+      },
+      fs: { readFileSync: () => 'lock', statSync: () => ({ ino: 1, mtimeMs: 1 }) },
+      quietEvaluator: () => ({ quiet: true, holders: [], probe_error: null }),
+      support: () => 'gate/1', preflight: async () => ({ ok: true }),
+    });
+    gate.evaluate({ dryRun: true });
+    await Promise.resolve();
+    expect(gate.evaluate({ dryRun: true }).would_pass).toBe(true);
+    expect(store.getState().requests).toEqual([operator,
+      { origin: 'watcher', reason: 'code update', sha: fixed, request_key: `code-update:${fixed}` }]);
+    for (let i = 0; i < 3; i++) await watcher.tick();
+    expect(addRequest).toHaveBeenCalledTimes(2);
+    state.head = { sha: NEW, at: T0 - DEFAULT_SETTLE_MS };
+    await watcher.tick();
+    expect(store.getState().requests).toEqual([operator,
+      { origin: 'watcher', reason: 'code update', sha: NEW, request_key: `code-update:${NEW}` }]);
+    expect(addRequest).toHaveBeenCalledTimes(3);
+  });
+
+  it('leaves restarting state byte-identical and retries on polls and back', async () => {
+    const { state, watcher, store, file, addRequest } = requestFixture();
+    store.addRequest({ reason: 'config', request_key: 'alice' });
+    store.setState('restarting', { stamp_written: true, participants: ['alice'] });
+    const before = fs.readFileSync(file, 'utf8');
+    for (let i = 0; i < 3; i++) {
+      await watcher.tick();
+      expect(fs.readFileSync(file, 'utf8')).toBe(before);
+    }
+    expect(addRequest).toHaveBeenCalledTimes(3);
+    store.setState('back');
+    const source = fs.readFileSync(new URL('../index.js', import.meta.url), 'utf8');
+    expect(source).toContain('addRequest: request => plannedRestartAvailable ? plannedRestartState.addRequest(request, undefined, {');
+    expect(source).toContain("state === 'back' && previousState !== 'back'");
+    expect(source).toContain('codeUpdateWatcher?.onBack()');
+    await watcher.onBack();
+    expect(store.getState().requests.filter(request => request.sha === NEW)).toHaveLength(1);
+    for (let i = 0; i < 3; i++) await watcher.tick();
+    expect(addRequest).toHaveBeenCalledTimes(4);
+    expect(state.restarts).toEqual([]);
+  });
+
+  it.each(['missing', 'unreadable', 'timeout'])('retries a refused request after %s input', async failure => {
+    const { state, watcher, store, file, addRequest } = requestFixture();
+    if (failure === 'missing') addRequest.mockImplementationOnce(() => undefined);
+    if (failure === 'unreadable') fs.mkdirSync(file);
+    if (failure === 'timeout') addRequest.mockImplementationOnce(() => { throw new Error('request timeout'); });
+    await watcher.tick().catch(() => {});
+    expect(state.restarts).toEqual([]);
+    expect(addRequest).toHaveBeenCalledTimes(1);
+    if (failure === 'unreadable') fs.rmdirSync(file);
+    await watcher.tick();
+    expect(store.getState().requests).toHaveLength(1);
+    expect(addRequest).toHaveBeenCalledTimes(2);
+  });
+
+  it('requests at the settle boundary and waits one millisecond before it', async () => {
+    const { state, watcher, addRequest } = requestFixture();
+    state.head.at = T0 - DEFAULT_SETTLE_MS + 1;
+    await watcher.tick();
+    expect(addRequest).not.toHaveBeenCalled();
+    state.now++;
+    await watcher.tick();
+    expect(addRequest).toHaveBeenCalledTimes(1);
+    state.now++;
+    await watcher.tick();
+    expect(addRequest).toHaveBeenCalledTimes(1);
+  });
+});
 
 describe('parseMs / restartEnabled', () => {
   it('takes a positive integer and falls back on anything else', () => {
@@ -185,12 +302,12 @@ describe('createCodeUpdateWatcher — a landed update', () => {
     expect(await watcher.tick()).toEqual({ action: 'restart', sha: NEW, forced: false, busy: 0, waitedMs: 120_000 });
   });
 
-  it('NEVER restarts while a turn is running, however long, and says so every 30 min', async () => {
+  it('waits through long busy periods before its opt-in force interval and warns every 30 min', async () => {
     // ship-1, 2026-10-03 05:51 UTC: the old 30 min cap cut a production
     // deploy shell off mid-run. A running turn is a running turn.
     const { state, watcher } = harness({ head: { sha: NEW, at: T0 - DEFAULT_SETTLE_MS }, busy: 1 });
     await watcher.tick();
-    expect(state.log.join('\n')).toMatch(/Restarting when no session is mid-turn, never mid-turn\./);
+    expect(state.log.join('\n')).toMatch(/Restarting when no session is mid-turn, forced after/);
     for (let m = 1; m <= 6 * 60; m++) {
       state.now = T0 + m * 60_000;
       expect((await watcher.tick()).action).toBe('waiting');
@@ -263,7 +380,7 @@ describe('createCodeUpdateWatcher — code that will not boot', () => {
       preflight: async () => { state.preflights++; return ok ? { ok: true } : { ok: false, error: 'nope' }; },
       restart: (i) => state.restarts.push(i),
       now: () => state.now,
-      bootSha: OLD,
+      bootSha: OLD, forceAfterMs: Number.MAX_SAFE_INTEGER,
     });
     expect((await watcher.tick()).action).toBe('refused');
     // Rolled back: HEAD is the boot sha again.
@@ -283,7 +400,7 @@ describe('createCodeUpdateWatcher — code that will not boot', () => {
     const w = createCodeUpdateWatcher({
       readHead: () => state.head, busySessions: () => 0,
       preflight: async () => { throw new Error('boom'); },
-      restart: (i) => state.restarts.push(i), now: () => state.now, bootSha: OLD,
+      restart: (i) => state.restarts.push(i), now: () => state.now, bootSha: OLD, forceAfterMs: Number.MAX_SAFE_INTEGER,
       warn: (m) => state.warn.push(m),
     });
     void watcher;
@@ -324,7 +441,7 @@ describe('createCodeUpdateWatcher — HEAD moving again', () => {
       busySessions: () => 0,
       preflight: () => new Promise(r => { release = r; }),
       restart: (i) => state.restarts.push(i),
-      now: () => T0, bootSha: OLD,
+      now: () => T0, bootSha: OLD, forceAfterMs: Number.MAX_SAFE_INTEGER,
     });
     const first = watcher.tick();
     expect(await watcher.tick()).toEqual({ action: 'checking', sha: NEW });
@@ -396,4 +513,16 @@ describe('self-restart stamp — carrying on by itself', () => {
     expect(selectAutoCarryOn([mine], stamp, { enabled: false })).toEqual({ auto: [], card: [mine] });
     expect(selectAutoCarryOn(null, stamp)).toEqual({ auto: [], card: [] });
   });
+});
+
+it.each([undefined, () => null])('uses the legacy idle path when planned requests are unavailable (%s)', async addRequest => {
+  const h = harness({ head: { sha: NEW, at: T0 - DEFAULT_SETTLE_MS }, busy: 1, forceAfterMs: 0, addRequest });
+  expect((await h.watcher.tick()).action).toBe('waiting');
+  expect(h.state.preflights).toBe(1);
+  h.state.now += 48 * 60 * 60_000;
+  expect((await h.watcher.tick()).action).toBe('waiting');
+  expect(h.state.restarts).toEqual([]);
+  h.state.busy = 0;
+  expect((await h.watcher.tick()).action).toBe('restart');
+  expect(h.state.restarts[0].forced).toBe(false);
 });

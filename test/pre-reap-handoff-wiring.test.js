@@ -74,7 +74,7 @@ describe('pre-reap handoff wiring', () => {
     // the compaction started.
     expect(body).toContain('if (plan.compact) session._preReapHandoff.compactPending = true;');
     expect(body).toMatch(/if \(!sendTextToSession\(session, handoffTurnText\(\{ idleMinutes \}\), \{ skipJournalMirror: true \}\)\) \{[\s\S]*?return;\s*\}\n\s+postControlNotice\(session, line\);/);
-    expect(body).toMatch(/\n {2}if \(drainPreReapCompact\(session\)\) postControlNotice\(session, line\);\n\}\n/);
+    expect(body).toMatch(/\n\s+if \(drainPreReapCompact\(session\)\) postControlNotice\(session, line\);\n/);
     expect(body.match(/postControlNotice\(session, line\);/g)).toHaveLength(2);
   });
 
@@ -118,7 +118,7 @@ describe('pre-reap handoff wiring', () => {
     expect(arm).toContain('session._operatorCompactPendingTurn = session.turnCount;');
     expect(arm).toMatch(/session\._operatorCompactTimer = setTimeout\(\(\) => \{\s*session\._operatorCompactTimer = null;\s*session\._operatorCompactPending = false;\s*\}, OPERATOR_COMPACT_ARM_MS\);/);
     const route = fnBody('journalRouteTextToSession');
-    expect(route).toMatch(/armOperatorCompact\(session, trimmed\);\n\s+return sendTextToSession\(session, trimmed, \{ skipJournalMirror: true \}\);\n\}/);
+    expect(route).toMatch(/armOperatorCompact\(session, trimmed\);\n\s+return sendTextToSession\(session, trimmed, \{ skipJournalMirror: true \}\);\n\s*\} finally \{ finishInput\?\.\(\); \}/);
     // The boundary handler honours exactly that marker and turn stamp.
     expect(index).toMatch(/if \(session\._operatorCompactPending && trigger === 'manual'\s*&& session\.turnCount === session\._operatorCompactPendingTurn\)/);
   });

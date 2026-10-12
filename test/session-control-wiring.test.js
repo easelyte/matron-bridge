@@ -37,7 +37,7 @@ describe('session control wiring (source inspection)', () => {
     const auth = fn.indexOf('const denied = authorizeControl({ params, fromDeviceId, coordinatorConvoId: coordinator.convoId });');
     expect(auth).toBeGreaterThan(-1);
     // A cold or stale role cache gets one forced refresh before an alert is refused (Bugbot).
-    const refresh = fn.indexOf("if (JOURNAL_ONLY_ACTIONS.has(params.action) && fromDeviceId === JOURNAL_DEVICE_ID && (!coordinator.known || coordinator.convoId !== params.convoId)) {\n    coordinator = await coordinatorLookup.refresh({ force: true });");
+    const refresh = fn.indexOf("if (JOURNAL_ONLY_ACTIONS.has(params.action) && fromDeviceId === JOURNAL_DEVICE_ID && (!coordinator.known || coordinator.convoId !== params.convoId)) {\n      coordinator = await coordinatorLookup.refresh({ force: true });");
     expect(refresh).toBeGreaterThan(-1);
     expect(refresh).toBeLessThan(auth);
     expect(fn).toContain('if (denied) return { ok: false, error: denied };');

@@ -37,10 +37,12 @@ describe('Codex authentication recovery in the bridge', () => {
   it.each([{ _codexLoginId: 'login' }, { _codexAccountCommandPending: true }])('keeps input out of the model while signing in: %j', state => {
     const session = { alive: true, codex: { transport: 'app-server', send: vi.fn() }, ...state };
     const reportSessionSendFailure = vi.fn(() => false);
-    const context = vm.createContext({ reportSessionSendFailure });
+    const context = vm.createContext({ restartLatch: undefined, reportSessionSendFailure });
     const start = source.indexOf('function sendToSession(');
     vm.runInContext(source.slice(start, source.indexOf('\n}\n', start) + 2), context);
-    expect(context.sendToSession(session, [{ type: 'text', text: 'ABCD-1234' }])).toBe(false);
+    let dispatched;
+    expect(() => { dispatched = context.sendToSession(session, [{ type: 'text', text: 'ABCD-1234' }]); }).not.toThrow();
+    expect(dispatched).toBe(false);
     expect(session.codex.send).not.toHaveBeenCalled();
     expect(reportSessionSendFailure).toHaveBeenCalledWith(session, expect.stringContaining('Enter the device code there'));
   });

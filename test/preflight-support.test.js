@@ -120,3 +120,8 @@ it('refuses gate child errors, timeouts and spawn exceptions', async () => {
   }
   expect((await defaultPreflight(repo, { mode: 'gate', exec: () => { throw new Error('spawn failed'); } })).ok).toBe(false);
 });
+
+it('recognizes the exact protocol line in an entry point larger than one megabyte', () => {
+  const { repo, sha } = fixture('// padding\n'.repeat(120000) + marker);
+  expect(preflightSupport(repo, sha)).toBe('gate/1');
+});

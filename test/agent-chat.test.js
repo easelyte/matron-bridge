@@ -2030,7 +2030,7 @@ describe('mute wiring (source inspection)', () => {
     // still hold while a muted session receives everything anyway — the notices
     // publish, execution falls through, and the user gets a 🔇 line followed by
     // the delivery it just denied. The whole gate is that one keyword.
-    expect(body).toMatch(/if \(disposition !== 'deliver'\) \{[\s\S]{0,900}\n {4}return;\n {2}\}/);
+    expect(body).toMatch(/if \(disposition !== 'deliver'\) \{[\s\S]{0,900}\n\s+return;\n\s+\}/);
     // The pre-mute backlog drain stays ABOVE the gate: those messages were
     // accepted before the mute, and agent_chat_mute discards this room's share
     // of them explicitly (roomDelivery.dropRoom) rather than stranding them.

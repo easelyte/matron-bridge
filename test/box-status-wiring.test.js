@@ -9,7 +9,7 @@ import { describe, expect, it } from 'vitest';
 // never reports simply shows no usage in every client.
 describe('box status wiring', () => {
   const index = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
-  const fn = index.slice(index.indexOf('function publishBoxStatus('), index.indexOf('function publishBoxStatus(') + 1600);
+  const fn = index.slice(index.indexOf('function publishBoxStatus('), index.indexOf('function publishBoxStatus(') + 2100);
 
   it('sends a box_status op built from the same capacity thunks as the recent_folders reply', () => {
     expect(fn).toMatch(/if \(!JOURNAL_ENABLED\) return false;/);
@@ -22,7 +22,7 @@ describe('box status wiring', () => {
     // no valid block, and a null block would be "malformed", not "absent".
     expect(fn).toMatch(/\.\.\.\(activity \? \{ activity \} : \{\}\)/);
     expect(fn).toMatch(/\.\.\.\(accountEmail \? \{ account: \{ email: accountEmail \} \} : \{\}\)/);
-    expect(fn).toMatch(/if \(!activity && !limits && !disk && !accountEmail && !defaults\) return false;/);
+    expect(fn).toMatch(/if \(!activity && !limits && !disk && !accountEmail && !defaults && !restart\) return false;/);
     // This box's effective defaults for new sessions (agent_boxes, the
     // spawn consent card), from the same resolvers a start uses.
     expect(fn).toMatch(/const \{ agent, source \} = defaultAgentInfo\(\);/);

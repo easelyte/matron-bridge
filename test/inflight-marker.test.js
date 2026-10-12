@@ -20,7 +20,7 @@ describe('noteTurnStart / noteTurnEnd', () => {
     const { marker, state } = harness();
     marker.noteTurnStart('convo-a', 'room-a');
     expect(state.data['convo-a']).toEqual({
-      roomId: 'room-a', bootId: 'boot-2', startedAt: 1_000_000, touchedAt: 1_000_000,
+      roomId: 'room-a', bootId: 'boot-2', kind: 'turn', startedAt: 1_000_000, touchedAt: 1_000_000,
     });
   });
 
@@ -73,7 +73,7 @@ describe('takeStale', () => {
     const { marker } = harness({ initial: { 'convo-a': prev(940_000) } });
     const stale = marker.takeStale(6 * 3600 * 1000);
     expect(stale).toEqual([{
-      convoId: 'convo-a', roomId: 'room-x', bootId: 'boot-1', startedAt: 935_000, touchedAt: 940_000, ageMs: 60_000,
+      convoId: 'convo-a', kind: 'turn', roomId: 'room-x', bootId: 'boot-1', startedAt: 935_000, touchedAt: 940_000, ageMs: 60_000,
     }]);
   });
 
@@ -161,7 +161,7 @@ describe('takeStale when the clear cannot be written', () => {
 
     const second = harness({ initial: first.state.data, bootId: 'boot-3' });
     expect(second.marker.takeStale(60_000)).toEqual([
-      { convoId: 'convo-1', roomId: 'room-1', bootId: 'boot-1', startedAt: 999_000, touchedAt: 999_000, ageMs: 1_000 },
+      { convoId: 'convo-1', kind: 'turn', roomId: 'room-1', bootId: 'boot-1', startedAt: 999_000, touchedAt: 999_000, ageMs: 1_000 },
     ]);
     expect(second.state.data).toEqual({});  // this boot's clear did land
   });
@@ -204,5 +204,80 @@ describe('load tolerance', () => {
     });
     expect(() => marker.noteTurnStart('c', 'r')).not.toThrow();
     expect(log).toHaveBeenCalled();
+  });
+});
+
+describe('background work markers', () => {
+  const maxAge = 6 * 3600 * 1000;
+  const background = (touchedAt = 999_000) => ({
+    roomId: 'room-a', bootId: 'boot-1', kind: 'background', startedAt: 0, touchedAt,
+  });
+
+  it('marks new turns and retains unfinished work at turn end', () => {
+    const { marker, state } = harness();
+    marker.noteTurnStart('alice', 'room-a');
+    expect(state.data.alice.kind).toBe('turn');
+    marker.noteTurnEnd('alice', { hasWork: true });
+    expect(state.data.alice?.kind).toBe('background');
+    expect(state.data.alice.startedAt).toBe(1_000_000);
+    marker.noteTurnEnd('alice', { hasWork: false });
+    expect(state.data.alice).toBeUndefined();
+  });
+
+  it('refreshes background work immediately without touching active turns', () => {
+    const { marker, state, advance } = harness({ initial: { alice: background() } });
+    advance(1);
+    marker.refreshBackground('alice');
+    expect(state.data.alice.touchedAt).toBe(1_000_001);
+    expect(state.data.alice.startedAt).toBe(0);
+    marker.noteTurnStart('bob', 'room-b');
+    advance(1);
+    marker.refreshBackground('bob');
+    marker.refreshBackground(null);
+    marker.refreshBackground('missing');
+    expect(state.data.bob.touchedAt).toBe(1_000_001);
+    expect(state.data.missing).toBeUndefined();
+  });
+
+  it('clears only background work and tolerates missing markers', () => {
+    const { marker, state } = harness({ initial: { alice: background() } });
+    marker.noteTurnStart('bob', 'room-b');
+    marker.clearBackground('alice');
+    expect(state.data.alice).toBeUndefined();
+    marker.clearBackground('bob');
+    marker.clearBackground(null);
+    marker.clearBackground('missing');
+    expect(state.data.bob?.kind).toBe('turn');
+  });
+
+  it('returns a seven-hour background job from its recent touch and defaults legacy records to turns', () => {
+    const { marker } = harness({ clock: 7 * 3600 * 1000,
+      initial: { alice: background(7 * 3600 * 1000 - 1), bob: { ...background(7 * 3600 * 1000 - 1), kind: undefined } } });
+    const stale = marker.takeStale(maxAge);
+    expect(stale.map(rec => rec.kind)).toEqual(['background', 'turn']);
+    expect(stale.map(rec => rec.ageMs)).toEqual([1, 1]);
+    expect(marker.takeStale(maxAge)).toEqual([]);
+  });
+
+  it.each([maxAge, maxAge + 1])('uses the exact carry-on age boundary at %i milliseconds', (age) => {
+    const { marker, state } = harness({ initial: { alice: background(1_000_000 - age) } });
+    // Pin the new record shape before checking the expiry decision.
+    marker.noteTurnStart('bob', 'room-b');
+    expect(state.data.bob?.kind).toBe('turn');
+    marker.noteTurnEnd('bob', { hasWork: true });
+    const result = marker.takeStale(maxAge);
+    if (age === maxAge) expect(result[0]?.kind).toBe('background');
+    expect(result).toHaveLength(age === maxAge ? 1 : 0);
+  });
+
+  it('defers background cards when a clear fails and retains them for retry', () => {
+    const { marker, save, state } = harness({ initial: { alice: background() } });
+    marker.refreshBackground('alice');
+    expect(state.data.alice.touchedAt).toBe(1_000_000);
+    save.mockImplementationOnce(() => { throw new Error('disk full'); });
+    expect(marker.takeStale(maxAge)).toEqual([]);
+    marker.noteTurnStart('bob', 'room-b');
+    expect(state.data.alice?.kind).toBe('background');
+    expect(marker.takeStale(maxAge).map(rec => rec.kind)).toEqual(['background']);
   });
 });

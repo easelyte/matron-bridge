@@ -41,7 +41,7 @@ describe('timer and reminder cards', () => {
 describe('queued-message cards', () => {
   it('the turn-end flush releases the batch\'s cards as sent (queued_release naming each prompt_id)', () => {
     const flush = body('function flushQueue(', '\nfunction ');
-    expect(flush).toContain('finalizeSentQueue(snapshot.convoId, snapshot.entries);\n  return true;');
+    expect(flush).toMatch(/finalizeSentQueue\(snapshot\.convoId, snapshot\.entries\);\s+return true;/);
     const fin = body('function finalizeSentQueue(', '\nfunction ');
     expect(fin).toContain("action = 'send'");
     expect(fin).toMatch(/emitRelease\(convoId, \{\s*promptId: liveEntry\.promptId,\s*action,/);
