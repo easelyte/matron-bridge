@@ -77,7 +77,7 @@ describe('planSessionControl', () => {
     expect(planSessionControl({ params: P('compact'), session: { alive: false } })).toMatchObject({ kind: 'error', code: 'gone' });
   });
   it('drains compact first (it must shrink the context before the next turn), then alert, then routine, then carry_on, then set_model', () => {
-    expect(CONTROL_KINDS).toEqual(['compact', 'alert', 'routine', 'carry_on', 'set_model']);
+    expect(CONTROL_KINDS).toEqual(['compact', 'restart_notice', 'alert', 'routine', 'carry_on', 'set_model']);
   });
 });
 

@@ -1,4 +1,10 @@
-import { readFileSync } from 'node:fs';
+import { readFileSync, mkdtempSync, rmSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import { runInNewContext } from 'node:vm';
+import { createReminderHandlers } from '../lib/reminder-tools.js';
+import { createRestartNotes } from '../lib/restart-notes.js';
+import { createPlannedRestartState } from '../lib/planned-restart-state.js';
 import { describe, expect, it } from 'vitest';
 
 // Source-text assertions on index.js / ask-user.js / the bridge guidance,
@@ -106,4 +112,24 @@ describe('reminders wiring', () => {
     expect(cancel).toMatch(/filter\(t => t\.repeat\)\.length/);
     expect(cancel).toMatch(/including \$\{daily\} daily check-in/);
   });
+});
+
+it('assembles reminder handlers that durably hold a restart note', async () => {
+  const root = mkdtempSync(path.join(os.tmpdir(), 'reminder-wiring-'));
+  try {
+    const state = createPlannedRestartState({ file: path.join(root, 'state.json'), makeId: () => 'alice' });
+    state.addRequest({ request_key: 'bob' });
+    const notes = createRestartNotes({ heldFile: path.join(root, 'held.json'), pendingFile: path.join(root, 'pending.json') });
+    const index = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
+    const start = index.indexOf('const reminderHandlers = createReminderHandlers({');
+    const end = index.indexOf('\n});', start) + 4;
+    const handlers = runInNewContext(index.slice(start, end) + '; reminderHandlers', {
+      createReminderHandlers, sessions: new Map([['room-a', { journalConvoId: 'bob' }]]),
+      journalConvoIdFor: session => session.journalConvoId, timerStore: {}, announceAgentReminder: () => {},
+      plannedRestartAvailable: true, plannedRestartState: state, createRestartNotes: () => notes,
+    });
+    const result = await handlers.create({ roomId: 'room-a', restart_note: true, text: 'Continue the work.' });
+    expect(result.status).toBe(201);
+    expect(notes.listHeld('alice')).toMatchObject([{ convoId: 'bob', text: 'Continue the work.' }]);
+  } finally { rmSync(root, { recursive: true, force: true }); }
 });

@@ -13,7 +13,7 @@ const settle = () => new Promise(resolve => setImmediate(resolve));
 function setup() {
   let ack;
   const session = { agent: 'codex', alive: true, busy: true, roomId: 'room', queuedMessages: [], queueNotifications: [], codex: { transport: 'app-server', steer: vi.fn(() => new Promise(resolve => { ack = resolve; })), interrupt: vi.fn() } };
-  const context = vm.createContext({ AGENT_CODEX: 'codex', hasQueuedCompact, markJournalOrigin, planQueueFlush, console,
+  const context = vm.createContext({ restartLatch: undefined, AGENT_CODEX: 'codex', hasQueuedCompact, markJournalOrigin, planQueueFlush, console,
     sessions: new Map([['room', session]]), pendingMediaMirror: () => [], journalMirrorUserMedia: vi.fn(),
     commitDispatchedUserTurn: vi.fn(), journalPublishUserItem: vi.fn(), finalizeSentQueue: vi.fn(),
     journalPublishNotice: vi.fn(), journalConvoIdFor: () => 'convo', dispatchDeferredCommand: vi.fn(), flushPendingSessionQueue: vi.fn(), maybeFlushRoomDelivery: vi.fn(),
