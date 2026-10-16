@@ -532,3 +532,29 @@ it('retries history after the last pending note has been removed', async () => {
   expect(f.history()).toHaveLength(1);
   expect(f.calls).toHaveLength(1);
 });
+
+it('drops a pending request already satisfied by the booted sha', () => {
+  const f = fixture({ participants: [], noted: [] });
+  f.state.setState('cancelled', { requests: [] });
+  f.state.addRequest({ request_key: 'satisfied', sha: 'code-a' });
+  expect(f.state.getState().state).toBe('pending');
+  const boot = f.boot();
+  boot.reconcile();
+  boot.listenerReady();
+  const after = f.state.getState();
+  expect(after.state).not.toBe('pending');
+  expect(after.requests).toEqual([]);
+});
+
+it('keeps pending requests for other shas and config-only requests', () => {
+  const f = fixture({ participants: [], noted: [] });
+  f.state.setState('cancelled', { requests: [] });
+  f.state.addRequest({ request_key: 'satisfied', sha: 'code-a' });
+  f.state.addRequest({ request_key: 'newer', sha: 'code-b' });
+  f.state.addRequest({ request_key: 'config', sha: null });
+  const boot = f.boot();
+  boot.reconcile();
+  const after = f.state.getState();
+  expect(after.state).toBe('pending');
+  expect(after.requests.map(r => r.request_key)).toEqual(['newer', 'config']);
+});

@@ -135,3 +135,20 @@ describe('wake route', () => {
     expect(deps.findSession).not.toHaveBeenCalledWith('convo-b');
   });
 });
+
+describe('wake route while the bridge is going down', () => {
+  it('answers 503 and delivers nothing while shutting down or a restart is latched', async () => {
+    const { handle, deps } = setup({ unavailable: () => true });
+    const res = await handle();
+    expect(res.status).toBe(503);
+    expect(deps.findSession).not.toHaveBeenCalled();
+    expect(deps.resumeConvo).not.toHaveBeenCalled();
+    expect(deps.routeText).not.toHaveBeenCalled();
+    expect(deps.publishNotice).not.toHaveBeenCalled();
+  });
+
+  it('still reports not-configured as 404 before the availability check', async () => {
+    const { handle } = setup({ convoId: '', unavailable: () => true });
+    expect((await handle()).status).toBe(404);
+  });
+});

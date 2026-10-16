@@ -309,7 +309,8 @@ app.get('/view', async (req, res) => {
   if (!token) return res.status(400).send('Missing token');
 
   const data = verifyToken(token);
-  if (!data) return res.status(403).send('Invalid or expired token');
+  // Page and download tokens are minted for their own routes only.
+  if (!data || data.dl === true || data.page === true) return res.status(403).send('Invalid or expired token');
 
   try {
     // Serve-time boundary (lib/file-link-guard.js): fd-pinned symlink,
