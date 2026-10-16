@@ -22,7 +22,7 @@ describe('pre-reap handoff wiring', () => {
   }
 
   it('is configured once from the environment against the reap timeout', () => {
-    expect(index).toContain("import { handoffConfig, handoffIdleSince, handoffDue, planHandoff, handoffTurnText, handoffNotice, noteTurnStart as notePreReapTurnStart } from './lib/pre-reap-handoff.js';");
+    expect(index).toContain("import { handoffConfig, handoffIdleSince, handoffDue, planHandoff, handoffTurnText, handoffNotice, preReapCompactCommand, noteTurnStart as notePreReapTurnStart } from './lib/pre-reap-handoff.js';");
     expect(index).toContain('const PRE_REAP_HANDOFF = handoffConfig(process.env, { reapTimeoutMs: SESSION_IDLE_TIMEOUT_MS });');
   });
 
@@ -90,7 +90,7 @@ describe('pre-reap handoff wiring', () => {
     expect(drain).toContain('if (!mark || !mark.compactPending) return false;');
     expect(drain).toContain('if (!session.alive || session._autoStopped || controlOccupied(session)) return false;');
     expect(drain).toContain('mark.compactPending = false;');
-    expect(drain).toContain("journalRouteTextToSession(session, '/compact')");
+    expect(drain).toContain("journalRouteTextToSession(session, preReapCompactCommand())");
   });
 
   it('a real user turn re-arms it: text, media, item replies and prompt answers from the journal', () => {
