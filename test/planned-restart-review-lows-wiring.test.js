@@ -1,6 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { runInNewContext } from 'node:vm';
 import { describe, expect, it, vi } from 'vitest';
+import { createWakeHandler } from '../lib/wake-route.js';
 
 // The real function text is cut out of index.js and run against fakes, so the
 // guards are exercised as shipped rather than matched as source text.
@@ -103,7 +104,41 @@ describe('listen-time restart token failure', () => {
   });
 });
 
-describe('/wake availability', () => {
+describe('/wake availability as wired in index.js', () => {
+  const source = between('const handleWake = createWakeHandler({', '\nconst handleSendAttachment');
+  function wire({ shuttingDown = false, stamped = false } = {}) {
+    const session = { alive: true, roomId: 'room-a' };
+    const context = {
+      createWakeHandler, shuttingDown, plannedRestartRuntime: { stamped },
+      process: { env: { MATRON_WAKE_CONVO_ID: 'convo-a', MATRON_WAKE_TEXT: 'wake up' } },
+      findSessionByClaudeSessionId: vi.fn(() => session),
+      journalResumeConvo: vi.fn(() => session),
+      journalRouteTextToSession: vi.fn(async () => true),
+      journalPublishNotice: vi.fn(),
+      journalConvoIdFor: () => 'convo-a',
+    };
+    runInNewContext(`${source}\nglobalThis.handle = handleWake;`, context);
+    return context;
+  }
+
+  it.each([
+    ['shutting down', { shuttingDown: true }],
+    ['a restart latched', { stamped: true }],
+    ['both', { shuttingDown: true, stamped: true }],
+  ])('answers 503 and delivers nothing while %s', async (_label, flags) => {
+    const context = wire(flags);
+    expect((await context.handle()).status).toBe(503);
+    expect(context.findSessionByClaudeSessionId).not.toHaveBeenCalled();
+    expect(context.journalResumeConvo).not.toHaveBeenCalled();
+    expect(context.journalRouteTextToSession).not.toHaveBeenCalled();
+  });
+
+  it('delivers normally when neither is set', async () => {
+    const context = wire();
+    expect((await context.handle()).status).toBe(200);
+    expect(context.journalRouteTextToSession).toHaveBeenCalledOnce();
+  });
+
   it('is unavailable while shutting down or a restart is latched', () => {
     const handler = between('const handleWake = createWakeHandler({', '\nconst handleSendAttachment');
     expect(handler).toContain('unavailable: () => shuttingDown || plannedRestartRuntime.stamped === true,');
