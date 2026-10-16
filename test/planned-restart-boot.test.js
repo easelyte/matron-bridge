@@ -558,3 +558,18 @@ it('keeps pending requests for other shas and config-only requests', () => {
   expect(after.state).toBe('pending');
   expect(after.requests.map(r => r.request_key)).toEqual(['newer', 'config']);
 });
+
+it('delivers a held continuation note when the booted sha satisfies the pending request', async () => {
+  const f = fixture({ participants: ['alice'], noted: ['alice'] });
+  f.state.setState('cancelled', { requests: [] });
+  f.state.addRequest({ request_key: 'satisfied', sha: 'code-a' });
+  expect(f.notes.listHeld('restart-a')).toHaveLength(1);
+  const boot = f.boot({ markerStore: { list: () => ({}) } });
+  boot.reconcile();
+  boot.listenerReady();
+  await drain(f);
+  expect(f.calls.map(entry => entry.convoId)).toEqual(['alice']);
+  expect(f.state.getState().state).toBe('back');
+  expect(f.notes.listHeld('restart-a')).toEqual([]);
+  expect(f.notes.listPending('restart-a')).toEqual([]);
+});

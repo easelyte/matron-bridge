@@ -1,36 +1,105 @@
 import { readFileSync } from 'node:fs';
-import { describe, expect, it } from 'vitest';
+import { runInNewContext } from 'node:vm';
+import { describe, expect, it, vi } from 'vitest';
 
-// Source-text assertions on index.js for the shutdown and listen-time guards.
+// The real function text is cut out of index.js and run against fakes, so the
+// guards are exercised as shipped rather than matched as source text.
 const index = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
 const between = (from, to) => {
   const start = index.indexOf(from);
   expect(start, `${from} is missing from index.js`).toBeGreaterThan(-1);
   return index.slice(start, index.indexOf(to, start + 1));
 };
+const tick = () => new Promise(resolve => setImmediate(resolve));
 
-describe('input guards across awaits', () => {
-  it('journalOnCoordinator re-checks shutdown after its awaits', () => {
-    const fn = between('async function journalOnCoordinator(', '\nasync function deliverCoordinatorTurn(');
-    const lookup = fn.indexOf('findSessionByClaudeSessionId(convoId)');
-    const guard = fn.indexOf('if (shuttingDown) return;');
-    expect(guard).toBeGreaterThan(fn.lastIndexOf('await ', lookup));
-    expect(guard).toBeLessThan(fn.indexOf('decideCoordinatorEvent({'));
+describe('journalOnCoordinator across its awaits', () => {
+  const source = between('async function journalOnCoordinator(', '\nasync function deliverCoordinatorTurn(');
+  async function run({ shutdownDuringAwait }) {
+    let release;
+    const refresh = vi.fn(() => new Promise(resolve => { release = resolve; }));
+    const context = {
+      shuttingDown: false,
+      coordinatorLookup: { apply() {}, refresh },
+      memoryLookup: { refresh: async () => {} },
+      findSessionByClaudeSessionId: vi.fn(() => ({ alive: true, roomId: 'room-a' })),
+      decideCoordinatorEvent: vi.fn(() => 'stale'),
+      console: { warn() {} },
+    };
+    runInNewContext(`${source}\nglobalThis.handler = journalOnCoordinator;`, context);
+    const done = context.handler('convo-a', { role: 'assigned' });
+    await tick();
+    if (shutdownDuringAwait) context.shuttingDown = true;
+    release({ convoId: 'convo-a' });
+    await done;
+    return context;
+  }
+
+  it('looks up and decides when the bridge is still running', async () => {
+    const context = await run({ shutdownDuringAwait: false });
+    expect(context.decideCoordinatorEvent).toHaveBeenCalledOnce();
   });
 
-  it('runPreReapHandoff re-checks shutdown with the session guard after its awaits', () => {
-    const fn = between('async function runPreReapHandoff(', '\nfunction drainPreReapCompact(');
-    expect(fn).toMatch(/if \(shuttingDown \|\| sessions\.get\(roomId\) !== session \|\| !session\.alive \|\| session\._autoStopped \|\| !session\._preReapHandoff\) return;/);
+  it('does nothing when shutdown began while the journal was answering', async () => {
+    const context = await run({ shutdownDuringAwait: true });
+    expect(context.findSessionByClaudeSessionId).not.toHaveBeenCalled();
+    expect(context.decideCoordinatorEvent).not.toHaveBeenCalled();
+  });
+});
+
+describe('runPreReapHandoff across its awaits', () => {
+  const source = between('async function runPreReapHandoff(', '\nfunction drainPreReapCompact(');
+  async function run({ shutdownDuringAwait }) {
+    let release;
+    const session = { roomId: 'room-a', alive: true };
+    const context = {
+      shuttingDown: false,
+      restartLatch: null,
+      sessions: new Map([['room-a', session]]),
+      journalConvoIdFor: () => 'convo-a',
+      missionsHandlers: { resolveMission: vi.fn(() => new Promise(resolve => { release = resolve; })) },
+      missionsClient: { get: async () => ({ status: 200, data: {} }) },
+      controlOccupied: vi.fn(() => true),
+      sendTextToSession: vi.fn(() => true),
+      debug() {},
+    };
+    runInNewContext(`${source}\nglobalThis.handler = runPreReapHandoff;`, context);
+    const done = context.handler(session, 1000, 0);
+    await tick();
+    if (shutdownDuringAwait) context.shuttingDown = true;
+    release(null);
+    await done;
+    return context;
+  }
+
+  it('goes on to the occupancy check when the bridge is still running', async () => {
+    const context = await run({ shutdownDuringAwait: false });
+    expect(context.controlOccupied).toHaveBeenCalledOnce();
+  });
+
+  it('dispatches nothing when shutdown began during the mission lookup', async () => {
+    const context = await run({ shutdownDuringAwait: true });
+    expect(context.controlOccupied).not.toHaveBeenCalled();
+    expect(context.sendTextToSession).not.toHaveBeenCalled();
   });
 });
 
 describe('listen-time restart token failure', () => {
-  it('keeps the carry-on cards and logs loudly instead of silently dropping them', () => {
-    const listen = between('apiServer.listen(API_PORT,', 'Local API listening');
-    const tokenCatch = listen.slice(listen.indexOf("catch {\n      plannedRestartAvailable = false;"), listen.indexOf('if (plannedRestartAvailable) {\n    try { restartBoot'));
-    expect(tokenCatch).toContain('restartBoot = null;');
-    expect(tokenCatch).toContain('publishRestartCarryOnCards();');
-    expect(tokenCatch).toContain("console.error('[restart] token initialization failed; planned restart unavailable');");
+  const source = between('apiServer.listen(API_PORT,', '\nfunction hydrateAgentState');
+  it('hands the carry-on cards back and logs an error', () => {
+    const publish = vi.fn(), error = vi.fn(), warn = vi.fn();
+    const context = {
+      plannedRestartAvailable: true, restartBoot: { listenerReady: vi.fn(), suppressCard: () => true },
+      apiServer: { listen: (_port, _host, callback) => callback() }, API_PORT: 0,
+      atomicWriteFileSync() { throw new Error('read-only file system'); },
+      RESTART_ENV_FILE: 'token', RESTART_TOKEN: 'token', restartTokenWritten: false,
+      publishRestartCarryOnCards: publish, console: { warn, error, log() {} },
+    };
+    runInNewContext(source, context);
+    expect(context.plannedRestartAvailable).toBe(false);
+    expect(context.restartBoot).toBe(null);
+    expect(publish).toHaveBeenCalledOnce();
+    expect(publish).toHaveBeenCalledWith();
+    expect(error).toHaveBeenCalledWith('[restart] token initialization failed; planned restart unavailable');
   });
 });
 
