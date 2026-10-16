@@ -257,7 +257,7 @@ import { createRestartNotices, planSessionControl, validateControlParams, contro
 import { noticeMeta, consentNoticeMeta, unseenNoticeMeta, roomNoticeMeta, controlNoticeKind } from './lib/system-notice.js';
 import { createSessionControlHandlers } from './lib/session-control-client.js';
 import { armFromStall, dueResumes, autoResumeDue, shouldCompactBefore, AUTO_RESUME_TEXT, BAD_MODEL_RECOVERY_TEXT, FABLE_SWITCH_TEXT } from './lib/auto-resume.js';
-import { handoffConfig, handoffIdleSince, handoffDue, planHandoff, handoffTurnText, handoffNotice, noteTurnStart as notePreReapTurnStart } from './lib/pre-reap-handoff.js';
+import { handoffConfig, handoffIdleSince, handoffDue, planHandoff, handoffTurnText, handoffNotice, preReapCompactCommand, noteTurnStart as notePreReapTurnStart } from './lib/pre-reap-handoff.js';
 import {
   AGENT_CLAUDE,
   AGENT_CODEX,
@@ -15746,7 +15746,7 @@ function drainPreReapCompact(session) {
   if (!mark || !mark.compactPending) return false;
   if (!session.alive || session._autoStopped || controlOccupied(session)) return false;
   mark.compactPending = false;
-  journalRouteTextToSession(session, '/compact').catch((e) => {
+  journalRouteTextToSession(session, preReapCompactCommand()).catch((e) => {
     try { console.warn(`[pre-reap-handoff] compact failed for ${session.roomId}: ${e.message}`); } catch { /* never throw from a seam */ }
   });
   return true;

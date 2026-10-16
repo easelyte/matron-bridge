@@ -1,8 +1,10 @@
 import { describe, it, expect } from 'vitest';
 import {
-  handoffConfig, handoffIdleSince, handoffDue, planHandoff, handoffTurnText, handoffNotice, noteTurnStart,
+  handoffConfig, handoffIdleSince, handoffDue, planHandoff, handoffTurnText, handoffNotice, preReapCompactCommand, noteTurnStart,
   DEFAULT_HANDOFF_IDLE_MS, DEFAULT_COMPACT_PCT, STATUS_FRESH_GRACE_MS, HANDOFF_TURN_PREFIX,
 } from '../lib/pre-reap-handoff.js';
+
+import { isCompactCommand, hasQueuedCompact, compactBatchSize } from '../lib/compact-priority.js';
 
 const HOUR = 3_600_000;
 const MIN = 60_000;
@@ -139,6 +141,33 @@ describe('planHandoff', () => {
   });
 });
 
+describe('preReapCompactCommand', () => {
+  it('passes one line of working-state instructions to the compact summarizer', () => {
+    const command = preReapCompactCommand();
+    expect(typeof command).toBe('string');
+    expect(command.startsWith('/compact ')).toBe(true);
+    expect(command).not.toMatch(/[\r\n]/);
+    expect(isCompactCommand(command)).toBe(true);
+    for (const topic of [
+      'Preserve', 'session goal', "user's latest asks", 'mission', 'PR',
+      'worktree', 'branch', 'names and paths', 'open tracker items',
+      'unanswered questions', 'pending background jobs', 'reminders',
+      'waits', 'promises made', 'exact next step',
+    ]) expect(command).toContain(topic);
+  });
+
+  it('keeps compact queue priority and the frozen idle anchor', () => {
+    const command = preReapCompactCommand();
+    const queue = [command, 'continue working'].map(text => [{ type: 'text', text }]);
+    expect(hasQueuedCompact(queue)).toBe(true);
+    expect(compactBatchSize(queue)).toBe(1);
+    const mark = { idleSince: T, at: T + MIN };
+    const session = { _preReapHandoff: mark };
+    noteTurnStart(session, command);
+    expect(session._preReapHandoff).toBe(mark);
+  });
+});
+
 describe('handoffTurnText', () => {
   it('is bridge-framed, names the idle time, and asks for status + milestone only on change, one line back', () => {
     const text = handoffTurnText({ idleMinutes: 50 });
@@ -148,6 +177,9 @@ describe('handoffTurnText', () => {
     expect(text).toContain('mission_status');
     expect(text).toContain('milestone_post');
     expect(text).toMatch(/nothing has changed/i);
+    expect(text).toContain("If this session's work is finished (its mission is done or it has completed the task it was given)");
+    expect(text).toContain('and /close has not been run since its last real work');
+    expect(text).toContain('run /close now (that is not new work); otherwise do nothing.');
     expect(text).toMatch(/do not start new work/i);
     expect(text).toMatch(/one line/i);
     expect(text).not.toContain('\n');
