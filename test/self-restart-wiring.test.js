@@ -147,3 +147,37 @@ describe('index.js self-restart loop budget', () => {
     expect(body).toMatch(/_agentRestartCount = 0/);
   });
 });
+
+// The per-backend guidance has to match what the bridge will actually do:
+// restart_session honours `browser` for Claude and refuses it for Codex
+// (lib/self-restart.js), so only Claude may be told to restart itself.
+describe('browser-tools guidance per backend', () => {
+  const claudeMd = readFileSync(new URL('../BRIDGE_CLAUDE.md', import.meta.url), 'utf-8');
+  const codexMd = readFileSync(new URL('../BRIDGE_CODEX.md', import.meta.url), 'utf-8');
+  const section = (md, heading) => {
+    const start = md.indexOf(heading);
+    expect(start).toBeGreaterThan(-1);
+    const next = md.indexOf('\n## ', start + heading.length);
+    return md.slice(start, next === -1 ? undefined : next);
+  };
+
+  it('tells Claude to restart itself with browser: true, the manual command only as a fallback', () => {
+    const text = section(claudeMd, '## Browser tools');
+    expect(text).toMatch(/call `restart_session` with `browser: true` and a `continue_with` message/);
+    expect(text).toMatch(/do not need to ask the user first/i);
+    expect(text).toMatch(/Only if `restart_session` refuses[^\n]*`\/restart --browser`/);
+  });
+
+  it('tells Codex to ask the user, and never to self-restart for browser tools', () => {
+    const text = section(codexMd, '## Browser and file viewer');
+    expect(text).toMatch(/ask the user to run `\/restart --browser`/);
+    expect(text).toMatch(/`restart_session` refuses `browser`/);
+    expect(text).not.toMatch(/restart_session` with `browser: true/);
+  });
+
+  it('says in the tool description that browser and model are Claude-only', () => {
+    const start = askUser.indexOf("'restart_session'");
+    const desc = askUser.slice(start, askUser.indexOf('continue_with: z.string()', start));
+    expect(desc).toMatch(/browser and model are Claude-only/);
+  });
+});

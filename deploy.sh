@@ -58,7 +58,7 @@ case "$(uname -s)" in
     TARGET="$DOMAIN/${SERVICE:-chat.matron.matron-bridge}"
 
     service_exists() { launchctl print "$TARGET" >/dev/null 2>&1; }
-    service_pid()    { launchctl print "$TARGET" 2>/dev/null | awk -F'= ' '/ pid = /{print $2; exit}' || true; }
+    service_pid()    { launchctl print "$TARGET" 2>/dev/null | awk -F'= ' '/^[[:space:]]*pid = /{print $2; exit}' || true; }
     # kickstart -k kills the running instance; KeepAlive relaunches it on the
     # freshly-synced code.
     service_restart() { launchctl kickstart -k "$TARGET"; }

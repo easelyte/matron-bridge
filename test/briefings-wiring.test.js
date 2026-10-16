@@ -56,7 +56,7 @@ describe('briefings wiring', () => {
     expect(slice).toContain("callBriefing('publish', args, formatBriefingPublishAck)");
     expect(slice).toMatch(/Coordinator only/);
     expect(slice).toMatch(/Latest briefing/);
-    expect(slice).toMatch(/matron:\/\//);
+    expect(slice).toMatch(/linked the way your instructions say/);
     expect(slice).toMatch(/do not also type it/);
     expect(slice).toMatch(/body: z\.string\(\)\.max\(32768\)/);
     expect(askUser).toMatch(/import \{ formatBriefingPublishAck \} from '\.\/lib\/briefings-tools\.js';/);

@@ -73,9 +73,9 @@ describe('pre-reap handoff wiring', () => {
     // once the work was dispatched: after the turn was accepted, or after
     // the compaction started.
     expect(body).toContain('if (plan.compact) session._preReapHandoff.compactPending = true;');
-    expect(body).toMatch(/if \(!sendTextToSession\(session, handoffTurnText\(\{ idleMinutes \}\), \{ skipJournalMirror: true \}\)\) \{[\s\S]*?return;\s*\}\n\s+postControlNotice\(session, line\);/);
-    expect(body).toMatch(/\n\s+if \(drainPreReapCompact\(session\)\) postControlNotice\(session, line\);\n\s*\} finally \{ finishInput\?\.\(\); \}\n\}/);
-    expect(body.match(/postControlNotice\(session, line\);/g)).toHaveLength(2);
+    expect(body).toMatch(/if \(!sendTextToSession\(session, handoffTurnText\(\{ idleMinutes \}\), \{ skipJournalMirror: true \}\)\) \{[\s\S]*?return;\s*\}\n\s+postControlNotice\(session, line, 'handoff'\);/);
+    expect(body).toMatch(/\n\s+if \(drainPreReapCompact\(session\)\) postControlNotice\(session, line, 'handoff'\);\n\s*\} finally \{ finishInput\?\.\(\); \}\n\}/);
+    expect(body.match(/postControlNotice\(session, line, 'handoff'\);/g)).toHaveLength(2);
   });
 
   it('the compaction drains at the shared free gate, after parked controls and before the room inbox', () => {

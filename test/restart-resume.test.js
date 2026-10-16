@@ -313,7 +313,7 @@ it('retries cancellation after journal hello', () => {
   const start = source.indexOf('function handleJournalReconnect() {');
   const body = source.slice(start, source.indexOf('\n}', start) + 2);
   const retry = vi.fn();
-  const context = new Proxy({ retryRestartCancellation: retry, coordinatorLookup: { refresh() {} }, memoryLookup: { refresh() {} }, userDefaults: { refresh() {} } }, { get: (target, key) => key in target ? target[key] : () => {} });
+  const context = new Proxy({ retryRestartCancellation: retry, coordinatorLookup: { refresh() {} }, memoryLookup: { refresh() {} }, userDefaults: { refresh() {} }, journalIdentity: { refresh() {} } }, { get: (target, key) => key in target ? target[key] : () => {} });
   runInNewContext(`${body}\nhandleJournalReconnect()`, context);
   expect(retry).toHaveBeenCalledOnce();
 });

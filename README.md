@@ -156,6 +156,12 @@ The service installer starts two units on Linux, macOS and Windows: the bridge a
 
 To make those links usable from Matron clients, set `VIEWER_BASE_URL` to a public HTTPS URL that forwards to the local viewer (e.g. via a Cloudflare named tunnel or your own reverse proxy pointed at `127.0.0.1:$MATRON_VIEWER_PORT`). The bridge no longer ships its own Cloudflare tunnel helper — provisioning the tunnel/DNS is a dev-box-level concern, not something this repo manages.
 
+### Rendered HTML pages
+
+The `share_html_page` tool gives an agent a signed `/page` link that renders one self-contained HTML file from its working directory as a web page (reports, demo packs, mock-ups). These links last 7 days by default, up to 30, and can be opened many times. Each open re-runs the same file guards as `/view`: the file must be in the workdir, not a symlink, not sensitive-named, and at most 25 MB.
+
+The viewer origin also serves the secret-request and sensitive-data pages, so pages are served with a `Content-Security-Policy: sandbox` header that has no `allow-same-origin`. The browser then runs the page in an opaque origin of its own. Its scripts cannot read from or post as the viewer origin, and it gets no cookies or storage. The policy also blocks network reads, form posts and framing by other sites, and `Referrer-Policy: no-referrer` keeps the link token out of the Referer of anything the page links to. To serve pages from a hostname of their own anyway, point a second public hostname at the same viewer and set `VIEWER_PAGE_BASE_URL`.
+
 ### Live command output rides the journal protocol
 
 Live Bash output streams to Matron clients over the authenticated
@@ -263,9 +269,13 @@ relaunches after a non-zero exit.
 | `LINK_EXPIRY_MS` | Signed URL expiry in ms | `900000` (15 min) |
 | `MATRON_BRIDGE_API_PORT` | Internal API port (hooks, MCP, viewer) | `9802` |
 | `MATRON_VIEWER_PORT` | Local file viewer port | `9803` |
+| `MATRON_WAKE_CONVO_ID` | Conversation that `POST /wake` on the internal API wakes. Lets a scheduled job on the same machine wake one conversation with a fixed text, resuming its session if it was idle-stopped; the request can choose neither the conversation nor the text. Off unless both this and `MATRON_WAKE_TEXT` are set | — |
+| `MATRON_WAKE_TEXT` | The exact text `POST /wake` delivers to `MATRON_WAKE_CONVO_ID` | — |
 | `MCP_DEFAULT_EXTRAS` | Comma-separated MCP extras loaded for every session on this machine (e.g. `circleci`). Names must match `mcpExtras` keys in `mcp-config.json`/`mcp-config.local.json`. | _(none)_ |
 | `BRIDGE_PLUGIN_CACHE_DIR` | Dir plugin MCP servers (context7, serena, …) load from. Unset = an empty bridge-owned dir (no plugin MCPs, lean). Set to `~/.claude/plugins` or a curated dir to re-enable. | _(empty dir)_ |
 | `DOWNLOAD_RATE_LIMIT` | Viewer requests per minute for file downloads and sensitive-link shell pages | `30` |
+| `PAGE_RATE_LIMIT` | Viewer requests per minute for rendered HTML pages (`/page`) | `60` |
+| `VIEWER_PAGE_BASE_URL` | Optional separate public URL (pointed at the same viewer) for `share_html_page` links | `VIEWER_BASE_URL` |
 | `REVEAL_RATE_LIMIT` | Viewer requests per minute for `POST /sensitive/reveal`, counted separately so shell loads cannot exhaust it | `30` |
 | `WHISPER_MODEL_PATH` | whisper.cpp model for voice-note transcription | `~/.local/share/whisper-cpp/models/ggml-small.bin` |
 | `WHISPER_LANGUAGE` | Voice-note transcription language | `en` |

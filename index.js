@@ -33,6 +33,7 @@ import { transcribeAudio, transcribeAudioSegments, resolveWhisperPrompt, makeWhi
 import { extractVideoFrames, videoFramesMessage } from './lib/video-frames.js';
 import { prepareInlineImage, appendInlineImageBlocks } from './lib/inline-image.js';
 import { createSendAttachmentHandler, resolveAndUploadLocalFile } from './lib/send-attachment.js';
+import { createPageLinkHandler } from './lib/page-link.js';
 import { createItemsClient } from './lib/items-client.js';
 import { createItemsHandlers } from './lib/items-tools.js';
 import { createReminderHandlers } from './lib/reminder-tools.js';
@@ -40,6 +41,7 @@ import { createRestartNotes } from './lib/restart-notes.js';
 import { createRestartBoot, createRestartCancellation } from './lib/restart-boot.js';
 import { createMissionsClient } from './lib/missions-client.js';
 import { createMissionsHandlers } from './lib/missions-tools.js';
+import { createSearchHandlers } from './lib/search-tools.js';
 import { createProjectsClient } from './lib/projects-client.js';
 import { createProjectsHandlers } from './lib/projects-tools.js';
 import { createConsentClient } from './lib/consent-client.js';
@@ -60,6 +62,8 @@ import { createMemoryLookup } from './lib/memory-lookup.js';
 import { createUserDefaultsLookup, defaultDeclinedText, defaultOfferFor, defaultSavedText, effectiveDefaultEffort, effectiveDefaultModel } from './lib/user-defaults.js';
 import { createBoxDefaultsStore, createBoxDefaultsSetter, resolveDefaultAgent, boxModelFor, boxEffortFor, codexEnvDefaults } from './lib/box-defaults.js';
 import { createUserSettings } from './lib/user-settings.js';
+import { createJournalIdentity } from './lib/journal-identity.js';
+import { trackerUrlBase, renderTrackerLinks } from './lib/tracker-links.js';
 import { createRepoNameLookup } from './lib/repo-name.js';
 import { createCoordinatorLookup, loadCoordinatorBlock, loadNoticesBlock, renderNoticesBlock, claudeCoordinatorArgs, codexCoordinatorOptions, explicitModelFlag, explicitModelFlagForResume, coordinatorTurnText, planCoordinatorTransition, decideCoordinatorEvent, withCoordinatorModel, recreateSpawnModel, renderMemoryBlock } from './lib/coordinator.js';
 import { createServer } from 'http';
@@ -136,6 +140,7 @@ import { killProcessTree } from './lib/process-kill.js';
 import { processTableCommand, readProcessTableStrict } from './lib/process-table.js';
 import { evaluateQuiet, currentBootSubagents, sessionBackgroundWork, sessionOccupied } from './lib/restart-quiet.js';
 import { installShutdownToken, decideShutdown } from './lib/shutdown-endpoint.js';
+import { createWakeHandler } from './lib/wake-route.js';
 import {
   createCodeUpdateWatcher, resolveGitDir, readHeadReflog, defaultPreflight,
   restartEnabled as codeUpdateRestartEnabled, parseMs as parseCodeUpdateMs,
@@ -206,11 +211,11 @@ import { handlePickerValue, isResumeConvoId } from './lib/picker-dispatch.js';
 import { createPermissionRegistry, renderPermissionCard, permissionButtons, permissionSpawnArgs, resolveBypassMode, resolvePermissionTimeoutMs, isRootOutsideSandbox, guardRootBypass, ROOT_BYPASS_WARNING, resolvePermissionRequest, resolvePermissionCheck, buildPrintSessionSettings, foreignGateEntry, listSessionGrants, revokeSessionGrant } from './lib/permission-prompt.js';
 import { createPlanApprovalItems } from './lib/plan-approval-items.js';
 import { createSlowToolNotices, renderSlowToolNotice, resolveSlowToolNoticeMs, resolveSlowToolReminderMs } from './lib/slow-tool-notice.js';
-import { createJournalInputConsumer, resolvePromptChoice } from './lib/journal-input-router.js';
+import { createJournalInputConsumer, resolvePromptChoice, resolvePromptChoices } from './lib/journal-input-router.js';
 import { createAgentRooms, INVITE_TTL_MS } from './lib/agent-rooms.js';
 import { createAgentInvites, formatInviteRequestNotice, formatAutoJoinedRequest, INVITE_WAKE_NOTICE } from './lib/agent-invites.js';
 import { resolveInviteTarget } from './lib/invite-target.js';
-import { createRoomDelivery, formatRoomMessageNotice, formatRoomDeliveredNotice, formatRoomDeliveryFailedNotice, roomEchoLabel, roomFrameDisposition, ROOM_MESSAGE_QUEUED_NOTICE, ROOM_MUTED_NOT_DELIVERED_NOTICE, ROOM_WAKE_NOTICE } from './lib/room-delivery.js';
+import { createRoomDelivery, formatRoomMessageNotice, formatRoomDeliveredNotice, formatRoomDeliveryFailedNotice, roomEchoLabel, roomFrameDisposition, ROOM_MESSAGE_QUEUED_NOTICE, ROOM_MUTED_NOT_DELIVERED_NOTICE, ROOM_WAKE_NOTICE, parseMuteAnnouncement, formatUserUnmuteAnnouncement } from './lib/room-delivery.js';
 import { parseProcessTable, liveWorkChildren, workHold, keepAwakeUntil, mcpServerSignatures, WORK_HOLD_LEASE_MS } from './lib/work-hold.js';
 import { keepAwakeMode, powerHoldFlags, createPowerHold, POWER_HOLD_TICK_MS } from './lib/power-hold.js';
 import { unmuteChoiceValue, ROOM_MUTE_ACTION_ID, ROOM_MUTE_KIND } from './lib/room-mute-cards.js';
@@ -249,6 +254,7 @@ import { buildSessionStatus, publishedExtras, contextTokensFromAssistantEvent, p
 import { stallFromAssistantEvent, stallResetsAt } from './lib/stall-detector.js';
 import { spawnModelFallback, stallModelFallback, isFableModel } from './lib/fable-fallback.js';
 import { createRestartNotices, planSessionControl, validateControlParams, controlNotice, authorizeControl, mergeParkedSlot, JOURNAL_DEVICE_ID, JOURNAL_ONLY_ACTIONS, CONTROL_KINDS, TURN_STARTING_OPS, occupied as controlOccupied } from './lib/session-control.js';
+import { noticeMeta, consentNoticeMeta, unseenNoticeMeta, roomNoticeMeta, controlNoticeKind } from './lib/system-notice.js';
 import { createSessionControlHandlers } from './lib/session-control-client.js';
 import { armFromStall, dueResumes, autoResumeDue, shouldCompactBefore, AUTO_RESUME_TEXT, BAD_MODEL_RECOVERY_TEXT, FABLE_SWITCH_TEXT } from './lib/auto-resume.js';
 import { handoffConfig, handoffIdleSince, handoffDue, planHandoff, handoffTurnText, handoffNotice, noteTurnStart as notePreReapTurnStart } from './lib/pre-reap-handoff.js';
@@ -644,7 +650,7 @@ for (const artifactRoot of SHOW_FILE_ARTIFACT_ROOTS) {
   }
 }
 const SECRETS_DIR = path.join(os.homedir(), '.secrets');
-const SECRET_TTL_MS = 3600000; // 1 hour — how long a SUBMITTED value stays on disk
+const SECRET_TTL_MS = 3600000; // 1 hour — how long a SUBMITTED value stays on disk after its turn is delivered (capped at 24 h from submission)
 // Open secure-input requests, persisted like TIMERS_FILE / INFLIGHT_FILE above:
 // a request now lives 24 h (SECRET_REQUEST_TTL_MS in lib/secret-requests.js),
 // far longer than any bridge uptime guarantee, so the expiry timer is re-armed
@@ -999,7 +1005,24 @@ const userSettings = createUserSettings({
   baseUrl: journalHttpBase,
   token: _journalToken,
 });
-const noticesBlockNow = ({ coordinator, coordinatorOnly = false }) => renderNoticesBlock(NOTICES_BLOCKS, { enabled: userSettings.notices(), coordinator: coordinator === true, coordinatorOnly });
+const noticesBlockNow = ({ coordinator, coordinatorOnly = false }) => trackerLinksNow(renderNoticesBlock(NOTICES_BLOCKS, { enabled: userSettings.notices(), coordinator: coordinator === true, coordinatorOnly }));
+
+// Tracker links in what agents write (lib/tracker-links.js): the journal's
+// shareable https form, `<journal>/u/<user>/<num>`, once the user's journal
+// name is known (GET /me, refreshed with the lookups above) and the journal
+// URL is https; the old matron://item form until then. Rendered into each
+// session's instructions when it spawns, like the memory block.
+const JOURNAL_IDENTITY_FILE = path.join(os.homedir(), '.matron-bridge-journal-identity.json');
+const journalIdentity = createJournalIdentity({
+  baseUrl: journalHttpBase,
+  token: _journalToken,
+  load: () => (fs.existsSync(JOURNAL_IDENTITY_FILE) ? JSON.parse(fs.readFileSync(JOURNAL_IDENTITY_FILE, 'utf-8')) : null),
+  save: (data) => atomicWriteFileSync(JOURNAL_IDENTITY_FILE, JSON.stringify(data, null, 2), { mode: 0o600 }),
+});
+const trackerUrlBaseNow = () => trackerUrlBase({ httpBase: journalHttpBase, userName: journalIdentity.name() });
+function trackerLinksNow(text) {
+  return renderTrackerLinks(text, trackerUrlBaseNow());
+}
 
 // With no summary model this box silently loses written titles, its roster
 // summary and its summary events (lib/summary-model-nag.js). Nothing said so
@@ -1116,6 +1139,7 @@ function handleJournalReconnect() {
   coordinatorLookup.refresh({ force: true });
   memoryLookup.refresh({ force: true });
   userDefaults.refresh({ force: true });
+  journalIdentity.refresh({ force: true });
 }
 
 // Fail-loud backstop for the summary clamp. summaryForJournal
@@ -1271,6 +1295,7 @@ if (JOURNAL_ENABLED) {
   coordinatorLookup.refresh({ force: true });
   memoryLookup.refresh({ force: true });
   userDefaults.refresh({ force: true });
+  journalIdentity.refresh({ force: true });
   // Boot the control convo eagerly — safe even before the WS is connected
   // (journalPublisher queues FIFO and flushes on connect, same as every
   // other publish here). No Matrix dependency: this convo has no Matrix
@@ -1838,6 +1863,20 @@ function journalBufferPush(session, method, payload, options) {
   session._journalBuffer.push({ method, payload, options });
 }
 
+// The `repo` field for a session's establishing convo_upsert: the canonical
+// host/org/name of its workdir's origin remote (lib/repo-name.js), which the
+// journal matches per-org visibility on. Best-effort — no remote, or one the
+// journal would not accept, sends nothing, leaving any stored value alone.
+// Sent once per session process; the journal ignores an unchanged value.
+function journalRepoField(session) {
+  try {
+    const repo = repoNames.repoFor(session?.workdir);
+    return repo ? { repo } : {};
+  } catch {
+    return {};
+  }
+}
+
 // Send now if the convo_id is known, otherwise buffer for the eventual flush.
 // `options` is the publisher's per-frame options bag ({onLocalSendComplete,
 // onEvicted, idemKey}); it rides the buffer too, so a hook attached to a
@@ -1856,10 +1895,9 @@ function journalPublish(session, method, payload, options) {
     if (!session._journalConvoEstablished) {
       session._journalConvoEstablished = true;
       if (method !== 'upsertConvo') {
-        // Carry the backend kind on the bootstrap upsert too, so a
-        // convo first touched by a non-upsert publish (e.g. an assistant notice
-        // before the first state transition) is marked codex/claude immediately.
-        journalPublisher.upsertConvo(convoId, { title: session._journalTitleHint, agentKind: session.agent });
+        journalPublisher.upsertConvo(convoId, { title: session._journalTitleHint, agentKind: session.agent, ...journalRepoField(session) });
+      } else {
+        payload = { ...payload, ...journalRepoField(session) };
       }
     }
     journalPublisher[method](convoId, payload, options);
@@ -2685,7 +2723,7 @@ function journalFlushForSession(session) {
   const convoId = journalConvoIdFor(session);
   if (!convoId) return;
   session._journalConvoEstablished = true;
-  journalPublisher.upsertConvo(convoId, { title: session._journalTitleHint });
+  journalPublisher.upsertConvo(convoId, { title: session._journalTitleHint, ...journalRepoField(session) });
   const buffered = session._journalBuffer;
   session._journalBuffer = null;
   if (!buffered) return;
@@ -2726,6 +2764,7 @@ function coordinatorRoleAtSpawn(roomId, resumeSessionId, options, persisted) {
   coordinatorLookup.refresh();
   memoryLookup.refresh();
   userDefaults.refresh();
+  journalIdentity.refresh();
   if (JOURNAL_ENABLED && !role.known && !coordinatorUnknownWarned.has(roomId) && candidates.some((c) => typeof c === 'string' && c)) {
     coordinatorUnknownWarned.add(roomId);
     console.warn(`[coordinator] ${roomId}: coordinator not known yet (journal has not answered GET /coordinator) — starting as an ordinary session`);
@@ -2892,7 +2931,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     resumeSessionId, presetId: options.presetSessionId, mintId: randomUUID,
     transcriptExists: (id) => fs.existsSync(transcriptPathFor(cwd, id)),
   });
-  const printCoord = claudeCoordinatorArgs({ coordinator: !!options.coordinator, basePrompt: BRIDGE_SYSTEM_PROMPT, block: COORDINATOR_BLOCK, baseDisallowed: ['AskUserQuestion'], memoryBlock: memoryBlockNow({ coordinator: !!options.coordinator, workdir: cwd }), noticesBlock: noticesBlockNow({ coordinator: !!options.coordinator }) });
+  const printCoord = claudeCoordinatorArgs({ coordinator: !!options.coordinator, basePrompt: trackerLinksNow(BRIDGE_SYSTEM_PROMPT), block: trackerLinksNow(COORDINATOR_BLOCK), baseDisallowed: ['AskUserQuestion'], memoryBlock: memoryBlockNow({ coordinator: !!options.coordinator, workdir: cwd }), noticesBlock: noticesBlockNow({ coordinator: !!options.coordinator }) });
   const args = [
     '--print',
     '--verbose',
@@ -3330,7 +3369,7 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
       console.warn(`[show-file] disabled for ${roomId}: failed to pin allowed roots (${error.message})`);
     }
   }
-  const codexCoord = codexCoordinatorOptions({ coordinator: !!options.coordinator, baseInstructions: CODEX_BRIDGE_PROMPT, block: COORDINATOR_BLOCK, baseSandbox: CODEX_SANDBOX_MODE, memoryBlock: memoryBlockNow({ coordinator: !!options.coordinator, workdir: cwd }), noticesBlock: noticesBlockNow({ coordinator: !!options.coordinator }) });
+  const codexCoord = codexCoordinatorOptions({ coordinator: !!options.coordinator, baseInstructions: trackerLinksNow(CODEX_BRIDGE_PROMPT), block: trackerLinksNow(COORDINATOR_BLOCK), baseSandbox: CODEX_SANDBOX_MODE, memoryBlock: memoryBlockNow({ coordinator: !!options.coordinator, workdir: cwd }), noticesBlock: noticesBlockNow({ coordinator: !!options.coordinator }) });
   const Adapter = CODEX_APP_SERVER ? CodexAppServerSession : CodexExecSession;
   const codex = new Adapter({
     cwd,
@@ -3863,7 +3902,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
   // Fresh sessions pre-assign --session-id so the transcript path is known
   // before spawn; resumes pass --resume only. The exclusivity rule lives in
   // planSessionIdentity.
-  const ivCoord = claudeCoordinatorArgs({ coordinator: !!options.coordinator, basePrompt: BRIDGE_SYSTEM_PROMPT, block: COORDINATOR_BLOCK, memoryBlock: memoryBlockNow({ coordinator: !!options.coordinator, workdir: cwd }), noticesBlock: noticesBlockNow({ coordinator: !!options.coordinator }) });
+  const ivCoord = claudeCoordinatorArgs({ coordinator: !!options.coordinator, basePrompt: trackerLinksNow(BRIDGE_SYSTEM_PROMPT), block: trackerLinksNow(COORDINATOR_BLOCK), memoryBlock: memoryBlockNow({ coordinator: !!options.coordinator, workdir: cwd }), noticesBlock: noticesBlockNow({ coordinator: !!options.coordinator }) });
   const claudeArgs = [...identity.cliArgs];
   claudeArgs.push(
     // AskUserQuestion is allowed in iv-mode: the TUI prompt detector
@@ -7197,14 +7236,14 @@ function deduplicateFilename(dir, filename) {
 // BACK into the journal as a fresh from:'assistant' text event would be
 // exactly the re-publish loop the return path must avoid (the journal
 // already has the user's own row for that content).
-async function sendToRoom(roomId, text, html, { skipJournalMirror = false } = {}) {
+async function sendToRoom(roomId, text, html, { skipJournalMirror = false, notice = null } = {}) {
   // Journal mirror: every session reply and bridge notice that flows through
   // here is fine to mirror as-is (v1 doesn't distinguish the two). Rooms with
   // no active session (control-room chatter) are silently skipped.
   if (!skipJournalMirror) {
     const journalSession = sessions.get(roomId);
     if (journalSession) {
-      const payload = { body: text, from: 'assistant' };
+      const payload = { body: text, from: 'assistant', ...(notice ? { notice } : {}) };
       // Thread the streaming overlay's ref into the durable message so a
       // viewing client retires its overlay by ref (payload.message_ref is the
       // only channel the server exposes to a client — the durable event shape
@@ -9479,10 +9518,12 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
 // be no live session object for the target convo (e.g. a reply for a
 // session that no longer exists) or for control-convo replies (which have no
 // Matrix room / session at all). Fails open like every other journal call.
-function journalPublishNotice(convoId, body) {
+// `notice` ({kind, icon, summary}, lib/system-notice.js) marks a notice the
+// apps may show as one compact row that expands to `body`.
+function journalPublishNotice(convoId, body, notice = null) {
   if (!JOURNAL_ENABLED || !convoId) return;
   try {
-    journalPublisher.publishText(convoId, { body, from: 'assistant' });
+    journalPublisher.publishText(convoId, { body, from: 'assistant', ...(notice ? { notice } : {}) });
   } catch (e) {
     try { console.warn(`[journal-input] notice publish failed: ${e.message}`); } catch { /* logging must never throw */ }
   }
@@ -9631,6 +9672,10 @@ function armOperatorCompact(session, text) {
   return true;
 }
 
+// Resolves false when the text went to the session directly and the session
+// refused it (for instance, it stopped meanwhile); any other path
+// (a dispatched command, an answered prompt, a busy queue) resolves to a
+// non-false value. Only /wake reads this; other callers ignore it.
 async function journalRouteTextToSession(session, body, { keepRestartBudget = false } = {}) {
   const finishInput = restartLatch?.beginInput();
   try {
@@ -9943,16 +9988,26 @@ function journalRoutePromptReply(session, { choice, text }) {
   // choice sent by id round-trips correctly.
   if (session.waitingForAnswer && session.pendingQuestions?.length) {
     const q = session.pendingQuestions[session.currentQuestionIndex] || session.pendingQuestions[0];
-    const options = (q.options || []).map((opt, idx) => ({
-      id: `opt_${String.fromCharCode(97 + idx)}`,
-      label: typeof opt.label === 'string' ? opt.label : String(opt),
-    }));
+    const options = (q.options || []).map((opt, idx) => {
+      const label = typeof opt.label === 'string' ? opt.label : String(opt);
+      return { id: `opt_${String.fromCharCode(97 + idx)}`, label, value: label };
+    });
+    const freeText = typeof text === 'string' && text.trim() ? text.trim() : null;
     let answerText;
-    if (options.length > 0) {
+    if (options.length > 0 && q.multiSelect) {
+      // pick_many: Matron sends every ticked option's value in one `choice`,
+      // joined by ", ". Answer with all selected labels, comma-separated —
+      // the shape Claude Code itself uses for a multiSelect answer. A choice
+      // that does not fully resolve is still the user's answer: pass it on
+      // as free text rather than dropping it.
+      const resolved = resolvePromptChoices(options, choice);
+      const rawChoice = choice != null && String(choice).trim() ? String(choice).trim() : null;
+      answerText = resolved ? resolved.options.map(o => o.label).join(', ') : (freeText || rawChoice);
+    } else if (options.length > 0) {
       const resolved = resolvePromptChoice(options, choice);
-      answerText = resolved ? resolved.option.label : (typeof text === 'string' && text.trim() ? text.trim() : null);
+      answerText = resolved ? resolved.option.label : freeText;
     } else {
-      answerText = typeof text === 'string' && text.trim() ? text.trim() : null;
+      answerText = freeText;
     }
     if (!answerText) return null;
     const header = q.header ? `${q.header}: ` : '';
@@ -10317,7 +10372,7 @@ async function journalOnCoordinator(convoId, { role }) {
     if (session.busy && !session._deferredCommandText) session._deferredCommandText = '!restart --force';
   }
   const target = sessions.get(roomId) || session;
-  await deliverCoordinatorTurn(target, coordinatorTurnText(role, COORDINATOR_BLOCK, memoryBlockNow({ coordinator: role === 'assigned', workdir: target?.workdir }), noticesBlockNow({ coordinator: role === 'assigned', coordinatorOnly: true })));
+  await deliverCoordinatorTurn(target, coordinatorTurnText(role, trackerLinksNow(COORDINATOR_BLOCK), memoryBlockNow({ coordinator: role === 'assigned', workdir: target?.workdir }), noticesBlockNow({ coordinator: role === 'assigned', coordinatorOnly: true })));
 }
 
 // The injected assigned/released turn. Same inject-or-queue rule as a
@@ -10720,12 +10775,14 @@ async function fireTimer(record) {
       // Set by the agent through reminder_create: the delivered turn says so,
       // or the model reads its own reminder as something the user just typed.
       const repeats = record.repeat ? `, ${formatRepeat(record.repeat)}` : '';
-      journalPublishNotice(journalConvoIdFor(session), `⏰ Reminder #${record.id} (set by the agent${repeats}): "${record.text}"`);
+      const reminderLine = `⏰ Reminder #${record.id} (set by the agent${repeats}): "${record.text}"`;
+      journalPublishNotice(journalConvoIdFor(session), reminderLine, noticeMeta('reminder', reminderLine));
       await journalRouteTextToSession(session,
         `⏰ Reminder #${record.id} — you set this ${formatTimerDuration(Date.now() - record.createdAt)} ago: ${record.text}`);
       return;
     }
-    journalPublishNotice(journalConvoIdFor(session), `⏰ Timer #${record.id}: sending "${record.text}"`);
+    const timerLine = `⏰ Timer #${record.id}: sending "${record.text}"`;
+    journalPublishNotice(journalConvoIdFor(session), timerLine, noticeMeta('reminder', timerLine));
     await journalRouteTextToSession(session, record.text);
   } finally { finishInput?.(); }
 }
@@ -11089,7 +11146,7 @@ async function fireAutoResume(roomId, convoId, slot) {
       ? '🕒 Model switched — carrying on.'
       : slot.source === 'coordinator'
         ? '🕒 The usage limit has reset — sending the Coordinator\'s carry-on now.'
-        : '🕒 The usage limit has reset — carrying on automatically.');
+        : '🕒 The usage limit has reset — carrying on automatically.', 'control');
     try {
       if (shouldCompactBefore(session._lastContextTokens, contextWindowForSession(session))) {
         await journalRouteTextToSession(session, '/compact');
@@ -11298,12 +11355,17 @@ function boxLabelForControl() {
   try { return journalPublisher.identity?.()?.name || SERVER_LABEL || os.hostname(); } catch { return SERVER_LABEL || 'this box'; }
 }
 
-function postControlNotice(session, text) {
+function postControlNotice(session, text, kind = null) {
   const n = notice('info', text);
+  // A tagged notice takes sendHtml's own path (sendToRoom), with the tag.
+  const meta = kind ? noticeMeta(kind, text) : null;
+  if (meta && session?.roomId && typeof session.sendHtml === 'function' && sessions.get(session.roomId) === session) {
+    try { sendToRoom(session.roomId, n.plain, n.html, { notice: meta }); return; } catch { /* fall through */ }
+  }
   if (session && typeof session.sendHtml === 'function') {
     try { session.sendHtml(n.plain, n.html); return; } catch { /* fall through */ }
   }
-  journalPublishNotice(journalConvoIdFor(session), text);
+  journalPublishNotice(journalConvoIdFor(session), text, meta);
 }
 
 function persistControlState(session) {
@@ -11341,7 +11403,7 @@ async function journalControlSession(rawParams, { fromDeviceId } = {}) {
     const plan = planSessionControl({ params, session, canSwitch: canSwitchAgent });
     switch (plan.kind) {
       case 'error':
-        postControlNotice(session, controlNotice(params, { error: plan.detail || plan.code, agent: session.agent }));
+        postControlNotice(session, controlNotice(params, { error: plan.detail || plan.code, agent: session.agent }), controlNoticeKind(params.action));
         return { ok: false, error: { code: plan.code, ...(plan.detail ? { detail: plan.detail } : {}) } };
       case 'park':
         // The id is what the drain settles by: a print-mode recreate rebuilds
@@ -11351,18 +11413,18 @@ async function journalControlSession(rawParams, { fromDeviceId } = {}) {
         // (mergeParkedSlot); every other kind is latest-wins.
         session._deferredControls = { ...(session._deferredControls || {}), [plan.slot.kind]: { ...mergeParkedSlot(session._deferredControls?.[plan.slot.kind], plan.slot), id: randomUUID() } };
         persistControlState(session);
-        postControlNotice(session, controlNotice(params, { phase: 'deferred', agent: session.agent }));
+        postControlNotice(session, controlNotice(params, { phase: 'deferred', agent: session.agent }), controlNoticeKind(params.action));
         return { ok: true, result: { applied: 'deferred', box } };
       case 'schedule':
         session._autoResume = { at: plan.at, text: plan.text, kind: 'usage_limit', source: 'coordinator' };
         persistControlState(session);
-        postControlNotice(session, controlNotice(params, { phase: 'scheduled', resetsAt: plan.at, agent: session.agent }));
+        postControlNotice(session, controlNotice(params, { phase: 'scheduled', resetsAt: plan.at, agent: session.agent }), controlNoticeKind(params.action));
         return { ok: true, result: { applied: 'scheduled', at: plan.at, box } };
       case 'apply': {
-        postControlNotice(session, controlNotice(params, { phase: 'now', agent: session.agent }));
+        postControlNotice(session, controlNotice(params, { phase: 'now', agent: session.agent }), controlNoticeKind(params.action));
         const r = await applyControlSteps(session, plan.steps);
         if (!r.ok) {
-          postControlNotice(sessions.get(session.roomId) || session, controlNotice(params, { error: r.error.detail || r.error.code, agent: session.agent }));
+          postControlNotice(sessions.get(session.roomId) || session, controlNotice(params, { error: r.error.detail || r.error.code, agent: session.agent }), controlNoticeKind(params.action));
           return { ok: false, error: r.error };
         }
         return { ok: true, result: { applied: 'now', box, ...(r.detail ? { detail: r.detail } : {}) } };
@@ -11554,22 +11616,22 @@ function drainDeferredControls(session) {
         const { params } = slots[kind];
         const plan = planSessionControl({ params, session: current, canSwitch: canSwitchAgent });
         if (plan.kind === 'apply') {
-          postControlNotice(current, controlNotice(params, { phase: 'applied', agent: current.agent }));
+          postControlNotice(current, controlNotice(params, { phase: 'applied', agent: current.agent }), controlNoticeKind(params.action));
           const r = await applyControlSteps(current, plan.steps);
           current = sessions.get(current.roomId) || current;
           settle(current, kind);
-          if (!r.ok) postControlNotice(current, controlNotice(params, { error: r.error.detail || r.error.code, agent: current.agent }));
+          if (!r.ok) postControlNotice(current, controlNotice(params, { error: r.error.detail || r.error.code, agent: current.agent }), controlNoticeKind(params.action));
           else if (r.startedTurn || plan.steps.some((st) => TURN_STARTING_OPS.has(st.op))) startedTurn = true;
         } else if (plan.kind === 'park') {
           // Still not free for this one (an agent switch needs a fully idle
           // session): it simply stays in its slot for the next seam.
         } else if (plan.kind === 'error') {
           settle(current, kind);
-          postControlNotice(current, controlNotice(params, { error: plan.detail || plan.code, agent: current.agent }));
+          postControlNotice(current, controlNotice(params, { error: plan.detail || plan.code, agent: current.agent }), controlNoticeKind(params.action));
         } else if (plan.kind === 'schedule') {
           current._autoResume = { at: plan.at, text: plan.text, kind: 'usage_limit', source: 'coordinator' };
           settle(current, kind);
-          postControlNotice(current, controlNotice(params, { phase: 'scheduled', resetsAt: plan.at, agent: current.agent }));
+          postControlNotice(current, controlNotice(params, { phase: 'scheduled', resetsAt: plan.at, agent: current.agent }), controlNoticeKind(params.action));
         }
       }
     } finally {
@@ -11633,10 +11695,9 @@ function flushRoomInbox(session) {
   // room go in separate turns, so some may still be waiting (they get their
   // own 📨 at the next turn end).
   const sent = queued - roomDelivery.pendingCount(session.roomId);
-  journalPublishNotice(
-    journalConvoIdFor(session),
-    flushed ? formatRoomDeliveredNotice(sent) : formatRoomDeliveryFailedNotice(sent),
-  );
+  const flushLine = flushed ? formatRoomDeliveredNotice(sent) : formatRoomDeliveryFailedNotice(sent);
+  // A failed delivery stays a full-width warning.
+  journalPublishNotice(journalConvoIdFor(session), flushLine, flushed ? noticeMeta('queue', flushLine) : null);
   if (flushed || sessionOccupiedForRoomDelivery(session)) return;
   peerDelivery.flush(session, session.roomId);
 }
@@ -11863,10 +11924,23 @@ function journalOnPeerMessage(frame) {
 // routeLocalRoomMessage).
 function journalOnRoomFrame(room, frame) {
   reconcilePendingGuestOnFrame(room, frame);
+  notePeerMuteFromFrame(room, frame);
   deliverRoomFrameTo(room, frame);
   if (room.guestSessionRoomId != null && room.guestSessionRoomId !== room.sessionRoomId) {
     deliverRoomFrameTo({ ...room, sessionRoomId: room.guestSessionRoomId }, frame);
   }
+}
+
+// A remote peer's mute is held by its own bridge, which announces it in the
+// room (🔇 … muted …, 🔊 … unmuted …). Recording what it said is how
+// agent_chat_send here can tell the sender its messages are going nowhere
+// (lib/agent-rooms.js isPeerMuted). Agent frames only: a line the user types
+// that happens to look like one says nothing about the peer. Same-bridge
+// rooms read the peer's binding directly and are skipped by setPeerMuted.
+function notePeerMuteFromFrame(room, frame) {
+  if (frame.type !== 'text' || !String(frame.sender || '').startsWith('agent:')) return;
+  const said = parseMuteAnnouncement(frame.payload?.body);
+  if (said) agentRooms.setPeerMuted(frame.convo_id, said === 'muted');
 }
 
 // First-use membership reconciliation for a REMOTE guest binding stranded
@@ -11973,7 +12047,7 @@ function deliverRoomFrameTo(room, frame) {
       if (disposition === 'muted-user' && echoFrom) {
         const convoId = live ? journalConvoIdFor(session) : sleepingConvoIdFor(room.sessionRoomId);
         if (convoId) {
-          journalPublishNotice(convoId, formatRoomMessageNotice({ from: echoFrom, body, roomTitle, roomId: frame.convo_id }));
+          journalPublishNotice(convoId, formatRoomMessageNotice({ from: echoFrom, body, roomTitle, roomId: frame.convo_id }), roomNoticeMeta({ from: echoFrom, body }));
           journalPublishNotice(convoId, ROOM_MUTED_NOT_DELIVERED_NOTICE);
         }
       }
@@ -12000,6 +12074,7 @@ function deliverRoomFrameTo(room, frame) {
       journalPublishNotice(
         journalConvoIdFor(session),
         formatRoomMessageNotice({ from: echoFrom, body, roomTitle, roomId: frame.convo_id }),
+        roomNoticeMeta({ from: echoFrom, body }),
       );
     }
     // A reply consumed by an agent_chat_send wait already reached the agent
@@ -12029,7 +12104,7 @@ function deliverRoomFrameTo(room, frame) {
           roomId: frame.convo_id, roomTitle, from, body, at: frame.ts, foreign: { person },
         });
         if (echoFrom && queuedBeforeF === 0 && roomDelivery.pendingCount(session.roomId) > 0) {
-          journalPublishNotice(journalConvoIdFor(session), ROOM_MESSAGE_QUEUED_NOTICE);
+          journalPublishNotice(journalConvoIdFor(session), ROOM_MESSAGE_QUEUED_NOTICE, noticeMeta('queue', ROOM_MESSAGE_QUEUED_NOTICE));
         }
       };
       const pending = foreignSessions.refreshContext(frame.convo_id).then(deliverForeign, deliverForeign);
@@ -12052,7 +12127,7 @@ function deliverRoomFrameTo(room, frame) {
       fromAgent: sender.startsWith('agent:'),
     });
     if (echoFrom && queuedBefore === 0 && roomDelivery.pendingCount(session.roomId) > 0) {
-      journalPublishNotice(journalConvoIdFor(session), ROOM_MESSAGE_QUEUED_NOTICE);
+      journalPublishNotice(journalConvoIdFor(session), ROOM_MESSAGE_QUEUED_NOTICE, noticeMeta('queue', ROOM_MESSAGE_QUEUED_NOTICE));
     }
   } finally { if (!deferred) finishInput?.(); }
 }
@@ -12124,7 +12199,7 @@ function resolveRoomMuteTap(session, { roomId, sessionKey } = {}) {
   // replayed, so the gap is real and the agent has to go and read it.
   journalPublishNotice(convoId,
     `🔊 Unmuted "${where}" — new messages are delivered again. Anything sent while it was muted was not delivered; the agent can catch up with agent_chat_read.`);
-  const line = `🔊 ${roomMuteAgentLabel(session)} unmuted by user — messages sent while it was muted were not delivered; catching up with agent_chat_read.`;
+  const line = formatUserUnmuteAnnouncement({ who: roomMuteAgentLabel(session) });
   journalPublisher.publishText(roomId, { body: line, from: 'agent' });
   // A same-bridge peer never hears the journal echo of an own-device frame, so
   // the room line alone would reach every audience except the peer AGENT — the
@@ -12347,7 +12422,8 @@ function journalInjectInviteRequest(frame) {
 // like the feature simply not working.
 function publishInviteRequestNotice(session, frame, room, { addressed, joined }) {
   if (addressed) {
-    journalPublishNotice(journalConvoIdFor(session), formatInviteRequestNotice(frame, { roomTitle: room?.title || null, joined }));
+    const inviteLine = formatInviteRequestNotice(frame, { roomTitle: room?.title || null, joined });
+    journalPublishNotice(journalConvoIdFor(session), inviteLine, noticeMeta('invite', inviteLine));
   } else {
     console.warn(`[agent-invites] request for ${frame.room_id} carried no target_convo_id — routed to the most recently active session as a guess; the user's copy is suppressed (peer bridge predates target_convo_id)`);
   }
@@ -12896,6 +12972,12 @@ const secretRequests = createSecretRequests({
     return filePath;
   },
   removeSecretFile: (filePath) => { fs.unlink(filePath, () => {}); },
+  // The file's hour starts when its turn is delivered; restamping mtime lets
+  // the startup sweep count from the same moment after a restart.
+  touchSecretFile: (filePath, mtimeMs) => {
+    const t = new Date(mtimeMs);
+    fs.utimes(filePath, t, t, () => {});
+  },
   // Feeds the startup sweep: a submitted file is unlinked an hour later by a
   // timer, and that timer dies with the bridge, so a restart inside the hour
   // used to strand the file on disk indefinitely.
@@ -12946,6 +13028,20 @@ const secretRequests = createSecretRequests({
     fullText: text,
   }),
   publishNotice: journalPublishNotice,
+  // Is the turn naming this path still held for the room? A busy session
+  // parks it on queuedMessages (journalQueueMedia above), a just-resumed one
+  // in _resumeOutbox (sendToSession), and a native Codex steer holds its batch
+  // in _codexSteerPending until the steer settles (a rejected one restores
+  // it to the queue) — and a restart carries the queue onto the replacement
+  // session under the same roomId. Matched on the path, which is unique per
+  // request and is not the value.
+  awaitingDelivery: (roomId, needle) => {
+    const s = sessions.get(roomId);
+    if (!s) return false;
+    const holds = (entries) => Array.isArray(entries) && entries.some((blocks) => Array.isArray(blocks)
+      && blocks.some((b) => b?.type === 'text' && typeof b.text === 'string' && b.text.includes(needle)));
+    return holds(s.queuedMessages) || holds(s._resumeOutbox) || holds(s._codexSteerPending?.queued);
+  },
   fileTtlMs: SECRET_TTL_MS,
   log: console,
 });
@@ -13005,6 +13101,20 @@ function validateShowFileBody(data) {
   return null;
 }
 
+// POST /wake (lib/wake-route.js): wake one configured conversation with one
+// configured text, the way a timer firing does — resuming a reaped session.
+// Off unless both env vars are set; the request can choose neither.
+const handleWake = createWakeHandler({
+  convoId: process.env.MATRON_WAKE_CONVO_ID,
+  text: process.env.MATRON_WAKE_TEXT,
+  findSession: (convoId) => findSessionByClaudeSessionId(convoId),
+  resumeConvo: (convoId) => journalResumeConvo(convoId),
+  routeText: (session, text) => journalRouteTextToSession(session, text),
+  publishNotice: (message, session) => journalPublishNotice(
+    session ? journalConvoIdFor(session) : process.env.MATRON_WAKE_CONVO_ID, message),
+  isPending: (session) => !!(session.busy || session.queuedMessages?.length || session._resumeOutbox?.length),
+});
+
 const handleSendAttachment = createSendAttachmentHandler({
   sessions,
   publisher: journalPublisher,
@@ -13012,6 +13122,15 @@ const handleSendAttachment = createSendAttachmentHandler({
   rooms: agentRooms,
   onLocalRoomAttachment: routeLocalRoomAttachment,
   webBaseUrl: WEB_BASE_URL,
+});
+
+// share_html_page: a days-long signed viewer link that renders one HTML file
+// from the workdir as a sandboxed page. VIEWER_PAGE_BASE_URL optionally puts
+// those links on their own hostname (pointed at the same viewer).
+const handlePageLink = createPageLinkHandler({
+  sessions,
+  secret: HMAC_SECRET,
+  baseUrl: process.env.VIEWER_PAGE_BASE_URL || VIEWER_BASE_URL,
 });
 
 // The agent-chat tools (lib/agent-chat.js), mounted below as thin
@@ -13079,6 +13198,16 @@ const missionsHandlers = createMissionsHandlers({
   client: missionsClient,
 });
 
+// The `search` tool route (spec 2026-10-12 unified search), mounted below.
+// Reuses missionsClient (createJournalRequester is shared across domains;
+// lib/missions-client.js added searchAll alongside the mission routes) — a
+// search is not scoped to this conversation, so the handler needs no
+// journalConvoIdFor.
+const searchHandlers = createSearchHandlers({
+  sessions,
+  client: missionsClient,
+});
+
 // The seven project_* tool routes (lib/projects-tools.js), mounted below.
 // project_get with no num reads this conversation's current mission through
 // the missions resolver (one cache). project_close / project_merge are the
@@ -13143,7 +13272,7 @@ function journalHandleConsentFrame(frame) {
     console.warn(`[consent] a consent nudge arrived but the Coordinator conversation ${convoId} has no session on this box to give it to`);
     return;
   }
-  journalPublishNotice(journalConvoIdFor(session), text);
+  journalPublishNotice(journalConvoIdFor(session), text, consentNoticeMeta(frame));
   deliverCoordinatorTurn(session, text).catch((e) => console.warn(`[consent] nudge delivery failed: ${e.message}`));
 }
 
@@ -13153,6 +13282,8 @@ const unseenHandlers = createUnseenHandlers({
   journalConvoIdFor,
   client: unseenClient,
   isCoordinator: (session, convoId) => session?.coordinator === true || (!!convoId && coordinatorLookup.snapshot().convoId === convoId),
+  // Unseen items link in the same form as the session's instructions.
+  trackerBase: () => trackerUrlBaseNow(),
 });
 
 // The routine_* tool routes (lib/routines-tools.js), mounted below.
@@ -13181,7 +13312,7 @@ const briefingHandlers = createBriefingHandlers({
 // if idle-reaped, the same text left as a notice in its chat.
 function journalHandleUnseenFrame(frame) {
   if (!frame || frame.event !== 'pending') return;
-  const text = formatUnseenNudge(frame);
+  const text = formatUnseenNudge(frame, { trackerBase: trackerUrlBaseNow() });
   if (!text) return;
   const { convoId } = coordinatorLookup.snapshot();
   if (!convoId) {
@@ -13194,7 +13325,7 @@ function journalHandleUnseenFrame(frame) {
     console.warn(`[unseen] an unseen nudge arrived but the Coordinator conversation ${convoId} has no session on this box to give it to`);
     return;
   }
-  journalPublishNotice(journalConvoIdFor(session), text);
+  journalPublishNotice(journalConvoIdFor(session), text, unseenNoticeMeta(frame));
   deliverCoordinatorTurn(session, text).catch((e) => console.warn(`[unseen] nudge delivery failed: ${e.message}`));
 }
 
@@ -13249,7 +13380,7 @@ sessionControlHandlers = createSessionControlHandlers({
   sessions,
   publisher: journalPublisher,
   journalConvoIdFor,
-  notify: (convoId, text) => journalPublishNotice(convoId, text),
+  notify: (convoId, text) => journalPublishNotice(convoId, text, noticeMeta('control', text)),
   compactSelf: (d) => selfCompactHandler(d),
   log: console,
 });
@@ -13280,7 +13411,7 @@ agentSpawnHandlers = createAgentSpawnHandlers({
   // lands somewhere the user can actually read it instead of being dropped
   // on the floor.
   notifyParent: ({ session, convoId, text }) => {
-    if (convoId) journalPublishNotice(convoId, text);
+    if (convoId) journalPublishNotice(convoId, text, noticeMeta('spawn', text));
     if (session) {
       // A spawn outcome (started/declined/expired/failed) is autonomous-origin
       // work — a task THIS session spawned reporting back, not a peer or the
@@ -13312,7 +13443,7 @@ const selfCompactHandler = createSelfCompactHandler({
     const r = await applyControlSteps(session, [{ op: 'compact', command: params.command }]);
     if (!r.ok) throw new Error(r.error.detail || r.error.code);
   },
-  notify: (session, text) => postControlNotice(session, text),
+  notify: (session, text) => postControlNotice(session, text, 'control'),
 });
 
 // Backs the `restart_session` MCP tool: a session respawning its own agent
@@ -13609,6 +13740,27 @@ const apiServer = createServer(async (req, res) => {
     return;
   }
 
+  // POST /wake — handled before the body is read: it takes no input, so the
+  // body is drained unread (an empty one never reaches the JSON parse below).
+  if (url.pathname === '/wake') {
+    req.resume();
+    if (req.method !== 'POST') {
+      res.writeHead(405, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Method not allowed' }));
+      return;
+    }
+    let result;
+    try {
+      result = await handleWake();
+    } catch (e) {
+      console.warn(`[wake] delivery failed: ${e.message}`);
+      result = { status: 500, body: { error: 'wake delivery failed' } };
+    }
+    res.writeHead(result.status, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(result.body));
+    return;
+  }
+
   if (req.method !== 'POST') {
     if (url.pathname === '/show-file') auditShowFile({ result: 'method-not-allowed' });
     res.writeHead(405);
@@ -13902,6 +14054,14 @@ const apiServer = createServer(async (req, res) => {
         return;
       }
 
+      if (url.pathname === '/page-link') {
+        const { status, body: resBody } = await handlePageLink(data);
+        debug(`page-link ${status} ${data?.path} ${resBody.error || ''}`);
+        res.writeHead(status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(resBody));
+        return;
+      }
+
       if (url.pathname === '/agent-roster') {
         await respondAgentChatRoute(res, data, agentChatHandlers.roster,
           (status, b) => debug(`agent-roster ${status} ${b.error || `${(b.conversations || []).length} convos`}`));
@@ -14057,6 +14217,15 @@ const apiServer = createServer(async (req, res) => {
         const name = missionsRoute[1];
         await respondAgentChatRoute(res, data, missionsHandlers[name],
           (status, b) => debug(`missions/${name} ${status} ${b.error || (b.mission ? `#${b.mission.num ?? '?'}` : 'ok')}`));
+        return;
+      }
+
+      // The `search` tool route; same one-matcher allowlist shape.
+      const searchRoute = url.pathname.match(/^\/search\/(all)$/);
+      if (searchRoute) {
+        const name = searchRoute[1];
+        await respondAgentChatRoute(res, data, searchHandlers[name],
+          (status, b) => debug(`search/${name} ${status} ${b.error || `${(b.results || []).length} results`}`));
         return;
       }
 
@@ -15559,11 +15728,11 @@ async function runPreReapHandoff(session, now, idleSince) {
         session._preReapHandoff.compactPending = false;
         return;
       }
-      postControlNotice(session, line);
+      postControlNotice(session, line, 'handoff');
       // The compaction, if any, drains at the turn-end free gate.
       return;
     }
-    if (drainPreReapCompact(session)) postControlNotice(session, line);
+    if (drainPreReapCompact(session)) postControlNotice(session, line, 'handoff');
   } finally { finishInput?.(); }
 }
 

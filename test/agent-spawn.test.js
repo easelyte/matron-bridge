@@ -724,7 +724,7 @@ describe('index.js + ask-user.js spawn wiring (source inspection)', () => {
     const end = indexSrc.indexOf('\n  },', start);
     const body = indexSrc.slice(start, end);
     // The normal cases are untouched…
-    expect(body).toMatch(/if \(convoId\) journalPublishNotice\(convoId, text\)/);
+    expect(body).toMatch(/if \(convoId\) journalPublishNotice\(convoId, text, noticeMeta\('spawn', text\)\)/);
     expect(body).toMatch(/if \(session\) \{/);
     expect(body).toMatch(/roomDelivery\.deliver\(session, session\.roomId,/);
     // …and the fallback fires ONLY when session is absent (the `else`) AND

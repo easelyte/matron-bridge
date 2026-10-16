@@ -101,7 +101,7 @@ describe('transcribeAudio', () => {
     );
 
     await expect(transcribeAudio(fakeBuffer, 'audio/ogg', CONFIG))
-      .rejects.toThrow('empty transcription result');
+      .rejects.toMatchObject({ message: 'empty transcription result', code: 'TRANSCRIBE_EMPTY' });
   });
 
   it('passes correct ffmpeg args for 16kHz mono WAV conversion', async () => {

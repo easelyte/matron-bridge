@@ -151,3 +151,34 @@ describe('unseen client', () => {
     expect(await createUnseenClient({ baseUrl: '', token: 't' }).flag('c', [])).toEqual({ status: 0, data: { error: 'journal unreachable' } });
   });
 });
+
+describe('unseen item links follow the tracker link form', () => {
+  it('links items in the https form the bridge hands over, and keeps conversations on matron://convo', () => {
+    const data = { entries: [msg, item], tracker_url_base: 'https://chat.example/u/alice' };
+    const list = formatUnseenList(data, { now: NOW });
+    expect(list).toContain('link [#64](https://chat.example/u/alice/64)');
+    expect(list).toContain('[Deploy prep](matron://convo/c-1)');
+    expect(formatUnseenMine({ entries: [item], tracker_url_base: 'https://chat.example/u/alice' }, { now: NOW })).toContain('[#64](https://chat.example/u/alice/64)');
+    expect(formatUnseenNudge({ entries: [item] }, { now: NOW, trackerBase: 'https://chat.example/u/alice' })).toContain('[#64](https://chat.example/u/alice/64)');
+  });
+
+  it('falls back to matron://item for a missing or untrustworthy prefix', () => {
+    for (const bad of [undefined, '', 'http://chat.example/u/alice', 'https://chat.example/u/alice) [x](https://evil.example', 'javascript:alert(1)//u/a']) {
+      const text = formatUnseenList({ entries: [item], tracker_url_base: bad }, { now: NOW });
+      expect(text, String(bad)).toContain('[#64](matron://item/64)');
+    }
+    expect(formatUnseenNudge({ entries: [item] }, { now: NOW })).toContain('[#64](matron://item/64)');
+  });
+
+  it('the handlers put the prefix on successful list and mine answers only', async () => {
+    const session = { roomId: '!r:s', coordinator: true, journalConvoId: 'c-coord' };
+    const client = { list: vi.fn(async () => ({ status: 200, data: { entries: [item] } })), flag: vi.fn() };
+    const h = createUnseenHandlers({ sessions: new Map([['!r:s', session]]), journalConvoIdFor: (s) => s.journalConvoId, client, trackerBase: () => 'https://chat.example/u/alice' });
+    expect((await h.list({ roomId: '!r:s' })).body.tracker_url_base).toBe('https://chat.example/u/alice');
+    expect((await h.mine({ roomId: '!r:s' })).body.tracker_url_base).toBe('https://chat.example/u/alice');
+    client.list.mockResolvedValueOnce({ status: 500, data: { error: 'boom' } });
+    expect((await h.list({ roomId: '!r:s' })).body.tracker_url_base).toBeUndefined();
+    const unknown = createUnseenHandlers({ sessions: new Map([['!r:s', session]]), journalConvoIdFor: (s) => s.journalConvoId, client, trackerBase: () => null });
+    expect('tracker_url_base' in (await unknown.list({ roomId: '!r:s' })).body).toBe(false);
+  });
+});

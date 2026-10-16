@@ -95,6 +95,8 @@ function wiredSetup(backend, available = true) {
     newSessionConvoId: () => 'bob', mergeAgentStates: () => ({}),
     journalFlushForSession: noop, journalSpawnStatus: noop,
     CodexExecSession: class extends EventEmitter { constructor() { super(); this.send = vi.fn(() => true); } },
+    // Upstream notice/tracker-link helpers the extracted seams now call.
+    trackerLinksNow: text => text, noticeMeta: () => null, roomNoticeMeta: () => null, controlNoticeKind: () => null, journalRepoField: () => ({}),
   };
   vm.createContext(context);
   function load(startMarker, endMarker) {
