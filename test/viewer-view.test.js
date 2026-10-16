@@ -155,3 +155,16 @@ describe('GET /secret', () => {
     expect(body).toContain('&lt;script&gt;');
   });
 });
+
+describe('GET /view token kinds', () => {
+  it.each(['page', 'download'])('rejects a token minted for %s use', async (kind) => {
+    const tokens = await import('../lib/viewer-tokens.js');
+    const filePath = path.join(tmpDir, 'scoped.html');
+    writeFileSync(filePath, '<p>x</p>');
+    const url = kind === 'page'
+      ? tokens.generatePageUrl(`http://127.0.0.1:${port}`, filePath, undefined, 60, tmpDir)
+      : tokens.generateDownloadUrl(`http://127.0.0.1:${port}`, filePath, undefined, 60, tmpDir);
+    const res = await fetch(`http://127.0.0.1:${port}/view?token=${url.split('token=')[1]}`);
+    expect(res.status).toBe(403);
+  });
+});

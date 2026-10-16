@@ -10294,6 +10294,7 @@ async function journalOnCoordinator(convoId, { role }) {
   if (role === 'assigned') await memoryLookup.refresh({ force: true });
   // Looked up after the await: the session may have been reaped or respawned
   // while the journal answered.
+  if (shuttingDown) return;
   const session = findSessionByClaudeSessionId(convoId);
   const live = !!(session && session.alive);
   const verdict = decideCoordinatorEvent({
@@ -13113,6 +13114,7 @@ const handleWake = createWakeHandler({
   publishNotice: (message, session) => journalPublishNotice(
     session ? journalConvoIdFor(session) : process.env.MATRON_WAKE_CONVO_ID, message),
   isPending: (session) => !!(session.busy || session.queuedMessages?.length || session._resumeOutbox?.length),
+  unavailable: () => shuttingDown || plannedRestartRuntime.stamped === true,
 });
 
 const handleSendAttachment = createSendAttachmentHandler({
@@ -14687,7 +14689,12 @@ apiServer.listen(API_PORT, '127.0.0.1', () => {
       restartTokenWritten = true;
     } catch {
       plannedRestartAvailable = false;
-      console.warn('[restart] token initialization failed; planned restart unavailable');
+      // Boot reconciliation may be suppressing carry-on cards for chats it
+      // expected to resume itself; with planned restart down nothing will,
+      // so hand those cards back and report the failure loudly.
+      restartBoot = null;
+      console.error('[restart] token initialization failed; planned restart unavailable');
+      publishRestartCarryOnCards();
     }
   }
   if (plannedRestartAvailable) {
@@ -15695,7 +15702,7 @@ async function runPreReapHandoff(session, now, idleSince) {
     // After the awaits: still the live session for the room, and the mark
     // still ours (another turn meanwhile — a user message, a room message, a
     // reminder — cleared it, see noteTurnStart).
-    if (sessions.get(roomId) !== session || !session.alive || session._autoStopped || !session._preReapHandoff) return;
+    if (shuttingDown || sessions.get(roomId) !== session || !session.alive || session._autoStopped || !session._preReapHandoff) return;
     if (lookupFailed) {
       debug(`pre-reap handoff for ${roomId}: ${lookupFailed} — retrying next tick`);
       session._preReapHandoff = null;
