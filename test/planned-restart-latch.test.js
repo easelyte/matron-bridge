@@ -430,6 +430,8 @@ it('guards every ingress and rejects unknown dispatcher callers', () => {
     'handleCommand', 'peerDelivery', 'roomDelivery', 'foreignSessions', 'deliverRoomFrameTo', 'deliverInviteAsk', 'deliverAutoJoinedRequest',
     'journalNotifyRoomEvent', 'approvePlanBuild', 'secretRequests', 'agentSpawnHandlers',
     'apiServer', 'runPreReapHandoff', 'drainPreReapCompact',
+    // POST /wake (lib/wake-route.js): routes through journalRouteTextToSession, which holds the latch.
+    'handleWake',
     // Boot-time note hand-off: runs once at startup, before any latch can exist.
     'deliverRestartNote',
   ]);

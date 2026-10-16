@@ -6,6 +6,7 @@ import { describe, it } from 'vitest';
 import { createAgentChatHandlers } from '../lib/agent-chat.js';
 import { createRoomDelivery, formatRoomDeliveredNotice, formatRoomDeliveryFailedNotice } from '../lib/room-delivery.js';
 import { oneLine } from '../lib/peer-text.js';
+import { noticeMeta, roomNoticeMeta } from '../lib/system-notice.js';
 import { TURN_TIER, peerBatchTier, roomBatchTier, shouldPreemptForPriorityPeer } from '../lib/peer-priority.js';
 
 const indexSource = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
@@ -40,6 +41,8 @@ const buildPeerRuntime = new Function(
   'journalPublishNotice',
   'formatRoomDeliveredNotice',
   'formatRoomDeliveryFailedNotice',
+  'noticeMeta',
+  'roomNoticeMeta',
   // The room-delivery region also builds the foreign-turn sessions; those
   // collaborators are inert fakes here (no foreign turn runs in these tests).
   'path',
@@ -128,6 +131,8 @@ function makeRuntime({ target = session(), persistImpl, markBusyOnInject = false
     () => {}, // journalPublishNotice
     formatRoomDeliveredNotice,
     formatRoomDeliveryFailedNotice,
+    noticeMeta,
+    roomNoticeMeta,
     path,
     os,
     fs,

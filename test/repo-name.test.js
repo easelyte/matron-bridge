@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { repoNameFromRemote, createRepoNameLookup } from '../lib/repo-name.js';
+import { repoNameFromRemote, canonicalRepoFromRemote, createRepoNameLookup } from '../lib/repo-name.js';
 
 function fakeGit(answers) {
   // answers: { 'remote get-url origin': stdout | null, 'rev-parse --show-toplevel': stdout | null }
@@ -59,5 +59,62 @@ describe('createRepoNameLookup', () => {
     l.forget('/w');
     l.nameFor('/w');
     expect(r.exec).toHaveBeenCalledTimes(2);
+  });
+});
+
+describe('canonicalRepoFromRemote', () => {
+  it('normalises every network remote form to host/org/name, lower-casing host and org only', () => {
+    expect(canonicalRepoFromRemote('git@github.com:Acme/Acme-App.git')).toBe('github.com/acme/Acme-App');
+    expect(canonicalRepoFromRemote('https://GitHub.com/Acme/acme-app')).toBe('github.com/acme/acme-app');
+    expect(canonicalRepoFromRemote('https://github.com/acme/acme-app.git/')).toBe('github.com/acme/acme-app');
+    expect(canonicalRepoFromRemote('ssh://git@git.example.com:2222/org/Name.v2.GIT')).toBe('git.example.com/org/Name.v2');
+    expect(canonicalRepoFromRemote('git+ssh://git@example.com/org/app')).toBe('example.com/org/app');
+    expect(canonicalRepoFromRemote('  example.com:org/app  ')).toBe('example.com/org/app');
+  });
+
+  it('drops user info, so a token embedded in an https remote is never reported', () => {
+    const repo = canonicalRepoFromRemote('https://x-access-token:not-a-real-token@github.com/acme/app.git');
+    expect(repo).toBe('github.com/acme/app');
+    expect(repo).not.toContain('token');
+  });
+
+  it('returns null for anything the journal would reject or that is not a hosted repo', () => {
+    for (const bad of [
+      '', '   ', null, undefined, 42,
+      '/srv/git/bare-repo.git', 'file:///srv/git/org/app.git', '../sibling',
+      'https://gitlab.example.com/group/sub/project', // nested group: not org/name
+      'https://example.com/app', 'example.com:/abs/org/app', 'ftp://example.com/org/app',
+      'https://example.com/org/a b', 'https://exa_mple.com/org/app',
+      `https://example.com/org/${'n'.repeat(260)}`,
+    ]) expect(canonicalRepoFromRemote(bad), String(bad)).toBeNull();
+  });
+
+  it('only ever produces what the journal accepts', () => {
+    const journalShape = /^[a-z0-9.-]+\/[a-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
+    for (const url of ['git@GITHUB.COM:Org_1/x.y-z.git', 'https://h.example/O.rg/N_ame']) {
+      expect(canonicalRepoFromRemote(url)).toMatch(journalShape);
+    }
+  });
+});
+
+describe('createRepoNameLookup repoFor', () => {
+  it('reads the canonical repo off the same single git call as the name', () => {
+    const r = fakeGit({ 'remote get-url origin': 'git@github.com:Acme/acme-app.git' });
+    const l = createRepoNameLookup({ exec: r.exec });
+    expect(l.repoFor('/w')).toBe('github.com/acme/acme-app');
+    expect(l.nameFor('/w')).toBe('acme-app');
+    expect(r.exec).toHaveBeenCalledTimes(1);
+  });
+
+  it('is null without a usable remote, never guessed from the directory name', () => {
+    const local = fakeGit({ 'rev-parse --show-toplevel': '/home/d/local-only' });
+    const l = createRepoNameLookup({ exec: local.exec });
+    expect(l.nameFor('/home/d/local-only')).toBe('local-only');
+    expect(l.repoFor('/home/d/local-only')).toBeNull();
+    const fileRemote = fakeGit({ 'remote get-url origin': '/srv/git/app.git' });
+    expect(createRepoNameLookup({ exec: fileRemote.exec }).repoFor('/w')).toBeNull();
+    expect(l.repoFor('')).toBeNull();
+    expect(l.repoFor(undefined)).toBeNull();
+    expect(createRepoNameLookup({ exec: () => { throw new Error('boom'); } }).repoFor('/w')).toBeNull();
   });
 });

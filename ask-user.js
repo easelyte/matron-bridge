@@ -9,6 +9,7 @@ import { resolvePermissionTimeoutMs, classifyPermissionPostResponse } from './li
 import { formatBox } from './lib/agent-boxes-format.js';
 import { itemLine, formatItemList, formatItemDetail, formatCommentAck, formatHandoverAck, withImageWarnings } from './lib/items-format.js';
 import { formatStartAck, formatCreateAck, formatMilestoneAck, formatMissionDetail, missionLine, formatBlocked, formatJournalError, formatStatusAck, formatMissionList, formatJoinAck, formatLeaveAck, formatUpdateAck } from './lib/missions-format.js';
+import { formatSearchAll } from './lib/search-format.js';
 import { missionIdemKey, itemIdemKey } from './lib/missions-idem.js';
 import { projectLine, formatProjectList, formatProjectDetail, formatProjectCreateAck, formatProjectStatusAck, formatProjectMergeAck, formatProjectBlocked, formatProjectJournalError } from './lib/projects-format.js';
 import { formatMemoryList, formatMemoryDetail, formatSaveAck, formatDeleteAck } from './lib/memory-format.js';
@@ -244,6 +245,36 @@ server.tool(
         return { content: [{ type: 'text', text: `send_attachment failed: ${data.error || `HTTP ${postRes.status}`}` }] };
       }
       return { content: [{ type: 'text', text: `Sent ${data.kind} "${data.name}" (${data.size} bytes) into ${chat_room_id ? `room ${chat_room_id}` : 'the chat'}.` }] };
+    } catch (err) {
+      return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
+    }
+  }
+);
+
+server.tool(
+  'share_html_page',
+  'Get a signed link that opens one self-contained HTML file from the session working directory as a rendered web page in the user\'s browser (a report, a demo pack, a mock-up). The page runs sandboxed: its own inline script and style work, images, video and fonts can be inline data: URLs or https, links open in a new tab, but it cannot fetch from the network, submit forms, or use cookies or localStorage. Only .html/.htm files up to 25 MB. The link can be opened any number of times until it expires (default 7 days, max 30) and always shows the file as it is on disk at that moment, so keep the file in place. The link is returned, not posted: put it in your message or on the tracker item.',
+  {
+    path: z.string().describe('Path to the .html file — absolute, or relative to the session working directory'),
+    ttl_days: z.number().optional().describe('How many days the link works (default 7, max 30)'),
+  },
+  async ({ path, ttl_days }) => {
+    try {
+      const postRes = await fetch(`${BRIDGE_API}/page-link`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ roomId: ROOM_ID, path, ...(ttl_days !== undefined ? { ttl_days } : {}) }),
+      });
+      const data = await postRes.json().catch(() => ({}));
+      if (!postRes.ok) {
+        return { content: [{ type: 'text', text: `share_html_page failed: ${data.error || `HTTP ${postRes.status}`}` }] };
+      }
+      return {
+        content: [{
+          type: 'text',
+          text: `Page link for ${data.path}:\n${data.url}\n\nIt works until ${new Date(data.expiresAt).toISOString()} and can be opened many times. It renders the file as it is on disk when opened, so do not move or delete it before then.`,
+        }],
+      };
     } catch (err) {
       return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
     }
@@ -787,9 +818,9 @@ async function callBriefing(name, args, render) {
 
 server.tool(
   'briefing_publish',
-  'Coordinator only. Publish a briefing — the sweep\'s report, a status update, or the answer to a `[routine briefing …]` turn — so the apps show it as "Latest briefing" at the top of Projects. Markdown, with conversations, items and missions as matron:// links; keep it scannable on a phone. The journal puts it in this chat as your own message, so do not also type it.',
+  'Coordinator only. Publish a briefing — the sweep\'s report, a status update, or the answer to a `[routine briefing …]` turn — so the apps show it as "Latest briefing" at the top of Projects. Markdown, with conversations, items and missions linked the way your instructions say; keep it scannable on a phone. The journal puts it in this chat as your own message, so do not also type it.',
   {
-    body: z.string().max(32768).describe('The briefing as markdown (≤32 KB): a one-line headline, then short sections, with matron:// links'),
+    body: z.string().max(32768).describe('The briefing as markdown (≤32 KB): a one-line headline, then short sections, with conversations and items linked the way your instructions say'),
   },
   async (args) => callBriefing('publish', args, formatBriefingPublishAck),
 );
@@ -828,7 +859,7 @@ async function sessionControlCall(route, body, name) {
 
 server.tool(
   'restart_session',
-  "Restart THIS session's own agent process — the way to get browser tools (chrome-devtools MCP) mid-conversation, or to move onto a different model, without asking the user to do it. The conversation, workdir and history are kept; only the underlying process is respawned. continue_with is a message the bridge sends back into the restarted session as its first turn, so the work carries on unattended — write it as an instruction to your future self, including whatever context the restart is about to cost you. The restart does NOT happen instantly: it is parked until your current turn ends, so finish up and stop working rather than starting anything new after calling this. There is a small budget of consecutive self-restarts; once it runs out you must ask the user. Never call this in a loop.",
+  "Restart THIS session's own agent process — the way to get browser tools (chrome-devtools MCP) mid-conversation, or to move onto a different model, without asking the user to do it. The conversation, workdir and history are kept; only the underlying process is respawned. continue_with is a message the bridge sends back into the restarted session as its first turn, so the work carries on unattended — write it as an instruction to your future self, including whatever context the restart is about to cost you. The restart does NOT happen instantly: it is parked until your current turn ends, so finish up and stop working rather than starting anything new after calling this. There is a small budget of consecutive self-restarts; once it runs out you must ask the user. Never call this in a loop. browser and model are Claude-only: a Codex session gets a refusal for either, and takes both from its own config.",
   {
     continue_with: z.string().max(2000).describe('The message to send into the restarted session as its first turn. Written for your future self: what you were doing, what to do next.'),
     browser: z.boolean().optional().describe('Restart with browser tools (chrome-devtools MCP) enabled. Omit to keep the session\'s current MCP servers.'),
@@ -1368,6 +1399,35 @@ server.tool(
   async (args) => (args.shared
     ? callSharing('shared_list', 'mission_list', {}, formatSharedMissionList)
     : callMissions('list', args, formatMissionList)),
+);
+
+// --- Unified search (spec 2026-10-12): the search tool goes through the
+// bridge loopback like every other tool (index.js mounts lib/search-tools.js
+// at /search/all); the journal is the gate and the only source of truth.
+async function callSearch(args) {
+  try {
+    const res = await fetch(`${BRIDGE_API}/search/all`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ roomId: ROOM_ID, ...args }),
+    });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) return { content: [{ type: 'text', text: `search failed: ${data.error || `HTTP ${res.status}`}` }] };
+    return { content: [{ type: 'text', text: formatSearchAll(data) }] };
+  } catch (err) {
+    return { content: [{ type: 'text', text: `search failed: ${err.message}` }] };
+  }
+}
+
+server.tool(
+  'search',
+  "Find a mission, item, memory or project from a description in your own words — the first thing to try when you need old work back (e.g. after your context was compacted). Results are ranked exact match first, then all words, then word stems, then 'similar' (meaning-based; verify these with mission_get, item_get, memory_get or project_get, by kind). Put exact names, numbers or ids in double quotes for literal-only matching. Also lists the best-matching chats with their mission numbers; read one with the journal's `/journal/convo/:id/messages?around_seq=…`.",
+  {
+    q: z.string().min(1).max(256).describe('What you are looking for, in your own words; quote exact names'),
+    kinds: z.array(z.enum(['mission', 'item', 'memory', 'project'])).min(1).optional().describe('Limit to these kinds'),
+    limit: z.number().int().min(1).max(50).optional().describe('Default 20'),
+  },
+  async (args) => callSearch(args),
 );
 
 server.tool(

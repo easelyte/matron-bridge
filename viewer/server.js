@@ -4,7 +4,7 @@ import { watch as fsWatch, existsSync, readFileSync, statSync, openSync, readSyn
 import path from 'path';
 import { WebSocketServer } from 'ws';
 import { generateSignedUrl, verifyToken, scopeFromToken } from '../lib/viewer-tokens.js';
-import { validateAndOpen, FileLinkDenied, MAX_DOWNLOAD_BYTES } from '../lib/file-link-guard.js';
+import { validateAndOpen, FileLinkDenied, MAX_DOWNLOAD_BYTES, MAX_PAGE_BYTES, PAGE_HEADERS, isPageFile } from '../lib/file-link-guard.js';
 export { generateSignedUrl, verifyToken };
 
 // Port resolution with a legacy-name fallback: the Matrix→Matron rename left
@@ -362,6 +362,46 @@ app.get('/download', downloadLimiter, async (req, res) => {
     res.send(content);
   } catch (err) {
     if (!(err instanceof FileLinkDenied)) console.error('Error reading file:', err);
+    res.status(404).send('File not found');
+  }
+});
+
+// Own budget: a page link lives for days and is opened during screen
+// shares, so a burst of shell or download traffic must not 429 it (and vice
+// versa).
+const pageLimiter = rateLimit({
+  windowMs: 60_000,
+  limit: parseInt(process.env.PAGE_RATE_LIMIT || '60', 10),
+  standardHeaders: false,
+  legacyHeaders: false,
+  validate: { xForwardedForHeader: false },
+});
+
+// Renders an agent-written HTML file as a web page. The file is served
+// verbatim, so everything rests on PAGE_HEADERS (lib/file-link-guard.js):
+// the CSP sandbox puts the page in an opaque origin of its own, away from
+// the secret and sensitive-data routes this origin also serves. The usual
+// serve-time guards run on every open, so the link always shows the current
+// file and never anything outside the workdir or sensitive-named.
+app.get('/page', pageLimiter, async (req, res) => {
+  const { token } = req.query;
+  if (!token) return res.status(400).send('Missing token');
+
+  const data = verifyToken(token);
+  if (!data || data.page !== true) return res.status(403).send('Invalid or expired token');
+
+  try {
+    if (!isPageFile(data.path)) throw new FileLinkDenied('not-html');
+    // scopeFromToken: the token's pinned root identity, not its bare workdir
+    // pathname (same boundary as /view and /download).
+    const { content } = await validateAndOpen(data.path, {
+      ...scopeFromToken(data),
+      maxBytes: MAX_PAGE_BYTES,
+    });
+    res.set(PAGE_HEADERS);
+    res.send(content);
+  } catch (err) {
+    if (!(err instanceof FileLinkDenied)) console.error('Error reading page:', err);
     res.status(404).send('File not found');
   }
 });

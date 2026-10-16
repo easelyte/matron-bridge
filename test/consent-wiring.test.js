@@ -52,7 +52,7 @@ describe('consent wiring (source inspection)', () => {
     expect(fn).toContain('let session = findSessionByClaudeSessionId(convoId);');
     expect(fn).toContain('if (!session || !session.alive) session = journalResumeConvo(convoId, JOURNAL_RESUME_NOTICE);');
     expect(fn).not.toMatch(/s\.coordinator === true/);
-    expect(fn).toContain('journalPublishNotice(journalConvoIdFor(session), text)');
+    expect(fn).toContain('journalPublishNotice(journalConvoIdFor(session), text, consentNoticeMeta(frame))');
     expect(fn).toContain('deliverCoordinatorTurn(session, text)');
   });
 
@@ -81,5 +81,13 @@ describe('consent wiring (source inspection)', () => {
     expect(coord).toMatch(/operator has set a daily cap on approvals and it is reached/);
     expect(coord).toMatch(/Declines are never capped/);
     expect(coord).toMatch(/Tool permission prompts and secret requests are never yours to answer/);
+  });
+
+  it('the Coordinator may propose a contact request or mission share, and never answers a card', () => {
+    expect(coord).toMatch(/^## Sharing with other people: you propose, the user answers/m);
+    expect(coord).toMatch(/propose the request yourself with `contact_add`/);
+    expect(coord).toMatch(/A proposal sends nothing/);
+    expect(coord).toMatch(/You never answer a card/);
+    expect(coord).toMatch(/are never yours to answer, in either direction/);
   });
 });

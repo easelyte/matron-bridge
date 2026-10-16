@@ -45,10 +45,10 @@ describe('unseen wiring (source inspection)', () => {
     expect(index).toContain('onUnseenFrame: (frame) => journalHandleUnseenFrame(frame),');
     const fn = body('function journalHandleUnseenFrame(frame) {', '\n}');
     expect(fn).toContain("if (!frame || frame.event !== 'pending') return;");
-    expect(fn).toContain('formatUnseenNudge(frame)');
+    expect(fn).toContain('formatUnseenNudge(frame, { trackerBase: trackerUrlBaseNow() })');
     expect(fn).toContain('const { convoId } = coordinatorLookup.snapshot();');
     expect(fn).toContain('if (!session || !session.alive) session = journalResumeConvo(convoId, JOURNAL_RESUME_NOTICE);');
-    expect(fn).toContain('journalPublishNotice(journalConvoIdFor(session), text)');
+    expect(fn).toContain('journalPublishNotice(journalConvoIdFor(session), text, unseenNoticeMeta(frame))');
     expect(fn).toContain('deliverCoordinatorTurn(session, text)');
   });
 

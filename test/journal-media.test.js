@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { createJournalMediaRouter } from '../lib/journal-media.js';
+import { createJournalMediaRouter, EMPTY_VOICE_NOTICE, JOURNAL_FAILED_NOTICE } from '../lib/journal-media.js';
 
 const silentLog = { warn: () => {}, error: () => {} };
 
@@ -267,14 +267,14 @@ describe('createJournalMediaRouter — audio (voice note)', () => {
     expect(notice).toMatch(/install-whisper\.sh/);
   });
 
-  it('an empty transcript is dropped (no empty turn injected)', async () => {
+  it('an empty transcript is dropped (no empty turn injected) and asks for a re-recording', async () => {
     const { route, deps } = makeRouter({
       fetchMedia: vi.fn(async () => ({ buffer: Buffer.from('x'), contentType: 'audio/ogg' })),
       transcribe: vi.fn(async () => '   '),
     });
     await route(session, { type: 'file', blobRef: 'v', contentType: 'audio/ogg' }, ctx);
     expect(deps.injectText).not.toHaveBeenCalled();
-    expect(deps.publishNotice).toHaveBeenCalledWith('convo-1', expect.stringMatching(/transcribe/));
+    expect(deps.publishNotice).toHaveBeenCalledWith('convo-1', EMPTY_VOICE_NOTICE);
   });
 });
 
@@ -797,6 +797,60 @@ describe('createJournalMediaRouter — transcript from the journal (transcribed 
     expect(deps.fetchMedia).toHaveBeenCalledWith('vn-1');
     expect(deps.transcribe).toHaveBeenCalledTimes(1);
     expect(deps.injectText).toHaveBeenCalledWith(session, '[Voice note transcription]: hello world');
+  });
+
+  // A silent 0.07 s note: the journal's transcriber marked it 'failed', the
+  // bridge fell back to a whisper this box doesn't have, and the user was told
+  // to install whisper. The recording was the problem, so say that.
+  it("journal 'failed' on a box without whisper asks for a re-recording, not an install", async () => {
+    const { route, deps } = makeRouter({
+      fetchTranscript: vi.fn(async () => ({ status: 'failed' })),
+      fetchMedia: vi.fn(async () => ({ buffer: Buffer.from('a'), contentType: 'audio/mp4' })),
+      transcribe: vi.fn(async () => {
+        throw Object.assign(new Error('no whisper-cli'), { code: 'TRANSCRIBE_UNAVAILABLE', dependency: 'whisper.cpp' });
+      }),
+    });
+    await route(session, voice, ctx);
+    expect(deps.injectText).not.toHaveBeenCalled();
+    expect(deps.publishNotice).toHaveBeenCalledWith('convo-1', JOURNAL_FAILED_NOTICE);
+  });
+
+  it.each([
+    ['none (journal has no cloud transcriber)', { status: 'none' }],
+    ['null (older journal, network error)', null],
+  ])('journal answer %s on a box without whisper still names the install gap', async (_label, answer) => {
+    const { route, deps } = makeRouter({
+      fetchTranscript: vi.fn(async () => answer),
+      fetchMedia: vi.fn(async () => ({ buffer: Buffer.from('a'), contentType: 'audio/mp4' })),
+      transcribe: vi.fn(async () => {
+        throw Object.assign(new Error('no whisper-cli'), { code: 'TRANSCRIBE_UNAVAILABLE', dependency: 'whisper.cpp' });
+      }),
+    });
+    await route(session, voice, ctx);
+    expect(deps.publishNotice.mock.calls[0][1]).toMatch(/isn't set up on this box \(whisper\.cpp missing\)/);
+  });
+
+  it('whisper hearing no words (TRANSCRIBE_EMPTY) asks for a re-recording', async () => {
+    const { route, deps } = makeRouter({
+      fetchTranscript: vi.fn(async () => ({ status: 'failed' })),
+      fetchMedia: vi.fn(async () => ({ buffer: Buffer.from('a'), contentType: 'audio/mp4' })),
+      transcribe: vi.fn(async () => {
+        throw Object.assign(new Error('empty transcription result'), { code: 'TRANSCRIBE_EMPTY' });
+      }),
+    });
+    await route(session, voice, ctx);
+    expect(deps.injectText).not.toHaveBeenCalled();
+    expect(deps.publishNotice).toHaveBeenCalledWith('convo-1', EMPTY_VOICE_NOTICE);
+  });
+
+  it("journal 'failed' then a local whisper error keeps the generic notice", async () => {
+    const { route, deps } = makeRouter({
+      fetchTranscript: vi.fn(async () => ({ status: 'failed' })),
+      fetchMedia: vi.fn(async () => ({ buffer: Buffer.from('a'), contentType: 'audio/mp4' })),
+      transcribe: vi.fn(async () => { throw new Error('whisper died'); }),
+    });
+    await route(session, voice, ctx);
+    expect(deps.publishNotice).toHaveBeenCalledWith('convo-1', '🎤 Could not transcribe that voice note.');
   });
 
   it('a throwing fetchTranscript falls back too (the router never throws)', async () => {

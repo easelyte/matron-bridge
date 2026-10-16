@@ -80,4 +80,14 @@ describe('createMissionsClient', () => {
       'https://j/missions/61?history=1',
     ]);
   });
+
+  it('searchAll GETs /search/all with kinds comma-joined and q URL-encoded (spec 2026-10-12 unified search)', async () => {
+    const { fetchImpl, calls } = fakeFetch(() => ({ status: 200, body: { results: [], semantic: 'ready' } }));
+    const c = createMissionsClient({ baseUrl: 'https://j', token: 't', fetchImpl });
+    await c.searchAll({ q: 'refund export?', kinds: ['mission', 'item'], limit: 10 });
+    expect(calls[0].url).toBe('https://j/search/all?q=refund+export%3F&kinds=mission%2Citem&limit=10');
+    expect(calls[0].init.method).toBe('GET');
+    await c.searchAll({ q: 'x' });
+    expect(calls[1].url).toBe('https://j/search/all?q=x');
+  });
 });

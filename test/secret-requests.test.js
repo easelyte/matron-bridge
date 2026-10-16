@@ -4,6 +4,9 @@ import {
   formatSecretChatNotice,
   formatSecretItemBody,
   SECRET_REQUEST_TTL_MS,
+  SECRET_FILE_TTL_MS,
+  SECRET_FILE_MAX_TTL_MS,
+  SECRET_DELIVERY_POLL_MS,
   isOwnSecretFileName,
 } from '../lib/secret-requests.js';
 
@@ -80,6 +83,7 @@ function makeHarness(opts = {}) {
   const items = opts.items ?? makeItems();
   const files = new Map();
   const removed = [];
+  const touched = [];
   const turns = [];        // injected straight into a live idle session
   const queuedTurns = [];  // parked on session.queuedMessages mid-turn
   const notices = [];      // journal-side assistant notices (undeliverable)
@@ -97,7 +101,13 @@ function makeHarness(opts = {}) {
     load: () => saved,
     save: (data) => { saved = JSON.parse(JSON.stringify(data)); },
     now: () => clock,
-    setTimer: scheduler.setTimer,
+    // Each timer also remembers its absolute due time, for tests that run
+    // the clock forward rather than firing by delay.
+    setTimer: (fn, delay) => {
+      const id = scheduler.setTimer(fn, delay);
+      scheduler.armed.get(id).at = clock + delay;
+      return id;
+    },
     clearTimer: scheduler.clearTimer,
     newId: opts.newId ?? (() => 'sec-1'),
     writeSecretFile: opts.writeSecretFile ?? ((secretId, value) => {
@@ -105,6 +115,8 @@ function makeHarness(opts = {}) {
       return `/tmp/secrets/${secretId}.txt`;
     }),
     removeSecretFile: (p) => removed.push(p),
+    touchSecretFile: (p, mtimeMs) => touched.push({ path: p, mtimeMs }),
+    ...(opts.awaitingDelivery ? { awaitingDelivery: opts.awaitingDelivery } : {}),
     listSecretFiles: opts.listSecretFiles ?? (() => []),
     items,
     generateLink: opts.generateLink
@@ -131,7 +143,7 @@ function makeHarness(opts = {}) {
   });
 
   return {
-    store, scheduler, items, files, removed, turns, queuedTurns, notices, chat, resumes, live,
+    store, scheduler, items, files, removed, touched, turns, queuedTurns, notices, chat, resumes, live,
     get saved() { return saved; },
     advance: (ms) => { clock += ms; },
     get clock() { return clock; },
@@ -740,5 +752,150 @@ describe('createSecretRequests.init (persistence across a restart)', () => {
       initial: { requests: [{ label: 'no id' }, null, { secretId: 'x', label: 'y', expiresAt: 'soon' }] },
     });
     expect(h.store.init()).toBe(0);
+  });
+});
+
+describe('submitted file lifetime', () => {
+  // The turn naming the path can wait on a busy session's queue behind a long
+  // turn. The file's hour must start when that turn is delivered, not when
+  // the user pressed submit — but never outlive the 24 h ceiling.
+  const PATH = '/tmp/secrets/sec-1.txt';
+
+  // Advance the clock and fire whatever comes due, one timer at a time, the
+  // way real time would.
+  async function runFor(h, ms) {
+    const until = h.clock + ms;
+    for (;;) {
+      const next = [...h.scheduler.armed.entries()]
+        .map(([id, e]) => ({ id, at: e.at }))
+        .sort((a, b) => a.at - b.at)[0];
+      if (!next || next.at > until) break;
+      h.advance(next.at - h.clock);
+      await h.scheduler.fire(next.id);
+    }
+    h.advance(until - h.clock);
+  }
+
+  function harnessWithQueue(opts = {}) {
+    const state = { held: true };
+    const h = makeHarness({
+      session: makeSession('!room', { busy: true }),
+      awaitingDelivery: (roomId, needle) => {
+        expect(roomId).toBe('!room');
+        expect(needle).toBe(PATH);
+        return state.held;
+      },
+      ...opts,
+    });
+    return { h, state };
+  }
+
+  it('exports the hour, the 24 h ceiling and a sub-minute poll', () => {
+    expect(SECRET_FILE_TTL_MS).toBe(60 * 60 * 1000);
+    expect(SECRET_FILE_MAX_TTL_MS).toBe(24 * 60 * 60 * 1000);
+    expect(SECRET_DELIVERY_POLL_MS).toBeLessThanOrEqual(60 * 1000);
+  });
+
+  it('starts the hour at delivery, not at submission, when the turn waits on the queue', async () => {
+    const { h, state } = harnessWithQueue();
+    await h.store.create({ label: 'k', roomId: '!room', convoId: 'c' });
+    await (await h.store.submit('sec-1', DUMMY)).done;
+    expect(h.queuedTurns.length).toBe(1);
+
+    // Three hours behind a long-running turn: the file must still be there.
+    await runFor(h, 3 * SECRET_FILE_TTL_MS);
+    expect(h.removed).toEqual([]);
+
+    // The turn is delivered; the hour starts now.
+    state.held = false;
+    await runFor(h, SECRET_DELIVERY_POLL_MS);
+    expect(h.touched).toEqual([{ path: PATH, mtimeMs: h.clock }]);
+    await runFor(h, SECRET_FILE_TTL_MS - SECRET_DELIVERY_POLL_MS);
+    expect(h.removed).toEqual([]);
+    await runFor(h, SECRET_DELIVERY_POLL_MS);
+    expect(h.removed).toEqual([PATH]);
+    expect(h.scheduler.armed.size).toBe(0);
+  });
+
+  it('removes a never-delivered file at the 24 h ceiling', async () => {
+    const { h } = harnessWithQueue();
+    await h.store.create({ label: 'k', roomId: '!room', convoId: 'c' });
+    await (await h.store.submit('sec-1', DUMMY)).done;
+    await runFor(h, SECRET_FILE_MAX_TTL_MS - 1);
+    expect(h.removed).toEqual([]);
+    await runFor(h, 1);
+    expect(h.removed).toEqual([PATH]);
+    expect(h.scheduler.armed.size).toBe(0);
+  });
+
+  it('clamps the post-delivery hour to the ceiling', async () => {
+    const { h, state } = harnessWithQueue();
+    await h.store.create({ label: 'k', roomId: '!room', convoId: 'c' });
+    await (await h.store.submit('sec-1', DUMMY)).done;
+    await runFor(h, SECRET_FILE_MAX_TTL_MS - 10 * 60 * 1000);
+    state.held = false;
+    await runFor(h, 10 * 60 * 1000);
+    expect(h.removed).toEqual([PATH]);
+  });
+
+  it('restamps a late delivery no later than the ceiling minus the hour, so a restart sweep keeps the cap', async () => {
+    const { h, state } = harnessWithQueue();
+    await h.store.create({ label: 'k', roomId: '!room', convoId: 'c' });
+    const submittedAt = h.clock;
+    await (await h.store.submit('sec-1', DUMMY)).done;
+    await runFor(h, SECRET_FILE_MAX_TTL_MS - 10 * 60 * 1000);
+    state.held = false;
+    await runFor(h, SECRET_DELIVERY_POLL_MS);
+    expect(h.touched).toEqual([{ path: PATH, mtimeMs: submittedAt + SECRET_FILE_MAX_TTL_MS - SECRET_FILE_TTL_MS }]);
+  });
+
+  it('goes back to watching when the turn reappears on the queue after it was seen delivered', async () => {
+    const { h, state } = harnessWithQueue();
+    await h.store.create({ label: 'k', roomId: '!room', convoId: 'c' });
+    await (await h.store.submit('sec-1', DUMMY)).done;
+    state.held = false;
+    await runFor(h, SECRET_DELIVERY_POLL_MS);
+    // A send that failed after leaving the queue restores the turn to it.
+    state.held = true;
+    await runFor(h, SECRET_FILE_TTL_MS);
+    expect(h.removed).toEqual([]);
+    state.held = false;
+    await runFor(h, SECRET_DELIVERY_POLL_MS + SECRET_FILE_TTL_MS);
+    expect(h.removed).toEqual([PATH]);
+  });
+
+  it('counts the hour from submission when the turn could not be delivered at all', async () => {
+    const h = makeHarness({
+      session: null,
+    });
+    await h.store.create({ label: 'k', roomId: '!room', convoId: 'c' });
+    await (await h.store.submit('sec-1', DUMMY)).done;
+    expect(h.notices.length).toBe(1);
+    await runFor(h, SECRET_FILE_TTL_MS);
+    expect(h.removed).toEqual([PATH]);
+    expect(h.touched).toEqual([]);
+  });
+
+  it('treats a throwing delivery probe as delivered rather than keeping the file for a day', async () => {
+    const h = makeHarness({
+      session: makeSession('!room', { busy: true }),
+      awaitingDelivery: () => { throw new Error('boom'); },
+    });
+    await h.store.create({ label: 'k', roomId: '!room', convoId: 'c' });
+    await (await h.store.submit('sec-1', DUMMY)).done;
+    await runFor(h, SECRET_FILE_TTL_MS);
+    expect(h.removed).toEqual([PATH]);
+  });
+
+  it('never hands the value to the delivery probe or the restamp', async () => {
+    const seen = [];
+    const h = makeHarness({
+      session: makeSession('!room', { busy: true }),
+      awaitingDelivery: (...args) => { seen.push(args); return false; },
+    });
+    await h.store.create({ label: 'k', roomId: '!room', convoId: 'c' });
+    await (await h.store.submit('sec-1', DUMMY)).done;
+    expect(JSON.stringify(seen)).not.toContain(DUMMY);
+    expect(JSON.stringify(h.touched)).not.toContain(DUMMY);
   });
 });

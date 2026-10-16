@@ -307,7 +307,7 @@ describe('background marker behaviour in the bridge', () => {
     const session = { alive: true, busy: true, proc: { pid: 10 }, toolCalls: [], responseBuffer: '', turnCount: 0, workdir: 'box-a' };
     const noop = () => {};
     const context = {
-      inflightMarker: marker, journalConvoIdFor: () => 'alice',
+      inflightMarker: marker, journalConvoIdFor: () => 'alice', shuttingDown: false,
       SESSION_IDLE_CHECK_MS: 60_000, Date: { now: () => 1000 },
       liveWorkChildren, MCP_SERVER_SIGNATURES: [], readProcessTableStrict: () => ({ ok: true, table }),
       debug: noop, flushResponse: noop, journalStreamClear: noop, journalSessionState: noop,

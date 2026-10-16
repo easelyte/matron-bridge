@@ -551,3 +551,32 @@ describe('findLivePair pending freshness is per binding', () => {
     } finally { vi.useRealTimers(); }
   });
 });
+
+describe('peer mute', () => {
+  it('a remote room records the announced peer mute; a local room reads the other binding', () => {
+    const rooms = createAgentRooms();
+    rooms.record('r', { role: 'owner', state: 'joined', sessionRoomId: '!a' });
+    expect(rooms.isPeerMuted('r', '!a')).toBe(false);
+    rooms.setPeerMuted('r', true);
+    expect(rooms.isPeerMuted('r', '!a')).toBe(true);
+    expect(rooms.isPeerMuted('r', '!other')).toBe(false);
+    rooms.setPeerMuted('r', false);
+    expect(rooms.isPeerMuted('r', '!a')).toBe(false);
+
+    rooms.record('l', { role: 'owner', state: 'joined', sessionRoomId: '!a', guestSessionRoomId: '!b', guestState: 'joined' });
+    expect(rooms.setPeerMuted('l', true)).toBeNull();
+    rooms.setMuted('l', '!b', true, { reason: 'x' });
+    expect(rooms.isPeerMuted('l', '!a')).toBe(true);
+    expect(rooms.isPeerMuted('l', '!b')).toBe(false);
+    expect(rooms.isPeerMuted('nope', '!a')).toBe(false);
+  });
+
+  it('survives a reload', () => {
+    let saved = {};
+    const a = createAgentRooms({ load: () => saved, save: (o) => { saved = JSON.parse(JSON.stringify(o)); } });
+    a.record('r', { role: 'guest', state: 'joined', sessionRoomId: '!a' });
+    a.setPeerMuted('r', true);
+    const b = createAgentRooms({ load: () => saved, save: () => {} });
+    expect(b.isPeerMuted('r', '!a')).toBe(true);
+  });
+});

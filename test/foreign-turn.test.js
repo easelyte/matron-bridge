@@ -58,6 +58,16 @@ describe('decideForeignCall', () => {
     }
   });
 
+  // search reads the user's whole tracker (spec 2026-10-12 unified search);
+  // it is not in any foreign-turn allowlist (ROOM_TOOLS/OWNER_TRACKER_TOOLS/
+  // GUEST_TRACKER_TOOLS), so it must be denied by default like any other
+  // unlisted tool, with both an attached mission and without one.
+  it('blocks the search tool by default, with or without an attached mission', async () => {
+    expect((await decide(ownerTurn, `${A}search`, { q: 'refund export' })).decision).toBe('deny');
+    expect((await decide(bare, `${A}search`, { q: 'refund export' })).decision).toBe('deny');
+    expect((await decide(guestTurn, `${A}search`, { q: 'refund export' })).decision).toBe('deny');
+  });
+
   it('room tools reach only the room the turn came from', async () => {
     expect((await decide(bare, `${A}agent_chat_send`, { room_id: 'room-1', message: 'hi' })).decision).toBe('allow');
     expect((await decide(bare, `${A}agent_chat_read`, { room_id: 'room-1' })).decision).toBe('allow');
@@ -125,7 +135,7 @@ describe('the route layer', () => {
     expect(foreignRouteAllowed(bare, '/agent-chat-send', { room_id: 'room-9' })).toBe(false);
   });
   it('refuses every other route, and the tracker routes without a mission', () => {
-    for (const p of ['/secret', '/share-sensitive', '/memory/get', '/agent-session-start', '/restart-session', '/send-attachment', '/items/create', '/items/list', '/reminders/create', '/agent-chat-start']) {
+    for (const p of ['/secret', '/share-sensitive', '/memory/get', '/agent-session-start', '/restart-session', '/send-attachment', '/items/create', '/items/list', '/reminders/create', '/agent-chat-start', '/search/all']) {
       expect(foreignRouteAllowed(ownerTurn, p, {}), p).toBe(false);
     }
     expect(foreignRouteAllowed(bare, '/missions/get', {})).toBe(false);

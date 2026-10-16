@@ -109,6 +109,30 @@ describe('journal publisher agent kind', () => {
   });
 });
 
+describe('journal publisher repo', () => {
+  it('carries a passed repo and omits the key otherwise, so the stored value is never cleared', async () => {
+    FakeWebSocket.instances.length = 0;
+    const pub = createJournalPublisher({
+      url: 'ws://journal.test/ws',
+      token: 'test-token',
+      log: { warn() {} },
+      keepaliveIntervalMs: 0,
+      WebSocketImpl: FakeWebSocket,
+    });
+
+    await nextTurn();
+    pub.upsertConvo('convo-a', { title: 't', repo: 'github.com/acme/app' });
+    pub.upsertConvo('convo-b', { sessionState: 'running' });
+    await nextTurn();
+
+    const [withRepo, without] = FakeWebSocket.instances[0].frames;
+    expect(withRepo).toMatchObject({ op: 'convo_upsert', convo_id: 'convo-a', title: 't', repo: 'github.com/acme/app' });
+    expect('repo' in without).toBe(false);
+
+    pub.close();
+  });
+});
+
 describe('journal publisher peer messages', () => {
   it('hashes canonical tuples without plain-concatenation collisions', () => {
     expect(peerMessageIdemKey('ab', 'c', 'd')).not.toBe(peerMessageIdemKey('a', 'bc', 'd'));

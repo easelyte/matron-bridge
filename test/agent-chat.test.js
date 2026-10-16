@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'fs';
 import { createAgentChatHandlers, probeJoinedRoom, rosterBlurb, rosterSummaryEnabled } from '../lib/agent-chat.js';
 import { createAgentRooms } from '../lib/agent-rooms.js';
+import { formatMuteAnnouncement, parseMuteAnnouncement, PEER_MUTED_SEND_NOTE } from '../lib/room-delivery.js';
 
 const SELF = { deviceId: 1, name: 'mac' };
 const ROSTER = {
@@ -1538,7 +1539,8 @@ describe('index.js routes + ask-user.js tools (source inspection)', () => {
     const nStart = indexSrc.indexOf('function publishInviteRequestNotice(session, frame, room, { addressed, joined }) {');
     expect(nStart).toBeGreaterThan(-1);
     const noticeFn = indexSrc.slice(nStart, indexSrc.indexOf('\nfunction ', nStart + 1));
-    expect(noticeFn).toContain('journalPublishNotice(journalConvoIdFor(session), formatInviteRequestNotice(frame, { roomTitle: room?.title || null, joined }))');
+    expect(noticeFn).toContain('const inviteLine = formatInviteRequestNotice(frame, { roomTitle: room?.title || null, joined });');
+    expect(noticeFn).toContain("journalPublishNotice(journalConvoIdFor(session), inviteLine, noticeMeta('invite', inviteLine))");
     expect((noticeFn.match(/journalPublishNotice\(/g) || [])).toHaveLength(1);
     // Comments stripped: the ones in these functions NAME the forbidden path
     // to explain why it is forbidden.
@@ -2242,7 +2244,11 @@ describe('chatMute / chatUnmute', () => {
     const roomLine = f.calls.find((c) => c.call === 'publishText');
     expect(roomLine.convoId).toBe('room-1');
     expect(roomLine.payload.from).toBe('agent');
-    expect(roomLine.payload.body).toMatch(/^🔇 .* muted "M:ab ↔️ box-2": you are looping on the same question$/);
+    expect(roomLine.payload.body).toBe(formatMuteAnnouncement({
+      who: roomLine.payload.body.match(/^🔇 (.*) muted /u)[1], title: 'M:ab ↔️ box-2', reason: 'you are looping on the same question',
+    }));
+    expect(roomLine.payload.body).toContain('file a question for your user asking them to unmute it');
+    expect(parseMuteAnnouncement(roomLine.payload.body)).toBe('muted');
 
     const peerNotice = f.calls.find((c) => c.call === 'publishSessionNotice');
     expect(peerNotice.sessionKey).toBe('!guest');
@@ -2347,6 +2353,36 @@ describe('chatMute / chatUnmute', () => {
     expect(f.calls.some((c) => c.call === 'publishText' && c.payload.body === 'one last thing')).toBe(true);
   });
 
+  it('when the OTHER end of a local room mutes, the sender is told on every send', async () => {
+    const awaitRoomMessage = vi.fn(async () => null);
+    const f = makeFixture({ awaitRoomMessage });
+    muted(f);
+    f.sessions.set('!guest', { busy: false, alive: true, convoId: 'convo-guest' });
+    f.rooms.record('room-1', { guestSessionRoomId: '!guest', guestState: 'joined' });
+    await f.handlers.chatMute({ roomId: '!guest', room_id: 'room-1', reason: 'looping' });
+    expect(f.rooms.isPeerMuted('room-1', '!sess')).toBe(true);
+    expect(f.rooms.isPeerMuted('room-1', '!guest')).toBe(false);
+    const res = await f.handlers.chatSend({ roomId: '!sess', room_id: 'room-1', message: 'still there?', wait_seconds: 30 });
+    expect(res.body).toEqual({ ok: true, note: PEER_MUTED_SEND_NOTE });
+    // No dead reply wait: the muted side's bridge drops the message.
+    expect(awaitRoomMessage).not.toHaveBeenCalled();
+    await f.handlers.chatUnmute({ roomId: '!guest', room_id: 'room-1' });
+    const after = await f.handlers.chatSend({ roomId: '!sess', room_id: 'room-1', message: 'hi again' });
+    expect(after.body.note).toBe('sent — any reply will arrive as a later turn');
+  });
+
+  it('a REMOTE peer\'s announced mute changes the send note until it unmutes', async () => {
+    const f = makeFixture();
+    muted(f);
+    f.rooms.setPeerMuted('room-1', true);
+    const res = await f.handlers.chatSend({ roomId: '!sess', room_id: 'room-1', message: 'hello?' });
+    expect(res.body.note).toBe(PEER_MUTED_SEND_NOTE);
+    expect(res.body.note).toMatch(/file a question for your user/);
+    f.rooms.setPeerMuted('room-1', false);
+    const after = await f.handlers.chatSend({ roomId: '!sess', room_id: 'room-1', message: 'hello?' });
+    expect(after.body.note).toBe('sent — any reply will arrive as a later turn');
+  });
+
   it('an unmuted session\'s send note is unchanged', async () => {
     const f = makeFixture();
     muted(f);
@@ -2372,6 +2408,18 @@ describe('mute wiring (source inspection)', () => {
     return indexSrc.slice(start, end === -1 ? undefined : end);
   }
 
+  it('journalOnRoomFrame records a remote peer\'s announced mute from agent frames only', () => {
+    expect(fnBody('journalOnRoomFrame')).toMatch(/notePeerMuteFromFrame\(room, frame\)/);
+    const body = fnBody('notePeerMuteFromFrame');
+    expect(body).toMatch(/startsWith\('agent:'\)/);
+    expect(body).toMatch(/parseMuteAnnouncement\(frame\.payload\?\.body\)/);
+    expect(body).toMatch(/agentRooms\.setPeerMuted\(frame\.convo_id, said === 'muted'\)/);
+  });
+
+  it('BRIDGE_CLAUDE.md tells the sender what to do when the other agent mutes', () => {
+    expect(bridgeMd).toMatch(/If the OTHER agent mutes a room you are in[\s\S]{0,300}file a question for the user asking them to unmute it/);
+  });
+
   it('deliverRoomFrameTo gates on the muted binding ABOVE the echo, the waiter and the queue', () => {
     const body = fnBody('deliverRoomFrameTo');
     const gate = body.indexOf('roomFrameDisposition({');
@@ -2388,7 +2436,7 @@ describe('mute wiring (source inspection)', () => {
     // still hold while a muted session receives everything anyway — the notices
     // publish, execution falls through, and the user gets a 🔇 line followed by
     // the delivery it just denied. The whole gate is that one keyword.
-    expect(body).toMatch(/if \(disposition !== 'deliver'\) \{[\s\S]{0,900}\n\s+return;\n\s+\}/);
+    expect(body).toMatch(/if \(disposition !== 'deliver'\) \{[\s\S]{0,1200}\n\s+return;\n\s+\}/);
     // The pre-mute backlog drain stays ABOVE the gate: those messages were
     // accepted before the mute, and agent_chat_mute discards this room's share
     // of them explicitly (roomDelivery.dropRoom) rather than stranding them.
@@ -2433,7 +2481,7 @@ describe('mute wiring (source inspection)', () => {
     expect(clear).toBeGreaterThan(guard);
     // Both audiences are told, and both are told that nothing is replayed.
     expect(body).toMatch(/journalPublishNotice\(convoId,[\s\S]{0,300}agent_chat_read/);
-    expect(body).toMatch(/const line = `🔊 [\s\S]{0,300}agent_chat_read[\s\S]{0,200}journalPublisher\.publishText\(roomId, \{ body: line/);
+    expect(body).toMatch(/const line = formatUserUnmuteAnnouncement\(\{ who: roomMuteAgentLabel\(session\) \}\);[\s\S]{0,200}journalPublisher\.publishText\(roomId, \{ body: line/);
   });
 
   it('routes a verified tap through the roomMute flag, never by value shape', () => {

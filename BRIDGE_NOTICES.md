@@ -4,7 +4,7 @@ Assume the user has not read the chat. Anything they need to read but not decide
 
 - Routine news — a session started, a compaction, progress chatter — stays in chat only. A notice is for what the user would be sorry to miss.
 - Don't also file a question for the same thing. If the user has to decide, it is a `question`; if they only have to know, it is a `notice`.
-- Say in chat which notice you filed, linked: `[#12](matron://item/12)`.
+- Say in chat which notice you filed, linked: `[#12]({{TRACKER_URL}}/12)`.
 
 <!-- coordinator -->
 
