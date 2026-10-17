@@ -241,7 +241,7 @@ import { attachQueuedCleanup, markJournalOrigin, planQueueFlush, runQueuedCleanu
 import { queueFlushNotice } from './lib/queue-flush-notice.js';
 import {
   canSteerClaude, buildSteerLine, noteSteerWritten, applySteerLifecycle, decideSteerHold, noteSteerTurnOpened,
-  beginSteerHold, takeUnstartedSteers, takeFailedSteer, resetClaudeSteer, claudeSteerEnabled,
+  beginSteerHold, endSteerHold, steerPendingTurn, takeUnstartedSteers, takeFailedSteer, resetClaudeSteer, claudeSteerEnabled,
   STEER_NOTICE, STEER_PROMPT_SUPERSEDED_NOTICE,
 } from './lib/claude-steer.js';
 import { isCompactCommand, compactBatchSize, hasQueuedCompact } from './lib/compact-priority.js';
@@ -2959,9 +2959,11 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     // auto-restart.
     sweepToolStreams(session);
     clearPendingInterrupt(session);
-    // Before the auto-restart branch copies the queue: unstarted steered
-    // messages go back on it so they carry over.
-    requeueUnstartedSteers(session);
+    // Unstarted steered messages go back on the queue only in the
+    // auto-restart branch below, before it copies the queue to the
+    // replacement; a session ending for good drops them like its queue.
+    const orphanSteers = takeUnstartedSteers(session);
+    resetClaudeSteer(session);
 
     if (sessions.get(roomId) === session) {
       if (session._autoStopped) {
@@ -2971,6 +2973,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
         journalActivity(session, 'idle');
         journalEvictConvoInput(session);
       } else if (shouldAutoRestart(exitCode, session, shuttingDown)) {
+        requeueSteeredMessages(session, orphanSteers);
         // Auto-restart is about to replace `session` outright (no
         // journalSessionState('done') — the convo isn't over, it's
         // respawning) — but viewers still need to stop seeing a stale
@@ -5526,7 +5529,9 @@ function handleClaudeEvent(session, event) {
           // nulled.)
           session.busy = false;
           clearPendingInterrupt(session);
-          resetClaudeSteer(session);
+          // The process exits after a failed resume: leave unstarted steers to
+          // the exit path, which queues them again only if the session respawns.
+          endSteerHold(session);
           // This early break skips the normal turn-end seam below, so in
           // print mode a /restart parked mid-turn must fire here —
           // otherwise it would sit dormant (or fire surprisingly at the
@@ -5593,7 +5598,10 @@ function handleClaudeEvent(session, event) {
       // when a steered message still waits in the CLI, the CLI runs it next,
       // so a question or plan this turn ended on is superseded (not shown as
       // answerable) and the release below becomes beginHeldSteerTurn.
-      const steerHeld = decideSteerHold(session, { onStarted: (entry) => commitSteeredMessage(session, entry) });
+      const steerHeld = decideSteerHold(session, {
+        onStarted: (entry) => commitSteeredMessage(session, entry),
+        onDropped: (entries) => settleDroppedSteers(session, entries),
+      });
       if (steerHeld) supersedePromptsForSteerHold(session, event);
 
       if (!session.waitingForAnswer) {
@@ -5993,7 +6001,15 @@ function handleClaudeEvent(session, event) {
     // Progress on a message steered into a running turn (lib/claude-steer.js).
     // Bookkeeping only: never output, unknown uuids ignored.
     case 'command_lifecycle': {
-      applySteerLifecycle(session, event, { onStarted: (entry) => commitSteeredMessage(session, entry) });
+      applySteerLifecycle(session, event, {
+        onStarted: (entry) => commitSteeredMessage(session, entry),
+        onCancelled: (entry) => requeueCancelledSteer(session, entry),
+      });
+      // A hold whose only waiting message was cancelled has no turn coming.
+      if (session._steerHold && !steerPendingTurn(session)) {
+        endSteerHold(session);
+        releaseStaleSteerHold(session, 'held steered message was cancelled');
+      }
       break;
     }
 
@@ -6415,19 +6431,36 @@ function commitSteeredMessage(session, entry) {
   commitDispatchedUserTurn(session, entry?.historyText || '', null);
 }
 
+// Requeued steers, by queue entry, with the time they were first written —
+// what keeps several requeued steers in their original order.
+const requeuedSteerAt = new WeakMap();
+
 // Put steered messages the CLI never received back on the queue, with the
-// usual queued card, so nothing typed is lost. The queue (and its cards)
-// carries over to a replacement session exactly like any queued message.
+// usual queued card, so nothing typed is lost. They were typed before
+// anything now in the queue (a steer needs an empty queue), so each goes in
+// ahead of later messages: after a leading /compact (which always flushes
+// first and alone) and after older requeued steers. queuedMessages and
+// queueNotifications move together, so the card positions stay in lockstep;
+// cancel and release resolve cards by item id, not position. If the card did
+// not reserve its slot synchronously, the message stays at the end rather
+// than risk misaligning the two arrays.
 function requeueSteeredMessages(session, entries) {
   if (!entries.length) return;
   const ctx = journalSessionCommandCtx(session);
   for (const entry of entries) {
     if (!Array.isArray(entry.blocks) || !entry.blocks.length) continue;
     if (!session.queuedMessages) session.queuedMessages = [];
-    session.queuedMessages.push(markJournalOrigin(entry.blocks));
+    if (!session.queueNotifications) session.queueNotifications = [];
+    const queue = session.queuedMessages;
+    const notifs = session.queueNotifications;
+    const queued = markJournalOrigin([...entry.blocks]);
+    const at = Number.isFinite(entry.at) ? entry.at : 0;
+    requeuedSteerAt.set(queued, at);
+    const lockstep = notifs.length === queue.length;
+    queue.push(queued);
     const text = entry.historyText || '';
     const preview = text.length > 40 ? text.slice(0, 37) + '…' : text;
-    // Not awaited: callers run inside synchronous exit/kill bookkeeping. The
+    // Not awaited: callers run inside synchronous event/exit bookkeeping. The
     // release slot is reserved synchronously, so a carry-over right after
     // this still finds it.
     Promise.resolve(notifyQueuedMessage(session, preview, {
@@ -6438,15 +6471,42 @@ function requeueSteeredMessages(session, entries) {
       fullText: text,
       allowSendOne: session.agent !== AGENT_CODEX,
     })).catch((error) => debug(`steer requeue notice failed: ${error?.message || error}`));
+    if (!lockstep || notifs.length !== queue.length) continue;
+    let index = queue.length > 1 && hasQueuedCompact([queue[0]]) ? 1 : 0;
+    while (index < queue.length - 1 && requeuedSteerAt.has(queue[index]) && requeuedSteerAt.get(queue[index]) <= at) index++;
+    if (index < queue.length - 1) {
+      queue.splice(index, 0, queue.pop());
+      notifs.splice(index, 0, notifs.pop());
+    }
   }
 }
 
-// Process exit/kill: unstarted steered messages go back on the queue before
-// the queue is carried to a replacement; everything else steer-related clears.
-function requeueUnstartedSteers(session) {
-  const entries = takeUnstartedSteers(session);
+// Steered messages the bridge stops tracking while the claude process is
+// still alive: the CLI owns them and may still run them, so queueing them
+// again would deliver them twice. Record them in chat history (as a start
+// would) and let them go.
+function settleDroppedSteers(session, entries) {
+  for (const entry of entries) commitSteeredMessage(session, entry);
+}
+
+// Busy force-cleared while the process lives (interrupt wedge): settle what
+// the CLI still holds and clear all steer state.
+function releaseSteersToCli(session) {
+  settleDroppedSteers(session, takeUnstartedSteers(session));
   resetClaudeSteer(session);
-  requeueSteeredMessages(session, entries);
+}
+
+// The CLI cancelled a steered message before running it (an interrupt can
+// cancel queued commands). Queue it again so it goes out with the next
+// delivery; if nothing can take it, say it was not delivered.
+function requeueCancelledSteer(session, entry) {
+  const target = sessions.get(session.roomId) || session;
+  if (!target.alive) {
+    journalPublishNotice(journalConvoIdFor(session), `⚠️ Claude cancelled a message before reading it and it could not be queued again: "${(entry.historyText || '').slice(0, 80)}"`);
+    return;
+  }
+  requeueSteeredMessages(target, [entry]);
+  if (!target.busy && !target.waitingForAnswer) flushPendingSessionQueue(target);
 }
 
 // stdin write callback error (EPIPE and friends arrive asynchronously, after
@@ -6501,14 +6561,19 @@ function beginHeldSteerTurn(session) {
   // No inflightMarker.noteTurnStart: the result path skipped noteTurnEnd, so
   // the marker written when this turn started still covers the held turn.
   journalActivity(session, 'thinking');
-  beginSteerHold(session, { onBackstop: () => releaseStaleSteerHold(session) });
+  beginSteerHold(session, {
+    onBackstop: (dropped) => {
+      settleDroppedSteers(session, dropped);
+      releaseStaleSteerHold(session);
+    },
+  });
 }
 
 // Backstop for beginHeldSteerTurn: the CLI never started the steered message's
 // turn. Run the print-mode turn-end release so the session cannot stay busy.
-function releaseStaleSteerHold(session) {
+function releaseStaleSteerHold(session, why = 'steered message never started a turn') {
   if (!session.alive || !session.busy) return;
-  console.warn('[steer] steered message never started a turn, room %s — releasing busy', session.roomId);
+  console.warn('[steer] %s, room %s — releasing busy', why, session.roomId);
   resetClaudeSteer(session);
   session.busy = false;
   foreignSessions.end(session);
@@ -15317,7 +15382,7 @@ async function printModeInterrupt(session, sendReply) {
         session.roomId, armedGeneration,
       );
       session.busy = false;
-      resetClaudeSteer(session);
+      releaseSteersToCli(session);
       // Deliberately NO noteTurnEnd: this is a defensive unstick after an
       // interrupt got no acknowledgement, and the reply below says so — "the
       // turn may still be running". Further agent output is still possible,
@@ -15380,9 +15445,12 @@ function killSession(session, signal = 'SIGTERM', { preserveQueue = false } = {}
   // dangling.
   sweepToolStreams(session);
   clearPendingInterrupt(session);
-  // Steered messages the CLI never started go back on the queue, which the
-  // restart/switch paths carry to the replacement session.
-  requeueUnstartedSteers(session);
+  // Steered messages the CLI never started go back on the queue only when the
+  // queue carries over (preserveQueue: the restart path). A session ending
+  // for good drops them, exactly as its queued messages end with it.
+  const orphanSteers = takeUnstartedSteers(session);
+  resetClaudeSteer(session);
+  if (preserveQueue) requeueSteeredMessages(session, orphanSteers);
   // Same before-the-alive-check stance: a process that dies without ever
   // delivering tool_result must not leave a slow-tool timer to fire into
   // the dead session.

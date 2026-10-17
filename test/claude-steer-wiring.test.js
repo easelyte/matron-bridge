@@ -20,8 +20,9 @@ function sourceOf(name) {
 
 const LIFTED = [
   'bumpTurnGeneration', 'clearPendingInterrupt', 'steerIntoRunningTurn', 'commitSteeredMessage',
-  'requeueSteeredMessages', 'requeueUnstartedSteers', 'requeueFailedSteer', 'supersedePromptsForSteerHold',
-  'beginHeldSteerTurn', 'releaseStaleSteerHold', 'handleClaudeEvent', 'journalRouteTextToSession',
+  'requeueSteeredMessages', 'settleDroppedSteers', 'releaseSteersToCli', 'requeueCancelledSteer',
+  'requeueFailedSteer', 'supersedePromptsForSteerHold', 'beginHeldSteerTurn', 'releaseStaleSteerHold',
+  'handleClaudeEvent', 'journalRouteTextToSession', 'killSession',
 ];
 const KEYWORDS = new Set(['if', 'for', 'while', 'switch', 'catch', 'function', 'return', 'typeof', 'new', 'await', 'async', 'super']);
 
@@ -72,6 +73,9 @@ function setup({ session: overrides = {}, steerEnabled = true } = {}) {
     isLoginExpiredText: () => false,
     isSidechainEvent: () => false,
     sessionHasBackgroundWork: () => false,
+    loadPersistedSessions: () => ({}),
+    // Module-level state the lifted functions share.
+    requeuedSteerAt: new WeakMap(),
     journalPublishUserItem: vi.fn(),
     // Passed by reference (not called) in the busy branch.
     formatQueueSummary: vi.fn(), flushQueue: vi.fn(), clearQueueNotifications: vi.fn(),
@@ -378,20 +382,20 @@ describe('review follow-ups', () => {
     expect(h.session.queuedMessages).toBeNull();
   });
 
-  it('process exit with unstarted steers requeues them once; started ones are not resent', () => {
+  it('a restart kill (queue carries over) requeues unstarted steers once; started ones are not resent', () => {
     const h = setup();
     h.context.steerIntoRunningTurn(h.session, [{ type: 'text', text: 'first' }]);
     h.context.steerIntoRunningTurn(h.session, [{ type: 'text', text: 'second' }]);
     h.context.handleClaudeEvent(h.session, lifecycle('started', 'steer-uuid-1'));
     h.context.handleClaudeEvent(h.session, lifecycle('queued', 'steer-uuid-2'));
-    h.context.requeueUnstartedSteers(h.session);
+    h.context.killSession(h.session, 'SIGTERM', { preserveQueue: true });
     expect(h.session.queuedMessages.map(m => m[0].text)).toEqual(['second']);
     expect(h.context.notifyQueuedMessage).toHaveBeenCalledTimes(1);
     // Only the started one reached history; the requeued one commits when its flush sends it.
     expect(h.context.commitDispatchedUserTurn).toHaveBeenCalledTimes(1);
     expect(h.context.commitDispatchedUserTurn).toHaveBeenCalledWith(h.session, 'first', null);
     expect(h.session._steered).toBeNull();
-    h.context.requeueUnstartedSteers(h.session);
+    h.context.killSession(h.session, 'SIGTERM', { preserveQueue: true });
     expect(h.session.queuedMessages).toHaveLength(1);
   });
 
@@ -412,5 +416,166 @@ describe('review follow-ups', () => {
   it('a parked restart notice does not block steering', () => {
     const h = setup({ session: { _deferredControls: { restart_notice: { id: 'n' } } } });
     expect(steer.canSteerClaude(h.session, { origin: 'user', text: 'hi' })).toEqual({ ok: true });
+  });
+});
+
+describe('second review: settling, cancellation, order, teardown', () => {
+  const steerQueued = (h, text, n) => {
+    h.context.steerIntoRunningTurn(h.session, [{ type: 'text', text }]);
+    h.context.handleClaudeEvent(h.session, lifecycle('queued', `steer-uuid-${n}`));
+  };
+
+  it('backstop with the process alive: history committed, nothing requeued', () => {
+    vi.useFakeTimers();
+    const h = setup();
+    steerQueued(h, 'steer', 1);
+    h.context.handleClaudeEvent(h.session, result());
+    vi.advanceTimersByTime(steer.STEER_HOLD_BACKSTOP_MS);
+    expect(h.session.busy).toBe(false);
+    expect(h.context.commitDispatchedUserTurn).toHaveBeenCalledWith(h.session, 'steer', null);
+    expect(h.session.queuedMessages).toBeNull();
+    expect(h.context.notifyQueuedMessage).not.toHaveBeenCalled();
+  });
+
+  it('second result during a hold with the process alive: history committed, nothing requeued', () => {
+    vi.useFakeTimers();
+    const h = setup();
+    steerQueued(h, 'steer', 1);
+    h.context.handleClaudeEvent(h.session, result());
+    h.context.handleClaudeEvent(h.session, result());
+    expect(h.session.busy).toBe(false);
+    expect(h.context.commitDispatchedUserTurn).toHaveBeenCalledTimes(1);
+    expect(h.context.commitDispatchedUserTurn).toHaveBeenCalledWith(h.session, 'steer', null);
+    expect(h.context.notifyQueuedMessage).not.toHaveBeenCalled();
+  });
+
+  it('interrupt wedge (process alive): the CLI keeps the message, so history only', () => {
+    const h = setup();
+    steerQueued(h, 'steer', 1);
+    h.context.releaseSteersToCli(h.session);
+    expect(h.context.commitDispatchedUserTurn).toHaveBeenCalledWith(h.session, 'steer', null);
+    expect(h.session.queuedMessages).toBeNull();
+    expect(h.session._steered).toBeNull();
+    expect(sourceOf('printModeInterrupt')).toMatch(/session\.busy = false;\s*\n\s*releaseSteersToCli\(session\);/);
+  });
+
+  it('fatal resume failure: entries stay for the exit path (process is going away)', () => {
+    vi.useFakeTimers();
+    const h = setup();
+    steerQueued(h, 'steer', 1);
+    h.context.handleClaudeEvent(h.session, { type: 'result', is_error: true, errors: ['No conversation found with session ID x'] });
+    expect(h.session.busy).toBe(false);
+    expect(h.session._steered.get('steer-uuid-1').state).toBe('queued');
+    expect(h.context.commitDispatchedUserTurn).not.toHaveBeenCalled();
+    // Process gone and queue carried (restart path): requeued.
+    h.context.killSession(h.session, 'SIGTERM', { preserveQueue: true });
+    expect(h.session.queuedMessages.map(m => m[0].text)).toEqual(['steer']);
+  });
+
+  it('cancelled before starting: requeued (busy, so the turn end delivers it)', () => {
+    const h = setup();
+    steerQueued(h, 'steer', 1);
+    h.context.handleClaudeEvent(h.session, lifecycle('cancelled'));
+    expect(h.session.queuedMessages.map(m => m[0].text)).toEqual(['steer']);
+    expect(h.context.notifyQueuedMessage).toHaveBeenCalledTimes(1);
+    expect(h.context.flushPendingSessionQueue).not.toHaveBeenCalled();
+    expect(h.session._steered.size).toBe(0);
+    expect(steer.steerPendingTurn(h.session)).toBe(false);
+  });
+
+  it('cancelled while held: the hold is released at once and the requeued message flushed', () => {
+    vi.useFakeTimers();
+    const h = setup();
+    steerQueued(h, 'steer', 1);
+    h.context.handleClaudeEvent(h.session, result());
+    expect(h.session.busy).toBe(true);
+    h.context.handleClaudeEvent(h.session, lifecycle('cancelled'));
+    expect(h.session.busy).toBe(false);
+    expect(h.session._steerHold ?? null).toBeNull();
+    expect(h.context.flushPendingSessionQueue).toHaveBeenCalledTimes(1);
+    expect(h.session.queuedMessages.map(m => m[0].text)).toEqual(['steer']);
+  });
+
+  it('cancelled after it started: nothing resent (the model saw it)', () => {
+    const h = setup();
+    steerQueued(h, 'steer', 1);
+    h.context.handleClaudeEvent(h.session, lifecycle('started'));
+    h.context.handleClaudeEvent(h.session, lifecycle('cancelled'));
+    expect(h.session.queuedMessages).toBeNull();
+    expect(h.context.commitDispatchedUserTurn).toHaveBeenCalledTimes(1);
+  });
+
+  it('cancelled with no live session to take it: a not-delivered notice', () => {
+    const h = setup();
+    steerQueued(h, 'steer', 1);
+    h.session.alive = false;
+    h.context.handleClaudeEvent(h.session, lifecycle('cancelled'));
+    expect(h.session.queuedMessages).toBeNull();
+    expect(h.context.journalPublishNotice).toHaveBeenCalledWith('convo', expect.stringContaining('could not be queued again'));
+  });
+
+  it('requeued steers go in original order, after a leading /compact, ahead of later messages, cards in lockstep', () => {
+    const h = setup();
+    let n = 0;
+    h.context.notifyQueuedMessage = vi.fn((session) => {
+      session.queueNotifications.push({ id: `card-${++n}` });
+      return Promise.resolve();
+    });
+    steerQueued(h, 'older steer', 1);
+    steerQueued(h, 'newer steer', 2);
+    h.session.queuedMessages = [[{ type: 'text', text: '/compact' }], [{ type: 'text', text: 'typed later' }]];
+    h.session.queueNotifications = [{ id: 'compact-card' }, { id: 'later-card' }];
+    h.context.killSession(h.session, 'SIGTERM', { preserveQueue: true });
+    expect(h.session.queuedMessages.map(m => m[0].text)).toEqual(['/compact', 'older steer', 'newer steer', 'typed later']);
+    expect(h.session.queueNotifications.map(c => c.id)).toEqual(['compact-card', 'card-1', 'card-2', 'later-card']);
+  });
+
+  it('a requeue whose card did not reserve its slot synchronously stays at the end', () => {
+    const h = setup();
+    h.context.notifyQueuedMessage = vi.fn(() => Promise.resolve());
+    steerQueued(h, 'steer', 1);
+    h.session.queuedMessages = [[{ type: 'text', text: 'typed later' }]];
+    h.session.queueNotifications = [{ id: 'later-card' }];
+    h.context.killSession(h.session, 'SIGTERM', { preserveQueue: true });
+    expect(h.session.queuedMessages.map(m => m[0].text)).toEqual(['typed later', 'steer']);
+  });
+
+  it('/stop, idle reap and shutdown kills (no carry-over) post no queued card', () => {
+    const h = setup();
+    steerQueued(h, 'steer', 1);
+    h.context.killSession(h.session);
+    expect(h.context.notifyQueuedMessage).not.toHaveBeenCalled();
+    expect(h.session.queuedMessages).toBeNull();
+    expect(h.session._steered).toBeNull();
+  });
+
+  it('the exit handler requeues only in its auto-restart branch, before the queue is copied', () => {
+    const close = source.indexOf("proc.on('close', (exitCode) => {");
+    const branch = source.indexOf('} else if (shouldAutoRestart(exitCode, session, shuttingDown)) {', close);
+    const requeue = source.indexOf('requeueSteeredMessages(session, orphanSteers);', close);
+    const copy = source.indexOf('restarted.queuedMessages = session.queuedMessages;', close);
+    expect(close).toBeGreaterThan(0);
+    expect(requeue).toBeGreaterThan(branch);
+    expect(copy).toBeGreaterThan(requeue);
+    expect(source.slice(close, branch)).not.toContain('requeueSteeredMessages(');
+  });
+
+  it('init during a hold marks only the oldest waiting steer started; the next one holds the next result', () => {
+    vi.useFakeTimers();
+    const h = setup();
+    steerQueued(h, 'first', 1);
+    steerQueued(h, 'second', 2);
+    h.context.handleClaudeEvent(h.session, result());
+    expect(h.session.busy).toBe(true);
+    h.context.handleClaudeEvent(h.session, { type: 'system', subtype: 'init' });
+    expect(h.context.commitDispatchedUserTurn).toHaveBeenCalledTimes(1);
+    expect(h.context.commitDispatchedUserTurn).toHaveBeenCalledWith(h.session, 'first', null);
+    expect(h.session._steered.get('steer-uuid-2').state).toBe('queued');
+    h.context.handleClaudeEvent(h.session, result());
+    expect(h.session.busy).toBe(true);
+    h.context.handleClaudeEvent(h.session, { type: 'system', subtype: 'init' });
+    expect(h.context.commitDispatchedUserTurn).toHaveBeenLastCalledWith(h.session, 'second', null);
+    h.context.handleClaudeEvent(h.session, result());
+    expect(h.session.busy).toBe(false);
   });
 });
