@@ -1907,13 +1907,6 @@ function journalPublish(session, method, payload, options) {
   }
 }
 
-// Transactional release seam (loop #536, spec §3). Order: write-ahead a durable
-// `pending` outbox record → (if a mutate thunk is supplied) run the irreversible
-// queue mutation → publish with a deterministic idem_key. FAIL-CLOSED: if the
-// write-ahead can't durably persist, ABORT before the mutation and the publish
-// (return false), leaving the card actionable — a failed durability prerequisite
-// must never let the irreversible mutation proceed with no recoverable record.
-// Returns true on a durable emit, false on a fail-closed abort.
 // Reconnect handler (hoisted so the createJournalPublisher arg block stays free
 // of a nested `});`). Re-emits Codex outcomes (upstream behavior) and drives the
 // queued-release durability retry + one-shot boot reconcile (loop #536).
@@ -1944,6 +1937,13 @@ const releaseLifecycle = createQueuedReleaseLifecycle({
   releaseOutbox, journalPublisher,
   quietMs: Number(process.env.MATRON_QUEUED_RELEASE_RECONCILE_QUIET_MS) || 750,
 });
+// Transactional release seam. Order: write-ahead a durable
+// `pending` outbox record → (if a mutate thunk is supplied) run the irreversible
+// queue mutation → publish with a deterministic idem_key. FAIL-CLOSED: if the
+// write-ahead can't durably persist, ABORT before the mutation and the publish
+// (return false), leaving the card actionable — a failed durability prerequisite
+// must never let the irreversible mutation proceed with no recoverable record.
+// Returns true on a durable emit, false on a fail-closed abort.
 function emitRelease(convoId, payload, options) {
   return releaseLifecycle.emitRelease(convoId, payload, options);
 }
@@ -12306,8 +12306,8 @@ function journalHandleInboundEvent(frame) {
   // Re-arm the deferred boot reconcile (F1) while one is pending: every inbound
   // frame pushes the quiet-timer out (during the post-reconnect burst these are
   // the replay frames, which carry the release echoes), so reconcile runs only
-  // once that stream has gone quiet. No-op after the one-shot reconcile has fired
-  // The lifecycle only re-arms a timer while boot reconciliation is pending.
+  // once that stream has gone quiet. A no-op after the one-shot reconcile has
+  // fired: the lifecycle only re-arms a timer while boot reconciliation is pending.
   releaseLifecycle.onInboundEvent();
 }
 

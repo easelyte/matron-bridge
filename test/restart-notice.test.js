@@ -532,9 +532,6 @@ it.each(['journalRouteTextToSession', 'fireTimer', 'carryOnConvo', 'fireAutoResu
     if (name === 'flushQueue') {
       h.session.agent = 'codex'; h.session.busy = true;
       h.session.codex = { transport: 'app-server', steer: () => waiting };
-      Object.assign(h.context, { planQueueFlush: () => ({ blocks: [{ type: 'text', text: 'Continue.' }], mirrorText: '' }),
-        pendingMediaMirror: () => [], finalizeSentQueue: () => {},
-      });
       expect(h.context.flushQueue(h.session, [[{ type: 'text', text: 'Continue.' }]], { convoId: 'alice', entries: [] })).toBe('deferred');
       task = waiting;
     }

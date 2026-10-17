@@ -65,6 +65,15 @@ describe('queued-release reconnect wiring (F1)', () => {
       body,
       'journalHandleInboundEvent must re-arm scheduleReleaseReconcile while a reconcile is pending, so it fires only '
       + 'after the reconnect replay burst goes quiet — deleting the re-arm restores the F1 race with CI fully green',
-    ).toMatch(/^\s*releaseLifecycle\.onInboundEvent\(\);\s*$/m); // an unconditional statement, not a guarded call
+    ).toMatch(/^\s*releaseLifecycle\.onInboundEvent\(\);\s*$/m);
+    // The handler's code (comments stripped) is exactly: consume the frame, then
+    // re-arm, unconditionally. A guard or early return around the hook would
+    // leave the call text present but disable the re-arm.
+    const code = body
+      .replace(/\/\/[^\n]*/g, '')
+      .replace(/^function journalHandleInboundEvent\(frame\) \{/, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+    expect(code).toBe('journalInputConsumer(frame); releaseLifecycle.onInboundEvent(); }');
   });
 });
