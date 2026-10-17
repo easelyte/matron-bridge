@@ -6385,6 +6385,10 @@ function sendToSession(session, contentBlocks, { skipJournalMirror = false, turn
   } finally { finishInput?.(); }
 }
 
+function sendTextToSession(session, text, opts) {
+  return sendToSession(session, [{ type: 'text', text }], opts);
+}
+
 // Mid-turn steering (lib/claude-steer.js): write a message into the RUNNING
 // print-mode turn. Unlike sendToSession this is not a turn start: no busy
 // transition, no turnGeneration bump, no responseBuffer/toolCalls reset, no
@@ -6588,10 +6592,6 @@ function releaseStaleSteerHold(session, why = 'steered message never started a t
     queueDispatched = flushPendingSessionQueue(session) === true;
   }
   if (!queueDispatched) maybeFlushRoomDelivery(session);
-}
-
-function sendTextToSession(session, text, opts) {
-  return sendToSession(session, [{ type: 'text', text }], opts);
 }
 
 function submitCodexAsyncAnswer(session, text) {
