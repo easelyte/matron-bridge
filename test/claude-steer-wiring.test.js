@@ -19,8 +19,9 @@ function sourceOf(name) {
 }
 
 const LIFTED = [
-  'bumpTurnGeneration', 'clearPendingInterrupt', 'steerIntoRunningTurn', 'holdTurnForSteer',
-  'releaseStaleSteerHold', 'handleClaudeEvent', 'journalRouteTextToSession',
+  'bumpTurnGeneration', 'clearPendingInterrupt', 'steerIntoRunningTurn', 'commitSteeredMessage',
+  'requeueSteeredMessages', 'requeueUnstartedSteers', 'requeueFailedSteer', 'supersedePromptsForSteerHold',
+  'beginHeldSteerTurn', 'releaseStaleSteerHold', 'handleClaudeEvent', 'journalRouteTextToSession',
 ];
 const KEYWORDS = new Set(['if', 'for', 'while', 'switch', 'catch', 'function', 'return', 'typeof', 'new', 'await', 'async', 'super']);
 
@@ -30,7 +31,7 @@ function setup({ session: overrides = {}, steerEnabled = true } = {}) {
   const session = {
     agent: 'claude', alive: true, busy: true, roomId: 'room', turnGeneration: 7, _cliInitGeneration: 7,
     proc: { stdin: { write: stdinWrite, writable: true } }, queuedMessages: null, queueNotifications: [],
-    responseBuffer: 'partial reply', toolCalls: ['tool A'], turnCount: 0,
+    responseBuffer: 'partial reply', toolCalls: ['tool A'], turnCount: 0, turnTier: 'peer',
     totalUsage: { input_tokens: 0, output_tokens: 0, cache_read: 0, cache_create: 0 },
     ...overrides,
   };
@@ -43,7 +44,8 @@ function setup({ session: overrides = {}, steerEnabled = true } = {}) {
     ...steer,
     CLAUDE_STEER_ENABLED: steerEnabled,
     AGENT_CODEX: 'codex',
-    randomUUID: () => 'steer-uuid-1',
+    randomUUID: (() => { let n = 0; return () => `steer-uuid-${++n}`; })(),
+    sessions: new Map(),
     markJournalOrigin, hasQueuedCompact, isCompactCommand,
     restartLatch: undefined,
     inflightMarker: { touch: vi.fn(), noteTurnStart: vi.fn(), noteTurnEnd: vi.fn() },
@@ -87,6 +89,7 @@ function setup({ session: overrides = {}, steerEnabled = true } = {}) {
   }
   vm.createContext(context);
   vm.runInContext(lifted, context);
+  context.sessions.set(session.roomId, session);
   return { session, context, stdinWrite, replies, ctxObj };
 }
 
@@ -111,8 +114,11 @@ describe('journal text into a running Claude turn', () => {
     expect(h.session.turnGeneration).toBe(7);
     expect(h.session.busy).toBe(true);
     expect(h.session._steered.get('steer-uuid-1').state).toBe('written');
-    expect(h.context.commitDispatchedUserTurn).toHaveBeenCalledWith(h.session, 'also check the tests', null);
+    // History waits for the CLI to start the message.
+    expect(h.context.commitDispatchedUserTurn).not.toHaveBeenCalled();
     expect(h.context.journalSessionState).not.toHaveBeenCalled();
+    // The running turn now carries operator work.
+    expect(h.session.turnTier).toBeNull();
   });
 
   it('falls back to the queue when the stdin write throws', async () => {
@@ -122,7 +128,7 @@ describe('journal text into a running Claude turn', () => {
     expect(h.session.queuedMessages).toHaveLength(1);
     expect(h.context.notifyQueuedMessage).toHaveBeenCalledTimes(1);
     expect(h.replies).toEqual([]);
-    expect(h.session._steered ?? null).toBeNull();
+    expect(h.session._steered?.size ?? 0).toBe(0);
   });
 
   const queuedCases = [
@@ -196,8 +202,14 @@ describe('result handling with a steered message', () => {
     expect(h.context.inflightMarker.noteTurnEnd).not.toHaveBeenCalled();
     expect(h.session._steerHold).toBeTruthy();
 
+    expect(h.context.commitDispatchedUserTurn).not.toHaveBeenCalled();
+    expect(h.session.turnTier).toBeNull();
     h.context.handleClaudeEvent(h.session, lifecycle('started'));
     expect(h.session._steerHold).toBeNull();
+    // Committed after the first reply was flushed: history order matches the model's.
+    expect(h.context.commitDispatchedUserTurn).toHaveBeenCalledTimes(1);
+    expect(h.context.flushResponse.mock.invocationCallOrder[0])
+      .toBeLessThan(h.context.commitDispatchedUserTurn.mock.invocationCallOrder[0]);
     h.context.handleClaudeEvent(h.session, { type: 'system', subtype: 'init' });
     expect(h.session._cliInitGeneration).toBe(8);
     h.context.handleClaudeEvent(h.session, lifecycle('completed'));
@@ -210,12 +222,26 @@ describe('result handling with a steered message', () => {
     expect(h.context.flushPendingSessionQueue).toHaveBeenCalledTimes(1);
   });
 
-  it('a written entry with no lifecycle event yet also holds', () => {
+  it('a written entry with no event of its own holds once this process has shown lifecycle support', () => {
     vi.useFakeTimers();
     const h = setup();
+    h.context.handleClaudeEvent(h.session, lifecycle('completed', 'some-other-command'));
     h.context.steerIntoRunningTurn(h.session, [{ type: 'text', text: 'steer' }]);
     h.context.handleClaudeEvent(h.session, result());
     expect(h.session.busy).toBe(true);
+  });
+
+  it('older CLI (no lifecycle events ever): no hold, history committed, steering off for the process', () => {
+    vi.useFakeTimers();
+    const h = setup({ session: { queuedMessages: [[{ type: 'text', text: 'q' }]] } });
+    h.context.steerIntoRunningTurn(h.session, [{ type: 'text', text: 'steer' }]);
+    h.context.handleClaudeEvent(h.session, result());
+    expect(h.session.busy).toBe(false);
+    expect(h.context.flushPendingSessionQueue).toHaveBeenCalledTimes(1);
+    expect(h.context.commitDispatchedUserTurn).toHaveBeenCalledWith(h.session, 'steer', null);
+    expect(h.session._steerLifecycleUnsupported).toBe(true);
+    expect(steer.canSteerClaude({ ...h.session, busy: true, queuedMessages: null }, { origin: 'user', text: 'x' }))
+      .toEqual({ ok: false, reason: 'no-lifecycle' });
   });
 
   it('backstop: nothing starts, so busy is released and the queue flushed', () => {
@@ -237,6 +263,7 @@ describe('result handling with a steered message', () => {
     vi.useFakeTimers();
     const h = setup();
     h.context.steerIntoRunningTurn(h.session, [{ type: 'text', text: 'steer' }]);
+    h.context.handleClaudeEvent(h.session, lifecycle('queued'));
     h.context.handleClaudeEvent(h.session, result());
     expect(h.session.busy).toBe(true);
     h.context.handleClaudeEvent(h.session, result());
@@ -249,6 +276,7 @@ describe('result handling with a steered message', () => {
     const cancel = vi.fn();
     const h = setup();
     h.context.steerIntoRunningTurn(h.session, [{ type: 'text', text: 'steer' }]);
+    h.context.handleClaudeEvent(h.session, lifecycle('queued'));
     h.session.pendingInterrupt = { cancel };
     h.context.handleClaudeEvent(h.session, result());
     expect(h.session.busy).toBe(true);
@@ -260,6 +288,7 @@ describe('result handling with a steered message', () => {
     vi.useFakeTimers();
     const h = setup();
     h.context.steerIntoRunningTurn(h.session, [{ type: 'text', text: 'steer' }]);
+    h.context.handleClaudeEvent(h.session, lifecycle('queued'));
     h.context.handleClaudeEvent(h.session, result());
     h.session.alive = false;
     vi.advanceTimersByTime(steer.STEER_HOLD_BACKSTOP_MS);
@@ -274,5 +303,114 @@ describe('result handling with a steered message', () => {
     expect(h.context.journalPublishUserItem).not.toHaveBeenCalled();
     expect(h.session.busy).toBe(true);
     expect(h.session.responseBuffer).toBe('partial reply');
+  });
+});
+
+describe('review follow-ups', () => {
+  const planResult = () => ({
+    ...result('Here is my plan'),
+    permission_denials: [{ tool_name: 'ExitPlanMode', tool_use_id: 'plan-1', tool_input: { plan: 'do it' } }],
+  });
+
+  it('a plan the turn ended on is superseded during a hold: no card, no build state, one notice', () => {
+    vi.useFakeTimers();
+    const h = setup();
+    h.session.sendCallback = vi.fn();
+    h.session.sendHtml = vi.fn();
+    h.session.claudeSessionId = 'sid';
+    h.session.pendingPlanDenialId = 'plan-1';
+    h.context.steerIntoRunningTurn(h.session, [{ type: 'text', text: 'actually, smaller scope' }]);
+    h.context.handleClaudeEvent(h.session, lifecycle('queued'));
+    h.context.handleClaudeEvent(h.session, planResult());
+    expect(h.session.busy).toBe(true);
+    expect(h.session.pendingPlan ?? null).toBeNull();
+    expect(h.session.pendingPlanDenialId).toBeNull();
+    expect(h.context.planItems.opened).not.toHaveBeenCalled();
+    expect(h.session.sendHtml).not.toHaveBeenCalled();
+    expect(h.context.journalPublishNotice).toHaveBeenCalledWith('convo', steer.STEER_PROMPT_SUPERSEDED_NOTICE);
+  });
+
+  it('the same plan result without a hold still posts the card', () => {
+    const h = setup();
+    h.session.sendCallback = vi.fn();
+    h.session.sendHtml = vi.fn();
+    h.context.handleClaudeEvent(h.session, planResult());
+    expect(h.session.busy).toBe(false);
+    expect(h.session.pendingPlan).toBe('do it');
+    expect(h.context.planItems.opened).toHaveBeenCalledTimes(1);
+    expect(h.context.journalPublishNotice).not.toHaveBeenCalledWith('convo', steer.STEER_PROMPT_SUPERSEDED_NOTICE);
+  });
+
+  it('a question the turn ended on is superseded during a hold, and its reply text still flushes', () => {
+    vi.useFakeTimers();
+    const h = setup();
+    h.context.steerIntoRunningTurn(h.session, [{ type: 'text', text: 'never mind, use the default' }]);
+    h.context.handleClaudeEvent(h.session, lifecycle('queued'));
+    h.session.waitingForAnswer = 'text-reply';
+    h.session.pendingQuestions = [{ question: 'Which one?' }];
+    h.context.handleClaudeEvent(h.session, result('Which one?'));
+    expect(h.session.busy).toBe(true);
+    expect(h.session.waitingForAnswer).toBeNull();
+    expect(h.session.pendingQuestions).toBeNull();
+    expect(h.context.flushResponse).toHaveBeenCalledTimes(1);
+    expect(h.context.journalPublishNotice).toHaveBeenCalledWith('convo', steer.STEER_PROMPT_SUPERSEDED_NOTICE);
+  });
+
+  it('an async stdin write error puts the message back on the queue with a card', () => {
+    const h = setup();
+    expect(h.context.steerIntoRunningTurn(h.session, [{ type: 'text', text: 'steer me' }])).toBe(true);
+    const callback = h.stdinWrite.mock.calls[0][1];
+    callback(new Error('write EPIPE'));
+    expect(h.session.queuedMessages).toHaveLength(1);
+    expect(h.session.queuedMessages[0][0].text).toBe('steer me');
+    expect(h.context.notifyQueuedMessage).toHaveBeenCalledTimes(1);
+    expect(h.session._steered.size).toBe(0);
+    // Still busy, so the turn-end flush delivers it; no history yet.
+    expect(h.context.flushPendingSessionQueue).not.toHaveBeenCalled();
+    expect(h.context.commitDispatchedUserTurn).not.toHaveBeenCalled();
+  });
+
+  it('a write callback error after the CLI acknowledged the message does nothing', () => {
+    const h = setup();
+    h.context.steerIntoRunningTurn(h.session, [{ type: 'text', text: 'steer me' }]);
+    h.context.handleClaudeEvent(h.session, lifecycle('queued'));
+    h.stdinWrite.mock.calls[0][1](new Error('late'));
+    expect(h.session.queuedMessages).toBeNull();
+  });
+
+  it('process exit with unstarted steers requeues them once; started ones are not resent', () => {
+    const h = setup();
+    h.context.steerIntoRunningTurn(h.session, [{ type: 'text', text: 'first' }]);
+    h.context.steerIntoRunningTurn(h.session, [{ type: 'text', text: 'second' }]);
+    h.context.handleClaudeEvent(h.session, lifecycle('started', 'steer-uuid-1'));
+    h.context.handleClaudeEvent(h.session, lifecycle('queued', 'steer-uuid-2'));
+    h.context.requeueUnstartedSteers(h.session);
+    expect(h.session.queuedMessages.map(m => m[0].text)).toEqual(['second']);
+    expect(h.context.notifyQueuedMessage).toHaveBeenCalledTimes(1);
+    // Only the started one reached history; the requeued one commits when its flush sends it.
+    expect(h.context.commitDispatchedUserTurn).toHaveBeenCalledTimes(1);
+    expect(h.context.commitDispatchedUserTurn).toHaveBeenCalledWith(h.session, 'first', null);
+    expect(h.session._steered).toBeNull();
+    h.context.requeueUnstartedSteers(h.session);
+    expect(h.session.queuedMessages).toHaveLength(1);
+  });
+
+  it('system/init during a hold marks the steer started, so the next result does not hold again', () => {
+    vi.useFakeTimers();
+    const h = setup();
+    h.context.steerIntoRunningTurn(h.session, [{ type: 'text', text: 'steer' }]);
+    h.context.handleClaudeEvent(h.session, lifecycle('queued'));
+    h.context.handleClaudeEvent(h.session, result());
+    expect(h.session.busy).toBe(true);
+    h.context.handleClaudeEvent(h.session, { type: 'system', subtype: 'init' });
+    expect(h.context.commitDispatchedUserTurn).toHaveBeenCalledWith(h.session, 'steer', null);
+    h.context.handleClaudeEvent(h.session, result());
+    expect(h.session.busy).toBe(false);
+    expect(h.context.commitDispatchedUserTurn).toHaveBeenCalledTimes(1);
+  });
+
+  it('a parked restart notice does not block steering', () => {
+    const h = setup({ session: { _deferredControls: { restart_notice: { id: 'n' } } } });
+    expect(steer.canSteerClaude(h.session, { origin: 'user', text: 'hi' })).toEqual({ ok: true });
   });
 });
