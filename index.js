@@ -6346,13 +6346,10 @@ function sendToSession(session, contentBlocks, { skipJournalMirror = false, turn
       );
     }
 
-    const jsonMsg = JSON.stringify({
-      type: 'user',
-      message: {
-        role: 'user',
-        content: contentBlocks
-      }
-    }) + '\n';
+    // Every turn carries a uuid so the CLI reports command_lifecycle for it:
+    // by the time the user steers, the bridge already knows this CLI emits
+    // lifecycle events, and the steer hold never has to guess from a race.
+    const jsonMsg = buildSteerLine(contentBlocks, randomUUID());
     debug('Sending to stdin:', jsonMsg.length > 1000
       ? jsonMsg.slice(0, 500) + `... [${jsonMsg.length} chars total]`
       : jsonMsg.trim());
