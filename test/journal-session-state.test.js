@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
+import { createSessionStateLifecycle } from '../lib/session-state-lifecycle.js';
 import { createSessionStateLatch } from '../lib/journal-session-state.js';
 
 // Harness: `publish` stands in for index.js's journalUpsertConvo and records
@@ -147,18 +148,34 @@ describe('createSessionStateLatch', () => {
   });
 });
 
-// The wiring can only be verified by source inspection, as the other *-wiring
-// tests do: journalSessionState must delegate to the latch and the publisher's
-// capacity hook must drive the re-offer.
+// Exercise lifecycle delegation directly; inspect index.js for publisher wiring.
 describe('index.js session-state latch wiring', () => {
   const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
 
   it('journalSessionState delegates to the latch instead of latching on session._journalState itself', () => {
-    const start = src.indexOf('function journalSessionState(session, state) {');
-    expect(start).toBeGreaterThan(-1);
-    const body = src.slice(start, src.indexOf('\n}\n', start));
-    expect(body).toMatch(/sessionStateLatch\.offer\(session, state\)/);
-    expect(body).not.toMatch(/session\._journalState = state/);
+    const { latch, offers } = harness();
+    const session = { _journalState: 'waiting' };
+    const offer = vi.fn((target, state) => {
+      expect(target._journalState).toBeUndefined();
+      return latch.offer(target, state);
+    });
+    const note = vi.fn(() => 'revision-1');
+    const lifecycle = createSessionStateLifecycle({
+      runStateOutbox: { note }, sessionStateLatch: { offer },
+      journalConvoIdFor: () => 'convo',
+    });
+    lifecycle.journalSessionState(session, 'running');
+    expect(note).toHaveBeenCalledExactlyOnceWith('convo', 'running');
+    expect(offer).toHaveBeenCalledExactlyOnceWith(session, 'running');
+    expect(offers).toHaveLength(1);
+    expect(offers[0]).toMatchObject({ session, state: 'running' });
+    expect(offers[0].options.onEvicted).toEqual(expect.any(Function));
+    expect(session._journalState).toBe('running');
+
+    lifecycle.journalSessionState(session, 'running');
+    expect(note).toHaveBeenCalledTimes(1);
+    expect(offer).toHaveBeenCalledTimes(1);
+    expect(offers).toHaveLength(1);
   });
 
   it('chains the latch re-offer onto the publisher onSendCapacity hook', () => {

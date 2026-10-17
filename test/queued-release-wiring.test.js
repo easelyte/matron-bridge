@@ -65,6 +65,6 @@ describe('queued-release reconnect wiring (F1)', () => {
       body,
       'journalHandleInboundEvent must re-arm scheduleReleaseReconcile while a reconcile is pending, so it fires only '
       + 'after the reconnect replay burst goes quiet — deleting the re-arm restores the F1 race with CI fully green',
-    ).toMatch(/_releaseReconcileTimer\) scheduleReleaseReconcile\(/);
+    ).toMatch(/releaseLifecycle\.onInboundEvent\(\)/);
   });
 });

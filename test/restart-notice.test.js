@@ -1,3 +1,4 @@
+import { createQueuedDispatcher } from '../lib/queued-dispatch.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -485,6 +486,13 @@ function inputWiring() {
   };
   const latch = createRestartLatch(deps);
   h.context.restartLatch = latch;
+  h.context.queuedDispatcher = createQueuedDispatcher(new Proxy(h.context, {
+    get(target, key) {
+      if (key === 'queueRelease') return { listLive: () => [], dropItem() {} };
+      if (key === 'log') return target.console;
+      return target[key];
+    },
+  }));
   return { ...h, deps, latch, shutdown, ready: () => latch.onReady({ sha: 'head', state: h.store.getState() }) };
 }
 

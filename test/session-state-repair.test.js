@@ -1,4 +1,4 @@
-import { describe, expect, it, beforeEach, afterEach } from 'vitest';
+import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
 import { readFileSync, mkdtempSync, rmSync, writeFileSync, existsSync, readdirSync } from 'fs';
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
@@ -8,6 +8,8 @@ import { createRequire } from 'module';
 const require = createRequire(import.meta.url);
 
 import { planTransition, selectEpochRepairs } from '../lib/session-state-repair.js';
+import { createSessionStateLifecycle } from '../lib/session-state-lifecycle.js';
+import { createSessionStateLatch } from '../lib/journal-session-state.js';
 import { createRunStateOutbox } from '../lib/run-state-outbox.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -419,77 +421,184 @@ describe('planTransition (change-gate + write-ahead)', () => {
   });
 });
 
-describe('index.js wiring', () => {
-  // index.js starts a server at import time (main() + apiServer.listen at module top level), so
-  // it cannot be imported for a behavioral test — the repo's established fallback is a
-  // source-level invariant (see summary-latch-separation.test.js).
-  const source = readFileSync(join(root, 'index.js'), 'utf-8');
+describe('session-state lifecycle', () => {
+  let dir;
+  let file;
+  let outbox;
+  let session;
+  let sessions;
+  let publish;
+  let upsertConvoBestEffort;
+  let lifecycle;
+  let stateLatch;
 
-  function sliceFunction(signature) {
-    const start = source.indexOf(signature);
-    if (start === -1) throw new Error(`could not find ${signature}`);
-    const bodyOpen = /\)\s*\{/.exec(source.slice(start));
-    const open = start + bodyOpen.index + bodyOpen[0].length - 1;
-    let depth = 0;
-    for (let i = open; i < source.length; i++) {
-      if (source[i] === '{') depth++;
-      else if (source[i] === '}') {
-        depth--;
-        if (depth === 0) return source.slice(start, i + 1);
-      }
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'state-lifecycle-'));
+    file = join(dir, 'outbox.json');
+    outbox = createRunStateOutbox({ file, log: silent });
+    session = { convoId: 'c1', alive: true };
+    sessions = new Map([['room', session]]);
+    publish = vi.fn();
+    upsertConvoBestEffort = vi.fn(() => true);
+    const sessionStateLatch = createSessionStateLatch({
+      publish,
+      resolveSession: id => [...sessions.values()].find(s => s.convoId === id),
+      upsertConvoDirect: vi.fn(),
+    });
+    stateLatch = sessionStateLatch;
+    lifecycle = createSessionStateLifecycle({
+      runStateOutbox: outbox, sessionStateLatch, sessions,
+      journalConvoIdFor: s => s.convoId,
+      journalPublisher: { upsertConvoBestEffort }, log: silent,
+    });
+  });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  it('persists before offering through the eviction latch and leaves the record pending', () => {
+    publish.mockImplementation((_session, state, options) => {
+      expect(createRunStateOutbox({ file, log: silent }).list()[0].state).toBe(state);
+      expect(typeof options.onEvicted).toBe('function');
+      expect(options.onLocalSendComplete).toBeUndefined();
+    });
+    lifecycle.journalSessionState(session, 'running');
+    lifecycle.journalSessionState(session, 'running');
+    expect(publish).toHaveBeenCalledTimes(1);
+    expect(session._journalState).toBe('running');
+    expect(outbox.size()).toBe(1);
+    publish.mock.calls[0][2].onEvicted({ convo_id: 'c1', session_state: 'running' });
+    lifecycle.journalSessionState(session, 'running');
+    expect(publish).toHaveBeenCalledTimes(2);
+  });
+
+  it('leaves identical retries and inverse transitions publishable after a failed durable write', () => {
+    lifecycle.journalSessionState(session, 'waiting');
+    const note = vi.spyOn(outbox, 'note').mockReturnValueOnce(null);
+    lifecycle.journalSessionState(session, 'running');
+    expect(session._journalState).toBeUndefined();
+    lifecycle.journalSessionState(session, 'running');
+    note.mockReturnValueOnce(null);
+    lifecycle.journalSessionState(session, 'waiting');
+    lifecycle.journalSessionState(session, 'running');
+    expect(publish.mock.calls.map(call => call[1])).toEqual([
+      'waiting', 'running', 'running', 'waiting', 'running',
+    ]);
+  });
+
+  it('latches a buffered transition without writing an unidentified conversation', () => {
+    session.convoId = null;
+    const note = vi.spyOn(outbox, 'note');
+    lifecycle.journalSessionState(session, 'running');
+    lifecycle.journalSessionState(session, 'running');
+    expect(note).not.toHaveBeenCalled();
+    expect(publish).toHaveBeenCalledTimes(1);
+    expect(session._journalState).toBe('running');
+  });
+
+  it('reoffers live and terminal records and retires only unowned running records', () => {
+    outbox.note('c1', 'running');
+    outbox.note('orphan', 'running');
+    outbox.note('ended', 'waiting');
+    sessions.set('dead', { convoId: 'orphan', alive: false });
+    lifecycle.republishSessionStates();
+    expect(upsertConvoBestEffort.mock.calls.map(([id, payload]) => [id, payload.sessionState])).toEqual([
+      ['c1', 'running'], ['ended', 'waiting'], ['orphan', 'done'],
+    ]);
+    expect(outbox.size()).toBe(3);
+    for (const [, , options] of upsertConvoBestEffort.mock.calls) {
+      expect(options.retain).toBe(false);
+      options.onLocalSendComplete();
     }
-    throw new Error(`unterminated ${signature}`);
+    expect(outbox.size()).toBe(0);
+  });
+
+  it('settles only the revision offered, preserving a conversation resumed during retirement', () => {
+    outbox.note('orphan', 'running');
+    lifecycle.republishSessionStates();
+    const complete = upsertConvoBestEffort.mock.calls[0][2].onLocalSendComplete;
+    const resumed = outbox.note('orphan', 'running');
+    complete();
+    expect(outbox.list()[0].token).toEqual(resumed);
+  });
+
+  it('retries refused records on capacity and skips the sweep once settled', () => {
+    outbox.note('c1', 'done');
+    upsertConvoBestEffort.mockReturnValueOnce(false);
+    lifecycle.republishSessionStates();
+    expect(outbox.size()).toBe(1);
+    lifecycle.retryRunStateRepairs();
+    expect(upsertConvoBestEffort).toHaveBeenCalledTimes(2);
+    upsertConvoBestEffort.mock.calls[1][2].onLocalSendComplete();
+    const list = vi.spyOn(outbox, 'list');
+    lifecycle.retryRunStateRepairs();
+    expect(list).not.toHaveBeenCalled();
+    expect(upsertConvoBestEffort).toHaveBeenCalledTimes(2);
+  });
+
+  it('coalesces synchronous capacity reentry and releases the guard after a publisher throws', () => {
+    outbox.note('c1', 'done');
+    upsertConvoBestEffort.mockImplementationOnce(() => {
+      lifecycle.retryRunStateRepairs();
+      throw new Error('transport unavailable');
+    });
+    expect(() => lifecycle.republishSessionStates()).toThrow('transport unavailable');
+    expect(upsertConvoBestEffort).toHaveBeenCalledTimes(1);
+    lifecycle.retryRunStateRepairs();
+    expect(upsertConvoBestEffort).toHaveBeenCalledTimes(2);
+  });
+
+  function lifecycleWith(extra) {
+    return createSessionStateLifecycle({
+      runStateOutbox: outbox, sessionStateLatch: stateLatch, sessions,
+      journalConvoIdFor: s => s.convoId,
+      journalPublisher: { upsertConvoBestEffort }, ...extra,
+    });
   }
 
-  it('write-ahead records to the DURABLE outbox but does NOT settle eagerly on local send', () => {
-    const body = sliceFunction('function journalSessionState(');
-    expect(body).toContain('runStateOutbox.note(');
-    expect(body).toContain('planTransition(');
-    // The transition publish must NOT clear the durable record on the publisher's
-    // local-send callback — that callback fires when the frame leaves the local socket, not when
-    // the server commits it, so settling there strands a lost-after-send `done` forever. The
-    // reconnect reconciliation sweep (republishSessionStates) is the sole settle authority.
-    // The load-bearing signal is the absence of the settle CALL (comment prose is ignored by
-    // checking for the call form, not the bare identifier).
-    expect(body).not.toContain('runStateOutbox.settle(');
-    expect(body).not.toContain('onLocalSendComplete:');
+  it('does nothing while the journal is disabled, and repairs once it is enabled', () => {
+    let on = false;
+    const gated = lifecycleWith({ enabled: () => on, log: silent });
+    outbox.note('c1', 'running');
+    gated.republishSessionStates();
+    expect(upsertConvoBestEffort).not.toHaveBeenCalled();
+    on = true;
+    gated.republishSessionStates();
+    expect(upsertConvoBestEffort).toHaveBeenCalledTimes(1);
   });
+
+  it('logs the stranded-retirement count and the refused-offer count with exact totals', () => {
+    const log = { log: vi.fn(), warn: vi.fn() };
+    const logged = lifecycleWith({ log });
+    outbox.note('c1', 'running');
+    outbox.note('orphan-a', 'running');
+    outbox.note('orphan-b', 'running');
+    upsertConvoBestEffort.mockImplementation((id) => id === 'orphan-a');
+    logged.republishSessionStates();
+    expect(log.log).toHaveBeenCalledTimes(1);
+    expect(log.log.mock.calls[0][0]).toContain('queued done for 1 stranded running convo(s)');
+    expect(log.warn).toHaveBeenCalledTimes(1);
+    expect(log.warn.mock.calls[0][0]).toContain('2 of 3 run-state re-offer(s) refused');
+  });
+
+  it('stays silent when every offer is accepted and nothing is stranded', () => {
+    const log = { log: vi.fn(), warn: vi.fn() };
+    const logged = lifecycleWith({ log });
+    outbox.note('c1', 'running');
+    logged.republishSessionStates();
+    expect(log.log).not.toHaveBeenCalled();
+    expect(log.warn).not.toHaveBeenCalled();
+  });
+});
+
+describe('index.js reconnect wiring', () => {
+  const source = readFileSync(join(root, 'index.js'), 'utf-8');
+  const start = source.indexOf('function handleJournalReconnect(');
+  const body = source.slice(start, source.indexOf('\nfunction ', start + 1));
 
   it('runs the run-state repair on every accepted reconnect', () => {
-    expect(sliceFunction('function handleJournalReconnect(')).toContain('republishSessionStates()');
-  });
-
-  it('repairs through the NON-EVICTING path so it cannot drop the outage backlog', () => {
-    const body = sliceFunction('function republishSessionStates(');
-    expect(body).toContain('upsertConvoBestEffort');
-    expect(body).toContain('retain: false');
-    expect(body).not.toContain('journalUpsertConvo(');
-  });
-
-  it('retires stranded running convos that no live session owns', () => {
-    const body = sliceFunction('function republishSessionStates(');
-    expect(body).toContain('selectEpochRepairs(');
-    // Retirement publishes `done` but settles against the RECORDED `running` — settling on the
-    // published value would never match and would loop forever.
-    expect(body).toContain("offer(convoId, token, 'done')");
-    expect(body).toContain('onLocalSendComplete: () => runStateOutbox.settle(convoId, token)');
-    // The live set is built from sessions, the same signal the subagent reconcile uses.
-    expect(body).toContain('journalConvoIdFor(session)');
-  });
-
-  it('retries on returned send capacity, not only on another reconnect', () => {
-    expect(source).toContain('retryRunStateRepairs()');
-    const retry = sliceFunction('function retryRunStateRepairs(');
-    expect(retry).toContain('runStateOutbox.size()');
-    expect(retry).toContain('republishSessionStates()');
-  });
-
-  it('guards the sweep against synchronous re-entry from its own send', () => {
-    expect(sliceFunction('function republishSessionStates(')).toContain('_runStateRepairRunning');
+    expect(body).toContain('republishSessionStates()');
   });
 
   it('still repairs stranded subagents alongside it', () => {
-    const body = sliceFunction('function handleJournalReconnect(');
     expect(body).toContain('reconcileStrandedSubagents(');
   });
 });
