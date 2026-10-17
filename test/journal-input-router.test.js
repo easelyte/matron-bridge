@@ -2054,9 +2054,10 @@ describe('index.js agent-chat room wiring (source inspection)', () => {
     expect(src).toMatch(/function maybeFlushRoomDelivery\(session\) \{\s*\n\s*if \(sessionOccupiedForRoomDelivery\(session\)\) return;/);
     // …and a queue flush that dispatched a turn suppresses the room flush
     // (the new turn's own end seam picks it up) — one gate per seam family:
-    // codex, iv onTurnEnd, print result, and the resume-hold release (which
-    // flushes a queue carried across a restart — see restart-deferral tests).
-    expect(src.match(/flushPendingSessionQueue\(session\) === true/g) || []).toHaveLength(4);
+    // codex, iv onTurnEnd, print result, the resume-hold release (which
+    // flushes a queue carried across a restart — see restart-deferral tests),
+    // and the steer-hold backstop (releaseStaleSteerHold, lib/claude-steer.js).
+    expect(src.match(/flushPendingSessionQueue\(session\) === true/g) || []).toHaveLength(5);
     // The parked-slash release path must not append a room block onto the
     // just-typed slash command (Task 6 review I3) — but ONLY when the slash
     // was actually typed; the couldn't-run/held-messages branches typed
