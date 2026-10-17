@@ -178,6 +178,12 @@ describe('index.js session-state latch wiring', () => {
     expect(offers).toHaveLength(1);
   });
 
+  it('the production entry points delegate straight to the lifecycle', () => {
+    for (const [name, args] of [['journalSessionState', 'session, state'], ['republishSessionStates', ''], ['retryRunStateRepairs', '']]) {
+      expect(src).toContain(`function ${name}(${args}) {\n  return sessionStateLifecycle.${name}(${args});\n}`);
+    }
+  });
+
   it('chains the latch re-offer onto the publisher onSendCapacity hook', () => {
     const start = src.indexOf('onSendCapacity:');
     expect(start).toBeGreaterThan(-1);
