@@ -2,8 +2,11 @@ import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
 import { describe, expect, it, vi } from 'vitest';
 import { markJournalOrigin, planQueueFlush } from '../lib/queue-flush.js';
-import { hasQueuedCompact } from '../lib/compact-priority.js';
+import { createQueuedDispatcher } from '../lib/queued-dispatch.js';
+import { createQueuedReleaseLifecycle } from '../lib/queued-release-lifecycle.js';
+import { pendingMediaMirror } from '../lib/media-mirror.js';
 import { CodexPromptQueue } from '../lib/codex-prompts.js';
+// Only the index.js answer-routing and merged-send wiring needs source extraction.
 const source = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
 function sourceOf(name) {
   const start = source.indexOf(`function ${name}(`);
@@ -13,16 +16,26 @@ const settle = () => new Promise(resolve => setImmediate(resolve));
 function setup() {
   let ack;
   const session = { agent: 'codex', alive: true, busy: true, roomId: 'room', queuedMessages: [], queueNotifications: [], codex: { transport: 'app-server', steer: vi.fn(() => new Promise(resolve => { ack = resolve; })), interrupt: vi.fn() } };
-  const context = vm.createContext({ restartLatch: undefined, AGENT_CODEX: 'codex', hasQueuedCompact, markJournalOrigin, planQueueFlush, console,
-    sessions: new Map([['room', session]]), pendingMediaMirror: () => [], journalMirrorUserMedia: vi.fn(),
-    commitDispatchedUserTurn: vi.fn(), journalPublishUserItem: vi.fn(), finalizeSentQueue: vi.fn(),
+  const entries = [{ itemId: 'msg-1', promptId: 'queued-prompt' }];
+  const releaseOutbox = { put: vi.fn(() => true) };
+  const journalPublisher = { publishPromptReply: vi.fn() };
+  const lifecycle = createQueuedReleaseLifecycle({ releaseOutbox, journalPublisher, now: () => 123, log: { warn: vi.fn() } });
+  const context = vm.createContext({ markJournalOrigin, planQueueFlush, pendingMediaMirror, console,
+    sessions: new Map([['room', session]]), journalMirrorUserMedia: vi.fn(),
+    commitDispatchedUserTurn: vi.fn(), journalPublishUserItem: vi.fn(),
+    emitRelease: vi.fn(lifecycle.emitRelease),
+    queueRelease: { listLive: () => entries, dropItem: vi.fn((convoId, itemId) => {
+      entries.splice(entries.findIndex(entry => entry.itemId === itemId), 1);
+    }) },
     journalPublishNotice: vi.fn(), journalConvoIdFor: () => 'convo', dispatchDeferredCommand: vi.fn(), flushPendingSessionQueue: vi.fn(), maybeFlushRoomDelivery: vi.fn(),
     sendToSession: vi.fn(() => true), recordUserAnswer: vi.fn(),
   });
-  vm.runInContext(['restoreQueuedBatch', 'flushQueue', 'submitCodexAsyncAnswer', 'dispatchMergedFlush', 'journalRoutePromptReply'].map(sourceOf).join('\n'), context);
+  vm.runInContext(['submitCodexAsyncAnswer', 'dispatchMergedFlush', 'journalRoutePromptReply'].map(sourceOf).join('\n'), context);
+  const dispatcher = createQueuedDispatcher(context);
+  context.flushQueue = dispatcher.flushQueue;
   const batch = [[{ type: 'text', text: 'Also check the test' }]];
   const snapshot = { convoId: 'convo', entries: [{ itemId: 'msg-1' }] };
-  return { session, context, batch, snapshot, ack: value => ack(value), flush: () => context.flushQueue(session, batch, snapshot) };
+  return { session, context, batch, snapshot, entries, releaseOutbox, journalPublisher, ack: value => ack(value), flush: () => context.flushQueue(session, batch, snapshot) };
 }
 describe('bridge send-now steering', () => {
   it('retains messages for a parked restart without attempting native steering', () => {
@@ -30,19 +43,43 @@ describe('bridge send-now steering', () => {
     expect(h.flush()).toBe(false);
     expect(h.session.queuedMessages).toEqual(h.batch);
     expect(h.session.codex.steer).not.toHaveBeenCalled();
-    expect(h.context.finalizeSentQueue).not.toHaveBeenCalled();
+    expect(h.context.emitRelease).not.toHaveBeenCalled();
   });
   it('does not interrupt or retire queued cards until Codex acknowledges input', async () => {
     const h = setup(); expect(h.flush()).toBe('deferred');
-    expect(h.session.codex.interrupt).not.toHaveBeenCalled(); expect(h.context.finalizeSentQueue).not.toHaveBeenCalled();
+    expect(h.session.codex.interrupt).not.toHaveBeenCalled(); expect(h.context.emitRelease).not.toHaveBeenCalled();
+    expect(h.releaseOutbox.put).not.toHaveBeenCalled();
+    expect(h.journalPublisher.publishPromptReply).not.toHaveBeenCalled();
+    expect(h.context.queueRelease.dropItem).not.toHaveBeenCalled();
     h.ack(true); await settle();
     expect(h.context.commitDispatchedUserTurn).toHaveBeenCalledTimes(1);
-    expect(h.context.finalizeSentQueue).toHaveBeenCalledWith('convo', h.snapshot.entries);
+    expect(h.context.emitRelease).toHaveBeenCalledExactlyOnceWith('convo', {
+      promptId: 'queued-prompt', action: 'send', releasedIds: ['msg-1'],
+    });
+    expect(h.releaseOutbox.put).toHaveBeenCalledExactlyOnceWith('queued-prompt\0msg-1\0send', {
+      convoId: 'convo', promptId: 'queued-prompt', itemId: 'msg-1', action: 'send',
+      releasedIds: ['msg-1'], status: 'pending', at: 123,
+    });
+    expect(h.journalPublisher.publishPromptReply).toHaveBeenCalledExactlyOnceWith('convo', {
+      kind: 'queued_release', prompt_id: 'queued-prompt', action: 'send', released: ['msg-1'], at: 123,
+    }, { idemKey: 'qr\0queued-prompt\0msg-1\0send' });
+    expect(h.context.queueRelease.dropItem).toHaveBeenCalledExactlyOnceWith('convo', 'msg-1');
+    expect(h.entries).toEqual([]);
     expect(h.session.busy).toBe(true); expect(h.session._codexSteerPending).toBe(false);
+  });
+  it('keeps a queued card live when the acknowledged release cannot be durably recorded', async () => {
+    const h = setup();
+    h.releaseOutbox.put.mockReturnValue(false);
+    h.flush(); h.ack(true); await settle();
+    expect(h.context.commitDispatchedUserTurn).toHaveBeenCalledTimes(1);
+    expect(h.releaseOutbox.put).toHaveBeenCalledTimes(1);
+    expect(h.journalPublisher.publishPromptReply).not.toHaveBeenCalled();
+    expect(h.context.queueRelease.dropItem).not.toHaveBeenCalled();
+    expect(h.entries).toEqual([{ itemId: 'msg-1', promptId: 'queued-prompt' }]);
   });
   it('retains definitely rejected messages for turn end', async () => {
     const h = setup(); h.flush(); h.ack(false); await settle();
-    expect(h.session.queuedMessages).toEqual(h.batch); expect(h.context.finalizeSentQueue).not.toHaveBeenCalled();
+    expect(h.session.queuedMessages).toEqual(h.batch); expect(h.context.emitRelease).not.toHaveBeenCalled();
     expect(h.session._codexUncertainSteer).toBe(false);
   });
   it('holds unconfirmed messages even if the turn finishes before acknowledgement', async () => {
@@ -53,7 +90,7 @@ describe('bridge send-now steering', () => {
   });
   it('ignores an acknowledgement from a replaced session', async () => {
     const h = setup(); h.flush(); h.context.sessions.set('room', { alive: true }); h.ack(true); await settle();
-    expect(h.context.finalizeSentQueue).not.toHaveBeenCalled(); expect(h.context.commitDispatchedUserTurn).not.toHaveBeenCalled();
+    expect(h.context.emitRelease).not.toHaveBeenCalled(); expect(h.context.commitDispatchedUserTurn).not.toHaveBeenCalled();
   });
 });
 
@@ -74,7 +111,11 @@ describe('asynchronous question answer delivery', () => {
     h.ack(true); await settle();
     expect(h.context.commitDispatchedUserTurn).toHaveBeenCalledExactlyOnceWith(h.session, 'Which feature?\nTokens', null);
     expect(h.context.journalPublishUserItem).not.toHaveBeenCalled();
-    expect(h.context.finalizeSentQueue).toHaveBeenCalledWith('convo', []);
+    expect(h.context.emitRelease).not.toHaveBeenCalled();
+    expect(h.releaseOutbox.put).not.toHaveBeenCalled();
+    expect(h.journalPublisher.publishPromptReply).not.toHaveBeenCalled();
+    expect(h.context.queueRelease.dropItem).not.toHaveBeenCalled();
+    expect(h.entries).toEqual([{ itemId: 'msg-1', promptId: 'queued-prompt' }]);
     expect(h.session.queuedMessages).toBe(h.batch);
     expect(h.session.queueNotifications).toEqual([notification]);
   });

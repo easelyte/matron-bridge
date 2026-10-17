@@ -1,6 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'fs';
-import { runInNewContext } from 'vm';
+import { createQueuedReleaseLifecycle } from '../lib/queued-release-lifecycle.js';
+import { createQueuedDispatcher } from '../lib/queued-dispatch.js';
 import {
   cancelQueuedItem,
   dispatchBusyQueueMagicWord,
@@ -1709,28 +1710,25 @@ describe('notifyQueuedMessage — compact jump tile', () => {
 
 describe('queued-release publisher wiring', () => {
   it('emitRelease write-aheads before publishing exactly one structured prompt_reply with a deterministic idem_key', () => {
-    const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
-    const start = src.indexOf('function emitRelease(convoId, { promptId, action, releasedIds }');
-    expect(start).toBeGreaterThan(-1);
-    const end = src.indexOf('\n}\n\n// In-process retry driver', start);
-    expect(end).toBeGreaterThan(start);
-
     const publishPromptReply = vi.fn();
     const put = vi.fn(() => true); // durable write-ahead
+    const mutate = vi.fn();
     const now = vi.spyOn(Date, 'now').mockReturnValue(1_722_000_000_000);
-    const emitRelease = runInNewContext(
-      `(${src.slice(start, end + 2)})`,
-      { journalPublisher: { publishPromptReply }, releaseOutbox: { put }, console, Date },
-    );
+    const { emitRelease } = createQueuedReleaseLifecycle({
+      journalPublisher: { publishPromptReply }, releaseOutbox: { put },
+    });
 
     try {
       const result = emitRelease('convo-1', {
         promptId: 'pr_123',
         action: 'cancel',
         releasedIds: ['pr_123::0'],
-      });
+      }, { mutate });
 
       expect(result).toBe(true);
+      expect(mutate).toHaveBeenCalledTimes(1);
+      expect(put.mock.invocationCallOrder[0]).toBeLessThan(mutate.mock.invocationCallOrder[0]);
+      expect(mutate.mock.invocationCallOrder[0]).toBeLessThan(publishPromptReply.mock.invocationCallOrder[0]);
       // Write-ahead persisted a `pending` record keyed (promptId, itemId, action)
       // BEFORE the publish.
       expect(put).toHaveBeenCalledTimes(1);
@@ -1755,16 +1753,12 @@ describe('queued-release publisher wiring', () => {
   });
 
   it('emitRelease fail-closes when the write-ahead put returns false: no mutate, no publish', () => {
-    const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
-    const start = src.indexOf('function emitRelease(convoId, { promptId, action, releasedIds }');
-    const end = src.indexOf('\n}\n\n// In-process retry driver', start);
     const publishPromptReply = vi.fn();
     const put = vi.fn(() => false); // disk fault
     const mutate = vi.fn();
-    const emitRelease = runInNewContext(
-      `(${src.slice(start, end + 2)})`,
-      { journalPublisher: { publishPromptReply }, releaseOutbox: { put }, console, Date },
-    );
+    const { emitRelease } = createQueuedReleaseLifecycle({
+      journalPublisher: { publishPromptReply }, releaseOutbox: { put },
+    });
 
     const result = emitRelease('convo-1', {
       promptId: 'pr_9',
@@ -1794,12 +1788,6 @@ describe('queued-release publisher wiring', () => {
 
 describe('index.js queued-send finalizer', () => {
   function loadFlushHarness({ dispatchResult = true, dispatchThrows = null } = {}) {
-    const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
-    const start = src.indexOf('function queuedReleaseItemIds(');
-    const end = src.indexOf('\nfunction splitMessage(', start);
-    expect(start).toBeGreaterThan(-1);
-    expect(end).toBeGreaterThan(start);
-
     const emitRelease = vi.fn(() => true); // durable emit — finalizeSentQueue's fail-closed gate drops only on success
     const dropItem = vi.fn();
     const journalPublishNotice = vi.fn();
@@ -1813,21 +1801,11 @@ describe('index.js queued-send finalizer', () => {
       return dispatchResult;
     });
     const runQueuedCleanup = vi.fn(); // observe orphan-cleanup on the dead-session drop path
-    const flushQueue = runInNewContext(
-      `(() => { ${src.slice(start, end)}; return flushQueue; })()`,
-      {
-        restartLatch: undefined, AGENT_CODEX: 'codex',
-        console: { log: vi.fn() },
-        dispatchMergedFlush,
-        emitRelease,
-        journalConvoIdFor: () => 'convo-1',
-        journalPublishNotice,
-        runQueuedCleanup,
-        journalInputConsumer: {
-          queueRelease: { listLive, dropItem },
-        },
-      },
-    );
+    const { flushQueue } = createQueuedDispatcher({
+      dispatchMergedFlush, emitRelease,
+      journalConvoIdFor: () => 'convo-1', journalPublishNotice, runQueuedCleanup,
+      queueRelease: { listLive, dropItem }, log: { log: vi.fn() },
+    });
     return { flushQueue, emitRelease, dropItem, listLive, dispatchMergedFlush, journalPublishNotice, runQueuedCleanup };
   }
 
@@ -1893,6 +1871,7 @@ describe('index.js queued-send finalizer', () => {
     expect(harness.flushQueue(session, queued)).toBe(false);
     // Chronological order: the batch being retried was queued before `later`.
     expect(session.queuedMessages).toEqual([...queued, ...later]);
+    expect(harness.journalPublishNotice).not.toHaveBeenCalled();
     expect(harness.emitRelease).not.toHaveBeenCalled();
     expect(harness.dropItem).not.toHaveBeenCalled();
   });
@@ -1928,6 +1907,27 @@ describe('index.js queued-send finalizer', () => {
     expect(harness.runQueuedCleanup).toHaveBeenCalledTimes(2);
     expect(harness.runQueuedCleanup).toHaveBeenNthCalledWith(1, queued[0]);
     expect(harness.runQueuedCleanup).toHaveBeenNthCalledWith(2, queued[1]);
+  });
+
+  it.each([
+    { alive: false },
+    { alive: true, _autoStopped: true },
+  ])('expires tracked cards when a stopped session rejects dispatch: %j', (stopped) => {
+    const harness = loadFlushHarness({ dispatchResult: false });
+    const queued = [[{ type: 'text', text: 'undelivered' }]];
+    const session = {
+      ...stopped, agent: 'claude', busy: false, roomId: '!room',
+      queuedMessages: null, queueNotifications: [{ id: 'pr_1::0' }],
+    };
+    expect(harness.flushQueue(session, queued)).toBe(false);
+    expect(session.queuedMessages).toBeNull();
+    expect(harness.emitRelease).toHaveBeenCalledExactlyOnceWith('convo-1', {
+      promptId: 'pr_1', action: 'expired', releasedIds: ['pr_1::0'],
+    });
+    expect(harness.dropItem).toHaveBeenCalledExactlyOnceWith('convo-1', 'pr_1::0');
+    expect(harness.journalPublishNotice).toHaveBeenCalledExactlyOnceWith(
+      'convo-1', expect.stringContaining('session ended before it was sent'),
+    );
   });
 
   it('defers Codex release commitment until the interrupted turn has exited and dispatch succeeds', () => {
@@ -2061,41 +2061,6 @@ describe('index.js /interrupt endpoint — flush announcement (source inspection
   });
 });
 
-describe('index.js flushQueue drop path — undelivered notice wiring (source inspection)', () => {
-  // PR #150 follow-up: every queued entry was acknowledged with a
-  // success-style "📨 Queued" tile, so a flush that drops the queue (session
-  // dead / auto-stopped) must tell the user — a server-side console.log alone
-  // leaves them believing the messages were delivered.
-  it('a dropped queue publishes a journal notice, not just a server-side log', () => {
-    const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
-    const start = src.indexOf('[QUEUE] dropped queued message(s)');
-    expect(start).toBeGreaterThan(-1);
-    const window = src.slice(start, start + 1200);
-    expect(window).toMatch(/journalPublishNotice\(journalConvoIdFor\(session\)/);
-    expect(window).toMatch(/queued message/); // undelivered wording mentions the queue
-  });
-
-  // Bugbot on PR #158: dispatchMergedFlush also returns false while the
-  // session is still ALIVE (iv non-text-only queue, Codex validation/spawn
-  // failure, stdin write error) — paths that already surface their specific
-  // reason via reportSessionSendFailure. The "session ended" notice must be
-  // reserved for the session actually being gone, or those users get a
-  // duplicate AND factually wrong second message.
-  it('the "session ended" notice fires only when the session is actually dead/auto-stopped', () => {
-    const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
-    const drop = src.indexOf('[QUEUE] dropped queued message(s)');
-    expect(drop).toBeGreaterThan(-1);
-    // The drop log AND the "session ended" notice both sit inside a
-    // dead/auto-stopped gate: the gate opens before the drop log, and the
-    // notice follows the log inside the same branch.
-    const gate = src.lastIndexOf('if (!session.alive || session._autoStopped)', drop);
-    expect(gate).toBeGreaterThan(-1);
-    expect(gate).toBeLessThan(drop);
-    const window = src.slice(gate, drop + 1200);
-    expect(window).toMatch(/journalPublishNotice\(journalConvoIdFor\(session\)/);
-  });
-});
-
 describe('#165 index.js prompt-reply handler — value-shape classification retired (source inspection)', () => {
   it('index.js never classifies a queue tap by value shape (no isQueueReleaseTap usage)', () => {
     // The #165 label-hijack fix: a genuine answer whose label is literally
@@ -2207,5 +2172,142 @@ describe('busy-queue cancel unlinks a saved-media file the cancelled upload wrot
     expect(ok).toBe(false);
     expect(cleanup).not.toHaveBeenCalled();
     expect(session.queuedMessages).toHaveLength(1); // still queued
+  });
+});
+
+describe('queued-release lifecycle: failure ordering', () => {
+  const inherited = {
+    key: 'pr_1\0pr_1::0\0send', status: 'pending_inherited', convoId: 'c',
+    promptId: 'pr_1', itemId: 'pr_1::0', action: 'send', releasedIds: ['pr_1::0'], at: 1,
+  };
+
+  it('a throwing mutate thunk is logged and swallowed: the release is still published and reported durable', () => {
+    const publishPromptReply = vi.fn();
+    const warn = vi.fn();
+    const { emitRelease } = createQueuedReleaseLifecycle({
+      journalPublisher: { publishPromptReply }, releaseOutbox: { put: () => true }, log: { warn },
+    });
+    const result = emitRelease('convo-1', { promptId: 'pr_5', action: 'cancel', releasedIds: ['pr_5::0'] }, {
+      mutate: () => { throw new Error('splice failed'); },
+    });
+    expect(result).toBe(true);
+    expect(publishPromptReply).toHaveBeenCalledTimes(1);
+    expect(warn).toHaveBeenCalledWith(expect.stringContaining('splice failed'));
+  });
+
+  it('reconcile keeps the inherited record when the expired write-ahead fails', () => {
+    const remove = vi.fn();
+    const publishPromptReply = vi.fn();
+    const { reconcileReleaseOutbox } = createQueuedReleaseLifecycle({
+      journalPublisher: { publishPromptReply },
+      releaseOutbox: { list: () => [inherited], put: () => false, remove, sweepAcked: vi.fn() },
+      log: { warn: vi.fn() },
+    });
+    reconcileReleaseOutbox();
+    expect(remove).not.toHaveBeenCalled();
+    expect(publishPromptReply).not.toHaveBeenCalled();
+  });
+});
+
+describe('queued dispatcher: pending-input latch, Codex guards and batch scoping', () => {
+  function build(overrides = {}) {
+    const deps = {
+      dispatchMergedFlush: vi.fn(() => true),
+      emitRelease: vi.fn(() => true),
+      journalConvoIdFor: () => 'convo-1',
+      journalPublishNotice: vi.fn(),
+      runQueuedCleanup: vi.fn(),
+      queueRelease: {
+        listLive: vi.fn(() => [
+          { promptId: 'pr_1', itemId: 'pr_1::0' },
+          { promptId: 'pr_2', itemId: 'pr_2::0' },
+        ]),
+        dropItem: vi.fn(),
+      },
+      log: { log: vi.fn() },
+      ...overrides,
+    };
+    return { deps, dispatcher: createQueuedDispatcher(deps) };
+  }
+  const queued = [[{ type: 'text', text: 'hello' }]];
+
+  it('closes the latch input window exactly once on delivery, rejection and throw', () => {
+    for (const dispatchMergedFlush of [vi.fn(() => true), vi.fn(() => false), vi.fn(() => { throw new Error('x'); })]) {
+      const finish = vi.fn();
+      const beginInput = vi.fn(() => finish);
+      const { dispatcher } = build({ restartLatch: { beginInput }, dispatchMergedFlush });
+      dispatcher.flushQueue({ agent: 'claude', alive: true, busy: false, roomId: '!r', queuedMessages: null }, queued);
+      expect(beginInput).toHaveBeenCalledTimes(1);
+      expect(finish).toHaveBeenCalledTimes(1);
+    }
+  });
+
+  it('holds the latch window open for an in-flight Codex steer and closes it once the steer settles', async () => {
+    let resolveSteer;
+    const finish = vi.fn();
+    const { dispatcher } = build({
+      restartLatch: { beginInput: () => finish },
+      commitDispatchedUserTurn: vi.fn(), journalPublishUserItem: vi.fn(), journalMirrorUserMedia: vi.fn(),
+      dispatchDeferredCommand: vi.fn(() => false), flushPendingSessionQueue: vi.fn(() => false), maybeFlushRoomDelivery: vi.fn(),
+      sessions: new Map(),
+    });
+    const session = {
+      agent: 'codex', alive: true, busy: true, roomId: '!r', queuedMessages: null,
+      codex: { transport: 'app-server', steer: () => new Promise((r) => { resolveSteer = r; }) },
+    };
+    expect(dispatcher.flushQueue(session, queued)).toBe('deferred');
+    expect(finish).not.toHaveBeenCalled();
+    resolveSteer(false);
+    await new Promise((r) => setImmediate(r));
+    expect(finish).toHaveBeenCalledTimes(1);
+  });
+
+  it('refuses a second steer while one is pending and restores the batch', () => {
+    const steer = vi.fn();
+    const { dispatcher } = build();
+    const session = {
+      agent: 'codex', alive: true, busy: true, roomId: '!r', queuedMessages: null,
+      _codexSteerPending: { queued: [] }, codex: { transport: 'app-server', steer },
+    };
+    expect(dispatcher.flushQueue(session, queued)).toBe(false);
+    expect(steer).not.toHaveBeenCalled();
+    expect(session.queuedMessages).toEqual(queued);
+  });
+
+  it('keeps the batch and reports failure when a busy Codex turn cannot be interrupted', () => {
+    const { dispatcher, deps } = build();
+    const session = {
+      agent: 'codex', alive: true, busy: true, roomId: '!r', queuedMessages: null,
+      codex: { interrupt: vi.fn(() => false) },
+    };
+    expect(dispatcher.flushQueue(session, queued)).toBe(false);
+    expect(session._codexInterrupted).toBe(false);
+    expect(session.queuedMessages).toEqual(queued);
+    expect(deps.dispatchMergedFlush).not.toHaveBeenCalled();
+  });
+
+  it('an explicit retry clears a held uncertain-steer flag before delivering', () => {
+    const { dispatcher } = build();
+    const session = { agent: 'claude', alive: true, busy: false, roomId: '!r', queuedMessages: null, _codexUncertainSteer: true };
+    expect(dispatcher.flushQueue(session, queued)).toBe(true);
+    expect(session._codexUncertainSteer).toBe(false);
+  });
+
+  it('scopes the release registry view to the batch, not the whole live registry', () => {
+    const { dispatcher, deps } = build();
+    const session = { queueNotifications: [{ id: 'pr_1::0' }, { id: 'pr_2::0' }] };
+    const view = dispatcher.queueReleaseForBatch(session, [queued[0]]);
+    expect(view.listLive('convo-1')).toEqual([{ promptId: 'pr_1', itemId: 'pr_1::0' }]);
+    view.dropItem('convo-1', 'pr_1::0');
+    expect(deps.queueRelease.dropItem).toHaveBeenCalledWith('convo-1', 'pr_1::0');
+  });
+
+  it('a queued compact command travels alone as the pending flush batch', () => {
+    const { dispatcher } = build();
+    const compact = [{ type: 'text', text: '/compact' }];
+    const other = [{ type: 'text', text: 'then continue' }];
+    expect(dispatcher.pendingFlushBatch({ queuedMessages: [compact, other] })).toEqual([compact]);
+    expect(dispatcher.pendingFlushBatch({ queuedMessages: [other, other] })).toEqual([other, other]);
+    expect(dispatcher.pendingFlushBatch({})).toEqual([]);
   });
 });

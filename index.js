@@ -155,7 +155,9 @@ import { createSubagentConvoTracker } from './lib/subagent-convos.js';
 import { createQueuedReleaseOutbox } from './lib/queued-release-outbox.js';
 import { createSubagentRunningStore } from './lib/subagent-running-store.js';
 import { selectStrandedChildren, strandedRepairFrames } from './lib/subagent-reconcile.js';
-import { planTransition, selectEpochRepairs } from './lib/session-state-repair.js';
+import { createSessionStateLifecycle } from './lib/session-state-lifecycle.js';
+import { createQueuedReleaseLifecycle } from './lib/queued-release-lifecycle.js';
+import { createQueuedDispatcher } from './lib/queued-dispatch.js';
 import { createRunStateOutbox } from './lib/run-state-outbox.js';
 import { journalReemitCodexOutcomes } from './lib/codex-convos.js';
 import { formatSubagentToolBody, subagentToolStep } from './lib/subagent-tool-format.js';
@@ -1633,7 +1635,6 @@ const sessions = new Map(); // roomId -> session
 // `done` — see journalSessionState. On disk rather than in memory so a bridge RESTART mid-outage
 // does not lose the record and strand the row at `running` forever.
 const runStateOutbox = createRunStateOutbox({ file: RUN_STATE_OUTBOX_FILE, log: console });
-let _runStateRepairRunning = false;
 
 // Persistent, crash-safe write-ahead outbox for queued_release resolutions
 // (loop #536). Constructed here so it loads + relabels any inherited on-disk
@@ -1906,13 +1907,6 @@ function journalPublish(session, method, payload, options) {
   }
 }
 
-// Transactional release seam (loop #536, spec §3). Order: write-ahead a durable
-// `pending` outbox record → (if a mutate thunk is supplied) run the irreversible
-// queue mutation → publish with a deterministic idem_key. FAIL-CLOSED: if the
-// write-ahead can't durably persist, ABORT before the mutation and the publish
-// (return false), leaving the card actionable — a failed durability prerequisite
-// must never let the irreversible mutation proceed with no recoverable record.
-// Returns true on a durable emit, false on a fail-closed abort.
 // Reconnect handler (hoisted so the createJournalPublisher arg block stays free
 // of a nested `});`). Re-emits Codex outcomes (upstream behavior) and drives the
 // queued-release durability retry + one-shot boot reconcile (loop #536).
@@ -1939,127 +1933,25 @@ function journalOnReconnect() {
   scheduleReleaseReconcile();
 }
 
-function emitRelease(convoId, { promptId, action, releasedIds }, { mutate } = {}) {
-  const itemId = (Array.isArray(releasedIds) && releasedIds.length)
-    ? releasedIds[0]
-    : `${promptId}::0`;
-  const at = Date.now();
-  const recordKey = `${promptId}\0${itemId}\0${action}`;
-  const durable = releaseOutbox.put(recordKey, {
-    convoId,
-    promptId,
-    itemId,
-    action,
-    releasedIds: Array.isArray(releasedIds) ? releasedIds : [itemId],
-    status: 'pending',
-    at,
-  });
-  if (!durable) {
-    console.warn(`[queued-release-outbox] write-ahead failed for ${recordKey} — aborting release (card stays actionable)`);
-    return false;
-  }
-  try { mutate?.(); }
-  catch (e) { console.warn(`[emitRelease] mutate thunk threw for ${recordKey}: ${e?.message ?? String(e)}`); }
-  journalPublisher.publishPromptReply(convoId, {
-    kind: 'queued_release',
-    prompt_id: promptId,
-    action,
-    released: releasedIds,
-    at,
-  }, { idemKey: `qr\0${promptId}\0${itemId}\0${action}` });
-  return true;
+const releaseLifecycle = createQueuedReleaseLifecycle({
+  releaseOutbox, journalPublisher,
+  quietMs: Number(process.env.MATRON_QUEUED_RELEASE_RECONCILE_QUIET_MS) || 750,
+});
+// Transactional release seam. Order: write-ahead a durable
+// `pending` outbox record → (if a mutate thunk is supplied) run the irreversible
+// queue mutation → publish with a deterministic idem_key. FAIL-CLOSED: if the
+// write-ahead can't durably persist, ABORT before the mutation and the publish
+// (return false), leaving the card actionable — a failed durability prerequisite
+// must never let the irreversible mutation proceed with no recoverable record.
+// Returns true on a durable emit, false on a fail-closed abort.
+function emitRelease(convoId, payload, options) {
+  return releaseLifecycle.emitRelease(convoId, payload, options);
 }
-
-// In-process retry driver (spec §3 step 6). Re-publishes every SAME-EPOCH
-// `pending` outbox record whose frame is not already in the outbound queue,
-// with its deterministic idem_key (so a re-publish of an already-journaled
-// release is a server-side dedup no-op). SKIPS `pending_inherited` (the state
-// gate — only boot reconcile touches those) and `acked`. Fired by two triggers
-// (onSendCapacity + onReconnect); the in-progress flag coalesces overlapping
-// fires into one pass.
-let _republishingReleases = false;
 function republishPendingReleases() {
-  if (_republishingReleases) return;
-  // O(1) fast path: this fires per confirmed frame on the hot output path
-  // (onSendCapacity). With no retry-eligible records the pendingCount gate
-  // avoids an O(all-releases-since-boot) list() allocation per streamed delta.
-  if (releaseOutbox.pendingCount() === 0) return;
-  _republishingReleases = true;
-  try {
-    for (const rec of releaseOutbox.list()) {
-      if (rec.status !== 'pending') continue; // skip pending_inherited + acked
-      const idemKey = `qr\0${rec.promptId}\0${rec.itemId}\0${rec.action}`;
-      if (journalPublisher.hasQueuedIdem(idemKey)) continue; // frame still queued
-      journalPublisher.publishPromptReply(rec.convoId, {
-        kind: 'queued_release',
-        prompt_id: rec.promptId,
-        action: rec.action,
-        released: rec.releasedIds,
-        at: rec.at,
-      }, { idemKey });
-    }
-  } finally {
-    _republishingReleases = false;
-  }
-}
-
-// Boot reconciliation (spec §5). The SOLE toucher of `pending_inherited`. For
-// each inherited orphan (a release a prior process wrote but never got acked),
-// emit a terminal `expired` release via the normal write-ahead path — never
-// blind-re-publish the original send/cancel (device_id may differ post-restart,
-// so a re-publish could double-ink; expired is the conservative honest state).
-function reconcileReleaseOutbox() {
-  for (const rec of releaseOutbox.list()) {
-    if (rec.status !== 'pending_inherited') continue;
-    const expiredKey = `${rec.promptId}\0${rec.itemId}\0expired`;
-    // emitRelease write-aheads the expired-recovery record (key === expiredKey,
-    // status `pending`) BEFORE publishing, then publishes the terminal `expired`
-    // release. On a second boot where the inherited record IS the expired record
-    // this relabels it back to `pending` in place under the same key. Returns
-    // false (fail-closed) if the durable write-ahead can't persist.
-    const emitted = emitRelease(rec.convoId, {
-      promptId: rec.promptId,
-      action: 'expired',
-      releasedIds: [rec.itemId],
-    });
-    // F2: only remove the inherited original when the expired release was
-    // durably emitted. If emitRelease fail-closed (disk fault), keep the
-    // inherited record so a later boot retries — never delete with nothing
-    // published, else `_releaseReconciled` would permanently orphan the card.
-    // F1 self-delete guard: also require rec.key !== expiredKey — on an
-    // expired-on-expired second boot the keys match, so we must NOT delete the
-    // record we just re-wrote.
-    if (emitted && rec.key !== expiredKey) releaseOutbox.remove(rec.key);
-  }
-  releaseOutbox.sweepAcked();
-}
-
-// --- Boot-reconcile deferral (F1 timing fix) ---
-// reconcileReleaseOutbox must NOT run before the reconnect replay that carries
-// the echo of a committed-but-unacked release (that echo flips the record
-// pending_inherited -> acked, so reconcile then correctly skips it). We defer
-// reconcile behind a quiet-period timer, re-armed by every replayed journal
-// frame, so it fires only once the replay stream has been quiet for the window.
-// One-shot: inherited records are a boot-only concern, so we reconcile exactly
-// once (the first hello_ok's replay); after that the timer is null forever.
-// Quiet window overridable via env (short by default — a boot replay burst is
-// bounded and steady-state single-convo traffic isn't sub-window-continuous).
-const RELEASE_RECONCILE_QUIET_MS = Number(process.env.MATRON_QUEUED_RELEASE_RECONCILE_QUIET_MS) || 750;
-let _releaseReconciled = false;
-let _releaseReconcileTimer = null;
-function runReleaseReconcile() {
-  _releaseReconcileTimer = null;
-  if (_releaseReconciled) return;
-  _releaseReconciled = true;
-  reconcileReleaseOutbox();
+  return releaseLifecycle.republishPendingReleases();
 }
 function scheduleReleaseReconcile() {
-  if (_releaseReconciled) return;
-  if (_releaseReconcileTimer) clearTimeout(_releaseReconcileTimer);
-  _releaseReconcileTimer = setTimeout(runReleaseReconcile, RELEASE_RECONCILE_QUIET_MS);
-  if (_releaseReconcileTimer && typeof _releaseReconcileTimer.unref === 'function') {
-    _releaseReconcileTimer.unref();
-  }
+  return releaseLifecycle.scheduleReleaseReconcile();
 }
 
 function journalUpsertConvo(session, opts, options) {
@@ -2137,139 +2029,18 @@ const sessionStateLatch = createSessionStateLatch({
   resolveSession: (convoId) => findSessionByClaudeSessionId(convoId),
   warn: (m) => console.warn(m),
 });
+const sessionStateLifecycle = createSessionStateLifecycle({
+  runStateOutbox, sessionStateLatch, journalConvoIdFor, journalPublisher, sessions,
+  enabled: () => JOURNAL_ENABLED,
+});
 function journalSessionState(session, state) {
-  // Write-ahead the attempted transition to the durable outbox BEFORE publishing. The change-gate
-  // above advances on ENQUEUE, but the durable queue drops its OLDEST frame on overflow, so without
-  // a record an evicted transition is never retried and the convo's row stays at the pre-transition
-  // state forever (a stranded `running` renders as a permanent "Thinking" in every client). Keyed by
-  // convo id, not by session: the terminal paths delete the session from `sessions` immediately
-  // BEFORE publishing `done`, so a session-keyed record would miss exactly the case this repairs.
-  //
-  // The record is deliberately NOT settled here on local-send completion. There is no per-frame
-  // server commit ack on this WS path, and the publisher's onLocalSendComplete fires when the frame
-  // leaves the local socket buffer, NOT when the server persists it (see journal-publisher pump()).
-  // Settling on that callback was the earlier bug: a `done` frame whose write callback fired but
-  // whose connection dropped before the server committed cleared the outbox record, leaving the row
-  // stuck `running` with nothing left to reconcile — a permanent, unrecoverable "Thinking".
-  //
-  // Instead the reconnect reconciliation sweep is the settle authority: republishSessionStates
-  // (selectEpochRepairs) reads the surviving record on every accepted reconnect AND on returned send
-  // capacity (retryRunStateRepairs), re-offers a live convo's state, and retires an unowned `running`
-  // to `done` (an earlier bridge change). That sweep publishes and settles against the recorded revision token,
-  // so a lost initial send self-heals via the re-offer instead of stranding. See
-  // lib/session-state-repair.js for the gate + write-ahead + latch decision.
-  const convoId = journalConvoIdFor(session);
-  const { publish, latch } = planTransition(
-    session._journalState,
-    state,
-    // undefined (not null) when there is no convo id: the payload is buffered for a later
-    // flush rather than published, so there is nothing to protect and nothing has failed.
-    () => (convoId ? runStateOutbox.note(convoId, state) : undefined),
-  );
-  if (!publish) {
-    session._journalState = latch;
-    return;
-  }
-  // Publish through the eviction-aware latch (lib/journal-session-state.js) so the frame carries
-  // its onEvicted hook: if queue overflow drops it, the latch is released on the live session and
-  // the convo's state is re-offered on the next send-capacity tick. This COMPOSES with the outbox
-  // above: the outbox is the durable, reconnect-authoritative repair (survives a restart); the
-  // eviction hook is the fast in-process repair on a healthy socket. planTransition has already
-  // made the change-gate decision, so clear the latch for offer() (which would otherwise dedupe
-  // against it), then restore planTransition's verdict — `undefined` after a failed write-ahead.
-  session._journalState = undefined;
-  sessionStateLatch.offer(session, state);
-  session._journalState = latch;
+  return sessionStateLifecycle.journalSessionState(session, state);
 }
-
-// Repair the session_state latch across a connection epoch — the exact analogue of
-// republishSessionSummaries below, for the same defect.
-//
-// journalSessionState records "already sent" on ENQUEUE, not on acceptance: it advances
-// session._journalState and then hands the frame to the durable queue, which DROPS THE OLDEST
-// frame on overflow (journal-publisher enqueue()). So a terminal transition evicted during an
-// outage backlog is never retried — the latch says it went out — and the conversation's durable
-// row stays `running` forever on a session that then goes quiet.
-//
-// That is unfixable from the client BY CONSTRUCTION: the web reconcile (matron-web#28) prunes a
-// stale activity indicator against the durable session_state, so when the durable state is
-// itself wrong it keeps rendering "Thinking" and is right to. The outage IS the failure window,
-// so clearing the latch on every accepted hello_ok and re-offering the current state is the
-// matching repair. Idempotent: the server COALESCEs an unchanged session_state, so re-sending
-// one is inert. Bounded by the number of LIVE in-memory sessions.
 function republishSessionStates() {
-  if (!JOURNAL_ENABLED) return;
-  // Re-entrancy latch. A successful best-effort enqueue can pump, confirm and fire
-  // onSendCapacity synchronously on an injected transport, landing right back here mid-sweep.
-  // Same coalescing discipline as republishSessionSummaries / republishPendingReleases.
-  if (_runStateRepairRunning) return;
-  _runStateRepairRunning = true;
-  try {
-    // Convos a LIVE session currently owns — same signal reconcileStrandedSubagents uses.
-    const liveConvoIds = new Set();
-    for (const session of sessions.values()) {
-      if (!session?.alive) continue;
-      const convoId = journalConvoIdFor(session);
-      if (convoId) liveConvoIds.add(convoId);
-    }
-    const { reoffer, retire } = selectEpochRepairs(runStateOutbox.list(), liveConvoIds);
-
-    // NON-EVICTING path throughout, deliberately: the ordinary enqueue drops the oldest queued
-    // frame when the queue is full, and at reconnect that backlog is real user traffic (prompts,
-    // permission replies). retain:false so a refused offer is not held as a snapshot that could
-    // later land on top of a newer transition — it stays in the outbox and is re-offered on the
-    // next capacity window, recomputed from whatever the state is by then.
-    // `recorded` is what the OUTBOX holds; `publish` is what goes on the wire. They differ for a
-    // retirement, which publishes `done` against a record that still says `running` — settling on
-    // the published value would never match, so the record would survive, the capacity hook would
-    // re-sweep it, and every confirmed `done` would schedule another one. An endless publish loop
-    // against a row that is already correct.
-    const offer = (convoId, token, publish) =>
-      journalPublisher.upsertConvoBestEffort(convoId, { sessionState: publish }, {
-        retain: false,
-        // Settle the exact REVISION this sweep acted on. A retirement publishes `done` against a
-        // record that says `running`, so matching on the published state would never clear it and
-        // the capacity hook would re-publish forever; matching on the revision also means a
-        // conversation that resumed since this offer keeps its newer record.
-        onLocalSendComplete: () => runStateOutbox.settle(convoId, token),
-      });
-
-    let refused = 0;
-    let queued = 0;
-    for (const { convoId, state, token } of reoffer) {
-      if (offer(convoId, token, state) === false) refused += 1;
-      else queued += 1;
-    }
-    // Stranded `running` with nothing alive to own it: the process running that convo is gone, so
-    // the row can never be flipped by the session itself and every client shows a "Thinking" that
-    // will never clear. Retire it to `done` — the same terminal-owner call reconcileStrandedSubagents
-    // makes for child convos.
-    let retireQueued = 0;
-    for (const { convoId, token } of retire) {
-      if (offer(convoId, token, 'done') === false) refused += 1;
-      else { queued += 1; retireQueued += 1; }
-    }
-    // Deliberately says QUEUED, not "retired"/"repaired": offer() only puts the frame on the
-    // outbound queue. Reporting success here during the exact outage this diagnoses would be a
-    // false signal to whoever is reading the log to find out what happened.
-    if (retireQueued) {
-      console.log(`[run-state-repair] queued done for ${retireQueued} stranded running convo(s) with no live session`);
-    }
-    if (refused) {
-      console.warn(`[run-state-repair] ${refused} of ${queued + refused} run-state re-offer(s) refused (queue full) — retained for the next capacity window`);
-    }
-  } finally {
-    _runStateRepairRunning = false;
-  }
+  return sessionStateLifecycle.republishSessionStates();
 }
-
-// Send-completion retry — the trigger that does NOT need another reconnect. hello_ok fires
-// onReconnect BEFORE the backlog pumps, so on a connection that comes back with the queue still
-// full every re-offer is refused; without this, a healthy socket that never disconnects again
-// would leave those rows stranded forever. Gated on the map being non-empty so the common case
-// (nothing outstanding) costs one size check per confirmed send, not a sweep.
 function retryRunStateRepairs() {
-  if (runStateOutbox.size() > 0) republishSessionStates();
+  return sessionStateLifecycle.retryRunStateRepairs();
 }
 
 // Mirror the bridge's current activity into an ephemeral typing/activity
@@ -6823,199 +6594,27 @@ function dispatchMergedFlush(session, queued) {
   return true;
 }
 
-function queuedReleaseItemIds(session, queued) {
-  const batchSize = Array.isArray(queued) ? queued.length : 0;
-  return new Set(
-    (session.queueNotifications || [])
-      .slice(0, batchSize)
-      .map(notification => notification?.id)
-      .filter(Boolean),
-  );
-}
-
-function liveQueuedReleaseEntries(convoId, itemIds) {
-  return journalInputConsumer.queueRelease.listLive(convoId)
-    .filter(entry => itemIds.has(entry.itemId));
-}
-
-function snapshotQueuedReleaseBatch(session, queued) {
-  const convoId = journalConvoIdFor(session);
-  return {
-    convoId,
-    entries: liveQueuedReleaseEntries(
-      convoId,
-      queuedReleaseItemIds(session, queued),
-    ),
-  };
-}
-
-// The prefix of session.queuedMessages the NEXT flush will actually send —
-// the whole queue normally, or just a leading /compact when one is jumping
-// (lib/compact-priority.js). Every release-registry seam has to be scoped to
-// that batch: handed the whole queue instead, finalizeSentQueue would emit
-// `send` releases for messages still sitting in the queue, retiring their
-// cards while they wait for the compaction to finish.
-function pendingFlushBatch(session) {
-  const queue = session.queuedMessages || [];
-  return queue.slice(0, compactBatchSize(queue));
-}
-
-function queueReleaseForBatch(session, queued) {
-  const itemIds = queuedReleaseItemIds(session, queued);
-  return {
-    listLive: (convoId) => liveQueuedReleaseEntries(convoId, itemIds),
-    dropItem: (convoId, itemId) => {
-      journalInputConsumer.queueRelease.dropItem(convoId, itemId);
-    },
-  };
-}
-
-// action: 'send' for a batch that went out; 'expired' for one dropped
-// because its session ended first — either way the batch's cards stop
-// waiting on the user, and the release (a prompt_reply naming each card's
-// prompt_id) is how the journal hears it.
-function finalizeSentQueue(convoId, flushedSnapshot, action = 'send') {
-  const liveByItemId = new Map(
-    journalInputConsumer.queueRelease.listLive(convoId)
-      .map(entry => [entry.itemId, entry]),
-  );
-  for (const { itemId } of flushedSnapshot || []) {
-    const liveEntry = liveByItemId.get(itemId);
-    if (!liveEntry) continue;
-    // Fail-closed (F2): retire the live entry ONLY when the durable write-ahead
-    // committed. If emitRelease fail-closed (write-ahead disk fault, e.g.
-    // ENOSPC), keep the live registry entry so a later release attempt / boot
-    // reconcile can still recover the card — dropping it unconditionally here
-    // would leave a permanently dead card with no durable record, silently.
-    if (emitRelease(convoId, {
-      promptId: liveEntry.promptId,
-      action,
-      releasedIds: [itemId],
-    })) {
-      journalInputConsumer.queueRelease.dropItem(convoId, itemId);
-      liveByItemId.delete(itemId);
-    }
-  }
-}
-
-function restoreQueuedBatch(session, queued) {
-  const pending = session.queuedMessages || [];
-  if (pending === queued) return;
-  session.queuedMessages = [...queued, ...pending];
-}
-
+const queuedDispatcher = createQueuedDispatcher({
+  get queueRelease() { return journalInputConsumer.queueRelease; },
+  get restartLatch() { return restartLatch; },
+  emitRelease, journalConvoIdFor, dispatchMergedFlush, journalPublishNotice, runQueuedCleanup,
+  sessions, commitDispatchedUserTurn, journalPublishUserItem, journalMirrorUserMedia,
+  dispatchDeferredCommand, flushPendingSessionQueue, maybeFlushRoomDelivery,
+});
 function flushQueue(session, queued, releaseSnapshot = null) {
-  const finishInput = restartLatch?.beginInput();
-  let steering = false;
-  try {
-    const snapshot = releaseSnapshot || snapshotQueuedReleaseBatch(session, queued);
-    const restore = () => {
-      restoreQueuedBatch(session, queued);
-      // A separately submitted async answer has no queue card yet. Preserve the
-      // queue/notification alignment if it must join the queue for a retry.
-      if (snapshot.notifications) {
-        const current = session.queueNotifications || [];
-        session.queueNotifications = [...snapshot.notifications.filter(n => !current.includes(n)), ...current];
-      }
-    };
-    // A parked restart must keep the queue for the replacement, including
-    // native Codex steering; never send into a process about to be replaced.
-    if (typeof session._deferredCommandText === 'string' && session._deferredCommandText.startsWith('!restart')) {
-      restore();
-      journalPublishNotice(journalConvoIdFor(session), '⏳ A restart is pending for this session — queued messages go to the restarted session instead.');
-      return false;
-    }
-    session._codexUncertainSteer = false; // an explicit retry may release held input
-    if (session.codex?.transport === 'app-server' && session.busy && !hasQueuedCompact(queued)) {
-      if (session._codexSteerPending) { restore(); return false; }
-      const { blocks, mirrorText } = planQueueFlush(queued);
-      const notifications = snapshot.notifications || (session.queueNotifications || []).slice(0, queued.length);
-      session._codexSteerPending = { queued };
-      const pending = session.codex.steer(blocks);
-      steering = true;
-      void pending.then(sent => {
-        session._codexSteerPending = false;
-        if (!session.alive || sessions.get(session.roomId) !== session) return;
-        if (sent) {
-          commitDispatchedUserTurn(session, blocks.filter(b => b.type === 'text').map(b => b.text).join('\n\n'), null);
-          if (mirrorText) journalPublishUserItem(session, 'publishText', { body: mirrorText, from: 'user' });
-          for (const entry of queued) for (const payload of pendingMediaMirror(entry)) journalMirrorUserMedia(session, payload);
-          finalizeSentQueue(snapshot.convoId, snapshot.entries);
-          session.queueNotifications = (session.queueNotifications || []).filter(n => !notifications.includes(n));
-        } else {
-          restore();
-          session._codexUncertainSteer = session.codex.steerUncertain === true;
-          journalPublishNotice(snapshot.convoId, session._codexUncertainSteer
-            ? 'Codex did not confirm delivery. Your messages are retained, but will not resend automatically. Check the response before choosing Send or Cancel.'
-            : 'Codex could not steer this turn. Your messages are still queued for its end.');
-        }
-        if (!session.busy && !session._codexUncertainSteer) {
-          if (!dispatchDeferredCommand(session) && !flushPendingSessionQueue(session)) maybeFlushRoomDelivery(session);
-        }
-      }).catch(() => {
-        session._codexSteerPending = false;
-        if (!session.alive) return;
-        restore();
-        session._codexUncertainSteer = true;
-        journalPublishNotice(snapshot.convoId, 'Could not confirm Codex delivery. Messages retained; check before resending.');
-      }).finally(() => finishInput?.());
-      return 'deferred';
-    }
-    if (session.agent === AGENT_CODEX && session.busy) {
-      // Claude's stream-json stdin can accept a forced follow-up while the
-      // current process is alive; codex exec cannot. Preserve the detached
-      // batch, interrupt the active child, and let finishCodexTurn dispatch it
-      // after that child has exited and released the adapter's process slot.
-      restore();
-      session._codexInterrupted = true;
-      if (session.codex?.interrupt('SIGINT')) return 'deferred';
-      session._codexInterrupted = false;
-      console.log(`[QUEUE] could not interrupt active Codex turn; kept ${queued.length} queued message(s)`);
-      return false;
-    }
-    let delivered;
-    try {
-      delivered = dispatchMergedFlush(session, queued);
-    } catch (e) {
-      restore();
-      console.log(`[QUEUE] dispatch threw; kept ${queued.length} queued message(s) for retry (room ${session.roomId}): ${e?.message ?? String(e)}`);
-      return false;
-    }
-    if (!delivered) {
-      // dispatchMergedFlush fails in two distinct situations that must NOT be
-      // handled the same way:
-      //   1. The session is gone (dead / auto-stopped). There is nothing to
-      //      retry against, so retaining would strand the batch forever. Every
-      //      entry was acknowledged with a success-style "📨 Queued" tile, so a
-      //      silent server-side drop leaves the user believing it was delivered
-      //      (the misleading-success bug fixed earlier for attachments, and for
-      //      queued messages). Notify + drop — matching merged master.
-      //   2. The session is ALIVE but refused this flush (iv non-text-only
-      //      queue, Codex validation/spawn failure, stdin write error). Each of
-      //      those already surfaced its specific reason via
-      //      reportSessionSendFailure, and the session is still there to retry
-      //      against, so retain the batch for a later flush rather than dropping.
-      if (!session.alive || session._autoStopped) {
-        console.log(`[QUEUE] dropped queued message(s) (room ${session.roomId})`);
-        if (Array.isArray(queued)) for (const entry of queued) runQueuedCleanup(entry);
-        // Their cards would otherwise sit offering Send / Cancel for messages
-        // that no longer exist, and read as unanswered in the journal.
-        finalizeSentQueue(snapshot.convoId, snapshot.entries, 'expired');
-        // journalPublishNotice already no-ops on a falsy convo id and fails
-        // open like every journal call.
-        const count = Array.isArray(queued) ? queued.length : 0;
-        journalPublishNotice(journalConvoIdFor(session), count > 1
-          ? `⚠️ Couldn't deliver ${count} queued messages — the session ended before they were sent.`
-          : "⚠️ Couldn't deliver your queued message — the session ended before it was sent.");
-        return false;
-      }
-      restore();
-      console.log(`[QUEUE] could not send queued message(s); kept ${queued.length} queued message(s) for retry (room ${session.roomId})`);
-      return false;
-    }
-    finalizeSentQueue(snapshot.convoId, snapshot.entries);
-    return true;
-  } finally { if (!steering) finishInput?.(); }
+  return queuedDispatcher.flushQueue(session, queued, releaseSnapshot);
+}
+function snapshotQueuedReleaseBatch(session, queued) {
+  return queuedDispatcher.snapshotQueuedReleaseBatch(session, queued);
+}
+function pendingFlushBatch(session) {
+  return queuedDispatcher.pendingFlushBatch(session);
+}
+function queueReleaseForBatch(session, queued) {
+  return queuedDispatcher.queueReleaseForBatch(session, queued);
+}
+function restoreQueuedBatch(session, queued) {
+  return queuedDispatcher.restoreQueuedBatch(session, queued);
 }
 
 function splitMessage(text) {
@@ -12707,9 +12306,9 @@ function journalHandleInboundEvent(frame) {
   // Re-arm the deferred boot reconcile (F1) while one is pending: every inbound
   // frame pushes the quiet-timer out (during the post-reconnect burst these are
   // the replay frames, which carry the release echoes), so reconcile runs only
-  // once that stream has gone quiet. No-op after the one-shot reconcile has fired
-  // (_releaseReconcileTimer is null), so steady-state traffic pays only a null check.
-  if (_releaseReconcileTimer) scheduleReleaseReconcile();
+  // once that stream has gone quiet. A no-op after the one-shot reconcile has
+  // fired: the lifecycle only re-arms a timer while boot reconciliation is pending.
+  releaseLifecycle.onInboundEvent();
 }
 
 // Leave ONE room binding whose session key no longer resolves to a

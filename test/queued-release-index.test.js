@@ -1,57 +1,31 @@
 import { describe, it, expect, vi } from 'vitest';
-import { readFileSync, mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { runInNewContext } from 'node:vm';
+import { createQueuedReleaseLifecycle } from '../lib/queued-release-lifecycle.js';
+import { createQueuedDispatcher } from '../lib/queued-dispatch.js';
 import { createJournalInputConsumer } from '../lib/journal-input-router.js';
 import { createQueuedReleaseOutbox } from '../lib/queued-release-outbox.js';
 
-// Extract the queued-release seam (emitRelease + republishPendingReleases +
-// reconcileReleaseOutbox + the boot-reconcile quiet-timer helpers) from index.js
-// and eval it in a sandbox with injected `releaseOutbox` + `journalPublisher`
-// stubs. This mirrors the source-extraction pattern already used by
-// busy-queue.test.js for emitRelease.
-//
-// The seam now reads process.env (RELEASE_RECONCILE_QUIET_MS) and arms a
-// setTimeout, so the sandbox provides a controllable process/timer surface:
-// setTimeout captures the callback (fire it via seam.__timers.fire()) and counts
-// arms, clearTimeout resets it.
-function loadSeam({ releaseOutbox, journalPublisher, env = {} }) {
-  const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
-  const start = src.indexOf('function emitRelease(convoId, { promptId, action, releasedIds }');
-  const end = src.indexOf('\nfunction journalUpsertConvo', start);
-  expect(start).toBeGreaterThan(-1);
-  expect(end).toBeGreaterThan(start);
+function loadSeam({ releaseOutbox, journalPublisher }) {
   const timers = {
     cb: null,
     arms: 0,
     cleared: 0,
     fire() { const cb = this.cb; this.cb = null; if (cb) cb(); },
   };
-  const sandbox = {
-    releaseOutbox,
-    journalPublisher,
-    console,
-    Date,
-    process: { env },
-    setTimeout: (cb) => { timers.cb = cb; timers.arms += 1; return { unref() {} }; },
-    clearTimeout: () => { timers.cleared += 1; timers.cb = null; },
+  return {
+    ...createQueuedReleaseLifecycle({
+      releaseOutbox, journalPublisher,
+      setTimer: (cb) => { timers.cb = cb; timers.arms += 1; return { unref() {} }; },
+      clearTimer: () => { timers.cleared += 1; timers.cb = null; },
+    }),
+    __timers: timers,
   };
-  runInNewContext(src.slice(start, end), sandbox);
-  sandbox.__timers = timers;
-  return sandbox; // exposes emitRelease, republishPendingReleases, reconcileReleaseOutbox, scheduleReleaseReconcile
 }
 
-// finalizeSentQueue lives outside the emitRelease seam; extract it on its own.
 function loadFinalize({ emitRelease, journalInputConsumer }) {
-  const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
-  const start = src.indexOf('function finalizeSentQueue(convoId, flushedSnapshot');
-  const end = src.indexOf('\nfunction restoreQueuedBatch', start);
-  expect(start).toBeGreaterThan(-1);
-  expect(end).toBeGreaterThan(start);
-  const sandbox = { emitRelease, journalInputConsumer, Map, console };
-  runInNewContext(src.slice(start, end), sandbox);
-  return sandbox;
+  return createQueuedDispatcher({ emitRelease, queueRelease: journalInputConsumer.queueRelease });
 }
 
 const SEND_IDEM = 'qr\0pr_1\0pr_1::0\0send';
@@ -165,6 +139,14 @@ describe('index.js reconcileReleaseOutbox', () => {
 // end) with a controllable timer.
 describe('index.js boot-reconcile deferral (F1 timing fix)', () => {
   let dir;
+  it('ignores inbound traffic before reconciliation has been armed', () => {
+    const list = vi.fn(() => []);
+    const seam = loadSeam({ releaseOutbox: { list }, journalPublisher: {} });
+    seam.onInboundEvent();
+    expect(seam.__timers.arms).toBe(0);
+    expect(list).not.toHaveBeenCalled();
+  });
+
   function outboxWithInheritedSend() {
     dir = mkdtempSync(join(tmpdir(), 'qr-reconcile-'));
     const file = join(dir, 'outbox.json');
@@ -192,7 +174,7 @@ describe('index.js boot-reconcile deferral (F1 timing fix)', () => {
       // The reconnect replay carries the echo of the prior process's `send`.
       // markAcked flips pending_inherited -> acked; the frame re-arms the timer.
       outbox.markAcked('pr_1', 'send');
-      seam.scheduleReleaseReconcile();
+      seam.onInboundEvent();
       expect(seam.__timers.arms).toBe(2); // re-armed, still not run
       expect(outbox.list()[0].status).toBe('acked');
 
@@ -230,6 +212,7 @@ describe('index.js boot-reconcile deferral (F1 timing fix)', () => {
       seam.__timers.fire(); // reconciled once
       const armsAfter = seam.__timers.arms;
 
+      seam.onInboundEvent();
       seam.scheduleReleaseReconcile(); // already reconciled -> early return
       expect(seam.__timers.arms).toBe(armsAfter); // no new arm
     } finally {
@@ -266,9 +249,10 @@ describe('index.js finalizeSentQueue (F2 fail-closed send path)', () => {
     const emitRelease = vi.fn(() => true);
     const seam = loadFinalize({ emitRelease, journalInputConsumer: consumerStub(dropItem) });
 
-    seam.finalizeSentQueue('c', [{ itemId: 'i1' }]);
+    seam.finalizeSentQueue('c', [{ itemId: 'i1' }, { itemId: 'i1' }]);
 
-    expect(dropItem).toHaveBeenCalledWith('c', 'i1');
+    expect(dropItem).toHaveBeenCalledExactlyOnceWith('c', 'i1');
+    expect(emitRelease).toHaveBeenCalledTimes(1);
   });
 
   // A batch dropped because its session ended: the same durable release,

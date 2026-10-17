@@ -1,5 +1,6 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
+import { createQueuedDispatcher } from '../lib/queued-dispatch.js';
 
 // The restart_session tool's two ends: the MCP surface in ask-user.js and the
 // endpoint/session wiring in index.js. index.js can't be imported (it starts a
@@ -130,15 +131,33 @@ describe('index.js self-restart loop budget', () => {
   });
 
   it('keeps explicit queue releases from draining into a session with a parked restart', () => {
-    // send / send_one / the magic word all go through flushQueue; the queue
-    // carries into the replacement, so a parked !restart must hold it.
-    const start = src.indexOf('function flushQueue(');
-    const body = src.slice(start, src.indexOf('\n}', start));
-    const guard = body.indexOf("_deferredCommandText.startsWith('!restart')");
-    expect(guard).toBeGreaterThan(-1);
-    expect(guard).toBeLessThan(body.indexOf('dispatchMergedFlush('));
-    expect(body.slice(guard, guard + 400)).toMatch(/restore\(\)/);
-    expect(body).toMatch(/const restore = \(\) => \{\s*restoreQueuedBatch\(session, queued\)/);
+    const queued = [[{ type: 'text', text: 'Continue after restart' }]];
+    const pending = [{ type: 'text', text: 'Arrived later' }];
+    const notification = { id: 'message-a' };
+    const laterNotification = { id: 'message-b' };
+    const session = { alive: true, _deferredCommandText: '!restart --browser',
+      queuedMessages: [pending], queueNotifications: [laterNotification] };
+    const dispatchMergedFlush = vi.fn(() => true);
+    const emitRelease = vi.fn();
+    const journalPublishNotice = vi.fn();
+    const dispatcher = createQueuedDispatcher({
+      dispatchMergedFlush, emitRelease, journalPublishNotice,
+      journalConvoIdFor: () => 'convo', queueRelease: { listLive: () => [] },
+    });
+    const snapshot = { convoId: 'convo', entries: [], notifications: [notification] };
+    expect(dispatcher.flushQueue(session, queued, snapshot)).toBe(false);
+    expect(dispatchMergedFlush).not.toHaveBeenCalled();
+    expect(emitRelease).not.toHaveBeenCalled();
+    expect(session.queuedMessages).toEqual([...queued, pending]);
+    expect(session.queueNotifications).toEqual([notification, laterNotification]);
+    expect(journalPublishNotice).toHaveBeenCalledExactlyOnceWith('convo',
+      '⏳ A restart is pending for this session — queued messages go to the restarted session instead.');
+
+    delete session._deferredCommandText;
+    const restored = session.queuedMessages;
+    session.queuedMessages = [];
+    expect(dispatcher.flushQueue(session, restored)).toBe(true);
+    expect(dispatchMergedFlush).toHaveBeenCalledExactlyOnceWith(session, restored);
   });
 
   it('resets the count when the user sends text, handing back a fresh budget', () => {
