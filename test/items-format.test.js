@@ -218,6 +218,15 @@ describe('formatCommentAck', () => {
     expect(formatCommentAck({ item: open })).toBe('Comment added to #12 "Which auth library?"');
   });
 
+  it('warns when the owning session was not notified', () => {
+    const out = formatCommentAck({ item: open, owner_notified: false, owner_notice: 'owner session is offline' });
+    expect(out).toBe(`${formatCommentAck({ item: open })}\n⚠ owner session is offline`);
+  });
+
+  it('confirms when the owning session was notified', () => {
+    expect(formatCommentAck({ item: open, owner_notified: true })).toBe(`${formatCommentAck({ item: open })} (owner session notified)`);
+  });
+
   it('reports the new awaiting party when one was requested', () => {
     expect(formatCommentAck({ item: open }, 'user')).toBe('Comment added to #12 "Which auth library?" — awaiting now user');
     expect(formatCommentAck({ item: open }, null)).toBe('Comment added to #12 "Which auth library?" — awaiting now nobody');
