@@ -114,6 +114,63 @@ describe('createJournalInputConsumer', () => {
     expect(bareDeps.routeTextToSession).not.toHaveBeenCalled();
   });
 
+  describe('agent comment markers', () => {
+    const agentPayload = (extra = {}) => ({
+      item_id: 'it_1', num: 3, kind: 'task', title: 'T', action: 'commented', by: 'agent', awaiting: 'agent', resolution: null,
+      comment: { id: 'ic', body: 'heads up', attachments: [] },
+      agent_comment: true, from_convo_id: 'convo-b', from_label: 'Worker B', origin_convo_id: 'convo-1', ...extra,
+    });
+
+    it('turns another session\'s comment into a turn, named after the commenter', () => {
+      const deps = makeDeps({ routeItemToSession: vi.fn() });
+      const consumer = createJournalInputConsumer(deps);
+      const payload = agentPayload();
+      consumer(baseFrame({ type: 'item', sender: 'agent:box-2', payload }));
+      expect(deps.routeItemToSession).toHaveBeenCalledTimes(1);
+      expect(deps.routeItemToSession.mock.calls[0][2]).toEqual({ username: 'Worker B' });
+    });
+
+    it('falls back to a generic name when the commenter has no label', () => {
+      const deps = makeDeps({ routeItemToSession: vi.fn() });
+      createJournalInputConsumer(deps)(baseFrame({ type: 'item', sender: 'agent:box-2', payload: agentPayload({ from_label: '' }) }));
+      expect(deps.routeItemToSession.mock.calls[0][2]).toEqual({ username: 'another session' });
+    });
+
+    it('drops the marker in the commenter\'s own conversation', () => {
+      const deps = makeDeps({ routeItemToSession: vi.fn() });
+      createJournalInputConsumer(deps)(baseFrame({ type: 'item', sender: 'agent:box-2', payload: agentPayload({ from_convo_id: 'convo-1', origin_convo_id: undefined }) }));
+      expect(deps.routeItemToSession).not.toHaveBeenCalled();
+    });
+
+    it('still drops an ordinary agent-sender item marker', () => {
+      const deps = makeDeps({ routeItemToSession: vi.fn() });
+      const payload = agentPayload();
+      delete payload.agent_comment;
+      createJournalInputConsumer(deps)(baseFrame({ type: 'item', sender: 'agent:box-2', payload }));
+      expect(deps.routeItemToSession).not.toHaveBeenCalled();
+    });
+
+    it('does not trust the flag from a non-agent, non-user sender', () => {
+      const deps = makeDeps({ routeItemToSession: vi.fn() });
+      createJournalInputConsumer(deps)(baseFrame({ type: 'item', sender: 'person:eve', payload: agentPayload() }));
+      expect(deps.routeItemToSession).not.toHaveBeenCalled();
+    });
+
+    it('wakes a reaped session for an agent comment', () => {
+      const resumed = { claudeSessionId: 'convo-1', resumed: true };
+      const deps = makeDeps({
+        routeItemToSession: vi.fn(),
+        findSessionByConvoId: vi.fn(() => null),
+        resumeSessionForConvo: vi.fn(() => resumed),
+      });
+      createJournalInputConsumer(deps)(baseFrame({ type: 'item', sender: 'agent:box-2', payload: agentPayload() }));
+      expect(deps.resumeSessionForConvo).toHaveBeenCalledWith('convo-1', { username: 'Worker B' });
+      expect(deps.routeItemToSession).toHaveBeenCalledTimes(1);
+      expect(deps.routeItemToSession.mock.calls[0][0]).toBe(resumed);
+      expect(deps.noticeUnknownConvo).not.toHaveBeenCalled();
+    });
+  });
+
   it('an item marker wakes a reaped session, exactly as text does', () => {
     // Spec: a reply "wakes the box if asleep". Answering the agent's question
     // hours later — after the idle reaper took the session — is the case the

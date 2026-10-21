@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { formatItemTurn, createItemTurnRouter, isTurnWorthy } from '../lib/items-turn.js';
+import { formatItemTurn, createItemTurnRouter, isTurnWorthy, isAgentCommentMarker } from '../lib/items-turn.js';
 
 const base = { item_id: 'it_1', num: 12, kind: 'question', title: 'Which auth library?', by: 'user', awaiting: 'agent', resolution: null };
 
@@ -120,6 +120,40 @@ describe('formatItemTurn', () => {
     const t = formatItemTurn({ ...base, action: 'commented', awaiting: null, comment: { id: 'c', body: 'x', attachments: [] } }, {});
     expect(t).toContain('— the user replied:');
     expect(t).toContain('now awaiting: nobody.');
+  });
+});
+
+describe('agent comments', () => {
+  const marker = {
+    ...base, action: 'commented', agent_comment: true, from_convo_id: 'c-b', from_label: 'Worker\nB',
+    origin_convo_id: 'c-a', comment: { id: 'c', body: 'found a bug', attachments: [], action: 'Fix it' },
+  };
+
+  it('words the head as another agent session, never the user, and skips tapped-label logic', () => {
+    const t = formatItemTurn(marker, { username: 'Worker B', viewerConvoId: 'c-a' });
+    const lines = t.split('\n');
+    expect(lines[0]).toBe(`📌 Item #${base.num} "Which auth library?" — session "Worker B" (another agent session, not the user) commented:`);
+    expect(lines[1]).toBe('found a bug');
+    expect(t).not.toContain('tapped');
+    expect(t).not.toContain('(from ');
+    expect(lines.length).toBeGreaterThan(2);
+  });
+
+  it('falls back to another session when unlabelled', () => {
+    const t = formatItemTurn({ ...marker, from_label: undefined }, { viewerConvoId: 'c-a' });
+    expect(t).toContain('session "another session" (another agent session, not the user) commented:');
+  });
+
+  it('isAgentCommentMarker accepts only the owner-side agent comment shape', () => {
+    expect(isAgentCommentMarker(marker, 'c-a')).toBe(true);
+    expect(isAgentCommentMarker({ ...marker, origin_convo_id: undefined }, 'c-a')).toBe(true);
+    expect(isAgentCommentMarker(marker, 'c-b')).toBe(false);
+    expect(isAgentCommentMarker(marker, 'c-other')).toBe(false);
+    expect(isAgentCommentMarker({ ...marker, from_convo_id: 'c-a', origin_convo_id: undefined }, 'c-a')).toBe(false);
+    expect(isAgentCommentMarker({ ...marker, agent_comment: undefined }, 'c-a')).toBe(false);
+    expect(isAgentCommentMarker({ ...marker, action: 'closed' }, 'c-a')).toBe(false);
+    expect(isAgentCommentMarker({ ...marker, from_convo_id: '' }, 'c-a')).toBe(false);
+    expect(isAgentCommentMarker(null, 'c-a')).toBe(false);
   });
 });
 
