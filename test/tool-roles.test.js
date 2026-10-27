@@ -64,10 +64,17 @@ describe('buildClaudeSpawnEnv BRIDGE_TOOL_ROLE', () => {
   it('sets coordinator or worker with the opt-in', () => {
     const on = { BRIDGE_TOOL_FILTER: '1' };
     expect(build({ coordinator: true }, on).BRIDGE_TOOL_ROLE).toBe('coordinator');
-    expect(build({ coordinator: false }, on).BRIDGE_TOOL_ROLE).toBe('worker');
-    expect(build({}, on).BRIDGE_TOOL_ROLE).toBe('worker');
+    expect(build({ coordinator: false, roleKnown: true }, on).BRIDGE_TOOL_ROLE).toBe('worker');
     expect(build({ mode: 'iv', coordinator: true }, on).BRIDGE_TOOL_ROLE).toBe('coordinator');
-    expect(build({ mode: 'iv', coordinator: false }, on).BRIDGE_TOOL_ROLE).toBe('worker');
+    expect(build({ mode: 'iv', coordinator: false, roleKnown: true }, on).BRIDGE_TOOL_ROLE).toBe('worker');
+  });
+
+  it('gives the full list while the journal has not confirmed the role', () => {
+    const on = { BRIDGE_TOOL_FILTER: '1' };
+    expect(build({}, on).BRIDGE_TOOL_ROLE).toBe('full');
+    expect(build({ coordinator: false }, on).BRIDGE_TOOL_ROLE).toBe('full');
+    expect(build({ coordinator: false, roleKnown: false }, on).BRIDGE_TOOL_ROLE).toBe('full');
+    expect(build({ mode: 'iv', coordinator: false }, on).BRIDGE_TOOL_ROLE).toBe('full');
   });
 
   it('does not inherit a role from the bridge env', () => {

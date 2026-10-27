@@ -2585,6 +2585,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   }
   const coordinator = coordinatorRoleAtSpawn(roomId, resumeSessionId, options, persistedMode);
   options = { ...options, coordinator };
+  options.roleKnown = coordinatorLookup.snapshot().known === true;
   // A Claude session that changes cwd mid-flight (EnterWorktree is the common
   // case) has its transcript relocated to the NEW cwd's project dir, while the
   // bridge's persisted workdir stays where the session was spawned. Resuming
@@ -2766,6 +2767,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     showFileToken,
     permissionToken,
     coordinator: options.coordinator === true,
+    roleKnown: options.roleKnown === true,
   });
 
   const proc = launchWithCodexSinkEnv({
@@ -3727,6 +3729,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     showBashOutput: showBashOutputAtSpawn,
     showFileToken,
     coordinator: options.coordinator === true,
+    roleKnown: options.roleKnown === true,
   });
 
   debug(`Spawning interactive claude session ${sessionId} in ${cwd}`);

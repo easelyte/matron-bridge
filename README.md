@@ -327,6 +327,12 @@ narrow it:
 `would-hide` is how many registered tools a worker would not see. A change to
 either variable applies to sessions spawned afterwards.
 
+The role is fixed when the session spawns. A session whose role the journal has
+not confirmed yet (cold cache) gets `full`. A session made Coordinator while a
+question, permission prompt or resume hold is pending keeps its worker list
+until its next spawn (the same point where the Coordinator prompt and model
+apply), so respawn it to load the Coordinator tools.
+
 ## Memory & MCP tuning
 
 Sessions are lean by default so the bridge runs on small VPS boxes. Only the
