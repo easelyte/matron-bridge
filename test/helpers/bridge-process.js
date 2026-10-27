@@ -292,7 +292,7 @@ fs.watchFile(process.env.TRANSCRIPT_PATH, { interval: 25 }, async stat => {
     return {
       ready: true, confined, home, checkout, port, frames, supervisor, post, sendText,
       token(file = path.join(home, '.matron-bridge-restart.env')) {
-        return fs.readFileSync(file, 'utf8').trim().split('=')[1];
+        return fs.readFileSync(file, 'utf8').split('\n')[0].split('=')[1];
       },
       transcript(id) {
         const file = path.join(home, '.claude', 'projects', encodeProjectDir(workdir), `${id}.jsonl`);

@@ -810,7 +810,7 @@ if (PLANNED_RESTART_ENABLED) {
     process.env.MATRON_RESTART_ENV_FILE = RESTART_ENV_FILE;
     process.on('exit', () => {
       try {
-        if (restartTokenWritten && fs.readFileSync(RESTART_ENV_FILE, 'utf8') === `MATRON_RESTART_TOKEN=${RESTART_TOKEN}\n`) fs.unlinkSync(RESTART_ENV_FILE);
+        if (restartTokenWritten && fs.readFileSync(RESTART_ENV_FILE, 'utf8') === `MATRON_RESTART_TOKEN=${RESTART_TOKEN}\nMATRON_BRIDGE_API_PORT=${API_PORT}\n`) fs.unlinkSync(RESTART_ENV_FILE);
       }
       catch (error) { if (error.code !== 'ENOENT') console.warn('[restart] token cleanup failed'); }
     });
@@ -14557,7 +14557,7 @@ const apiServer = createServer(async (req, res) => {
 apiServer.listen(API_PORT, '127.0.0.1', () => {
   if (plannedRestartAvailable) {
     try {
-      atomicWriteFileSync(RESTART_ENV_FILE, `MATRON_RESTART_TOKEN=${RESTART_TOKEN}\n`, { mode: 0o600 });
+      atomicWriteFileSync(RESTART_ENV_FILE, `MATRON_RESTART_TOKEN=${RESTART_TOKEN}\nMATRON_BRIDGE_API_PORT=${API_PORT}\n`, { mode: 0o600 });
       restartTokenWritten = true;
     } catch {
       plannedRestartAvailable = false;

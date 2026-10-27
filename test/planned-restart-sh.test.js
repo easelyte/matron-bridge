@@ -16,7 +16,7 @@ afterEach(async () => {
 });
 // A real loopback HTTP server stands in for the bridge: the script calls an
 // absolute curl, so no binary can be substituted through PATH.
-async function fixture({ token = 'a'.repeat(64), statuses = ['200'], rotate = false, transport = false } = {}) {
+async function fixture({ token = 'a'.repeat(64), statuses = ['200'], rotate = false, rotatedPort, transport = false } = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'restart-client-'));
   roots.push(root);
   const file = path.join(root, '.matron-bridge-restart.env');
@@ -28,7 +28,7 @@ async function fixture({ token = 'a'.repeat(64), statuses = ['200'], rotate = fa
     req.on('end', () => {
       requests.push({ url: req.url, headers: req.headers, body });
       const status = statuses[requests.length - 1] ?? '200';
-      if (rotate && requests.length === 1) fs.writeFileSync(file, `MATRON_RESTART_TOKEN=${'b'.repeat(64)}\n`);
+      if (rotate && requests.length === 1) fs.writeFileSync(file, `MATRON_RESTART_TOKEN=${'b'.repeat(64)}\n${rotatedPort ? `MATRON_BRIDGE_API_PORT=${rotatedPort}\n` : ''}`);
       if (transport) { req.socket.destroy(); return; }
       res.writeHead(Number(status), { 'Content-Type': 'application/json' });
       res.end('{"state":"pending"}');
@@ -37,7 +37,7 @@ async function fixture({ token = 'a'.repeat(64), statuses = ['200'], rotate = fa
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   servers.push(server);
   const port = server.address().port;
-  return { file, root, requests,
+  return { file, root, port, requests,
     run(args = ['config "quoted"\nnext', '--sha', 'c'.repeat(40), '--request-key', 'alice'], { env = {}, viaBash = false } = {}) {
       const command = viaBash ? '/bin/bash' : script;
       const bare = viaBash === 'bare';
@@ -96,7 +96,9 @@ it('maps only connection-level curl failures to exit 4', async () => {
   const closedPort = closed.address().port;
   await new Promise(resolve => closed.close(resolve));
   const refused = await fixture();
-  expect((await refused.run(undefined, { env: { MATRON_BRIDGE_API_PORT: String(closedPort) } })).status).toBe(4);
+  const failure = await refused.run(undefined, { env: { MATRON_BRIDGE_API_PORT: String(closedPort) } });
+  expect(failure.status).toBe(4);
+  expect(failure.stderr).toContain(`retry after back (port ${closedPort})`);
   // A reply curl cannot parse as HTTP is not retryable: exit 2.
   const garbage = net.createServer(socket => { socket.end('not http at all\r\n\r\n', () => socket.destroy()); });
   servers.push(garbage);
@@ -125,12 +127,62 @@ it.each(['9802@example.com', '0', '65536', '99999', '080', '-1', '1e3'])('refuse
   expect(result.status).toBe(2);
   expect(f.requests).toHaveLength(0);
 });
-it('honours the port override only together with an explicit token file', () => {
-  // Sending to the real default port from a test is unsafe; assert the guard in source.
+it('retains the legacy default port without connecting to it', () => {
   const source = fs.readFileSync(script, 'utf8');
-  expect(source).toMatch(/\[\[ -z "\$\{MATRON_RESTART_ENV_FILE-\}" \]\] \|\| api_port=/);
-  expect(source).toMatch(/elif \[\[ -n "\$\{MATRON_BRIDGE_API_PORT:-\}" \]\]; then\n {2}port=/);
+  expect(source).toContain('port=9802');
   expect(source).toContain('http://127.0.0.1:${port}/restart');
+});
+it.each([false, true])('uses the file port with an explicit token path (%s)', async explicit => {
+  const f = await fixture();
+  fs.writeFileSync(f.file, `MATRON_RESTART_TOKEN=${'a'.repeat(64)}\nMATRON_BRIDGE_API_PORT=${f.port}\n`);
+  const result = await f.run(undefined, { env: {
+    MATRON_RESTART_ENV_FILE: explicit ? f.file : '',
+    // Without an explicit file, even an invalid ambient override is ignored.
+    MATRON_BRIDGE_API_PORT: explicit ? '' : 'invalid',
+  } });
+  expect(result.status).toBe(0);
+  expect(f.requests).toHaveLength(1);
+  expect(f.requests[0].headers['x-matron-restart-token']).toBe('a'.repeat(64));
+});
+it('lets an explicit override take precedence over the file port', async () => {
+  const target = await fixture();
+  const other = await fixture();
+  fs.writeFileSync(target.file, `MATRON_RESTART_TOKEN=${'a'.repeat(64)}\nMATRON_BRIDGE_API_PORT=${other.port}\n`);
+  expect((await target.run()).status).toBe(0);
+  expect(target.requests).toHaveLength(1);
+  expect(other.requests).toHaveLength(0);
+});
+it.each([
+  'OTHER=1234', 'MATRON_BRIDGE_API_PORT=', 'MATRON_BRIDGE_API_PORT=0',
+  'MATRON_BRIDGE_API_PORT=65536', 'MATRON_BRIDGE_API_PORT=080',
+  'MATRON_BRIDGE_API_PORT=-1', 'MATRON_BRIDGE_API_PORT=1e3',
+  'MATRON_BRIDGE_API_PORT=1234 ', ' MATRON_BRIDGE_API_PORT=1234',
+  'MATRON_BRIDGE_API_PORT=$(touch marker)', 'MATRON_BRIDGE_API_PORT=1234\nOTHER=bad',
+  '', 'MATRON_BRIDGE_API_PORT=1234\n', 'MATRON_BRIDGE_API_PORT=1234\0ignored',
+])('rejects a malformed second line even with a valid override (%j)', async line => {
+  const f = await fixture();
+  fs.writeFileSync(f.file, `MATRON_RESTART_TOKEN=${'a'.repeat(64)}\n${line}\n`);
+  const result = await f.run();
+  expect(result.status).toBe(2);
+  expect(result.stderr).toContain('malformed restart token file');
+  expect(f.requests).toHaveLength(0);
+  expect(fs.existsSync(path.join(f.root, 'marker'))).toBe(false);
+});
+it.each([false, true])('accepts a file without its final newline (port line: %s)', async withPort => {
+  const f = await fixture();
+  fs.writeFileSync(f.file, `MATRON_RESTART_TOKEN=${'a'.repeat(64)}${withPort ? `\nMATRON_BRIDGE_API_PORT=${f.port}` : ''}`);
+  expect((await f.run(undefined, { env: withPort ? { MATRON_BRIDGE_API_PORT: '' } : {} })).status).toBe(0);
+  expect(f.requests).toHaveLength(1);
+});
+it('re-reads the file port as well as the token after unauthorized', async () => {
+  const target = await fixture();
+  const first = await fixture({ statuses: ['401'], rotate: true, rotatedPort: target.port });
+  fs.writeFileSync(first.file, `MATRON_RESTART_TOKEN=${'a'.repeat(64)}\nMATRON_BRIDGE_API_PORT=${first.port}\n`);
+  const result = await first.run(undefined, { env: { MATRON_BRIDGE_API_PORT: '' } });
+  expect(result.status).toBe(0);
+  expect(first.requests).toHaveLength(1);
+  expect(target.requests).toHaveLength(1);
+  expect(target.requests[0].headers['x-matron-restart-token']).toBe('b'.repeat(64));
 });
 it('sends a JSON request with the token only in a header and prints the response', async () => {
   const f = await fixture();

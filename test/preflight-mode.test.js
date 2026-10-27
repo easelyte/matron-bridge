@@ -57,7 +57,8 @@ syncBuiltinESMExports();
     async run(mode, { env = {}, file, missing = false } = {}) {
       const childHome = fs.mkdtempSync(path.join(root, 'home-'));
       const sentinel = path.join(childHome, '.matron-bridge-restart.env');
-      fs.writeFileSync(sentinel, 'sentinel');
+      const tokenFile = `MATRON_RESTART_TOKEN=${'a'.repeat(64)}\nMATRON_BRIDGE_API_PORT=${port}\n`;
+      fs.writeFileSync(sentinel, tokenFile);
       const envFile = path.join(checkout, '.env');
       if (missing) fs.rmSync(envFile, { recursive: true, force: true });
       else if (file !== undefined) fs.writeFileSync(envFile, file);
@@ -78,7 +79,7 @@ syncBuiltinESMExports();
           (error, stdout, stderr) => resolve({ code: error ? error.code : 0, output: stdout + stderr })));
         expect(result.output).not.toContain('startup side effect');
         expect(connections).toBe(0);
-        expect(fs.readFileSync(sentinel, 'utf8')).toBe('sentinel');
+        expect(fs.readFileSync(sentinel, 'utf8')).toBe(tokenFile);
         expect(fs.readdirSync(childHome)).toEqual(['.matron-bridge-restart.env']);
         expect(fs.readdirSync(checkout).some(name => name.startsWith('.mcp-config-generated'))).toBe(false);
         const probe = net.createServer();
