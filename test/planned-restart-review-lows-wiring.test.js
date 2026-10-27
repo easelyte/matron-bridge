@@ -15,13 +15,14 @@ const tick = () => new Promise(resolve => setImmediate(resolve));
 
 describe('journalOnCoordinator across its awaits', () => {
   const source = between('async function journalOnCoordinator(', '\nasync function deliverCoordinatorTurn(');
-  async function run({ shutdownDuringAwait }) {
+  async function run({ shutdownDuringAwait, awaitAt }) {
     let release;
-    const refresh = vi.fn(() => new Promise(resolve => { release = resolve; }));
+    const pause = () => new Promise(resolve => { release = resolve; });
+    const refresh = vi.fn(awaitAt === 'coordinator' ? pause : async () => ({ convoId: 'convo-a' }));
     const context = {
       shuttingDown: false,
       coordinatorLookup: { apply() {}, refresh },
-      memoryLookup: { refresh: async () => {} },
+      memoryLookup: { refresh: vi.fn(awaitAt === 'memory' ? pause : async () => {}) },
       findSessionByClaudeSessionId: vi.fn(() => ({ alive: true, roomId: 'room-a' })),
       decideCoordinatorEvent: vi.fn(() => 'stale'),
       console: { warn() {} },
@@ -35,13 +36,13 @@ describe('journalOnCoordinator across its awaits', () => {
     return context;
   }
 
-  it('looks up and decides when the bridge is still running', async () => {
-    const context = await run({ shutdownDuringAwait: false });
+  it.each(['coordinator', 'memory'])('looks up and decides after the %s lookup when still running', async awaitAt => {
+    const context = await run({ shutdownDuringAwait: false, awaitAt });
     expect(context.decideCoordinatorEvent).toHaveBeenCalledOnce();
   });
 
-  it('does nothing when shutdown began while the journal was answering', async () => {
-    const context = await run({ shutdownDuringAwait: true });
+  it.each(['coordinator', 'memory'])('does nothing when shutdown began during the %s lookup', async awaitAt => {
+    const context = await run({ shutdownDuringAwait: true, awaitAt });
     expect(context.findSessionByClaudeSessionId).not.toHaveBeenCalled();
     expect(context.decideCoordinatorEvent).not.toHaveBeenCalled();
   });
@@ -49,16 +50,18 @@ describe('journalOnCoordinator across its awaits', () => {
 
 describe('runPreReapHandoff across its awaits', () => {
   const source = between('async function runPreReapHandoff(', '\nfunction drainPreReapCompact(');
-  async function run({ shutdownDuringAwait }) {
+  async function run({ shutdownDuringAwait, awaitAt }) {
     let release;
+    const pause = () => new Promise(resolve => { release = resolve; });
+    const finishInput = vi.fn();
     const session = { roomId: 'room-a', alive: true };
     const context = {
       shuttingDown: false,
-      restartLatch: null,
+      restartLatch: { beginInput: vi.fn(() => finishInput) },
       sessions: new Map([['room-a', session]]),
       journalConvoIdFor: () => 'convo-a',
-      missionsHandlers: { resolveMission: vi.fn(() => new Promise(resolve => { release = resolve; })) },
-      missionsClient: { get: async () => ({ status: 200, data: {} }) },
+      missionsHandlers: { resolveMission: vi.fn(awaitAt === 'resolve' ? pause : async () => ({ id: 'task-a' })) },
+      missionsClient: { get: vi.fn(awaitAt === 'status' ? pause : async () => ({ status: 200, data: {} })) },
       controlOccupied: vi.fn(() => true),
       sendTextToSession: vi.fn(() => true),
       debug() {},
@@ -67,18 +70,20 @@ describe('runPreReapHandoff across its awaits', () => {
     const done = context.handler(session, 1000, 0);
     await tick();
     if (shutdownDuringAwait) context.shuttingDown = true;
-    release(null);
+    release(awaitAt === 'status' ? { status: 200, data: {} } : null);
     await done;
+    expect(context.restartLatch.beginInput).toHaveBeenCalledOnce();
+    expect(finishInput).toHaveBeenCalledOnce();
     return context;
   }
 
-  it('goes on to the occupancy check when the bridge is still running', async () => {
-    const context = await run({ shutdownDuringAwait: false });
+  it.each(['resolve', 'status'])('checks occupancy after the %s lookup when still running', async awaitAt => {
+    const context = await run({ shutdownDuringAwait: false, awaitAt });
     expect(context.controlOccupied).toHaveBeenCalledOnce();
   });
 
-  it('dispatches nothing when shutdown began during the mission lookup', async () => {
-    const context = await run({ shutdownDuringAwait: true });
+  it.each(['resolve', 'status'])('dispatches nothing when shutdown began during the %s lookup', async awaitAt => {
+    const context = await run({ shutdownDuringAwait: true, awaitAt });
     expect(context.controlOccupied).not.toHaveBeenCalled();
     expect(context.sendTextToSession).not.toHaveBeenCalled();
   });
@@ -139,8 +144,26 @@ describe('/wake availability as wired in index.js', () => {
     expect(context.journalRouteTextToSession).toHaveBeenCalledOnce();
   });
 
-  it('is unavailable while shutting down or a restart is latched', () => {
-    const handler = between('const handleWake = createWakeHandler({', '\nconst handleSendAttachment');
-    expect(handler).toContain('unavailable: () => shuttingDown || plannedRestartRuntime.stamped === true,');
+  it('checks current availability even when a previous wake could be coalesced', async () => {
+    const context = wire();
+    expect((await context.handle()).status).toBe(200);
+    const session = context.findSessionByClaudeSessionId.mock.results[0].value;
+    session.busy = true;
+    context.findSessionByClaudeSessionId.mockClear();
+    context.plannedRestartRuntime.stamped = true;
+    expect((await context.handle()).status).toBe(503);
+    expect(context.findSessionByClaudeSessionId).not.toHaveBeenCalled();
+    expect(context.journalRouteTextToSession).toHaveBeenCalledOnce();
+    context.plannedRestartRuntime.stamped = false;
+    expect((await context.handle()).body.coalesced).toBe(true);
+    expect(context.journalRouteTextToSession).toHaveBeenCalledOnce();
+  });
+
+  it('uses the same handler after shutdown is cancelled', async () => {
+    const context = wire({ shuttingDown: true });
+    expect((await context.handle()).status).toBe(503);
+    context.shuttingDown = false;
+    expect((await context.handle()).status).toBe(200);
+    expect(context.journalRouteTextToSession).toHaveBeenCalledOnce();
   });
 });
