@@ -15,8 +15,12 @@ describe('shouldRegister', () => {
     for (const name of COORDINATOR_ONLY) expect(shouldRegister(name, 'worker')).toBe(false);
   });
 
-  it('worker keeps ordinary tools', () => {
-    for (const name of ['item_create', 'memory_save', 'mission_start', 'request_secret']) {
+  it('worker keeps ordinary tools, including those open to any agent', () => {
+    // project create/update/status are open to any agent (lib/projects-tools.js)
+    // and box_defaults_set is advertised to every session: asserted here
+    // independently of COORDINATOR_ONLY so a list edit cannot drop them.
+    for (const name of ['item_create', 'memory_save', 'mission_start', 'request_secret',
+      'project_create', 'project_update', 'project_status', 'box_defaults_set', 'unseen_flag']) {
       expect(shouldRegister(name, 'worker')).toBe(true);
     }
   });
@@ -67,6 +71,24 @@ describe('buildClaudeSpawnEnv BRIDGE_TOOL_ROLE', () => {
     expect(build({ coordinator: false, roleKnown: true }, on).BRIDGE_TOOL_ROLE).toBe('worker');
     expect(build({ mode: 'iv', coordinator: true }, on).BRIDGE_TOOL_ROLE).toBe('coordinator');
     expect(build({ mode: 'iv', coordinator: false, roleKnown: true }, on).BRIDGE_TOOL_ROLE).toBe('worker');
+  });
+
+  it('index.js hands the role and its confirmed flag to both Claude spawn builders', () => {
+    const src = fs.readFileSync(path.join(ROOT, 'index.js'), 'utf8');
+    const section = (start) => {
+      const i = src.indexOf(start);
+      expect(i).toBeGreaterThan(-1);
+      const j = src.indexOf('\nfunction ', i + start.length);
+      return src.slice(i, j === -1 ? undefined : j);
+    };
+    const print = section('function createSession(roomId, workdir, resumeSessionId, options = {}) {');
+    const iv = section('function createInteractiveSessionForRoom(');
+    for (const fn of [print, iv]) {
+      const call = fn.slice(fn.indexOf('buildClaudeSpawnEnv('));
+      expect(call.slice(0, call.indexOf('});'))).toContain('coordinator: options.coordinator === true,');
+      expect(call.slice(0, call.indexOf('});'))).toContain('roleKnown: options.roleKnown === true,');
+    }
+    expect(print).toContain('options.roleKnown = coordinatorLookup.snapshot().known === true;');
   });
 
   it('gives the full list while the journal has not confirmed the role', () => {
