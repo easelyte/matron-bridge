@@ -2765,6 +2765,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     showBashOutput: showBashOutputAtSpawn,
     showFileToken,
     permissionToken,
+    coordinator: options.coordinator === true,
   });
 
   const proc = launchWithCodexSinkEnv({
@@ -3725,6 +3726,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     pluginCacheDir: PLUGIN_CACHE_DIR,
     showBashOutput: showBashOutputAtSpawn,
     showFileToken,
+    coordinator: options.coordinator === true,
   });
 
   debug(`Spawning interactive claude session ${sessionId} in ${cwd}`);

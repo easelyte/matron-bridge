@@ -312,6 +312,21 @@ avoid loading ambient shell startup files and exported functions.
 
 Voice notes sent in chat are transcribed by the journal at upload when it has a cloud speech-to-text key (`MATRON_STT_AZURE_KEY`, see the journal's protocol doc): the bridge asks `GET /media/:id/transcript` first and only runs its own whisper when the journal has no words for the note (no key, an older journal, or a failed job).
 
+## Tool list by role
+
+By default every session gets the full `ask-user` tool list. Two variables
+narrow it:
+
+| Variable | Description | Default |
+|---|---|---|
+| `BRIDGE_TOOL_FILTER` | Bridge env opt-in. Set to `1` and the bridge gives each Claude session a `BRIDGE_TOOL_ROLE` of `coordinator` or `worker` at spawn. | off |
+| `BRIDGE_TOOL_ROLE` | Set per session by the bridge, read by `ask-user.js`. `worker` skips the Coordinator-only tools (`COORDINATOR_ONLY` in `lib/tool-roles.js`); `coordinator`, `full`, unset or any unknown value registers every tool. `permission_request` always registers. | unset |
+
+`ask-user.js` logs one stderr line at boot (`role`, `registered`, `hidden`,
+`would-hide`) so the effect can be checked before enabling the filter:
+`would-hide` is how many registered tools a worker would not see. A change to
+either variable applies to sessions spawned afterwards.
+
 ## Memory & MCP tuning
 
 Sessions are lean by default so the bridge runs on small VPS boxes. Only the
