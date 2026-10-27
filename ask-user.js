@@ -23,6 +23,7 @@ import {
 import { formatUnseenList, formatUnseenMine, formatFlagAck } from './lib/unseen-tools.js';
 import { formatRoutineList, formatRoutineUpdateAck, formatRoutineRunAck, formatRoutineCreateAck, formatRoutineDeleteAck } from './lib/routines-tools.js';
 import { formatBriefingPublishAck } from './lib/briefings-tools.js';
+import { shouldRegister } from './lib/tool-roles.js';
 
 // Route to whichever bridge spawned us: explicit BRIDGE_API_URL wins, else the
 // per-session MATRON_BRIDGE_API_PORT exported by the bridge at spawn (journal=9812,
@@ -45,6 +46,21 @@ const server = new McpServer({
   name: 'ask-user',
   version: '1.0.0',
 });
+
+// Role-based tool list (lib/tool-roles.js): with BRIDGE_TOOL_ROLE=worker the
+// Coordinator-only tools are not registered. Unset or unknown means all tools.
+const TOOL_ROLE = process.env.BRIDGE_TOOL_ROLE || '';
+const toolCounts = { registered: 0, hidden: 0, wouldHide: 0 };
+const registerTool = server.tool.bind(server);
+server.tool = (name, ...rest) => {
+  if (!shouldRegister(name, TOOL_ROLE)) {
+    toolCounts.hidden += 1;
+    return undefined;
+  }
+  toolCounts.registered += 1;
+  if (!shouldRegister(name, 'worker')) toolCounts.wouldHide += 1;
+  return registerTool(name, ...rest);
+};
 
 server.tool(
   'request_secret',
@@ -1699,6 +1715,10 @@ server.tool(
   { name: z.string().describe('The memory name') },
   async (args) => callMemory('delete', args, formatDeleteAck),
 );
+
+// One boot line so the filter can be validated before it is enabled: with no
+// role set, "would hide" is what a worker session would lose.
+process.stderr.write(`[ask-user] tool role=${TOOL_ROLE || 'unset'} registered=${toolCounts.registered} hidden=${toolCounts.hidden} would-hide=${toolCounts.wouldHide}\n`);
 
 const transport = new StdioServerTransport();
 await server.connect(transport);
