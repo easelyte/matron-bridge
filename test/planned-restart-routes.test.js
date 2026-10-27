@@ -178,7 +178,7 @@ syncBuiltinESMExports();
     await delay(25);
   }
   expect(output, 'isolated bridge must boot').toContain('Local API listening');
-  return { file, store, latchFlag, notes, heldFile, noteWriteFault, notices, child, tokenFile, evidence, headFile, probes, writeFault, timerEvidence, gitEvidence, preflightEvidence,
+  return { file, store, latchFlag, notes, heldFile, noteWriteFault, notices, child, tokenFile, evidence, headFile, probes, writeFault, timerEvidence, gitEvidence, preflightEvidence, port,
     envFile: path.join(checkout, '.env'),
     subagentFile: path.join(home, '.claude-subagent-running.json'),
     get output() { return output; },
@@ -197,7 +197,7 @@ syncBuiltinESMExports();
       expect(output).toContain('EADDRINUSE');
       expect(second.exitCode).not.toBe(null);
     },
-    async post(route, body = {}, token = fs.existsSync(tokenFile) ? fs.readFileSync(tokenFile, 'utf8').trim().split('=')[1] : null) {
+    async post(route, body = {}, token = fs.existsSync(tokenFile) ? fs.readFileSync(tokenFile, 'utf8').split('\n')[0].split('=')[1] : null) {
       const response = await fetch(`http://localhost:${port}${route}`, { method: 'POST',
         headers: { 'Content-Type': 'application/json', ...(token === null ? {} : { 'X-Matron-Restart-Token': token }) },
         body: typeof body === 'string' ? body : JSON.stringify(body), signal: AbortSignal.timeout(2000) });
@@ -210,7 +210,8 @@ it('writes a private per-boot token after binding and before accepting and remov
   const evidence = JSON.parse(fs.readFileSync(f.evidence));
   expect(evidence.beforeBind).toBe(null);
   expect(typeof evidence.token).toBe('string');
-  expect(evidence.token).toMatch(/^MATRON_RESTART_TOKEN=[a-f0-9]{64}\n$/);
+  expect(evidence.token).toMatch(/^MATRON_RESTART_TOKEN=[a-f0-9]{64}\nMATRON_BRIDGE_API_PORT=[1-9][0-9]{0,4}\n$/);
+  expect(evidence.token.split('\n')[1]).toBe(`MATRON_BRIDGE_API_PORT=${f.port}`);
   expect(evidence.childFile).toBe(f.tokenFile);
   const source = fs.readFileSync(path.join(repo, 'index.js'), 'utf8');
   expect(source).toContain('repoDir: __dirname');
@@ -434,9 +435,12 @@ it('preserves the active token after a duplicate launch fails to bind', async ()
   expect((await f.post('/restart/dry-run')).status).toBe(200);
 });
 
-it('preserves a replacement token file when its original owner exits', async () => {
+it.each(['token', 'port'])('preserves a replacement token file when its %s changes', async changed => {
   const f = await fixture();
-  const replacement = `MATRON_RESTART_TOKEN=${'b'.repeat(64)}\n`;
+  const original = fs.readFileSync(f.tokenFile, 'utf8');
+  const replacement = changed === 'token'
+    ? original.replace(/^MATRON_RESTART_TOKEN=[a-f0-9]{64}/, `MATRON_RESTART_TOKEN=${'b'.repeat(64)}`)
+    : original.replace(`MATRON_BRIDGE_API_PORT=${f.port}`, `MATRON_BRIDGE_API_PORT=${f.port === 65535 ? 65534 : f.port + 1}`);
   fs.writeFileSync(f.tokenFile, replacement);
   f.child.kill('SIGTERM');
   await once(f.child, 'exit');

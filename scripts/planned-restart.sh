@@ -58,14 +58,16 @@ while [[ $# -gt 0 ]]; do
 done
 
 env_file=${MATRON_RESTART_ENV_FILE:-}
-port=9802
+port_override=''
 if [[ -z "$env_file" ]]; then
   [[ -n "${HOME:-}" ]] || { echo 'HOME is not set' >&2; exit 2; }
   env_file="${HOME}/.matron-bridge-restart.env"
 elif [[ -n "${MATRON_BRIDGE_API_PORT:-}" ]]; then
-  port=$MATRON_BRIDGE_API_PORT
+  port_override=$MATRON_BRIDGE_API_PORT
 fi
-[[ "$port" =~ ^[1-9][0-9]{0,4}$ ]] && (( port <= 65535 )) || { echo 'invalid MATRON_BRIDGE_API_PORT' >&2; exit 2; }
+if [[ -n "$port_override" ]]; then
+  [[ "$port_override" =~ ^[1-9][0-9]{0,4}$ ]] && (( port_override <= 65535 )) || { echo 'invalid MATRON_BRIDGE_API_PORT' >&2; exit 2; }
+fi
 
 node_bin=''
 for candidate in /usr/bin/node /usr/local/bin/node /opt/homebrew/bin/node; do
@@ -77,9 +79,22 @@ done
 read_token() {
   [[ -e "$env_file" ]] || { echo 'bridge restarting or down, retry after back' >&2; exit 4; }
   [[ -f "$env_file" && -r "$env_file" ]] || { echo 'malformed restart token file' >&2; exit 2; }
-  raw=$(<"$env_file") || { echo 'cannot read restart token file' >&2; exit 2; }
-  [[ "$raw" =~ ^MATRON_RESTART_TOKEN=([a-f0-9]{64})$ ]] || { echo 'malformed restart token file' >&2; exit 2; }
+  # Read as data, preserving newlines; a NUL terminator is never valid here.
+  raw=''
+  IFS= read -r -d '' raw < "$env_file"
+  [[ "$?" == 1 ]] || { echo 'malformed restart token file' >&2; exit 2; }
+  raw=${raw%$'\n'}
+  token_line=${raw%%$'\n'*}
+  [[ "$token_line" =~ ^MATRON_RESTART_TOKEN=([a-f0-9]{64})$ ]] || { echo 'malformed restart token file' >&2; exit 2; }
   token=${BASH_REMATCH[1]}
+  port=9802
+  if [[ "$raw" == *$'\n'* ]]; then
+    port_line=${raw#*$'\n'}
+    [[ "$port_line" =~ ^MATRON_BRIDGE_API_PORT=([1-9][0-9]{0,4})$ ]] || { echo 'malformed restart token file' >&2; exit 2; }
+    port=${BASH_REMATCH[1]}
+    (( port <= 65535 )) || { echo 'malformed restart token file' >&2; exit 2; }
+  fi
+  [[ -z "$port_override" ]] || port=$port_override
 }
 read_token
 payload=$(/usr/bin/env -i "$node_bin" -e '
@@ -96,7 +111,8 @@ for attempt in 1 2; do
     # Only connection-level failures (refused 7, timeout 28, empty reply 52,
     # receive error 56) mean "retry after back"; anything else is not retryable.
     case "$curl_rc" in
-      7|28|52|56) echo 'bridge restarting or down, retry after back' >&2; exit 4 ;;
+      7) echo "bridge restarting or down, retry after back (port $port)" >&2; exit 4 ;;
+      28|52|56) echo 'bridge restarting or down, retry after back' >&2; exit 4 ;;
       *) echo "restart request failed (curl exit $curl_rc)" >&2; exit 2 ;;
     esac
   fi

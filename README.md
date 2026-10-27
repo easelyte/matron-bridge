@@ -231,6 +231,28 @@ card instead). Sessions between turns resume with their history on their next tu
 as with any restart. The exit code is 75, non-zero on purpose: launchd only
 relaunches after a non-zero exit.
 
+**Planned restart client (Bash):** from the bridge checkout, request a restart
+with a reason and, optionally, a target commit and an idempotency key:
+
+```sh
+/bin/bash -p ./scripts/planned-restart.sh "Apply configuration update"
+/bin/bash -p ./scripts/planned-restart.sh "Apply code update" --sha <commit> --request-key <key>
+```
+
+Run as the bridge's service user so the client finds
+`$HOME/.matron-bridge-restart.env`. After binding its local API, the bridge
+writes that private file with `MATRON_RESTART_TOKEN=<64 lowercase hex digits>`
+on line 1 and `MATRON_BRIDGE_API_PORT=<port>` on line 2. The client reads it
+as data; do not source it. Older files containing only the token still work,
+using port `9802`. Malformed files exit with code 2.
+
+To select another bridge explicitly, set `MATRON_RESTART_ENV_FILE` to its token
+file. A `MATRON_BRIDGE_API_PORT` environment override takes precedence over
+the file's port only when that explicit file is also set; otherwise ambient
+port overrides are ignored. Connection refusal exits with code 4 and reports
+the port tried. Execute the script directly or use `bash -p` as above to
+avoid loading ambient shell startup files and exported functions.
+
 ## Config (.env)
 
 | Variable | Description | Default |
