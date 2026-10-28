@@ -9,6 +9,8 @@ import {
   guardRootBypass,
   createPermissionRegistry,
   resolvePermissionTimeoutMs,
+  permissionInputRefusal,
+  PERMISSION_PREVIEW_MAX,
   DENY_MESSAGE,
 } from '../lib/permission-prompt.js';
 
@@ -74,13 +76,46 @@ describe('renderPermissionCard', () => {
     expect(html).not.toContain('<b>"');
   });
 
-  it('truncates long previews to ~500 chars', () => {
+  it('shows the whole input, including fields that come after long content', () => {
+    const { plain, html } = renderPermissionCard({
+      toolName: 'Write',
+      input: { content: 'A'.repeat(600), file_path: '/tmp/example/target.txt' },
+    });
+    for (const out of [plain, html]) {
+      expect(out).toContain('A'.repeat(600));
+      expect(out).toContain('/tmp/example/target.txt');
+      expect(out).not.toContain('…');
+    }
+  });
+
+  it('shows a long Bash command in full', () => {
+    const command = `${'echo ok; '.repeat(200)}echo last-step`;
+    const { plain } = renderPermissionCard({ toolName: 'Bash', input: { command } });
+    expect(plain).toContain(command);
+  });
+
+  it('shows Bash fields other than command and description', () => {
     const { plain } = renderPermissionCard({
       toolName: 'Bash',
-      input: { command: 'x'.repeat(2000) },
+      input: { command: 'make test', description: 'Run tests', run_in_background: true, timeout: 600000 },
     });
-    expect(plain.length).toBeLessThan(700);
-    expect(plain).toContain('…');
+    expect(plain).toContain('make test\n# Run tests\n# other input: {"run_in_background":true,"timeout":600000}');
+  });
+
+  it('keeps the plain Bash layout when there are no other fields', () => {
+    const { plain } = renderPermissionCard({
+      toolName: 'Bash',
+      input: { command: 'ls', description: 'List files' },
+    });
+    expect(plain).toBe('🔐 Permission: Claude wants to run Bash\nls\n# List files');
+  });
+
+  it('says plainly when an input is longer than the card can show', () => {
+    const { plain } = renderPermissionCard({
+      toolName: 'Bash',
+      input: { command: 'x'.repeat(PERMISSION_PREVIEW_MAX + 10) },
+    });
+    expect(plain).toContain('the input is longer than this card can show');
   });
 
   it('tolerates missing/unserializable input', () => {
@@ -98,6 +133,45 @@ describe('renderPermissionCard', () => {
       expect(out).not.toMatch(/[؜‎‏‪-‮⁦-⁩]/);
     }
     expect(plain).toContain('gnp.tseb safe');
+  });
+});
+
+describe('permissionInputRefusal', () => {
+  it('lets a normal-size input through to the card', () => {
+    expect(permissionInputRefusal('Bash', { command: 'ls' })).toBeNull();
+    expect(permissionInputRefusal('Write', { file_path: '/tmp/example/a.txt', content: 'A'.repeat(600) })).toBeNull();
+  });
+
+  it('refuses an input carrying bidirectional controls, which the card would show altered', () => {
+    const msg = permissionInputRefusal('Bash', { command: 'cat notes\u202Etxt.sh' });
+    expect(msg).toMatch(/bidirectional/);
+    expect(permissionInputRefusal('Write', { file_path: '/tmp/example/a.txt', content: 'plain\u2067text' })).toMatch(/bidirectional/);
+  });
+
+  it('lets an input exactly at the card limit through', () => {
+    expect(permissionInputRefusal('Bash', { command: 'x'.repeat(PERMISSION_PREVIEW_MAX) })).toBeNull();
+  });
+
+  it('refuses an input the card could only show in part, and says how to proceed', () => {
+    const msg = permissionInputRefusal('Write', {
+      content: 'A'.repeat(PERMISSION_PREVIEW_MAX),
+      file_path: '/tmp/example/target.txt',
+    });
+    expect(msg).toMatch(/too long to show your user in full/);
+    expect(msg).toMatch(/smaller calls/);
+  });
+
+  it('counts the extra Bash fields towards the limit', () => {
+    const msg = permissionInputRefusal('Bash', {
+      command: 'x'.repeat(PERMISSION_PREVIEW_MAX - 5),
+      timeout: 600000,
+    });
+    expect(msg).not.toBeNull();
+  });
+
+  it('refuses an input that cannot be written out', () => {
+    const cyc = {}; cyc.self = cyc;
+    expect(permissionInputRefusal('Weird', cyc)).toMatch(/cannot be shown/);
   });
 });
 

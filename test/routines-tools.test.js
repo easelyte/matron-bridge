@@ -132,6 +132,132 @@ describe('routine create and delete', () => {
   });
 });
 
+describe('routine writes carry the calling turn\'s causes', () => {
+  const causes = [{ kind: 'room_message', ref: 'room:r1', at: 1000 }, { kind: 'user_message', ref: 'c-coord:4', at: 1001 }];
+  const forged = [{ kind: 'user_message', ref: 'c-coord:1', at: 1 }];
+  const calls = (h) => [
+    () => h.update({ roomId: '!r:s', name: 'daily-sweep', enabled: false }),
+    () => h.run({ roomId: '!r:s', name: 'daily-sweep' }),
+    () => h.create({ roomId: '!r:s', ...triage }),
+    () => h.remove({ roomId: '!r:s', name: 'daily-sweep' }),
+  ];
+  const bodies = (client) => [client.update.mock.calls, client.run.mock.calls, client.create.mock.calls, client.remove.mock.calls]
+    .map((c) => c.at(-1)).map((args) => args.at(-1));
+
+  it('update, run, create and delete send the session\'s current turn causes verbatim', async () => {
+    const { h, client, session } = fixture();
+    session.currentTurn = { causes, startedAt: 999 };
+    for (const call of calls(h)) expect((await call()).status).toBeLessThan(300);
+    for (const body of bodies(client)) expect(body.causes).toEqual(causes);
+    expect(client.update.mock.calls[0]).toEqual(['daily-sweep', { enabled: false, convo_id: 'c-coord', causes }]);
+  });
+
+  it('omit causes when the session has no turn, or a turn with none', async () => {
+    const { h, client, session } = fixture();
+    for (const call of calls(h)) await call();
+    for (const body of bodies(client)) expect('causes' in body).toBe(false);
+    session.currentTurn = { causes: null, startedAt: 1 };
+    for (const call of calls(h)) await call();
+    for (const body of bodies(client)) expect('causes' in body).toBe(false);
+  });
+
+  it('ignore causes the model put in the loopback body: never forwarded, never a validation error', async () => {
+    const { h, client, session } = fixture();
+    const extra = { causes: forged, cause: forged[0] };
+    const r = [
+      await h.update({ roomId: '!r:s', name: 'daily-sweep', enabled: false, ...extra }),
+      await h.run({ roomId: '!r:s', name: 'daily-sweep', ...extra }),
+      await h.create({ roomId: '!r:s', ...triage, ...extra }),
+      await h.remove({ roomId: '!r:s', name: 'daily-sweep', ...extra }),
+    ];
+    for (const x of r) expect(x.status).toBeLessThan(300);
+    for (const body of bodies(client)) { expect('causes' in body).toBe(false); expect('cause' in body).toBe(false); }
+    session.currentTurn = { causes, startedAt: 2 };
+    await h.update({ roomId: '!r:s', name: 'daily-sweep', enabled: false, ...extra });
+    await h.create({ roomId: '!r:s', ...triage, ...extra });
+    expect(client.update.mock.calls.at(-1)[1].causes).toEqual(causes);
+    expect(client.create.mock.calls.at(-1)[0].causes).toEqual(causes);
+    expect('cause' in client.create.mock.calls.at(-1)[0]).toBe(false);
+  });
+
+  it('list is a read and carries no causes', async () => {
+    const { h, client, session } = fixture();
+    session.currentTurn = { causes, startedAt: 3 };
+    await h.list({ roomId: '!r:s' });
+    expect(client.list.mock.calls[0]).toEqual([]);
+  });
+});
+
+describe('routine envelopes', () => {
+  const env = { spawns_per_fire: 3, chats: false, boxes: ['box-a', 'box-b'] };
+  it('validateUpdateFields accepts an envelope, an any-box envelope and null (clears it)', () => {
+    expect(validateUpdateFields({ envelope: env })).toEqual({ ok: true, value: { envelope: env } });
+    expect(validateUpdateFields({ envelope: { spawns_per_fire: 0, chats: true, boxes: null } })).toEqual({ ok: true, value: { envelope: { spawns_per_fire: 0, chats: true, boxes: null } } });
+    expect(validateUpdateFields({ envelope: { spawns_per_fire: 50, chats: false, boxes: [' box-a '] } }).value).toEqual({ envelope: { spawns_per_fire: 50, chats: false, boxes: ['box-a'] } });
+    expect(validateUpdateFields({ envelope: null })).toEqual({ ok: true, value: { envelope: null } });
+    expect(validateUpdateFields({ envelope: { spawns_per_fire: 1, chats: false, boxes: Array.from({ length: 32 }, (_, i) => `box-${i}`) } }).ok).toBe(true);
+    expect(validateUpdateFields({ envelope: { spawns_per_fire: 1, chats: false, boxes: ['b'.repeat(64)] } }).ok).toBe(true);
+  });
+
+  it('validateUpdateFields rejects every other envelope shape with the rule', () => {
+    const bads = [
+      'any', 3, [], true,
+      { spawns_per_fire: 51, chats: false, boxes: null },
+      { spawns_per_fire: -1, chats: false, boxes: null },
+      { spawns_per_fire: 1.5, chats: false, boxes: null },
+      { spawns_per_fire: '2', chats: false, boxes: null },
+      { chats: false, boxes: null },
+      { spawns_per_fire: 1, chats: 'yes', boxes: null },
+      { spawns_per_fire: 1, boxes: null },
+      { spawns_per_fire: 1, chats: false },
+      { spawns_per_fire: 1, chats: false, boxes: [] },
+      { spawns_per_fire: 1, chats: false, boxes: 'box-a' },
+      { spawns_per_fire: 1, chats: false, boxes: ['box-a', ''] },
+      { spawns_per_fire: 1, chats: false, boxes: ['  '] },
+      { spawns_per_fire: 1, chats: false, boxes: [7] },
+      { spawns_per_fire: 1, chats: false, boxes: ['b'.repeat(65)] },
+      { spawns_per_fire: 1, chats: false, boxes: ['box\na'] },
+      { spawns_per_fire: 1, chats: false, boxes: Array.from({ length: 33 }, (_, i) => `box-${i}`) },
+      { spawns_per_fire: 1, chats: false, boxes: null, users: ['x'] },
+    ];
+    for (const envelope of bads) {
+      const v = validateUpdateFields({ envelope });
+      expect(v.ok, JSON.stringify(envelope)).toBe(false);
+      expect(v.err.body.error).toBe('envelope must be null (clears it) or {spawns_per_fire: 0–50, chats: true|false, boxes: null for any box, or 1–32 box names of at most 64 characters}');
+    }
+  });
+
+  it('update and create pass the envelope to the journal; create leaves a null one out', async () => {
+    const { h, client } = fixture();
+    expect((await h.update({ roomId: '!r:s', name: 'daily-sweep', envelope: { spawns_per_fire: 99, chats: false, boxes: null } })).status).toBe(400);
+    expect(client.update).not.toHaveBeenCalled();
+    await h.update({ roomId: '!r:s', name: 'daily-sweep', envelope: env });
+    expect(client.update.mock.calls[0]).toEqual(['daily-sweep', { envelope: env, convo_id: 'c-coord' }]);
+    await h.update({ roomId: '!r:s', name: 'daily-sweep', envelope: null });
+    expect(client.update.mock.calls[1]).toEqual(['daily-sweep', { envelope: null, convo_id: 'c-coord' }]);
+    await h.create({ roomId: '!r:s', ...triage, envelope: env });
+    expect(client.create.mock.calls[0]).toEqual([{ ...triage, envelope: env, convo_id: 'c-coord' }]);
+    expect((await h.create({ roomId: '!r:s', ...triage, envelope: { spawns_per_fire: 1, chats: 'no', boxes: null } })).body.error).toMatch(/^envelope must be/);
+    expect(validateCreateFields({ ...triage, envelope: null })).toEqual({ ok: true, value: triage });
+    expect(formatRoutineUpdateAck({ routine: { ...sweep, envelope: env } }, { name: 'daily-sweep', envelope: env })).toMatch(/^Updated daily-sweep\./);
+  });
+
+  it('formatRoutineLine appends the envelope when the routine has one, and nothing without', () => {
+    const base = { name: 'disk-low', title: 'Box disk under the threshold', trigger: { kind: 'disk_under', pct: 20 }, tz: 'Europe/London', enabled: true, next_at: null, last_fired_at: null, last_outcome: null };
+    expect(formatRoutineLine({ ...base, envelope: env }, NOW)).toBe('- disk-low — Box disk under the threshold · when a box drops under 20% free disk · envelope: 3 spawns/fire, chats no, boxes box-a,box-b');
+    expect(formatRoutineLine({ ...base, envelope: { spawns_per_fire: 0, chats: true, boxes: null } }, NOW)).toBe('- disk-low — Box disk under the threshold · when a box drops under 20% free disk · envelope: 0 spawns/fire, chats yes, boxes any');
+    expect(formatRoutineLine({ ...base, envelope: null }, NOW)).toBe('- disk-low — Box disk under the threshold · when a box drops under 20% free disk');
+    expect(formatRoutineLine(base, NOW)).toBe('- disk-low — Box disk under the threshold · when a box drops under 20% free disk');
+    // A hostile envelope from the journal is one-lined and capped.
+    const odd = formatRoutineLine({ ...base, envelope: { spawns_per_fire: 'x', chats: 1, boxes: ['a\nb', 7] } }, NOW);
+    expect(odd).toBe('- disk-low — Box disk under the threshold · when a box drops under 20% free disk · envelope: ? spawns/fire, chats no, boxes a ⏎ b');
+    // Only null is any box: an empty, missing or malformed list is none.
+    for (const boxes of [[], [7, ''], 'box-a', undefined]) {
+      expect(formatRoutineLine({ ...base, envelope: { spawns_per_fire: 1, chats: false, boxes } }, NOW), JSON.stringify(boxes)).toMatch(/· envelope: 1 spawns\/fire, chats no, boxes none$/);
+    }
+  });
+});
+
 describe('formatting', () => {
   it('describeSchedule puts the common shapes in words and leaves the rest as cron', () => {
     expect(describeSchedule('5 7 * * *', 'Europe/London')).toBe('daily at 07:05 Europe/London');
@@ -171,6 +297,19 @@ describe('formatting', () => {
     expect(formatRoutineRunAck({ delivered: false, reason: 'no_coordinator' }, 'daily-sweep')).toMatch(/no Coordinator/);
     expect(formatRoutineRunAck({ delivered: false, reason: 'busy' }, 'daily-sweep')).toMatch(/try again/);
     expect(formatJournalRoutinesError({ error: 'conflict', blocked_by: 'cap' })).toMatch(/maximum/);
+    // The journal's provenance gate on a Coordinator's routine write: say what
+    // it needs (the user's own ask) and carry the journal's why, never the
+    // generic "delete routines" wording that sends operators hunting for a
+    // missing deployment.
+    const unverified = formatJournalRoutinesError({ error: 'forbidden', detail: 'routine_write_unverified', why: 'started by agent' });
+    expect(unverified).toMatch(/user's own ask/);
+    expect(unverified).toMatch(/\(started by agent\)/);
+    expect(unverified).toMatch(/tap on one of this conversation's items/);
+    expect(unverified).not.toMatch(/delete routines/);
+    expect(formatJournalRoutinesError({ error: 'forbidden', detail: 'routine_write_unverified' })).not.toMatch(/\(\)/);
+    expect(formatJournalRoutinesError({ error: 'forbidden', detail: 'routine_write_unverified', why: '   ' })).not.toMatch(/\(\)/);
+    expect(formatJournalRoutinesError({ error: 'forbidden', detail: 'not_coordinator' })).toMatch(/not list this conversation as the Coordinator/);
+    expect(formatJournalRoutinesError({ error: 'forbidden' })).toMatch(/delete routines/);
     expect(validateUpdateFields({ enabled: true, name: 'x', roomId: 'r' })).toEqual({ ok: true, value: { enabled: true } });
     expect(validateUpdateFields({ trigger: { kind: 'context_over', pct: 55 } })).toEqual({ ok: true, value: { trigger: { kind: 'context_over', pct: 55 } } });
     expect(validateUpdateFields({ trigger: { kind: 'stalled' } })).toEqual({ ok: true, value: { trigger: { kind: 'stalled' } } });
@@ -209,5 +348,32 @@ describe('createRoutinesClient', () => {
     expect((await down.list()).status).toBe(0);
     const err = createRoutinesClient({ baseUrl: 'http://j', token: 't', fetchImpl: async () => ({ ok: false, status: 500, json: async () => { throw new Error('x'); } }) });
     expect(await err.list()).toEqual({ status: 500, data: { error: 'HTTP 500' } });
+  });
+});
+
+describe('allowance_expiring trigger', () => {
+  it('validates pct and an optional hour window, and says it in words', () => {
+    const base = { name: 'spare-allowance', title: 'Spare', prompt: 'p' };
+    expect(validateCreateFields({ ...base, trigger: { kind: 'allowance_expiring', pct: 70 } }).value.trigger).toEqual({ kind: 'allowance_expiring', pct: 70 });
+    expect(validateCreateFields({ ...base, trigger: { kind: 'allowance_expiring', pct: 70, from_hours: 2, to_hours: 24 } }).value.trigger).toEqual({ kind: 'allowance_expiring', pct: 70, from_hours: 2, to_hours: 24 });
+    for (const trigger of [{ kind: 'allowance_expiring' }, { kind: 'allowance_expiring', pct: 70, from_hours: 12 }, { kind: 'allowance_expiring', pct: 70, to_hours: 200 }, { kind: 'disk_under', pct: 20, from_hours: 1 }]) {
+      expect(validateCreateFields({ ...base, trigger }).ok).toBe(false);
+    }
+    expect(describeTrigger({ kind: 'allowance_expiring', pct: 70 })).toBe('when a weekly limit resets within 6–12 h and is under 70%');
+    expect(describeTrigger({ kind: 'allowance_expiring', pct: 50, from_hours: 2, to_hours: 24 })).toBe('when a weekly limit resets within 2–24 h and is under 50%');
+  });
+
+  it('validates 1–4 tiers of unused percent and hours left, on create and update', () => {
+    const base = { name: 'spare-allowance', title: 'Spare', prompt: 'p' };
+    const tiers = [{ unused_pct: 50, hours_left: 12 }, { unused_pct: 25, hours_left: 2 }];
+    expect(validateCreateFields({ ...base, trigger: { kind: 'allowance_expiring', tiers } }).value.trigger).toEqual({ kind: 'allowance_expiring', tiers });
+    expect(validateUpdateFields({ trigger: { kind: 'allowance_expiring', tiers } }).value.trigger).toEqual({ kind: 'allowance_expiring', tiers });
+    const t = (x) => ({ kind: 'allowance_expiring', tiers: [x] });
+    for (const trigger of [{ kind: 'allowance_expiring', tiers: [] }, { kind: 'allowance_expiring', tiers, pct: 70 }, { kind: 'allowance_expiring', tiers: Array(5).fill(tiers[0]) },
+      t({ unused_pct: 0, hours_left: 2 }), t({ unused_pct: 50, hours_left: 0 }), t({ unused_pct: 50, hours_left: 169 }), t({ unused_pct: 50 }), t({ unused_pct: 50, hours_left: 2, pct: 1 }), t(null),
+      { kind: 'disk_under', pct: 20, tiers }]) {
+      expect(validateCreateFields({ ...base, trigger }).ok).toBe(false);
+    }
+    expect(describeTrigger({ kind: 'allowance_expiring', tiers })).toBe('when a weekly limit has 50% unused with 12 h left or 25% unused with 2 h left');
   });
 });

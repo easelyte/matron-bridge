@@ -96,7 +96,7 @@ describe('notices wiring (source inspection)', () => {
     expect(index).toMatch(/const userSettings = createUserSettings\(\{\s*baseUrl: journalHttpBase,\s*token: _journalToken,\s*\}\);/);
     expect(index).toContain('renderNoticesBlock(NOTICES_BLOCKS, { enabled: userSettings.notices(), coordinator: coordinator === true, coordinatorOnly })');
     expect(index).toContain('onSettings: (settings, { hello }) => { if (hello) userSettings.onHello(settings); else userSettings.apply(settings); },');
-    const builders = index.match(/noticesBlock: noticesBlockNow\(\{ coordinator: !!options\.coordinator \}\) \}\);/g) || [];
+    const builders = index.match(/noticesBlock: noticesBlockNow\(\{ coordinator: !!options\.coordinator \}\), matronMdBlock: matronMd\.block \}\);/g) || [];
     expect(builders).toHaveLength(3);
   });
 });

@@ -238,3 +238,11 @@ describe('missions-format against real journal response bodies', () => {
     expect(formatBlocked({ error: 'conflict', blocked_by: 'closed' })).toBe('mission is closed — no more milestones, joins or status changes');
   });
 });
+
+describe('formatBlocked, hand-over in flight', () => {
+  it('turns handover_pending (mission_update with project) into a sentence', () => {
+    const text = 'a hand-over of this mission or project is waiting; move it after it is answered';
+    expect(formatBlocked({ error: 'conflict', blocked_by: 'handover_pending' })).toBe(text);
+    expect(formatBlocked({ error: 'handover_pending' })).toBe(text);
+  });
+});

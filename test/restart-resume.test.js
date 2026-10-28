@@ -8,6 +8,7 @@ import { createRestartCancellation, createRestartBoot } from '../lib/restart-boo
 import { createRestartLatch } from '../lib/restart-latch.js';
 import { sessionOccupied } from '../lib/restart-quiet.js';
 import { runInNewContext } from 'node:vm';
+import * as turnCause from '../lib/turn-cause.js';
 
 const source = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
 it('reconciles synchronously before timers and startup dispatch', async () => {
@@ -242,7 +243,7 @@ it.each(['/compact', '/context-full'])('keeps stored text out of native command 
   const body = source.slice(start, source.indexOf('\nfunction sendTextToSession(', start));
   const send = vi.fn(() => true), compact = vi.fn(() => true);
   const session = { alive: true, agent: 'codex', codex: { transport: 'app-server', send, compact } };
-  const context = new Proxy({ Date, restartLatch: null, AGENT_CODEX: 'codex', codexInput: blocks => blocks,
+  const context = new Proxy({ ...turnCause, inflightTurnOrigin: () => ({}), Date, restartLatch: null, AGENT_CODEX: 'codex', codexInput: blocks => blocks,
     isCompactCommand: value => value.startsWith('/compact'), contextFullToNative: () => '/context',
     applyPendingAgentHandoff: (target, blocks) => ({ blocks, pending: null }),
     inflightMarker: { noteTurnStart() {} }, journalConvoIdFor: () => 'alice',
@@ -313,7 +314,7 @@ it('retries cancellation after journal hello', () => {
   const start = source.indexOf('function handleJournalReconnect() {');
   const body = source.slice(start, source.indexOf('\n}', start) + 2);
   const retry = vi.fn();
-  const context = new Proxy({ retryRestartCancellation: retry, coordinatorLookup: { refresh() {} }, memoryLookup: { refresh() {} }, userDefaults: { refresh() {} }, journalIdentity: { refresh() {} } }, { get: (target, key) => key in target ? target[key] : () => {} });
+  const context = new Proxy({ transferSender: { resumeAll() { return Promise.resolve(); } }, transferReceiver: { catchUp() { return Promise.resolve(); } }, retryRestartCancellation: retry, coordinatorLookup: { refresh() {} }, memoryLookup: { refresh() {} }, userDefaults: { refresh() {} }, journalIdentity: { refresh() {} } }, { get: (target, key) => key in target ? target[key] : () => {} });
   runInNewContext(`${body}\nhandleJournalReconnect()`, context);
   expect(retry).toHaveBeenCalledOnce();
 });
@@ -370,7 +371,7 @@ it('keeps the listener available and falls back to carry-on when listener recove
   const context = { plannedRestartAvailable: true, restartBoot: { listenerReady: () => { throw new Error('storage full'); } },
     apiServer: { listen: (_port, _host, callback) => callback() }, API_PORT: 0,
     atomicWriteFileSync() {}, RESTART_ENV_FILE: 'token', RESTART_TOKEN: 'token', restartTokenWritten: false,
-    publishRestartCarryOnCards: legacy, console: { warn, log() {} },
+    publishRestartCarryOnCards: legacy, publishOperatorToken() {}, console: { warn, log() {} },
   };
   expect(() => runInNewContext(body, context)).not.toThrow();
   expect(context.plannedRestartAvailable).toBe(false);

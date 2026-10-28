@@ -20,11 +20,11 @@ This project is licensed under AGPLv3. For alternative licensing, contact [licen
 - Claude Code CLI and/or Codex CLI installed and authenticated
 - A [matron-journal](https://github.com/Matronhq/matron-journal) server, plus the Matron app signed in to it (to pair the bridge by QR code) or an agent token minted on the journal server with `matron-admin agent add <user> <device-name>`
 
-**Linux (Ubuntu/Debian):** `apt-get install nodejs npm` (or use nvm). For voice notes: `setup/install-whisper.sh` will install the rest.
+**Linux (Ubuntu/Debian):** `apt-get install nodejs npm` (or use nvm), and `apt-get install ffmpeg` for the key frames of videos sent in chat. Voice notes are transcribed by the journal, so whisper is optional: `setup/install-whisper.sh` installs it (and ffmpeg) as a local fallback.
 
-**macOS:** [Homebrew](https://brew.sh), Xcode Command Line Tools (`xcode-select --install`), and `brew install node@22`. For voice notes: `setup/install-whisper.sh` will run `brew install whisper-cpp ffmpeg` automatically.
+**macOS:** [Homebrew](https://brew.sh), Xcode Command Line Tools (`xcode-select --install`), and `brew install node@22`, plus `brew install ffmpeg` for the key frames of videos sent in chat. Voice notes are transcribed by the journal, so whisper is optional: `setup/install-whisper.sh` runs `brew install whisper-cpp ffmpeg` for a local fallback.
 
-**Windows (10 1809+ / Server 2019+):** [Node.js 22+](https://nodejs.org) (`winget install OpenJS.NodeJS.LTS`), [Git for Windows](https://git-scm.com/downloads/win) (`winget install Git.Git` — Git Bash is what gives Claude Code its Bash tool; without it sessions get the PowerShell tool and live Bash output is off), and Claude Code via the native installer (`irm https://claude.ai/install.ps1 | iex`), logged in (`claude`) as the user who will run the bridge. If Claude Code cannot find Git Bash, set `CLAUDE_CODE_GIT_BASH_PATH` in `%USERPROFILE%\.claude\settings.json` (see the [Claude Code setup docs](https://code.claude.com/docs/en/setup#set-up-on-windows)). Not available on Windows: the Codex backend and voice-note transcription.
+**Windows (10 1809+ / Server 2019+):** [Node.js 22+](https://nodejs.org) (`winget install OpenJS.NodeJS.LTS`), [Git for Windows](https://git-scm.com/downloads/win) (`winget install Git.Git` — Git Bash is what gives Claude Code its Bash tool; without it sessions get the PowerShell tool and live Bash output is off), and Claude Code via the native installer (`irm https://claude.ai/install.ps1 | iex`), logged in (`claude`) as the user who will run the bridge. If Claude Code cannot find Git Bash, set `CLAUDE_CODE_GIT_BASH_PATH` in `%USERPROFILE%\.claude\settings.json` (see the [Claude Code setup docs](https://code.claude.com/docs/en/setup#set-up-on-windows)). Not available on Windows: the Codex backend and the local whisper fallback (voice notes are still transcribed by the journal).
 
 For public file and secret viewer links on macOS, install `cloudflared` if you want to publish the local viewer through Cloudflare Tunnel:
 
@@ -129,6 +129,42 @@ sudo chown "$USER":staff ~/Library/LaunchAgents
 After editing `.env`, re-run `setup/service.sh` (on macOS, launchd has no
 `EnvironmentFile` equivalent — values are inlined into the plist at install
 time).
+
+### Firewall-friendly process names on macOS
+
+Per-app firewalls on macOS identify a program by its executable file and its
+code signature. Every Node script runs through the same `node` binary, so the
+bridge would otherwise be indistinguishable from any other Node program
+(npm, a dev server, a test runner), and a wrapper script, symlink or
+`process.title` does not change that.
+
+So on macOS the bridge's starters (`setup/service.sh`, `start-bridge.sh`,
+`restart.sh`) go through `bin/run-named-node`, which keeps a copy of your
+node binary under a Matron name in `~/.matron/bin` and runs the script with
+it. The copy keeps node's own code signature (`codesign -v` passes), and the
+firewall shows:
+
+| Process | Name |
+|---|---|
+| The bridge (`index.js`) | `matron-bridge` |
+| The file viewer (`viewer/start.js`) | `matron-viewer` |
+
+The `ask-user` and `show-file` MCP servers the bridge starts for each
+session run with the bridge's copy too, so they appear as `matron-bridge`.
+
+- After a node upgrade the copy is refreshed on the next start (it is
+  replaced whenever node's size or modification time differs), and the
+  firewall may ask about it once more.
+- To opt out, set `MATRON_NAMED_NODE=0` in the environment the starter runs
+  in (for the launchd service, add it to `.env` and re-run
+  `setup/service.sh`). The script then runs with node itself.
+- `MATRON_NAMED_NODE_DIR` moves the copies elsewhere; `NODE_BIN` picks the
+  node binary (the service installer records the one it found).
+- If the copy cannot be written, the launcher prints one warning and runs
+  node itself, so the bridge still starts.
+
+Existing installs switch over when `setup/service.sh` is re-run. On Linux the
+launcher just runs node; the Windows starters do not use it.
 
 ### Windows
 
@@ -291,26 +327,28 @@ avoid loading ambient shell startup files and exported functions.
 | `WEB_BASE_URL` | Web client base URL for Files deep links. When set, doc handoffs (send_attachment / show_file / item attachments) append an `Open in Files` link (`${WEB_BASE_URL}/#files=<abs>`, so set it to wherever the web app itself is served, including any path prefix); token-less (uses the operator's web session). Unset => handoffs fall back to the plain path. Set only after the matron-web deep-link build is deployed. | — |
 | `LINK_EXPIRY_MS` | Signed URL expiry in ms | `900000` (15 min) |
 | `MATRON_BRIDGE_API_PORT` | Internal API port (hooks, MCP, viewer) | `9802` |
+| `MATRON_BRIDGE_API_AUTH` | `off` stops checking the per-session tokens on the internal API (they are still issued). Leave it unset. Scripts run outside a session can list sessions (`POST /sessions`) with `curl -H @"${XDG_STATE_HOME:-$HOME/.local/state}/matron-bridge/api-operator.header"`, an owner-only file the bridge rewrites at each start | on |
 | `MATRON_VIEWER_PORT` | Local file viewer port | `9803` |
 | `MATRON_WAKE_CONVO_ID` | Conversation that `POST /wake` on the internal API wakes. Lets a scheduled job on the same machine wake one conversation with a fixed text, resuming its session if it was idle-stopped; the request can choose neither the conversation nor the text. Off unless both this and `MATRON_WAKE_TEXT` are set | — |
 | `MATRON_WAKE_TEXT` | The exact text `POST /wake` delivers to `MATRON_WAKE_CONVO_ID` | — |
+| `MATRON_WAKE_TOKEN` | Optional. When set, `POST /wake` is refused (403) unless the request carries it in an `X-Matron-Wake-Token` header — the internal API port is reachable by every local user, and a wake resumes a session | — |
 | `MCP_DEFAULT_EXTRAS` | Comma-separated MCP extras loaded for every session on this machine (e.g. `circleci`). Names must match `mcpExtras` keys in `mcp-config.json`/`mcp-config.local.json`. | _(none)_ |
 | `BRIDGE_PLUGIN_CACHE_DIR` | Dir plugin MCP servers (context7, serena, …) load from. Unset = an empty bridge-owned dir (no plugin MCPs, lean). Set to `~/.claude/plugins` or a curated dir to re-enable. | _(empty dir)_ |
 | `DOWNLOAD_RATE_LIMIT` | Viewer requests per minute for file downloads and sensitive-link shell pages | `30` |
 | `PAGE_RATE_LIMIT` | Viewer requests per minute for rendered HTML pages (`/page`) | `60` |
 | `VIEWER_PAGE_BASE_URL` | Optional separate public URL (pointed at the same viewer) for `share_html_page` links | `VIEWER_BASE_URL` |
 | `REVEAL_RATE_LIMIT` | Viewer requests per minute for `POST /sensitive/reveal`, counted separately so shell loads cannot exhaust it | `30` |
-| `WHISPER_MODEL_PATH` | whisper.cpp model for voice-note transcription | `~/.local/share/whisper-cpp/models/ggml-small.bin` |
-| `WHISPER_LANGUAGE` | Voice-note transcription language | `en` |
-| `WHISPER_PROMPT` | Vocabulary hint passed to whisper-cli as `--prompt`: names and terms it should spell right (box names, `sudo`, `PR`). Set it to your own list, or to the empty string to send no prompt | _(built-in Matron vocabulary)_ |
-| `SUMMARY_PROVIDERS` | Preference order for conversation titles and rolling TOC summaries, comma-separated from `anthropic`, `openai`, `gemini`. A provider without its key is skipped; a failed request falls through to the next one. Summaries are off when none has a key | `anthropic,openai,gemini` |
-| `SUMMARY_ANTHROPIC_API_KEY` | Dedicated Claude summariser key (`claude-haiku-5-5` by default). Does not change session authentication | — |
+| `WHISPER_MODEL_PATH` | whisper.cpp model for the optional local voice-note fallback. Used only when this file, and the `whisper-cli` built beside it, exist; the journal transcribes first, and the bridge never installs whisper itself | `~/.local/share/whisper-cpp/models/ggml-small.bin` |
+| `WHISPER_LANGUAGE` | Language for the local whisper fallback | `en` |
+| `WHISPER_PROMPT` | Vocabulary hint for the local whisper fallback, passed to whisper-cli as `--prompt`: names and terms it should spell right (box names, `sudo`, `PR`). Set it to your own list, or to the empty string to send no prompt | _(built-in Matron vocabulary)_ |
+| `SUMMARY_PROVIDERS` | Preference order for conversation titles and rolling TOC summaries, comma-separated from `journal`, `anthropic`, `openai`, `gemini`. `journal` asks the journal (`POST /summarise`, with the bridge's journal token), which holds the provider key server-side, so a bridge connected to a journal needs no summary key of its own. A provider without its key (or, for `journal`, without a journal URL and token) is skipped; a failed request falls through to the next one. After a 404 or 503 the journal is skipped for 10 minutes, and after a 429 for as long as `Retry-After` says. Summaries are off when no provider is available | `journal,anthropic,openai,gemini` |
+| `SUMMARY_ANTHROPIC_API_KEY` | Optional local fallback: dedicated Claude summariser key (`claude-haiku-5-5` by default). Does not change session authentication | — |
 | `SUMMARY_ANTHROPIC_MODEL` | Claude summariser model | `claude-haiku-5-5` |
-| `OPENAI_API_KEY` | Optional OpenAI summariser key (`gpt-6-luna` by default) | — |
-| `GEMINI_API_KEY` | Optional Gemini summariser key (`gemini-3-flash-preview` by default) | — |
+| `OPENAI_API_KEY` | Optional local fallback: OpenAI summariser key (`gpt-6-luna` by default) | — |
+| `GEMINI_API_KEY` | Optional local fallback: Gemini summariser key (`gemini-3-flash-preview` by default) | — |
 | `SUMMARY_MODEL` | Model override for the OpenAI and Gemini summarisers | — |
 
-Voice notes sent in chat are transcribed by the journal at upload when it has a cloud speech-to-text key (`MATRON_STT_AZURE_KEY`, see the journal's protocol doc): the bridge asks `GET /media/:id/transcript` first and only runs its own whisper when the journal has no words for the note (no key, an older journal, or a failed job).
+Voice notes are transcribed by the journal: at upload when it has a cloud speech-to-text key (`MATRON_STT_AZURE_KEY`), falling back to its own whisper when the cloud call fails; tracker-item voice notes also use the journal's whisper when it has no key (see the journal's protocol doc). For a voice note sent in chat the bridge asks `GET /media/:id/transcript`; when the journal has no words for it (its job failed, or never ran) the bridge asks it to try again with `POST /media/:id/transcript` and waits for the answer. A voice note on a tracker item follows the same order, and the words are written back to the item's comment. Only when the journal still has no words does the bridge run its own whisper, and only where it is installed (see `WHISPER_MODEL_PATH`); otherwise a chat voice note is not delivered (any text typed with it still is) and the user is told why, and a tracker item's turn goes out with `(transcription failed)` in place of the words (`(no transcript)` when the journal heard none). Videos sent in chat arrive as key frames, which needs ffmpeg and ffprobe on this machine, narrated from the journal's timestamped transcript of their audio, or by the local whisper fallback where installed.
 
 ## Tool list by role
 
@@ -429,10 +467,23 @@ Every session gets these MCP tools via `ask-user.js`:
 - `agent_chat_join` — ask to join an existing room by id
 - `agent_chat_send` / `agent_chat_read` — post to a room, or catch up on its recent messages
 - `agent_chat_mute` / `agent_chat_unmute` — stop and resume delivery of a room's messages to you
+- `agent_chat_leave` — step out of a room of three or more that someone else started, once your part is done (a room of two cannot be left)
 
 The user's consent card is the gate: once an invite is approved, the target bridge joins its agent to the room on delivery and tells it so (with the room's opening message), rather than asking it to accept — a target mid-turn for the whole invite window could never accept in time, and pairs ended up with several rooms. Inbound requests are also posted into the invited session's conversation, so the user sees who asked and why. Invites never block: the inviting agent keeps working, and answers and room replies arrive as later turns.
 
 A room between two sessions stays open for as long as both live — agents have no way to close one. When a room goes wrong (a peer looping, spamming, or malfunctioning) the agent mutes it with a reason: the room and both members' chats say so out loud, and the user gets a **🔊 Unmute** card in that agent's conversation to overrule it with one tap.
+
+## Repository instructions (MATRON.md)
+
+CLAUDE.md and AGENTS.md are read by every Claude Code or Codex run in a repository, so instructions there about the tracker, rooms or missions confuse a run outside Matron, which has none of those tools. A repository puts such instructions in a `MATRON.md` instead, and the bridge adds it to the instructions of Matron sessions only.
+
+- **Which files.** Every `MATRON.md` from the repository root (the nearest ancestor of the workdir holding `.git`, so a worktree counts) down to the session's workdir, root first. Outside a repository, only the workdir's own `MATRON.md`. A `MATRON.md` in a subdirectory applies only to sessions whose workdir is inside it; nested files are not loaded on first touch the way Claude Code loads a nested CLAUDE.md.
+- **Where it goes.** In the system prompt the bridge already builds (`--append-system-prompt` for Claude, developer instructions for Codex), after the bridge's own instructions, the Coordinator brief and the notices block, and before the user's memories. Its heading tells the agent that it adds to CLAUDE.md and AGENTS.md and wins over them in a Matron session, and that the user's memories and the bridge's rules on sensitive data and on other people's turns win over it. It is trusted like CLAUDE.md: whatever branch is checked out supplies it.
+- **When.** Read afresh at every spawn: start, resume, `/workdir`, `/restart`, `restart_session`, a crash respawn and a bridge restart. An edit reaches a running session at its next restart; a `cd` inside a session changes nothing.
+- **Size.** At most 24 KB in total. Anything past that is cut off, with a line in the prompt saying so and a warning in the bridge log.
+- **Seeing it.** The start, resume, workdir and restart messages and `/status` list the files a session loaded, e.g. `MATRON.md: MATRON.md (3.1 KB)`.
+
+**MATRON.md or a memory?** `MATRON.md` is part of the code: reviewed in pull requests, it follows the branch and applies to everyone's Matron sessions in the repository. Use it for how to work on that repository through Matron. A `repo:<name>` memory is one user's own standing rule, changed at once and private to them. Use it for personal preferences and anything about particular machines.
 
 ## How it works
 
@@ -458,11 +509,20 @@ Anything that cannot steer is queued exactly as before: slash commands and `!` c
 ```bash
 npm test        # vitest suite
 npm run lint    # eslint, zero warnings allowed
-npm run check   # node --check on every entrypoint
+npm run check   # node --check on every .js/.mjs file
 npm run ci      # lint + check + test + npm audit (high)
 ```
 
-CI runs the same gates on Node 20 and 22.
+CI runs the same gates on Node 22, on Linux and on Windows.
+
+Two operator checks are kept out of `npm test`, because each needs a local install or an API key:
+
+```bash
+node scripts/check-codex-app-server.mjs        # Codex app-server contract check: ephemeral threads, no model turns, no tool runs
+node scripts/spoken-sample.mjs [conversation]  # print the spoken summary lines for a saved conversation (one real model call)
+```
+
+`check-codex-app-server.mjs` needs the Codex CLI installed and logged in; run it after a Codex upgrade. `spoken-sample.mjs` needs `OPENAI_API_KEY` or `GEMINI_API_KEY` (`SUMMARY_MODEL` overrides the model) and reads a JSON array of `{role, text}` messages, by default `test/fixtures/spoken-sample.json`. Neither prints keys or config values.
 
 ## File structure
 
@@ -480,21 +540,30 @@ matron-bridge/
 ├── docs/agent-rpc.md     # Agent RPC methods (recent_folders, start, read/edit_file, ops_snapshot)
 ├── mcp-config.json       # MCP server config for Claude Code
 ├── viewer/               # HMAC-signed file viewer
-├── setup/                # OS-dispatching installer, service, whisper
+├── setup/                # OS-dispatching installer, service, optional local whisper
 ├── hooks/                # Claude Code hooks used by bridge sessions
+├── bin/run-named-node    # macOS: runs node under a Matron name (firewall-friendly)
 ├── test/                 # Vitest suite
 ├── SECURITY.md
 ├── package.json
 └── .env.example
 ```
 
-Claude summary rollout: with the default order, supplying
-`SUMMARY_ANTHROPIC_API_KEY` is what turns Claude on, so provision it through
-the secure credential store only once its Console billing organisation is
-confirmed, and start with one bridge. Check titles, roster and spoken
-summaries, and inspect debug `summary usage` counts for cache reads after
-repeated turns. The fixed prompt prefix has a 5-minute cache breakpoint;
-transcript and prior roster text are never in it. Cache hits depend on the
-model's minimum prompt length. Provider failures log a fallback event without
-prompt or response content. Roll back by removing the key, or by setting
-`SUMMARY_PROVIDERS=openai,gemini`, and restarting the bridge.
+Summaries come from the journal by default: the bridge posts the prompt to
+the journal's `POST /summarise` under its own journal token, and the journal
+calls the model with a key it holds server-side, so no provider key needs to
+sit on the box. Local keys are fallbacks only, used when the journal has no
+key, is rate limited, fails upstream, or predates the route. To keep a box on
+local keys only, set `SUMMARY_PROVIDERS` without `journal` (for example
+`anthropic,openai,gemini`).
+
+Local Claude fallback: supplying `SUMMARY_ANTHROPIC_API_KEY` is what turns it
+on, so provision it through the secure credential store only once its
+Console billing organisation is confirmed, and start with one bridge. Check
+titles, roster and spoken summaries, and inspect debug `summary usage` counts
+for cache reads after repeated turns. The fixed prompt prefix has a 5-minute
+cache breakpoint; transcript and prior roster text are never in it. Cache
+hits depend on the model's minimum prompt length. Provider failures log a
+fallback event without prompt or response content. Roll back by removing the
+key, or by setting `SUMMARY_PROVIDERS` to an order without `anthropic`, and
+restarting the bridge.

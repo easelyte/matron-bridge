@@ -23,6 +23,7 @@ import {
   isLocalHost,
   tokenEnv,
   strandedTokenFile,
+  sameJournal,
   hmacSecretFor,
   writeEnvFile,
   testConnection,
@@ -97,6 +98,35 @@ export function tokenMethod(answer) {
   if (a === '' || a === '1' || a === 'p' || a === 'pair') return 'pair';
   if (a === '2' || a === 'paste' || a === 't' || a === 'token') return 'paste';
   return null;
+}
+
+// Which stored token file the wizard may offer to keep for journalUrl
+// (exported for tests). Returns { file, question, defaultKeep } when there is
+// one to offer, or { file: '', note } when a stored token belongs to another
+// journal and must not be used (note says so; '' when there is nothing).
+export function storedTokenToOffer(existing, journalUrl, { tokenPath } = {}) {
+  if (existing.JOURNAL_TOKEN_FILE) {
+    if (sameJournal(existing.JOURNAL_WS_URL, journalUrl)) {
+      return {
+        file: existing.JOURNAL_TOKEN_FILE,
+        question: `Keep the agent token already stored in ${existing.JOURNAL_TOKEN_FILE}?`,
+        defaultKeep: true,
+      };
+    }
+    return {
+      file: '',
+      note: `The agent token in ${existing.JOURNAL_TOKEN_FILE} was paired with ${existing.JOURNAL_WS_URL || 'another journal'}; ${journalUrl} needs a token of its own.`,
+    };
+  }
+  const stranded = strandedTokenFile(existing, tokenPath);
+  if (stranded) {
+    return {
+      file: stranded,
+      question: `${stranded} holds a token from an earlier, unfinished setup. Keep it? (only if it was paired with ${journalUrl})`,
+      defaultKeep: false,
+    };
+  }
+  return { file: '', note: '' };
 }
 
 // Pair with the Matron app; resolves to the token, or '' when the user
@@ -179,12 +209,18 @@ async function main() {
 
   // --- agent token ---
   let token = '';
+  // A stored token is only ever offered for the journal that issued it: the
+  // JOURNAL_WS_URL saved beside it in .env. Switching journals needs a token
+  // from the new one, so the old token is never tested against it.
   // A token paired by an earlier run that was interrupted before .env was
-  // written counts as stored too: re-pairing would mint a second agent.
-  const storedTokenFile = existing.JOURNAL_TOKEN_FILE || strandedTokenFile(existing);
-  if (storedTokenFile && fs.existsSync(storedTokenFile)) {
-    const keep = await askYesNo(`Keep the agent token already stored in ${storedTokenFile}?`, true);
-    if (keep) token = fs.readFileSync(storedTokenFile, 'utf8').trim();
+  // written has no record of its journal, so keeping it is opt-in: the
+  // person running setup knows which journal they paired it with.
+  const keepFile = storedTokenToOffer(existing, journalUrl);
+  if (keepFile.file && fs.existsSync(keepFile.file)) {
+    const keep = await askYesNo(keepFile.question, keepFile.defaultKeep);
+    if (keep) token = fs.readFileSync(keepFile.file, 'utf8').trim();
+  } else if (keepFile.note) {
+    console.log(keepFile.note);
   }
   while (!token) {
     console.log('How should this machine get its agent token?');

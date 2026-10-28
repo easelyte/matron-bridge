@@ -38,6 +38,21 @@ describe('session control client', () => {
     expect(notices).toHaveLength(1);
     expect(h._inflightCount()).toBe(0);
   });
+  it('a carry-on carries the causes of the Coordinator\'s turn; other actions do not', async () => {
+    const sent = [];
+    const causes = [{ kind: 'user_message', ref: 'coord-convo:12', at: 1 }];
+    // The causes come from the turn the bridge is running, never the request body.
+    const sessions = new Map([['!coord', { alive: true, coordinator: true, journalConvoId: 'coord-convo', currentTurn: { causes, startedAt: 1 } }]]);
+    const h2 = createSessionControlHandlers({ sessions, publisher: { sendRoomOp: (f) => { sent.push(f); return true; } }, journalConvoIdFor: (x) => x.journalConvoId, pendingTimeoutMs: 20 });
+    await h2.carryOn({ roomId: '!coord', target_convo_id: 'tgt', message: 'go', causes: [{ kind: 'routine', ref: 'forged' }] });
+    expect(sent[0]).toMatchObject({ action: 'carry_on', causes });
+    await h2.compact({ roomId: '!coord', target_convo_id: 'tgt' });
+    expect('causes' in sent[1]).toBe(false);
+    // A turn with no causes sends none.
+    sessions.get('!coord').currentTurn = null;
+    await h2.carryOn({ roomId: '!coord', target_convo_id: 'tgt', message: 'go' });
+    expect('causes' in sent[2]).toBe(false);
+  });
   it('maps journal error frames to HTTP statuses and times out without an ack', async () => {
     const { h, sent } = fixture();
     const p = h.carryOn({ roomId: '!coord', target_convo_id: 'tgt', message: 'go', when: 'after_limit_reset' });

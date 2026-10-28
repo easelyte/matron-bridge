@@ -117,7 +117,13 @@ async function runPass(session, answer, { during } = {}) {
   const context = vm.createContext({
     applyFallbackTitle: () => {}, SERVER_LABEL: 'bridge', updateRoomName: () => {},
     llmTitleEarned: () => false, markLlmTitleEarned: () => {},
-    summaryModel: { model: 'test-model', generate: async () => { during?.(); return answer; } },
+    // The event names the model that wrote this pass's text (returned with
+    // it), never the shared configuration label.
+    summaryModel: {
+      model: 'configured-label',
+      generate: async () => { during?.(); return answer; },
+      generateWithModel: async () => { during?.(); return { text: answer, model: 'test-model' }; },
+    },
     summaryModelNag: { maybeFile: () => {} },
     journalConvoIdFor: () => 'convo', debug: () => {}, console,
     summaryWindow, buildSummaryPrompt, splitSpoken, spokenPayload, spokenRefFor,

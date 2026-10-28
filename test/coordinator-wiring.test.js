@@ -49,14 +49,14 @@ describe('coordinator spawn wiring (source inspection)', () => {
 
   it('print mode: prompt and disallowed tools come from claudeCoordinatorArgs', () => {
     const cs = body('function createSession(roomId, workdir, resumeSessionId, options = {}) {', '\nfunction ');
-    expect(cs).toMatch(/const printCoord = claudeCoordinatorArgs\(\{ coordinator: !!options\.coordinator, basePrompt: trackerLinksNow\(BRIDGE_SYSTEM_PROMPT\), block: trackerLinksNow\(COORDINATOR_BLOCK\), baseDisallowed: \['AskUserQuestion'\], memoryBlock: memoryBlockNow\(\{ coordinator: !!options\.coordinator, workdir: cwd \}\), noticesBlock: noticesBlockNow\(\{ coordinator: !!options\.coordinator \}\) \}\);/);
+    expect(cs).toMatch(/const printCoord = claudeCoordinatorArgs\(\{ coordinator: !!options\.coordinator, basePrompt: trackerLinksNow\(BRIDGE_SYSTEM_PROMPT\), block: trackerLinksNow\(COORDINATOR_BLOCK\), baseDisallowed: \['AskUserQuestion'\], memoryBlock: memoryBlockNow\(\{ coordinator: !!options\.coordinator, workdir: cwd \}\), noticesBlock: noticesBlockNow\(\{ coordinator: !!options\.coordinator \}\), matronMdBlock: matronMd\.block \}\);/);
     expect(cs).toContain("'--disallowed-tools', ...printCoord.disallowedTools,");
     expect(cs).toContain("'--append-system-prompt', printCoord.appendSystemPrompt,");
   });
 
   it('interactive mode: same helper, --disallowed-tools only when there is something to disallow', () => {
     const iv = body('function createInteractiveSessionForRoom(', '\nfunction ');
-    expect(iv).toMatch(/const ivCoord = claudeCoordinatorArgs\(\{ coordinator: !!options\.coordinator, basePrompt: trackerLinksNow\(BRIDGE_SYSTEM_PROMPT\), block: trackerLinksNow\(COORDINATOR_BLOCK\), memoryBlock: memoryBlockNow\(\{ coordinator: !!options\.coordinator, workdir: cwd \}\), noticesBlock: noticesBlockNow\(\{ coordinator: !!options\.coordinator \}\) \}\);/);
+    expect(iv).toMatch(/const ivCoord = claudeCoordinatorArgs\(\{ coordinator: !!options\.coordinator, basePrompt: trackerLinksNow\(BRIDGE_SYSTEM_PROMPT\), block: trackerLinksNow\(COORDINATOR_BLOCK\), memoryBlock: memoryBlockNow\(\{ coordinator: !!options\.coordinator, workdir: cwd \}\), noticesBlock: noticesBlockNow\(\{ coordinator: !!options\.coordinator \}\), matronMdBlock: matronMd\.block \}\);/);
     expect(iv).toContain("...(ivCoord.disallowedTools.length ? ['--disallowed-tools', ...ivCoord.disallowedTools] : []),");
     expect(iv).toContain("'--append-system-prompt', ivCoord.appendSystemPrompt,");
   });
@@ -67,7 +67,7 @@ describe('coordinator spawn wiring (source inspection)', () => {
 
   it('Codex: developer instructions and sandbox come from codexCoordinatorOptions', () => {
     const cx = body('function createCodexSessionForRoom(', '\nfunction ');
-    expect(cx).toMatch(/const codexCoord = codexCoordinatorOptions\(\{ coordinator: !!options\.coordinator, baseInstructions: trackerLinksNow\(CODEX_BRIDGE_PROMPT\), block: trackerLinksNow\(COORDINATOR_BLOCK\), baseSandbox: CODEX_SANDBOX_MODE, memoryBlock: memoryBlockNow\(\{ coordinator: !!options\.coordinator, workdir: cwd \}\), noticesBlock: noticesBlockNow\(\{ coordinator: !!options\.coordinator \}\) \}\);/);
+    expect(cx).toMatch(/const codexCoord = codexCoordinatorOptions\(\{ coordinator: !!options\.coordinator, baseInstructions: trackerLinksNow\(CODEX_BRIDGE_PROMPT\), block: trackerLinksNow\(COORDINATOR_BLOCK\), baseSandbox: CODEX_SANDBOX_MODE, memoryBlock: memoryBlockNow\(\{ coordinator: !!options\.coordinator, workdir: cwd \}\), noticesBlock: noticesBlockNow\(\{ coordinator: !!options\.coordinator \}\), matronMdBlock: matronMd\.block \}\);/);
     expect(cx).toContain('sandbox: codexCoord.sandbox,');
     expect(cx).toContain('developerInstructions: codexCoord.developerInstructions + (CODEX_APP_SERVER');
     expect(cx).not.toContain('sandbox: CODEX_SANDBOX_MODE,');

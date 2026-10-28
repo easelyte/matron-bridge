@@ -5,7 +5,8 @@
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import { z } from 'zod';
-import { resolvePermissionTimeoutMs, classifyPermissionPostResponse } from './lib/permission-prompt.js';
+import { SECRET_CONTEXT_MAX_LENGTH } from './lib/secret-context.js';
+import { resolvePermissionTimeoutMs, classifyPermissionPostResponse, permissionInputRefusal } from './lib/permission-prompt.js';
 import { formatBox } from './lib/agent-boxes-format.js';
 import { itemLine, formatItemList, formatItemDetail, formatCommentAck, formatHandoverAck, withImageWarnings } from './lib/items-format.js';
 import { formatStartAck, formatCreateAck, formatMilestoneAck, formatMissionDetail, missionLine, formatBlocked, formatJournalError, formatStatusAck, formatMissionList, formatJoinAck, formatLeaveAck, formatUpdateAck } from './lib/missions-format.js';
@@ -18,12 +19,14 @@ import { rosterLine } from './lib/roster-format.js';
 import { formatPendingList, formatDecideAck } from './lib/consent-tools.js';
 import {
   formatContactList, formatContactAddAck, formatContactEndAck, formatGrantList, formatShareAck, formatUnshareAck,
-  formatSharedMissionList, formatSharedMissionDetail, formatSharingError,
+  formatSharedMissionList, formatSharedMissionDetail, formatSharingError, formatContribAck,
 } from './lib/sharing-format.js';
+import { BRIEF_WHAT } from './lib/sharing-tools.js';
 import { formatUnseenList, formatUnseenMine, formatFlagAck } from './lib/unseen-tools.js';
 import { formatRoutineList, formatRoutineUpdateAck, formatRoutineRunAck, formatRoutineCreateAck, formatRoutineDeleteAck } from './lib/routines-tools.js';
 import { formatBriefingPublishAck } from './lib/briefings-tools.js';
 import { shouldRegister } from './lib/tool-roles.js';
+import { readApiHeaderFile } from './lib/api-header-file.js';
 
 // Route to whichever bridge spawned us: explicit BRIDGE_API_URL wins, else the
 // per-session MATRON_BRIDGE_API_PORT exported by the bridge at spawn (journal=9812,
@@ -33,6 +36,13 @@ const BRIDGE_API = process.env.BRIDGE_API_URL
   || (process.env.MATRON_BRIDGE_API_PORT && `http://127.0.0.1:${process.env.MATRON_BRIDGE_API_PORT}`)
   || 'http://127.0.0.1:9802';
 const ROOM_ID = process.env.BRIDGE_ROOM_ID || null;
+// This session's loopback API token (lib/api-auth.js), sent on every bridge
+// call. Read per call: the file is written before the session spawns, and a
+// read is cheap next to the request.
+function bridgeFetch(url, opts = {}) {
+  const auth = readApiHeaderFile(process.env.MATRON_BRIDGE_API_HEADER_FILE);
+  return fetch(url, { ...opts, headers: { ...(opts.headers || {}), ...auth } });
+}
 const POLL_INTERVAL_MS = 500;
 // Max wait for a permission tap — the bridge's registry TTL resolves from the
 // same env var through the same validation, keeping one expiry for the whole
@@ -67,14 +77,15 @@ server.tool(
   'Request a secret from the user via a secure web form: API keys, tokens, passwords, or whole key files (multiline: true) — anything that must not appear in chat. This tool does NOT block and returns nothing secret: it files the request in the user\'s tracker (their For you list) alongside a chat link, then returns immediately. The user has 24 hours. When they submit, you receive a turn telling you the local file path to read the value from — so carry on with other work in the meantime and never poll for it.',
   {
     label: z.string().describe('A short label describing what secret is needed, e.g. "AWS access key" or "database password"'),
+    context: z.string().trim().min(1).max(SECRET_CONTEXT_MAX_LENGTH).describe('Required non-secret explanation: identify and link the related task, explain why this credential is needed, and give the exact permissions and resource scope (or say when scope is not applicable). Displayed with the request and on the secure form. Use plain text; URLs are shown literally. The bridge adds the originating conversation automatically and labels your explanation as unverified. Never include a secret value.'),
     multiline: z.boolean().optional().describe('Render a multi-line box instead of a masked one-line field. Use for PEM keys, certificates and JSON service-account files, whose newlines a one-line field would destroy.'),
   },
-  async ({ label, multiline }) => {
+  async ({ label, context, multiline }) => {
     try {
-      const postRes = await fetch(`${BRIDGE_API}/secret`, {
+      const postRes = await bridgeFetch(`${BRIDGE_API}/secret`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ label, roomId: ROOM_ID, multiline: multiline === true }),
+        body: JSON.stringify({ label, context, roomId: ROOM_ID, multiline: multiline === true }),
       });
 
       if (!postRes.ok) {
@@ -118,8 +129,13 @@ server.tool(
     // CLOSED — any relay failure denies rather than silently allowing.
     const deny = (message) => ({ content: [{ type: 'text', text: JSON.stringify({ behavior: 'deny', message }) }] });
     const allow = () => ({ content: [{ type: 'text', text: JSON.stringify({ behavior: 'allow', updatedInput: input ?? {} }) }] });
+    // The card shows the whole input and "Allow once" releases exactly that
+    // input, so a call the card could only show in part is refused here,
+    // before any card is minted.
+    const refusal = permissionInputRefusal(tool_name, input ?? {});
+    if (refusal) return deny(refusal);
     try {
-      const postRes = await fetch(`${BRIDGE_API}/permission-request`, {
+      const postRes = await bridgeFetch(`${BRIDGE_API}/permission-request`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ roomId: ROOM_ID, toolName: tool_name, input: input ?? {} }),
@@ -144,7 +160,7 @@ server.tool(
         // deadline; only the deadline itself resolves the request (→ deny).
         let status;
         try {
-          const pollRes = await fetch(`${BRIDGE_API}/permission-request/${requestId}`, {
+          const pollRes = await bridgeFetch(`${BRIDGE_API}/permission-request/${requestId}`, {
             signal: AbortSignal.timeout(BRIDGE_FETCH_TIMEOUT_MS),
           });
           if (!pollRes.ok) continue;
@@ -178,7 +194,7 @@ server.tool(
   },
   async ({ label, content, ttl, filename, download, one_time }) => {
     try {
-      const postRes = await fetch(`${BRIDGE_API}/share-sensitive`, {
+      const postRes = await bridgeFetch(`${BRIDGE_API}/share-sensitive`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -218,7 +234,7 @@ server.tool(
   },
   async ({ eventId, reason }) => {
     try {
-      const postRes = await fetch(`${BRIDGE_API}/redact-message`, {
+      const postRes = await bridgeFetch(`${BRIDGE_API}/redact-message`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ roomId: ROOM_ID, eventId, reason }),
@@ -243,15 +259,15 @@ server.tool(
 
 server.tool(
   'send_attachment',
-  'Send a file from disk into the Matron chat as a real attachment: images (png/jpg/gif/webp/heic) render inline; PDFs, logs, and other files appear as tappable file attachments. Use this for screenshots, plots, generated documents, and build artifacts instead of describing them or pasting their contents. Do NOT use for secrets or credential files — use share_sensitive_data for those. The file must be inside the session working directory, and attachments are capped at 50 MB. Keep it purposeful: send the artifact the user needs, not every intermediate file.',
+  'Send a file from disk into the Matron chat as a real attachment: images (png/jpg/gif/webp/heic) render inline; PDFs, logs, and other files appear as tappable file attachments. Use this for screenshots, plots, generated documents, and build artifacts instead of describing them or pasting their contents. Do NOT use for secrets or credential files — use share_sensitive_data for those. The file must be inside the session working directory or be one the bridge downloaded for this conversation (a file the user sent here, or an item attachment), and attachments are capped at 50 MB. With chat_room_id the file goes to the other agents in that room instead: each room file needs the user\'s approval on a card, may be up to 10 GB, and uploads in the background — the tool returns at once and the outcome arrives in the room. Keep it purposeful: send the artifact the user needs, not every intermediate file.',
   {
     path: z.string().describe('Path to the file — absolute, or relative to the session working directory'),
-    caption: z.string().optional().describe('Optional caption rendered with the attachment, like a message body'),
+    caption: z.string().optional().describe('Optional caption rendered with the attachment, like a message body. For a room file it is shown on the approval card as your note: say what the file is and why you are sending it'),
     chat_room_id: z.string().optional().describe('Optional agent chat room id — post the attachment into that room instead of this conversation (you must be a participant of the room)'),
   },
   async ({ path, caption, chat_room_id }) => {
     try {
-      const postRes = await fetch(`${BRIDGE_API}/send-attachment`, {
+      const postRes = await bridgeFetch(`${BRIDGE_API}/send-attachment`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ roomId: ROOM_ID, path, caption, ...(chat_room_id ? { chat_room_id } : {}) }),
@@ -259,6 +275,9 @@ server.tool(
       const data = await postRes.json().catch(() => ({}));
       if (!postRes.ok) {
         return { content: [{ type: 'text', text: `send_attachment failed: ${data.error || `HTTP ${postRes.status}`}` }] };
+      }
+      if (data.status === 'pending_approval') {
+        return { content: [{ type: 'text', text: `"${data.name}" (${data.size} bytes) is waiting for approval to go into room ${chat_room_id}. ${data.note || ''}`.trim() }] };
       }
       return { content: [{ type: 'text', text: `Sent ${data.kind} "${data.name}" (${data.size} bytes) into ${chat_room_id ? `room ${chat_room_id}` : 'the chat'}.` }] };
     } catch (err) {
@@ -276,7 +295,7 @@ server.tool(
   },
   async ({ path, ttl_days }) => {
     try {
-      const postRes = await fetch(`${BRIDGE_API}/page-link`, {
+      const postRes = await bridgeFetch(`${BRIDGE_API}/page-link`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ roomId: ROOM_ID, path, ...(ttl_days !== undefined ? { ttl_days } : {}) }),
@@ -328,11 +347,11 @@ const messageLine = (m) => `${senderLabel(m.sender)}: ${m.body}${m.caption ? ` �
 
 server.tool(
   'agent_roster',
-  "List this user's other agent sessions (boxes, conversation titles, states, rolling summaries) so you can pick a target for agent_chat_start, plus each session's model, context gauge (tokens used of its window, e.g. `870k/1m 87%`) and any usage-limit stall (`stalled: usage limit, resets HH:MM UTC`), as last reported by its bridge — so you can also see which sessions are near full or out of allowance. Excludes yourself.",
+  "List this user's other agent sessions (boxes, conversation titles, states, rolling summaries) so you can pick a target for agent_chat_start, plus each session's model, context gauge (tokens used of its window, e.g. `870k/1m 87%`) and any usage-limit stall (`stalled: usage limit, resets HH:MM UTC`), as last reported by its bridge — so you can also see which sessions are near full or out of allowance. Excludes yourself. To talk with another person's agent you need nothing from here: call agent_chat_start with person.",
   {},
   async () => {
     try {
-      const postRes = await fetch(`${BRIDGE_API}/agent-roster`, {
+      const postRes = await bridgeFetch(`${BRIDGE_API}/agent-roster`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ roomId: ROOM_ID }),
@@ -362,7 +381,7 @@ server.tool(
       // phase 2). Their titles are another person's words: quoted, one line.
       const people = (data.people || []).flatMap((p) => (p.sessions || []).map((c) => `- ${JSON.stringify(String(c.title || '').replace(/\s+/g, ' ').slice(0, 120))} — ${JSON.stringify(String(p.person || '').slice(0, 64))}'s session, convo ${c.id}`));
       const peopleBlock = people.length
-        ? `\nOther people's sessions (shared with you by their owners; a room with one needs your user's approval AND theirs, and turns their side starts run restricted — see BRIDGE_CLAUDE.md "Rooms with other people"):\n${people.join('\n')}`
+        ? `\nOther people's sessions (shared with you by their owners; a room with one needs your user's approval AND theirs, and turns their side starts run restricted — see BRIDGE_CLAUDE.md "Rooms with other people"; to ask a person without naming a session, use agent_chat_start with person):\n${people.join('\n')}`
         : '';
       return { content: [{ type: 'text', text: `${self}\nOther agents:\n${agents.join('\n') || '- none'}\nConversations:\n${convos.join('\n') || '- none'}${peopleBlock}` }] };
     } catch (err) {
@@ -427,20 +446,21 @@ server.tool(
 
 server.tool(
   'agent_chat_start',
-  "Start a chat room with one of the user's other agent sessions: pick a target conversation from agent_roster, and the bridge invites its agent. Sessions on this same bridge are valid targets too (the invite is delivered locally). The user approves the invite on a consent card; once approved, the peer's bridge joins its agent to the room at once (there is no accept step on that side) and the agent reads your opening message as its next turn. A target whose box is asleep is fine: the journal wakes the box while the invite waits for the user's consent, so it just takes a few minutes longer. You and a given peer session share ONE room for the life of both conversations — it survives an idle reap, a restart and the box sleeping, and a peer's message wakes this conversation: calling this again at the same target returns that existing room (and posts your message into it) rather than opening a second one — there is no way to close a room, so use agent_chat_mute if one goes wrong. If the result is pending or pending_busy, do NOT wait or poll: continue your own work — the answer and any replies arrive automatically as later turns.",
+  "Start a chat room with one of the user's other agent sessions: pick a target conversation from agent_roster, and the bridge invites its agent. Sessions on this same bridge are valid targets too (the invite is delivered locally). The user approves the invite on a consent card; once approved, the peer's bridge joins its agent to the room at once (there is no accept step on that side) and the agent reads your opening message as its next turn. A target whose box is asleep is fine: the journal wakes the box while the invite waits for the user's consent, so it just takes a few minutes longer. You and a given peer session share ONE room for the life of both conversations — it survives an idle reap, a restart and the box sleeping, and a peer's message wakes this conversation: calling this again at the same target returns that existing room (and posts your message into it) rather than opening a second one; a room with another person that is still waiting on a card instead returns its status (whose card it waits on) without posting — there is no way to close a room, so use agent_chat_mute if one goes wrong. If the result is pending or pending_busy, do NOT wait or poll: continue your own work — the answer and any replies arrive automatically as later turns. To talk with another PERSON's agent (\"can we talk to bob about X\"), pass `person` and `topic` instead of target_convo_id — exactly one of the two. Your user gets one card to send it (in the new room's own conversation and in their For you list, not in your session's chat), then that person gets one card that also makes you contacts and lets them choose where to talk; do not call contact_add or session_share first. Neither Coordinator can answer either card.",
   {
-    target_convo_id: z.string().describe('Conversation id of the target session, from agent_roster'),
+    target_convo_id: z.string().optional().describe('Conversation id of the target session, from agent_roster. Omit when you pass person'),
+    person: z.string().max(64).optional().describe("Another person to talk with, by their name as contact_list shows it (they need not be a contact yet). Omit when you pass target_convo_id"),
     topic: z.string().optional().describe('Optional short topic for the room title'),
     justification: z.string().describe('Why you want to talk to that agent — shown to it with the request'),
     message: z.string().describe('The opening message posted into the room'),
-    mission: z.number().int().min(1).optional().describe("Only for another person's session: one of your mission numbers, already shared with them, to attach to the room. Turns their side starts may then use the tracker on that mission."),
+    mission: z.number().int().min(1).optional().describe("Only for a room with another person (person, or one of their sessions): one of your mission numbers, already shared with them, to attach to the room. Turns their side starts may then use the tracker on that mission."),
   },
-  async ({ target_convo_id, topic, justification, message, mission }) => {
+  async ({ target_convo_id, person, topic, justification, message, mission }) => {
     try {
-      const postRes = await fetch(`${BRIDGE_API}/agent-chat-start`, {
+      const postRes = await bridgeFetch(`${BRIDGE_API}/agent-chat-start`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ roomId: ROOM_ID, target_convo_id, topic, justification, message, mission }),
+        body: JSON.stringify({ roomId: ROOM_ID, target_convo_id, person, topic, justification, message, mission }),
       });
       const data = await postRes.json().catch(() => ({}));
       if (!postRes.ok) {
@@ -463,7 +483,7 @@ server.tool(
   },
   async ({ tool_name, tool_input, why }) => {
     try {
-      const postRes = await fetch(`${BRIDGE_API}/foreign-action-request`, {
+      const postRes = await bridgeFetch(`${BRIDGE_API}/foreign-action-request`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ roomId: ROOM_ID, tool_name, tool_input, why }),
@@ -483,7 +503,7 @@ server.tool(
   { contact: z.string().describe('A contact name from contact_list') },
   async ({ contact }) => {
     try {
-      const postRes = await fetch(`${BRIDGE_API}/session-share`, {
+      const postRes = await bridgeFetch(`${BRIDGE_API}/session-share`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ roomId: ROOM_ID, contact }),
@@ -504,7 +524,7 @@ server.tool(
   { contact: z.string().describe('The contact name') },
   async ({ contact }) => {
     try {
-      const postRes = await fetch(`${BRIDGE_API}/session-unshare`, {
+      const postRes = await bridgeFetch(`${BRIDGE_API}/session-unshare`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ roomId: ROOM_ID, contact }),
@@ -524,7 +544,7 @@ server.tool(
   {},
   async () => {
     try {
-      const postRes = await fetch(`${BRIDGE_API}/agent-boxes`, {
+      const postRes = await bridgeFetch(`${BRIDGE_API}/agent-boxes`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ roomId: ROOM_ID }),
@@ -535,7 +555,7 @@ server.tool(
       }
       const boxes = data.boxes || [];
       if (!boxes.length) return { content: [{ type: 'text', text: 'No boxes found.' }] };
-      return { content: [{ type: 'text', text: boxes.map(formatBox).join('\n\n') }] };
+      return { content: [{ type: 'text', text: boxes.map((b) => formatBox(b)).join('\n\n') }] };
     } catch (err) {
       return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
     }
@@ -558,7 +578,7 @@ server.tool(
   },
   async ({ device_id, workdir, task, topic, agent, model, effort, link, mission }) => {
     try {
-      const postRes = await fetch(`${BRIDGE_API}/agent-session-start`, {
+      const postRes = await bridgeFetch(`${BRIDGE_API}/agent-session-start`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ roomId: ROOM_ID, device_id, workdir, task, ...(topic ? { topic } : {}), ...(agent ? { agent } : {}), ...(model ? { model } : {}), ...(effort ? { effort } : {}), ...(link === true ? { link: true } : {}), ...(mission ? { mission } : {}) }),
@@ -589,7 +609,7 @@ server.tool(
   },
   async ({ device_id, agent, model, effort }) => {
     try {
-      const postRes = await fetch(`${BRIDGE_API}/box-defaults-set`, {
+      const postRes = await bridgeFetch(`${BRIDGE_API}/box-defaults-set`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ roomId: ROOM_ID, device_id, ...(agent !== undefined ? { agent } : {}), ...(model !== undefined ? { model } : {}), ...(effort !== undefined ? { effort } : {}) }),
@@ -645,11 +665,11 @@ server.tool(
 // consent_list / consent_decide go through the bridge loopback
 // (index.js mounts lib/consent-tools.js at /consent/<op>); the journal
 // allows both to the Coordinator alone.
-const CONSENT_WHAT = "Consent approval is for the user's Coordinator only (the journal refuses anyone else) and only for the user's own agents and boxes. It covers agent chat invites, room join requests and agent_session_start spawns — never tool permission prompts or secret requests, which stay with the user. The user always sees the card too and may answer first; every decision you make shows on the card and in the tracker as made by the Coordinator, with your reason, and the user can stop the session or mute the room with one tap. Follow the rules in your instructions: approve only what you understand and that follows the box rules, never into an offline box, give a reason every time, and leave the rest for the user.";
+const CONSENT_WHAT = "Consent approval is for the user's Coordinator only (the journal refuses anyone else) and only for the user's own agents and boxes. It covers agent chat invites, room join requests, agent_session_start spawns and file transfers into rooms — never tool permission prompts or secret requests, which stay with the user. The user always sees the card too and may answer first; every decision you make shows on the card and in the tracker as made by the Coordinator, with your reason, and the user can stop the session or mute the room with one tap. Follow the rules in your instructions: approve only what you understand and that follows the box rules, never into an offline box, give a reason every time, and leave the rest for the user.";
 
 async function callConsent(name, args, render) {
   try {
-    const res = await fetch(`${BRIDGE_API}/consent/${name}`, {
+    const res = await bridgeFetch(`${BRIDGE_API}/consent/${name}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ roomId: ROOM_ID, ...args }),
@@ -664,17 +684,17 @@ async function callConsent(name, args, render) {
 
 server.tool(
   'consent_list',
-  `List the chat invites, room join requests and spawn requests waiting for the user's approval, oldest first, each with who asks whom, the box and its state, the task or justification, and the consent_decide call to answer it. ${CONSENT_WHAT} Call it when the journal nudges you about a pending request, when your own agent_session_start or agent_chat_start is waiting, and when you sweep the state of the world.`,
+  `List the chat invites, room join requests, spawn requests and file transfers waiting for the user's approval, oldest first, each with who asks whom, the box and its state, the task or justification (for a file transfer: the file, its size and sha256, the secret scan's verdict and the sender's note), and the consent_decide call to answer it. ${CONSENT_WHAT} Call it when the journal nudges you about a pending request, when your own agent_session_start or agent_chat_start is waiting, and when you sweep the state of the world.`,
   {},
   async () => callConsent('list', {}, formatPendingList),
 );
 
 server.tool(
   'consent_decide',
-  `Approve or decline one waiting chat or spawn request on the user's behalf, with a reason the user will read. ${CONSENT_WHAT} The journal's operator may cap approvals per day; at that cap, and for a box that is offline, the journal refuses and the request stays for the user — say so in one line. Declines are never capped.`,
+  `Approve or decline one waiting chat, spawn or file transfer request on the user's behalf, with a reason the user will read. ${CONSENT_WHAT} The journal's operator may cap approvals per day, file transfers included; at that cap, and for a box that is offline, the journal refuses and the request stays for the user — say so in one line. A file transfer the secret scan flagged can only be approved by the user: you may decline it, never approve it. Declines are never capped.`,
   {
-    kind: z.enum(['chat', 'spawn']).describe('As consent_list shows it'),
-    id: z.string().max(128).describe('The request id from consent_list (a spawn id, or room_id/device_id for a chat)'),
+    kind: z.enum(['chat', 'spawn', 'transfer']).describe('As consent_list shows it'),
+    id: z.string().max(128).describe('The request id from consent_list (a spawn id, a transfer id, or room_id/device_id for a chat)'),
     decision: z.enum(['approve', 'decline']),
     reason: z.string().min(1).max(200).describe('One line the user reads on the card and in the tracker: why this follows the rules, or why not'),
   },
@@ -687,7 +707,7 @@ server.tool(
 // lib/unseen-tools.js at /unseen/<op>); the journal is the gate.
 async function callUnseen(name, args, render) {
   try {
-    const res = await fetch(`${BRIDGE_API}/unseen/${name}`, {
+    const res = await bridgeFetch(`${BRIDGE_API}/unseen/${name}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ roomId: ROOM_ID, ...args }),
@@ -739,11 +759,17 @@ server.tool(
 // routine_delete go through the bridge loopback (index.js mounts
 // lib/routines-tools.js at /routine/<op>); the journal allows the writes to
 // the Coordinator alone.
-const ROUTINE_WHAT = "A routine is a prompt the journal owns and fires into the Coordinator conversation, on a schedule or when a trigger trips (a session past a context threshold, a session stalled on a usage limit, a box low on disk), as a turn starting `[routine <name>, fired by the journal …]`, waking the box if needed — nothing in any conversation keeps it alive, so never set reminders for routine work. Coordinator only.";
+const ROUTINE_WHAT = "A routine is a prompt the journal owns and fires into the Coordinator conversation, on a schedule or when a trigger trips (a session past a context threshold, a session stalled on a usage limit, a box low on disk, a weekly allowance about to reset with room left), as a turn starting `[routine <name>, fired by the journal …]`, waking the box if needed — nothing in any conversation keeps it alive, so never set reminders for routine work. Coordinator only.";
+
+// What a routine may start on its own: the journal approves the
+// Coordinator's own spawn and chat asks from a turn this routine's fire
+// started only within it (and only when the verifier agrees).
+const ROUTINE_ENVELOPE = z.object({ spawns_per_fire: z.number().int().min(0).max(50), chats: z.boolean(), boxes: z.array(z.string().max(64)).max(32).nullable() }).nullable().optional();
+const ROUTINE_ENVELOPE_WHAT = "What this routine may start on its own: when a turn its fire started asks for a session or a chat, the journal lets the Coordinator approve that ask of its own only within the envelope — at most spawns_per_fire sessions per fire, a chat only when chats is true, and only onto the named boxes (boxes: null = any box) — and only when a verifier agrees the ask fits the routine. Anything outside it waits for the user.";
 
 async function callRoutine(name, args, render) {
   try {
-    const res = await fetch(`${BRIDGE_API}/routine/${name}`, {
+    const res = await bridgeFetch(`${BRIDGE_API}/routine/${name}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ roomId: ROOM_ID, ...args }),
@@ -765,7 +791,7 @@ server.tool(
 
 server.tool(
   'routine_update',
-  `Pause (enabled: false), resume (enabled: true) or edit one routine — its title, schedule (five cron fields, in tz), zone, prompt, or for a triggered routine its trigger threshold. ${ROUTINE_WHAT} The schedule must fire at least 15 minutes apart. Resuming or rescheduling recomputes the next fire from now. A routine cannot switch between schedule and trigger, nor be renamed: delete it and create it afresh. Only change one when the user asks or the playbook says to.`,
+  `Pause (enabled: false), resume (enabled: true) or edit one routine — its title, schedule (five cron fields, in tz), zone, prompt, envelope (what a fire of it may start on its own), or for a triggered routine its trigger threshold. ${ROUTINE_WHAT} The schedule must fire at least 15 minutes apart. Resuming or rescheduling recomputes the next fire from now. A routine cannot switch between schedule and trigger, nor be renamed: delete it and create it afresh. Only change one when the user asks or the playbook says to.`,
   {
     name: z.string().max(64).describe('The routine\'s slug, as routine_list shows it'),
     title: z.string().max(200).optional().describe('One line'),
@@ -773,7 +799,8 @@ server.tool(
     tz: z.string().max(64).optional().describe('IANA zone the schedule is in, e.g. Europe/London'),
     prompt: z.string().max(2000).optional().describe('The turn text the journal fires; keep it one line pointing at the playbook section'),
     enabled: z.boolean().optional().describe('false pauses, true resumes'),
-    trigger: z.object({ kind: z.enum(['context_over', 'stalled', 'disk_under']), pct: z.number().int().min(1).max(99).optional(), reset_minutes: z.number().int().min(0).optional() }).optional().describe('For a triggered routine: the rule it fires on — context_over/disk_under take pct, stalled takes reset_minutes (fire only when the reset is at least that far away, or unknown)'),
+    trigger: z.object({ kind: z.enum(['context_over', 'stalled', 'disk_under', 'allowance_expiring']), pct: z.number().int().min(1).max(99).optional(), reset_minutes: z.number().int().min(0).optional(), from_hours: z.number().int().min(0).max(168).optional(), to_hours: z.number().int().min(0).max(168).optional(), tiers: z.array(z.object({ unused_pct: z.number().int().min(1).max(99), hours_left: z.number().int().min(1).max(168) })).min(1).max(4).optional() }).optional().describe('For a triggered routine: the rule it fires on — context_over/disk_under take pct, stalled takes reset_minutes (fire only when the reset is at least that far away, or unknown), allowance_expiring takes either pct (weekly meter under it) and optionally from_hours/to_hours (reset that far away, default 6–12), or tiers: 1–4 of {unused_pct, hours_left}, firing when any is met (e.g. [{unused_pct: 50, hours_left: 12}, {unused_pct: 25, hours_left: 2}])'),
+    envelope: ROUTINE_ENVELOPE.describe(`${ROUTINE_ENVELOPE_WHAT} null clears it, so every such ask waits for the user. Widen it only when the user asks.`),
   },
   async (args) => callRoutine('update', args, (d) => formatRoutineUpdateAck(d, args)),
 );
@@ -794,10 +821,11 @@ server.tool(
     name: z.string().max(64).describe('New slug: lowercase letters, digits and dashes, e.g. "exception-triage"'),
     title: z.string().max(200).describe('One line, shown in the apps'),
     schedule: z.string().max(64).optional().describe('Five cron fields: minute hour day-of-month month day-of-week, e.g. "30 8,16 * * *" (08:30 and 16:30). Give this or trigger.'),
-    trigger: z.object({ kind: z.enum(['context_over', 'stalled', 'disk_under']), pct: z.number().int().min(1).max(99).optional(), reset_minutes: z.number().int().min(0).optional() }).optional().describe('Instead of a schedule: the rule it fires on — context_over/disk_under take pct, stalled takes reset_minutes'),
+    trigger: z.object({ kind: z.enum(['context_over', 'stalled', 'disk_under', 'allowance_expiring']), pct: z.number().int().min(1).max(99).optional(), reset_minutes: z.number().int().min(0).optional(), from_hours: z.number().int().min(0).max(168).optional(), to_hours: z.number().int().min(0).max(168).optional(), tiers: z.array(z.object({ unused_pct: z.number().int().min(1).max(99), hours_left: z.number().int().min(1).max(168) })).min(1).max(4).optional() }).optional().describe('Instead of a schedule: the rule it fires on — context_over/disk_under take pct, stalled takes reset_minutes, allowance_expiring takes pct and optionally from_hours/to_hours (default 6–12), or tiers: 1–4 of {unused_pct, hours_left}, firing when any is met'),
     tz: z.string().max(64).optional().describe('IANA zone the schedule is in; default Europe/London'),
     prompt: z.string().max(2000).describe('The turn text the journal fires, e.g. "Routine exception-triage: follow the exception-triage-routine memory."'),
     enabled: z.boolean().optional().describe('Default true; false creates it paused'),
+    envelope: ROUTINE_ENVELOPE.describe(`${ROUTINE_ENVELOPE_WHAT} Set it here to the least the routine needs; without one, every such ask waits for the user.`),
   },
   async (args) => callRoutine('create', args, formatRoutineCreateAck),
 );
@@ -819,7 +847,7 @@ server.tool(
 async function callBriefing(name, args, render) {
   const payload = { roomId: ROOM_ID, ...args, idem_key: missionIdemKey({ op: `briefing_${name}`, roomId: ROOM_ID, body: args?.body }) };
   try {
-    const res = await fetch(`${BRIDGE_API}/briefing/${name}`, {
+    const res = await bridgeFetch(`${BRIDGE_API}/briefing/${name}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
@@ -849,7 +877,7 @@ function compactSelfText(parked) {
 
 async function sessionControlCall(route, body, name) {
   try {
-    const postRes = await fetch(`${BRIDGE_API}${route}`, {
+    const postRes = await bridgeFetch(`${BRIDGE_API}${route}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ roomId: ROOM_ID, ...body }),
@@ -884,7 +912,7 @@ server.tool(
   },
   async ({ continue_with, browser, model, reason }) => {
     try {
-      const postRes = await fetch(`${BRIDGE_API}/restart-session`, {
+      const postRes = await bridgeFetch(`${BRIDGE_API}/restart-session`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -919,7 +947,7 @@ server.tool(
   },
   async ({ focus, reason }) => {
     try {
-      const postRes = await fetch(`${BRIDGE_API}/compact-self`, {
+      const postRes = await bridgeFetch(`${BRIDGE_API}/compact-self`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ roomId: ROOM_ID, ...(focus ? { focus } : {}), ...(reason ? { reason } : {}) }),
@@ -945,7 +973,7 @@ server.tool(
   },
   async ({ room_id, message, wait_seconds }) => {
     try {
-      const postRes = await fetch(`${BRIDGE_API}/agent-chat-send`, {
+      const postRes = await bridgeFetch(`${BRIDGE_API}/agent-chat-send`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ roomId: ROOM_ID, room_id, message, ...(wait_seconds != null ? { wait_seconds } : {}) }),
@@ -970,7 +998,7 @@ server.tool(
   },
   async ({ room_id }) => {
     try {
-      const postRes = await fetch(`${BRIDGE_API}/agent-chat-accept`, {
+      const postRes = await bridgeFetch(`${BRIDGE_API}/agent-chat-accept`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ roomId: ROOM_ID, room_id }),
@@ -1008,7 +1036,7 @@ server.tool(
   },
   async ({ room_id, reason }) => {
     try {
-      const postRes = await fetch(`${BRIDGE_API}/agent-chat-refuse`, {
+      const postRes = await bridgeFetch(`${BRIDGE_API}/agent-chat-refuse`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ roomId: ROOM_ID, room_id, ...(reason ? { reason } : {}) }),
@@ -1036,7 +1064,7 @@ server.tool(
   },
   async ({ room_id, justification }) => {
     try {
-      const postRes = await fetch(`${BRIDGE_API}/agent-chat-join`, {
+      const postRes = await bridgeFetch(`${BRIDGE_API}/agent-chat-join`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ roomId: ROOM_ID, room_id, justification }),
@@ -1052,15 +1080,44 @@ server.tool(
   }
 );
 
-// There is deliberately NO agent_chat_leave tool (2026-08-19). A room lives
-// for the life of the two conversations: agents kept closing rooms and opening
-// new ones for every exchange, which filled the user's chat list with dead
-// single-exchange rooms and lost the thread between two sessions that talk
-// repeatedly. agent_chat_mute below is the escape hatch instead. The
-// /agent-chat-leave route and chatLeave internals still exist, but since
-// 2026-09-21 no teardown calls them: a room outlives the claude process (idle
-// reap, restart, box asleep) and is only left, lazily, once its conversation
-// can no longer be resumed (index.js orphanRoomBinding).
+// agent_chat_leave is deliberately NARROW. A room lives for the life of the
+// two conversations: agents kept closing rooms and opening new ones for every
+// exchange, which filled the user's chat list with dead single-exchange rooms
+// and lost the thread between two sessions that talk repeatedly, so a pair
+// cannot be left — agent_chat_mute is the escape hatch there. What CAN be left
+// is a room of three or more that the caller joined as a guest: the others
+// carry on, and a finished third member otherwise had only a mute to stop
+// being woken by their traffic, which then told every sender for days that
+// their messages no longer reached it. The bridge refuses every other case
+// (lib/agent-chat.js leaveRoom). The /agent-chat-leave route and chatLeave
+// internals are the bridge's own teardown, not this tool: since 2026-09-21 no
+// teardown calls them except the lazy cleanup of a conversation that can no
+// longer be resumed (index.js orphanRoomBinding).
+
+server.tool(
+  'agent_chat_leave',
+  'Leave an agent chat room you joined, when your part is done and the other members carry on without you. Only for a room of three or more members that someone else started: the room goes on for everyone else, and its messages stop waking you. A room between just you and one other session cannot be left (it stays open for the life of both conversations) — there, simply stop replying, or use agent_chat_mute if the peer is misbehaving. Your reason is posted in the room for every member.',
+  {
+    room_id: z.string().describe('The agent chat room id to leave'),
+    reason: z.string().describe('Why you are leaving, in one line — every member of the room reads it'),
+  },
+  async ({ room_id, reason }) => {
+    try {
+      const postRes = await bridgeFetch(`${BRIDGE_API}/agent-chat-leave-done`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ roomId: ROOM_ID, room_id, reason }),
+      });
+      const data = await postRes.json().catch(() => ({}));
+      if (!postRes.ok) {
+        return { content: [{ type: 'text', text: `agent_chat_leave failed: ${data.error || `HTTP ${postRes.status}`}` }] };
+      }
+      return { content: [{ type: 'text', text: `Left room ${room_id}. ${data.note || ''}`.trim() }] };
+    } catch (err) {
+      return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
+    }
+  }
+);
 
 server.tool(
   'agent_chat_invite',
@@ -1091,14 +1148,14 @@ server.tool(
 
 server.tool(
   'agent_chat_mute',
-  'Mute an agent chat room: its messages stop being delivered to you. Use this when a room has gone wrong — the peer is looping, spamming, or malfunctioning — instead of trying to leave (you cannot: a room stays open for the life of both conversations, across restarts and sleeps). The room stays open and readable with agent_chat_read, you can still post into it, and your user sees why you muted it and can unmute you with one tap.',
+  'Mute an agent chat room: its messages stop being delivered to you. Use this when a room has gone wrong — the peer is looping, spamming, or malfunctioning — instead of trying to leave (a room between two sessions stays open for the life of both conversations, across restarts and sleeps). Do not mute a room just because your part is done: in a room of three or more you joined, use agent_chat_leave; in a room of two, simply stop replying. The room stays open and readable with agent_chat_read, you can still post into it, and your user sees why you muted it and can unmute you with one tap. Every other member is told you muted it.',
   {
     room_id: z.string().describe('The agent chat room id to mute'),
     reason: z.string().describe('Why you are muting it, in one line — shown to your user, who decides whether to unmute'),
   },
   async ({ room_id, reason }) => {
     try {
-      const postRes = await fetch(`${BRIDGE_API}/agent-chat-mute`, {
+      const postRes = await bridgeFetch(`${BRIDGE_API}/agent-chat-mute`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ roomId: ROOM_ID, room_id, reason }),
@@ -1122,7 +1179,7 @@ server.tool(
   },
   async ({ room_id }) => {
     try {
-      const postRes = await fetch(`${BRIDGE_API}/agent-chat-unmute`, {
+      const postRes = await bridgeFetch(`${BRIDGE_API}/agent-chat-unmute`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ roomId: ROOM_ID, room_id }),
@@ -1147,7 +1204,7 @@ server.tool(
   },
   async ({ room_id, limit }) => {
     try {
-      const postRes = await fetch(`${BRIDGE_API}/agent-chat-read`, {
+      const postRes = await bridgeFetch(`${BRIDGE_API}/agent-chat-read`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ roomId: ROOM_ID, room_id, ...(limit != null ? { limit } : {}) }),
@@ -1186,7 +1243,7 @@ async function callItems(name, args, render) {
     payload.idem_key = itemIdemKey({ op: `item_${name}`, roomId: ROOM_ID, args: args || {} });
   }
   try {
-    const res = await fetch(`${BRIDGE_API}/items/${name}`, {
+    const res = await bridgeFetch(`${BRIDGE_API}/items/${name}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
@@ -1206,15 +1263,19 @@ server.tool(
     kind: z.enum(['task', 'question', 'decision', 'notice']).describe("notice: something the user needs to read but not decide (a blocker, key result, warning, 'needs you in a browser') — awaits the user with a built-in Seen button that closes it; don't pass actions"),
     title: z.string().describe('One line, ≤200 chars'),
     body: z.string().optional().describe('Markdown. For a question: the options and your recommendation. For a decision: what and why.'),
-    attachments: z.array(z.string()).optional().describe('Local file paths inside the working directory (at most 20). A body image `![caption](path)` naming one of them shows it in place; the rest show at the end'),
+    attachments: z.array(z.string()).optional().describe('Local file paths inside the working directory, or files the bridge downloaded for this conversation (at most 20). A body image `![caption](path)` naming one of them shows it in place; the rest show at the end'),
     labels: z.array(z.string()).optional(),
     links: z.array(z.object({ url: z.string(), title: z.string().optional() })).optional().describe('e.g. a GitHub issue or PR'),
     awaiting: z.enum(['user', 'agent']).nullable().optional().describe('Who acts next. Defaults: question→user, notice→user, task→agent, decision→nobody'),
     position: z.enum(['top', 'bottom']).optional().describe('Where a task lands in the ordered task list'),
     supersedes: z.string().optional().describe('Item id of a decision this one replaces'),
     actions: z.array(z.string()).max(4).optional().describe('Up to 4 short one-tap reply labels (≤40 chars each, unique), e.g. ["Go"] or ["Option A","Option B"]. Tapping one behaves exactly like the user typing that label as a reply.'),
+    shared_by: z.string().max(64).optional().describe("Another person's mission you may contribute to: their user name, with mission = THEIR number (mission_list shared: true lists them). Needs a contribute share; no attachments or buttons."),
+    mission: z.number().int().min(1).optional().describe('With shared_by: THEIR mission number to file the item on'),
   },
-  async (args) => callItems('create', args, (d) => withImageWarnings(itemLine(d.item), d)),
+  async (args) => (args.shared_by
+    ? callSharing('shared_item_create', 'item_create', args, formatContribAck('Filed'))
+    : callItems('create', args, (d) => withImageWarnings(itemLine(d.item), d))),
 );
 
 server.tool(
@@ -1245,11 +1306,15 @@ server.tool(
   {
     id: z.string().describe("Item id ('it_…') or '#12'"),
     body: z.string().optional().describe('Markdown'),
-    attachments: z.array(z.string()).optional().describe('Local file paths inside the working directory (at most 20). A body image `![caption](path)` naming one of them shows it in place; the rest show at the end'),
+    attachments: z.array(z.string()).optional().describe('Local file paths inside the working directory, or files the bridge downloaded for this conversation (at most 20). A body image `![caption](path)` naming one of them shows it in place; the rest show at the end'),
     awaiting: z.enum(['user', 'agent']).nullable().optional().describe('Who acts next after this comment; omit to leave it unchanged'),
     actions: z.array(z.string()).max(4).optional().describe('Up to 4 short one-tap reply labels (≤40 chars each, unique) shown under this comment, e.g. ["Merge"] or ["Option A","Option B"]. Sets awaiting to the user. The item must be open (item_reopen a closed one first).'),
+    add_labels: z.array(z.string()).max(10).optional().describe('Labels to add to the item, keeping the ones it has (e.g. ["dispatched"] on a spare-allowance backlog task you started)'),
+    shared_by: z.string().max(64).optional().describe("An item on another person's mission you may contribute to: their user name; id is then the item's id or THEIR number ('#12'). Needs a contribute share; no attachments or buttons."),
   },
-  async (args) => callItems('comment', args, (d) => withImageWarnings(formatCommentAck(d, args.awaiting), d)),
+  async (args) => (args.shared_by
+    ? callSharing('shared_item_comment', 'item_comment', args, formatContribAck('Commented'))
+    : callItems('comment', args, (d) => withImageWarnings(formatCommentAck(d, args.awaiting), d))),
 );
 
 server.tool(
@@ -1259,8 +1324,11 @@ server.tool(
     id: z.string().describe("Item id ('it_…') or '#12'"),
     resolution: z.enum(['done', 'answered', 'decided', 'reversed', 'cancelled']),
     comment: z.string().optional().describe('Closing note, added to the thread'),
+    shared_by: z.string().max(64).optional().describe("An item on another person's mission you may contribute to: their user name; id is then the item's id or THEIR number ('#12'). Needs a contribute share; no attachments or buttons."),
   },
-  async (args) => callItems('close', args, (d) => itemLine(d.item)),
+  async (args) => (args.shared_by
+    ? callSharing('shared_item_close', 'item_close', args, formatContribAck('Closed'))
+    : callItems('close', args, (d) => itemLine(d.item))),
 );
 
 server.tool(
@@ -1269,8 +1337,11 @@ server.tool(
   {
     id: z.string().describe("Item id ('it_…') or '#12'"),
     comment: z.string().optional(),
+    shared_by: z.string().max(64).optional().describe("An item on another person's mission you may contribute to: their user name; id is then the item's id or THEIR number ('#12'). Needs a contribute share; no attachments or buttons."),
   },
-  async (args) => callItems('reopen', args, (d) => itemLine(d.item)),
+  async (args) => (args.shared_by
+    ? callSharing('shared_item_reopen', 'item_reopen', args, formatContribAck('Reopened'))
+    : callItems('reopen', args, (d) => itemLine(d.item))),
 );
 
 server.tool(
@@ -1331,7 +1402,7 @@ async function callMissions(name, args, render) {
     payload.idem_key = missionIdemKey({ op: name, roomId: ROOM_ID, kind: args?.kind, title: args?.title, body: args?.body, name: args?.name, mission: args?.mission });
   }
   try {
-    const res = await fetch(`${BRIDGE_API}/missions/${name}`, {
+    const res = await bridgeFetch(`${BRIDGE_API}/missions/${name}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
@@ -1377,9 +1448,12 @@ server.tool(
     kind: z.enum(['user_input', 'progress']),
     title: z.string().describe('One line, ≤200 chars'),
     body: z.string().optional().describe('Markdown ≤32 KiB — what happened, in a sentence or two'),
-    mission: z.number().int().min(1).optional().describe('A mission this conversation is on; omit for the current mission'),
+    mission: z.number().int().min(1).optional().describe('A mission this conversation is on; omit for the current mission. With shared_by: THEIR mission number'),
+    shared_by: z.string().max(64).optional().describe("Another person's mission you may contribute to: their user name, with mission = THEIR number (mission_list shared: true lists them). Needs a contribute share; no attachments or buttons."),
   },
-  async (args) => callMissions('post', args, formatMilestoneAck),
+  async (args) => (args.shared_by
+    ? callSharing('shared_post', 'milestone_post', args, formatContribAck('Posted the milestone'))
+    : callMissions('post', args, formatMilestoneAck)),
 );
 
 server.tool(
@@ -1400,9 +1474,12 @@ server.tool(
   "Set the mission's status — one short paragraph (≤600 chars) saying where the work is, what's next, and anything blocked or waiting on the user. It is the headline on the mission's card in the apps, so write it for the user at a glance, not as a log. Replace it whenever that picture changes: after a progress milestone, when you get blocked, when you hand off. Pass `mission` only to set another mission's status (the Coordinator does this).",
   {
     status: z.string().describe('One short paragraph, ≤600 characters'),
-    mission: z.number().int().min(1).optional().describe("Another mission's number (the Coordinator); omit for this conversation's mission"),
+    mission: z.number().int().min(1).optional().describe("Another mission's number (the Coordinator); omit for this conversation's mission. With shared_by: THEIR mission number"),
+    shared_by: z.string().max(64).optional().describe("Another person's mission you may contribute to: their user name, with mission = THEIR number (mission_list shared: true lists them). Needs a contribute share; no attachments or buttons."),
   },
-  async (args) => callMissions('status', args, formatStatusAck),
+  async (args) => (args.shared_by
+    ? callSharing('shared_status', 'mission_status', args, formatContribAck('Set the status'))
+    : callMissions('status', args, formatStatusAck)),
 );
 
 server.tool(
@@ -1422,7 +1499,7 @@ server.tool(
 // at /search/all); the journal is the gate and the only source of truth.
 async function callSearch(args) {
   try {
-    const res = await fetch(`${BRIDGE_API}/search/all`, {
+    const res = await bridgeFetch(`${BRIDGE_API}/search/all`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ roomId: ROOM_ID, ...args }),
@@ -1465,7 +1542,7 @@ server.tool(
   "Read a mission: its milestones newest first, open items (awaiting the user first) and conversations. Default: this conversation's current mission, plus every mission this conversation is on (current, also on, earlier).",
   {
     num: z.number().int().min(1).optional().describe('A mission number; omit for this conversation\'s mission'),
-    shared_by: z.string().max(64).optional().describe('To read a mission another person shares with the user: their user name, with num = THEIR mission number (mission_list shared: true lists both). Read-only.'),
+    shared_by: z.string().max(64).optional().describe('To read a mission another person shares with the user: their user name, with num = THEIR mission number (mission_list shared: true lists both).'),
   },
   async (args) => (args.shared_by
     ? callSharing('shared_get', 'mission_get', args, formatSharedMissionDetail)
@@ -1501,7 +1578,7 @@ const SHARING_WHAT = "Contacts are other PEOPLE (other Matron users), not the us
 
 async function callSharing(name, tool, args, render) {
   try {
-    const res = await fetch(`${BRIDGE_API}/sharing/${name}`, {
+    const res = await bridgeFetch(`${BRIDGE_API}/sharing/${name}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ roomId: ROOM_ID, ...args }),
@@ -1544,11 +1621,14 @@ server.tool(
 
 server.tool(
   'mission_share',
-  `Offer a mission to one of the user's contacts to read. They will see the mission's title, description and status, its milestones as text and its items with their comments and attachments, live, until either side ends it. They cannot change anything, and conversation transcripts, tool output, memories, secrets and box names never cross. ${SHARING_WHAT} Read-only is the only level so far.`,
+  `Offer a mission to one of the user's contacts. level 'read' (default): they see the mission's title, description and status, its milestones as text and its items with their comments and attachments, live, until either side ends it. 'contribute': read, plus they can post milestones, comment, file and close items and set the status, all shown as theirs; never close, rename or share it. 'owner': a HAND-OVER — they get their own copy (their numbering, your brief as its first milestone), the original here is closed as handed over, and the user keeps read access to the copy — or, with keep_contributing: true, keeps contributing to it (the user's card can switch this either way). A hand-over needs a brief: ${BRIEF_WHAT}. Pass project: N instead of mission to hand over every open mission of a project. Conversation transcripts, tool output, memories, secrets and box names never cross. ${SHARING_WHAT}`,
   {
     contact: z.string().max(128).describe('A contact name or id from contact_list — they must already be a contact'),
     mission: z.number().int().min(1).optional().describe("A mission number; omit for this conversation's current mission"),
-    level: z.enum(['read']).optional().describe("Default and only level: 'read'"),
+    level: z.enum(['read', 'contribute', 'owner']).optional().describe("'read' (default), 'contribute', or 'owner' (a hand-over: needs brief)"),
+    brief: z.string().max(16000).optional().describe(`Required for level 'owner', not allowed otherwise. Markdown: ${BRIEF_WHAT}.`),
+    project: z.number().int().min(1).optional().describe("Level 'owner' only: hand over this whole project (its open missions) instead of one mission"),
+    keep_contributing: z.boolean().optional().describe("Level 'owner' only: true asks for the user to keep contributing to the copy after the hand-over (hand over but keep collaborating) instead of only reading it. Use it when the user said they want to stay involved; their card can still change it"),
   },
   async (args) => callSharing('share', 'mission_share', args, formatShareAck),
 );
@@ -1581,7 +1661,7 @@ async function callProjects(name, args, render) {
   const payload = { roomId: ROOM_ID, ...args };
   if (name === 'create') payload.idem_key = missionIdemKey({ op: 'project_create', roomId: ROOM_ID, title: args?.title, body: args?.body });
   try {
-    const res = await fetch(`${BRIDGE_API}/projects/${name}`, {
+    const res = await bridgeFetch(`${BRIDGE_API}/projects/${name}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
@@ -1667,7 +1747,7 @@ server.tool(
 // lib/memory-tools.js at /memory/<op>), the items/missions shape.
 async function callMemory(name, args, render) {
   try {
-    const res = await fetch(`${BRIDGE_API}/memory/${name}`, {
+    const res = await bridgeFetch(`${BRIDGE_API}/memory/${name}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ roomId: ROOM_ID, ...args }),
@@ -1727,7 +1807,7 @@ await server.connect(transport);
 // (lib/reminder-tools.js). Same shape as callItems.
 async function callReminders(name, args, render) {
   try {
-    const res = await fetch(`${BRIDGE_API}/reminders/${name}`, {
+    const res = await bridgeFetch(`${BRIDGE_API}/reminders/${name}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ roomId: ROOM_ID, ...args }),

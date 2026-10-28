@@ -18,7 +18,7 @@
     "browser": {
       "chrome-devtools": {
         "command": "./hooks/xvfb-wrap.sh",
-        "args": ["npx", "-y", "chrome-devtools-mcp", "--no-usage-statistics", "--acceptInsecureCerts", "--chromeArg=--no-sandbox", "--chromeArg=--disable-setuid-sandbox", "--viewport=1920x1080"]
+        "args": ["node", "./node_modules/chrome-devtools-mcp/build/src/bin/chrome-devtools-mcp.js", "--no-usage-statistics", "--acceptInsecureCerts", "--chromeArg=--no-sandbox", "--chromeArg=--disable-setuid-sandbox", "--viewport=1920x1080"]
       }
     }
   }

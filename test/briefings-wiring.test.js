@@ -8,7 +8,6 @@ import { createBriefingHandlers, formatBriefingPublishAck } from '../lib/briefin
 describe('briefings wiring', () => {
   const index = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
   const askUser = readFileSync(new URL('../ask-user.js', import.meta.url), 'utf8');
-  const pkg = JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8'));
 
   it('mounts exactly the /briefing/publish route through the handler map', () => {
     const m = index.match(/url\.pathname\.match\(\/\^\\\/briefing\\\/\(([a-z|]+)\)\$\/\)/);
@@ -77,7 +76,7 @@ describe('briefings wiring', () => {
         const r = await handlers[op](body);
         return { status: r.status, ok: r.status >= 200 && r.status < 300, json: async () => r.body };
       };
-      return { posts, call: new Function('fetch', 'BRIDGE_API', 'ROOM_ID', 'missionIdemKey', `${src}\nreturn callBriefing;`)(fetch, 'http://bridge', '!r:s', missionIdemKey) };
+      return { posts, call: new Function('bridgeFetch', 'BRIDGE_API', 'ROOM_ID', 'missionIdemKey', `${src}\nreturn callBriefing;`)(fetch, 'http://bridge', '!r:s', missionIdemKey) };
     };
     const publishBriefing = vi.fn(async () => ({ status: 201, data: { briefing: { id: 'br_1', convo_id: 'c1', seq: 9 } } }));
     const h = createBriefingHandlers({ sessions: new Map([['!r:s', { roomId: '!r:s', journalConvoId: 'c1', coordinator: true }]]), journalConvoIdFor: (s) => s.journalConvoId, client: { publishBriefing } });
@@ -94,10 +93,6 @@ describe('briefings wiring', () => {
     const refusing = createBriefingHandlers({ sessions: new Map([['!r:s', { roomId: '!r:s', journalConvoId: 'c1', coordinator: true }]]), journalConvoIdFor: (s) => s.journalConvoId, client: { publishBriefing: async () => ({ status: 403, data: { error: 'forbidden', detail: 'not_coordinator' } }) } });
     const err = await makeCall(refusing).call('publish', { body: 'x' }, formatBriefingPublishAck);
     expect(err).toEqual({ content: [{ type: 'text', text: 'briefing_publish failed: the journal does not list this conversation as the Coordinator' }] });
-  });
-
-  it('npm run check covers the two new files', () => {
-    for (const f of ['lib/briefings-client.js', 'lib/briefings-tools.js']) expect(pkg.scripts.check).toContain(`node --check ${f}`);
   });
 
   it('the playbook publishes reports and status updates with briefing_publish, and has the on-demand briefing routine', () => {

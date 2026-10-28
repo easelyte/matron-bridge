@@ -465,6 +465,86 @@ describe('classifyScreen — /login menu rendered with cursor-down', () => {
   });
 });
 
+describe('classifyScreen — /login select under an effort-badge border', () => {
+  // Newer Claude Code draws the effort badge INTO the input box's top border
+  // ("▔▔▔▔ ● high · /effort ▔"), with the slash-command picker that launched
+  // /login still painted above it. The border wasn't recognised as a
+  // separator, so the question walk absorbed it, the `· /` chrome check
+  // rejected the whole menu, and the bridge fell back to a raw screen dump.
+  const screen = fs.readFileSync(path.join(__dir, 'fixtures', 'login-select-effort-border.txt'), 'utf-8');
+
+  it('classifies the login-method select as a numbered prompt', () => {
+    const r = classifyScreen(screen);
+    expect(r).not.toBeNull();
+    expect(r.kind).toBe('numbered');
+    expect(r.options.map(o => o.key)).toEqual(['1', '2', '3']);
+    expect(r.options[0].label).toMatch(/^Claude account with subscription/);
+    expect(r.options[1].label).toMatch(/^Anthropic Console account/);
+    expect(r.options[2].label).toMatch(/^3rd-party platform/);
+  });
+
+  it('collapses cursor-forward gaps in labels so buttons read cleanly', () => {
+    const r = classifyScreen(screen.replace('Anthropic Console', 'Anthropic     Console'));
+    expect(r.options[1].label).toBe('Anthropic Console account · API usage billing');
+  });
+
+  it('stops the question at the badge border, leaving the slash picker out', () => {
+    const r = classifyScreen(screen);
+    expect(r.question).toMatch(/^Login Claude Code can be used/);
+    expect(r.question).toMatch(/Select login method:$/);
+    expect(r.question).not.toMatch(/design-login|\/effort|Sign in with your Anthropic account/);
+  });
+
+  it('still treats a plain labelled rule (no status chrome) as question text', () => {
+    const r = classifyScreen([
+      '──── Pick one ────',
+      'Which mode?',
+      '❯ 1. Fast',
+      '  2. Careful',
+    ].join('\n'));
+    expect(r.question).toBe('──── Pick one ──── Which mode?');
+  });
+
+  it('PromptDetector emits a structured prompt, not the unclassified fallback', async () => {
+    const det = new PromptDetector({ idleMs: 30 });
+    const prompts = [];
+    const fallbacks = [];
+    det.on('prompt', p => prompts.push(p));
+    det.on('unclassified-prompt', p => fallbacks.push(p));
+    det.feed(screen);
+    await new Promise(r => setTimeout(r, 120));
+    expect(fallbacks).toHaveLength(0);
+    expect(prompts).toHaveLength(1);
+    expect(prompts[0].options).toHaveLength(3);
+  });
+
+  it('then relays the OAuth sign-in step (wrapped URL + paste-code cue) as a screen update', async () => {
+    const det = new PromptDetector({ idleMs: 30 });
+    const updates = [];
+    const fallbacks = [];
+    det.on('screen-update', u => updates.push(u));
+    det.on('unclassified-prompt', p => fallbacks.push(p));
+    det.feed(screen);
+    await new Promise(r => setTimeout(r, 120));
+    det.reset();
+    // Shape of the screen after picking option 1, with a made-up URL that
+    // the TUI hard-wraps at the terminal width.
+    det.feed([
+      '▔▔▔▔ ● high · /effort ▔',
+      '  Browser didn\'t open? Use the url below to sign in (c to copy)',
+      'https://auth.example.com/oauth/authorize?code=true&client_id=00000000-0000-0000-0000-000000000000&response_type=code&redir',
+      'ect_uri=https%3A%2F%2Fauth.example.com%2Fcallback&state=placeholder',
+      '  Paste code here if prompted >',
+      '  Esc to cancel',
+    ].join('\n'));
+    await new Promise(r => setTimeout(r, 120));
+    expect(fallbacks).toHaveLength(0);
+    expect(updates).toHaveLength(1);
+    expect(updates[0].hasInputCue).toBe(true);
+    expect(updates[0].urls[0]).toMatch(/^https:\/\/auth\.example\.com\/oauth\/authorize\?/);
+  });
+});
+
 describe('classifyScreen — full question text for multi-line modals', () => {
   // Real reproduction from the bypass-permissions warning modal that the
   // bridge surfaces over Matrix. Old detector took only 2 lines above the

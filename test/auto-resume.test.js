@@ -24,6 +24,11 @@ describe('armFromStall', () => {
     expect(armFromStall({ kind: 'usage_limit', resets_at: 'soon' })).toBeNull();
     expect(armFromStall({ kind: 'bad_model', model: 'x' })).toBeNull();
   });
+  it("keeps a Coordinator's carry-on record id when it re-arms", () => {
+    const coord = { at: AT, kind: 'usage_limit', text: '[from the Coordinator] finish the PR', source: 'coordinator', carryOnId: 'co_0123456789abcdef' };
+    expect(armFromStall({ kind: 'usage_limit', resets_at: '2026-09-29T20:00:00.000Z' }, coord, T).carryOnId).toBe('co_0123456789abcdef');
+    expect(armFromStall({ kind: 'usage_limit', resets_at: AT }, coord, T).carryOnId).toBe('co_0123456789abcdef');
+  });
   it("keeps a Coordinator's message for the same stall, re-arms on a new reset time", () => {
     const coord = { at: AT, kind: 'usage_limit', text: '[from the Coordinator] finish the PR', source: 'coordinator' };
     expect(armFromStall({ kind: 'usage_limit', resets_at: AT }, coord, T - 1000)).toBe(coord);

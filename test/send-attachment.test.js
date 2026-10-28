@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, afterEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import path from 'path';
 import { mkdtempSync, writeFileSync, mkdirSync, symlinkSync, rmSync } from 'fs';
 import { realpath } from 'fs/promises';
@@ -246,31 +246,120 @@ describe('createSendAttachmentHandler', () => {
   });
 
   describe('chat_room_id room target', () => {
-    function makeRoomFixture(roomRecord) {
+    function makeRoomFixture(roomRecord, extra = {}) {
       const fx = makeFixture();
       const rooms = { get: (id) => (id === 'room-1' ? roomRecord : null) };
+      const sender = { start: vi.fn(() => ({ jobId: 'job-1' })) };
+      const uploadMedia = vi.spyOn(fx.publisher, 'uploadMedia');
       const handler = createSendAttachmentHandler({
-        sessions: fx.sessions, publisher: fx.publisher, rooms,
-        // The room target must not require the session's own convo.
-        journalConvoIdFor: () => null,
+        sessions: fx.sessions, publisher: fx.publisher, rooms, sender,
+        // The transfer is "from" the session's own journal conversation.
+        journalConvoIdFor: () => 'convo-abc',
+        ...extra,
       });
-      return { ...fx, handler };
+      return { ...fx, handler, sender, uploadMedia };
     }
 
-    it('publishes into the room convo instead of the session convo', async () => {
-      const { handler, published } = makeRoomFixture({ sessionRoomId: '!room1', role: 'guest', state: 'joined' });
-      const res = await handler({ roomId: '!room1', path: 'shot.png', chat_room_id: 'room-1', caption: 'evidence' });
+    it('starts a journal transfer instead of uploading media', async () => {
+      const { handler, published, sender, uploadMedia, workdir } = makeRoomFixture({ sessionRoomId: '!room1', role: 'guest', state: 'joined' });
+      const res = await handler({ roomId: '!room1', path: 'report.pdf', chat_room_id: 'room-1', caption: 'evidence' });
       expect(res.status).toBe(200);
-      expect(published).toHaveLength(1);
-      expect(published[0].convoId).toBe('room-1');
-      expect(published[0].payload.caption).toBe('evidence');
+      expect(res.body).toMatchObject({ ok: true, status: 'pending_approval', name: 'report.pdf', size: 9 });
+      expect(res.body.note).toMatch(/approval card/);
+      expect(uploadMedia).not.toHaveBeenCalled();
+      expect(published).toHaveLength(0);
+      const realWorkdir = await realpath(workdir);
+      expect(sender.start).toHaveBeenCalledWith(expect.objectContaining({
+        sessionKey: '!room1', roomId: 'room-1', fromConvoId: 'convo-abc',
+        absPath: path.join(realWorkdir, 'report.pdf'), name: 'report.pdf', size: 9,
+        mtimeMs: expect.any(Number), contentType: 'application/pdf', caption: 'evidence',
+      }));
     });
 
-    it('lets the owner post while the room is still pending', async () => {
-      const { handler, published } = makeRoomFixture({ sessionRoomId: '!room1', role: 'owner', state: 'pending' });
+    it('refuses a file name with a backslash with a readable 400, before starting anything', async () => {
+      const { handler, sender, workdir } = makeRoomFixture({ sessionRoomId: '!room1', role: 'guest', state: 'joined' });
+      writeFileSync(path.join(workdir, 'build\\log.txt'), 'x');
+      const res = await handler({ roomId: '!room1', path: 'build\\log.txt', chat_room_id: 'room-1' });
+      expect(res.status).toBe(400);
+      expect(res.body.error).toMatch(/backslash/);
+      expect(res.body.error).toMatch(/rename/);
+      expect(sender.start).not.toHaveBeenCalled();
+    });
+
+    it('lets the owner send while the room is still pending', async () => {
+      const { handler, sender } = makeRoomFixture({ sessionRoomId: '!room1', role: 'owner', state: 'pending' });
       const res = await handler({ roomId: '!room1', path: 'report.pdf', chat_room_id: 'room-1' });
       expect(res.status).toBe(200);
-      expect(published[0].convoId).toBe('room-1');
+      expect(sender.start).toHaveBeenCalledTimes(1);
+    });
+
+    it('refuses a file over 10 GB with 413 before starting anything', async () => {
+      const { handler, sender } = makeRoomFixture({ sessionRoomId: '!room1', role: 'guest', state: 'joined' }, { transferMaxBytes: 5 });
+      const res = await handler({ roomId: '!room1', path: 'report.pdf', chat_room_id: 'room-1' });
+      expect(res.status).toBe(413);
+      expect(res.body.error).toMatch(/too large/);
+      expect(sender.start).not.toHaveBeenCalled();
+    });
+
+    it('caps room files at 10 GB by default, not 50 MB', async () => {
+      const { handler, sender } = makeRoomFixture({ sessionRoomId: '!room1', role: 'guest', state: 'joined' }, { maxBytes: 1 });
+      const res = await handler({ roomId: '!room1', path: 'report.pdf', chat_room_id: 'room-1' });
+      expect(res.status).toBe(200);
+      expect(sender.start).toHaveBeenCalled();
+    });
+
+    it("refuses a room with another person's agent with 403", async () => {
+      const { handler, sender, uploadMedia } = makeRoomFixture({ sessionRoomId: '!room1', role: 'owner', state: 'joined', person: 'bob' });
+      const res = await handler({ roomId: '!room1', path: 'report.pdf', chat_room_id: 'room-1' });
+      expect(res.status).toBe(403);
+      expect(res.body.error).toBe("files do not cross into rooms with another person's agent");
+      expect(sender.start).not.toHaveBeenCalled();
+      expect(uploadMedia).not.toHaveBeenCalled();
+    });
+
+    it("passes the asking turn's causes, read before any await, and a null when the turn has none", async () => {
+      const asked = [{ kind: 'user_message', ref: 'convo-abc:41', at: 1 }];
+      let release;
+      const gate = new Promise((r) => { release = r; });
+      const isPersonRoom = vi.fn(() => gate.then(() => false));
+      const { handler, sender, sessions } = makeRoomFixture({ sessionRoomId: '!room1', role: 'guest', state: 'joined' }, { isPersonRoom });
+      const session = sessions.get('!room1');
+      session.currentTurn = { causes: asked };
+      const pending = handler({ roomId: '!room1', path: 'report.pdf', chat_room_id: 'room-1' });
+      // A new turn begins while the person-room check is still out.
+      session.currentTurn = { causes: [{ kind: 'room_message', ref: 'room:room-1', at: 2 }] };
+      release();
+      expect((await pending).status).toBe(200);
+      expect(sender.start).toHaveBeenCalledWith(expect.objectContaining({ fromConvoId: 'convo-abc', causes: asked }));
+
+      session.currentTurn = null;
+      await handler({ roomId: '!room1', path: 'report.pdf', chat_room_id: 'room-1' });
+      expect(sender.start.mock.calls[1][0].causes).toBeNull();
+    });
+
+    it('asks the injected predicate about a guest-side person room', async () => {
+      const isPersonRoom = vi.fn(async (id) => id === 'room-1');
+      const { handler, sender } = makeRoomFixture({ sessionRoomId: '!room1', role: 'guest', state: 'joined' }, { isPersonRoom });
+      const res = await handler({ roomId: '!room1', path: 'report.pdf', chat_room_id: 'room-1' });
+      expect(res.status).toBe(403);
+      expect(isPersonRoom).toHaveBeenCalledWith('room-1', expect.objectContaining({ role: 'guest' }));
+      expect(sender.start).not.toHaveBeenCalled();
+    });
+
+    it('409s when the session has no journal conversation yet', async () => {
+      const { handler, sender } = makeRoomFixture({ sessionRoomId: '!room1', role: 'guest', state: 'joined' }, { journalConvoIdFor: () => null });
+      const res = await handler({ roomId: '!room1', path: 'report.pdf', chat_room_id: 'room-1' });
+      expect(res.status).toBe(409);
+      expect(sender.start).not.toHaveBeenCalled();
+    });
+
+    it('still guards the path for room files', async () => {
+      const { handler, sender, workdir } = makeRoomFixture({ sessionRoomId: '!room1', role: 'guest', state: 'joined' });
+      writeFileSync(path.join(workdir, '.env'), 'SECRET=1');
+      expect((await handler({ roomId: '!room1', path: '.env', chat_room_id: 'room-1' })).status).toBe(403);
+      expect((await handler({ roomId: '!room1', path: '/etc/hosts', chat_room_id: 'room-1' })).status).toBe(403);
+      expect((await handler({ roomId: '!room1', path: 'nope.pdf', chat_room_id: 'room-1' })).status).toBe(404);
+      expect(sender.start).not.toHaveBeenCalled();
     });
 
     it('404s a room this session does not participate in', async () => {
@@ -288,10 +377,10 @@ describe('createSendAttachmentHandler', () => {
 
     it('409s an owner who left/was refused/expired — same shared gate as agent_chat_send', async () => {
       for (const state of ['left', 'refused', 'expired']) {
-        const { handler, published } = makeRoomFixture({ sessionRoomId: '!room1', role: 'owner', state });
+        const { handler, sender } = makeRoomFixture({ sessionRoomId: '!room1', role: 'owner', state });
         const res = await handler({ roomId: '!room1', path: 'shot.png', chat_room_id: 'room-1' });
         expect(res.status).toBe(409);
-        expect(published).toHaveLength(0);
+        expect(sender.start).not.toHaveBeenCalled();
       }
     });
 
@@ -305,6 +394,17 @@ describe('createSendAttachmentHandler', () => {
       const handler = createSendAttachmentHandler({ sessions, publisher, journalConvoIdFor: () => 'convo-abc' });
       const res = await handler({ roomId: '!room1', path: 'shot.png', chat_room_id: 'room-1' });
       expect(res.status).toBe(404);
+    });
+
+    it('the own-conversation path still uploads media under the 50 MB cap', async () => {
+      const { handler, sender, uploadMedia, published } = makeRoomFixture({ sessionRoomId: '!room1', role: 'guest', state: 'joined' });
+      const res = await handler({ roomId: '!room1', path: 'report.pdf' });
+      expect(res.status).toBe(200);
+      expect(uploadMedia).toHaveBeenCalledTimes(1);
+      expect(published[0].convoId).toBe('convo-abc');
+      expect(sender.start).not.toHaveBeenCalled();
+      const capped = makeRoomFixture({ sessionRoomId: '!room1', role: 'guest', state: 'joined' }, { maxBytes: 5 });
+      expect((await capped.handler({ roomId: '!room1', path: 'report.pdf' })).status).toBe(413);
     });
   });
 
@@ -412,5 +512,108 @@ describe('createSendAttachmentHandler Files deep link', () => {
     const { handler, published } = fixtureWithWeb('');
     await handler({ roomId: '!room1', path: 'report.pdf', caption: '' });
     expect('caption' in published[0].payload).toBe(false);
+  });
+});
+
+// A file the bridge downloaded for this conversation (a chat upload, an item
+// attachment) lives outside the workdir, in the session's own download folder
+// (lib/matron-files.js sessionDownloadDir). These run the real default
+// wiring, with MATRON_FILES_DIR pointed at a temp root.
+describe("the conversation's own downloads", () => {
+  let prevRoot;
+  let root;
+  beforeEach(() => {
+    prevRoot = process.env.MATRON_FILES_DIR;
+    root = mkdtempSync(path.join(tmpdir(), 'send-attach-files-'));
+    process.env.MATRON_FILES_DIR = root;
+  });
+  afterEach(() => {
+    if (prevRoot === undefined) delete process.env.MATRON_FILES_DIR;
+    else process.env.MATRON_FILES_DIR = prevRoot;
+  });
+
+  // A session in a repo folder called "repo", plus a file the bridge saved
+  // for it and one it saved for another conversation in the same repo.
+  function downloadsFixture() {
+    const parent = mkdtempSync(path.join(tmpdir(), 'send-attach-wd-'));
+    const workdir = path.join(parent, 'repo');
+    mkdirSync(workdir);
+    const own = path.join(root, 'repo', 'convo-own');
+    const other = path.join(root, 'repo', 'convo-other');
+    mkdirSync(own, { recursive: true });
+    mkdirSync(other, { recursive: true });
+    writeFileSync(path.join(own, 'scan.zip'), 'zip-bytes');
+    writeFileSync(path.join(other, 'theirs.zip'), 'zip-bytes');
+    writeFileSync(path.join(root, 'repo', 'loose.txt'), 'shared project folder');
+    const session = { roomId: 'convo-own', workdir };
+    const { publisher } = makeUploadFixture();
+    return { session, workdir, own, other, publisher };
+  }
+
+  it('uploads a file the bridge saved for this conversation', async () => {
+    const { session, own, publisher } = downloadsFixture();
+    const r = await resolveAndUploadLocalFile({ session, reqPath: path.join(own, 'scan.zip'), publisher });
+    expect(r.ok).toBe(true);
+    expect(r.media).toMatchObject({ name: 'scan.zip', mime: 'application/zip', isImage: false });
+    expect(publisher.uploadMedia).toHaveBeenCalledWith(expect.objectContaining({ filePath: await realpath(path.join(own, 'scan.zip')) }));
+  });
+
+  it("refuses another conversation's download in the same repo", async () => {
+    const { session, other, publisher } = downloadsFixture();
+    const r = await resolveAndUploadLocalFile({ session, reqPath: path.join(other, 'theirs.zip'), publisher });
+    expect(r.status).toBe(403);
+    expect(r.body.error).toMatch(/outside/i);
+    expect(publisher.uploadMedia).not.toHaveBeenCalled();
+  });
+
+  it('refuses a file in the shared project folder above the conversation folder', async () => {
+    const { session, publisher } = downloadsFixture();
+    const r = await resolveAndUploadLocalFile({ session, reqPath: path.join(root, 'repo', 'loose.txt'), publisher });
+    expect(r.status).toBe(403);
+    expect(publisher.uploadMedia).not.toHaveBeenCalled();
+  });
+
+  it('refuses a ../ path that climbs out of the download folder', async () => {
+    const { session, own, publisher } = downloadsFixture();
+    const r = await resolveAndUploadLocalFile({ session, reqPath: path.join(own, '..', 'convo-other', 'theirs.zip'), publisher });
+    expect(r.status).toBe(403);
+    expect(publisher.uploadMedia).not.toHaveBeenCalled();
+  });
+
+  it('still refuses a sensitive-looking file in the download folder', async () => {
+    const { session, own, publisher } = downloadsFixture();
+    writeFileSync(path.join(own, '.env'), 'SECRET=1');
+    const r = await resolveAndUploadLocalFile({ session, reqPath: path.join(own, '.env'), publisher });
+    expect(r.status).toBe(403);
+    expect(r.body.error).toMatch(/share_sensitive_data/);
+    expect(publisher.uploadMedia).not.toHaveBeenCalled();
+  });
+
+  it('refuses a symlink in the download folder that points outside it', async () => {
+    const { session, own, other, publisher } = downloadsFixture();
+    symlinkSync(path.join(other, 'theirs.zip'), path.join(own, 'mine.zip'));
+    const r = await resolveAndUploadLocalFile({ session, reqPath: path.join(own, 'mine.zip'), publisher });
+    expect(r.status).toBe(403);
+    expect(publisher.uploadMedia).not.toHaveBeenCalled();
+  });
+
+  it('allows nothing extra for a session with no room id', async () => {
+    const { workdir, own, publisher } = downloadsFixture();
+    const r = await resolveAndUploadLocalFile({ session: { workdir }, reqPath: path.join(own, 'scan.zip'), publisher });
+    expect(r.status).toBe(403);
+    expect(publisher.uploadMedia).not.toHaveBeenCalled();
+  });
+
+  it("send_attachment posts this conversation's download into a room", async () => {
+    const { session, own, publisher } = downloadsFixture();
+    const rooms = { get: (id) => (id === 'room-1' ? { sessionRoomId: 'convo-own', role: 'guest', state: 'joined' } : null) };
+    const sender = { start: vi.fn(() => ({ jobId: 'job-1' })) };
+    const handler = createSendAttachmentHandler({
+      sessions: new Map([['convo-own', session]]), publisher, rooms, sender, journalConvoIdFor: () => 'convo-own',
+    });
+    const res = await handler({ roomId: 'convo-own', path: path.join(own, 'scan.zip'), chat_room_id: 'room-1' });
+    expect(res.status).toBe(200);
+    expect(sender.start).toHaveBeenCalledWith(expect.objectContaining({ roomId: 'room-1', name: 'scan.zip' }));
+    expect(publisher.uploadMedia).not.toHaveBeenCalled();
   });
 });

@@ -10,6 +10,8 @@ import {
   permissionGateHookOutput,
   PERMISSION_GATE_FETCH_TIMEOUT_MS,
 } from '../lib/permission-prompt.js';
+import { readApiHeaderFile } from '../lib/api-header-file.js';
+import { readStdinText } from './hook-util.mjs';
 
 // The bridge bakes `--port <n> --room <id>` into the hook command at spawn.
 // Deliberately NOT read from the environment: a settings `env` block reaches
@@ -20,26 +22,21 @@ function parseArgs(argv) {
   for (let i = 0; i < argv.length - 1; i += 1) {
     if (argv[i] === '--port') out.port = argv[i + 1];
     if (argv[i] === '--room') out.room = argv[i + 1];
+    if (argv[i] === '--auth') out.auth = argv[i + 1];
   }
   return out;
-}
-
-async function readStdin() {
-  const chunks = [];
-  for await (const chunk of process.stdin) chunks.push(chunk);
-  return Buffer.concat(chunks).toString('utf8');
 }
 
 async function main() {
   let toolName;
   try {
-    toolName = JSON.parse(await readStdin())?.tool_name;
+    toolName = JSON.parse(await readStdinText())?.tool_name;
   } catch {
     // Unparseable hook input: we cannot tell what is being called. Ask.
     return permissionGateHookOutput(null);
   }
   if (!isGatedMcpTool(toolName)) return null;
-  const { port, room } = parseArgs(process.argv.slice(2));
+  const { port, room, auth } = parseArgs(process.argv.slice(2));
   const portNum = Number(port);
   if (!Number.isInteger(portNum) || portNum < 1 || portNum > 65535 || !room) {
     return permissionGateHookOutput(null);
@@ -47,7 +44,7 @@ async function main() {
   try {
     const res = await fetch(`http://127.0.0.1:${portNum}/permission-check`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', ...readApiHeaderFile(auth) },
       body: JSON.stringify({ roomId: room, toolName }),
       signal: AbortSignal.timeout(PERMISSION_GATE_FETCH_TIMEOUT_MS),
     });

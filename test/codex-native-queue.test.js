@@ -6,6 +6,7 @@ import { createQueuedDispatcher } from '../lib/queued-dispatch.js';
 import { createQueuedReleaseLifecycle } from '../lib/queued-release-lifecycle.js';
 import { pendingMediaMirror } from '../lib/media-mirror.js';
 import { CodexPromptQueue } from '../lib/codex-prompts.js';
+import { queueCauses, joinHeldTurn, tagCauses, mergeIntoTurn } from '../lib/turn-cause.js';
 // Only the index.js answer-routing and merged-send wiring needs source extraction.
 const source = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
 function sourceOf(name) {
@@ -20,7 +21,7 @@ function setup() {
   const releaseOutbox = { put: vi.fn(() => true) };
   const journalPublisher = { publishPromptReply: vi.fn() };
   const lifecycle = createQueuedReleaseLifecycle({ releaseOutbox, journalPublisher, now: () => 123, log: { warn: vi.fn() } });
-  const context = vm.createContext({ markJournalOrigin, planQueueFlush, pendingMediaMirror, console,
+  const context = vm.createContext({ AGENT_CODEX: 'codex', markJournalOrigin, planQueueFlush, pendingMediaMirror, queueCauses, joinHeldTurn, tagCauses, mergeIntoTurn, console,
     sessions: new Map([['room', session]]), journalMirrorUserMedia: vi.fn(),
     commitDispatchedUserTurn: vi.fn(), journalPublishUserItem: vi.fn(),
     emitRelease: vi.fn(lifecycle.emitRelease),
@@ -97,10 +98,21 @@ describe('bridge send-now steering', () => {
 describe('asynchronous question answer delivery', () => {
   function question(h) {
     h.session.codexPrompts = new CodexPromptQueue({ publish: () => true,
-      submitAsync: text => h.context.submitCodexAsyncAnswer(h.session, text) });
+      submitAsync: (text, causes) => h.context.submitCodexAsyncAnswer(h.session, text, causes) });
     h.session.codexPrompts.addAsync('question', [{ title: 'Which feature?', options: ['Models', 'Tokens'] }]);
-    return () => h.context.journalRoutePromptReply(h.session, { choice: h.session.codexPrompts.active.options[1].value });
+    return (causes = null) => h.context.journalRoutePromptReply(h.session, { choice: h.session.codexPrompts.active.options[1].value }, { causes });
   }
+  const reply = [{ kind: 'user_message', ref: 'convo:77', at: 1 }];
+  it('an answer after the turn ended starts its turn with the user\'s reply as its cause', () => {
+    const h = setup(); h.session.busy = false;
+    expect(question(h)(reply)).toBe('Tokens');
+    expect(h.context.sendToSession).toHaveBeenCalledWith(h.session, [{ type: 'text', text: 'Which feature?\nTokens' }], { skipJournalMirror: true, causes: reply });
+  });
+  it('an answer steered into the running turn adds the user\'s reply to its causes', () => {
+    const h = setup(); h.session.currentTurn = { causes: [{ kind: 'other', at: 0 }], startedAt: 0 };
+    expect(question(h)(reply)).toBe('Tokens');
+    expect(h.session.currentTurn.causes.map(c => c.ref)).toEqual([undefined, 'convo:77']);
+  });
   it('steers a selected answer without releasing unrelated queued messages or duplicating history', async () => {
     const h = setup(); h.session.queuedMessages = h.batch;
     const notification = { id: 'unrelated' }; h.session.queueNotifications = [notification];
@@ -123,7 +135,7 @@ describe('asynchronous question answer delivery', () => {
     const h = setup(); h.session.busy = false;
     expect(question(h)()).toBe('Tokens');
     expect(h.session.codex.steer).not.toHaveBeenCalled();
-    expect(h.context.sendToSession).toHaveBeenCalledWith(h.session, [{ type: 'text', text: 'Which feature?\nTokens' }], { skipJournalMirror: true });
+    expect(h.context.sendToSession).toHaveBeenCalledWith(h.session, [{ type: 'text', text: 'Which feature?\nTokens' }], { skipJournalMirror: true, causes: null });
     expect(h.context.recordUserAnswer).not.toHaveBeenCalled();
   });
   it('retains rejected answers and keeps queue notification positions aligned', async () => {

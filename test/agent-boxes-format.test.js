@@ -26,6 +26,19 @@ describe('formatBox', () => {
     );
   });
 
+  it('gives each limit line its reset time, but not a passed reset', () => {
+    const now = Date.parse('2026-10-23T10:00:00Z');
+    const box = {
+      device_id: 2, name: 'elm', online: true, folders: [],
+      limits: { as_of: now, lines: [
+        { id: 'session', label: 'Session', percent: 7, resets_at: '2026-10-23T12:00:00Z' },
+        { id: 'week_all', label: 'Week (all models)', percent: 32, resets_at: '2026-10-23T19:00:00Z' },
+        { id: 'codex:codex:secondary', label: 'Codex · Weekly', percent: 5, resets_at: '2026-10-21T00:00:00Z' },
+      ] },
+    };
+    expect(formatBox(box, now).split('\n')[1]).toBe('  limits: Session 7% (resets in 2 h, Fri 12:00 UTC) · Week (all models) 32% (resets in 9 h, Fri 19:00 UTC) · Codex · Weekly 5% (as of 2026-10-23T10:00:00.000Z)');
+  });
+
   it('shows the box defaults a session started there with no explicit choice runs as', () => {
     const base = { device_id: 2, name: 'elm', online: true, folders: [] };
     expect(formatBox({ ...base, defaults: { agent: 'codex', model: 'gpt-5.1-codex', effort: 'high', source: 'box' } }))

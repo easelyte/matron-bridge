@@ -111,11 +111,14 @@ fi
 step "preflight (old process still serving)"
 
 echo "  - declared deps all installed?"
-if ! npm ls --omit=dev >/tmp/matron-deploy-npmls.txt 2>&1; then
+# A private temp file (mktemp), never a fixed name in the shared /tmp.
+NPMLS_OUT=$(mktemp)
+trap 'rm -f "$NPMLS_OUT"' EXIT
+if ! npm ls --omit=dev >"$NPMLS_OUT" 2>&1; then
   # npm ls also exits non-zero for benign 'extraneous' packages; only a
   # genuinely missing/unmet/invalid dep is a boot blocker.
-  if grep -qiE 'missing|invalid|unmet' /tmp/matron-deploy-npmls.txt; then
-    grep -iE 'missing|invalid|unmet' /tmp/matron-deploy-npmls.txt >&2
+  if grep -qiE 'missing|invalid|unmet' "$NPMLS_OUT"; then
+    grep -iE 'missing|invalid|unmet' "$NPMLS_OUT" >&2
     fail "a declared dependency is missing/invalid — 'npm install' did not resolve it"
   fi
 fi
@@ -146,9 +149,14 @@ fi
 #    be verified afterwards (the restart kills the process hosting whatever
 #    invoked us, so we can't reliably check the new PID here).
 OLD_PID=$(service_pid)
-echo "${OLD_PID:-none}" > /tmp/matron-deploy-oldpid
+# Kept in a per-user state directory: a fixed name in the shared /tmp could
+# be created first by another user.
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/matron-bridge"
+mkdir -p -m 700 "$STATE_DIR"
+chmod 700 "$STATE_DIR"
+echo "${OLD_PID:-none}" > "$STATE_DIR/deploy-oldpid"
 step "restart $TARGET  (old PID: ${OLD_PID:-none})"
 service_restart
 
-echo "Restart requested. Old PID was ${OLD_PID:-none} (saved to /tmp/matron-deploy-oldpid)."
+echo "Restart requested. Old PID was ${OLD_PID:-none} (saved to $STATE_DIR/deploy-oldpid)."
 echo "Verify: $VERIFY_HINT — the PID should differ and stay up."

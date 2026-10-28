@@ -29,7 +29,7 @@ vi.mock('fs', () => ({
 
 import { execFile } from 'child_process';
 import fs from 'fs';
-import { transcribeAudio, transcribeAudioSegments, parseWhisperSegments, resolveWhisperPrompt, makeWhisperPrompt, promptLooksTruncated, DEFAULT_WHISPER_PROMPT, MIME_TO_EXT, TRANSCRIBE_UNAVAILABLE } from '../lib/transcribe.js';
+import { transcribeAudio, transcribeAudioSegments, parseWhisperSegments, localWhisperAvailable, whisperCliPath, resolveWhisperPrompt, makeWhisperPrompt, promptLooksTruncated, DEFAULT_WHISPER_PROMPT, MIME_TO_EXT, TRANSCRIBE_UNAVAILABLE } from '../lib/transcribe.js';
 
 function mockExecFile(ffmpegResult, whisperResult) {
   const customFn = execFile[Symbol.for('nodejs.util.promisify.custom')];
@@ -567,5 +567,35 @@ describe('transcribeAudioSegments', () => {
     mockExecFile({ stdout: '' }, { error: new Error('whisper died') });
     await expect(transcribeAudioSegments(fakeBuffer, 'video/mp4', CONFIG)).rejects.toThrow('whisper died');
     expect(fs.rmSync).toHaveBeenCalledWith(expect.stringContaining('voice-'), { recursive: true, force: true });
+  });
+});
+
+describe('localWhisperAvailable', () => {
+  const MODEL = CONFIG.modelPath;
+  const CLI = whisperCliPath(MODEL);
+  const fakeFs = (present) => ({ existsSync: (p) => present.includes(p) });
+
+  it('localWhisperAvailable false when the model is missing', () => {
+    expect(localWhisperAvailable({ modelPath: MODEL, fs: fakeFs([CLI]) })).toBe(false);
+  });
+
+  it('localWhisperAvailable false when whisper-cli is missing', () => {
+    expect(localWhisperAvailable({ modelPath: MODEL, fs: fakeFs([MODEL]) })).toBe(false);
+  });
+
+  it('localWhisperAvailable true when both exist', () => {
+    expect(localWhisperAvailable({ modelPath: MODEL, fs: fakeFs([MODEL, CLI]) })).toBe(true);
+  });
+
+  it('localWhisperAvailable false without a model path, and never throws', () => {
+    expect(localWhisperAvailable()).toBe(false);
+    expect(localWhisperAvailable({ modelPath: '' })).toBe(false);
+  });
+
+  it('localWhisperAvailable defaults to the real fs module', () => {
+    fs.existsSync.mockImplementation((p) => p === MODEL);
+    expect(localWhisperAvailable({ modelPath: MODEL })).toBe(false);
+    fs.existsSync.mockImplementation(() => true);
+    expect(localWhisperAvailable({ modelPath: MODEL })).toBe(true);
   });
 });

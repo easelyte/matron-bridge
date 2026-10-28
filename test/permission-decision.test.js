@@ -265,7 +265,7 @@ describe('permission hook spawn environment wiring (source inspection)', () => {
 
   it('builds print spawn settings by composing the fork settings onto upstream buildPrintSessionSettings', () => {
     expect(printSpawn).toContain("'--settings', JSON.stringify(withForkPrintSettings(");
-    expect(printSpawn).toContain("buildPrintSessionSettings({ bypass: bypassMode, hooksDir: path.join(__dirname, 'hooks'), apiPort: API_PORT, roomId, foreignFlag: foreignFlagPath(roomId) }),");
+    expect(printSpawn).toContain("buildPrintSessionSettings({ bypass: bypassMode, hooksDir: path.join(__dirname, 'hooks'), apiPort: API_PORT, roomId, foreignFlag: foreignFlagPath(roomId), apiHeaderFile: apiHeaderFileFor(roomId) }),");
     expect(printSpawn).toContain('{ bypass: bypassMode },');
   });
 

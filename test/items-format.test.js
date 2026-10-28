@@ -276,3 +276,11 @@ describe('formatItemDetail: buttons on a comment', () => {
     expect(text.match(/Actions:/g)).toHaveLength(2);
   });
 });
+
+describe('itemLine labels', () => {
+  it('lists the labels, flattened', async () => {
+    const { itemLine } = await import('../lib/items-format.js');
+    expect(itemLine({ num: 3, title: 'Audit', state: 'open', awaiting: 'agent', labels: ['spare-allowance', 'dis\npatched'], id: 'it_3' }))
+      .toBe('#3 Audit — open, awaiting agent, labels spare-allowance, dis patched (id it_3)');
+  });
+});

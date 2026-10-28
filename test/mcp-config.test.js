@@ -1,4 +1,6 @@
 import { describe, it, expect } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import {
   buildMcpServers,
   effectiveExtras,
@@ -111,7 +113,7 @@ const BASE_WRAP = Object.freeze({
       'chrome-devtools': {
         command: './hooks/xvfb-wrap.sh',
         args: [
-          'npx', '-y', 'chrome-devtools-mcp',
+          'node', './node_modules/chrome-devtools-mcp/build/src/bin/chrome-devtools-mcp.js',
           '--no-usage-statistics',
           '--chromeArg=--no-sandbox',
           '--chromeArg=--disable-setuid-sandbox',
@@ -130,8 +132,40 @@ describe('buildMcpServers — repo-relative command resolution (xvfb-wrap.sh)', 
       askUserBaseDir: '/opt/bridge',
     });
     expect(config.mcpServers['chrome-devtools'].command).toBe('/opt/bridge/hooks/xvfb-wrap.sh');
-    // args are the real command line, untouched by resolution
-    expect(config.mcpServers['chrome-devtools'].args[0]).toBe('npx');
+    // args are the real command line; only the script inside the bridge's
+    // own node_modules is resolved, so it is found from any session workdir
+    expect(config.mcpServers['chrome-devtools'].args).toEqual([
+      'node', '/opt/bridge/node_modules/chrome-devtools-mcp/build/src/bin/chrome-devtools-mcp.js',
+      '--no-usage-statistics',
+      '--chromeArg=--no-sandbox',
+      '--chromeArg=--disable-setuid-sandbox',
+    ]);
+  });
+
+  it('on macOS under a named node copy the unwrapped browser server runs with that copy', () => {
+    const { config } = buildMcpServers({
+      baseConfig: BASE_WRAP,
+      extras: ['browser'],
+      platform: 'darwin',
+      askUserBaseDir: '/opt/bridge',
+      execPath: '/opt/matron/bin/matron-bridge',
+    });
+    expect(config.mcpServers['chrome-devtools'].command).toBe('/opt/matron/bin/matron-bridge');
+    expect(config.mcpServers['chrome-devtools'].args[0])
+      .toBe('/opt/bridge/node_modules/chrome-devtools-mcp/build/src/bin/chrome-devtools-mcp.js');
+  });
+
+  it('resolves only args that point into ./node_modules/, leaving other ./ args alone', () => {
+    const { config } = buildMcpServers({
+      baseConfig: {
+        mcpServers: {},
+        mcpExtras: { x: { tool: { command: 'node', args: ['./node_modules/pkg/cli.js', './data.json', '--flag'] } } },
+      },
+      extras: ['x'],
+      platform: 'linux',
+      askUserBaseDir: '/opt/bridge',
+    });
+    expect(config.mcpServers.tool.args).toEqual(['/opt/bridge/node_modules/pkg/cli.js', './data.json', '--flag']);
   });
 
   it('leaves the relative command as-is when no base dir is supplied', () => {
@@ -160,9 +194,9 @@ describe('buildMcpServers — repo-relative command resolution (xvfb-wrap.sh)', 
       platform: 'darwin',
       askUserBaseDir: '/opt/bridge',
     });
-    expect(config.mcpServers['chrome-devtools'].command).toBe('npx');
+    expect(config.mcpServers['chrome-devtools'].command).toBe('node');
     expect(config.mcpServers['chrome-devtools'].args).toEqual([
-      '-y', 'chrome-devtools-mcp', '--no-usage-statistics',
+      '/opt/bridge/node_modules/chrome-devtools-mcp/build/src/bin/chrome-devtools-mcp.js', '--no-usage-statistics',
     ]);
   });
 
@@ -173,9 +207,9 @@ describe('buildMcpServers — repo-relative command resolution (xvfb-wrap.sh)', 
       platform: 'win32',
       askUserBaseDir: 'C:/bridge',
     });
-    expect(config.mcpServers['chrome-devtools'].command).toBe('npx');
+    expect(config.mcpServers['chrome-devtools'].command).toBe('node');
     expect(config.mcpServers['chrome-devtools'].args).toEqual([
-      '-y', 'chrome-devtools-mcp', '--no-usage-statistics',
+      'C:/bridge/node_modules/chrome-devtools-mcp/build/src/bin/chrome-devtools-mcp.js', '--no-usage-statistics',
     ]);
   });
 });
@@ -434,5 +468,34 @@ describe('parseDefaultExtras', () => {
   });
   it('drops empty segments', () => {
     expect(parseDefaultExtras('circleci,,')).toEqual(['circleci']);
+  });
+});
+
+// The committed browser extra runs the chrome-devtools MCP the bridge
+// installed from its lockfile, so the code a browser session starts is the
+// exact version that was reviewed and locked, not whatever the registry
+// serves under the name at launch.
+describe('committed browser extra runs the locked chrome-devtools-mcp', () => {
+  const read = (f) => JSON.parse(readFileSync(fileURLToPath(new URL(`../${f}`, import.meta.url)), 'utf8'));
+  const config = read('mcp-config.json');
+  const pkg = read('package.json');
+  const lock = read('package-lock.json');
+  const server = config.mcpExtras.browser['chrome-devtools'];
+  const locked = lock.packages['node_modules/chrome-devtools-mcp'];
+
+  it('does not fetch a package at launch', () => {
+    expect([server.command, ...server.args]).not.toContain('npx');
+    expect(server.args).not.toContain('-y');
+  });
+
+  it('is an exact-version dependency with a locked, integrity-checked entry', () => {
+    expect(pkg.dependencies['chrome-devtools-mcp']).toMatch(/^\d+\.\d+\.\d+$/);
+    expect(locked.version).toBe(pkg.dependencies['chrome-devtools-mcp']);
+    expect(locked.integrity).toMatch(/^sha512-/);
+  });
+
+  it('starts the package\'s own bin script from the bridge\'s node_modules', () => {
+    expect(server.args[0]).toBe('node');
+    expect(server.args[1]).toBe(`./node_modules/chrome-devtools-mcp/${locked.bin['chrome-devtools-mcp']}`);
   });
 });

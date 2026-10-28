@@ -11,6 +11,7 @@ import { fileURLToPath } from 'node:url';
 import WebSocket from 'ws';
 import qrcode from 'qrcode-terminal';
 import { pairAgent, pairHttpBase, PairingError } from '../lib/journal-pairing.js';
+import { atomicWriteFileSync } from '../lib/atomic-write.js';
 
 export const REPO_DIR = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 export const ENV_PATH = path.join(REPO_DIR, '.env');
@@ -50,6 +51,15 @@ export function normalizeJournalUrl(input) {
   return url;
 }
 
+// Whether two journal URLs, in any form normalizeJournalUrl accepts, reach
+// the same journal: same scheme, host and port. An unparsable or empty URL
+// matches nothing.
+export function sameJournal(a, b) {
+  const ua = normalizeJournalUrl(a || '');
+  const ub = normalizeJournalUrl(b || '');
+  return !!ua && !!ub && ua.origin === ub.origin;
+}
+
 export function isLocalHost(hostname) {
   return hostname === 'localhost' || hostname === '127.0.0.1' || hostname === '::1' || hostname === '[::1]';
 }
@@ -83,24 +93,25 @@ export function tokenEnv(journalUrl) {
 }
 
 // Render `owned` over the previous .env onto the template, back the previous
-// .env up to .env.bak, and write the new one mode 0600. Returns whether a
-// backup was made.
-export function writeEnvFile(existing, owned) {
-  const example = fs.readFileSync(EXAMPLE_PATH, 'utf8');
+// .env up to .env.bak (owner-only, like .env itself, since it holds the same
+// secrets), and write the new one mode 0600. Returns whether a backup was
+// made. The paths are parameters for tests only.
+export function writeEnvFile(existing, owned, { envPath = ENV_PATH, examplePath = EXAMPLE_PATH } = {}) {
+  const example = fs.readFileSync(examplePath, 'utf8');
   const env = buildEnv(example, existing, owned);
-  // Copy and handle ENOENT rather than existsSync-then-copy: the check-then-
+  // Read and handle ENOENT rather than existsSync-then-copy: the check-then-
   // act pair is a race (CodeQL js/file-system-race), and "no previous .env"
   // is the only outcome the check was guarding.
-  let backedUp = false;
+  let previous = null;
   try {
-    fs.copyFileSync(ENV_PATH, `${ENV_PATH}.bak`);
-    backedUp = true;
+    previous = fs.readFileSync(envPath);
   } catch (e) {
     if (e.code !== 'ENOENT') throw e;
   }
-  fs.writeFileSync(ENV_PATH, env, { mode: 0o600 });
-  fs.chmodSync(ENV_PATH, 0o600);
-  return backedUp;
+  if (previous !== null) atomicWriteFileSync(`${envPath}.bak`, previous, { mode: 0o600 });
+  fs.writeFileSync(envPath, env, { mode: 0o600 });
+  fs.chmodSync(envPath, 0o600);
+  return previous !== null;
 }
 
 // The token the bridge would boot with from this .env — same rule as
@@ -111,6 +122,15 @@ export function currentToken(existing) {
     try { return fs.readFileSync(existing.JOURNAL_TOKEN_FILE, 'utf8').trim(); } catch { return ''; }
   }
   return (existing.JOURNAL_TOKEN || '').trim();
+}
+
+// The agent token .env names, but only for the journal it was saved with: a
+// token is issued by one journal, and the JOURNAL_WS_URL written next to it
+// is that journal. Returns '' when the target is a different journal (or .env
+// names no journal), so the stored token is never sent anywhere else.
+export function storedTokenFor(existing, journalUrl) {
+  if (!sameJournal(existing.JOURNAL_WS_URL, journalUrl)) return '';
+  return currentToken(existing);
 }
 
 // A token in <repo>/.journal-token that .env doesn't reference: left behind

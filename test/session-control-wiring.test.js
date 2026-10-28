@@ -30,7 +30,8 @@ describe('session control wiring (source inspection)', () => {
     expect(fn).toContain("code: known ? 'gone' : 'not_found'");
     expect(fn).toContain('planSessionControl({ params, session, canSwitch: canSwitchAgent })');
     expect(fn).toContain("session._deferredControls = { ...(session._deferredControls || {}), [plan.slot.kind]: { ...mergeParkedSlot(session._deferredControls?.[plan.slot.kind], plan.slot), id: randomUUID() } };");
-    expect(fn).toContain("session._autoResume = { at: plan.at, text: plan.text, kind: 'usage_limit', source: 'coordinator' };");
+    // The scheduled slot keeps the journal's record of the carry-on for the turn it fires.
+    expect(fn).toContain("session._autoResume = { at: plan.at, text: plan.text, kind: 'usage_limit', source: 'coordinator', ...(plan.carryOnId ? { carryOnId: plan.carryOnId } : {}) };");
   });
   it('authorizes a journal-originated alert against the current Coordinator before resolving the target', () => {
     const fn = body('async function journalControlSession(rawParams, { fromDeviceId } = {}) {', '\nasync function applyControlSteps(');
@@ -53,7 +54,9 @@ describe('session control wiring (source inspection)', () => {
     expect(fn).toContain("...(step.effort && step.agent === AGENT_CLAUDE ? { claudeEffort: step.effort } : {}),");
     expect(fn).toContain('await applyControlEffort(current, step.effort, ctx);');
     expect(fn).toContain("await journalRouteTextToSession(current, step.command || '/compact', { keepRestartBudget: !!step.command });");
-    expect(fn).toContain('sendTextToSession(current, step.text, { skipJournalMirror: true })');
+    // The planner's causes reach the turn (lib/turn-cause.js).
+    expect(fn).toContain('const causes = step.causes ?? (step.cause ? [step.cause] : null);');
+    expect(fn).toContain('sendTextToSession(current, step.text, { skipJournalMirror: true, causes })');
   });
   it('drains parked slots from the shared free gate, before room delivery, and never on an occupied session', () => {
     const gate = body('function maybeFlushRoomDelivery(session) {', '\n}');
@@ -125,7 +128,8 @@ describe('automatic carry-on wiring (source inspection)', () => {
     expect(fire).toContain('session._autoResume = null;');
     expect(fire).toContain("if (shouldCompactBefore(session._lastContextTokens, contextWindowForSession(session))) {");
     expect(fire).toContain("await journalRouteTextToSession(session, '/compact');");
-    expect(fire).toContain("await journalRouteTextToSession(sessions.get(roomId) || session, slot.text || (slot.kind === 'model_recovery' ? BAD_MODEL_RECOVERY_TEXT : AUTO_RESUME_TEXT));");
+    expect(fire).toContain("await journalRouteTextToSession(sessions.get(roomId) || session, slot.text || (slot.kind === 'model_recovery' ? BAD_MODEL_RECOVERY_TEXT : AUTO_RESUME_TEXT),");
+    expect(fire).toContain("{ causes: slot.source === 'coordinator' ? [carryOnCause(slot.carryOnId)] : null });");
     expect(fire).toContain("slot.kind === 'model_recovery'");
     // A thrown delivery puts the slot back unless something newer was armed.
     expect(fire).toContain('if (!live._autoResume) { live._autoResume = slot; persistControlState(live); }');

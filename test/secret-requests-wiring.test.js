@@ -46,9 +46,10 @@ describe('bridge wiring', () => {
   it('drives every secret route through lib/secret-requests.js', () => {
     expect(index).toContain("from './lib/secret-requests.js'");
     expect(index).toContain('createSecretRequests({');
-    expect(index).toContain('secretRequests.create(');
+    expect(index).toContain('requestSecretForSession(data, {');
+    expect(index).toContain('convoIdFor: journalConvoIdFor,');
+    expect(index).toContain('requests: secretRequests,');
     expect(index).toContain('secretRequests.submit(');
-    expect(index).toContain('secretRequests.read(');
   });
 
   it('re-arms persisted requests at startup', () => {
@@ -59,6 +60,9 @@ describe('bridge wiring', () => {
   it('signs the secret link for the request lifetime, not the file-link window', () => {
     expect(index).toMatch(/function generateSecretLink\(secretId, label, roomId, \{[^)]*ttlMs/);
     expect(index).toMatch(/multiline/);
+    expect(index).toContain('if (context) payloadObj.context = context;');
+    expect(index).toContain('if (convoId) payloadObj.convoId = convoId;');
+    expect(index).toContain('generateSecretLink(secretId, label, roomId, { ttlMs, multiline, context, convoId })');
   });
 
   // The delivery BEHAVIOUR (idle / busy / reaped / resume-failed) is unit-

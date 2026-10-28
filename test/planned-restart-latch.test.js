@@ -13,6 +13,7 @@ import { evaluateQuiet } from '../lib/restart-quiet.js';
 import { createJournalMediaRouter } from '../lib/journal-media.js';
 import { TURN_TIER } from '../lib/peer-priority.js';
 import { atomicWriteFileSync } from '../lib/atomic-write.js';
+import * as turnCause from '../lib/turn-cause.js';
 
 const roots = [];
 const steps = ['restarting', 'quiet', 'code', 'persist', 'stamp', 'shutdown'];
@@ -291,7 +292,7 @@ function indexFunction(name, context) {
   const source = fs.readFileSync(new URL('../index.js', import.meta.url), 'utf8');
   const start = source.indexOf(`function ${name}(`);
   const end = source.indexOf('\n}\n', start) + 2;
-  return runInNewContext(`${source.slice(start, end)}; ${name}`, context);
+  return runInNewContext(`${source.slice(start, end)}; ${name}`, { ...turnCause, ...context });
 }
 
 it('holds room input while foreign context is pending and releases after delivery', async () => {
@@ -301,7 +302,7 @@ it('holds room input while foreign context is pending and releases after deliver
   const deliver = vi.fn();
   const session = { alive: true, roomId: 'alice' };
   const route = indexFunction('deliverRoomFrameTo', {
-    restartLatch: f.latch, sessions: new Map([['alice', session]]),
+    restartLatch: f.latch, sessions: new Map([['alice', session]]), journalPublisher: { identity: () => null },
     personOfSender: () => 'bob', personLabel: () => 'bob',
     maybeFlushRoomDelivery() {}, roomEchoLabel: () => null,
     roomFrameDisposition: () => 'deliver', agentRooms: { isMuted: () => false },
@@ -468,7 +469,7 @@ it('guards every ingress and rejects unknown dispatcher callers', () => {
     'handleCommand', 'peerDelivery', 'journalOnPeerMessage',
     'sendToSession', 'sendTextToSession', 'journalRouteTextToSession', 'journalOnText', 'journalOnMedia',
     'journalMediaRouter', 'fireTimer', 'journalOnRoomFrame', 'deliverRoomFrameTo', 'routeLocalRoomMessage',
-    'routeLocalRoomAttachment', 'routeLocalRoomFrame', 'journalInjectInviteRequest', 'deliverInviteAsk',
+    'routeLocalRoomFrame', 'journalInjectInviteRequest', 'deliverInviteAsk',
     'deliverAutoJoinedRequest', 'journalNotifyRoomEvent', 'journalHandleControlCommand', 'journalControlSession',
     'applyControlSteps', 'applyControlEffort', 'drainDeferredControls', 'flushQueue', 'flushPendingSessionQueue',
     'dispatchMergedFlush', 'fireAutoResume', 'carryOnConvo', 'runPreReapHandoff', 'journalResumeConvo',

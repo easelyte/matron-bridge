@@ -17,8 +17,8 @@ const fnBody = (src, sig) => {
 
 describe('index.js wiring', () => {
   it('every Claude session gets the gate: print spawns and iv settings name the flag path', () => {
-    expect(index).toMatch(/buildPrintSessionSettings\(\{ bypass: bypassMode, hooksDir: [\s\S]{0,120}?foreignFlag: foreignFlagPath\(roomId\) \}\)/);
-    expect(index).toMatch(/foreignGateEntry\(\{ hooksDir: path\.join\(__dirname, 'hooks'\), apiPort: API_PORT, roomId, foreignFlag: foreignFlagPath\(roomId\) \}\)/);
+    expect(index).toMatch(/buildPrintSessionSettings\(\{ bypass: bypassMode, hooksDir: [\s\S]{0,120}?foreignFlag: foreignFlagPath\(roomId\), apiHeaderFile: apiHeaderFileFor\(roomId\) \}\)/);
+    expect(index).toMatch(/foreignGateEntry\(\{ hooksDir: path\.join\(__dirname, 'hooks'\), apiPort: API_PORT, roomId, foreignFlag: foreignFlagPath\(roomId\), apiHeaderFile: apiHeaderFileFor\(roomId\) \}\)/);
   });
 
   it('a foreign turn ends at the print and iv turn-end seams, before the queue or room flush', () => {
@@ -35,12 +35,45 @@ describe('index.js wiring', () => {
 
   it('input of the session\'s own, sent while idle, ends a foreign turn a seam missed; mid-turn input does not', () => {
     const body = fnBody(index, 'function sendToSession(');
-    expect(body).toMatch(/if \(!foreign && !session\.busy && session\.foreignTurn\) foreignSessions\.end\(session\);/);
+    // "No turn running" also needs the open turn record: busy is false after an unacknowledged interrupt.
+    expect(body).toMatch(/if \(!foreign && !session\.busy && !session\.currentTurn && session\.foreignTurn\) foreignSessions\.end\(session\);/);
+    // The in-flight marker remembers whose turn it was, for the restart carry-on.
+    expect(body).toMatch(/inflightMarker\.noteTurnStart\(journalConvoIdFor\(session\), session\.roomId, inflightTurnOrigin\(session\)\)/);
+    // Every marker write names the running restricted turn's person, not only the send that started it.
+    expect(index).not.toMatch(/inflightMarker\.noteTurnStart\(journalConvoIdFor\(session\), session\.roomId\);/);
+    expect(fnBody(index, 'function inflightTurnOrigin(')).toMatch(/foreignPerson: session\.foreignTurn\?\.person \?\? null/);
+  });
+
+  it('a usage-limit stall in a turn another person started is never carried on by itself', () => {
+    const body = fnBody(index, 'function handleClaudeEvent(');
+    expect(body).toMatch(/foreign: Boolean\(session\.foreignTurn\),/);
+    expect(body).toMatch(/if \(session\.foreignTurn\) \{[\s\S]*?\} else if \(stall\.kind === 'bad_model'\)/);
+    // A carry-on armed before the stall is dropped as well.
+    expect(body).toMatch(/if \(session\.foreignTurn\) \{[\s\S]*?if \(session\._autoResume\) \{\s*session\._autoResume = null;/);
+    expect(body).toMatch(/if \(session\._stall\.kind === 'usage_limit' && !session\._stall\.foreign\) \{/);
+    expect(fnBody(index, 'function switchFableStall(')).toMatch(/if \(session\._stall\.foreign\) return false;/);
+  });
+
+  it('user messages wait for the owner\'s name, and the permission route refuses inputs a card cannot show', () => {
+    expect(index).toMatch(/onOwnerUnknown: \(\) => refreshJournalIdentity\(\{ force: true \}\),/);
+    // Any refresh that learns the name releases what the router held.
+    expect(fnBody(index, 'function refreshJournalIdentity(')).toMatch(/journalInputConsumer\.replayHeldOwnerFrames\(\)/);
+    expect(index).not.toMatch(/[^.\w]journalIdentity\.refresh\(\{/);
+    const route = index.slice(index.indexOf("url.pathname === '/permission-request'"));
+    expect(route.indexOf('permissionInputRefusal(toolName, input)')).toBeGreaterThan(-1);
+    expect(route.indexOf('permissionInputRefusal(toolName, input)')).toBeLessThan(route.indexOf('permissionRegistry.create('));
+  });
+
+  it('a room another person invited this session to is recorded as a person room on the guest side', () => {
+    const body = fnBody(index, 'function journalInjectInviteRequest(');
+    expect(body).toMatch(/role: 'guest',[\s\S]{0,400}\.\.\.\(typeof frame\.person\?\.name === 'string' && frame\.person\.name \? \{ person: frame\.person\.name \} : \{\}\)/);
   });
 
   it('another person\'s room frame becomes a foreign delivery, never an inline reply-wait result', () => {
     const body = fnBody(index, 'function deliverRoomFrameTo(');
-    expect(body).toMatch(/const person = personOfSender\(sender\);/);
+    expect(body).toMatch(/const senderPerson = personOfSender\(sender\);/);
+    // Any other device's agent frame in a person room is restricted too, in the room's person's name.
+    expect(body).toMatch(/const person = senderPerson\s*\|\| \(typeof room\.person === 'string' && room\.person && sender\.startsWith\('agent:'\) && sender !== `agent:\$\{selfAgent\}`/);
     expect(body).toMatch(/if \(!person && roomReplyWaiters\.resolve\(/);
     expect(body).toMatch(/foreign: \{ person \}/);
     // Codex has no gate: never a foreign turn there.
@@ -88,7 +121,7 @@ describe('ask-user.js tools', () => {
 
   it('registers foreign_action_request, session_share and session_unshare, and a mission on agent_chat_start', () => {
     for (const t of ['foreign_action_request', 'session_share', 'session_unshare']) expect(askUser).toContain(`'${t}',`);
-    expect(askUser).toMatch(/mission: z\.number\(\)\.int\(\)\.min\(1\)\.optional\(\)\.describe\("Only for another person's session/);
+    expect(askUser).toMatch(/mission: z\.number\(\)\.int\(\)\.min\(1\)\.optional\(\)\.describe\("Only for a room with another person/);
   });
 });
 
@@ -104,9 +137,9 @@ describe('room delivery keeps another person\'s messages in turns of their own',
   it('idle: a foreign message is injected with its meta', () => {
     const { d, calls } = make();
     d.deliver({ alive: true }, 'k', foreign('hi'));
-    expect(calls[0].meta).toEqual({ foreign: { roomId: 'r-tim', person: 'tim' } });
+    expect(calls[0].meta.foreign).toEqual({ roomId: 'r-tim', person: 'tim' });
     d.deliver({ alive: true }, 'k', own('hey'));
-    expect(calls[1].meta).toBeUndefined();
+    expect(calls[1].meta.foreign).toBeUndefined();
   });
 
   it('busy then flush: own batch first, each foreign room on its own later turn', () => {
@@ -118,15 +151,15 @@ describe('room delivery keeps another person\'s messages in turns of their own',
     d.deliver(s, 'k', foreign('d'));
     s.busy = false;
     d.flush(s, 'k');
-    expect(calls[0].meta).toBeUndefined();
+    expect(calls[0].meta.foreign).toBeUndefined();
     expect(calls[0].text).toContain('b');
     expect(calls[0].text).not.toContain("tim's agent");
     expect(d.pendingCount('k')).toBe(3);
     d.flush(s, 'k');
-    expect(calls[1].meta).toEqual({ foreign: { roomId: 'r-tim', person: 'tim' } });
+    expect(calls[1].meta.foreign).toEqual({ roomId: 'r-tim', person: 'tim' });
     expect(calls[1].text).toMatch(/2 messages/);
     d.flush(s, 'k');
-    expect(calls[2].meta).toEqual({ foreign: { roomId: 'r-ann', person: 'tim' } });
+    expect(calls[2].meta.foreign).toEqual({ roomId: 'r-ann', person: 'tim' });
     expect(d.pendingCount('k')).toBe(0);
   });
 
@@ -135,5 +168,50 @@ describe('room delivery keeps another person\'s messages in turns of their own',
     const text = formatAutoJoinedRequest({ room_id: 'r', from_name: 'alice', person: { name: 'alice' }, justification: 'talk' }, { events: [{ type: 'text', sender: 'person:alice', payload: { body: 'opening' } }] });
     expect(text).toContain('alice (another person): opening');
     expect(text).toMatch(/ANOTHER PERSON's agent/);
+  });
+});
+
+describe('talk requests: asking another person by name', () => {
+  const claudeMd = readFileSync(new URL('../BRIDGE_CLAUDE.md', import.meta.url), 'utf8');
+  const coordMd = readFileSync(new URL('../BRIDGE_COORDINATOR.md', import.meta.url), 'utf8');
+  const codexMd = readFileSync(new URL('../BRIDGE_CODEX.md', import.meta.url), 'utf8');
+  const triage = readFileSync(new URL('../coordinator/procedures/20-triage-a-consent-request.md', import.meta.url), 'utf8');
+  const section = (md, head) => {
+    const start = md.indexOf(head);
+    expect(start, head).toBeGreaterThan(-1);
+    const next = md.indexOf('\n## ', start + head.length);
+    return md.slice(start, next < 0 ? md.length : next);
+  };
+  const toolDef = askUser.slice(askUser.indexOf("'agent_chat_start',"), askUser.indexOf("'foreign_action_request',"));
+
+  it('agent_chat_start takes person or target_convo_id, and sends person to the bridge', () => {
+    expect(toolDef).toMatch(/target_convo_id: z\.string\(\)\.optional\(\)/);
+    expect(toolDef).toMatch(/person: z\.string\(\)\.max\(64\)\.optional\(\)/);
+    expect(toolDef).toMatch(/JSON\.stringify\(\{ roomId: ROOM_ID, target_convo_id, person, topic, justification, message, mission \}\)/);
+    expect(toolDef).toMatch(/exactly one/i);
+    expect(toolDef).toMatch(/Neither Coordinator can answer/);
+  });
+
+  it('BRIDGE_CLAUDE.md: "can we talk to bob" is agent_chat_start with person and topic, nothing first', () => {
+    const rooms = section(claudeMd, '## Rooms with other people');
+    expect(rooms).toMatch(/talk to bob/);
+    expect(rooms).toMatch(/`agent_chat_start` with `person` and `topic`/);
+    expect(rooms).toMatch(/Don't call `contact_add` or `session_share` first/);
+    expect(rooms).toMatch(/one card each/i);
+    expect(rooms).toMatch(/`session_share`[^\n]*standing/);
+    expect(rooms).toMatch(/Neither Coordinator can/);
+    expect(section(claudeMd, '## Sharing with other people')).toMatch(/neither can the Coordinator/);
+  });
+
+  it('BRIDGE_COORDINATOR.md: a talk goes through agent_chat_start with person, and the Coordinator still answers no card', () => {
+    const sharing = section(coordMd, '## Sharing with other people');
+    expect(sharing).toMatch(/`agent_chat_start` with `person`/);
+    expect(sharing).toMatch(/You never answer a card/);
+    expect(triage).toMatch(/talk requests/);
+    expect(triage).toMatch(/never yours to answer/);
+  });
+
+  it('BRIDGE_CODEX.md keeps Codex out of rooms with other people', () => {
+    expect(section(codexMd, '## Sharing with other people')).toMatch(/Codex session cannot hold a room with another person/);
   });
 });

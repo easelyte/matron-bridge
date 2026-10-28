@@ -97,7 +97,7 @@ describe('listen-time restart token failure', () => {
       plannedRestartAvailable: true, restartBoot: { listenerReady: vi.fn(), suppressCard: () => true },
       apiServer: { listen: (_port, _host, callback) => callback() }, API_PORT: 0,
       atomicWriteFileSync() { throw new Error('read-only file system'); },
-      RESTART_ENV_FILE: 'token', RESTART_TOKEN: 'token', restartTokenWritten: false,
+      RESTART_ENV_FILE: 'token', RESTART_TOKEN: 'token', restartTokenWritten: false, publishOperatorToken: vi.fn(),
       publishRestartCarryOnCards: publish, console: { warn, error, log() {} },
     };
     runInNewContext(source, context);
@@ -110,7 +110,7 @@ describe('listen-time restart token failure', () => {
 });
 
 describe('/wake availability as wired in index.js', () => {
-  const source = between('const handleWake = createWakeHandler({', '\nconst handleSendAttachment');
+  const source = between('const handleWake = createWakeHandler({', '\n// send_attachment into a room: a journal transfer');
   function wire({ shuttingDown = false, stamped = false } = {}) {
     const session = { alive: true, roomId: 'room-a' };
     const context = {

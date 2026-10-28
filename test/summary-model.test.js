@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { createSummaryModel } from '../lib/summary-model.js';
+import { createSummaryModel, parseSummaryProviders, DEFAULT_SUMMARY_PROVIDERS } from '../lib/summary-model.js';
 
 const okFetch = (text) => vi.fn(async () => ({
   ok: true,
@@ -145,5 +145,193 @@ describe('Claude summaries and the SUMMARY_PROVIDERS order', () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe('the journal summariser', () => {
+  const BASE = 'https://journal.example.com';
+  const SUMMARISE_URL = `${BASE}/summarise`;
+  const usage = { inputTokens: 40, outputTokens: 12, cacheReadTokens: 300, cacheWriteTokens: 5 };
+  const ok = (text = 'TITLE: from journal', model = 'claude-haiku-5-5') => ({
+    ok: true, status: 200, headers: new Headers(), json: async () => ({ text, model, usage }),
+  });
+  const fail = (status, headers = {}) => ({
+    ok: false, status, headers: new Headers(headers), json: async () => ({ error: 'private detail' }),
+  });
+  const openaiOk = { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: 'from openai' } }] }) };
+  const journal = (extra = {}) => ({ journalBaseUrl: `${BASE}/`, journalToken: 'jt-test', ...extra });
+
+  it('is first in the default order and needs only a journal URL and token', () => {
+    expect(parseSummaryProviders()).toEqual(['journal', 'anthropic', 'openai', 'gemini']);
+    expect(DEFAULT_SUMMARY_PROVIDERS).toBe('journal,anthropic,openai,gemini');
+    expect(createSummaryModel(journal()).model).toBe('journal');
+    expect(createSummaryModel({ ...journal(), anthropicApiKey: 'test', openaiApiKey: 'test' }).model).toBe('journal');
+    expect(createSummaryModel({ journalBaseUrl: BASE })).toBeNull();
+    expect(createSummaryModel({ journalToken: 'jt-test' })).toBeNull();
+  });
+
+  it('gives a journal-only bridge a summary model, so it is not nagged as having none', () => {
+    // index.js files the "no summary model" notice only when this is null.
+    expect(createSummaryModel({ ...journal(), anthropicApiKey: '', openaiApiKey: '', geminiClient: null })).not.toBeNull();
+  });
+
+  it('still accepts an explicit order that leaves the journal out', () => {
+    const m = createSummaryModel({ ...journal(), providers: 'anthropic,openai,gemini', openaiApiKey: 'test' });
+    expect(m.model).toBe('gpt-6-luna');
+    expect(createSummaryModel({ ...journal(), providers: 'gemini' })).toBeNull();
+    expect(parseSummaryProviders(' Journal ,openai')).toEqual(['journal', 'openai']);
+  });
+
+  it('posts a structured prompt to /summarise with the bridge bearer token', async () => {
+    const fetchImpl = vi.fn(async () => ok());
+    const m = createSummaryModel({ ...journal(), fetchImpl });
+    await expect(m.generate({ system: 'fixed format', prompt: 'changing transcript' })).resolves.toBe('TITLE: from journal');
+    const [url, opts] = fetchImpl.mock.calls[0];
+    expect(url).toBe(`${BASE}/summarise`);
+    expect(opts.method).toBe('POST');
+    expect(opts.headers).toEqual({ 'Content-Type': 'application/json', Authorization: 'Bearer jt-test' });
+    expect(opts.signal).toBeInstanceOf(AbortSignal);
+    expect(JSON.parse(opts.body)).toEqual({ system: 'fixed format', prompt: 'changing transcript' });
+  });
+
+  it('sends a plain string prompt as {prompt}', async () => {
+    const fetchImpl = vi.fn(async () => ok());
+    await createSummaryModel({ ...journal(), fetchImpl }).generate('compact this');
+    expect(JSON.parse(fetchImpl.mock.calls[0][1].body)).toEqual({ prompt: 'compact this' });
+  });
+
+  it('reports usage and returns the model the journal used with the text', async () => {
+    const onUsage = vi.fn();
+    const m = createSummaryModel({ ...journal(), fetchImpl: vi.fn(async () => ok(' text ', 'some-model')), onUsage });
+    await expect(m.generateWithModel('p')).resolves.toEqual({ text: 'text', model: 'some-model' });
+    await expect(m.generate('p')).resolves.toBe('text');
+    expect(onUsage).toHaveBeenCalledWith({ model: 'some-model', ...usage });
+    expect(m.model).toBe('journal');
+  });
+
+  it('keeps each concurrent call paired with its own model', async () => {
+    // Call A asks first and is answered last, by a different model than B;
+    // B falls through to OpenAI. Nothing shared may leak between them.
+    const releases = [];
+    const fetchImpl = vi.fn((url, opts) => {
+      if (url !== SUMMARISE_URL) return Promise.resolve(openaiOk);
+      const { prompt } = JSON.parse(opts.body);
+      return new Promise((resolve) => releases.push({ prompt, resolve }));
+    });
+    const m = createSummaryModel({ ...journal(), openaiApiKey: 'test', fetchImpl });
+    const a = m.generateWithModel('first');
+    const b = m.generateWithModel('second');
+    await vi.waitFor(() => expect(releases).toHaveLength(2));
+    releases.find((r) => r.prompt === 'second').resolve(fail(502));
+    await expect(b).resolves.toEqual({ text: 'from openai', model: 'gpt-6-luna' });
+    releases.find((r) => r.prompt === 'first').resolve(ok('from journal', 'model-a'));
+    await expect(a).resolves.toEqual({ text: 'from journal', model: 'model-a' });
+    expect(m.model).toBe('journal');
+  });
+
+  it('treats an empty text as a failure', async () => {
+    const m = createSummaryModel({ ...journal(), providers: 'journal', fetchImpl: vi.fn(async () => ok('  ')) });
+    await expect(m.generate('p')).rejects.toThrow('journal: empty completion');
+  });
+
+  it.each([
+    ['503', () => fail(503)],
+    ['429', () => fail(429, { 'Retry-After': '30' })],
+    ['502', () => fail(502)],
+    ['404', () => fail(404)],
+    ['401', () => fail(401)],
+    ['a network error', () => { throw new Error('sensitive transport detail'); }],
+  ])('falls through to the next provider on %s', async (_label, journalResponse) => {
+    const fetchImpl = vi.fn(async (url) => (url === SUMMARISE_URL ? journalResponse() : openaiOk));
+    const onFallback = vi.fn();
+    const m = createSummaryModel({ ...journal(), openaiApiKey: 'test', fetchImpl, onFallback });
+    await expect(m.generateWithModel({ system: 's', prompt: 'p' })).resolves.toEqual({ text: 'from openai', model: 'gpt-6-luna' });
+    expect(onFallback).toHaveBeenCalledWith({ provider: 'journal', fallbackModel: 'gpt-6-luna' });
+    expect(JSON.stringify(onFallback.mock.calls)).not.toContain('private');
+  });
+
+  it('rejects with the status only, never the body', async () => {
+    const m = createSummaryModel({ ...journal(), fetchImpl: vi.fn(async () => fail(502)) });
+    const err = await m.generate('p').catch((e) => e);
+    expect(err.message).toBe('journal HTTP 502');
+  });
+
+  describe('back-off', () => {
+    let clock;
+    const now = () => clock;
+    const setup = (journalResponse) => {
+      const fetchImpl = vi.fn(async (url) => (url === SUMMARISE_URL ? journalResponse() : openaiOk));
+      const m = createSummaryModel({ ...journal({ now }), openaiApiKey: 'test', fetchImpl });
+      const journalCalls = () => fetchImpl.mock.calls.filter(([u]) => u === SUMMARISE_URL).length;
+      return { m, journalCalls };
+    };
+
+    it.each([404, 503])('skips the journal for 10 minutes after a %i', async (status) => {
+      clock = 1_000_000;
+      const { m, journalCalls } = setup(() => fail(status));
+      await m.generate('p');
+      expect(journalCalls()).toBe(1);
+      clock += 9 * 60_000;
+      await expect(m.generate('p')).resolves.toBe('from openai');
+      expect(journalCalls()).toBe(1);
+      clock += 60_000;
+      await m.generate('p');
+      expect(journalCalls()).toBe(2);
+    });
+
+    it('honours Retry-After seconds after a 429', async () => {
+      clock = 1_000_000;
+      const { m, journalCalls } = setup(() => fail(429, { 'Retry-After': '120' }));
+      await m.generate('p');
+      clock += 119_000;
+      await m.generate('p');
+      expect(journalCalls()).toBe(1);
+      clock += 1_000;
+      await m.generate('p');
+      expect(journalCalls()).toBe(2);
+    });
+
+    it('honours an HTTP-date Retry-After and falls back to a minute without one', async () => {
+      clock = Date.parse('2026-01-01T00:00:00Z');
+      const dated = setup(() => fail(429, { 'Retry-After': 'Thu, 01 Jan 2026 00:05:00 GMT' }));
+      await dated.m.generate('p');
+      clock += 4 * 60_000;
+      await dated.m.generate('p');
+      expect(dated.journalCalls()).toBe(1);
+      clock += 60_000;
+      await dated.m.generate('p');
+      expect(dated.journalCalls()).toBe(2);
+
+      clock = 0;
+      const bare = setup(() => fail(429));
+      await bare.m.generate('p');
+      clock += 59_000;
+      await bare.m.generate('p');
+      expect(bare.journalCalls()).toBe(1);
+      clock += 1_000;
+      await bare.m.generate('p');
+      expect(bare.journalCalls()).toBe(2);
+    });
+
+    it('does not back off after a 502 or a network error', async () => {
+      clock = 0;
+      const { m, journalCalls } = setup(() => fail(502));
+      await m.generate('p');
+      await m.generate('p');
+      expect(journalCalls()).toBe(2);
+      const net = setup(() => { throw new Error('down'); });
+      await net.m.generate('p');
+      await net.m.generate('p');
+      expect(net.journalCalls()).toBe(2);
+    });
+
+    it('rejects quickly while backing off when the journal is the only provider', async () => {
+      clock = 0;
+      const fetchImpl = vi.fn(async () => fail(503));
+      const m = createSummaryModel({ ...journal({ now }), fetchImpl });
+      await expect(m.generate('p')).rejects.toThrow('journal HTTP 503');
+      await expect(m.generate('p')).rejects.toThrow('journal: backing off');
+      expect(fetchImpl).toHaveBeenCalledTimes(1);
+    });
   });
 });

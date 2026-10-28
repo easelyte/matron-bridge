@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   WORK_HOLD_MAX_MS, WORK_HOLD_LEASE_MS, liveWorkChildren, workHold, keepAwakeUntil, parseProcessTable,
-  mcpServerSignatures, isMcpServerProcess,
+  mcpServerSignatures, isMcpServerProcess, createTransferHold,
 } from '../lib/work-hold.js';
 
 // A session with work in flight is not idle (a colleague's
@@ -172,5 +172,36 @@ describe('keepAwakeUntil', () => {
     expect(keepAwakeUntil({ timerUntil: T0 + 10, workUntil: 0 })).toBe(T0 + 10);
     expect(keepAwakeUntil({ timerUntil: null, workUntil: 0 })).toBeNull();
     expect(keepAwakeUntil({})).toBeNull();
+  });
+});
+
+describe('createTransferHold: file transfers in flight keep the box up', () => {
+  it('leases while anything is active, releases at 0, and is bounded by WORK_HOLD_MAX_MS of continuous activity', () => {
+    let t = 1_000_000;
+    const hold = createTransferHold({ now: () => t });
+    expect(hold.update(0)).toBe(0);
+    expect(hold.update(2)).toBe(t + WORK_HOLD_LEASE_MS);
+    t += 60_000;
+    expect(hold.update(1)).toBe(t + WORK_HOLD_LEASE_MS);
+    // Activity drops to 0: the lease is released at once.
+    t += 60_000;
+    expect(hold.update(0)).toBe(0);
+    // A new burst starts its own clock.
+    const start = t;
+    expect(hold.update(1)).toBe(t + WORK_HOLD_LEASE_MS);
+    t = start + WORK_HOLD_MAX_MS - 1;
+    expect(hold.update(1)).toBe(t + WORK_HOLD_LEASE_MS);
+    t = start + WORK_HOLD_MAX_MS;
+    expect(hold.update(3)).toBe(0);
+    // Until activity drops to 0, the bound stands; then a fresh burst is held again.
+    t += 60_000;
+    expect(hold.update(1)).toBe(0);
+    expect(hold.update(0)).toBe(0);
+    expect(hold.update(1)).toBe(t + WORK_HOLD_LEASE_MS);
+  });
+
+  it('treats junk counts as nothing active', () => {
+    const hold = createTransferHold({ now: () => 5 });
+    for (const n of [undefined, null, NaN, -1, '2']) expect(hold.update(n)).toBe(0);
   });
 });

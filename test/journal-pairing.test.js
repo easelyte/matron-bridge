@@ -140,6 +140,13 @@ describe('claimPair', () => {
     expect(fetch.calls).toEqual([['/pair/claim', { poll_token: POLL }]]);
   });
 
+  it('never follows a redirect, so the poll_token only reaches the journal asked', async () => {
+    const fetch = scriptedFetch([started(), res(200, { status: 'pending' })]);
+    await startPair({ httpBase: BASE, fetch });
+    await claimPair({ httpBase: BASE, pollToken: POLL, fetch });
+    expect(fetch.mock.calls.map(([, init]) => init.redirect)).toEqual(['error', 'error']);
+  });
+
   it('maps approved to the token and device id', async () => {
     const fetch = scriptedFetch([res(200, { status: 'approved', token: TOKEN, device_id: 42 })]);
     expect(await claimPair({ httpBase: BASE, pollToken: POLL, fetch }))

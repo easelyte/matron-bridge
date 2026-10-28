@@ -114,7 +114,7 @@ describe('Codex journal publication', () => {
     expect(h.session._codexAwaitingAnswer).toBe(false);
     h.session.busy = false; h.codex.emit('requests-cleared'); h.codex.emit('turn-exit', { code: 0 });
     expect(h.session.codexPrompts.answer({ choice: h.session.codexPrompts.active.options[1].value })).toBe('Model switching');
-    expect(submitAsyncAnswer).toHaveBeenCalledWith(h.session, 'What should we test?\nModel switching');
+    expect(submitAsyncAnswer).toHaveBeenCalledWith(h.session, 'What should we test?\nModel switching', null);
     expect(h.codex.client.respond).not.toHaveBeenCalled();
   });
   it('clears async cards on disconnect, interruption, or shutdown', () => {

@@ -215,6 +215,19 @@ fs.watchFile(process.env.TRANSCRIPT_PATH, { interval: 25 }, async stat => {
 `;
     fs.writeFileSync(path.join(home, 'bin', 'claude'), shim.replace('/*SESSIONSETUP*/', planned ? sessionSetup : ''), { mode: 0o755 });
     journal = new WebSocketServer({ host: '127.0.0.1', port: 0 });
+    // The bridge also asks the journal over HTTP (GET /me names the owner, and
+    // user messages are held until it is known). ws answers every plain request
+    // with 426, so serve that one route and keep 426 for the rest.
+    journal._server.removeAllListeners('request');
+    journal._server.on('request', (req, res) => {
+      if (req.method === 'GET' && req.url === '/me') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ user: { name: 'harness' } }));
+        return;
+      }
+      res.writeHead(426, { 'Content-Type': 'text/plain' });
+      res.end('Upgrade Required');
+    });
     journal.on('connection', socket => {
       socket.on('message', data => {
         const frame = JSON.parse(data.toString());
@@ -227,7 +240,7 @@ fs.watchFile(process.env.TRANSCRIPT_PATH, { interval: 25 }, async stat => {
     await once(journal, 'listening');
     const port = await randomPort();
     const env = {
-      HOME: home, TMPDIR: home, XDG_CONFIG_HOME: path.join(home, '.config'),
+      HOME: home, TMPDIR: home, MATRON_BRIDGE_API_AUTH: 'off', XDG_CONFIG_HOME: path.join(home, '.config'),
       PATH: `${path.join(home, 'bin')}:${path.dirname(process.execPath)}:/usr/bin:/bin`,
       JOURNAL_WS_URL: `ws://127.0.0.1:${journal.address().port}/ws`,
       JOURNAL_TOKEN: 'harness-only', JOURNAL_CONTROL_CONVO_ID: 'harness-control',

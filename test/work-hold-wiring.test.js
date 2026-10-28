@@ -80,10 +80,31 @@ describe('work in flight holds the session and the box', () => {
     expect(index).toMatch(/function writeKeepAwakeMarker\(timers\) \{\s*\n\s*writeKeepAwake\(keepAwakeMarker\(timers\)\);/);
     expect(index).toMatch(/function refreshKeepAwakeMarker\(\) \{\s*\n\s*writeKeepAwake\(timerStore\.holdAwakeMarker\(\)\);/);
     const body = fnBody('writeKeepAwake');
-    expect(body).toMatch(/keepAwakeUntil\(\{ timerUntil: marker\?\.until \?\? null, workUntil: workHoldUntil \}\)/);
+    expect(body).toMatch(/keepAwakeUntil\(\{ timerUntil: marker\?\.until \?\? null, workUntil: workLeaseUntil\(\) \}\)/);
     expect(body).toMatch(/fs\.rmSync\(KEEPAWAKE_FILE, \{ force: true \}\)/);
-    expect(body).toMatch(/atomicWriteFileSync\(KEEPAWAKE_FILE, JSON\.stringify\(\{ until, reminders: marker\?\.reminders \?\? 0, work: workHoldSessions, updatedAt: Date\.now\(\) \}, null, 2\)\)/);
+    expect(body).toMatch(/atomicWriteFileSync\(KEEPAWAKE_FILE, JSON\.stringify\(\{ until, reminders: marker\?\.reminders \?\? 0, work: workHoldSessions, transfers: transferHoldCount, updatedAt: Date\.now\(\) \}, null, 2\)\)/);
     expect(index).toMatch(/import \{[^}]*\bkeepAwakeUntil\b[^}]*\} from '\.\/lib\/work-hold\.js'/);
+  });
+
+  it('file transfers in flight lease the same marker, released when they stop, and the reaper tick sweeps the inbox', () => {
+    expect(index).toMatch(/import \{[^}]*\bcreateTransferHold\b[^}]*\} from '\.\/lib\/work-hold\.js'/);
+    expect(index).toMatch(/function workLeaseUntil\(\) \{\s*\n\s*return Math\.max\(workHoldUntil, transferHoldUntil\);/);
+    const refresh = fnBody('refreshTransferHold');
+    expect(refresh).toContain('(transferSender?.active() ?? 0) + (transferReceiver?.active() ?? 0)');
+    expect(refresh).toContain('transferHold.update(count)');
+    // Every upkeep tick while held (and the one that releases it) rewrites the
+    // marker, so the lease is renewed even with the idle reaper off.
+    expect(refresh).toMatch(/if \(until > 0 \|\| prev > 0\) refreshKeepAwakeMarker\(\);/);
+    expect(fnBody('startTransferUpkeep')).toMatch(/setInterval\(refreshTransferHold, TRANSFER_HOLD_TICK_MS\)\.unref\(\);/);
+    // The sweep is confined to the bridge's own download roots.
+    expect(index).toMatch(/inboxRoots: \(\) => \[matronFilesRoot\(\), ivUploadsRoot\(\)\]/);
+    expect(index).toMatch(/setInterval\(refreshTransferHold, TRANSFER_HOLD_TICK_MS\)\.unref\(\)/);
+    const reaper = fnBody('startIdleReaper');
+    const tick = reaper.indexOf('refreshTransferHold()');
+    expect(tick).toBeGreaterThan(-1);
+    expect(tick).toBeLessThan(reaper.lastIndexOf('refreshKeepAwakeMarker();'));
+    expect(reaper).toContain('sweepTransferInbox()');
+    expect(fnBody('sweepTransferInbox')).toContain('transferReceiver?.sweep()');
   });
 
   it('tells the agent that a running turn or background job already holds the box', () => {

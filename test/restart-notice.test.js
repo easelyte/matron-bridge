@@ -17,6 +17,7 @@ import { InteractiveSession } from '../lib/interactive-session.js';
 import { createRestartNotices, validateControlParams, authorizeControl, JOURNAL_DEVICE_ID, JOURNAL_ONLY_ACTIONS, CONTROL_KINDS, planSessionControl, controlNotice, TURN_STARTING_OPS } from '../lib/session-control.js';
 import { createPlannedRestartState } from '../lib/planned-restart-state.js';
 import { createPlannedRestart } from '../lib/planned-restart.js';
+import * as turnCause from '../lib/turn-cause.js';
 
 const roots = [];
 afterEach(() => { vi.restoreAllMocks(); for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
@@ -63,7 +64,7 @@ function wiredSetup(backend, available = true) {
   let timerId = 0;
   const noop = () => {};
   const context = {
-    restartLatch: undefined, TURN_TIER, bumpTurnGeneration: noop, clearTurnClassification: noop, console: { warn: vi.fn() }, queueMicrotask, CONTROL_KINDS, TURN_STARTING_OPS, planSessionControl, controlNotice,
+    ...turnCause, inflightTurnOrigin: () => ({}), loadMatronMd: () => ({ block: '' }), apiHeaderFileFor: () => null, restartLatch: undefined, TURN_TIER, bumpTurnGeneration: noop, clearTurnClassification: noop, console: { warn: vi.fn() }, queueMicrotask, CONTROL_KINDS, TURN_STARTING_OPS, planSessionControl, controlNotice,
     createRestartNotices, plannedRestartAvailable: available, plannedRestartState: available ? h.store : null,
     sessions: new Map([['room-a', h.session]]),
     journalConvoIdFor: session => session.journalConvoId || session.claudeSessionId,

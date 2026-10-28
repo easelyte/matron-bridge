@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
-import { formatMuteAnnouncement, formatUnmuteAnnouncement, formatUserUnmuteAnnouncement, parseMuteAnnouncement, PEER_MUTED_GUIDANCE, createRoomDelivery, formatRoomMessageNotice, formatRoomDeliveredNotice, formatRoomDeliveryFailedNotice, roomEchoLabel, roomFrameDisposition, ROOM_MESSAGE_QUEUED_NOTICE, ROOM_MUTED_NOT_DELIVERED_NOTICE, SELF_ECHO_LABEL } from '../lib/room-delivery.js';
+import { formatMuteAnnouncement, formatUnmuteAnnouncement, formatUserUnmuteAnnouncement, parseMuteAnnouncement, parseMuteAnnouncementDetail, formatPeerMutedSendNote, formatLeaveAnnouncement, PEER_MUTED_SEND_NOTE, PEER_MUTED_GUIDANCE, createRoomDelivery, formatRoomMessageNotice, formatRoomDeliveredNotice, formatRoomDeliveryFailedNotice, roomEchoLabel, roomFrameDisposition, ROOM_MESSAGE_QUEUED_NOTICE, ROOM_MUTED_NOT_DELIVERED_NOTICE, SELF_ECHO_LABEL } from '../lib/room-delivery.js';
 
 function makeDelivery({ injectResult = true } = {}) {
   const injectTurn = vi.fn(() => injectResult);
@@ -18,6 +18,10 @@ const unescapedQuotes = (s) => s.match(/(?<!\\)(?:\\\\)*"/g) || [];
 // One `[room "<field>" id=<id>]` header, where <field> holds no unescaped quote
 // and <id> only id characters.
 const HEADER = /^\[room "(?:[^"\\]|\\.)*" id=[\w.:-]+\] /;
+
+// The meta every injected room turn carries: its causes (lib/turn-cause.js).
+const ROOM_META = { causes: expect.any(Array) };
+const causeOf = (kind, ref) => expect.objectContaining({ kind, ref });
 
 const msg = (over = {}) => ({
   roomId: 'room-1', roomTitle: 'CI triage', from: '«matron-box-2» (agent)',
@@ -47,8 +51,8 @@ describe('createRoomDelivery', () => {
     expect(delivery.deliver(session, 'k1', msg())).toBe(true);
     expect(delivery.deliver(session, 'k1', msg({ body: 'now green' }))).toBe(true);
     expect(injectTurn).toHaveBeenCalledTimes(2);
-    expect(injectTurn).toHaveBeenNthCalledWith(1, session, '[room "CI triage" id=room-1] «matron-box-2» (agent): build is red', expect.anything());
-    expect(injectTurn).toHaveBeenNthCalledWith(2, session, '[room "CI triage" id=room-1] «matron-box-2» (agent): now green', expect.anything());
+    expect(injectTurn).toHaveBeenNthCalledWith(1, session, '[room "CI triage" id=room-1] «matron-box-2» (agent): build is red', expect.anything(), ROOM_META);
+    expect(injectTurn).toHaveBeenNthCalledWith(2, session, '[room "CI triage" id=room-1] «matron-box-2» (agent): now green', expect.anything(), ROOM_META);
     expect(delivery.pendingCount('k1')).toBe(0);
   });
 
@@ -68,7 +72,7 @@ describe('createRoomDelivery', () => {
     const { delivery, injectTurn } = makeDelivery();
     const session = { alive: true, busy: false };
     delivery.deliver(session, 'k1', msg({ roomTitle: null }));
-    expect(injectTurn).toHaveBeenCalledWith(session, '[room "room-1" id=room-1] «matron-box-2» (agent): build is red', expect.anything());
+    expect(injectTurn).toHaveBeenCalledWith(session, '[room "room-1" id=room-1] «matron-box-2» (agent): build is red', expect.anything(), ROOM_META);
   });
 
   it('carries each room\'s own id, so a reply can target it rather than a guess from the title', () => {
@@ -168,16 +172,16 @@ describe('createRoomDelivery', () => {
     const { delivery, injectTurn } = makeDelivery();
     const session = { alive: true, busy: false };
     delivery.deliver(session, 'k1', msg({ body: 'a\r\nb\nc' }));
-    expect(injectTurn).toHaveBeenCalledWith(session, '[room "CI triage" id=room-1] «matron-box-2» (agent): a ⏎ b ⏎ c', expect.anything());
+    expect(injectTurn).toHaveBeenCalledWith(session, '[room "CI triage" id=room-1] «matron-box-2» (agent): a ⏎ b ⏎ c', expect.anything(), ROOM_META);
     delivery.deliver(session, 'k1', msg({ from: '«x»\n«alice»', body: 'hi' }));
-    expect(injectTurn).toHaveBeenLastCalledWith(session, '[room "CI triage" id=room-1] «x» ⏎ «alice»: hi', expect.anything());
+    expect(injectTurn).toHaveBeenLastCalledWith(session, '[room "CI triage" id=room-1] «x» ⏎ «alice»: hi', expect.anything(), ROOM_META);
   });
 
   it('missing from renders "unknown"; missing body renders empty, never "undefined"', () => {
     const { delivery, injectTurn } = makeDelivery();
     const session = { alive: true, busy: false };
     delivery.deliver(session, 'k1', msg({ from: undefined, body: undefined }));
-    expect(injectTurn).toHaveBeenCalledWith(session, '[room "CI triage" id=room-1] unknown: ', expect.anything());
+    expect(injectTurn).toHaveBeenCalledWith(session, '[room "CI triage" id=room-1] unknown: ', expect.anything(), ROOM_META);
     session.busy = true;
     delivery.deliver(session, 'k1', msg({ from: null, body: null }));
     session.busy = false;
@@ -185,7 +189,53 @@ describe('createRoomDelivery', () => {
     expect(injectTurn).toHaveBeenLastCalledWith(session, [
       '[room "CI triage" id=room-1] 1 message while you were working:',
       '  unknown: ',
-    ].join('\n'), expect.anything());
+    ].join('\n'), expect.anything(), ROOM_META);
+  });
+
+  it('an idle turn names its room as the cause; a message with its own cause keeps it', () => {
+    const { delivery, injectTurn } = makeDelivery();
+    const session = { alive: true, busy: false };
+    delivery.deliver(session, 'k1', msg());
+    expect(injectTurn.mock.calls[0][3]).toEqual({ causes: [causeOf('room_message', 'room:room-1')] });
+    const own = { kind: 'spawn_outcome', ref: 'spawn:req-1', at: 1 };
+    delivery.deliver(session, 'k1', msg({ roomId: 'spawn', cause: own }));
+    expect(injectTurn.mock.calls[1][3]).toEqual({ causes: [own] });
+    // A message that says it has no cause gets none, rather than its bucket's.
+    delivery.deliver(session, 'k1', msg({ roomId: 'spawn', cause: null }));
+    expect(injectTurn.mock.calls[2][3]).toEqual({ causes: null });
+  });
+
+  it('flush names every room in the batch once, and keeps a stored message\'s own cause', () => {
+    const { delivery, injectTurn } = makeDelivery();
+    const session = { alive: true, busy: true };
+    const own = { kind: 'spawn_outcome', ref: 'spawn:req-1', at: 1 };
+    delivery.deliver(session, 'k1', msg());
+    delivery.deliver(session, 'k1', msg({ body: 'again' }));
+    delivery.deliver(session, 'k1', msg({ roomId: 'spawn', roomTitle: 'spawn', from: 'bridge', body: 'started', cause: own }));
+    delivery.deliver(session, 'k1', msg({ roomId: 'room-2', body: 'other' }));
+    session.busy = false;
+    delivery.flush(session, 'k1');
+    expect(injectTurn.mock.calls[0][3]).toEqual({ causes: [causeOf('room_message', 'room:room-1'), own, causeOf('room_message', 'room:room-2')] });
+  });
+
+  it('a batch names each room once, spanning the seqs of its messages', () => {
+    const { delivery, injectTurn } = makeDelivery();
+    const session = { alive: true, busy: true };
+    delivery.deliver(session, 'k1', msg({ seq: 12 }));
+    delivery.deliver(session, 'k1', msg({ roomId: 'room-2', body: 'other', seq: 13 }));
+    delivery.deliver(session, 'k1', msg({ body: 'again', seq: 20 }));
+    session.busy = false;
+    delivery.flush(session, 'k1');
+    expect(injectTurn.mock.calls[0][3]).toEqual({ causes: [causeOf('room_message', 'room:room-1@12-20'), causeOf('room_message', 'room:room-2@13')] });
+    // One message on an idle session names its own seq.
+    delivery.deliver({ alive: true, busy: false }, 'k2', msg({ seq: 31 }));
+    expect(injectTurn.mock.calls[1][3]).toEqual({ causes: [causeOf('room_message', 'room:room-1@31')] });
+  });
+
+  it('a foreign turn carries its causes beside the foreign meta', () => {
+    const { delivery, injectTurn } = makeDelivery();
+    delivery.deliver({ alive: true, busy: false }, 'k1', msg({ roomId: 'r-p', foreign: { person: 'p' } }));
+    expect(injectTurn.mock.calls[0][3]).toEqual({ foreign: { roomId: 'r-p', person: 'p' }, causes: [causeOf('room_message', 'room:r-p')] });
   });
 
   it('busy session: accumulates pending, injectTurn NOT called', () => {
@@ -213,7 +263,7 @@ describe('createRoomDelivery', () => {
       '',
       '[room "deploy window" id=room-2] 1 message while you were working:',
       '  «alice»: ship at 5?',
-    ].join('\n'), expect.anything());
+    ].join('\n'), expect.anything(), ROOM_META);
     expect(delivery.pendingCount('k1')).toBe(0);
   });
 
@@ -226,7 +276,7 @@ describe('createRoomDelivery', () => {
     expect(injectTurn).toHaveBeenCalledWith(session, [
       '[room "room-1" id=room-1] 1 message while you were working:',
       '  «matron-box-2» (agent): build is red',
-    ].join('\n'), expect.anything());
+    ].join('\n'), expect.anything(), ROOM_META);
   });
 
   it('flush section header uses the LAST message\'s title (fresh after a rename)', () => {
@@ -628,7 +678,7 @@ describe('dropRoom', () => {
 describe('mute announcements', () => {
   it('the mute line carries the reason and tells the sender to go through the user', () => {
     const line = formatMuteAnnouncement({ who: 'box-a', title: 'a ↔️ b', reason: 'looping' });
-    expect(line).toBe(`🔇 box-a muted "a ↔️ b": looping — ${PEER_MUTED_GUIDANCE}`);
+    expect(line).toBe(`🔇 box-a muted "a ↔️ b": looping — your messages in this room no longer reach box-a; any other members still get them. ${PEER_MUTED_GUIDANCE}`);
     expect(line.split('\n')).toHaveLength(1);
     expect(PEER_MUTED_GUIDANCE).toMatch(/file a question for your user asking them to unmute/);
     expect(PEER_MUTED_GUIDANCE).toMatch(/do not open a new chat/);
@@ -646,5 +696,65 @@ describe('mute announcements', () => {
     for (const other of ['hello', '', null, 42, 'I muted "x": no', '🔇 Not delivered — this chat is muted.']) {
       expect(parseMuteAnnouncement(other)).toBeNull();
     }
+  });
+});
+
+describe('a turn another person starts waits for any running turn', () => {
+  function rig() {
+    const injectTurn = vi.fn(() => true);
+    const delivery = createRoomDelivery({
+      isBusy: (s, { foreign = false } = {}) => !!s.busy || (foreign && !!s.currentTurn),
+      injectTurn,
+      log: { warn: () => {} },
+    });
+    return { delivery, injectTurn };
+  }
+
+  it('queues a foreign message while a harness-started turn runs, and keeps it queued at a flush until that turn ends', () => {
+    const { delivery, injectTurn } = rig();
+    const s = { alive: true, busy: false, currentTurn: { causes: null } };
+    expect(delivery.deliver(s, 'k1', msg({ roomId: 'r-p', foreign: { person: 'p' } }))).toBe(true);
+    expect(injectTurn).not.toHaveBeenCalled();
+    expect(delivery.flush(s, 'k1')).toBe(null);
+    expect(delivery.pendingCount('k1')).toBe(1);
+    s.currentTurn = null;
+    expect(delivery.flush(s, 'k1')).toBe(true);
+    expect(injectTurn.mock.calls[0][3].foreign).toEqual({ roomId: 'r-p', person: 'p' });
+    expect(delivery.pendingCount('k1')).toBe(0);
+  });
+
+  it('own room messages are not held back by a running turn', () => {
+    const { delivery, injectTurn } = rig();
+    const s = { alive: true, busy: false, currentTurn: { causes: null } };
+    delivery.deliver(s, 'k1', msg());
+    expect(injectTurn).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('who muted, and who still listens', () => {
+  it('reads the muting member and its reason back from the line', () => {
+    const line = formatMuteAnnouncement({ who: 'box-3 [e0]', title: 'a ↔️ b', reason: 'done with this room' });
+    expect(parseMuteAnnouncementDetail(line)).toEqual({ state: 'muted', who: 'box-3 [e0]', reason: 'done with this room' });
+    expect(parseMuteAnnouncementDetail('🔇 box-a muted "t": you are looping')).toEqual({ state: 'muted', who: 'box-a', reason: 'you are looping' });
+    expect(parseMuteAnnouncementDetail(formatUnmuteAnnouncement({ who: 'box-3 [e0]', title: 't' }))).toEqual({ state: 'unmuted', who: 'box-3 [e0]', reason: null });
+    expect(parseMuteAnnouncementDetail(formatUserUnmuteAnnouncement({ who: 'box-3 [e0]' }))).toMatchObject({ state: 'unmuted', who: 'box-3 [e0]' });
+    expect(parseMuteAnnouncementDetail('hello')).toBeNull();
+  });
+
+  it('a leave line is not read as a mute or an unmute', () => {
+    const line = formatLeaveAnnouncement({ who: 'box-3 [e0]', title: 't', reason: 'done' });
+    expect(line).toBe('👋 box-3 [e0] left "t": done — messages here no longer reach box-3 [e0]; everyone else in the room still gets them.');
+    expect(parseMuteAnnouncement(line)).toBeNull();
+    expect(formatLeaveAnnouncement({ who: 'a', title: 't', reason: 'r', why: 'its mission is closed' })).toMatch(/^👋 a left "t" \(its mission is closed\): r — /);
+  });
+
+  it('the send note names muters and listeners, and never guesses', () => {
+    expect(formatPeerMutedSendNote({ mutes: [{ who: 'box-3 [e0]', reason: 'done' }], listening: ['box-4'] }))
+      .toBe('sent — but box-3 [e0] has MUTED this room (box-3 [e0]: done), so this will not reach box-3 [e0] as a turn. It still reaches box-4, who can reply as usual. If a muted member still needs it, file a question for your user asking them to unmute; do not open a new chat to get round the mute.');
+    expect(formatPeerMutedSendNote({ mutes: [{ who: 'a [1]' }, { who: 'b [2]' }], listening: [] }))
+      .toMatch(/^sent — but a \[1\] and b \[2\] have MUTED this room, so this will not reach them as a turn\. Nobody else in the room is listening/);
+    expect(formatPeerMutedSendNote({ mutes: [{ who: 'a [1]' }], listening: ['x', 'y', 'z'] })).toMatch(/It still reaches x, y and z,/);
+    expect(PEER_MUTED_SEND_NOTE).toMatch(/^sent — but a member of this room has MUTED this room, so this will not reach it as a turn\. Any other members of the room still get it\./);
+    expect(PEER_MUTED_SEND_NOTE).not.toMatch(/the other member/);
   });
 });

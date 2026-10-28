@@ -80,6 +80,7 @@ function makeFixture(overrides = {}) {
     serverLabel: '2',
     deliverLocalInvite, localAnswer, routeLocalRoomMessage, notifyRoomPeer,
     publishSessionNotice, publishMuteCard, retireMuteCard, dropPendingRoomMessages,
+    ...('personRoomState' in overrides ? { personRoomState: overrides.personRoomState } : {}),
     log,
     // Explicit {} rather than the process.env default, so an ambient
     // AGENT_ROSTER_SUMMARY_ENABLED on the test box cannot flip these assertions.
@@ -431,6 +432,33 @@ describe('createAgentChatHandlers', () => {
       // The invite outcome drives state via onInviteFrame in production; the
       // handler itself leaves the registry pending.
       expect(rooms.get(chatRoomId).state).toBe('pending');
+    });
+
+    it('passes the calling session\'s turn causes to invites.invite, and none when the turn has none', async () => {
+      const causes = [{ kind: 'user_message', ref: 'convo-sess:4', at: 10 }];
+      const withTurn = makeFixture({ session: { currentTurn: { causes, startedAt: 9 } } });
+      await withTurn.handlers.chatStart(good);
+      expect(withTurn.invites.invite.mock.calls[0][0].causes).toEqual(causes);
+      const noTurn = makeFixture({ session: { currentTurn: null } });
+      await noTurn.handlers.chatStart({ ...good, causes, cause: causes[0] });
+      expect('causes' in noTurn.invites.invite.mock.calls[0][0]).toBe(false);
+      expect('cause' in noTurn.invites.invite.mock.calls[0][0]).toBe(false);
+    });
+
+    it('stamps the invite with the causes of the turn that made the call, not of a turn begun while the roster was fetched', async () => {
+      const original = [{ kind: 'room_message', ref: 'room:r-1', at: 10 }];
+      const later = [{ kind: 'user_message', ref: 'convo-sess:9', at: 20 }];
+      let session = null;
+      const f = makeFixture({
+        session: { currentTurn: { causes: original, startedAt: 9 } },
+        // The user interrupts while the roster is in flight: the old turn
+        // ends and a new one, theirs, begins before fetchRoster resolves.
+        publisher: { fetchRoster: async () => { await Promise.resolve(); session.currentTurn = { causes: later, startedAt: 19 }; return ROSTER; } },
+      });
+      session = f.sessions.get('!sess');
+      await f.handlers.chatStart(good);
+      expect(session.currentTurn.causes).toEqual(later);
+      expect(f.invites.invite.mock.calls[0][0].causes).toEqual(original);
     });
 
     it('omits the topic suffix from the title when no topic given', async () => {
@@ -825,6 +853,36 @@ describe('createAgentChatHandlers', () => {
       expect(res.body).toEqual({ ok: true, note: 'sent — any reply will arrive as a later turn' });
       expect(f.calls).toContainEqual({ call: 'publishText', convoId: id, payload: { body: 'ping', from: 'agent' } });
       expect(awaitRoomMessage).not.toHaveBeenCalled();
+    });
+
+    it('chatStart\'s opening message names the turn that asked, read before the roster await', async () => {
+      const sent = [];
+      const before = [{ kind: 'user_message', ref: 'convo-sess:5', at: 1 }];
+      let release;
+      const gate = new Promise((r) => { release = r; });
+      const f = makeFixture({
+        session: { currentTurn: { causes: before, startedAt: 1 } },
+        publisher: {
+          fetchRoster: async () => { await gate; return ROSTER; },
+          publishText: (convoId, payload, options) => sent.push({ payload, options }),
+        },
+      });
+      const p = f.handlers.chatStart({ roomId: '!sess', target_convo_id: 'convo-remote', justification: 'review', message: 'hello' });
+      // A new turn begins while the roster is fetched.
+      f.sessions.get('!sess').currentTurn = { causes: [{ kind: 'reminder', at: 2 }], startedAt: 2 };
+      release();
+      await p;
+      const opening = sent.find((x) => x.payload.body === 'hello');
+      expect(opening.options).toEqual({ provenance: { fromConvoId: 'convo-sess', causes: before } });
+    });
+
+    it('names the writing session and its turn causes beside the message', async () => {
+      const sent = [];
+      const turn = { causes: [{ kind: 'carry_on', ref: 'carry_on:co_0123456789abcdef', at: 1 }], startedAt: 1 };
+      const f = makeFixture({ session: { currentTurn: turn }, publisher: { publishText: (convoId, payload, options) => sent.push({ convoId, payload, options }) } });
+      const id = joined(f);
+      expect((await f.handlers.chatSend({ roomId: '!sess', room_id: id, message: 'ping' })).status).toBe(200);
+      expect(sent).toEqual([{ convoId: id, payload: { body: 'ping', from: 'agent' }, options: { provenance: { fromConvoId: 'convo-sess', causes: turn.causes } } }]);
     });
 
     it('returns a quick reply from the wait window and caps wait_seconds at 60', async () => {
@@ -1259,6 +1317,16 @@ describe('createAgentChatHandlers', () => {
       expect(rooms.get('room-1')).toMatchObject({ role: 'guest', state: 'pending', sessionRoomId: '!sess' });
     });
 
+    it('passes the calling session\'s turn causes to invites.join, and none when the turn has none', async () => {
+      const causes = [{ kind: 'item_tap', ref: 'item:2@2026-01-01T00:00:00.000Z', at: 10 }];
+      const withTurn = makeFixture({ session: { currentTurn: { causes, startedAt: 9 } } });
+      await withTurn.handlers.chatJoin({ roomId: '!sess', room_id: 'room-1', justification: 'j' });
+      expect(withTurn.invites.join.mock.calls[0][0].causes).toEqual(causes);
+      const noTurn = makeFixture();
+      await noTurn.handlers.chatJoin({ roomId: '!sess', room_id: 'room-1', justification: 'j', causes });
+      expect('causes' in noTurn.invites.join.mock.calls[0][0]).toBe(false);
+    });
+
     it('clamps the join justification to the wire cap', async () => {
       const { handlers, invites } = makeFixture();
       await handlers.chatJoin({ roomId: '!sess', room_id: 'room-1', justification: 'j'.repeat(5000) });
@@ -1346,6 +1414,47 @@ describe('createAgentChatHandlers', () => {
       expect((await handlers.chatRead({ roomId: '!sess', room_id: 'room-ghost' })).status).toBe(404);
     });
 
+    it('the running turn takes the room\'s cause, spanning the messages others wrote', async () => {
+      const events = [
+        { seq: 40, type: 'text', sender: 'agent:box-2', payload: { body: 'please ask for a helper' }, ts: 1 },
+        { seq: 41, type: 'text', sender: 'agent:mac', payload: { body: 'on it' }, ts: 2 },
+        { seq: 47, type: 'image', sender: 'agent:box-2', payload: { name: 'x.png' }, ts: 3 },
+        { seq: 50, type: 'text', sender: 'user:alice', payload: { body: 'hi' }, ts: 4 },
+      ];
+      const start = [{ kind: 'user_message', ref: 'convo-sess:3', at: 1 }];
+      const turn = { causes: start, startedAt: 1 };
+      const { handlers, rooms, sessions } = makeFixture({ session: { currentTurn: turn }, publisher: { fetchMessages: async () => ({ events }) } });
+      rooms.record('room-1', { role: 'guest', state: 'joined', sessionRoomId: '!sess' });
+      expect((await handlers.chatRead({ roomId: '!sess', room_id: 'room-1' })).status).toBe(200);
+      expect(sessions.get('!sess').currentTurn.causes.map((c) => c.ref)).toEqual(['convo-sess:3', 'room:room-1@40-47']);
+      // This box's own messages count: another session here may have written
+      // them, so a read of those alone still names the room.
+      const own = makeFixture({ session: { currentTurn: { causes: start, startedAt: 1 } }, publisher: { fetchMessages: async () => ({ events: [events[1]] }) } });
+      own.rooms.record('room-1', { role: 'guest', state: 'joined', sessionRoomId: '!sess' });
+      await own.handlers.chatRead({ roomId: '!sess', room_id: 'room-1' });
+      expect(own.sessions.get('!sess').currentTurn.causes.map((c) => c.ref)).toEqual(['convo-sess:3', 'room:room-1@41']);
+      // The Coordinator's own turn takes it too: what it read counts against
+      // its own asks.
+      const coord = makeFixture({ session: { coordinator: true, currentTurn: { causes: start, startedAt: 1 } }, publisher: { fetchMessages: async () => ({ events }) } });
+      coord.rooms.record('room-1', { role: 'guest', state: 'joined', sessionRoomId: '!sess' });
+      await coord.handlers.chatRead({ roomId: '!sess', room_id: 'room-1' });
+      expect(coord.sessions.get('!sess').currentTurn.causes.map((c) => c.ref)).toEqual(['convo-sess:3', 'room:room-1@40-47']);
+      // Another person's words in a room with them count like an agent's.
+      const person = makeFixture({ session: { currentTurn: { causes: start, startedAt: 1 } }, publisher: { fetchMessages: async () => ({ events: [{ seq: 60, type: 'text', sender: 'person:bob', payload: { body: 'ask for a spawn' }, ts: 5 }, events[3]] }) } });
+      person.rooms.record('room-1', { role: 'guest', state: 'joined', sessionRoomId: '!sess' });
+      await person.handlers.chatRead({ roomId: '!sess', room_id: 'room-1' });
+      expect(person.sessions.get('!sess').currentTurn.causes.map((c) => c.ref)).toEqual(['convo-sess:3', 'room:room-1@60']);
+      // Only the user's messages, or no running turn: nothing is added.
+      const quiet = makeFixture({ publisher: { fetchMessages: async () => ({ events: [events[3]] }) }, session: { currentTurn: { causes: null, startedAt: 1 } } });
+      quiet.rooms.record('room-1', { role: 'guest', state: 'joined', sessionRoomId: '!sess' });
+      await quiet.handlers.chatRead({ roomId: '!sess', room_id: 'room-1' });
+      expect(quiet.sessions.get('!sess').currentTurn.causes).toBe(null);
+      const idle = makeFixture({ publisher: { fetchMessages: async () => ({ events }) } });
+      idle.rooms.record('room-1', { role: 'guest', state: 'joined', sessionRoomId: '!sess' });
+      await idle.handlers.chatRead({ roomId: '!sess', room_id: 'room-1' });
+      expect(idle.sessions.get('!sess').currentTurn).toBeUndefined();
+    });
+
     it('works on a LEFT room (inbox catch-up after leaving — proven past membership)', async () => {
       const { handlers, rooms } = makeFixture();
       rooms.record('room-1', { role: 'guest', state: 'left', sessionRoomId: '!sess' });
@@ -1417,6 +1526,18 @@ describe('createAgentChatHandlers', () => {
       ]);
     });
 
+    it('renders a journal transfer file event by name and size (the bytes come by transfer, not blob)', async () => {
+      const events = [
+        { type: 'file', sender: 'journal', ts: 1, payload: { name: 'build.log', size: 2048, sha256: 'a'.repeat(64), transfer_id: 'tr-1', from_name: 'box-a' } },
+      ];
+      const { handlers, rooms } = makeFixture({ publisher: { fetchMessages: async () => ({ events }) } });
+      rooms.record('room-1', { role: 'guest', state: 'joined', sessionRoomId: '!sess' });
+      const res = await handlers.chatRead({ roomId: '!sess', room_id: 'room-1' });
+      expect(res.body.messages).toEqual([
+        { sender: 'journal', type: 'file', ts: 1, body: '[file "build.log" (transfer, 2.0 KB)]' },
+      ]);
+    });
+
     it('clamps the limit to 1..200 and defaults to 50', async () => {
       const fetchMessages = vi.fn(async () => ({ events: [] }));
       const { handlers, rooms } = makeFixture({ publisher: { fetchMessages } });
@@ -1466,7 +1587,9 @@ describe('index.js routes + ask-user.js tools (source inspection)', () => {
   it('mounts every loopback route on its handler via the throw-isolating adapter', () => {
     for (const [route, handler] of ROUTES) {
       expect(indexSrc).toMatch(new RegExp(
-        `url\\.pathname === '${route}'[\\s\\S]{0,120}respondAgentChatRoute\\(res, data, agentChatHandlers\\.${handler},`));
+        // The two sending routes go through the tracker link check first
+        // (lib/tracker-link-check.js).
+        `url\\.pathname === '${route}'[\\s\\S]{0,120}respondAgentChatRoute\\(res, data, (agentChatHandlers\\.${handler}|linkChecked\\('${route.slice(1)}', agentChatHandlers\\.${handler}\\)),`));
     }
     // The shared adapter turns a handler throw into that route's own 500 —
     // never the outer body-parse catch's "Invalid JSON" 400.
@@ -1488,7 +1611,9 @@ describe('index.js routes + ask-user.js tools (source inspection)', () => {
     // function, but it has to clear the queued-notice rationale that now sits
     // between the two (the ⏳ is published after the short-circuit for the
     // same reason the short-circuit exists).
-    expect(indexSrc).toMatch(/if \(!person && roomReplyWaiters\.resolve\(replyWaiterKey\(frame\.convo_id, room\.sessionRoomId\), \{ from, body \}\)\) return;[\s\S]{0,3000}roomDelivery\.deliver\(/);
+    // The consumed reply still reaches the running turn's causes first, the
+    // Coordinator's included.
+    expect(indexSrc).toMatch(/if \(!person && roomReplyWaiters\.resolve\(replyWaiterKey\(frame\.convo_id, room\.sessionRoomId\), \{ from, body \}\)\) \{\n {4}joinHeldTurn\(session, \[roomMessageCause\(frame\.convo_id, frame\.seq\)\]\);\n {4}return;\n {2}\}[\s\S]{0,3000}roomDelivery\.deliver\(/);
   });
 
   it('holds inbound join_requests in pendingJoinRequests, never the rooms registry (C1)', () => {
@@ -1523,7 +1648,7 @@ describe('index.js routes + ask-user.js tools (source inspection)', () => {
     const start = indexSrc.indexOf('function journalInjectInviteRequest(');
     const end = indexSrc.indexOf('\nfunction ', start + 1);
     const body = indexSrc.slice(start, end);
-    expect(body).toMatch(/role: 'guest',[\s\S]{0,900}targetConvoId: frame\.from_convo_id \|\| null,/);
+    expect(body).toMatch(/role: 'guest',[\s\S]{0,1400}targetConvoId: frame\.from_convo_id \|\| null,/);
   });
 
   it('publishes the user-facing request notice as a NOTICE, above the agent\'s turn', () => {
@@ -1688,13 +1813,18 @@ describe('index.js routes + ask-user.js tools (source inspection)', () => {
     }
   });
 
-  it('declares NO agent_chat_leave tool — a room is not the agent\'s to close', () => {
-    // Rooms live for the life of the two sessions (2026-08-19). The tool is
-    // what agents reached for constantly, so it is gone from the surface
-    // entirely; mute is the escape hatch. The ROUTE stays (session eviction),
-    // which is exactly why this pin is on the tool declaration and not on the
-    // string appearing anywhere in the file.
-    expect(askUserSrc).not.toMatch(/server\.tool\(\s*\n\s*'agent_chat_leave',/);
+  it('agent_chat_leave is the GUARDED leave, never the bridge\'s own teardown route', () => {
+    // Rooms of two live for the life of the two sessions (2026-08-19), so the
+    // tool must not reach the unguarded /agent-chat-leave route the bridge's
+    // teardown uses: it goes to /agent-chat-leave-done, whose handler refuses
+    // every leave that would end a room for someone else.
+    const start = askUserSrc.indexOf("'agent_chat_leave',");
+    expect(start).toBeGreaterThan(-1);
+    const block = askUserSrc.slice(start, askUserSrc.indexOf('server.tool(', start));
+    expect(block).toMatch(/\$\{BRIDGE_API\}\/agent-chat-leave-done`/);
+    expect(block).not.toMatch(/\/agent-chat-leave`/);
+    expect(block).toMatch(/three or more/);
+    expect(block).toMatch(/cannot be left/);
   });
 
   // Task 8 review, finding 8b: pin each tool's loopback path and body keys,
@@ -2363,7 +2493,9 @@ describe('chatMute / chatUnmute', () => {
     expect(f.rooms.isPeerMuted('room-1', '!sess')).toBe(true);
     expect(f.rooms.isPeerMuted('room-1', '!guest')).toBe(false);
     const res = await f.handlers.chatSend({ roomId: '!sess', room_id: 'room-1', message: 'still there?', wait_seconds: 30 });
-    expect(res.body).toEqual({ ok: true, note: PEER_MUTED_SEND_NOTE });
+    // Names the muting session, not "the other member".
+    expect(res.body.ok).toBe(true);
+    expect(res.body.note).toMatch(/^sent — but mac has MUTED this room \(mac: looping\), so this will not reach mac as a turn\./);
     // No dead reply wait: the muted side's bridge drops the message.
     expect(awaitRoomMessage).not.toHaveBeenCalled();
     await f.handlers.chatUnmute({ roomId: '!guest', room_id: 'room-1' });
@@ -2396,6 +2528,162 @@ describe('chatMute / chatUnmute', () => {
 // (it boots the bridge), so the RULES are unit-tested in their libs
 // (roomFrameDisposition in room-delivery.test.js, the card registry in
 // room-mute-cards.test.js) and only the wiring is pinned here.
+// Rooms of three or more: a mute is one member's, never the room's. A third
+// member muted when it was done, and the sender was told "the other member
+// has MUTED this room" — and read that as its only real peer having stopped
+// listening.
+describe('mutes and leaving in rooms of three or more', () => {
+  const SNAP = {
+    agents: [{ device_id: 1, name: 'mac' }, { device_id: 7, name: 'box-2' }, { device_id: 9, name: 'box-3' }],
+    conversations: [{ id: 'room-1', participants: [1, 7, 9] }],
+  };
+  function room(f, fields = {}) {
+    f.rooms.record('room-1', {
+      role: 'owner', state: 'joined', sessionRoomId: '!sess',
+      peerDeviceId: 7, peerName: 'box-2', title: 'M:ab ↔️ box-2', targetConvoId: 'convo-remote', ...fields,
+    });
+  }
+
+  it('names the member that muted, and who still gets the message', async () => {
+    const awaitRoomMessage = vi.fn(async () => null);
+    const f = makeFixture({ awaitRoomMessage, publisher: { fetchSnapshot: async () => SNAP } });
+    room(f);
+    f.rooms.setPeerMuted('room-1', true, { who: 'box-3 [e0]', reason: 'done with this room' });
+    const res = await f.handlers.chatSend({ roomId: '!sess', room_id: 'room-1', message: 'deploy please', wait_seconds: 5 });
+    expect(res.body.note).toMatch(/^sent — but box-3 \[e0\] has MUTED this room \(box-3 \[e0\]: done with this room\), so this will not reach box-3 \[e0\] as a turn\./);
+    expect(res.body.note).toMatch(/It still reaches box-2, who can reply as usual\./);
+    expect(res.body.note).not.toMatch(/the other member/);
+    // Someone is still listening, so the reply wait is worth making.
+    expect(awaitRoomMessage).toHaveBeenCalled();
+  });
+
+  it('says nobody is listening when every other member has muted, and skips the dead wait', async () => {
+    const awaitRoomMessage = vi.fn(async () => null);
+    const f = makeFixture({ awaitRoomMessage, publisher: { fetchSnapshot: async () => SNAP } });
+    room(f);
+    f.rooms.setPeerMuted('room-1', true, { who: 'box-3 [e0]', reason: 'done' });
+    f.rooms.setPeerMuted('room-1', true, { who: 'box-2 [c4]', reason: 'looping' });
+    const res = await f.handlers.chatSend({ roomId: '!sess', room_id: 'room-1', message: 'hello?', wait_seconds: 5 });
+    expect(res.body.note).toMatch(/box-3 \[e0\] and box-2 \[c4\] have MUTED this room/);
+    expect(res.body.note).toMatch(/Nobody else in the room is listening, so no reply will come\./);
+    expect(awaitRoomMessage).not.toHaveBeenCalled();
+  });
+
+  it('one member unmuting leaves the other member\'s mute in place', async () => {
+    const f = makeFixture({ publisher: { fetchSnapshot: async () => SNAP } });
+    room(f);
+    f.rooms.setPeerMuted('room-1', true, { who: 'box-3 [e0]', reason: 'done' });
+    f.rooms.setPeerMuted('room-1', true, { who: 'box-2 [c4]', reason: 'looping' });
+    f.rooms.setPeerMuted('room-1', false, { who: 'box-2 [c4]' });
+    const res = await f.handlers.chatSend({ roomId: '!sess', room_id: 'room-1', message: 'hi' });
+    expect(res.body.note).toMatch(/^sent — but box-3 \[e0\] has MUTED/);
+    expect(res.body.note).toMatch(/It still reaches box-2/);
+  });
+
+  it('does not guess when the membership cannot be read', async () => {
+    const f = makeFixture({ publisher: { fetchSnapshot: async () => null } });
+    room(f);
+    f.rooms.setPeerMuted('room-1', true, { who: 'box-3 [e0]', reason: 'done' });
+    const res = await f.handlers.chatSend({ roomId: '!sess', room_id: 'room-1', message: 'hi' });
+    expect(res.body.note).toMatch(/box-3 \[e0\] has MUTED this room/);
+    expect(res.body.note).toMatch(/Any other members of the room still get it\./);
+  });
+
+  it('the mute records who muted, for a same-bridge peer\'s note', async () => {
+    const f = makeFixture();
+    room(f);
+    await f.handlers.chatMute({ roomId: '!sess', room_id: 'room-1', reason: 'looping' });
+    expect(f.rooms.get('room-1')).toMatchObject({ muted: true, mutedReason: 'looping', mutedBy: 'mac [ab]' });
+  });
+
+  describe('chatLeaveDone (agent_chat_leave)', () => {
+    it('a guest leaves a room the others carry on in, saying goodbye first', async () => {
+      const f = makeFixture({ publisher: { fetchSnapshot: async () => SNAP } });
+      room(f, { role: 'guest' });
+      f.rooms.setMuted('room-1', '!sess', true, { reason: 'done', who: 'mac [ab]' });
+      const res = await f.handlers.chatLeaveDone({ roomId: '!sess', room_id: 'room-1', reason: 'my part is done' });
+      expect(res.status).toBe(200);
+      expect(res.body).toMatchObject({ ok: true, left: true });
+      expect(res.body.note).toMatch(/box-2, box-3 carry on without you/);
+      const posts = f.calls.filter((c) => c.call === 'publishText' && c.convoId === 'room-1');
+      expect(posts.at(-1).payload.body).toBe('👋 mac [ab] left "M:ab ↔️ box-2": my part is done — messages here no longer reach mac [ab]; everyone else in the room still gets them.');
+      expect(f.invites.leave).toHaveBeenCalledWith({ roomId: 'room-1' });
+      expect(f.rooms.get('room-1').state).toBe('left');
+      expect(f.rooms.isMuted('room-1', '!sess')).toBe(false);
+      expect(f.retireMuteCard).toHaveBeenCalledWith('room-1', '!sess');
+    });
+
+    it('refuses to leave a room of two — that would end it for the peer', async () => {
+      const f = makeFixture({ publisher: { fetchSnapshot: async () => ({ ...SNAP, conversations: [{ id: 'room-1', participants: [1, 7] }] }) } });
+      room(f, { role: 'guest' });
+      const res = await f.handlers.chatLeaveDone({ roomId: '!sess', room_id: 'room-1', reason: 'done' });
+      expect(res.status).toBe(409);
+      expect(res.body.error).toMatch(/only one other member/);
+      expect(f.invites.leave).not.toHaveBeenCalled();
+      expect(f.rooms.get('room-1').state).toBe('joined');
+    });
+
+    it('refuses the owner, a same-bridge room, an unreadable membership and a missing reason', async () => {
+      const owner = makeFixture({ publisher: { fetchSnapshot: async () => SNAP } });
+      room(owner);
+      expect((await owner.handlers.chatLeaveDone({ roomId: '!sess', room_id: 'room-1', reason: 'done' })).body.error).toMatch(/you started this room/);
+
+      const local = makeFixture({ publisher: { fetchSnapshot: async () => SNAP } });
+      local.sessions.set('!guest', { alive: true, convoId: 'convo-guest' });
+      room(local, { guestSessionRoomId: '!guest', guestState: 'joined' });
+      expect((await local.handlers.chatLeaveDone({ roomId: '!guest', room_id: 'room-1', reason: 'done' })).body.error).toMatch(/both ends of this room are on this box/);
+
+      const blind = makeFixture({ publisher: { fetchSnapshot: async () => null } });
+      room(blind, { role: 'guest' });
+      expect((await blind.handlers.chatLeaveDone({ roomId: '!sess', room_id: 'room-1', reason: 'done' })).status).toBe(503);
+
+      const silent = makeFixture({ publisher: { fetchSnapshot: async () => SNAP } });
+      room(silent, { role: 'guest' });
+      expect((await silent.handlers.chatLeaveDone({ roomId: '!sess', room_id: 'room-1', reason: '  ' })).status).toBe(400);
+
+      // No own device id yet: this box cannot be told from the others, so a
+      // pair would look like three. Fails closed.
+      const anon = makeFixture({ publisher: { identity: () => null, fetchSnapshot: async () => ({ ...SNAP, conversations: [{ id: 'room-1', participants: [1, 7] }] }) } });
+      room(anon, { role: 'guest' });
+      expect((await anon.handlers.chatLeaveDone({ roomId: '!sess', room_id: 'room-1', reason: 'done' })).status).toBe(503);
+
+      for (const f of [owner, local, blind, silent, anon]) expect(f.invites.leave).not.toHaveBeenCalled();
+    });
+
+    it('keeps the room when the journal refuses the leave', async () => {
+      const f = makeFixture({ leaveOutcome: { kind: 'error', code: 'conflict', detail: 'not a joined participant' }, publisher: { fetchSnapshot: async () => SNAP } });
+      room(f, { role: 'guest' });
+      const res = await f.handlers.chatLeaveDone({ roomId: '!sess', room_id: 'room-1', reason: 'done' });
+      expect(res.status).toBe(502);
+      expect(f.rooms.get('room-1').state).toBe('joined');
+      const last = f.calls.filter((c) => c.call === 'publishText' && c.convoId === 'room-1').at(-1).payload.body;
+      expect(last).toBe('↩️ mac [ab] is still in this room — the leave did not go through.');
+    });
+  });
+
+  describe('leaveMutedRoomsOnMissionClose', () => {
+    it('leaves a room of three it had muted as a guest, and nothing else', async () => {
+      const f = makeFixture({ publisher: { fetchSnapshot: async () => ({ ...SNAP, conversations: [
+        { id: 'room-1', participants: [1, 7, 9] }, { id: 'room-2', participants: [1, 7, 9] }, { id: 'room-3', participants: [1, 7] },
+      ] }) } });
+      room(f, { role: 'guest' });
+      f.rooms.setMuted('room-1', '!sess', true, { reason: 'done with it' });
+      f.rooms.record('room-2', { role: 'guest', state: 'joined', sessionRoomId: '!sess', peerDeviceId: 7, title: 'unmuted' });
+      f.rooms.record('room-3', { role: 'guest', state: 'joined', sessionRoomId: '!sess', peerDeviceId: 7, title: 'a pair' });
+      f.rooms.setMuted('room-3', '!sess', true, { reason: 'looping' });
+      const left = await f.handlers.leaveMutedRoomsOnMissionClose('!sess');
+      expect(left).toEqual(['room-1']);
+      expect(f.rooms.get('room-1').state).toBe('left');
+      expect(f.rooms.get('room-2').state).toBe('joined');
+      // A pair keeps its mute: leaving it would end the room for the peer.
+      expect(f.rooms.get('room-3').state).toBe('joined');
+      expect(f.rooms.isMuted('room-3', '!sess')).toBe(true);
+      const bye = f.calls.filter((c) => c.call === 'publishText' && c.convoId === 'room-1').at(-1).payload.body;
+      expect(bye).toMatch(/^👋 mac \[ab\] left "M:ab ↔️ box-2" \(its mission is closed\): done with it — /);
+    });
+  });
+});
+
 describe('mute wiring (source inspection)', () => {
   const indexSrc = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
   const askUserSrc = readFileSync(new URL('../ask-user.js', import.meta.url), 'utf-8');
@@ -2412,12 +2700,14 @@ describe('mute wiring (source inspection)', () => {
     expect(fnBody('journalOnRoomFrame')).toMatch(/notePeerMuteFromFrame\(room, frame\)/);
     const body = fnBody('notePeerMuteFromFrame');
     expect(body).toMatch(/startsWith\('agent:'\)/);
-    expect(body).toMatch(/parseMuteAnnouncement\(frame\.payload\?\.body\)/);
-    expect(body).toMatch(/agentRooms\.setPeerMuted\(frame\.convo_id, said === 'muted'\)/);
+    expect(body).toMatch(/parseMuteAnnouncementDetail\(frame\.payload\?\.body\)/);
+    expect(body).toMatch(/agentRooms\.setPeerMuted\(frame\.convo_id, said\.state === 'muted', \{ who: said\.who, reason: said\.reason \}\)/);
   });
 
   it('BRIDGE_CLAUDE.md tells the sender what to do when the other agent mutes', () => {
-    expect(bridgeMd).toMatch(/If the OTHER agent mutes a room you are in[\s\S]{0,300}file a question for the user asking them to unmute it/);
+    expect(bridgeMd).toMatch(/If ANOTHER member mutes a room you are in, you are told so in the room, naming who muted[\s\S]{0,500}file a question for the user asking them to unmute it/);
+    expect(bridgeMd).toMatch(/never that the whole room or another member did/);
+    expect(bridgeMd).toMatch(/Finished with a room\?\*\* Don't mute it\.[\s\S]{0,200}agent_chat_leave\(room_id, reason\)/);
   });
 
   it('deliverRoomFrameTo gates on the muted binding ABOVE the echo, the waiter and the queue', () => {
@@ -2436,11 +2726,23 @@ describe('mute wiring (source inspection)', () => {
     // still hold while a muted session receives everything anyway — the notices
     // publish, execution falls through, and the user gets a 🔇 line followed by
     // the delivery it just denied. The whole gate is that one keyword.
-    expect(body).toMatch(/if \(disposition !== 'deliver'\) \{[\s\S]{0,1200}\n\s+return;\n\s+\}/);
+    expect(body).toMatch(/if \(disposition !== 'deliver'\) \{[\s\S]{0,1800}\n\s+return;\n\s+\}/);
     // The pre-mute backlog drain stays ABOVE the gate: those messages were
     // accepted before the mute, and agent_chat_mute discards this room's share
     // of them explicitly (roomDelivery.dropRoom) rather than stranding them.
     expect(body.indexOf('maybeFlushRoomDelivery(session);')).toBeLessThan(gate);
+  });
+
+  it('a muted binding whose conversation is gone for good is left, not kept muted forever', () => {
+    const body = fnBody('deliverRoomFrameTo');
+    expect(body).toMatch(/if \(disposition !== 'deliver'\) \{\n[\s\S]{0,700}if \(!live && !sleepingConvoIdFor\(room\.sessionRoomId\)\) \{[\s\S]{0,250}orphanRoomBinding\(frame\.convo_id, room\.sessionRoomId\);\n {6}return;/);
+  });
+
+  it('a member leaving drops the mute it announced, and closing a mission leaves muted rooms of three', () => {
+    expect(indexSrc).toMatch(/onMemberLeft: \(roomId, fromDeviceId\) => \{ forgetLeftMemberMute\(roomId, fromDeviceId\)/);
+    expect(indexSrc).toMatch(/async function forgetLeftMemberMute\(roomId, fromDeviceId\) \{[\s\S]{0,400}agentRooms\.clearPeerMutesForBox\(roomId, name\)/);
+    expect(indexSrc).toMatch(/name === 'close' && data\?\.mission === undefined[\s\S]{0,250}agentChatHandlers\.leaveMutedRoomsOnMissionClose\(d\?\.roomId\)/);
+    expect(indexSrc).toMatch(/url\.pathname === '\/agent-chat-leave-done'\) \{\n\s+await respondAgentChatRoute\(res, data, agentChatHandlers\.chatLeaveDone,/);
   });
 
   it('gives the mute handler a seam to drop what the room already had queued', () => {
@@ -2506,9 +2808,8 @@ describe('mute wiring (source inspection)', () => {
     // …and that it outlives the process: an agent that thinks a reap or a
     // restart lost its room opens a duplicate.
     expect(bridgeMd).toMatch(/survives everything that ends your process but not the conversation/);
-    expect(bridgeMd).toMatch(/There is no leave tool\./);
+    expect(bridgeMd).toMatch(/A room of two cannot be left\./);
     expect(bridgeMd).toMatch(/looping, spamming[\s\S]{0,120}agent_chat_mute\(room_id, reason\)/);
-    expect(bridgeMd).not.toMatch(/agent_chat_leave/);
     // …and the reuse promise, so an agent doesn't open a second room by hand.
     expect(bridgeMd).toMatch(/returns the room you already have/);
   });
@@ -2525,7 +2826,8 @@ describe('mute wiring (source inspection)', () => {
     const start = askUserSrc.indexOf("'agent_chat_mute',");
     const block = askUserSrc.slice(start, askUserSrc.indexOf('server.tool(', start));
     expect(block).toMatch(/looping, spamming, or malfunctioning/);
-    expect(block).toMatch(/you cannot: a room stays open for the life of both conversations, across restarts and sleeps/);
+    expect(block).toMatch(/a room between two sessions stays open for the life of both conversations, across restarts and sleeps/);
+    expect(block).toMatch(/Do not mute a room just because your part is done/);
   });
 });
 
@@ -2706,5 +3008,218 @@ describe('probeJoinedRoom', () => {
     const fetchMessages = vi.fn(async () => { throw new Error('boom'); });
     expect(await probeJoinedRoom(publisher(fetchMessages), 'room-1')).toEqual({ joined: false, events: null });
     expect(fetchMessages).toHaveBeenCalledWith('room-1', { limit: 20 });
+  });
+});
+
+describe('chatStart with a person (talk request)', () => {
+  const talk = { roomId: '!sess', person: 'bob', topic: 'cover editor', justification: 'the user wants to compare notes', message: 'hello bob' };
+
+  it('requires exactly one of target_convo_id and person', async () => {
+    const { handlers, invites } = makeFixture();
+    const both = await handlers.chatStart({ ...talk, target_convo_id: 'convo-remote' });
+    expect(both.status).toBe(400);
+    expect(both.body.error).toMatch(/not both/);
+    const neither = await handlers.chatStart({ roomId: '!sess', justification: 'j', message: 'm' });
+    expect(neither.status).toBe(400);
+    expect(neither.body.error).toMatch(/target_convo_id or person/);
+    for (const person of ['', '   ', 42, 'x'.repeat(65)]) {
+      expect((await handlers.chatStart({ ...talk, person })).status).toBe(400);
+    }
+    expect(invites.invite).not.toHaveBeenCalled();
+  });
+
+  it('asks the journal by person: no device, no conversation, the 👤 title, and a record that keeps the person', async () => {
+    const { handlers, calls, invites } = makeFixture({ inviteOutcome: { kind: 'pending_quiet' } });
+    const res = await handlers.chatStart({ ...talk, mission: 3 });
+    expect(res.status).toBe(200);
+    const roomId = res.body.room_id;
+    expect(invites.invite).toHaveBeenCalledTimes(1);
+    const args = invites.invite.mock.calls[0][0];
+    expect(args).toMatchObject({ roomId, targetPerson: 'bob', fromConvoId: 'convo-sess', topic: 'cover editor', mission: 3 });
+    expect(args.targetDeviceId).toBeUndefined();
+    expect(args.targetConvoId).toBeUndefined();
+    const upsert = calls.find((c) => c.call === 'upsertConvo');
+    expect(upsert.opts.title).toBe('M:ab ↔️ 👤 bob — cover editor');
+    const rec = calls.find((c) => c.call === 'record');
+    expect(rec.fields).toMatchObject({ role: 'owner', state: 'pending', sessionRoomId: '!sess', peerDeviceId: null, peerName: "bob's agent", person: 'bob', talk: true, targetConvoId: null });
+    // The opening message goes into the fresh room before the ask.
+    expect(calls.findIndex((c) => c.call === 'publishText')).toBeLessThan(calls.findIndex((c) => c.call === 'invite'));
+  });
+
+  it('a talk request carries the calling session\'s turn causes, and none when the turn has none', async () => {
+    const causes = [{ kind: 'routine', ref: 'routine:sweep@2026-01-01T08:00:00.000Z', at: 10 }];
+    const withTurn = makeFixture({ inviteOutcome: { kind: 'pending_quiet' }, session: { currentTurn: { causes, startedAt: 9 } } });
+    await withTurn.handlers.chatStart(talk);
+    expect(withTurn.invites.invite.mock.calls[0][0].causes).toEqual(causes);
+    const noTurn = makeFixture({ inviteOutcome: { kind: 'pending_quiet' } });
+    await noTurn.handlers.chatStart({ ...talk, causes });
+    expect('causes' in noTurn.invites.invite.mock.calls[0][0]).toBe(false);
+  });
+
+  it('a talk request is stamped with the causes of the turn that made the call, not of a turn begun while the roster was fetched', async () => {
+    const original = [{ kind: 'room_message', ref: 'room:r-1', at: 10 }];
+    const later = [{ kind: 'user_message', ref: 'convo-sess:9', at: 20 }];
+    let session = null;
+    const f = makeFixture({
+      inviteOutcome: { kind: 'pending_quiet' },
+      session: { currentTurn: { causes: original, startedAt: 9 } },
+      publisher: { fetchRoster: async () => { await Promise.resolve(); session.currentTurn = { causes: later, startedAt: 19 }; return ROSTER; } },
+    });
+    session = f.sessions.get('!sess');
+    await f.handlers.chatStart(talk);
+    expect(session.currentTurn.causes).toEqual(later);
+    expect(f.invites.invite.mock.calls[0][0].causes).toEqual(original);
+  });
+
+  it('trims the name, and works without a roster entry for the person', async () => {
+    const { handlers, invites } = makeFixture({ inviteOutcome: { kind: 'pending_quiet' } });
+    await handlers.chatStart({ ...talk, person: '  bob ' });
+    expect(invites.invite.mock.calls[0][0].targetPerson).toBe('bob');
+  });
+
+  it('a Codex session is refused, before any room exists', async () => {
+    const { handlers, calls, invites } = makeFixture({ session: { codex: true } });
+    const res = await handlers.chatStart(talk);
+    expect(res.status).toBe(409);
+    expect(res.body.error).toMatch(/Codex/);
+    expect(calls).toEqual([]);
+    expect(invites.invite).not.toHaveBeenCalled();
+  });
+
+  it('a bad mission is refused like on any person room', async () => {
+    const { handlers } = makeFixture();
+    expect((await handlers.chatStart({ ...talk, mission: 0 })).status).toBe(400);
+    expect((await handlers.chatStart({ ...talk, mission: 'x' })).status).toBe(400);
+  });
+
+  it('pending says the user has the card to send, then the other person gets one', async () => {
+    for (const kind of ['pending_quiet', 'pending_idle', 'pending_busy']) {
+      const { handlers } = makeFixture({ inviteOutcome: { kind } });
+      const res = await handlers.chatStart(talk);
+      expect(res.status).toBe(200);
+      expect(res.body.status).toBe('pending');
+      expect(res.body.note).toMatch(/your user/i);
+      expect(res.body.note).toMatch(/bob/);
+      expect(res.body.note).toMatch(/do NOT wait/);
+    }
+  });
+
+  it('accepted and refused map as for any room', async () => {
+    const ok = makeFixture({ inviteOutcome: { kind: 'accepted', peerDeviceId: 9 } });
+    expect((await ok.handlers.chatStart(talk)).body.status).toBe('accepted');
+    const no = makeFixture({ inviteOutcome: { kind: 'refused', reason: 'not now' } });
+    const res = await no.handlers.chatStart(talk);
+    expect(res.body).toMatchObject({ status: 'refused', reason: 'not now' });
+  });
+
+  it('journal refusals become sentences, and the room is marked dead', async () => {
+    const cases = [
+      [{ kind: 'error', code: 'not_found' }, 404, /no person called "bob"|contact_list/],
+      [{ kind: 'error', code: 'conflict', detail: 'already awaiting_user' }, 409, /already awaiting_user/],
+      [{ kind: 'error', code: 'forbidden', detail: 'a private box cannot open a room with another person' }, 403, /private box/],
+      [{ kind: 'error', code: 'offline' }, 200, /offline/],
+    ];
+    for (const [outcome, status, re] of cases) {
+      const { handlers, calls, rooms } = makeFixture({ inviteOutcome: outcome });
+      const res = await handlers.chatStart(talk);
+      expect(res.status).toBe(status);
+      expect(res.body.error).toMatch(re);
+      expect(rooms.get(res.body.room_id).state).toBe('expired');
+      expect(calls.filter((c) => c.call === 'upsertConvo').at(-1).opts.sessionState).not.toBe('waiting');
+    }
+  });
+
+  it('a second ask for the same person from the same session reuses the room: one card per person', async () => {
+    const { handlers, invites, calls } = makeFixture({ inviteOutcome: { kind: 'pending_quiet' } });
+    const first = await handlers.chatStart(talk);
+    calls.length = 0;
+    const again = await handlers.chatStart({ ...talk, message: 'also this' });
+    expect(again.status).toBe(200);
+    expect(again.body.room_id).toBe(first.body.room_id);
+    expect(again.body.note).toMatch(/existing room reused/);
+    expect(invites.invite).toHaveBeenCalledTimes(1);
+    expect(calls.filter((c) => c.call === 'publishText')).toEqual([
+      { call: 'publishText', convoId: first.body.room_id, payload: { body: 'also this', from: 'agent' } },
+    ]);
+    // A different person is a different room.
+    await handlers.chatStart({ ...talk, person: 'carol' });
+    expect(invites.invite).toHaveBeenCalledTimes(2);
+  });
+
+  it('pending says where the card is: the room\'s own conversation and For you, not the session\'s chat', async () => {
+    const { handlers } = makeFixture({ inviteOutcome: { kind: 'pending_quiet' } });
+    const res = await handlers.chatStart(talk);
+    expect(res.body.note).toMatch(/room's own conversation, "[^"]*👤 bob — cover editor"/);
+    expect(res.body.note).toMatch(/not in your session's chat/);
+    expect(res.body.note).toMatch(/For you/);
+  });
+
+  it('a repeat ask whose first is still waiting on the user\'s card says so, posts nothing and raises nothing', async () => {
+    const personRoomState = vi.fn(async () => ({ status: 200, data: { person_room: { state: 'awaiting_owner', person: 'bob' } } }));
+    const { handlers, invites, calls } = makeFixture({ inviteOutcome: { kind: 'pending_quiet' }, personRoomState });
+    const first = await handlers.chatStart(talk);
+    calls.length = 0;
+    const again = await handlers.chatStart({ ...talk, message: 'also this' });
+    expect(personRoomState).toHaveBeenCalledWith(first.body.room_id);
+    expect(again.body).toMatchObject({ room_id: first.body.room_id, status: 'pending', waiting_on: 'your_user' });
+    expect(again.body.note).toMatch(/still waiting for YOUR user's card/);
+    expect(again.body.note).toMatch(/room's own conversation/);
+    expect(again.body.note).not.toMatch(/reused/);
+    expect(invites.invite).toHaveBeenCalledTimes(1);
+    expect(calls.filter((c) => c.call === 'publishText')).toEqual([]);
+  });
+
+  it('a repeat ask the other person has yet to accept says it waits on them', async () => {
+    const personRoomState = async () => ({ status: 200, data: { person_room: { state: 'awaiting_guest' } } });
+    const { handlers, invites } = makeFixture({ inviteOutcome: { kind: 'pending_quiet' }, personRoomState });
+    await handlers.chatStart(talk);
+    const again = await handlers.chatStart(talk);
+    expect(again.body).toMatchObject({ status: 'pending', waiting_on: 'bob' });
+    expect(again.body.note).toMatch(/waiting for bob to accept/);
+    expect(invites.invite).toHaveBeenCalledTimes(1);
+  });
+
+  it('a repeat ask whose first the journal no longer holds starts a fresh room with a fresh card', async () => {
+    const personRoomState = async () => ({ status: 404, data: { error: 'not found' } });
+    const { handlers, invites, rooms, calls } = makeFixture({ inviteOutcome: { kind: 'pending_quiet' }, personRoomState });
+    const first = await handlers.chatStart(talk);
+    const again = await handlers.chatStart(talk);
+    expect(again.body.room_id).not.toBe(first.body.room_id);
+    expect(again.body.status).toBe('pending');
+    expect(rooms.get(first.body.room_id).state).toBe('expired');
+    expect(invites.invite).toHaveBeenCalledTimes(2);
+    // The old room is closed in the chat list, with a line saying why.
+    expect(calls.some((c) => c.call === 'upsertConvo' && c.convoId === first.body.room_id && c.opts.sessionState === 'done')).toBe(true);
+    expect(calls.some((c) => c.call === 'publishText' && c.convoId === first.body.room_id && /no longer open/.test(c.payload.body))).toBe(true);
+  });
+
+  it('the same check covers a room at another person\'s shared session', async () => {
+    const roster = { ...ROSTER, people: [{ person: 'bob', sessions: [{ convo_id: 'bob-work', title: 'Bob work', agent_device_id: 40 }] }] };
+    const personRoomState = vi.fn(async () => ({ status: 200, data: { person_room: { state: 'awaiting_owner' } } }));
+    const { handlers, invites } = makeFixture({ inviteOutcome: { kind: 'pending_quiet' }, personRoomState, publisher: { fetchRoster: async () => roster } });
+    const ask = { roomId: '!sess', target_convo_id: 'bob-work', topic: 'cover editor', justification: 'compare notes', message: 'hello bob' };
+    const first = await handlers.chatStart(ask);
+    expect(first.body.note).toMatch(/room's own conversation, "[^"]*👤 bob — cover editor"/);
+    const again = await handlers.chatStart(ask);
+    expect(again.body).toMatchObject({ room_id: first.body.room_id, status: 'pending', waiting_on: 'your_user' });
+    expect(invites.invite).toHaveBeenCalledTimes(1);
+  });
+
+  it('an unreadable journal or an open room reuses as before', async () => {
+    for (const r of [{ status: 0, data: { error: 'journal unreachable' } }, { status: 200, data: { person_room: { state: 'joined' } } }]) {
+      const { handlers, invites } = makeFixture({ inviteOutcome: { kind: 'pending_quiet' }, personRoomState: async () => r });
+      const first = await handlers.chatStart(talk);
+      const again = await handlers.chatStart(talk);
+      expect(again.body.room_id).toBe(first.body.room_id);
+      expect(again.body.note).toMatch(/existing room reused/);
+      expect(invites.invite).toHaveBeenCalledTimes(1);
+    }
+  });
+
+  it('fails closed on unknown identity, like a session target', async () => {
+    const { handlers, invites } = makeFixture({ publisher: { identity: () => null } });
+    const res = await handlers.chatStart(talk);
+    expect(res.status).toBe(503);
+    expect(invites.invite).not.toHaveBeenCalled();
   });
 });

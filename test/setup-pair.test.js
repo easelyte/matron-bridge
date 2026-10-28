@@ -5,9 +5,12 @@ import { describe, it, expect, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { parseArgs, pairingJournalUrl } from '../setup/pair.mjs';
-import { currentToken, tokenEnv, TOKEN_PATH, pairWithApp, strandedTokenFile } from '../setup/common.mjs';
-import { tokenMethod } from '../setup/wizard.mjs';
+import { parseArgs, pairingJournalUrl, existingTokenCheck } from '../setup/pair.mjs';
+import {
+  currentToken, tokenEnv, TOKEN_PATH, pairWithApp, strandedTokenFile,
+  sameJournal, storedTokenFor, writeEnvFile,
+} from '../setup/common.mjs';
+import { tokenMethod, storedTokenToOffer } from '../setup/wizard.mjs';
 
 describe('npm run pair argument parsing', () => {
   it('defaults to the .env journal, no force', () => {
@@ -144,5 +147,105 @@ describe('wizard token-source menu', () => {
 
   it('flags anything else', () => {
     expect(tokenMethod('3')).toBe(null);
+  });
+});
+
+describe('a stored agent token stays with the journal it was saved for', () => {
+  const withTokenFile = (fn) => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pair-journal-'));
+    const file = path.join(dir, 'tok');
+    fs.writeFileSync(file, 'token-for-a\n');
+    try { fn(file); } finally { fs.rmSync(dir, { recursive: true }); }
+  };
+
+  it('sameJournal compares scheme, host and port across URL forms', () => {
+    expect(sameJournal('wss://a.example.com/ws', 'https://a.example.com')).toBe(true);
+    expect(sameJournal('wss://a.example.com/ws', 'a.example.com')).toBe(true);
+    expect(sameJournal('wss://a.example.com/ws', 'wss://b.example.com/ws')).toBe(false);
+    expect(sameJournal('wss://a.example.com/ws', 'wss://a.example.com:8443/ws')).toBe(false);
+    expect(sameJournal('ws://localhost:9810/ws', 'wss://localhost:9810/ws')).toBe(false);
+    expect(sameJournal('', 'wss://a.example.com/ws')).toBe(false);
+    expect(sameJournal(undefined, undefined)).toBe(false);
+  });
+
+  it('storedTokenFor hands out the token only for its own journal', () => {
+    withTokenFile((file) => {
+      const existing = { JOURNAL_WS_URL: 'wss://a.example.com/ws', JOURNAL_TOKEN_FILE: file };
+      expect(storedTokenFor(existing, 'https://a.example.com')).toBe('token-for-a');
+      expect(storedTokenFor(existing, 'wss://b.example.com/ws')).toBe('');
+    });
+    expect(storedTokenFor({ JOURNAL_TOKEN: 'raw' }, 'wss://a.example.com/ws')).toBe('');
+  });
+
+  it('npm run pair --server <another journal> checks no stored token there', () => {
+    withTokenFile((file) => {
+      const existing = { JOURNAL_WS_URL: 'wss://a.example.com/ws', JOURNAL_TOKEN_FILE: file };
+      expect(existingTokenCheck(existing, 'wss://a.example.com/ws')).toEqual({ token: 'token-for-a', note: '' });
+      const other = existingTokenCheck(existing, 'wss://b.example.com/ws');
+      expect(other.token).toBe('');
+      expect(other.note).toContain('wss://a.example.com/ws');
+      expect(other.note).not.toContain('token-for-a');
+    });
+  });
+
+  it('npm run pair never checks a token with no record of its journal', () => {
+    withTokenFile((tokenPath) => {
+      const check = existingTokenCheck({ JOURNAL_WS_URL: 'wss://a.example.com/ws' }, 'wss://a.example.com/ws', { tokenPath });
+      expect(check.token).toBe('');
+      expect(check.note).toContain('unfinished setup');
+    });
+  });
+
+  it('the wizard offers to keep a token only for its own journal', () => {
+    const existing = { JOURNAL_WS_URL: 'wss://a.example.com/ws', JOURNAL_TOKEN_FILE: '/srv/box-a/tok' };
+    expect(storedTokenToOffer(existing, 'wss://a.example.com/ws'))
+      .toMatchObject({ file: '/srv/box-a/tok', defaultKeep: true });
+    const other = storedTokenToOffer(existing, 'wss://b.example.com/ws');
+    expect(other.file).toBe('');
+    expect(other.note).toContain('needs a token of its own');
+  });
+
+  it('the wizard asks before keeping a token from an unfinished setup, defaulting to no', () => {
+    withTokenFile((tokenPath) => {
+      expect(storedTokenToOffer({}, 'wss://a.example.com/ws', { tokenPath }))
+        .toMatchObject({ file: tokenPath, defaultKeep: false });
+    });
+  });
+});
+
+describe('writeEnvFile', () => {
+  it('keeps the .env backup owner-only', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pair-envfile-'));
+    const envPath = path.join(dir, '.env');
+    const examplePath = path.join(dir, '.env.example');
+    try {
+      fs.writeFileSync(examplePath, 'JOURNAL_WS_URL=\n');
+      fs.writeFileSync(envPath, 'JOURNAL_WS_URL=wss://a.example.com/ws\n', { mode: 0o644 });
+      fs.chmodSync(envPath, 0o644);
+      fs.writeFileSync(`${envPath}.bak`, 'old\n', { mode: 0o644 });
+      fs.chmodSync(`${envPath}.bak`, 0o644);
+      expect(writeEnvFile({}, { JOURNAL_WS_URL: 'wss://b.example.com/ws' }, { envPath, examplePath })).toBe(true);
+      expect(fs.readFileSync(`${envPath}.bak`, 'utf8')).toBe('JOURNAL_WS_URL=wss://a.example.com/ws\n');
+      expect(fs.readFileSync(envPath, 'utf8')).toBe('JOURNAL_WS_URL=wss://b.example.com/ws\n');
+      if (process.platform !== 'win32') {
+        expect(fs.statSync(`${envPath}.bak`).mode & 0o777).toBe(0o600);
+        expect(fs.statSync(envPath).mode & 0o777).toBe(0o600);
+      }
+    } finally {
+      fs.rmSync(dir, { recursive: true });
+    }
+  });
+
+  it('makes no backup on a first run', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pair-envfile-'));
+    const envPath = path.join(dir, '.env');
+    const examplePath = path.join(dir, '.env.example');
+    try {
+      fs.writeFileSync(examplePath, 'JOURNAL_WS_URL=\n');
+      expect(writeEnvFile({}, { JOURNAL_WS_URL: 'wss://a.example.com/ws' }, { envPath, examplePath })).toBe(false);
+      expect(fs.existsSync(`${envPath}.bak`)).toBe(false);
+    } finally {
+      fs.rmSync(dir, { recursive: true });
+    }
   });
 });

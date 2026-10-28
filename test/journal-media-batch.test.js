@@ -55,6 +55,9 @@ function makeRouter(overrides = {}) {
   const deps = {
     fetchMedia: vi.fn(async () => ({ buffer: Buffer.from('bytes'), contentType: 'image/png' })),
     transcribe: vi.fn(async () => 'hello world'),
+    // A box with local whisper installed; the journal-first batch test
+    // overrides it.
+    hasLocalWhisper: vi.fn(() => true),
     buildSavedBlocks: vi.fn((sess, { name }) => [{ type: 'text', text: `saved:${name}` }]),
     injectText: vi.fn(() => true),
     injectBlocks: vi.fn(() => true),
@@ -289,6 +292,30 @@ describe('createJournalMediaRouter — multi-attachment batches', () => {
     await route(session, frame('pic.png', { id: 'B9f', index: 2, total: 2 }), ctx);
 
     expect(deps.publishNotice).toHaveBeenCalledWith('convo-1', '🎤 Could not transcribe that voice note.');
+    expect(deps.injectBlocks).toHaveBeenCalledTimes(1);
+    expect(deps.injectBlocks.mock.calls[0][1].map((b) => b.text)).toEqual(['typed', 'saved:pic.png']);
+    expect(mirrorText).not.toHaveBeenCalled();
+  });
+
+  it('a voice note in a batch the journal failed twice, on a box without whisper, still delivers the typed text with the attachments', async () => {
+    const fetchMedia = vi.fn(async () => ({ buffer: Buffer.from('img'), contentType: 'image/png' }));
+    const mirrorText = vi.fn();
+    const { route, deps } = makeRouter({
+      fetchMedia,
+      mirrorText,
+      hasLocalWhisper: () => false,
+      fetchTranscript: vi.fn(async () => ({ status: 'failed' })),
+      requestTranscript: vi.fn(async () => ({ status: 'pending' })),
+    });
+
+    await route(session, frame('voice-note.m4a', { id: 'B9j', index: 1, total: 2 },
+      { type: 'file', contentType: 'audio/mp4', caption: 'typed' }), ctx);
+    await route(session, frame('pic.png', { id: 'B9j', index: 2, total: 2 }), ctx);
+
+    expect(deps.transcribe).not.toHaveBeenCalled();
+    // Only the image was fetched: the voice note's audio is never needed here.
+    expect(fetchMedia).toHaveBeenCalledTimes(1);
+    expect(deps.publishNotice).toHaveBeenCalledWith('convo-1', expect.stringMatching(/journal couldn't transcribe/i));
     expect(deps.injectBlocks).toHaveBeenCalledTimes(1);
     expect(deps.injectBlocks.mock.calls[0][1].map((b) => b.text)).toEqual(['typed', 'saved:pic.png']);
     expect(mirrorText).not.toHaveBeenCalled();

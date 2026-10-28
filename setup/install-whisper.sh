@@ -9,7 +9,7 @@ case "$OS" in
   Darwin) exec bash "$SCRIPT_DIR/install-whisper-macos.sh" "$@" ;;
   MINGW*|MSYS*|CYGWIN*)
     echo "ERROR: this is a Git Bash / MSYS shell on Windows." >&2
-    echo "Voice-note transcription is not available on Windows." >&2
+    echo "Local whisper is not available on Windows; voice notes are still transcribed by the journal." >&2
     exit 1
     ;;
   *)

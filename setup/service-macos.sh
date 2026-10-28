@@ -97,13 +97,20 @@ emit_env_keys() {
       \'*\') val="${val#\'}"; val="${val%\'}" ;;
     esac
     [ -z "$val" ] && continue
+    # write_plist sets NODE_BIN itself, to the node this installer resolved.
+    [ "$key" = NODE_BIN ] && continue
     printf '    <key>%s</key>\n    <string>%s</string>\n' \
       "$(xml_escape "$key")" "$(xml_escape "$val")"
   done < "$REPO_DIR/.env"
 }
 
+# The service runs through bin/run-named-node, which execs the script with a
+# copy of node named <process-name> (e.g. $HOME/.matron/bin/matron-bridge) so a
+# per-app firewall can tell Matron's processes from other Node programs.
+# It execs, so launchd's KeepAlive still watches the node process itself.
+# NODE_BIN tells it which node to use, as launchd's PATH may not have node.
 write_plist() {
-  local out="$1" label="$2" script="$3" stdout_log="$4"
+  local out="$1" label="$2" script="$3" process_name="$4" stdout_log="$5"
   cat > "$out" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -113,7 +120,9 @@ write_plist() {
   <string>$(xml_escape "$label")</string>
   <key>ProgramArguments</key>
   <array>
-    <string>$(xml_escape "$NODE_BIN")</string>
+    <string>/bin/sh</string>
+    <string>$(xml_escape "$REPO_DIR/bin/run-named-node")</string>
+    <string>$(xml_escape "$process_name")</string>
     <string>$(xml_escape "$REPO_DIR/$script")</string>
   </array>
   <key>WorkingDirectory</key>
@@ -133,6 +142,8 @@ write_plist() {
   <dict>
     <key>PATH</key>
     <string>$(xml_escape "$HOME")/.local/bin:$(xml_escape "$HOME")/.claude/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>NODE_BIN</key>
+    <string>$(xml_escape "$NODE_BIN")</string>
 $(emit_env_keys)
   </dict>
 </dict>
@@ -154,8 +165,8 @@ reload_service() {
   launchctl kickstart -k "$TARGET/$label"
 }
 
-write_plist "$BRIDGE_PLIST" "$BRIDGE_LABEL" "index.js" "$LOG_DIR/matron-bridge.log"
-write_plist "$VIEWER_PLIST" "$VIEWER_LABEL" "viewer/start.js" "$LOG_DIR/matron-bridge-viewer.log"
+write_plist "$BRIDGE_PLIST" "$BRIDGE_LABEL" "index.js" "matron-bridge" "$LOG_DIR/matron-bridge.log"
+write_plist "$VIEWER_PLIST" "$VIEWER_LABEL" "viewer/start.js" "matron-viewer" "$LOG_DIR/matron-bridge-viewer.log"
 
 reload_service "$BRIDGE_LABEL" "$BRIDGE_PLIST"
 reload_service "$VIEWER_LABEL" "$VIEWER_PLIST"

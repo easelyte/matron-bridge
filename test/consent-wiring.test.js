@@ -63,7 +63,10 @@ describe('consent wiring (source inspection)', () => {
     expect(askUser).toContain("'consent_decide',");
     expect(askUser).toContain("callConsent('decide', args, (d) => formatDecideAck(d, args))");
     const decide = askUser.slice(askUser.indexOf("'consent_decide',"), askUser.indexOf('async function sessionControlCall'));
-    expect(decide).toContain("kind: z.enum(['chat', 'spawn'])");
+    expect(decide).toContain("kind: z.enum(['chat', 'spawn', 'transfer'])");
+    const list = askUser.slice(askUser.indexOf("'consent_list',"), askUser.indexOf("'consent_decide',"));
+    expect(list).toMatch(/file transfers/);
+    expect(decide).toMatch(/flagged/);
     expect(decide).toContain("decision: z.enum(['approve', 'decline'])");
     expect(decide).toContain('reason: z.string().min(1).max(200)');
     // Both descriptions carry the scope and the guardrails the user approved.
@@ -81,6 +84,17 @@ describe('consent wiring (source inspection)', () => {
     expect(coord).toMatch(/operator has set a daily cap on approvals and it is reached/);
     expect(coord).toMatch(/Declines are never capped/);
     expect(coord).toMatch(/Tool permission prompts and secret requests are never yours to answer/);
+  });
+
+  it('the Coordinator prompt teaches how to judge a file transfer card', () => {
+    const preamble = readFileSync(new URL('../BRIDGE_COORDINATOR.md', import.meta.url), 'utf8');
+    expect(preamble).toMatch(/file transfer[^\n]*"triage a consent request"/i);
+    expect(coord).toMatch(/approve a file transfer only when the file, the sender and the receiving sessions match work you can see/i);
+    expect(coord).toMatch(/never approve one whose note does not explain it/i);
+    expect(coord).toMatch(/flagged[^\n]*always the user's/i);
+    expect(coord).toMatch(/work you relayed[^\n]*only while the user's "Let the Coordinator approve file transfers" switch is on/i);
+    expect(coord).toMatch(/Transfer approvals have a daily cap of their own/);
+    expect(coord).toMatch(/transfer[^\n]*reason on every decision/i);
   });
 
   it('the Coordinator may propose a contact request or mission share, and never answers a card', () => {

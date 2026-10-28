@@ -3,6 +3,7 @@ import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
 import { describe, expect, it, vi } from 'vitest';
 import { handleCodexControl, isCodexAuthError } from '../lib/codex-controls.js';
+import * as turnCause from '../lib/turn-cause.js';
 
 const source = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
 const settle = () => new Promise(resolve => setImmediate(resolve));
@@ -17,7 +18,7 @@ describe('Codex authentication recovery in the bridge', () => {
       _codexLastError: 'unexpected status 401 Unauthorized: Missing bearer or basic authentication in header, url: https://api.openai.com/v1/responses' };
     const reply = vi.fn();
     const finishCodexTurn = vi.fn(s => { s.busy = false; s._codexTurnFinished = true; });
-    const context = vm.createContext({ codex, session, clearInterval, shuttingDown: false, CODEX_APP_SERVER: true, isCodexAuthError,
+    const context = vm.createContext({ ...turnCause, codex, session, clearInterval, shuttingDown: false, CODEX_APP_SERVER: true, isCodexAuthError,
       refreshCodexTelemetry: vi.fn(), refreshCodexMetadata: vi.fn(), finishCodexTurn, offerCodexBuild: vi.fn(),
       runCodexControl: (s, command) => handleCodexControl(s, command, { reply }),
     });
@@ -42,7 +43,7 @@ describe('Codex authentication recovery in the bridge', () => {
         _codexLastError: authError ? '401 Unauthorized' : 'turn failed', turnCount: 0, toolCalls: [] };
       const runCodexControl = vi.fn();
       const flushPendingSessionQueue = vi.fn(s => { s.queuedMessages = null; return true; });
-      const context = vm.createContext({ codex, session, clearInterval, shuttingDown, CODEX_APP_SERVER: true,
+      const context = vm.createContext({ ...turnCause, codex, session, clearInterval, shuttingDown, CODEX_APP_SERVER: true,
         isCodexAuthError, runCodexControl, flushPendingSessionQueue,
         refreshCodexTelemetry: vi.fn(), refreshCodexMetadata: vi.fn(), offerCodexBuild: vi.fn(),
         flushResponse: vi.fn(), journalStreamClear: vi.fn(), journalSessionState: vi.fn(),

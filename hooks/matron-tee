@@ -2,7 +2,7 @@
 // hooks/matron-tee
 // Usage: matron-tee <log-path> -- <command> [args...]
 import { spawn } from 'child_process';
-import { createWriteStream, existsSync, mkdirSync } from 'fs';
+import { createWriteStream, existsSync, mkdirSync, openSync } from 'fs';
 import path from 'path';
 
 const args = process.argv.slice(2);
@@ -21,12 +21,26 @@ const MAX_BYTES = parseInt(process.env.MATRON_LIVE_OUTPUT_MAX_BYTES || String(50
 
 const dir = path.dirname(logPath);
 if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
-const log = createWriteStream(logPath);
+// Owner-only and exclusive: the log holds everything the command printed,
+// and /tmp is shared with every other account on the machine. If the name
+// is already taken (a file, directory or symlink someone else put there),
+// run the command without a log rather than write into it.
+let log = null;
+try {
+  log = createWriteStream(null, { fd: openSync(logPath, 'wx', 0o600) });
+} catch (err) {
+  process.stderr.write(`[matron-tee: live log disabled: ${err.code || err.message}]\n`);
+}
 
-log.on('error', err => {
+log?.on('error', err => {
   process.stderr.write(`[matron-tee: log write error: ${err.message}]\n`);
   process.exit(126);
 });
+
+function endLog(done) {
+  if (log) log.end(done);
+  else done();
+}
 
 let bytesWritten = 0;
 let truncated = false;
@@ -39,15 +53,15 @@ function pipe(source, sink) {
     }
     if (bytesWritten + chunk.length > MAX_BYTES) {
       const remaining = MAX_BYTES - bytesWritten;
-      if (remaining > 0) log.write(chunk.subarray(0, remaining));
-      log.write(`\n[matron-tee: output truncated at ${MAX_BYTES} bytes]\n`);
+      if (remaining > 0) log?.write(chunk.subarray(0, remaining));
+      log?.write(`\n[matron-tee: output truncated at ${MAX_BYTES} bytes]\n`);
       truncated = true;
       bytesWritten = MAX_BYTES;
       sink.write(chunk);
       return;
     }
     bytesWritten += chunk.length;
-    log.write(chunk);
+    log?.write(chunk);
     sink.write(chunk);
   });
 }
@@ -57,13 +71,13 @@ pipe(child.stdout, process.stdout);
 pipe(child.stderr, process.stderr);
 
 child.on('close', (code, signal) => {
-  log.end(() => {
+  endLog(() => {
     if (signal) process.kill(process.pid, signal);
     else process.exit(code ?? 1);
   });
 });
 
 child.on('error', err => {
-  log.write(`\n[matron-tee: spawn error: ${err.message}]\n`);
-  log.end(() => process.exit(127));
+  log?.write(`\n[matron-tee: spawn error: ${err.message}]\n`);
+  endLog(() => process.exit(127));
 });

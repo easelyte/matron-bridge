@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { createWakeHandler, WAKE_COALESCE_MS } from '../lib/wake-route.js';
+import { createWakeHandler, WAKE_COALESCE_MS, wakeTokenOk } from '../lib/wake-route.js';
 
 const CONVO = 'convo-a';
 const TEXT = 'check the overnight queue';
@@ -133,6 +133,20 @@ describe('wake route', () => {
     expect(deps.findSession).toHaveBeenCalledWith(CONVO);
     expect(deps.routeText).toHaveBeenCalledWith(session, TEXT);
     expect(deps.findSession).not.toHaveBeenCalledWith('convo-b');
+  });
+
+  describe('the optional token', () => {
+    it('is not required when none is configured', () => {
+      expect(wakeTokenOk('', undefined)).toBe(true);
+      expect(wakeTokenOk(undefined, 'anything')).toBe(true);
+    });
+    it('must match exactly when configured', () => {
+      expect(wakeTokenOk('s3cret', 's3cret')).toBe(true);
+      expect(wakeTokenOk('s3cret', 's3cre')).toBe(false);
+      expect(wakeTokenOk('s3cret', 'S3CRET')).toBe(false);
+      expect(wakeTokenOk('s3cret', undefined)).toBe(false);
+      expect(wakeTokenOk('s3cret', ['s3cret'])).toBe(false);
+    });
   });
 });
 

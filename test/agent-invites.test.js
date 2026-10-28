@@ -12,8 +12,9 @@ function makeInvites(overrides = {}) {
   const injectRequestTurn = overrides.injectRequestTurn ?? vi.fn();
   const notifyRoom = overrides.notifyRoom ?? vi.fn();
   const log = overrides.log ?? { warn: vi.fn() };
-  const inv = createAgentInvites({ sendRoomOp, rooms, injectRequestTurn, notifyRoom, log });
-  return { inv, sendRoomOp, rooms, injectRequestTurn, notifyRoom, log };
+  const onMemberLeft = overrides.onMemberLeft ?? vi.fn();
+  const inv = createAgentInvites({ sendRoomOp, rooms, injectRequestTurn, notifyRoom, onMemberLeft, log });
+  return { inv, sendRoomOp, rooms, injectRequestTurn, notifyRoom, onMemberLeft, log };
 }
 
 afterEach(() => {
@@ -32,6 +33,31 @@ describe('createAgentInvites', () => {
       inv.invite({ roomId: 'r1', targetDeviceId: 7, justification: 'j' });
       const op = sendRoomOp.mock.calls[0][0];
       expect('target_convo_id' in op).toBe(false);
+    });
+
+    it('a talk request names the person: target_person, and no target device or conversation', async () => {
+      const { inv, sendRoomOp, rooms } = makeInvites();
+      rooms.record('r1', { role: 'owner', state: 'pending', sessionRoomId: '!sess', person: 'bob', talk: true });
+      inv.invite({ roomId: 'r1', targetPerson: 'bob', fromConvoId: 'c1', topic: 'cover editor', justification: 'j', mission: 4 });
+      const op = sendRoomOp.mock.calls[0][0];
+      expect(op).toEqual({ op: 'agent_invite', room_id: 'r1', target_person: 'bob', from_convo_id: 'c1', topic: 'cover editor', mission: 4, justification: 'j' });
+    });
+
+    it('sends the turn\'s causes verbatim on the agent_invite frame', async () => {
+      const { inv, sendRoomOp } = makeInvites({ sendRoomOp: vi.fn(() => false) });
+      const causes = [{ kind: 'item_reply', ref: 'item:3@2026-01-01T00:00:00.000Z', at: 5 }];
+      await inv.invite({ roomId: 'r1', targetDeviceId: 7, fromConvoId: 'c1', justification: 'j', causes });
+      expect(sendRoomOp).toHaveBeenCalledWith({
+        op: 'agent_invite', room_id: 'r1', target_device_id: 7, from_convo_id: 'c1', justification: 'j', causes,
+      });
+    });
+
+    it('omits causes entirely when the turn has none', async () => {
+      const { inv, sendRoomOp } = makeInvites({ sendRoomOp: vi.fn(() => false) });
+      await inv.invite({ roomId: 'r1', targetDeviceId: 7, justification: 'j', causes: null });
+      await inv.invite({ roomId: 'r1', targetPerson: 'bob', justification: 'j' });
+      expect('causes' in sendRoomOp.mock.calls[0][0]).toBe(false);
+      expect('causes' in sendRoomOp.mock.calls[1][0]).toBe(false);
     });
 
     it('happy path: delivered -> idle ack -> accept answer, registry joined', async () => {
@@ -347,6 +373,21 @@ describe('createAgentInvites', () => {
       });
     });
 
+    it('sends the turn\'s causes verbatim on the agent_join frame', async () => {
+      const { inv, sendRoomOp } = makeInvites({ sendRoomOp: vi.fn(() => false) });
+      const causes = [{ kind: 'room_message', ref: 'room:r9', at: 5 }];
+      await inv.join({ roomId: 'r2', justification: 'j', fromConvoId: 'convo-mine', causes });
+      expect(sendRoomOp).toHaveBeenCalledWith({
+        op: 'agent_join', room_id: 'r2', from_convo_id: 'convo-mine', justification: 'j', causes,
+      });
+    });
+
+    it('omits causes from the agent_join frame when the turn has none', async () => {
+      const { inv, sendRoomOp } = makeInvites({ sendRoomOp: vi.fn(() => false) });
+      await inv.join({ roomId: 'r2', justification: 'j', causes: null });
+      expect('causes' in sendRoomOp.mock.calls[0][0]).toBe(false);
+    });
+
     it('omits from_convo_id entirely when the session has no journal convo yet', async () => {
       // Same absent-never-null discipline as invite()'s: the journal
       // validates a PRESENT from_convo_id against this device and fails the
@@ -616,6 +657,18 @@ describe('createAgentInvites', () => {
       notifyRoom.mockClear();
       inv.onInviteFrame({ kind: 'invite', event: 'left', room_id: 'ghost', from_device_id: 7 });
       expect(notifyRoom).not.toHaveBeenCalled();
+    });
+
+    it('member_left keeps the room live, owes no turn, and hands the leaver on', () => {
+      const { inv, rooms, notifyRoom, onMemberLeft } = makeInvites();
+      rooms.record('r1', { role: 'owner', state: 'joined', sessionRoomId: '!sess' });
+      inv.onInviteFrame({ kind: 'invite', event: 'member_left', room_id: 'r1', from_device_id: 9, participants: [1, 7] });
+      expect(rooms.get('r1').state).toBe('joined');
+      expect(rooms.isActive('r1')).toBe(true);
+      expect(notifyRoom).not.toHaveBeenCalled();
+      expect(onMemberLeft).toHaveBeenCalledWith('r1', 9);
+      inv.onInviteFrame({ kind: 'invite', event: 'member_left', room_id: 'ghost', from_device_id: 9 });
+      expect(onMemberLeft).toHaveBeenCalledTimes(1);
     });
 
     it('unknown events are ignored', () => {

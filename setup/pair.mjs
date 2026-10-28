@@ -22,6 +22,7 @@ import {
   hmacSecretFor,
   writeEnvFile,
   currentToken,
+  storedTokenFor,
   strandedTokenFile,
   testConnection,
   pairWithApp,
@@ -62,6 +63,28 @@ export function pairingJournalUrl(raw) {
     throw new Error(`${url.host} is remote; pairing over plain ws:// would send the agent token in cleartext — use https:// or wss://`);
   }
   return url.toString();
+}
+
+// Which stored token, if any, `npm run pair` may check against journalUrl
+// before pairing (exported for tests). Returns { token, note }: token is ''
+// unless .env names one that was saved for this same journal; note explains
+// why a stored token is being left out, for the operator.
+export function existingTokenCheck(existing, journalUrl, { tokenPath = TOKEN_PATH } = {}) {
+  const token = storedTokenFor(existing, journalUrl);
+  if (token) return { token, note: '' };
+  if (currentToken(existing)) {
+    return {
+      token: '',
+      note: `The stored agent token was paired with ${existing.JOURNAL_WS_URL || 'another journal'}, not ${journalUrl}; it stays unused here and a new agent is paired with this journal.`,
+    };
+  }
+  if (strandedTokenFile(existing, tokenPath)) {
+    return {
+      token: '',
+      note: `${tokenPath} holds a token from an unfinished setup with no record of its journal; pairing a new agent token instead (revoke the old agent in the Matron app if it is listed).`,
+    };
+  }
+  return { token: '', note: '' };
 }
 
 // Point .env at the token file. The token itself is already safe on disk, so
@@ -113,20 +136,18 @@ async function main() {
   // Refuse to replace a token that still works: pairing mints a NEW agent
   // device in the journal, and the old one would be orphaned (still listed,
   // still valid) until someone revokes it in the app.
-  // A token a first-run wizard paired and stored before it was interrupted
-  // (so .env never pointed at it) is adopted rather than re-paired.
-  const stranded = strandedTokenFile(existing);
-  const oldToken = currentToken(existing) || (stranded ? readIfExists(stranded).trim() : '');
+  // The check only ever sends the stored token to the journal it was saved
+  // with (the JOURNAL_WS_URL beside it in .env): pairing with a different
+  // journal pairs afresh without presenting the old journal's token there.
+  // A token .env never pointed at (left by a first-run wizard interrupted
+  // before it wrote .env) has no record of its journal, so it is replaced.
+  const { token: oldToken, note } = existingTokenCheck(existing, journalUrl);
+  if (note) console.log(note);
   if (oldToken && !opts.force) {
     process.stdout.write(`Checking the current agent token against ${journalUrl} ... `);
     try {
       const name = await testConnection(journalUrl, oldToken);
       console.log('ok');
-      if (stranded) {
-        saveEnv(existing, journalUrl);
-        console.log(`Found agent "${name}" already paired in ${stranded}; .env now points at it.`);
-        return;
-      }
       console.log(`This bridge is already paired as agent "${name}". Nothing to do.`);
       console.log('To pair it again anyway (e.g. as a different agent), re-run with --force:');
       console.log('  npm run pair -- --force');

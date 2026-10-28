@@ -152,7 +152,7 @@ describe('createJournalInputConsumer', () => {
 
     it('does not trust the flag from a non-agent, non-user sender', () => {
       const deps = makeDeps({ routeItemToSession: vi.fn() });
-      createJournalInputConsumer(deps)(baseFrame({ type: 'item', sender: 'person:eve', payload: agentPayload() }));
+      createJournalInputConsumer(deps)(baseFrame({ type: 'item', sender: 'device:eve', payload: agentPayload() }));
       expect(deps.routeItemToSession).not.toHaveBeenCalled();
     });
 
@@ -261,7 +261,15 @@ describe('createJournalInputConsumer', () => {
     const [session, body, ctx] = deps.routeTextToSession.mock.calls[0];
     expect(session).toEqual({ claudeSessionId: 'convo-1' });
     expect(body).toBe('hello there');
-    expect(ctx).toEqual({ username: 'alice' });
+    expect(ctx).toEqual({ username: 'alice', seq: 1, convoId: 'convo-1' });
+  });
+
+  it('hands routeTextToSession the frame\'s seq and convo id, so the turn can name the message that started it', () => {
+    const deps = makeDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(baseFrame({ seq: 42, payload: { body: 'go' } }));
+    const [, , ctx] = deps.routeTextToSession.mock.calls[0];
+    expect(ctx).toMatchObject({ seq: 42, convoId: 'convo-1', username: 'alice' });
   });
 
   it('skips a text event with no usable body (missing/non-string), logs, never throws', () => {
@@ -303,7 +311,7 @@ describe('createJournalInputConsumer', () => {
     const [session, body, ctx] = deps.routeTextToSession.mock.calls[0];
     expect(session).toEqual({ claudeSessionId: 'convo-1' });
     expect(body).toBe('📌 Task #1 "x" — alice commented:\nhi');
-    expect(ctx).toEqual({ username: 'alice' });
+    expect(ctx).toEqual({ username: 'alice', seq: 1, convoId: 'convo-1' });
   });
 
   it('routes a prompt_reply event for a known session to routePromptReply with target_seq/choice/text', () => {
@@ -314,6 +322,18 @@ describe('createJournalInputConsumer', () => {
     const [session, answer, ctx] = deps.routePromptReply.mock.calls[0];
     expect(session).toEqual({ claudeSessionId: 'convo-1' });
     expect(answer).toEqual({ target_seq: 5, choice: 'opt_a', text: null });
+    // The reply row itself, which the answer's turn cites as its cause.
+    expect(ctx).toEqual({ username: 'alice', seq: 1, convoId: 'convo-1' });
+  });
+
+  it('only an answer to a pending prompt names its reply row; a picker tap does not', () => {
+    const deps = makeDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(baseFrame({ seq: 7, type: 'prompt', sender: 'agent:box-a', payload: { question: 'Model?', mode: 'pick_one', options: [{ id: 'model-sonnet', label: 'Sonnet', value: 'model:sonnet' }] } }));
+    consumer(baseFrame({ seq: 8, type: 'prompt_reply', payload: { target_seq: 7, choice: 'model:sonnet', text: null } }));
+    expect(deps.routePromptReply).toHaveBeenCalledTimes(1);
+    const [, answer, ctx] = deps.routePromptReply.mock.calls[0];
+    expect(answer.picker).toBe(true);
     expect(ctx).toEqual({ username: 'alice' });
   });
 
@@ -324,7 +344,7 @@ describe('createJournalInputConsumer', () => {
     expect(deps.routePromptReply).toHaveBeenCalledWith(
       { claudeSessionId: 'convo-1' },
       { target_seq: undefined, choice: null, text: null },
-      { username: 'alice' },
+      { username: 'alice', seq: 1, convoId: 'convo-1' },
     );
   });
 
@@ -369,7 +389,7 @@ describe('createJournalInputConsumer', () => {
     consumer(baseFrame({ convo_id: 'convo-1', payload: { body: 'new /tmp/foo' } }));
     expect(deps.handleControlCommand).not.toHaveBeenCalled();
     expect(deps.routeTextToSession).toHaveBeenCalledWith(
-      { claudeSessionId: 'convo-1' }, 'new /tmp/foo', { username: 'alice' },
+      { claudeSessionId: 'convo-1' }, 'new /tmp/foo', { username: 'alice', seq: 1, convoId: 'convo-1' },
     );
   });
 
@@ -747,7 +767,7 @@ describe('createJournalInputConsumer — auto-resume of reaped sessions (resumeS
     consumer(baseFrame({ payload: { body: '  hello again  ' } }));
     expect(deps.resumeSessionForConvo).toHaveBeenCalledWith('convo-1', { username: 'alice' });
     expect(deps.routeTextToSession).toHaveBeenCalledWith(
-      { claudeSessionId: 'convo-1', resumed: true }, 'hello again', { username: 'alice' },
+      { claudeSessionId: 'convo-1', resumed: true }, 'hello again', { username: 'alice', seq: 1, convoId: 'convo-1' },
     );
     expect(deps.noticeUnknownConvo).not.toHaveBeenCalled();
   });
@@ -983,6 +1003,70 @@ describe('createJournalInputConsumer — auto-resume of reaped sessions (resumeS
       expect(deps.noticeUnknownConvo).toHaveBeenCalledWith('convo-1', { type: 'prompt_reply', username: 'alice' });
     });
   });
+
+  // The login-expired card is posted when Claude can't reply, and the user may
+  // tap Log in after the idle reaper took the session: a verified tap wakes
+  // the session and then dispatches as a picker tap, like a typed /login.
+  describe('login card: a verified Log in tap wakes a reaped session', () => {
+    const loginCard = (seq, sender = 'agent:box-2') => baseFrame({
+      seq, sender, type: 'prompt',
+      payload: { question: 'Claude\'s login has expired', options: [{ id: 'login-start', value: 'login:start' }] },
+    });
+    const loginReply = (targetSeq, choice = 'login:start') => baseFrame({
+      seq: 300, type: 'prompt_reply',
+      payload: { target_seq: targetSeq, choice, text: null },
+    });
+    const woken = { claudeSessionId: 'convo-1', alive: true };
+
+    it('resumes the session and routes the tap as a picker tap', () => {
+      const deps = { ...makeDeps(), resumeSessionForConvo: vi.fn(() => woken) };
+      const consumer = createJournalInputConsumer(deps);
+      consumer(loginCard(20));
+      consumer(loginReply(20));
+      expect(deps.resumeSessionForConvo).toHaveBeenCalledWith('convo-1', { username: 'alice' });
+      expect(deps.routePromptReply).toHaveBeenCalledTimes(1);
+      expect(deps.routePromptReply.mock.calls[0][0]).toBe(woken);
+      expect(deps.routePromptReply.mock.calls[0][1]).toMatchObject({ choice: 'login:start', picker: true });
+      expect(deps.noticeUnknownConvo).not.toHaveBeenCalled();
+    });
+
+    it('still works after evictConvo (session teardown)', () => {
+      const deps = { ...makeDeps(), resumeSessionForConvo: vi.fn(() => woken) };
+      const consumer = createJournalInputConsumer(deps);
+      consumer(loginCard(20));
+      consumer.evictConvo('convo-1');
+      consumer(loginReply(20));
+      expect(deps.resumeSessionForConvo).toHaveBeenCalledTimes(1);
+      expect(deps.routePromptReply.mock.calls[0][1]).toMatchObject({ choice: 'login:start', picker: true });
+    });
+
+    it('is single-use: a second tap does not log in again', () => {
+      const deps = { ...makeDeps(), resumeSessionForConvo: vi.fn(() => woken) };
+      const consumer = createJournalInputConsumer(deps);
+      consumer(loginCard(20));
+      consumer(loginReply(20));
+      consumer(loginReply(20));
+      expect(deps.routePromptReply.mock.calls.filter(c => c[1]?.picker)).toHaveLength(1);
+    });
+
+    it('does not wake anything for a login: choice no bridge card offered', () => {
+      const deps = { ...makeDeps(), resumeSessionForConvo: vi.fn(() => woken) };
+      const consumer = createJournalInputConsumer(deps);
+      consumer(loginCard(20, 'user:alice')); // a client-published lookalike
+      consumer(loginReply(20));
+      consumer(loginReply(21));
+      expect(deps.resumeSessionForConvo).not.toHaveBeenCalled();
+      expect(deps.routePromptReply).not.toHaveBeenCalled();
+    });
+
+    it('does not wake anything for a value the card never offered', () => {
+      const deps = { ...makeDeps(), resumeSessionForConvo: vi.fn(() => woken) };
+      const consumer = createJournalInputConsumer(deps);
+      consumer(loginCard(20));
+      consumer(loginReply(20, 'login:logout'));
+      expect(deps.resumeSessionForConvo).not.toHaveBeenCalled();
+    });
+  });
 });
 
 // The wiring half of the auto-resume seam: index.js can't be imported
@@ -1183,7 +1267,8 @@ describe('createJournalInputConsumer — media (file/image) routing', () => {
       type: 'file', blobRef: 'blob-1', contentType: 'application/pdf',
       name: 'report.pdf', size: 1234, dims: null, caption: null, batch: null,
     });
-    expect(ctx).toEqual({ username: 'alice' });
+    // seq + convoId name the message for the turn's cause, as for text.
+    expect(ctx).toEqual({ username: 'alice', seq: 1, convoId: 'convo-1' });
     expect(deps.routeTextToSession).not.toHaveBeenCalled();
   });
 
@@ -1441,7 +1526,7 @@ describe('createJournalInputConsumer — queue-action-shaped labels are ordinary
     expect(deps.routePromptReply).toHaveBeenCalledWith(
       expect.anything(),
       { target_seq: 10, choice: 'cancel:2', text: null },
-      { username: 'alice' },
+      { username: 'alice', seq: 100, convoId: 'convo-1' },
     );
   });
 
@@ -1887,6 +1972,18 @@ describe('agent-chat room carve-out', () => {
     expect(deps.routeRoomFrame).toHaveBeenCalledTimes(2);
   });
 
+  // The journal's own room lines for a transfer ("Not sent: ... declined",
+  // "Delivered ...", expired, failed) are for the people reading the room.
+  // They never reach a session, so the sending bridge tells its session
+  // itself (lib/transfer-outcome.js) with no duplicate.
+  it('drops a journal-voice line in a room (sender journal)', () => {
+    const deps = makeRoomDeps();
+    const consumer = createJournalInputConsumer(deps);
+    consumer(roomFrame({ sender: 'journal', payload: { body: 'Not sent: `x` was declined' } }));
+    expect(deps.routeRoomFrame).not.toHaveBeenCalled();
+    expect(deps.routeTextToSession).not.toHaveBeenCalled();
+  });
+
   it('drops this bridge\'s own echo (sender agent:<self>)', () => {
     const deps = makeRoomDeps();
     const consumer = createJournalInputConsumer(deps);
@@ -2094,7 +2191,8 @@ describe('index.js agent-chat room wiring (source inspection)', () => {
     const rd = src.indexOf('createRoomDelivery({');
     expect(rd).toBeGreaterThan(-1);
     const rdEnd = src.indexOf('});', rd);
-    expect(src.slice(rd, rdEnd)).toMatch(/isBusy: sessionOccupiedForRoomDelivery/);
+    // Another person's turn uses the stricter gate (no turn running at all).
+    expect(src.slice(rd, rdEnd)).toMatch(/isBusy: \(session, \{ foreign = false \} = \{\}\) => \(foreign\s*\? sessionOccupiedForForeignTurn\(session\)\s*: sessionOccupiedForRoomDelivery\(session\)\)/);
     // The injected turn must not re-mirror into the session's own convo.
     expect(src.slice(rd, rdEnd)).toMatch(/skipJournalMirror: true/);
   });
@@ -2209,7 +2307,7 @@ describe('index.js agent-chat room wiring (source inspection)', () => {
       expect(count).toBeGreaterThan(-1);
       expect(flush).toBeGreaterThan(count);
       // Nothing queued => nothing to close, and no notice at all.
-      expect(body).toMatch(/if \(!queued\) return;/);
+      expect(body).toMatch(/if \(!queued \|\| flushed === null\) return;/);
       // A refused inject must say so rather than leave the ⏳ hanging.
       // A flush is one turn's worth (own messages and each other person's
       // room go separately), so the notice counts what actually went out.
@@ -2554,5 +2652,118 @@ describe('coordinator events', () => {
     onEvent(baseFrame({ type: 'coordinator', payload: { role: 'assigned' } }));
     expect(routeRoomFrame).not.toHaveBeenCalled();
     expect(seams.onCoordinatorEvent).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('createJournalInputConsumer — user: frames must be the owner', () => {
+  function makeDeps(overrides = {}) {
+    return {
+      isControlConvo: vi.fn((id) => id === 'control-1'),
+      handleControlCommand: vi.fn(),
+      findSessionByConvoId: vi.fn(() => ({ claudeSessionId: 'convo-1' })),
+      routeTextToSession: vi.fn(),
+      routePromptReply: vi.fn(),
+      noticeUnknownConvo: vi.fn(),
+      log: silentLog,
+      ...overrides,
+    };
+  }
+
+  it('routes the owner and drops another user once the owner is known', () => {
+    const onForeignUser = vi.fn();
+    const deps = makeDeps({ ownerName: () => 'alice', onForeignUser });
+    const consumer = createJournalInputConsumer(deps);
+    consumer(baseFrame({ sender: 'user:alice' }));
+    expect(deps.routeTextToSession).toHaveBeenCalledTimes(1);
+    consumer(baseFrame({ sender: 'user:bob', seq: 2 }));
+    expect(deps.routeTextToSession).toHaveBeenCalledTimes(1);
+    expect(onForeignUser).toHaveBeenCalledWith('bob');
+    consumer(baseFrame({ sender: 'user:bob', convo_id: 'control-1', payload: { body: '/start' } }));
+    expect(deps.handleControlCommand).not.toHaveBeenCalled();
+  });
+
+  it('keeps the old behaviour when the owner name is not tracked', () => {
+    const deps = makeDeps();
+    createJournalInputConsumer(deps)(baseFrame({ sender: 'user:bob' }));
+    expect(deps.routeTextToSession).toHaveBeenCalledTimes(1);
+  });
+
+  it('holds user messages while the owner name is unknown and replays the owner\'s once it is known', async () => {
+    let owner = null;
+    let resolveRefresh;
+    const onOwnerUnknown = vi.fn(() => new Promise((r) => { resolveRefresh = r; }));
+    const deps = makeDeps({ ownerName: () => owner, onOwnerUnknown });
+    const consumer = createJournalInputConsumer(deps);
+    consumer(baseFrame({ sender: 'user:bob', seq: 1 }));
+    consumer(baseFrame({ sender: 'user:alice', seq: 2 }));
+    consumer(baseFrame({ sender: 'user:bob', convo_id: 'control-1', payload: { body: '/start' }, seq: 3 }));
+    expect(deps.routeTextToSession).not.toHaveBeenCalled();
+    expect(deps.handleControlCommand).not.toHaveBeenCalled();
+    expect(onOwnerUnknown).toHaveBeenCalled();
+    owner = 'alice';
+    resolveRefresh('alice');
+    await Promise.resolve(); await Promise.resolve();
+    expect(deps.routeTextToSession).toHaveBeenCalledTimes(1);
+    expect(deps.routeTextToSession.mock.calls[0][2]).toMatchObject({ seq: 2 });
+    expect(deps.handleControlCommand).not.toHaveBeenCalled();
+  });
+
+  it('keeps holding when the refresh settles without a name', async () => {
+    const deps = makeDeps({ ownerName: () => null, onOwnerUnknown: () => Promise.resolve(null) });
+    const consumer = createJournalInputConsumer(deps);
+    consumer(baseFrame({ sender: 'user:alice' }));
+    await Promise.resolve(); await Promise.resolve();
+    expect(deps.routeTextToSession).not.toHaveBeenCalled();
+  });
+
+  it('replays at once when the owner lookup answers synchronously', () => {
+    let owner = null;
+    const deps = makeDeps({ ownerName: () => owner, onOwnerUnknown: () => { owner = 'alice'; } });
+    createJournalInputConsumer(deps)(baseFrame({ sender: 'user:alice' }));
+    expect(deps.routeTextToSession).toHaveBeenCalledTimes(1);
+  });
+
+  it('asks again with backoff while messages are held, and replays when the name comes in', async () => {
+    let owner = null;
+    const timers = [];
+    const onOwnerUnknown = vi.fn(() => Promise.resolve(null));
+    const deps = makeDeps({ ownerName: () => owner, onOwnerUnknown, setTimer: (fn, ms) => { timers.push({ fn, ms }); return { unref() {} }; }, clearTimer: () => {} });
+    createJournalInputConsumer(deps)(baseFrame({ sender: 'user:alice' }));
+    await Promise.resolve(); await Promise.resolve();
+    expect(timers).toHaveLength(1);
+    expect(timers[0].ms).toBe(5_000);
+    owner = 'alice';
+    timers[0].fn();
+    await Promise.resolve(); await Promise.resolve();
+    expect(onOwnerUnknown).toHaveBeenCalledTimes(2);
+    expect(deps.routeTextToSession).toHaveBeenCalledTimes(1);
+  });
+
+  it('lets the caller replay held messages when another path learns the name', () => {
+    let owner = null;
+    const deps = makeDeps({ ownerName: () => owner, onOwnerUnknown: () => new Promise(() => {}) });
+    const consumer = createJournalInputConsumer(deps);
+    consumer(baseFrame({ sender: 'user:alice' }));
+    expect(deps.routeTextToSession).not.toHaveBeenCalled();
+    owner = 'alice';
+    consumer.replayHeldOwnerFrames();
+    expect(deps.routeTextToSession).toHaveBeenCalledTimes(1);
+  });
+
+  it('holds a room message from a user while the owner name is unknown', () => {
+    const routeRoomFrame = vi.fn();
+    const deps = makeDeps({ ownerName: () => null, roomFor: (id) => (id === 'room-1' ? { roomId: 'room-1' } : null), routeRoomFrame });
+    createJournalInputConsumer(deps)(baseFrame({ convo_id: 'room-1', sender: 'user:bob' }));
+    expect(routeRoomFrame).not.toHaveBeenCalled();
+  });
+
+  it('drops another user in a room', () => {
+    const routeRoomFrame = vi.fn();
+    const deps = makeDeps({ ownerName: () => 'alice', roomFor: (id) => (id === 'room-1' ? { roomId: 'room-1' } : null), routeRoomFrame });
+    const consumer = createJournalInputConsumer(deps);
+    consumer(baseFrame({ convo_id: 'room-1', sender: 'user:bob' }));
+    expect(routeRoomFrame).not.toHaveBeenCalled();
+    consumer(baseFrame({ convo_id: 'room-1', sender: 'user:alice' }));
+    expect(routeRoomFrame).toHaveBeenCalledTimes(1);
   });
 });

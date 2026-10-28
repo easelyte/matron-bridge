@@ -15,6 +15,9 @@ const fixture = JSON.parse(readFileSync(
   'utf8',
 ));
 
+// The turn's causes (lib/turn-cause.js) ride beside the tier; these tests pin the tier.
+const withoutCauses = ({ causes: _causes, ...rest }) => rest;
+
 function sourceBetween(startMarker, endMarker) {
   const start = indexSource.indexOf(startMarker);
   const end = indexSource.indexOf(endMarker, start);
@@ -215,7 +218,7 @@ describe('journalOnPeerMessage receive behavior', () => {
     runtime.journalOnPeerMessage(peerFrame());
 
     assert.equal(runtime.injectCalls.length, 1);
-    assert.deepEqual(runtime.injectCalls[0], [
+    assert.deepEqual([runtime.injectCalls[0][0], runtime.injectCalls[0][1], withoutCauses(runtime.injectCalls[0][2])], [
       runtime.target,
       `[peer «Sender Session» (codex) · ${marker}] Coordinate on the release checklist.`,
       { skipJournalMirror: true, turnTier: 'peer-coalesced' },
@@ -626,11 +629,11 @@ describe('journalOnPeerMessage priority preemption', () => {
   it('tags an idle-injected peer turn with its priority tier so a later priority peer can outrank it', () => {
     const normal = makeRuntime();
     normal.journalOnPeerMessage(peerFrame());
-    assert.deepEqual(normal.injectCalls[0][2], { skipJournalMirror: true, turnTier: 'peer-coalesced' });
+    assert.deepEqual(withoutCauses(normal.injectCalls[0][2]), { skipJournalMirror: true, turnTier: 'peer-coalesced' });
 
     const priority = makeRuntime();
     priority.journalOnPeerMessage(priorityFrame());
-    assert.deepEqual(priority.injectCalls[0][2], { skipJournalMirror: true, turnTier: 'peer-priority' });
+    assert.deepEqual(withoutCauses(priority.injectCalls[0][2]), { skipJournalMirror: true, turnTier: 'peer-priority' });
   });
 
   it('flushes a pending priority peer BEFORE a lower-tier room batch at turn end', () => {
@@ -755,7 +758,7 @@ describe('journalOnPeerMessage priority preemption', () => {
     target.busy = false;
     assert.equal(runtime.peerDelivery.flush(target, target.roomId), true);
     // The mixed batch flushes as a peer-priority turn (any priority present).
-    assert.deepEqual(runtime.injectCalls[0][2], { skipJournalMirror: true, turnTier: 'peer-priority' });
+    assert.deepEqual(withoutCauses(runtime.injectCalls[0][2]), { skipJournalMirror: true, turnTier: 'peer-priority' });
   });
 });
 

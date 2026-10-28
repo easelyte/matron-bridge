@@ -195,7 +195,7 @@ describe('playbook directory (spec 2026-10-01 coordinator routines)', () => {
       expect(heads.some((h) => h === `## Procedure: ${want}`), want).toBe(true);
     }
     const routines = files('routines/');
-    expect(routines).toEqual(['briefing.md', 'context-over.md', 'daily-sweep.md', 'deploy-window.md', 'disk-low.md', 'project-status.md', 'session-health.md', 'stalled-session.md', 'unseen-digest.md']);
+    expect(routines).toEqual(['briefing.md', 'context-over.md', 'daily-sweep.md', 'deploy-window.md', 'disk-low.md', 'project-status.md', 'session-health.md', 'spare-allowance.md', 'stalled-session.md', 'unseen-digest.md']);
     for (const n of routines) {
       const text = readFileSync(new URL(`routines/${n}`, root), 'utf8');
       expect(text.split('\n')[0]).toMatch(new RegExp(`^## Routine: ${n.replace(/\.md$/, '')} — `));
@@ -309,6 +309,25 @@ describe('memory block plumbing (spec 2026-09-27 memories; every session since 2
     expect(coordinatorTurnText('assigned', 'BLOCK', 'MEM')).toBe(`${COORDINATOR_ASSIGNED_PREFIX}\n\nBLOCK\n\nMEM`);
     expect(coordinatorTurnText('assigned', 'BLOCK')).toBe(`${COORDINATOR_ASSIGNED_PREFIX}\n\nBLOCK`);
     expect(coordinatorTurnText('released', 'BLOCK', 'MEM')).toBe(COORDINATOR_RELEASED_TURN);
+  });
+});
+
+describe('MATRON.md block plumbing', () => {
+  it('sits after the notices and before the memories for an ordinary session, on Claude and Codex', () => {
+    expect(claudeCoordinatorArgs({ coordinator: false, basePrompt: 'BASE', block: 'BLOCK', noticesBlock: 'NOT', matronMdBlock: 'MD', memoryBlock: 'MEM' }).appendSystemPrompt)
+      .toBe('BASE\n\nNOT\n\nMD\n\nMEM');
+    expect(codexCoordinatorOptions({ coordinator: false, baseInstructions: 'B', block: 'K', baseSandbox: 'x', noticesBlock: 'NOT', matronMdBlock: 'MD', memoryBlock: 'MEM' }).developerInstructions)
+      .toBe('B\n\nNOT\n\nMD\n\nMEM');
+  });
+  it('sits after the Coordinator brief and the notices, before the memories', () => {
+    expect(claudeCoordinatorArgs({ coordinator: true, basePrompt: 'BASE', block: 'BLOCK', noticesBlock: 'NOT', matronMdBlock: 'MD', memoryBlock: 'MEM' }).appendSystemPrompt)
+      .toBe('BASE\n\nBLOCK\n\nNOT\n\nMD\n\nMEM');
+    expect(codexCoordinatorOptions({ coordinator: true, baseInstructions: 'B', block: 'K', baseSandbox: 'x', noticesBlock: 'NOT', matronMdBlock: 'MD', memoryBlock: 'MEM' }).developerInstructions)
+      .toBe('B\n\nK\n\nNOT\n\nMD\n\nMEM');
+  });
+  it('an empty block appends nothing, so a repository without MATRON.md gets the same prompt as before', () => {
+    expect(claudeCoordinatorArgs({ coordinator: false, basePrompt: 'BASE', block: 'BLOCK', matronMdBlock: '', memoryBlock: 'MEM' }).appendSystemPrompt).toBe('BASE\n\nMEM');
+    expect(codexCoordinatorOptions({ coordinator: false, baseInstructions: 'B', block: 'K', baseSandbox: 'x', memoryBlock: 'MEM' }).developerInstructions).toBe('B\n\nMEM');
   });
 });
 

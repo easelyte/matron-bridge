@@ -44,7 +44,7 @@ describe('renderTrackerLinks', () => {
 
   it('renders the https form, naming every record kind and the per-user rule', () => {
     const out = renderTrackerLinks(text, BASE);
-    expect(out).toContain('`[#12](https://chat.example/u/alice/12)`');
+    expect(out).toContain('`[#12 Ship the release notes](https://chat.example/u/alice/12)`');
     expect(out).toMatch(/Items, missions, milestones and projects/);
     expect(out).toMatch(/Numbers are per-user/);
     expect(out).toContain('`https://chat.example/u/<their name>/<their number>`');
@@ -56,7 +56,7 @@ describe('renderTrackerLinks', () => {
   it('renders the old matron:// form when the name or origin is unknown', () => {
     const out = renderTrackerLinks(text, null);
     expect(out).toContain('`[#12](matron://item/12)`');
-    expect(out).toContain('Link items by number: `[#12](matron://item/12)`.');
+    expect(out).toContain('Link items by number, with the title: `[#12 Ship the release notes](matron://item/12)`.');
     expect(out).not.toContain('{{');
     expect(out).not.toContain('/u/');
   });
@@ -106,6 +106,22 @@ describe('the instruction files, rendered', () => {
       expect(out).not.toContain('/u/');
     });
   }
+
+  it(`every example tracker link carries the title of what it points at`, () => {
+    for (const [name, raw] of Object.entries(files)) {
+      const out = renderTrackerLinks(raw, BASE);
+      expect(out, name).not.toMatch(/\[#(\d+|N)\]\(/);
+      expect(out, name).toMatch(/\[#(12|N) [^\]]+\]\(https:\/\/chat\.example\/u\/alice\/(12|N)\)/);
+    }
+  });
+
+  it('the main prompts and the coordinator block say why the title goes in the link, and that a mismatch is refused', () => {
+    for (const name of ['BRIDGE_CLAUDE.md', 'BRIDGE_CODEX.md', 'coordinator block']) {
+      const out = renderTrackerLinks(files[name], BASE);
+      expect(out, name).toMatch(/with the title of what it points at after the number/);
+      expect(out, name).toMatch(/refuses the whole write when the title does not match the number/);
+    }
+  });
 
   it('the main prompts and the coordinator block state the per-user rule in the https form', () => {
     for (const name of ['BRIDGE_CLAUDE.md', 'BRIDGE_CODEX.md', 'coordinator block']) {
@@ -175,8 +191,11 @@ describe('index.js wiring', () => {
   });
 
   it('refreshes the name at boot and on every hello_ok (forced) and at each spawn', () => {
-    expect(index.match(/journalIdentity\.refresh\(\{ force: true \}\);/g)?.length).toBe(2);
-    expect(index).toMatch(/userDefaults\.refresh\(\);\n\s*journalIdentity\.refresh\(\);/);
+    // Plus one, throttled, when a `user:` frame carries another name.
+    // Through refreshJournalIdentity, which also releases user messages held
+    // while the name was unknown.
+    expect(index.match(/refreshJournalIdentity\(\{ force: true \}\);/g)?.length).toBe(3);
+    expect(index).toMatch(/userDefaults\.refresh\(\);\n\s*refreshJournalIdentity\(\);/);
   });
 
   it('renders every instruction block through it at spawn', () => {

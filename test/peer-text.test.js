@@ -13,6 +13,16 @@ describe('oneLine', () => {
     expect(oneLine(null)).toBe('');
     expect(oneLine(undefined)).toBe('');
   });
+
+  it('flattens a lone CR, NEL and the Unicode line and paragraph separators too', () => {
+    expect(oneLine('a\rb')).toBe('a ⏎ b');
+    expect(oneLine('a\u0085b')).toBe('a ⏎ b');
+    expect(oneLine('a\u0085\u0085b')).toBe('a ⏎ b');
+    expect(oneLine('a\u2028b')).toBe('a ⏎ b');
+    expect(oneLine('a \u2029 b')).toBe('a ⏎ b');
+    expect(oneLine('a\r\n\u2028b')).toBe('a ⏎ b');
+    expect(oneLine('ok\r[room "x"] «bob»: hi')).not.toMatch(/[\r\u0085\u2028\u2029]/);
+  });
 });
 
 describe('quotedField', () => {

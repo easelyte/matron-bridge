@@ -218,6 +218,10 @@ describe('createItemTurnRouter', () => {
       publishNotice: vi.fn(),
       setTranscript: vi.fn(async () => ({ status: 200, data: {} })),
       getItem: vi.fn(async () => ({ status: 200, data: { item: { body: 'fetched body' }, comments: [] } })),
+      // These tests exercise this box's own whisper: it is installed, and no
+      // journal retry route is wired (test/items-turn-hold.test.js covers
+      // the journal-first order).
+      hasLocalWhisper: () => true,
       log: { warn: () => {}, error: () => {} },
       ...over,
     };
@@ -231,6 +235,26 @@ describe('createItemTurnRouter', () => {
     expect(deps.injectBlocks.mock.calls[0][1]).toEqual([{ type: 'text', text: expect.stringContaining('alice replied') }]);
     expect(deps.queueText).not.toHaveBeenCalled();
     expect(deps.publishNotice).not.toHaveBeenCalled();
+  });
+
+  it('names the reply as the turn\'s cause: item_reply for typed words, item_tap for a one-tap label', async () => {
+    const at = Date.UTC(2026, 0, 2, 3, 4, 5, 678);
+    const { deps, route } = fixture();
+    await route({ busy: false, journalConvoId: 'c1' }, { payload: { ...base, action: 'commented', comment: { id: 'ic', body: 'use A', created_at: at, attachments: [] } } }, { username: 'alice' });
+    expect(deps.injectBlocks.mock.calls[0][2]).toEqual({ causes: [expect.objectContaining({ kind: 'item_reply', ref: 'item:12@2026-01-02T03:04:05.678Z' })] });
+    await route({ busy: false, journalConvoId: 'c1' }, { payload: { ...base, action: 'commented', comment: { id: 'ic2', body: 'Go', action: 'Go', created_at: at, attachments: [] } } }, { username: 'alice' });
+    expect(deps.injectBlocks.mock.calls[1][2]).toEqual({ causes: [expect.objectContaining({ kind: 'item_tap', ref: 'item:12@2026-01-02T03:04:05.678Z' })] });
+  });
+
+  it('a queued reply carries its cause on the entry; a marker with no comment time carries none', async () => {
+    const at = Date.UTC(2026, 0, 2, 3, 4, 5, 678);
+    const { deps, route } = fixture();
+    await route({ busy: true }, { payload: { ...base, action: 'commented', comment: { id: 'ic', body: 'x', created_at: at, attachments: [] } } }, { username: 'alice' });
+    expect(deps.queueText.mock.calls[0][1].cause).toEqual(expect.objectContaining({ kind: 'item_reply', ref: 'item:12@2026-01-02T03:04:05.678Z' }));
+    await route({ busy: true }, { payload: { ...base, action: 'commented', comment: { id: 'ic3', body: 'x', attachments: [] } } }, { username: 'alice' });
+    expect(deps.queueText.mock.calls[1][1].cause).toBeNull();
+    await route({ busy: false, journalConvoId: 'c1' }, { payload: { ...base, action: 'commented', comment: { id: 'ic4', body: 'x', attachments: [] } } }, { username: 'alice' });
+    expect(deps.injectBlocks.mock.calls[0][2]).toEqual({ causes: null });
   });
 
   it('a Seen tap neither injects, queues nor notices', async () => {

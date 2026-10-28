@@ -12,15 +12,10 @@ import {
 import { attachQueuedCleanup } from '../lib/queue-flush.js';
 import { compactBatchSize } from '../lib/compact-priority.js';
 
-// Busy-queue magic-word parity (PR #101 follow-up). The Matrix busy branch's
-// send/interrupt/!interrupt (flush now) and cancel (pop last) handling is
-// extracted into lib/busy-queue.js so the journal session-text route can
-// reuse the SAME implementation. Matrix behavior is pinned byte-for-byte via
-// the full seam set. Per the PR #104 review findings, the journal caller
-// passes BOTH Matrix notification seams too (editMessage AND
-// stripQueueNotificationLinks — session.roomId is a real Matrix room, and
-// queuedMessages/queueNotifications must move in lockstep on every path or
-// later indexed cancels edit the WRONG tile); only sendHtml is omitted,
+// Busy-queue magic words, notifications and queue-release taps
+// (lib/busy-queue.js). queuedMessages and queueNotifications must move in
+// lockstep on every path, or later indexed cancels remove the WRONG message.
+// The "full" deps add the sendHtml sink; the journal caller omits it,
 // because journal feedback stays plain text.
 
 // The real formatQueueSummary lives in index.js (it leans on escapeHtml);
@@ -46,47 +41,35 @@ function makeSession(overrides = {}) {
   };
 }
 
-function matrixDeps(overrides = {}) {
+function fullDeps(overrides = {}) {
   return {
     sendReply: vi.fn(async () => {}),
     sendHtml: vi.fn(async () => {}),
     formatQueueSummary: vi.fn(fakeSummary),
     flushQueue: vi.fn(() => true),
     stripQueueNotificationLinks: vi.fn(),
-    editMessage: vi.fn(async () => {}),
     ...overrides,
   };
 }
 
-// Faithful stand-in for index.js's stripQueueNotificationLinks (index.js
-// ~3150): clears session.queueNotifications AND edits every tile back to its
-// plain text (removing the action links). Bound to a deps object so the
-// per-tile edits are observable on the same editMessage mock.
-function realisticStrip(deps) {
+// Stand-in for index.js's clearQueueNotifications: clears
+// session.queueNotifications so a flush leaves no stale entries behind.
+function realisticStrip() {
   return vi.fn(async (session) => {
-    const notifs = session.queueNotifications || [];
-    if (notifs.length === 0) return;
     session.queueNotifications = [];
-    for (const { eventId, plain } of notifs) {
-      await deps.editMessage(session.roomId, eventId, plain);
-    }
   });
 }
 
 function journalDeps(overrides = {}) {
   // What journalRouteTextToSession passes: a plain reply sink, the shared
-  // queue primitives, and BOTH Matrix notification seams (PR #104 review
-  // findings) — session.roomId is a real Matrix room, so a Matron cancel
-  // pops-and-edits the cancelled tile and a Matron send clears + strips the
-  // queued tiles, exactly like their Matrix counterparts. Only sendHtml is
+  // queue primitives and the notification-clearing seam. Only sendHtml is
   // omitted (journal feedback stays plain text).
   const deps = {
     sendReply: vi.fn(async () => {}),
     formatQueueSummary: vi.fn(fakeSummary),
     flushQueue: vi.fn(() => true),
-    editMessage: vi.fn(async () => {}),
   };
-  deps.stripQueueNotificationLinks = realisticStrip(deps);
+  deps.stripQueueNotificationLinks = realisticStrip();
   return { ...deps, ...overrides };
 }
 
@@ -118,12 +101,12 @@ describe('dispatchBusyQueueMagicWord — gating', () => {
   });
 });
 
-describe('handleBusyQueueMagicWord — send/interrupt (Matrix pin, full seams)', () => {
+describe('handleBusyQueueMagicWord — send/interrupt (full seams)', () => {
   it('flushes the whole queue through flushQueue in ONE call, after the summary message', async () => {
     const session = makeSession();
     const queuedRef = session.queuedMessages;
     const order = [];
-    const deps = matrixDeps({
+    const deps = fullDeps({
       sendHtml: vi.fn(async () => order.push('summary')),
       flushQueue: vi.fn(() => {
         order.push('flush');
@@ -145,7 +128,7 @@ describe('handleBusyQueueMagicWord — send/interrupt (Matrix pin, full seams)',
 
   it('sends the exact Matrix summary text (html sink present)', async () => {
     const session = makeSession();
-    const deps = matrixDeps();
+    const deps = fullDeps();
     await handleBusyQueueMagicWord(session, 'send', deps);
     expect(deps.sendHtml).toHaveBeenCalledWith(
       '⚡ Sending 2 queued messages now:\n  1. [2 entries]',
@@ -156,14 +139,14 @@ describe('handleBusyQueueMagicWord — send/interrupt (Matrix pin, full seams)',
 
   it('uses the singular form for one queued message', async () => {
     const session = makeSession({ queuedMessages: [[{ type: 'text', text: 'only' }]] });
-    const deps = matrixDeps();
+    const deps = fullDeps();
     await handleBusyQueueMagicWord(session, 'send', deps);
     expect(deps.sendHtml.mock.calls[0][0]).toMatch(/^⚡ Sending 1 queued message now:/);
   });
 
   it('replies "no queued messages" when the queue is empty, and never flushes', async () => {
     const session = makeSession({ queuedMessages: null });
-    const deps = matrixDeps();
+    const deps = fullDeps();
     await handleBusyQueueMagicWord(session, 'send', deps);
     expect(deps.sendReply).toHaveBeenCalledWith('⚡ No queued messages to send.');
     expect(deps.flushQueue).not.toHaveBeenCalled();
@@ -192,22 +175,18 @@ describe('handleBusyQueueMagicWord — send/interrupt (journal seams)', () => {
     const deps = journalDeps({ stripQueueNotificationLinks: undefined });
     await expect(handleBusyQueueMagicWord(session, 'send', deps)).resolves.toBeUndefined();
     expect(session.queueNotifications).toHaveLength(2);
-    expect(deps.editMessage).not.toHaveBeenCalled();
   });
 
-  it('journal send-flush clears queueNotifications and strips each tile to its plain text (PR #104 Bugbot finding)', async () => {
+  it('journal send-flush clears queueNotifications', async () => {
     const session = makeSession();
     const deps = journalDeps();
 
     await handleBusyQueueMagicWord(session, 'send', deps);
-    // strip is fire-and-forget (un-awaited, like the Matrix original) — let
-    // its per-tile edits drain before asserting them.
+    // strip is fire-and-forget (un-awaited) — let it drain before asserting.
     await new Promise(r => setTimeout(r, 0));
 
     expect(deps.stripQueueNotificationLinks).toHaveBeenCalledWith(session);
     expect(session.queueNotifications).toEqual([]);
-    expect(deps.editMessage).toHaveBeenCalledWith('!room:server', '$ev1', '📨 Queued (1): first');
-    expect(deps.editMessage).toHaveBeenCalledWith('!room:server', '$ev2', '📨 Queued (2): second');
     expect(deps.flushQueue).toHaveBeenCalledTimes(1);
   });
 
@@ -290,14 +269,13 @@ describe('handleBusyQueueMagicWord — send/interrupt (journal seams)', () => {
 // the shared dispatcher BOTH Matrix notification seams (the lib guards make
 // omitting them silently "work" — this is what keeps the wiring honest).
 describe('index.js journal busy caller — notification seams wiring (source inspection)', () => {
-  it('passes editMessage AND stripQueueNotificationLinks to dispatchBusyQueueMagicWord', () => {
+  it('passes stripQueueNotificationLinks to dispatchBusyQueueMagicWord', () => {
     const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
     const start = src.indexOf('dispatchBusyQueueMagicWord(trimmed, session, {');
     expect(start).toBeGreaterThan(-1);
     const end = src.indexOf('});', start);
     expect(end).toBeGreaterThan(start);
     const args = src.slice(start, end);
-    expect(args).toMatch(/\beditMessage\b/);
     expect(args).toMatch(/\bstripQueueNotificationLinks\b/);
   });
 
@@ -335,19 +313,16 @@ describe('index.js journal busy caller — notification seams wiring (source ins
   });
 });
 
-describe('handleBusyQueueMagicWord — cancel (Matrix pin, full seams)', () => {
-  it('pops the LAST queued message, edits its notification, and reports the remaining count', async () => {
+describe('handleBusyQueueMagicWord — cancel (full seams)', () => {
+  it('pops the LAST queued message and its notification, and reports the remaining count', async () => {
     const session = makeSession();
-    const deps = matrixDeps();
+    const deps = fullDeps();
 
     await handleBusyQueueMagicWord(session, 'cancel', deps);
 
     expect(session.queuedMessages).toHaveLength(1);
     expect(session.queuedMessages[0]).toEqual([{ type: 'text', text: 'first' }]);
     expect(session.queueNotifications).toHaveLength(1);
-    expect(deps.editMessage).toHaveBeenCalledWith(
-      '!room:server', '$ev2', '✕ 📨 Queued (2): second (cancelled)',
-    );
     expect(deps.sendReply).toHaveBeenCalledWith('Cancelled queued message (1 remaining).');
     expect(deps.flushQueue).not.toHaveBeenCalled();
   });
@@ -357,7 +332,7 @@ describe('handleBusyQueueMagicWord — cancel (Matrix pin, full seams)', () => {
       queuedMessages: [[{ type: 'text', text: 'solo' }]],
       queueNotifications: [{ eventId: '$ev1', plain: '📨 Queued (1): solo' }],
     });
-    const deps = matrixDeps();
+    const deps = fullDeps();
     await handleBusyQueueMagicWord(session, 'cancel', deps);
     expect(session.queuedMessages).toBeNull();
     expect(deps.sendReply).toHaveBeenCalledWith('Cancelled queued message (queue empty).');
@@ -365,32 +340,30 @@ describe('handleBusyQueueMagicWord — cancel (Matrix pin, full seams)', () => {
 
   it('replies "no queued messages" when nothing is queued', async () => {
     const session = makeSession({ queuedMessages: [], queueNotifications: [] });
-    const deps = matrixDeps();
+    const deps = fullDeps();
     await handleBusyQueueMagicWord(session, 'cancel', deps);
     expect(deps.sendReply).toHaveBeenCalledWith('No queued messages to cancel.');
-    expect(deps.editMessage).not.toHaveBeenCalled();
   });
 
-  it('a notification entry without a Matrix event id is popped but not edited (guard, do not crash)', async () => {
+  it('a notification entry without an event id is popped (guard, do not crash)', async () => {
     const session = makeSession({
       queuedMessages: [[{ type: 'text', text: 'x' }]],
       queueNotifications: [{ eventId: null, plain: '📨 Queued (1): x' }],
     });
-    const deps = matrixDeps();
+    const deps = fullDeps();
     await expect(handleBusyQueueMagicWord(session, 'cancel', deps)).resolves.toBeUndefined();
-    expect(deps.editMessage).not.toHaveBeenCalled();
     // The notif is still popped in lockstep with the queue entry.
     expect(session.queueNotifications).toHaveLength(0);
     expect(deps.sendReply).toHaveBeenCalledWith('Cancelled queued message (queue empty).');
   });
 
-  it('pops the notification in lockstep even when NO editMessage seam is passed (arrays never drift)', async () => {
+  it('pops the notification in lockstep (arrays never drift)', async () => {
     // PR #104 review finding: skipping the pop when the edit seam was absent
     // left queueNotifications longer than queuedMessages, so a LATER Matrix
     // cancel edited the wrong tile. The pop must be unconditional; only the
     // edit itself is seam-gated.
     const session = makeSession();
-    const deps = journalDeps({ editMessage: undefined });
+    const deps = journalDeps();
     await expect(handleBusyQueueMagicWord(session, 'cancel', deps)).resolves.toBeUndefined();
     expect(session.queuedMessages).toHaveLength(1);
     expect(session.queueNotifications).toHaveLength(1);
@@ -399,7 +372,7 @@ describe('handleBusyQueueMagicWord — cancel (Matrix pin, full seams)', () => {
 });
 
 describe('handleBusyQueueMagicWord — cancel (journal seams)', () => {
-  it('pops BOTH arrays in lockstep, edits the popped tile "(cancelled)", and publishes the remaining count', async () => {
+  it('pops BOTH arrays in lockstep and publishes the remaining count', async () => {
     const session = makeSession();
     const deps = journalDeps();
 
@@ -413,29 +386,20 @@ describe('handleBusyQueueMagicWord — cancel (journal seams)', () => {
     // Matrix cancel.
     expect(session.queueNotifications).toHaveLength(1);
     expect(session.queueNotifications[0].eventId).toBe('$ev1');
-    expect(deps.editMessage).toHaveBeenCalledWith(
-      '!room:server', '$ev2', '✕ 📨 Queued (2): second (cancelled)',
-    );
     expect(deps.sendReply).toHaveBeenCalledWith('Cancelled queued message (1 remaining).');
   });
 
-  it('mixed sequence: a Matron cancel then a Matrix cancel each edit the CORRECT tile', async () => {
+  it('two cancels in a row each pop the CORRECT pair', async () => {
     const session = makeSession();
     const journal = journalDeps();
-    const matrix = matrixDeps();
+    const matrix = fullDeps();
 
     // Matron cancels the last queued message -> $ev2's tile is edited.
     await handleBusyQueueMagicWord(session, 'cancel', journal);
-    expect(journal.editMessage).toHaveBeenCalledWith(
-      '!room:server', '$ev2', '✕ 📨 Queued (2): second (cancelled)',
-    );
 
     // A subsequent Matrix-typed cancel pops the remaining pair and edits
     // $ev1 — NOT a dangling $ev2 (the pre-fix misalignment).
     await handleBusyQueueMagicWord(session, 'cancel', matrix);
-    expect(matrix.editMessage).toHaveBeenCalledWith(
-      '!room:server', '$ev1', '✕ 📨 Queued (1): first (cancelled)',
-    );
     expect(session.queuedMessages).toBeNull();
     expect(session.queueNotifications).toHaveLength(0);
     expect(matrix.sendReply).toHaveBeenCalledWith('Cancelled queued message (queue empty).');
@@ -446,7 +410,6 @@ describe('handleBusyQueueMagicWord — cancel (journal seams)', () => {
     const deps = journalDeps();
     await handleBusyQueueMagicWord(session, 'cancel', deps);
     expect(deps.sendReply).toHaveBeenCalledWith('No queued messages to cancel.');
-    expect(deps.editMessage).not.toHaveBeenCalled();
     expect(session.queueNotifications).toHaveLength(2);
   });
 });
@@ -496,24 +459,6 @@ describe('notifyQueuedMessage', () => {
     await notifyQueuedMessage(session, 'second', { sendReply });
     expect(sendReply).toHaveBeenCalledWith('📨 Queued (2): second');
     expect(session.queueNotifications).toEqual([]);
-  });
-
-  it('Matrix signed-link fallback: html tile via sendHtml, notif recorded on event id', async () => {
-    const sendHtml = vi.fn(async () => '$linktile');
-    const session = makeSession({ queueNotifications: [] });
-    await notifyQueuedMessage(session, 'second', {
-      sendReply: vi.fn(),
-      sendHtml,
-      htmlEscape: (s) => s,
-      buildActionLinks: (queueIndex) => `<a href="x?i=${queueIndex}">✕ Cancel</a>`,
-    });
-    expect(sendHtml).toHaveBeenCalledWith(
-      '📨 Queued (2): second',
-      '📨 Queued (2): second<br/><a href="x?i=1">✕ Cancel</a>',
-    );
-    expect(session.queueNotifications).toEqual([
-      { eventId: '$linktile', plain: '📨 Queued (2): second' },
-    ]);
   });
 
   it('initializes queueNotifications when the session has none yet', async () => {
@@ -877,7 +822,7 @@ describe('cancelQueuedItem', () => {
 describe('resolveQueueReleaseTap', () => {
   it('interrupt: detaches + strips + flushes without a post-action text line, returns true', () => {
     const session = makeSession();
-    const deps = matrixDeps();
+    const deps = fullDeps();
     const handled = resolveQueueReleaseTap('interrupt', session, deps);
     expect(handled).toBe(true);
     expect(session.queuedMessages).toBeNull();
@@ -890,7 +835,7 @@ describe('resolveQueueReleaseTap', () => {
 
   it('interrupt via journal seams: no post-action text line, same flush', () => {
     const session = makeSession();
-    const deps = matrixDeps({ sendHtml: null });
+    const deps = fullDeps({ sendHtml: null });
     const handled = resolveQueueReleaseTap('interrupt', session, deps);
     expect(handled).toBe(true);
     expect(deps.sendReply).not.toHaveBeenCalled();
@@ -899,7 +844,7 @@ describe('resolveQueueReleaseTap', () => {
 
   it('interrupt on an empty queue is a SILENT no-op (stale-tile tap), still handled', () => {
     const session = makeSession({ queuedMessages: null });
-    const deps = matrixDeps();
+    const deps = fullDeps();
     expect(resolveQueueReleaseTap('interrupt', session, deps)).toBe(true);
     expect(deps.sendHtml).not.toHaveBeenCalled();
     expect(deps.sendReply).not.toHaveBeenCalled();
@@ -908,13 +853,10 @@ describe('resolveQueueReleaseTap', () => {
 
   it('cancel:<n> splices exactly the indexed message AND its tile without a post-action text line', () => {
     const session = makeSession();
-    const deps = matrixDeps();
+    const deps = fullDeps();
     expect(resolveQueueReleaseTap('cancel:0', session, deps)).toBe(true);
     expect(session.queuedMessages).toEqual([[{ type: 'text', text: 'second' }]]);
     expect(session.queueNotifications).toEqual([{ eventId: '$ev2', plain: '📨 Queued (2): second' }]);
-    expect(deps.editMessage).toHaveBeenCalledWith(
-      '!room:server', '$ev1', '✕ 📨 Queued (1): first (cancelled)',
-    );
     expect(deps.sendReply).not.toHaveBeenCalled();
   });
 
@@ -923,7 +865,7 @@ describe('resolveQueueReleaseTap', () => {
       queuedMessages: [[{ type: 'text', text: 'solo' }]],
       queueNotifications: [{ eventId: '$ev1', plain: '📨 Queued (1): solo' }],
     });
-    const deps = matrixDeps();
+    const deps = fullDeps();
     resolveQueueReleaseTap('cancel:0', session, deps);
     expect(session.queuedMessages).toBeNull();
     expect(deps.sendReply).not.toHaveBeenCalled();
@@ -931,16 +873,15 @@ describe('resolveQueueReleaseTap', () => {
 
   it('cancel with an out-of-range index is a SILENT no-op (stale tile), still handled', () => {
     const session = makeSession();
-    const deps = matrixDeps();
+    const deps = fullDeps();
     expect(resolveQueueReleaseTap('cancel:9', session, deps)).toBe(true);
     expect(session.queuedMessages).toHaveLength(2);
-    expect(deps.editMessage).not.toHaveBeenCalled();
     expect(deps.sendReply).not.toHaveBeenCalled();
   });
 
   it('non-queue values touch nothing and return false', () => {
     const session = makeSession();
-    const deps = matrixDeps();
+    const deps = fullDeps();
     expect(resolveQueueReleaseTap('model:opus', session, deps)).toBe(false);
     expect(resolveQueueReleaseTap('opt_a', session, deps)).toBe(false);
     expect(session.queuedMessages).toHaveLength(2);
@@ -1437,18 +1378,15 @@ describe('resolveQueueReleaseTap — send_one (structured, stable-id)', () => {
 // branch is still the contract for any pre-deploy tile still on screen, so the
 // third affordance exists here too and obeys the same stale-tap silence.
 describe('resolveQueueReleaseTap — legacy sendone:<n>', () => {
-  it('splices exactly the indexed message + tile, flushes only it, and marks the tile sent', () => {
+  it('splices exactly the indexed message + tile and flushes only it', () => {
     const session = makeSession();
-    const deps = matrixDeps({ flushQueue: vi.fn(() => true) });
+    const deps = fullDeps({ flushQueue: vi.fn(() => true) });
     expect(resolveQueueReleaseTap('sendone:0', session, deps)).toBe(true);
 
     expect(deps.flushQueue).toHaveBeenCalledTimes(1);
     expect(deps.flushQueue.mock.calls[0][1]).toEqual([[{ type: 'text', text: 'first' }]]);
     expect(session.queuedMessages).toEqual([[{ type: 'text', text: 'second' }]]);
     expect(session.queueNotifications).toEqual([{ eventId: '$ev2', plain: '📨 Queued (2): second' }]);
-    expect(deps.editMessage).toHaveBeenCalledWith(
-      '!room:server', '$ev1', '⚡ 📨 Queued (1): first (sent)',
-    );
     expect(deps.sendReply).not.toHaveBeenCalled();
   });
 
@@ -1457,17 +1395,16 @@ describe('resolveQueueReleaseTap — legacy sendone:<n>', () => {
       queuedMessages: [[{ type: 'text', text: 'solo' }]],
       queueNotifications: [{ eventId: '$ev1', plain: '📨 Queued (1): solo' }],
     });
-    resolveQueueReleaseTap('sendone:0', session, matrixDeps({ flushQueue: vi.fn(() => true) }));
+    resolveQueueReleaseTap('sendone:0', session, fullDeps({ flushQueue: vi.fn(() => true) }));
     expect(session.queuedMessages).toBeNull();
   });
 
   it('an out-of-range index is a SILENT no-op (stale tile), still handled', () => {
     const session = makeSession();
-    const deps = matrixDeps();
+    const deps = fullDeps();
     expect(resolveQueueReleaseTap('sendone:9', session, deps)).toBe(true);
     expect(deps.flushQueue).not.toHaveBeenCalled();
     expect(session.queuedMessages).toHaveLength(2);
-    expect(deps.editMessage).not.toHaveBeenCalled();
   });
 
   // Taps index 1, not 0: at index 0 a restore-to-front and a restore-to-origin
@@ -1485,7 +1422,7 @@ describe('resolveQueueReleaseTap — legacy sendone:<n>', () => {
         { eventId: '$ev2', plain: '📨 Queued (3): second' },
       ],
     });
-    const deps = matrixDeps({
+    const deps = fullDeps({
       // Faithful restoreQueuedBatch: it PREPENDS, which is what makes putting
       // the entry back at its own index this branch's job.
       flushQueue: vi.fn((s, queued) => {
@@ -1504,7 +1441,6 @@ describe('resolveQueueReleaseTap — legacy sendone:<n>', () => {
     ]);
     // The compact is still isolated by the next flush, not merged mid-body.
     expect(compactBatchSize(session.queuedMessages)).toBe(1);
-    expect(deps.editMessage).not.toHaveBeenCalled();
   });
 });
 
@@ -1780,9 +1716,8 @@ describe('queued-release publisher wiring', () => {
 
   it('the router rejects agent-authored release echoes at its user-sender guard', () => {
     const src = readFileSync(new URL('../lib/journal-input-router.js', import.meta.url), 'utf-8');
-    expect(src).toMatch(
-      /if \(typeof sender !== ['"]string['"] \|\| !sender\.startsWith\(['"]user:['"]\)\) return;/,
-    );
+    expect(src).toMatch(/if \(!isOwnerSender\(sender\)\) return;/);
+    expect(src).toMatch(/if \(typeof sender !== ['"]string['"] \|\| !sender\.startsWith\(['"]user:['"]\)\) return false;/);
   });
 });
 
@@ -1960,7 +1895,7 @@ describe('index.js queued-send finalizer', () => {
 describe('index.js journal busy caller — queued-tile notification wiring (source inspection)', () => {
   it('the journal busy branch posts the tile via notifyQueuedMessage with the journal ctx sink', () => {
     const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
-    const start = src.indexOf('const entry = markJournalOrigin([{ type: \'text\', text: trimmed }]);');
+    const start = src.indexOf('const entry = tagCauses(markJournalOrigin([{ type: \'text\', text: trimmed }]), causes);');
     expect(start).toBeGreaterThan(-1);
     const window = src.slice(start, start + 1200);
     expect(window).toMatch(/notifyQueuedMessage\(session, preview, \{/);
@@ -2085,7 +2020,7 @@ describe('#165 index.js prompt-reply handler — value-shape classification reti
     // journalEchoPromptAnswer helper — which permission-cards also reuses —
     // rather than inline, so assert the helper call instead of the string.)
     expect(body).toMatch(/queuedRelease\.state === 'live'/);
-    expect(body).toMatch(/journalRoutePromptReply\(session, answer\)/);
+    expect(body).toMatch(/journalRoutePromptReply\(session, answer, \{ causes \}\)/);
     expect(body).toMatch(/journalEchoPromptAnswer\(session, username, label\)/);
     expect(body).not.toMatch(/isQueueReleaseTap/);
   });

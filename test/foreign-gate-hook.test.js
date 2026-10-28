@@ -21,7 +21,7 @@ beforeAll(async () => {
     let body = '';
     req.on('data', (c) => { body += c; });
     req.on('end', () => {
-      seen.push({ url: req.url, body });
+      seen.push({ url: req.url, body, headers: req.headers });
       if (answer === 'error') { res.writeHead(500); res.end('{}'); return; }
       if (answer === 'garbage') { res.writeHead(200); res.end('<html>'); return; }
       res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -118,3 +118,28 @@ describe('settings', () => {
     expect(e.hooks[0]).toMatchObject({ command: 'node.exe', args: ['C:\\h\\foreign-gate.mjs', '--port', '1', '--room', 'r', '--flag', 'C:\\f'] });
   });
 });
+
+// The session's loopback API token travels as a header read from the file the
+// bridge bakes into the hook command (--auth), never as an argv value.
+for (const script of ['foreign-gate.sh', 'foreign-gate.mjs']) {
+  describe.skipIf(script.endsWith('.sh') && process.platform === 'win32')(`${script} token`, () => {
+    it('sends the header from the --auth file', async () => {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fgate-auth-'));
+      const auth = path.join(dir, 'header');
+      fs.writeFileSync(auth, 'X-Matron-Session-Token: tok123\n', { mode: 0o600 });
+      answer = {};
+      seen.length = 0;
+      await run(script, { tool_name: 'Bash' }, ['--port', String(port), '--room', 'r1', '--flag', flag, '--auth', auth]);
+      expect(seen[0].headers['x-matron-session-token']).toBe('tok123');
+      fs.rmSync(dir, { recursive: true, force: true });
+    });
+
+    it('a refused token (401) with the flag present still denies', async () => {
+      answer = 'error';
+      fs.writeFileSync(flag, '1');
+      const r = await run(script, { tool_name: 'Bash' }, ['--port', String(port), '--room', 'r1', '--flag', flag]);
+      expect(r.out.startsWith(DENY_PREFIX)).toBe(true);
+      fs.rmSync(flag);
+    });
+  });
+}

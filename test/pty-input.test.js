@@ -15,8 +15,19 @@ describe('bracketedPaste', () => {
   });
 
   it('strips embedded paste-terminator sequences so content cannot escape the paste', () => {
-    expect(bracketedPaste('a\x1b[201~\rrm -rf /\r')).toBe('\x1b[200~a\rrm -rf /\r\x1b[201~');
-    expect(bracketedPaste('\x1b[201~\x1b[201~x')).toBe('\x1b[200~x\x1b[201~');
+    expect(bracketedPaste('a\x1b[201~\rrm -rf /\r')).toBe('\x1b[200~a[201~\rrm -rf /\r\x1b[201~');
+    expect(bracketedPaste('\x1b[201~\x1b[201~x')).toBe('\x1b[200~[201~[201~x\x1b[201~');
+  });
+
+  it('a nested terminator cannot reassemble one after stripping', () => {
+    const out = bracketedPaste('a\x1b[20\x1b[201~1~b');
+    expect(out.startsWith('\x1b[200~')).toBe(true);
+    expect(out.endsWith('\x1b[201~')).toBe(true);
+    expect(out.slice(6, -6)).not.toContain('\x1b');
+  });
+
+  it('drops other control characters but keeps tab and newlines', () => {
+    expect(bracketedPaste('a\tb\nc\x00\x07\x1bd\u009be')).toBe('\x1b[200~a\tb\ncde\x1b[201~');
   });
 });
 

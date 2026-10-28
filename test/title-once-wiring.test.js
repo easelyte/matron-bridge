@@ -22,7 +22,11 @@ function harness({ persisted = {}, answer = 'TITLE: export fix\nNEW: Fixed the e
   const context = vm.createContext({
     applyFallbackTitle: () => {}, SERVER_LABEL: 'bridge',
     updateRoomName: (_roomId, name) => calls.renames.push(name),
-    summaryModel: { model: 'test-model', generate: async (prompt) => { calls.prompts.push(prompt); return answer; } },
+    summaryModel: {
+      model: 'test-model',
+      generate: async (prompt) => { calls.prompts.push(prompt); return answer; },
+      generateWithModel: async (prompt) => { calls.prompts.push(prompt); return { text: answer, model: 'test-model' }; },
+    },
     summaryModelNag: { maybeFile: () => {} },
     journalConvoIdFor: () => 'convo', debug: () => {}, console,
     summaryWindow, buildSummaryPrompt, splitSpoken, spokenPayload, spokenRefFor,

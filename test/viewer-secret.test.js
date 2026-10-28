@@ -71,6 +71,51 @@ function postValue(token, value) {
 }
 
 describe('GET /secret', () => {
+  it('separates the bridge source from unverified context and keeps agent links literal', async () => {
+    const context = 'For [the release](https://example.com/tasks/release).\nScope: staging only. <img src=x onerror=1> [unsafe](javascript:alert(1))';
+    const res = await getForm({ secretId: 'sec-1', label: 'Deployment token', context, convoId: 'source-conversation' });
+    expect(res.status).toBe(200);
+    expect(res.headers.get('referrer-policy')).toBe('no-referrer');
+    expect(res.headers.get('cache-control')).toBe('no-store');
+    const html = await res.text();
+    expect(html).toContain('<a href="matron://convo/source-conversation" rel="noreferrer">Open originating conversation</a>');
+    expect(html).toContain('Source supplied by the bridge.');
+    expect(html).toContain('Agent’s explanation');
+    expect(html).toContain('The bridge has not verified these claims or permissions.');
+    expect(html).toContain('[the release](https://example.com/tasks/release)');
+    expect(html).not.toContain('href="https://example.com');
+    expect(html).toContain('Scope: staging only. &lt;img src=x onerror=1&gt;');
+    expect(html).not.toContain('<img src=x');
+    expect(html).not.toContain('href="javascript:');
+    expect(html.indexOf('class="context"')).toBeLessThan(html.indexOf('<input type="password"'));
+    expect(html.indexOf('class="origin"')).toBeLessThan(html.indexOf('class="context"'));
+  });
+
+  it.each(['https://untrusted.example', 'x" onclick="evil', '../another'])('never turns an invalid signed conversation id into a source link: %s', async (convoId) => {
+    const html = await (await getForm({ secretId: 'sec-1', label: 'token', convoId })).text();
+    expect(html).not.toContain('href=');
+    expect(html).toContain('no conversation link');
+  });
+
+  it('rejects a substituted conversation id with the original signature', async () => {
+    const [payload, signature] = secretToken({ secretId: 'sec-1', label: 'token', convoId: 'original-conversation' }).split('.');
+    const data = JSON.parse(Buffer.from(payload, 'base64url').toString());
+    data.convoId = 'substituted-conversation';
+    const altered = `${Buffer.from(JSON.stringify(data)).toString('base64url')}.${signature}`;
+    const res = await fetch(`http://127.0.0.1:${port}/secret?token=${encodeURIComponent(altered)}`);
+    expect(res.status).toBe(403);
+  });
+
+  it('rejects altered context unless the token is signed again', async () => {
+    const token = secretToken({ secretId: 'sec-1', label: 'token', context: 'Staging only' });
+    const [payload, signature] = token.split('.');
+    const data = JSON.parse(Buffer.from(payload, 'base64url').toString());
+    data.context = 'Production admin';
+    const altered = `${Buffer.from(JSON.stringify(data)).toString('base64url')}.${signature}`;
+    const res = await fetch(`http://127.0.0.1:${port}/secret?token=${encodeURIComponent(altered)}`);
+    expect(res.status).toBe(403);
+  });
+
   it('renders a masked single-line field by default', async () => {
     const res = await getForm({ secretId: 'sec-1', label: 'AWS access key' });
     expect(res.status).toBe(200);
@@ -78,6 +123,7 @@ describe('GET /secret', () => {
     expect(html).toContain('<input type="password" name="value"');
     expect(html).not.toContain('<textarea');
     expect(html).toContain('AWS access key');
+    expect(html).toContain('This older request has no conversation link.');
   });
 
   it('renders a textarea when the token says the request is multiline', async () => {

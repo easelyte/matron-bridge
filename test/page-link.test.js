@@ -3,7 +3,7 @@ import { mkdtempSync, writeFileSync, rmSync, realpathSync, symlinkSync } from 'n
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createPageLinkHandler, pageLinkTtlSeconds, PAGE_LINK_DEFAULT_DAYS, PAGE_LINK_MAX_DAYS } from '../lib/page-link.js';
-import { verifyToken } from '../lib/viewer-tokens.js';
+import { verifyToken, readPageToken } from '../lib/viewer-tokens.js';
 
 const SECRET = 'page-link-secret';
 let workdir, outside, handler;
@@ -32,16 +32,29 @@ describe('page-link handler', () => {
     expect(status).toBe(200);
     expect(body.url).toMatch(/^https:\/\/viewer\.example\.com\/page\?token=/);
     expect(body.path).toBe(path.join(workdir, 'pack.html'));
-    const data = verifyToken(tokenOf(body.url), SECRET);
+    const data = readPageToken(tokenOf(body.url), SECRET);
     expect(data).toMatchObject({ path: path.join(workdir, 'pack.html'), workdir, page: true });
     expect(data.exp - before).toBeGreaterThanOrEqual(PAGE_LINK_DEFAULT_DAYS * 86400 - 1);
     expect(data.exp - before).toBeLessThanOrEqual(PAGE_LINK_DEFAULT_DAYS * 86400 + 1);
   });
 
+  it('keeps the path and workdir out of the link itself', async () => {
+    const { body } = await handler({ roomId: 'room-1', path: 'pack.html' });
+    const token = tokenOf(body.url);
+    const outer = verifyToken(token, SECRET);
+    expect(outer.page).toBe(true);
+    expect(outer.path).toBeUndefined();
+    expect(outer.workdir).toBeUndefined();
+    expect(Buffer.from(token.split('.')[0], 'base64url').toString()).not.toContain('pack.html');
+    expect(token).not.toContain(Buffer.from(workdir).toString('base64url').slice(0, 8));
+    // Only the right secret opens it.
+    expect(readPageToken(token, 'another-secret')).toBeNull();
+  });
+
   it('accepts an absolute path inside the workdir and a custom ttl', async () => {
     const { status, body } = await handler({ roomId: 'room-1', path: path.join(workdir, 'pack.html'), ttl_days: 3 });
     expect(status).toBe(200);
-    const data = verifyToken(tokenOf(body.url), SECRET);
+    const data = readPageToken(tokenOf(body.url), SECRET);
     expect(data.exp - Math.floor(Date.now() / 1000)).toBeLessThanOrEqual(3 * 86400 + 1);
   });
 

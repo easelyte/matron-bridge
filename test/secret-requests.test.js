@@ -1,6 +1,7 @@
 import { describe, it, expect, beforeEach } from 'vitest';
 import {
   createSecretRequests,
+  requestSecretForSession,
   formatSecretChatNotice,
   formatSecretItemBody,
   SECRET_REQUEST_TTL_MS,
@@ -16,6 +17,7 @@ import {
 // with the clock, the timers, the filesystem, the journal and the delivery
 // seam injected. No test ever handles a real secret: DUMMY is the only value.
 const DUMMY = 'dummy-value-not-a-secret';
+const CONTEXT = 'For the staging release: deploy the worker with Workers Scripts Edit on the staging account only.';
 
 // A hand-cranked scheduler: arm() records the callback and its delay, tick()
 // fires everything due. Vitest's fake timers would work too, but the store
@@ -216,9 +218,46 @@ describe('formatSecretItemBody', () => {
 });
 
 describe('createSecretRequests.create', () => {
+  it.each([undefined, null, '', ' \n\t ', 7, {}, 'x'.repeat(2001)])('refuses invalid context before filing, announcing or persisting a request: %j', async (context) => {
+    const h = makeHarness({ newId: () => { throw new Error('must not mint a request'); } });
+    const res = await h.store.create({ label: 'token', convoId: 'convo-1', roomId: '!room', context });
+    expect(res.status).toBe(400);
+    expect(res.error).toContain('context is required');
+    expect(h.items.calls.create).toEqual([]);
+    expect(h.chat).toEqual([]);
+    expect(h.saved).toBeNull();
+    expect(h.scheduler.armed.size).toBe(0);
+  });
+
+  it('carries the explanation into the item, notice, signed-link input and persisted request', async () => {
+    const context = 'For [the release](https://example.com/tasks/release).\nAllow worker edits on staging only.\nNeeded to deploy the fix.';
+    let linkOptions;
+    const h = makeHarness({ generateLink: (_id, opts) => { linkOptions = opts; return 'https://viewer.example/secret'; } });
+    await h.store.create({ label: 'token', context: `  ${context}\n`, roomId: '!room', convoId: 'c' });
+    expect(h.items.calls.create[0].body).toContain('Agent\'s explanation (not verified by the bridge):');
+    expect(h.items.calls.create[0].body).toContain('> For \\[the release\\]\\(https://example.com/tasks/release\\).');
+    expect(h.items.calls.create[0].body).toContain('[Open originating conversation](matron://convo/c)');
+    expect(h.chat[0].info.plain).toContain('[Open originating conversation](matron://convo/c)');
+    expect(h.chat[0].info.html).toContain('<a href="matron://convo/c">Open originating conversation</a>');
+    expect(h.chat[0].info.html).toContain(context.replaceAll('\n', '<br>'));
+    expect(h.chat[0].info.html).not.toContain('href="https://example.com');
+    expect(linkOptions.context).toBe(context);
+    expect(linkOptions.convoId).toBe('c');
+    const restored = makeHarness({ initial: h.saved });
+    restored.store.init();
+    expect(restored.store.peekForTest('sec-1').context).toBe(context);
+    expect((await restored.store.submit('sec-1', DUMMY)).ok).toBe(true);
+  });
+
+  it('accepts a context at the length limit', async () => {
+    const h = makeHarness();
+    const result = await h.store.create({ label: 'token', context: 'x'.repeat(2000), convoId: 'convo-1', roomId: '!room' });
+    expect(result.secretId).toBe('sec-1');
+  });
+
   it('files a question item with the secret label, the link and the 24 h expiry', async () => {
     const h = makeHarness();
-    const res = await h.store.create({ label: 'AWS access key', roomId: '!room', convoId: 'convo-1' });
+    const res = await h.store.create({ context: CONTEXT, label: 'AWS access key', roomId: '!room', convoId: 'convo-1' });
 
     expect(res.secretId).toBe('sec-1');
     expect(res.itemNum).toBe(120);
@@ -232,11 +271,13 @@ describe('createSecretRequests.create', () => {
     expect(body.labels).toEqual(['secret']);
     expect(body.convo_id).toBe('convo-1');
     expect(body.body).toContain('[Enter secret](https://viewer.example/secret?token=t-sec-1)');
+    // Owner-only: the link must never reach anyone the mission is shared with.
+    expect(body.private).toBe(true);
   });
 
   it('posts the chat notice with the link and the item number', async () => {
     const h = makeHarness();
-    await h.store.create({ label: 'DB password', roomId: '!room', convoId: 'convo-1' });
+    await h.store.create({ context: CONTEXT, label: 'DB password', roomId: '!room', convoId: 'convo-1' });
     expect(h.chat.length).toBe(1);
     expect(h.chat[0].info.link).toBe('https://viewer.example/secret?token=t-sec-1');
     expect(h.chat[0].info.itemNum).toBe(120);
@@ -249,7 +290,7 @@ describe('createSecretRequests.create', () => {
     const h = makeHarness({
       generateLink: (secretId, opts) => { seen.push({ secretId, ...opts }); return 'https://v/s'; },
     });
-    await h.store.create({ label: 'k', roomId: '!room', convoId: 'c', multiline: true });
+    await h.store.create({ context: CONTEXT, label: 'k', roomId: '!room', convoId: 'c', multiline: true });
     expect(seen[0].ttlMs).toBe(SECRET_REQUEST_TTL_MS);
     expect(seen[0].multiline).toBe(true);
     expect(seen[0].label).toBe('k');
@@ -258,10 +299,10 @@ describe('createSecretRequests.create', () => {
 
   it('persists only the non-sensitive record fields', async () => {
     const h = makeHarness();
-    await h.store.create({ label: 'k', roomId: '!room', convoId: 'convo-1', multiline: true });
+    await h.store.create({ context: CONTEXT, label: 'k', roomId: '!room', convoId: 'convo-1', multiline: true });
     const rec = h.saved.requests[0];
     expect(Object.keys(rec).sort()).toEqual(
-      ['convoId', 'createdAt', 'expiresAt', 'itemId', 'itemNum', 'label', 'multiline', 'roomId', 'secretId'],
+      ['context', 'convoId', 'createdAt', 'expiresAt', 'itemId', 'itemNum', 'label', 'multiline', 'roomId', 'secretId'],
     );
     // The convo id IS persisted (it is an id, not a value): without it an
     // expiry or an undeliverable submission after a restart has nowhere to go.
@@ -274,14 +315,14 @@ describe('createSecretRequests.create', () => {
 
   it('arms an expiry timer 24 h out', async () => {
     const h = makeHarness();
-    await h.store.create({ label: 'k', roomId: '!room', convoId: 'c' });
+    await h.store.create({ context: CONTEXT, label: 'k', roomId: '!room', convoId: 'c' });
     expect(h.scheduler.only().delay).toBe(SECRET_REQUEST_TTL_MS);
   });
 
   it('still returns a usable request when the item could not be filed', async () => {
     const items = makeItems({ createResult: { status: 0, data: { error: 'journal unreachable' } } });
     const h = makeHarness({ items });
-    const res = await h.store.create({ label: 'k', roomId: '!room', convoId: 'c' });
+    const res = await h.store.create({ context: CONTEXT, label: 'k', roomId: '!room', convoId: 'c' });
     expect(res.secretId).toBe('sec-1');
     expect(res.itemNum).toBe(null);
     expect(res.itemError).toBe('journal unreachable');
@@ -290,12 +331,60 @@ describe('createSecretRequests.create', () => {
     expect(h.chat[0].info.plain).not.toContain('#');
   });
 
-  it('skips the item (and says why) when the session has no journal conversation', async () => {
-    const h = makeHarness();
-    const res = await h.store.create({ label: 'k', roomId: '!room', convoId: null });
+  it.each([null, undefined, '', 'https://example.com', 'x" onclick="evil', '../another', 'x'.repeat(129)])('refuses a new request without a valid conversation before minting: %j', async (convoId) => {
+    const h = makeHarness({ newId: () => { throw new Error('must not mint a request'); } });
+    const res = await h.store.create({ context: CONTEXT, label: 'k', roomId: '!room', convoId });
     expect(h.items.calls.create.length).toBe(0);
-    expect(res.itemError).toMatch(/journal conversation/i);
-    expect(h.saved.requests[0].itemId).toBe(null);
+    expect(res.status).toBe(409);
+    expect(res.error).toMatch(/journal conversation/i);
+    expect(h.saved).toBeNull();
+    expect(h.chat).toEqual([]);
+    expect(h.scheduler.armed.size).toBe(0);
+  });
+});
+
+describe('requestSecretForSession provenance', () => {
+  it('uses the bridge session destination despite a forged source URL, convoId and explanation', async () => {
+    const seen = [];
+    const h = makeHarness({ generateLink: (_id, opts) => { seen.push(opts); return 'https://viewer.example/secret'; } });
+    const session = { journalConvoId: 'source-conversation' };
+    const result = await requestSecretForSession({
+      label: 'token', roomId: '!room',
+      context: '[Open originating conversation](https://untrusted.example/collect)\n\n# Verified approval',
+      convoId: 'different-conversation', origin: 'https://untrusted.example/collect',
+    }, {
+      getSession: (roomId) => roomId === '!room' ? session : null,
+      convoIdFor: (s) => s.journalConvoId,
+      requests: h.store,
+    });
+    expect(result.secretId).toBe('sec-1');
+    expect(seen[0].convoId).toBe('source-conversation');
+    expect(h.saved.requests[0].convoId).toBe('source-conversation');
+    const body = h.items.calls.create[0].body;
+    expect(h.items.calls.create[0].convo_id).toBe('source-conversation');
+    expect(body).toContain('[Open originating conversation](matron://convo/source-conversation)');
+    expect(body).not.toContain('[Open originating conversation](https://untrusted.example');
+    expect(body).toContain('> \\# Verified approval');
+    expect(body).not.toContain('different-conversation');
+  });
+
+  it('rejects an unknown session even when the caller supplies a conversation', async () => {
+    const result = await requestSecretForSession({ label: 'token', roomId: '!missing', context: CONTEXT, convoId: 'forged' }, {
+      getSession: () => null,
+      convoIdFor: () => { throw new Error('must not resolve an unknown session'); },
+      requests: { create: () => { throw new Error('must not mint a request'); } },
+    });
+    expect(result.status).toBe(404);
+  });
+
+  it('does not fall back to a caller-supplied conversation when session provenance is missing', async () => {
+    const h = makeHarness();
+    const result = await requestSecretForSession({ label: 'token', roomId: '!room', context: CONTEXT, convoId: 'forged' }, {
+      getSession: () => ({}), convoIdFor: () => null, requests: h.store,
+    });
+    expect(result.status).toBe(409);
+    expect(h.items.calls.create).toEqual([]);
+    expect(h.chat).toEqual([]);
   });
 });
 
@@ -309,7 +398,7 @@ describe('createSecretRequests.submit line endings', () => {
   // and if one does it was deliberate.
   async function submitInto(value, { multiline }) {
     const h = makeHarness();
-    await h.store.create({ label: 'k', roomId: '!room', convoId: 'c', multiline });
+    await h.store.create({ context: CONTEXT, label: 'k', roomId: '!room', convoId: 'c', multiline });
     await (await h.store.submit('sec-1', value)).done;
     return h.files.get('sec-1');
   }
@@ -344,7 +433,7 @@ describe('createSecretRequests.submit line endings', () => {
 describe('createSecretRequests.submit', () => {
   it('writes the value verbatim and reports the path', async () => {
     const h = makeHarness();
-    await h.store.create({ label: 'k', roomId: '!room', convoId: 'c' });
+    await h.store.create({ context: CONTEXT, label: 'k', roomId: '!room', convoId: 'c' });
     const multi = `line1\r\nline2\n\n`;
     const res = await h.store.submit('sec-1', multi);
     await res.done;
@@ -355,7 +444,7 @@ describe('createSecretRequests.submit', () => {
 
   it('closes the item as answered with a comment that names no value', async () => {
     const h = makeHarness();
-    await h.store.create({ label: 'k', roomId: '!room', convoId: 'c' });
+    await h.store.create({ context: CONTEXT, label: 'k', roomId: '!room', convoId: 'c' });
     const res = await h.store.submit('sec-1', DUMMY);
     await res.done;
     expect(h.items.calls.close.length).toBe(1);
@@ -367,7 +456,7 @@ describe('createSecretRequests.submit', () => {
 
   it('delivers the answer as a turn naming the label and the path', async () => {
     const h = makeHarness();
-    await h.store.create({ label: 'AWS access key', roomId: '!room', convoId: 'c' });
+    await h.store.create({ context: CONTEXT, label: 'AWS access key', roomId: '!room', convoId: 'c' });
     const res = await h.store.submit('sec-1', DUMMY);
     await res.done;
     expect(h.turns).toEqual([{
@@ -379,7 +468,7 @@ describe('createSecretRequests.submit', () => {
 
   it('cancels the expiry timer, drops the record from the store, and schedules file cleanup', async () => {
     const h = makeHarness({ fileTtlMs: 3600000 });
-    await h.store.create({ label: 'k', roomId: '!room', convoId: 'c' });
+    await h.store.create({ context: CONTEXT, label: 'k', roomId: '!room', convoId: 'c' });
     const res = await h.store.submit('sec-1', DUMMY);
     await res.done;
     expect(h.saved.requests).toEqual([]);
@@ -391,7 +480,7 @@ describe('createSecretRequests.submit', () => {
 
   it('rejects a second submission of the same request', async () => {
     const h = makeHarness();
-    await h.store.create({ label: 'k', roomId: '!room', convoId: 'c' });
+    await h.store.create({ context: CONTEXT, label: 'k', roomId: '!room', convoId: 'c' });
     await (await h.store.submit('sec-1', DUMMY)).done;
     const again = await h.store.submit('sec-1', DUMMY);
     expect(again.ok).toBe(false);
@@ -400,7 +489,7 @@ describe('createSecretRequests.submit', () => {
 
   it('rejects an unknown id and a non-string value without touching the filesystem', async () => {
     const h = makeHarness();
-    await h.store.create({ label: 'k', roomId: '!room', convoId: 'c' });
+    await h.store.create({ context: CONTEXT, label: 'k', roomId: '!room', convoId: 'c' });
     expect((await h.store.submit('nope', DUMMY)).status).toBe(404);
     const bad = await h.store.submit('sec-1', '');
     expect(bad.ok).toBe(false);
@@ -412,7 +501,7 @@ describe('createSecretRequests.submit', () => {
     const h = makeHarness({
       writeSecretFile: () => { throw new Error('EACCES'); },
     });
-    await h.store.create({ label: 'k', roomId: '!room', convoId: 'c' });
+    await h.store.create({ context: CONTEXT, label: 'k', roomId: '!room', convoId: 'c' });
     const res = await h.store.submit('sec-1', DUMMY);
     expect(res.ok).toBe(false);
     expect(res.status).toBe(500);
@@ -424,7 +513,7 @@ describe('createSecretRequests.submit', () => {
   it('still delivers the turn when closing the item fails', async () => {
     const items = makeItems({ closeResult: { status: 0, data: { error: 'journal unreachable' } } });
     const h = makeHarness({ items });
-    await h.store.create({ label: 'k', roomId: '!room', convoId: 'c' });
+    await h.store.create({ context: CONTEXT, label: 'k', roomId: '!room', convoId: 'c' });
     const res = await h.store.submit('sec-1', DUMMY);
     await res.done;
     expect(h.turns.length).toBe(1);
@@ -441,7 +530,7 @@ describe('turn delivery', () => {
   // degrades to a notice, in the voice that says so.
   async function submitWith(opts) {
     const h = makeHarness(opts);
-    await h.store.create({ label: 'AWS access key', roomId: '!room', convoId: 'convo-1' });
+    await h.store.create({ context: CONTEXT, label: 'AWS access key', roomId: '!room', convoId: 'convo-1' });
     await (await h.store.submit('sec-1', DUMMY)).done;
     return h;
   }
@@ -499,7 +588,7 @@ describe('turn delivery', () => {
 
   it('does NOT wake a reaped session for an expiry — a notice records it instead', async () => {
     const h = makeHarness({ session: null, resumeTo: makeSession('!room') });
-    await h.store.create({ label: 'AWS access key', roomId: '!room', convoId: 'convo-1' });
+    await h.store.create({ context: CONTEXT, label: 'AWS access key', roomId: '!room', convoId: 'convo-1' });
     h.advance(SECRET_REQUEST_TTL_MS);
     await h.scheduler.fireDue(SECRET_REQUEST_TTL_MS);
     expect(h.resumes).toEqual([]);
@@ -512,7 +601,7 @@ describe('turn delivery', () => {
 
   it('uses the PERSISTED convo id after a restart, so a notice always has a destination', async () => {
     const seed = makeHarness();
-    await seed.store.create({ label: 'k', roomId: '!room', convoId: 'convo-1' });
+    await seed.store.create({ context: CONTEXT, label: 'k', roomId: '!room', convoId: 'convo-1' });
     const h = makeHarness({ initial: seed.saved, session: null, startAt: 1_000_000 + 1000 });
     h.store.init();
     await (await h.store.submit('sec-1', DUMMY)).done;
@@ -525,9 +614,9 @@ describe('per-room pending cap', () => {
     let n = 0;
     const h = makeHarness({ newId: () => `sec-${++n}` });
     for (let i = 0; i < 5; i++) {
-      expect((await h.store.create({ label: `k${i}`, roomId: '!room', convoId: 'c' })).secretId).toBeTruthy();
+      expect((await h.store.create({ context: CONTEXT, label: `k${i}`, roomId: '!room', convoId: 'c' })).secretId).toBeTruthy();
     }
-    const sixth = await h.store.create({ label: 'k6', roomId: '!room', convoId: 'c' });
+    const sixth = await h.store.create({ context: CONTEXT, label: 'k6', roomId: '!room', convoId: 'c' });
     expect(sixth.secretId).toBeFalsy();
     expect(sixth.error).toBe('5 secret requests already pending for this session — wait for one to be answered or expire');
     expect(h.saved.requests.length).toBe(5);
@@ -545,7 +634,7 @@ describe('per-room pending cap', () => {
     const slowCreate = items.create;
     items.create = (body) => new Promise((resolve) => { release.push(() => resolve(slowCreate(body))); });
     const h = makeHarness({ newId: () => `sec-${++n}`, items });
-    const results = Promise.all(Array.from({ length: 6 }, (_, i) => h.store.create({ label: `k${i}`, roomId: '!room', convoId: 'c' })));
+    const results = Promise.all(Array.from({ length: 6 }, (_, i) => h.store.create({ context: CONTEXT, label: `k${i}`, roomId: '!room', convoId: 'c' })));
     await new Promise((r) => setTimeout(r, 0));
     expect(release.length).toBe(5);
     for (const go of release) go();
@@ -563,7 +652,7 @@ describe('per-room pending cap', () => {
     const slowCreate = items.create;
     items.create = (body) => new Promise((resolve) => { release.push(() => resolve(slowCreate(body))); });
     const h = makeHarness({ newId: () => `sec-${++n}`, items });
-    const creating = h.store.create({ label: 'k', roomId: '!room', convoId: 'c' });
+    const creating = h.store.create({ context: CONTEXT, label: 'k', roomId: '!room', convoId: 'c' });
     await new Promise((r) => setTimeout(r, 0));
     // The user reached the form through the item and submitted before create() resumed.
     const sub = await h.store.submit('sec-1', DUMMY);
@@ -586,7 +675,7 @@ describe('per-room pending cap', () => {
     items.create = async () => { throw new Error('network down'); };
     let n = 0;
     const h = makeHarness({ newId: () => `sec-${++n}`, items });
-    const r = await h.store.create({ label: 'k', roomId: '!room', convoId: 'c' });
+    const r = await h.store.create({ context: CONTEXT, label: 'k', roomId: '!room', convoId: 'c' });
     expect(r.secretId).toBe('sec-1');
     expect(r.itemError).toBe('network down');
     expect(h.saved.requests.length).toBe(1);
@@ -596,13 +685,13 @@ describe('per-room pending cap', () => {
   it('counts per room, and frees a slot when one is answered', async () => {
     let n = 0;
     const h = makeHarness({ newId: () => `sec-${++n}`, maxPendingPerRoom: 2 });
-    await h.store.create({ label: 'a', roomId: '!room', convoId: 'c' });
-    await h.store.create({ label: 'b', roomId: '!room', convoId: 'c' });
-    expect((await h.store.create({ label: 'c', roomId: '!room', convoId: 'c' })).error).toBeTruthy();
+    await h.store.create({ context: CONTEXT, label: 'a', roomId: '!room', convoId: 'c' });
+    await h.store.create({ context: CONTEXT, label: 'b', roomId: '!room', convoId: 'c' });
+    expect((await h.store.create({ context: CONTEXT, label: 'c', roomId: '!room', convoId: 'c' })).error).toBeTruthy();
     // Another room is unaffected.
-    expect((await h.store.create({ label: 'd', roomId: '!other', convoId: 'c2' })).secretId).toBeTruthy();
+    expect((await h.store.create({ context: CONTEXT, label: 'd', roomId: '!other', convoId: 'c2' })).secretId).toBeTruthy();
     await (await h.store.submit('sec-1', DUMMY)).done;
-    expect((await h.store.create({ label: 'e', roomId: '!room', convoId: 'c' })).secretId).toBeTruthy();
+    expect((await h.store.create({ context: CONTEXT, label: 'e', roomId: '!room', convoId: 'c' })).secretId).toBeTruthy();
   });
 });
 
@@ -655,22 +744,10 @@ describe('orphaned secret files', () => {
   });
 });
 
-describe('createSecretRequests.read (legacy GET compatibility)', () => {
-  it('reports pending, then answered once, then forgets', async () => {
-    const h = makeHarness();
-    await h.store.create({ label: 'k', roomId: '!room', convoId: 'c' });
-    expect(h.store.read('sec-1')).toEqual({ answered: false, path: null });
-    await (await h.store.submit('sec-1', DUMMY)).done;
-    expect(h.store.read('sec-1')).toEqual({ answered: true, path: '/tmp/secrets/sec-1.txt' });
-    expect(h.store.read('sec-1')).toBe(null);
-    expect(h.store.read('unknown')).toBe(null);
-  });
-});
-
 describe('createSecretRequests expiry', () => {
   it('closes the item as cancelled and tells the agent when 24 h pass', async () => {
     const h = makeHarness();
-    await h.store.create({ label: 'AWS access key', roomId: '!room', convoId: 'c' });
+    await h.store.create({ context: CONTEXT, label: 'AWS access key', roomId: '!room', convoId: 'c' });
     h.advance(SECRET_REQUEST_TTL_MS);
     await h.scheduler.fireDue(SECRET_REQUEST_TTL_MS);
 
@@ -687,7 +764,7 @@ describe('createSecretRequests expiry', () => {
 
   it('refuses a submission after expiry', async () => {
     const h = makeHarness();
-    await h.store.create({ label: 'k', roomId: '!room', convoId: 'c' });
+    await h.store.create({ context: CONTEXT, label: 'k', roomId: '!room', convoId: 'c' });
     h.advance(SECRET_REQUEST_TTL_MS);
     await h.scheduler.fireDue(SECRET_REQUEST_TTL_MS);
     expect((await h.store.submit('sec-1', DUMMY)).status).toBe(404);
@@ -698,11 +775,13 @@ describe('createSecretRequests.init (persistence across a restart)', () => {
   let created;
   beforeEach(async () => {
     const h = makeHarness({ startAt: 1_000_000 });
-    await h.store.create({ label: 'AWS access key', roomId: '!room', convoId: 'c', multiline: true });
+    await h.store.create({ context: CONTEXT, label: 'AWS access key', roomId: '!room', convoId: 'c', multiline: true });
     created = h.saved;
   });
 
-  it('re-arms a still-pending request with its REMAINING delay', async () => {
+  it('re-arms an older request without context or origin and accepts its submission', async () => {
+    delete created.requests[0].context;
+    delete created.requests[0].convoId;
     const h = makeHarness({ initial: created, startAt: 1_000_000 + 3600_000 });
     expect(h.store.init()).toBe(1);
     expect(h.scheduler.only().delay).toBe(SECRET_REQUEST_TTL_MS - 3600_000);
@@ -798,7 +877,7 @@ describe('submitted file lifetime', () => {
 
   it('starts the hour at delivery, not at submission, when the turn waits on the queue', async () => {
     const { h, state } = harnessWithQueue();
-    await h.store.create({ label: 'k', roomId: '!room', convoId: 'c' });
+    await h.store.create({ context: CONTEXT, label: 'k', roomId: '!room', convoId: 'c' });
     await (await h.store.submit('sec-1', DUMMY)).done;
     expect(h.queuedTurns.length).toBe(1);
 
@@ -819,7 +898,7 @@ describe('submitted file lifetime', () => {
 
   it('removes a never-delivered file at the 24 h ceiling', async () => {
     const { h } = harnessWithQueue();
-    await h.store.create({ label: 'k', roomId: '!room', convoId: 'c' });
+    await h.store.create({ context: CONTEXT, label: 'k', roomId: '!room', convoId: 'c' });
     await (await h.store.submit('sec-1', DUMMY)).done;
     await runFor(h, SECRET_FILE_MAX_TTL_MS - 1);
     expect(h.removed).toEqual([]);
@@ -830,7 +909,7 @@ describe('submitted file lifetime', () => {
 
   it('clamps the post-delivery hour to the ceiling', async () => {
     const { h, state } = harnessWithQueue();
-    await h.store.create({ label: 'k', roomId: '!room', convoId: 'c' });
+    await h.store.create({ context: CONTEXT, label: 'k', roomId: '!room', convoId: 'c' });
     await (await h.store.submit('sec-1', DUMMY)).done;
     await runFor(h, SECRET_FILE_MAX_TTL_MS - 10 * 60 * 1000);
     state.held = false;
@@ -840,7 +919,7 @@ describe('submitted file lifetime', () => {
 
   it('restamps a late delivery no later than the ceiling minus the hour, so a restart sweep keeps the cap', async () => {
     const { h, state } = harnessWithQueue();
-    await h.store.create({ label: 'k', roomId: '!room', convoId: 'c' });
+    await h.store.create({ context: CONTEXT, label: 'k', roomId: '!room', convoId: 'c' });
     const submittedAt = h.clock;
     await (await h.store.submit('sec-1', DUMMY)).done;
     await runFor(h, SECRET_FILE_MAX_TTL_MS - 10 * 60 * 1000);
@@ -851,7 +930,7 @@ describe('submitted file lifetime', () => {
 
   it('goes back to watching when the turn reappears on the queue after it was seen delivered', async () => {
     const { h, state } = harnessWithQueue();
-    await h.store.create({ label: 'k', roomId: '!room', convoId: 'c' });
+    await h.store.create({ context: CONTEXT, label: 'k', roomId: '!room', convoId: 'c' });
     await (await h.store.submit('sec-1', DUMMY)).done;
     state.held = false;
     await runFor(h, SECRET_DELIVERY_POLL_MS);
@@ -868,7 +947,7 @@ describe('submitted file lifetime', () => {
     const h = makeHarness({
       session: null,
     });
-    await h.store.create({ label: 'k', roomId: '!room', convoId: 'c' });
+    await h.store.create({ context: CONTEXT, label: 'k', roomId: '!room', convoId: 'c' });
     await (await h.store.submit('sec-1', DUMMY)).done;
     expect(h.notices.length).toBe(1);
     await runFor(h, SECRET_FILE_TTL_MS);
@@ -881,7 +960,7 @@ describe('submitted file lifetime', () => {
       session: makeSession('!room', { busy: true }),
       awaitingDelivery: () => { throw new Error('boom'); },
     });
-    await h.store.create({ label: 'k', roomId: '!room', convoId: 'c' });
+    await h.store.create({ context: CONTEXT, label: 'k', roomId: '!room', convoId: 'c' });
     await (await h.store.submit('sec-1', DUMMY)).done;
     await runFor(h, SECRET_FILE_TTL_MS);
     expect(h.removed).toEqual([PATH]);
@@ -893,7 +972,7 @@ describe('submitted file lifetime', () => {
       session: makeSession('!room', { busy: true }),
       awaitingDelivery: (...args) => { seen.push(args); return false; },
     });
-    await h.store.create({ label: 'k', roomId: '!room', convoId: 'c' });
+    await h.store.create({ context: CONTEXT, label: 'k', roomId: '!room', convoId: 'c' });
     await (await h.store.submit('sec-1', DUMMY)).done;
     expect(JSON.stringify(seen)).not.toContain(DUMMY);
     expect(JSON.stringify(h.touched)).not.toContain(DUMMY);

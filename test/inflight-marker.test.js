@@ -24,6 +24,21 @@ describe('noteTurnStart / noteTurnEnd', () => {
     });
   });
 
+  it('keeps the name of another person who started the turn, and hands it back with the stale record', () => {
+    const { marker, state } = harness({ bootId: 'boot-1' });
+    marker.noteTurnStart('convo-a', 'room-a', { foreignPerson: 'bob' });
+    expect(state.data['convo-a'].foreignPerson).toBe('bob');
+    const next = harness({ initial: state.data, bootId: 'boot-2' });
+    const [rec] = next.marker.takeStale(60_000);
+    expect(rec).toMatchObject({ convoId: 'convo-a', foreignPerson: 'bob' });
+  });
+
+  it('records no person for a turn of the user\'s own', () => {
+    const { marker, state } = harness();
+    marker.noteTurnStart('convo-a', 'room-a', { foreignPerson: null });
+    expect(state.data['convo-a']).not.toHaveProperty('foreignPerson');
+  });
+
   it('removes the marker at turn end', () => {
     const { marker, state } = harness();
     marker.noteTurnStart('convo-a', 'room-a');

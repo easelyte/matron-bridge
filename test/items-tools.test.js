@@ -593,3 +593,24 @@ describe('items handlers deep-link byte-bound + multi-trailer', () => {
     expect(Buffer.byteLength(sent.body, 'utf8')).toBeLessThanOrEqual(BODY_MAX);
   });
 });
+
+describe('item_comment add_labels', () => {
+  const make = (labels) => fixture({ get: vi.fn(async () => ({ status: 200, data: { item: { id: 'it_1', labels } } })) });
+
+  it('adds to the labels the item has, never replacing them', async () => {
+    const { h, client } = make(['spare-allowance']);
+    const r = await h.comment({ roomId: '!r:s', id: 'it_1', body: 'started', add_labels: ['dispatched', 'dispatched'] });
+    expect(r.status).toBe(201);
+    expect(client.update.mock.calls[0]).toEqual(['it_1', { labels: ['spare-allowance', 'dispatched'] }]);
+    expect(r.body.labels_added).toEqual(['dispatched']);
+  });
+
+  it('writes nothing when the label is already there, and refuses bad labels before posting', async () => {
+    const { h, client } = make(['spare-allowance', 'dispatched']);
+    await h.comment({ roomId: '!r:s', id: 'it_1', body: 'again', add_labels: ['dispatched'] });
+    expect(client.update).not.toHaveBeenCalled();
+    expect((await h.comment({ roomId: '!r:s', id: 'it_1', body: 'x', add_labels: [''] })).status).toBe(400);
+    expect((await h.comment({ roomId: '!r:s', id: 'it_1', body: 'x', add_labels: 'dispatched' })).status).toBe(400);
+    expect(client.comment).toHaveBeenCalledTimes(1);
+  });
+});

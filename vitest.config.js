@@ -21,6 +21,9 @@ const WINDOWS_EXCLUDES = [
   'test/bridge-process.g7.test.js',
   'test/codex-completion.test.js',
   'test/codex-redact-publish.test.js',
+  // bin/run-named-node is a POSIX sh launcher for macOS (and a plain exec
+  // elsewhere); Windows starts node through its own .ps1 scripts.
+  'test/run-named-node.test.js',
   // Integration suites that need ffmpeg / a journal.
   'test/journal-publisher.integration.test.js',
   'test/video-frames.integration.test.js',

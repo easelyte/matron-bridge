@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from 'vitest';
-import { mkdtempSync, rmSync, readFileSync, existsSync, writeFileSync, utimesSync } from 'fs';
+import { mkdtempSync, rmSync, readFileSync, existsSync, writeFileSync, utimesSync, statSync, mkdirSync, symlinkSync } from 'fs';
 import { tmpdir } from 'os';
 import path from 'path';
 import { createLiveOutputStore, sweepOrphanedLogs } from '../lib/live-output.js';
@@ -77,5 +77,37 @@ describe('LiveOutputStore', () => {
     expect(existsSync(oldDone)).toBe(false);
     expect(existsSync(newLog)).toBe(true);
     rmSync(tmp, { recursive: true });
+  });
+});
+
+describe('markComplete in a shared directory', () => {
+  it.skipIf(process.platform === 'win32')('writes the sentinel owner-only', () => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'lo-'));
+    try {
+      const store = createLiveOutputStore();
+      store.register('toolu_m', { logPath: path.join(dir, 'matron-cmd-toolu_m.log') });
+      store.markComplete('toolu_m', { exitCode: 0 });
+      const st = statSync(path.join(dir, 'matron-cmd-toolu_m.log.done'));
+      expect(st.mode & 0o777).toBe(0o600);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+
+  it('does not throw or write through when the name is already taken', () => {
+    const dir = mkdtempSync(path.join(tmpdir(), 'lo-'));
+    try {
+      const store = createLiveOutputStore();
+      const logPath = path.join(dir, 'matron-cmd-toolu_s.log');
+      store.register('toolu_s', { logPath });
+      mkdirSync(`${logPath}.done`);
+      expect(() => store.markComplete('toolu_s', { exitCode: 0 })).not.toThrow();
+      expect(store.get('toolu_s').complete).toBe(true);
+
+      const target = path.join(dir, 'victim');
+      writeFileSync(target, 'keep');
+      store.register('toolu_l', { logPath: path.join(dir, 'matron-cmd-toolu_l.log') });
+      symlinkSync(target, path.join(dir, 'matron-cmd-toolu_l.log.done'));
+      expect(() => store.markComplete('toolu_l', { exitCode: 0 })).not.toThrow();
+      expect(readFileSync(target, 'utf8')).toBe('keep');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
 });

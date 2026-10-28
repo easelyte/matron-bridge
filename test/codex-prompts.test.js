@@ -101,10 +101,26 @@ describe('asynchronous Codex question cards', () => {
     await settle();
     expect(h.publish).toHaveBeenLastCalledWith({ question: '(2/2) Any details?', options: [], mode: 'pick_one' });
     expect(h.queue.answer({ text: 'Show all models' })).toBe('Show all models');
-    expect(h.submitAsync).toHaveBeenCalledWith('Which feature?\nModels\n\nAny details?\nShow all models');
+    expect(h.submitAsync).toHaveBeenCalledWith('Which feature?\nModels\n\nAny details?\nShow all models', null);
     expect(h.respond).not.toHaveBeenCalled();
     h.queue.addAsync('message-1', [{ title: 'Duplicate?' }]);
     expect(h.queue.active).toBeNull();
+  });
+  it('hands every reply\'s causes on with the answers\' message', async () => {
+    const h = setup();
+    h.queue.addAsync('message-1', [{ title: 'Which feature?', options: ['Tokens', 'Models'] }, { title: 'Any details?', options: null }]);
+    await settle();
+    const first = { kind: 'user_message', ref: 'c1:10', at: 1 };
+    const second = { kind: 'user_message', ref: 'c1:12', at: 2 };
+    expect(h.queue.answer({ choice: h.queue.active.options[1].value, causes: [first] })).toBe('Models');
+    expect(h.submitAsync).not.toHaveBeenCalled();
+    expect(h.queue.answer({ text: 'All of them', causes: [second] })).toBe('All of them');
+    expect(h.submitAsync).toHaveBeenCalledWith('Which feature?\nModels\n\nAny details?\nAll of them', [first, second]);
+  });
+  it('sends no causes when the replies named none', async () => {
+    const h = setup(); h.queue.addAsync('message-1', [{ title: 'Name?' }]);
+    expect(h.queue.answer({ text: 'Matron' })).toBe('Matron');
+    expect(h.submitAsync).toHaveBeenCalledWith('Name?\nMatron', null);
   });
   it('keeps async answers separate from approval decisions and resumes their cards', async () => {
     const h = setup(); h.queue.addAsync('message-1', [{ title: 'Continue?', options: ['Allow once'] }]); await settle();
@@ -118,7 +134,7 @@ describe('asynchronous Codex question cards', () => {
     expect(h.publish).toHaveBeenLastCalledWith(expect.objectContaining({ question: 'Continue?' }));
     h.queue.clear({ preserveAsync: true });
     expect(h.choose(0)).toBe('Allow once');
-    expect(h.submitAsync).toHaveBeenCalledWith('Continue?\nAllow once');
+    expect(h.submitAsync).toHaveBeenCalledWith('Continue?\nAllow once', null);
     expect(h.respond).toHaveBeenCalledTimes(1);
   });
   it('retains an answer for retry when the delivery path refuses it', () => {

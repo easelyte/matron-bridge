@@ -1,12 +1,12 @@
 #!/bin/bash
 # PreToolUse hook for ExitPlanMode — gates plan-mode approval through the
-# matrix bridge instead of letting claude's TUI show a "Build? Y/n" prompt.
+# bridge instead of letting claude's TUI show a "Build? Y/n" prompt.
 #
 # Flow:
 #   1. Hook receives the tool_use_id and plan text on stdin.
 #   2. POSTs to bridge HTTP /plan-decision and BLOCKS until the bridge
 #      responds (the bridge holds the response open while it waits for the
-#      user's Matrix reply — see the timeout matching --max-time below).
+#      user's reply — see the timeout matching --max-time below).
 #   3. Returns hookSpecificOutput with permissionDecision allow|deny.
 #
 # For any tool_name other than ExitPlanMode the hook is a no-op pass-through.
@@ -29,6 +29,7 @@ PORT="${MATRON_BRIDGE_API_PORT:-9802}"
 # slightly-shorter timer and reply with decision=deny on expiry so we never
 # exceed this curl ceiling.
 RESP=$(curl -s --max-time 1800 -X POST "http://127.0.0.1:${PORT}/plan-decision" \
+  -H @"${MATRON_BRIDGE_API_HEADER_FILE:-/dev/null}" \
   -H 'Content-Type: application/json' \
   -d "$(jq -nc --arg sid "$SID" --arg tuid "$TUID" --arg plan "$PLAN" \
         '{session_id:$sid,tool_use_id:$tuid,plan:$plan}')")

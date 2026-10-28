@@ -18,7 +18,7 @@ describe('macOS keep-awake wiring', () => {
   it('counts live sessions the way the reaper does, and folds in the keep-awake marker', () => {
     const body = fnBody('refreshPowerHold');
     expect(body).toMatch(/if \(session\.alive && !session\._autoStopped\) liveSessions \+= 1;/);
-    expect(body).toMatch(/keepAwakeUntil\(\{ timerUntil: timerStore\.holdAwakeMarker\(\)\?\.until \?\? null, workUntil: workHoldUntil \}\)/);
+    expect(body).toMatch(/keepAwakeUntil\(\{ timerUntil: timerStore\.holdAwakeMarker\(\)\?\.until \?\? null, workUntil: workLeaseUntil\(\) \}\)/);
     expect(body).toMatch(/powerHoldFlags\(\{ mode: KEEP_AWAKE_MODE, liveSessions, holdUntil \}\)/);
     expect(body).toMatch(/powerHold\.set\(flags\)/);
   });

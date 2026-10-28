@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { createAgentRooms, INVITE_TTL_MS } from '../lib/agent-rooms.js';
+import { labelBox, createAgentRooms, INVITE_TTL_MS, PERSON_INVITE_TTL_MS } from '../lib/agent-rooms.js';
 
 // No fs fake needed: the registry takes plain load/save functions, so tests
 // record calls directly and round-trip persistence through the save payload.
@@ -564,7 +564,6 @@ describe('peer mute', () => {
     expect(rooms.isPeerMuted('r', '!a')).toBe(false);
 
     rooms.record('l', { role: 'owner', state: 'joined', sessionRoomId: '!a', guestSessionRoomId: '!b', guestState: 'joined' });
-    expect(rooms.setPeerMuted('l', true)).toBeNull();
     rooms.setMuted('l', '!b', true, { reason: 'x' });
     expect(rooms.isPeerMuted('l', '!a')).toBe(true);
     expect(rooms.isPeerMuted('l', '!b')).toBe(false);
@@ -578,5 +577,116 @@ describe('peer mute', () => {
     a.setPeerMuted('r', true);
     const b = createAgentRooms({ load: () => saved, save: () => {} });
     expect(b.isPeerMuted('r', '!a')).toBe(true);
+  });
+});
+
+describe('per-member peer mutes', () => {
+  it('files each announced mute under the member that made it', () => {
+    const rooms = createAgentRooms();
+    rooms.record('r', { role: 'owner', state: 'joined', sessionRoomId: '!a' });
+    rooms.setPeerMuted('r', true, { who: 'box-3 [e0]', reason: 'done' });
+    rooms.setPeerMuted('r', true, { who: 'box-2 [c4]', reason: 'looping' });
+    expect(rooms.peerMutesFor('r', '!a')).toEqual([{ who: 'box-3 [e0]', reason: 'done' }, { who: 'box-2 [c4]', reason: 'looping' }]);
+    rooms.setPeerMuted('r', false, { who: 'box-2 [c4]' });
+    expect(rooms.peerMutesFor('r', '!a')).toEqual([{ who: 'box-3 [e0]', reason: 'done' }]);
+    expect(rooms.isPeerMuted('r', '!a')).toBe(true);
+    expect(rooms.peerMutesFor('r', '!other')).toEqual([]);
+  });
+
+  it('reads a record from before per-member mutes as one unnamed mute', () => {
+    const rooms = createAgentRooms({ load: () => ({ r: { role: 'owner', state: 'joined', sessionRoomId: '!a', peerMuted: true } }) });
+    expect(rooms.peerMutesFor('r', '!a')).toEqual([{ who: null, reason: null }]);
+    rooms.setPeerMuted('r', false);
+    expect(rooms.isPeerMuted('r', '!a')).toBe(false);
+    expect(rooms.get('r').peerMuted).toBeUndefined();
+  });
+
+  it('a named unmute clears a legacy unnamed mute too', () => {
+    const rooms = createAgentRooms({ load: () => ({ r: { role: 'owner', state: 'joined', sessionRoomId: '!a', peerMuted: true } }) });
+    rooms.setPeerMuted('r', false, { who: 'box-2 [c4]' });
+    expect(rooms.isPeerMuted('r', '!a')).toBe(false);
+  });
+
+  it('a member filed by name unmuting leaves someone else\'s unnamed mute alone', () => {
+    const rooms = createAgentRooms({ load: () => ({ r: { role: 'owner', state: 'joined', sessionRoomId: '!a', peerMuted: true } }) });
+    rooms.setPeerMuted('r', true, { who: 'box-3 [e0]', reason: 'done' });
+    rooms.setPeerMuted('r', false, { who: 'box-3 [e0]' });
+    expect(rooms.peerMutesFor('r', '!a')).toEqual([{ who: null, reason: null }]);
+  });
+
+  it('drops a member\'s mute when it leaves, matched on the box', () => {
+    const rooms = createAgentRooms();
+    rooms.record('r', { role: 'owner', state: 'joined', sessionRoomId: '!a' });
+    rooms.setPeerMuted('r', true, { who: 'box-3 [e0]', reason: 'done' });
+    rooms.setPeerMuted('r', true, { who: 'box-2 [c4]', reason: 'looping' });
+    expect(rooms.clearPeerMutesForBox('r', 'box-3')).toBe(1);
+    expect(rooms.peerMutesFor('r', '!a').map((m) => m.who)).toEqual(['box-2 [c4]']);
+    expect(rooms.clearPeerMutesForBox('r', 'nobody')).toBe(0);
+  });
+
+  it('a same-bridge room names the other binding and adds any remote member\'s mute', () => {
+    const rooms = createAgentRooms();
+    rooms.record('l', { role: 'owner', state: 'joined', sessionRoomId: '!a', guestSessionRoomId: '!b', guestState: 'joined' });
+    rooms.setMuted('l', '!b', true, { reason: 'x', who: 'mac [bb]' });
+    rooms.setPeerMuted('l', true, { who: 'box-3 [e0]', reason: 'done' });
+    expect(rooms.peerMutesFor('l', '!a')).toEqual([{ who: 'mac [bb]', reason: 'x' }, { who: 'box-3 [e0]', reason: 'done' }]);
+    expect(rooms.peerMutesFor('l', '!b')).toEqual([{ who: 'box-3 [e0]', reason: 'done' }]);
+    rooms.setMuted('l', '!b', false);
+    expect(rooms.get('l').guestMutedBy).toBeNull();
+  });
+
+  it('labelBox strips the session tag', () => {
+    expect(labelBox('box-a [3f]')).toBe('box-a');
+    expect(labelBox('box-a')).toBe('box-a');
+  });
+});
+
+describe('rooms with another person', () => {
+  const TALK = { role: 'owner', state: 'pending', sessionRoomId: '!sess1', peerDeviceId: null, person: 'bob', talk: true };
+
+  it('record keeps person and talk, and a partial re-record does not drop them', () => {
+    const { rooms, save } = makeStore();
+    rooms.record('r1', TALK);
+    expect(rooms.get('r1')).toMatchObject({ person: 'bob', talk: true });
+    rooms.record('r1', { state: 'joined' });
+    expect(rooms.get('r1')).toMatchObject({ person: 'bob', talk: true, state: 'joined' });
+    const reloaded = createAgentRooms({ load: () => save.mock.calls.at(-1)[0], log: { warn: () => {} } });
+    expect(reloaded.get('r1')).toMatchObject({ person: 'bob', talk: true });
+  });
+
+  it('an ordinary room has no person', () => {
+    const { rooms } = makeStore();
+    rooms.record('r1', REC);
+    expect(rooms.get('r1').person ?? null).toBeNull();
+  });
+
+  it('findLivePair finds a live room with the same person from the same session only', () => {
+    const { rooms } = makeStore();
+    rooms.record('r1', TALK);
+    expect(rooms.findLivePair('!sess1', { person: 'bob' })).toMatchObject({ roomId: 'r1' });
+    expect(rooms.findLivePair('!sess1', { person: 'carol' })).toBeNull();
+    expect(rooms.findLivePair('!sess2', { person: 'bob' })).toBeNull();
+    rooms.setState('r1', 'refused');
+    expect(rooms.findLivePair('!sess1', { person: 'bob' })).toBeNull();
+  });
+
+  it('a pending room with another person stays live past the ordinary invite TTL (both people answer in their own time)', () => {
+    vi.useFakeTimers();
+    try {
+      const { rooms, save } = makeStore();
+      rooms.record('r1', TALK);
+      rooms.record('r2', REC);
+      vi.advanceTimersByTime(INVITE_TTL_MS + 1);
+      expect(rooms.isActive('r1')).toBe(true);
+      expect(rooms.isActive('r2')).toBe(false);
+      expect(rooms.findLivePair('!sess1', { person: 'bob' })).toMatchObject({ roomId: 'r1' });
+      // …and survives a restart's load-time prune.
+      const reloaded = createAgentRooms({ load: () => save.mock.calls.at(-1)[0], log: { warn: () => {} } });
+      expect(reloaded.get('r1')).not.toBeNull();
+      expect(reloaded.get('r2')).toBeNull();
+      // It is still on a clock: past the person-room TTL it is gone too.
+      vi.advanceTimersByTime(PERSON_INVITE_TTL_MS);
+      expect(rooms.isActive('r1')).toBe(false);
+    } finally { vi.useRealTimers(); }
   });
 });

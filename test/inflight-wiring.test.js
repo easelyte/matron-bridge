@@ -8,6 +8,7 @@ import { liveWorkChildren } from '../lib/work-hold.js';
 import { currentBootSubagents, sessionBackgroundWork, evaluateQuiet } from '../lib/restart-quiet.js';
 import { createInflightMarker } from '../lib/inflight-marker.js';
 import { selectAutoCarryOn } from '../lib/code-update-restart.js';
+import * as turnCause from '../lib/turn-cause.js';
 
 // Source-text assertions on index.js, same idiom as test/codex-session.test.js's
 // "Codex bridge wiring" block. index.js has no unit-test harness, so the
@@ -162,7 +163,7 @@ describe('restart carry-on turn-boundary wiring', () => {
       'handleCodexEvent must record the turn start once the Codex thread id arrives, and must gate '
       + 'it on session.busy so a thread.started outside a turn cannot invent a marker. '
       + 'CONSEQUENCE OF REMOVING: no carry-on card for the first turn of every new Codex chat.',
-    ).toContain('if (session.busy) inflightMarker.noteTurnStart(journalConvoIdFor(session), session.roomId);');
+    ).toContain('if (session.busy) inflightMarker.noteTurnStart(journalConvoIdFor(session), session.roomId, inflightTurnOrigin(session));');
 
     expect(
       body.split('inflightMarker.noteTurnStart(').length - 1,
@@ -200,7 +201,7 @@ describe('background marker behaviour in the bridge', () => {
     const end = src.indexOf('\nfunction ', start + 1);
     const body = src.slice(start, end < 0 ? src.indexOf('\nasync function ', start + 1) : end);
     return runInNewContext(`${body}\n${name};`, {
-      BRIDGE_BOOT_AT: 1000, currentBootSubagents, sessionBackgroundWork,
+      ...turnCause, BRIDGE_BOOT_AT: 1000, currentBootSubagents, sessionBackgroundWork,
       journalConvoIdFor: session => session.journalConvoId || 'alice',
       subagentRunningStore: { listStrict: () => ({ ok: true, records: [] }) },
       ...context,
@@ -307,7 +308,7 @@ describe('background marker behaviour in the bridge', () => {
     const session = { alive: true, busy: true, proc: { pid: 10 }, toolCalls: [], responseBuffer: '', turnCount: 0, workdir: 'box-a' };
     const noop = () => {};
     const context = {
-      inflightMarker: marker, journalConvoIdFor: () => 'alice', shuttingDown: false,
+      ...turnCause, inflightMarker: marker, journalConvoIdFor: () => 'alice', shuttingDown: false,
       SESSION_IDLE_CHECK_MS: 60_000, Date: { now: () => 1000 },
       liveWorkChildren, MCP_SERVER_SIGNATURES: [], readProcessTableStrict: () => ({ ok: true, table }),
       debug: noop, flushResponse: noop, journalStreamClear: noop, journalSessionState: noop,

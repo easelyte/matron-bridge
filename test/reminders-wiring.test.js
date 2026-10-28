@@ -57,7 +57,7 @@ describe('reminders wiring', () => {
       expect(askUser, `reminder_${t} is not registered`).toContain(`'reminder_${t}',`);
       expect(askUser, `reminder_${t} does not go through callReminders`).toContain(`callReminders('${t}',`);
     }
-    expect(askUser).toMatch(/fetch\(`\$\{BRIDGE_API\}\/reminders\/\$\{name\}`[\s\S]*?JSON\.stringify\(\{ roomId: ROOM_ID, \.\.\.args \}\)/);
+    expect(askUser).toMatch(/bridgeFetch\(`\$\{BRIDGE_API\}\/reminders\/\$\{name\}`[\s\S]*?JSON\.stringify\(\{ roomId: ROOM_ID, \.\.\.args \}\)/);
   });
 
   it('tells both agents to prefer reminder_create over in-process scheduling for anything past the idle reap', () => {

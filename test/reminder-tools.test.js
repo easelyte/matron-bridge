@@ -43,6 +43,17 @@ describe('reminder handlers', () => {
     expect(announce).toHaveBeenCalledWith(session, expect.objectContaining({ id: 1 }));
   });
 
+  it('create keeps the causes of the turn that set it, on disk; none when the turn had none', async () => {
+    const { h, saves, session } = fixture();
+    const causes = [{ kind: 'carry_on', ref: 'carry_on:co_0123456789abcdef', at: 1 }];
+    session.currentTurn = { causes, startedAt: 1 };
+    await h.create({ roomId: '!r:s', text: 'ask for the helper', in: '1h' });
+    expect(saves.at(-1).timers[0].causes).toEqual(causes);
+    session.currentTurn = null;
+    await h.create({ roomId: '!r:s', text: 'later', in: '2h' });
+    expect('causes' in saves.at(-1).timers[1]).toBe(false);
+  });
+
   it('create with `at` resolves a clock time on this box', async () => {
     const { h } = fixture();
     const r = await h.create({ roomId: '!r:s', text: 'standup', at: '14:30' });
@@ -251,8 +262,8 @@ describe('restart note creation', () => {
       const source = readFileSync(new URL('../ask-user.js', import.meta.url), 'utf8');
       const start = source.indexOf('async function callReminders(');
       const end = source.lastIndexOf('server.tool(', source.indexOf("  'reminder_list',"));
-      Function('server', 'z', 'fetch', 'BRIDGE_API', 'ROOM_ID', 'formatReminderLine', source.slice(start, end))(
-        server, z, fetch, 'http://bridge', 'box-a', formatReminderLine);
+      Function('server', 'z', 'fetch', 'bridgeFetch', 'BRIDGE_API', 'ROOM_ID', 'formatReminderLine', source.slice(start, end))(
+        server, z, fetch, fetch, 'http://bridge', 'box-a', formatReminderLine);
       const tool = tools.get('reminder_create');
       const result = await tool.callback(tool.schema.parse({ restart_note: true, text: 'resume work' }));
       expect(posts).toEqual([input]);
