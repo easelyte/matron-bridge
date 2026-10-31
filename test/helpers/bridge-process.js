@@ -247,7 +247,7 @@ fs.watchFile(process.env.TRANSCRIPT_PATH, { interval: 25 }, async stat => {
       ALLOWED_USER_IDS: 'harness',
       DEFAULT_WORKDIR: workdir, MATRON_BRIDGE_API_PORT: String(port),
       MATRON_INTERACTIVE_MODE: interactive ? '1' : '0', MATRON_CODE_UPDATE_RESTART: '0',
-      SESSION_IDLE_TIMEOUT_MS: '0', MATRON_KEEP_AWAKE: 'off',
+      SESSION_IDLE_TIMEOUT_MS: '0', MATRON_KEEP_AWAKE: 'off', MATRON_CRASH_RECOVERY_PROMPT: '0',
       MATRON_LIVE_OUTPUT_TTL: '3153600000', // Keep startup's literal /tmp sweep inert in both modes.
     };
     supervisor = supervise(() => {

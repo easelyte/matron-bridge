@@ -28,7 +28,10 @@ import { createPlannedRestart } from './lib/planned-restart.js';
 import { createRestartLatch } from './lib/restart-latch.js';
 import { buildRestartStatus } from './lib/box-status-restart.js';
 import { BRIDGE_BOOT_AT } from './lib/boot-time.js';
-import { spawn, execFileSync } from 'child_process';
+import { spawn, execFileSync, execFile } from 'child_process';
+import {
+  createCrashWatch, lostWorkLikely, recoveryPrompt, crashNoticeText, burstNoticeText, CRASH_BURST_WINDOW_MS,
+} from './lib/crash-recovery.js';
 import { transcribeAudio, transcribeAudioSegments, resolveWhisperPrompt, makeWhisperPrompt, localWhisperAvailable } from './lib/transcribe.js';
 import { extractVideoFrames, videoFramesMessage } from './lib/video-frames.js';
 import { prepareInlineImage, appendInlineImageBlocks } from './lib/inline-image.js';
@@ -2680,6 +2683,54 @@ function shouldAutoRestart(exitCode, session, shuttingDown) {
   return !shuttingDown && exitCode !== 0 && session.restartCount < 3 && !session._resumeFailed;
 }
 
+// Crash restarts (lib/crash-recovery.js): the process died on its own and was
+// respawned. Count it, keep a durable record, flag a burst, and tell the
+// respawned agent what it lost. Returns the notice text for the chat.
+const crashWatch = createCrashWatch();
+const CRASH_LOG_FILE = path.join(os.homedir(), '.matron-bridge-crash-log.jsonl');
+const CRASH_RECOVERY_DELAY_MS = 2_000;
+// Off switch for the automatic recovery turn (the notice and burst alert stay on).
+const CRASH_RECOVERY_PROMPT = process.env.MATRON_CRASH_RECOVERY_PROMPT !== '0';
+
+function onCrashRestart(session, restarted, exitCode, signal = null) {
+  const wasBusy = !!session.busy;
+  const hadWork = lostWorkLikely({ busy: wasBusy, bgWorkObserved: session._bgWorkObserved });
+  try {
+    const convoId = journalConvoIdFor(restarted);
+    const result = crashWatch.note({ convoId, exitCode, signal, wasBusy, hadWork });
+    const record = { at: new Date().toISOString(), convoId, exitCode, signal, wasBusy, hadWork, concurrent: result.count };
+    try { fs.appendFileSync(CRASH_LOG_FILE, JSON.stringify(record) + '\n', { mode: 0o600 }); } catch { /* the record is best effort */ }
+    console.warn(`[crash-restart] ${convoId} exit=${exitCode} signal=${signal ?? 'none'} busy=${wasBusy} bgWork=${hadWork} concurrent=${result.count}`);
+    if (result.burst) {
+      console.error(`[crash-restart] BURST: ${result.count} sessions crashed within ${CRASH_BURST_WINDOW_MS / 1000}s; load=${os.loadavg().map(n => n.toFixed(2)).join(' ')}`);
+      // The signal's sender is not visible from here, but a snapshot taken
+      // now shows what else was running.
+      execFile('ps', ['-eo', 'pid,ppid,pgid,stat,etime,pcpu,pmem,args', '--sort=-pcpu'], { timeout: 5000, maxBuffer: 1 << 20 }, (err, out) => {
+        const top = err ? `ps failed: ${err.message}` : String(out).split('\n').slice(0, 30).map(l => l.slice(0, 200)).join('\n');
+        console.error(`[crash-restart] process snapshot at burst:\n${top}`);
+      });
+      const co = coordinatorLookup.snapshot();
+      if (co.convoId) {
+        journalPublishNotice(co.convoId, burstNoticeText({ count: result.count, exitCodes: result.events.map(e => e.exitCode) }));
+      }
+    }
+    if (hadWork && CRASH_RECOVERY_PROMPT) {
+      const text = recoveryPrompt({ exitCode, signal, wasBusy });
+      const timer = setTimeout(() => {
+        const target = sessions.get(restarted.roomId);
+        if (!target || !target.alive) return;
+        journalRouteTextToSession(target, text, { keepRestartBudget: true }).catch((e) => {
+          try { console.warn(`[crash-restart] recovery prompt failed for ${convoId}: ${e.message}`); } catch { /* logging must never throw */ }
+        });
+      }, CRASH_RECOVERY_DELAY_MS);
+      timer.unref?.();
+    }
+  } catch (e) {
+    try { console.warn(`[crash-restart] bookkeeping failed: ${e.message}`); } catch { /* logging must never throw */ }
+  }
+  return crashNoticeText({ exitCode, signal, restartCount: restarted.restartCount, willResume: hadWork && CRASH_RECOVERY_PROMPT });
+}
+
 function createSession(roomId, workdir, resumeSessionId, options = {}) {
   restartLatch?.onInput();
   // A persisted workdir can stop existing between spawns (repo renamed,
@@ -3188,15 +3239,12 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
         restarted._journalState = session._journalState;
         restarted._journalConvoEstablished = session._journalConvoEstablished;
         sessions.set(roomId, restarted);
+        const crashText = onCrashRestart(session, restarted, exitCode, proc.signalCode);
         if (restarted.sendHtml) {
-          const n = notice('warning',
-            `[Session crashed (exit ${exitCode}), restarted automatically — attempt ${restarted.restartCount}/3]`,
-            `Session crashed (exit ${exitCode}), restarted automatically — attempt <b>${restarted.restartCount}/3</b>`);
+          const n = notice('warning', `[${crashText}]`, escapeHtml(crashText));
           restarted.sendHtml(n.plain, n.html);
         } else if (restarted.sendCallback) {
-          restarted.sendCallback(
-            `[Session crashed (exit ${exitCode}), restarted automatically — attempt ${restarted.restartCount}/3]`
-          );
+          restarted.sendCallback(`[${crashText}]`);
         }
       } else {
         // Notice BEFORE teardown: sendToRoom's journal mirror looks the
@@ -4143,13 +4191,12 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
         // sent right after the restart was typed into a still-loading TUI
         // and dropped (Bugbot, PR #162).
         enterResumeHold(restarted);
+        const crashText = onCrashRestart(session, restarted, exitCode);
         if (restarted.sendHtml) {
-          const n = notice('warning',
-            `[Session crashed (exit ${exitCode}), restarted automatically — attempt ${restarted.restartCount}/3]`,
-            `Session crashed (exit ${exitCode}), restarted automatically — attempt <b>${restarted.restartCount}/3</b>`);
+          const n = notice('warning', `[${crashText}]`, escapeHtml(crashText));
           restarted.sendHtml(n.plain, n.html);
         } else if (restarted.sendCallback) {
-          restarted.sendCallback(`[Session crashed (exit ${exitCode}), restarted automatically — attempt ${restarted.restartCount}/3]`);
+          restarted.sendCallback(`[${crashText}]`);
         }
       } else {
         // Notices FIRST, teardown second: sendToRoom's journal mirror looks
