@@ -296,6 +296,61 @@ describe('createItemTurnRouter', () => {
     expect(deps.injectBlocks).not.toHaveBeenCalled();
   });
 
+  it.each(['reply', 'tap', 'created', 'reopened', 'closed'])('steers a busy user %s once without queueing or injecting', async (action) => {
+    const steerText = vi.fn(() => true);
+    const { deps, route } = fixture({ steerText });
+    const session = { busy: true, journalConvoId: 'c1' };
+    const payload = {
+      ...base, action: ['reply', 'tap'].includes(action) ? 'commented' : action,
+      comment: { id: 'ic', body: 'use A', created_at: 1000, attachments: [], ...(action === 'tap' ? { action: 'Go' } : {}) },
+    };
+    await route(session, { payload }, { username: 'alice' });
+    await route(session, { payload }, { username: 'alice' });
+    expect(steerText).toHaveBeenCalledTimes(1);
+    expect(steerText).toHaveBeenCalledWith(session, {
+      text: formatItemTurn(payload, { username: 'alice', body: 'fetched body', convoId: 'c1' }),
+      cause: expect.objectContaining({ kind: action === 'tap' ? 'item_tap' : 'item_reply' }),
+    });
+    expect(deps.queueText).not.toHaveBeenCalled();
+    expect(deps.injectBlocks).not.toHaveBeenCalled();
+    expect(deps.publishNotice).not.toHaveBeenCalled();
+  });
+
+  it.each(['false', 'throw'])('queues when steering returns %s', async (outcome) => {
+    const steerText = vi.fn(() => { if (outcome === 'throw') throw new Error('write failed'); return false; });
+    const { deps, route } = fixture({ steerText });
+    const session = { busy: true };
+    await route(session, { payload: { ...base, action: 'commented', comment: { id: 'ic', body: 'x', attachments: [] } } }, { username: 'alice' });
+    expect(steerText).toHaveBeenCalledTimes(1);
+    expect(deps.queueText).toHaveBeenCalledWith(session, expect.objectContaining({
+      text: expect.stringContaining('alice replied'), preview: '📌 #12 Which auth library?',
+      source: { item_id: base.item_id, comment_id: 'ic' }, cause: null,
+    }));
+    expect(deps.injectBlocks).not.toHaveBeenCalled();
+    expect(deps.publishNotice).not.toHaveBeenCalled();
+  });
+
+  it.each(['handover', 'agent comment'])('never steers a busy %s', async (kind) => {
+    const steerText = vi.fn(() => true);
+    const { deps, route } = fixture({ steerText });
+    const payload = kind === 'handover'
+      ? { ...base, action: 'updated', handover: { stage: 'offered', from_convo_id: 'c1', to_convo_id: 'c2' } }
+      : { ...base, action: 'commented', agent_comment: true, from_convo_id: 'c2', comment: { id: 'ic', body: 'x', attachments: [] } };
+    await route({ busy: true, journalConvoId: 'c1' }, { payload }, { username: 'alice' });
+    expect(steerText).not.toHaveBeenCalled();
+    expect(deps.queueText).toHaveBeenCalledTimes(1);
+    expect(deps.injectBlocks).not.toHaveBeenCalled();
+  });
+
+  it('injects an idle reply without calling the steering seam', async () => {
+    const steerText = vi.fn(() => true);
+    const { deps, route } = fixture({ steerText });
+    await route({ busy: false }, { payload: { ...base, action: 'commented', comment: { id: 'ic', body: 'x', attachments: [] } } }, { username: 'alice' });
+    expect(deps.injectBlocks).toHaveBeenCalledTimes(1);
+    expect(steerText).not.toHaveBeenCalled();
+    expect(deps.queueText).not.toHaveBeenCalled();
+  });
+
   it('downloads file attachments through saveAttachments and names their paths; audio is left to the transcriber', async () => {
     const saveAttachments = vi.fn(async (_s, atts) => atts.map((a) => (a.mime.startsWith('audio/') ? a : { ...a, path: `/files/${a.name}` })));
     const { deps, route } = fixture({ saveAttachments });

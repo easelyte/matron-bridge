@@ -102,6 +102,17 @@ const result = (text = 'done') => ({ type: 'result', result: text, usage: { inpu
 
 afterEach(() => vi.useRealTimers());
 
+describe('item turn steering wiring', () => {
+  it('uses the user gate and running-turn writer without posting a notice', () => {
+    const start = source.indexOf('const itemTurnRouter = createItemTurnRouter({');
+    const wiring = source.slice(start, source.indexOf('\n});', start));
+    expect(wiring).toContain(`steerText: (session, { text }) => canSteerClaude(session, {`);
+    expect(wiring).toContain(`enabled: CLAUDE_STEER_ENABLED, origin: 'user', text, inputHeld: effortFlowHoldsInput(session),`);
+    expect(wiring).toContain(`}).ok && steerIntoRunningTurn(session, [{ type: 'text', text }])`);
+    expect(wiring).not.toContain('STEER_NOTICE');
+  });
+});
+
 describe('journal text into a running Claude turn', () => {
   it('steers plain typed text: one stdin line with a uuid, nothing queued, notice posted, turn untouched', async () => {
     const h = setup();

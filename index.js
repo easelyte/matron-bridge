@@ -9969,8 +9969,9 @@ async function journalRouteTextToSession(session, body, { keepRestartBudget = fa
       if (handledMagicWord) return;
       // Print-mode Claude: plain text the user typed goes straight into the
       // running turn (lib/claude-steer.js) instead of waiting in the queue.
-      // Only journalOnText passes steerable; reminders, timers and carry-on
-      // taps queue as before. Any "no", or a failed write, falls through to
+      // journalOnText passes steerable; user-authored item turns use the same
+      // gate in itemTurnRouter. Reminders, timers and carry-on taps queue as
+      // before. Any "no", or a failed write, falls through to
       // the queue below so nothing is lost.
       if (steerable && canSteerClaude(session, {
         enabled: CLAUDE_STEER_ENABLED, origin: 'user', text: trimmed, inputHeld: effortFlowHoldsInput(session),
@@ -10356,6 +10357,10 @@ const itemTurnRouter = createItemTurnRouter({
   fetchTranscript: (blobRef, opts) => journalPublisher.fetchTranscript(blobRef, opts),
   hasLocalWhisper,
   injectBlocks: (session, blocks, { causes = null } = {}) => sendToSession(session, blocks, { skipJournalMirror: true, causes }),
+  // Item replies are the user's own words, same as chat; the thread is the record.
+  steerText: (session, { text }) => canSteerClaude(session, {
+    enabled: CLAUDE_STEER_ENABLED, origin: 'user', text, inputHeld: effortFlowHoldsInput(session),
+  }).ok && steerIntoRunningTurn(session, [{ type: 'text', text }]),
   queueText: (session, { text, preview, source, cause = null }) => journalQueueMedia(session, {
     blocks: [{ type: 'text', text }],
     mirrorToJournal: false,
