@@ -372,3 +372,16 @@ describe('formatLimits', () => {
     expect(html).toContain('Jul 9, &quot;noon&quot;');
   });
 });
+
+import { usageFetchTimeoutMs, DEFAULT_USAGE_FETCH_TIMEOUT_MS } from '../lib/usage-limits.js';
+describe('usageFetchTimeoutMs', () => {
+  it('defaults above the ~50s a large box needs', () => {
+    expect(usageFetchTimeoutMs({})).toBe(DEFAULT_USAGE_FETCH_TIMEOUT_MS);
+    expect(DEFAULT_USAGE_FETCH_TIMEOUT_MS).toBeGreaterThan(60000);
+  });
+  it('honours a valid override and ignores junk', () => {
+    expect(usageFetchTimeoutMs({ USAGE_FETCH_TIMEOUT_MS: '90000' })).toBe(90000);
+    expect(usageFetchTimeoutMs({ USAGE_FETCH_TIMEOUT_MS: 'abc' })).toBe(DEFAULT_USAGE_FETCH_TIMEOUT_MS);
+    expect(usageFetchTimeoutMs({ USAGE_FETCH_TIMEOUT_MS: '5' })).toBe(DEFAULT_USAGE_FETCH_TIMEOUT_MS);
+  });
+});
