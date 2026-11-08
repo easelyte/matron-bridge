@@ -44,6 +44,12 @@ describe('classifyDesignLoginOutput', () => {
     expect(classifyDesignLoginOutput('D e s i g n - s y s t e m   a c c e s s   a u t h o r i z e d .')).toBe('authorized');
   });
 
+  it('ignores an earlier attempt\'s result repainted above the live sign-in screen', () => {
+    const repaint = `❯ /design-login\n  ⎿  Design-system access authorized.\n${SIGN_IN_SCREEN}`;
+    expect(classifyDesignLoginOutput(repaint)).toBe(null);
+    expect(classifyDesignLoginOutput(`${repaint}\n  ⎿  Design login cancelled.`)).toBe('cancelled');
+  });
+
   it('does not treat the /design-sync hint as a result', () => {
     expect(classifyDesignLoginOutput('Authorize design-system access for /design-sync with your claude.ai account')).toBe(null);
   });
@@ -54,6 +60,15 @@ describe('designLoginCodeRefused', () => {
     expect(designLoginCodeRefused(' That code wasn\'t accepted. It may be incomplete, expired, already used.\n Press Enter to retry, or any other key to cancel.'))
       .toBe(true);
     expect(designLoginCodeRefused(SIGN_IN_SCREEN)).toBe(false);
+  });
+
+  it('spots a code pasted without its state half', () => {
+    expect(designLoginCodeRefused(`${SIGN_IN_SCREEN}\n Invalid code. Please make sure the full code was copied.\n Press Enter to retry.`))
+      .toBe(true);
+  });
+
+  it('ignores a refusal repainted above a fresh sign-in screen', () => {
+    expect(designLoginCodeRefused(` That code wasn't accepted.\n${SIGN_IN_SCREEN}`)).toBe(false);
   });
 });
 
@@ -107,5 +122,7 @@ describe('/design-login wiring (source inspection)', () => {
     const fn = src.slice(fnStart, src.indexOf('// --- Structured Question Handling ---', fnStart));
     expect(fn).toMatch(/if \(switched\) current\._accountFlowReturnToPrint = false;/);
     expect(fn).toMatch(/shouldRunAccountFlowReturn\(current\)/);
+    // An abandoned flow's timer must not end a newer flow in the same room.
+    expect(fn).toMatch(/current\.iv !== iv\) return;/);
   });
 });

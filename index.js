@@ -4816,7 +4816,7 @@ function armDesignLoginWatch(session) {
     if (outcome) {
       watch.stop();
       debug(`design-login finished (${outcome})`);
-      scheduleDesignLoginFinish(roomId, outcome, LOGIN_RETURN_TO_PRINT_DELAY_MS);
+      scheduleDesignLoginFinish(roomId, iv, outcome, LOGIN_RETURN_TO_PRINT_DELAY_MS);
       return;
     }
     // A refused code leaves the TUI on "Press Enter to retry, or any other
@@ -4840,7 +4840,7 @@ function armDesignLoginWatch(session) {
   const cap = setTimeout(() => {
     watch.stop();
     debug('design-login watch timed out');
-    scheduleDesignLoginFinish(roomId, null, 0);
+    scheduleDesignLoginFinish(roomId, iv, null, 0);
   }, DESIGN_LOGIN_WATCH_CAP_MS);
   if (typeof cap.unref === 'function') cap.unref();
   iv.on('pty-data', onData);
@@ -4850,10 +4850,14 @@ function armDesignLoginWatch(session) {
 // Report the outcome and, for a borrowed session, switch back to print. A
 // refused switch (a turn running, a prompt open) retries quietly like the
 // /effort return; only the last try tells the user to type /mode print.
-function scheduleDesignLoginFinish(roomId, outcome, delayMs, attempt = 0) {
+// Bound to the TUI the watch was armed on: a flow abandoned with /mode print
+// (or replaced by a restart) leaves a new session in the room, possibly
+// mid-way through a NEWER /design-login with the same borrow flag, and an
+// old timer must not end that one.
+function scheduleDesignLoginFinish(roomId, iv, outcome, delayMs, attempt = 0) {
   const t = setTimeout(() => {
     const current = sessions.get(roomId);
-    if (!current?.alive) return;
+    if (!current?.alive || current.iv !== iv) return;
     const sendReply = current.sendCallback || (() => {});
     const sendHtml = current.sendHtml || ((plain) => sendReply(plain));
     if (!shouldRunAccountFlowReturn(current)) {
@@ -4863,7 +4867,7 @@ function scheduleDesignLoginFinish(roomId, outcome, delayMs, attempt = 0) {
       return;
     }
     if (!planModeSwitch(current, false).ok && attempt < DESIGN_LOGIN_RETRY_LIMIT) {
-      scheduleDesignLoginFinish(roomId, outcome, DESIGN_LOGIN_RETRY_MS, attempt + 1);
+      scheduleDesignLoginFinish(roomId, iv, outcome, DESIGN_LOGIN_RETRY_MS, attempt + 1);
       return;
     }
     const switched = applyModeSwitch(roomId, current, false, {
