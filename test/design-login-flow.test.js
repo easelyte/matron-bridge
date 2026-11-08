@@ -1,0 +1,111 @@
+import { describe, it, expect } from 'vitest';
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
+import {
+  DESIGN_LOGIN_COMMAND,
+  classifyDesignLoginOutput,
+  designLoginCodeRefused,
+  designLoginOutcomeMessage,
+} from '../lib/design-login-flow.js';
+import { BRIDGE_COMMAND_NAMES, classifyBridgeCommand } from '../lib/command-dispatch.js';
+
+// Screens as Claude Code's /design-login renders them (ANSI already stripped).
+const SIGN_IN_SCREEN = [
+  '❯ /design-login',
+  'Design login',
+  'Authorize design-system access (read and write your organization\'s claude.ai/design projects) with your claude.ai',
+  ' Browser didn\'t open? Use the url below to sign in (c to copy)',
+  'https://claude.com/cai/oauth/authorize?code=true&client_id=x&response_type=code',
+  ' ·  Waiting for browser authorization…',
+  ' Paste code here if prompted >',
+  ' Esc to cancel',
+].join('\n');
+
+describe('classifyDesignLoginOutput', () => {
+  it('is null while the sign-in screen waits', () => {
+    expect(classifyDesignLoginOutput(SIGN_IN_SCREEN)).toBe(null);
+  });
+
+  it('reads the success result line', () => {
+    expect(classifyDesignLoginOutput(`${SIGN_IN_SCREEN}\n  ⎿  Design-system access authorized. /design-sync can now reach your claude.ai/design projects.\n❯ `))
+      .toBe('authorized');
+  });
+
+  it('reads cancel and failure lines', () => {
+    expect(classifyDesignLoginOutput('❯ /design-login\n  ⎿  Design login cancelled.\n❯')).toBe('cancelled');
+    expect(classifyDesignLoginOutput('  ⎿  Design login failed: network error')).toBe('failed');
+    expect(classifyDesignLoginOutput('Design login was interrupted.')).toBe('failed');
+    expect(classifyDesignLoginOutput('The browser authorization timed out after 5 minutes. Retry, or run /design-login for the manual flow.'))
+      .toBe('failed');
+    expect(classifyDesignLoginOutput('/design-login isn\'t available in this environment.')).toBe('failed');
+  });
+
+  it('matches letter-spaced shimmer output', () => {
+    expect(classifyDesignLoginOutput('D e s i g n - s y s t e m   a c c e s s   a u t h o r i z e d .')).toBe('authorized');
+  });
+
+  it('does not treat the /design-sync hint as a result', () => {
+    expect(classifyDesignLoginOutput('Authorize design-system access for /design-sync with your claude.ai account')).toBe(null);
+  });
+});
+
+describe('designLoginCodeRefused', () => {
+  it('spots the refused-code screen', () => {
+    expect(designLoginCodeRefused(' That code wasn\'t accepted. It may be incomplete, expired, already used.\n Press Enter to retry, or any other key to cancel.'))
+      .toBe(true);
+    expect(designLoginCodeRefused(SIGN_IN_SCREEN)).toBe(false);
+  });
+});
+
+describe('designLoginOutcomeMessage', () => {
+  it('says the mode returns only for a borrowed session', () => {
+    expect(designLoginOutcomeMessage('authorized')).toMatch(/authorized — back to normal mode\.$/);
+    expect(designLoginOutcomeMessage('authorized', { returning: false })).toBe('✅ Claude Design access authorized.');
+  });
+
+  it('points a failure or timeout at a retry', () => {
+    expect(designLoginOutcomeMessage('failed')).toMatch(/Send \/design-login to try again\./);
+    expect(designLoginOutcomeMessage(null)).toMatch(/didn't finish in time/);
+  });
+});
+
+describe('/design-login routing', () => {
+  it('is a bridge command', () => {
+    expect(BRIDGE_COMMAND_NAMES.has('design-login')).toBe(true);
+    expect(classifyBridgeCommand('/design-login')).toBe('!design-login');
+    expect(DESIGN_LOGIN_COMMAND).toBe('/design-login');
+  });
+
+  it('leaves /design to Claude Code (consent and revoke run in print mode)', () => {
+    expect(classifyBridgeCommand('/design consent')).toBe(null);
+    expect(classifyBridgeCommand('/design-sync')).toBe(null);
+  });
+});
+
+describe('/design-login wiring (source inspection)', () => {
+  const src = readFileSync(fileURLToPath(new URL('../index.js', import.meta.url)), 'utf-8');
+  const caseStart = src.indexOf("case '!design-login': {");
+  const caseBody = src.slice(caseStart, src.indexOf("case '!effort': {", caseStart));
+
+  it('the print branch parks the command and borrows interactive mode on the replacement', () => {
+    expect(caseStart).toBeGreaterThan(0);
+    expect(caseBody).toMatch(/next\._postReadySlashCommand = DESIGN_LOGIN_COMMAND;/);
+    expect(caseBody).toMatch(/next\._accountFlowReturnToPrint = true;/);
+    expect(caseBody).not.toMatch(/session\._accountFlowReturnToPrint = true;/);
+  });
+
+  it('the interactive branch arms the result watch after typing', () => {
+    expect(caseBody).toMatch(/session\.iv\.sendText\(DESIGN_LOGIN_COMMAND\)[\s\S]*armDesignLoginWatch\(session\);/);
+  });
+
+  it('the readiness watcher arms the result watch when it types a parked /design-login', () => {
+    expect(src).toMatch(/if \(parkedSlash === DESIGN_LOGIN_COMMAND\) armDesignLoginWatch\(session\);/);
+  });
+
+  it('the return clears the borrow flag only on an actual switch', () => {
+    const fnStart = src.indexOf('function scheduleDesignLoginFinish(');
+    const fn = src.slice(fnStart, src.indexOf('// --- Structured Question Handling ---', fnStart));
+    expect(fn).toMatch(/if \(switched\) current\._accountFlowReturnToPrint = false;/);
+    expect(fn).toMatch(/shouldRunAccountFlowReturn\(current\)/);
+  });
+});
