@@ -327,7 +327,7 @@ describe('createSession id pre-assignment (source inspection)', () => {
     // the provisional switch, so a zero-turn chat reaches the mode switch on
     // its own. It has to stay gone — an unauthenticated box cannot complete
     // the turn the old message asked for, which made /login unreachable
-    // precisely when it was the only thing that would help (jack, dev-j).
+    // precisely when it was the only thing that would help.
     expect(src).not.toMatch(/needs a conversation that has started/);
     // Busy is still handled, now by planModeSwitch's own refusal rather than
     // by an exclusion in a guard that no longer exists (Bugbot, PR #173).

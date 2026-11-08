@@ -289,6 +289,14 @@ port overrides are ignored. Connection refusal exits with code 4 and reports
 the port tried. Execute the script directly or use `bash -p` as above to
 avoid loading ambient shell startup files and exported functions.
 
+The file viewer follows the same rule: it watches the same checkout and,
+once new code has settled and the viewer module loads from it, exits with
+75 for its own supervisor to relaunch it. It has no turns to wait for. This
+keeps the viewer and the bridge on the same code, so a change to how the
+viewer signs its calls to the bridge cannot leave secret forms and one-time
+links failing until the machine reboots. `MATRON_CODE_UPDATE_RESTART=0` in
+the viewer's environment turns it off.
+
 ## Config (.env)
 
 | Variable | Description | Default |
@@ -331,6 +339,7 @@ avoid loading ambient shell startup files and exported functions.
 | `MATRON_VIEWER_PORT` | Local file viewer port | `9803` |
 | `MATRON_WAKE_CONVO_ID` | Conversation that `POST /wake` on the internal API wakes. Lets a scheduled job on the same machine wake one conversation with a fixed text, resuming its session if it was idle-stopped; the request can choose neither the conversation nor the text. Off unless both this and `MATRON_WAKE_TEXT` are set | — |
 | `MATRON_WAKE_TEXT` | The exact text `POST /wake` delivers to `MATRON_WAKE_CONVO_ID` | — |
+| `MATRON_WAKE_TARGETS` | Optional. Comma-separated names of further wake targets, for a box that runs more than one conversation needing a wake. `POST /wake/<name>` wakes target `<name>` (lowercase letters, digits and single dashes, up to 32 characters) with the conversation in `MATRON_WAKE_CONVO_ID_<NAME>` and the text in `MATRON_WAKE_TEXT_<NAME>`, where `<NAME>` is the name upper-cased with dashes as underscores (`chat-2` reads `MATRON_WAKE_CONVO_ID_CHAT_2`). Each target coalesces on its own, and `MATRON_WAKE_TOKEN` guards them all. A listed target missing either variable is off (404) and logged at startup | — |
 | `MATRON_WAKE_TOKEN` | Optional. When set, `POST /wake` is refused (403) unless the request carries it in an `X-Matron-Wake-Token` header — the internal API port is reachable by every local user, and a wake resumes a session | — |
 | `MCP_DEFAULT_EXTRAS` | Comma-separated MCP extras loaded for every session on this machine (e.g. `circleci`). Names must match `mcpExtras` keys in `mcp-config.json`/`mcp-config.local.json`. | _(none)_ |
 | `BRIDGE_PLUGIN_CACHE_DIR` | Dir plugin MCP servers (context7, serena, …) load from. Unset = an empty bridge-owned dir (no plugin MCPs, lean). Set to `~/.claude/plugins` or a curated dir to re-enable. | _(empty dir)_ |
@@ -397,7 +406,7 @@ bridge's own `ask-user` MCP loads per session; everything else is opt-in.
 |---|---|
 | `!start [--claude\|--codex] [workdir]` | Start a session with the selected agent (optional custom workdir) |
 | `!start now` | Start a fresh session (skip resume offer) |
-| `!start --browser [workdir]` | Claude only: also load the chrome-devtools MCP (off by default to save ~400M/session). The flag is order-independent and also accepted by `!resume`, `!workdir`, and `!restart`. |
+| `!start --browser [workdir]` | Claude only: also load the chrome-devtools MCP (off by default to save ~400M/session). The flag is order-independent and also accepted by `!resume`, `!workdir`, and `!restart`. Chrome runs with its sandbox on, so on Linux the bridge must run as an unprivileged user (Chrome will not start sandboxed as root) with Xvfb and the Google Chrome package installed; the package's AppArmor profile lets it use the user namespaces Ubuntu otherwise restricts. |
 | `!start --auto [workdir]` | Claude only: spawn with auto permission mode + Matron permission cards instead of the default `--dangerously-skip-permissions`. Also order-independent and accepted by `!resume`, `!workdir`, and `!restart`; pass `--bypass` instead to return to the default. See Permissions below. |
 | `!stop` | Stop the current session |
 | `!restart [--force] [--browser] [--bypass\|--auto]` | Restart the session; mid-turn it waits for the turn to finish unless `--force` is given (`--browser`/`--bypass`/`--auto` are Claude-only) |

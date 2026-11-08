@@ -35,7 +35,7 @@ import {
 import { transcribeAudio, transcribeAudioSegments, resolveWhisperPrompt, makeWhisperPrompt, localWhisperAvailable } from './lib/transcribe.js';
 import { extractVideoFrames, videoFramesMessage } from './lib/video-frames.js';
 import { prepareInlineImage, appendInlineImageBlocks } from './lib/inline-image.js';
-import { createSendAttachmentHandler, resolveAndUploadLocalFile } from './lib/send-attachment.js';
+import { createSendAttachmentHandler, checkLocalUpload, resolveAndUploadLocalFile } from './lib/send-attachment.js';
 import { createPageLinkHandler } from './lib/page-link.js';
 import { createItemsClient } from './lib/items-client.js';
 import { createTransferClient } from './lib/transfer-client.js';
@@ -149,7 +149,7 @@ import { killProcessTree } from './lib/process-kill.js';
 import { processTableCommand, readProcessTableStrict } from './lib/process-table.js';
 import { evaluateQuiet, currentBootSubagents, sessionBackgroundWork, sessionOccupied } from './lib/restart-quiet.js';
 import { installShutdownToken, decideShutdown } from './lib/shutdown-endpoint.js';
-import { createWakeHandler, wakeTokenOk, WAKE_TOKEN_HEADER } from './lib/wake-route.js';
+import { createWakeHandler, wakeTokenOk, WAKE_TOKEN_HEADER, wakeTargetsFromEnv, wakeRouteName } from './lib/wake-route.js';
 import {
   createCodeUpdateWatcher, resolveGitDir, readHeadReflog, defaultPreflight,
   restartEnabled as codeUpdateRestartEnabled, parseMs as parseCodeUpdateMs,
@@ -303,6 +303,7 @@ import { buildClaudeSpawnEnv, buildCodexSpawnEnv } from './lib/spawn-env.js';
 import { createJournalReadProxy } from './lib/journal-read-proxy.js';
 import { loopbackRefusal } from './lib/loopback-guard.js';
 import { createApiAuth, viewerApiKey, apiAuthRefusal, namedSessionRoom, operatorHeaderPath } from './lib/api-auth.js';
+import { createRunDir, headerRunRoot, healHeaderFile, writeHeaderFile } from './lib/header-files.js';
 import { codexMcpConfig } from './lib/codex-mcp.js';
 import { handleCodexControl, isCodexAuthError, offerCodexBuild, listCodexThreads, mergeCodexThreads } from './lib/codex-controls.js';
 import { createCodexAccountReader, codexSessionOptions } from './lib/codex-account.js';
@@ -932,22 +933,30 @@ const memoryClient = createMemoryClient({
 // an env value or argv: `curl -H @"$MATRON_JOURNAL_PROXY_HEADER_FILE"` reads
 // the header from the file, whereas a token on curl's command line would be
 // visible to other users in the process table. The file is `<Header>: <token>`
-// in a private mkdtemp dir, removed on exit.
+// in this process's private run directory (lib/header-files.js: under the
+// state directory, not the temp folder, whose cleaners delete by age),
+// removed on exit and rewritten by the heal timer below if it goes missing.
+//
+// The run directory holds the session API header files too.
+let HEADER_RUN_DIR = null;
+try {
+  HEADER_RUN_DIR = createRunDir(headerRunRoot());
+  process.once('exit', () => { try { fs.rmSync(HEADER_RUN_DIR, { recursive: true, force: true }); } catch { /* best effort */ } });
+} catch (e) {
+  console.warn(`[api] could not create the header file directory under ${headerRunRoot()}: ${e.message}`);
+}
 const JOURNAL_PROXY_CAP_TOKEN = randomBytes(32).toString('hex');
 const JOURNAL_PROXY_CAP_HEADER = 'x-matron-journal-proxy-token';
+const JOURNAL_PROXY_HEADER_LINE = `X-Matron-Journal-Proxy-Token: ${JOURNAL_PROXY_CAP_TOKEN}`;
 let JOURNAL_PROXY_HEADER_FILE = '';
-if (journalHttpBase) {
-  let dir = '';
+if (journalHttpBase && HEADER_RUN_DIR) {
   try {
-    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-journal-proxy-'));
-    const file = path.join(dir, 'header');
-    fs.writeFileSync(file, `X-Matron-Journal-Proxy-Token: ${JOURNAL_PROXY_CAP_TOKEN}\n`, { mode: 0o600 });
-    JOURNAL_PROXY_HEADER_FILE = file;
-    process.once('exit', () => { try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ } });
+    JOURNAL_PROXY_HEADER_FILE = writeHeaderFile(path.join(HEADER_RUN_DIR, 'journal-proxy.header'), JOURNAL_PROXY_HEADER_LINE);
   } catch (e) {
-    if (dir) { try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best effort */ } }
     console.warn(`[journal] could not write the read-proxy header file; journal search is unavailable to sessions: ${e.message}`);
   }
+} else if (journalHttpBase) {
+  console.warn('[journal] no header file directory; journal search is unavailable to sessions');
 }
 // Windows: the per-boot token that gates POST /shutdown, written where
 // restart.ps1 reads it (%LOCALAPPDATA%\matron-bridge\shutdown.token).
@@ -963,19 +972,27 @@ const journalReadProxy = createJournalReadProxy({
 });
 
 // Per-session tokens for the loopback API (lib/api-auth.js): each session's
-// children get a 0600 header file in a private mkdtemp dir, removed on exit.
+// children get a 0600 header file in the private run directory above.
 // MATRON_BRIDGE_API_AUTH=off turns the check off (the tokens are still
 // issued), for a rollback without a code change.
 const API_AUTH_ENFORCED = process.env.MATRON_BRIDGE_API_AUTH !== 'off';
-let API_AUTH_DIR = null;
-try {
-  API_AUTH_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-api-'));
-  process.once('exit', () => { try { fs.rmSync(API_AUTH_DIR, { recursive: true, force: true }); } catch { /* best effort */ } });
-} catch (e) {
-  console.warn(`[api] could not create the session token directory: ${e.message}`);
-}
+const API_AUTH_DIR = HEADER_RUN_DIR;
 const apiAuth = createApiAuth({ dir: API_AUTH_DIR, viewerKey: viewerApiKey(process.env.HMAC_SECRET || '') });
 if (!API_AUTH_ENFORCED) console.warn('[api] MATRON_BRIDGE_API_AUTH=off: loopback API session tokens are not checked');
+// Rewrite any header file that has gone missing, so a live session whose
+// file something deleted gets it back without a restart (a respawn heals it
+// at once: ensure() rewrites a missing file).
+const HEADER_HEAL_INTERVAL_MS = 10 * 60 * 1000;
+function healHeaderFiles() {
+  const rooms = apiAuth.heal();
+  if (rooms.length) console.warn(`[api] rewrote ${rooms.length} missing session token file(s): ${rooms.join(', ')}`);
+  try {
+    if (healHeaderFile(JOURNAL_PROXY_HEADER_FILE, JOURNAL_PROXY_HEADER_LINE)) console.warn('[journal] rewrote the missing read-proxy header file');
+  } catch (e) {
+    console.warn(`[journal] could not rewrite the read-proxy header file: ${e.message}`);
+  }
+}
+setInterval(healHeaderFiles, HEADER_HEAL_INTERVAL_MS).unref();
 // The operator token, for the owner's own scripts outside any session
 // (lib/api-auth.js). Written once this process holds the API port (a second
 // start that cannot bind must not replace the live bridge's file), and
@@ -10238,7 +10255,7 @@ const journalMediaRouter = createJournalMediaRouter({
     });
     return blocks;
   },
-  buildSavedBlocks: async (session, { buffer, mime, isImage, name, dims, caption }) => {
+  buildSavedBlocks: async (session, { buffer, mime, isImage, name, dims, caption, onInlineSkip = null }) => {
     const safeName = safeMediaFilename(name);
     // Downscale/skip decision for the INLINE copy only (iv mode never inlines,
     // so don't burn a decode there). The original buffer still goes to disk.
@@ -10249,6 +10266,7 @@ const journalMediaRouter = createJournalMediaRouter({
         console.log(`[journal-media] inline image downscaled: ${buffer.length}B ${mime} -> ${inline.buffer.length}B ${inline.mediaType} ${inline.width}x${inline.height}`);
       } else if (inline.action === 'skip') {
         console.warn(`[journal-media] inline image skipped (${inline.reason}); full file still saved for Read`);
+        if (typeof onInlineSkip === 'function') onInlineSkip(inline.reason);
       }
     }
     const { blocks, savedPath, savedIdentity, savedTmpPath } = buildSavedMediaBlocks(session, {
@@ -13422,17 +13440,27 @@ function validateShowFileBody(data) {
 // POST /wake (lib/wake-route.js): wake one configured conversation with one
 // configured text, the way a timer firing does — resuming a reaped session.
 // Off unless both env vars are set; the request can choose neither.
-const handleWake = createWakeHandler({
-  convoId: process.env.MATRON_WAKE_CONVO_ID,
-  text: process.env.MATRON_WAKE_TEXT,
-  findSession: (convoId) => findSessionByClaudeSessionId(convoId),
-  resumeConvo: (convoId) => journalResumeConvo(convoId),
-  routeText: (session, text) => journalRouteTextToSession(session, text),
-  publishNotice: (message, session) => journalPublishNotice(
-    session ? journalConvoIdFor(session) : process.env.MATRON_WAKE_CONVO_ID, message),
-  isPending: (session) => !!(session.busy || session.queuedMessages?.length || session._resumeOutbox?.length),
-  unavailable: () => shuttingDown || plannedRestartRuntime.stamped === true,
-});
+// POST /wake/<name> does the same for each named target in
+// MATRON_WAKE_TARGETS, each with its own coalescing.
+function makeWakeHandler(convoId, text) {
+  return createWakeHandler({
+    convoId,
+    text,
+    findSession: (id) => findSessionByClaudeSessionId(id),
+    resumeConvo: (id) => journalResumeConvo(id),
+    routeText: (session, t) => journalRouteTextToSession(session, t),
+    publishNotice: (message, session) => journalPublishNotice(
+      session ? journalConvoIdFor(session) : convoId, message),
+    isPending: (session) => !!(session.busy || session.queuedMessages?.length || session._resumeOutbox?.length),
+    unavailable: () => shuttingDown || plannedRestartRuntime.stamped === true,
+  });
+}
+const wakeHandlers = new Map([['', makeWakeHandler(process.env.MATRON_WAKE_CONVO_ID, process.env.MATRON_WAKE_TEXT)]]);
+{
+  const { targets, problems } = wakeTargetsFromEnv(process.env);
+  for (const problem of problems) console.warn(`[wake] ${problem}; that target is off`);
+  for (const [name, t] of targets) wakeHandlers.set(name, makeWakeHandler(t.convoId, t.text));
+}
 
 // send_attachment into a room: a journal transfer, uploaded in the
 // background. The outcome (declined / failed / expired, or a cancel because
@@ -13590,6 +13618,7 @@ const itemsHandlers = createItemsHandlers({
   journalConvoIdFor,
   client: itemsClient,
   uploadLocalFile: (session, reqPath, opts) => resolveAndUploadLocalFile({ session, reqPath, publisher: journalPublisher, ...opts }),
+  checkLocalFile: (session, reqPath) => checkLocalUpload({ session, reqPath }),
   webBaseUrl: WEB_BASE_URL,
   saveAttachments: saveItemAttachments,
 });
@@ -14114,7 +14143,8 @@ const apiServer = createServer(async (req, res) => {
   // names a session needs that session's. The viewer's key opens only the
   // routes the viewer calls.
   const apiCaller = apiAuth.caller(req.headers);
-  const ownCredentialRoute = url.pathname === '/wake' || url.pathname === '/shutdown' || url.pathname === '/show-file';
+  const wakeName = wakeRouteName(url.pathname);
+  const ownCredentialRoute = wakeName !== null || url.pathname === '/shutdown' || url.pathname === '/show-file';
   const refuseApiCall = (namedRoomId) => {
     if (!API_AUTH_ENFORCED || ownCredentialRoute) return false;
     const r = apiAuthRefusal({ caller: apiCaller, method: req.method, pathname: url.pathname, namedRoomId });
@@ -14180,9 +14210,10 @@ const apiServer = createServer(async (req, res) => {
     return;
   }
 
-  // POST /wake — handled before the body is read: it takes no input, so the
-  // body is drained unread (an empty one never reaches the JSON parse below).
-  if (url.pathname === '/wake') {
+  // POST /wake and /wake/<name> — handled before the body is read: they take
+  // no input, so the body is drained unread (an empty one never reaches the
+  // JSON parse below).
+  if (wakeName !== null) {
     req.resume();
     if (req.method !== 'POST') {
       res.writeHead(405, { 'Content-Type': 'application/json' });
@@ -14194,6 +14225,12 @@ const apiServer = createServer(async (req, res) => {
     if (!wakeTokenOk(process.env.MATRON_WAKE_TOKEN, req.headers[WAKE_TOKEN_HEADER])) {
       res.writeHead(403, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: 'wake token required' }));
+      return;
+    }
+    const handleWake = wakeHandlers.get(wakeName);
+    if (!handleWake) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'wake is not configured' }));
       return;
     }
     let result;
@@ -14356,6 +14393,14 @@ const apiServer = createServer(async (req, res) => {
         const faSession = sessions.get(data.roomId);
         if (!faSession) { res.writeHead(404); res.end(JSON.stringify({ error: 'No session for roomId' })); return; }
         const out = await foreignSessions.requestAction(faSession, data);
+        res.writeHead(out.status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(out.body));
+        return;
+      }
+      if (url.pathname === '/foreign-notice') {
+        const fnSession = sessions.get(data.roomId);
+        if (!fnSession) { res.writeHead(404); res.end(JSON.stringify({ error: 'No session for roomId' })); return; }
+        const out = await foreignSessions.raiseNotice(fnSession, data);
         res.writeHead(out.status, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(out.body));
         return;

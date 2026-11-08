@@ -203,7 +203,9 @@ describe('index.js child spawns are scoped', () => {
   });
 
   it('writes the proxy capability to a 0600 header file, never into an env value', () => {
-    expect(indexSrc).toMatch(/fs\.writeFileSync\(file, `X-Matron-Journal-Proxy-Token: \$\{JOURNAL_PROXY_CAP_TOKEN\}\\n`, \{ mode: 0o600 \}\)/);
+    // writeHeaderFile (lib/header-files.js) writes it owner-only (0600).
+    expect(indexSrc).toMatch(/const JOURNAL_PROXY_HEADER_LINE = `X-Matron-Journal-Proxy-Token: \$\{JOURNAL_PROXY_CAP_TOKEN\}`;/);
+    expect(indexSrc).toMatch(/writeHeaderFile\(path\.join\(HEADER_RUN_DIR, 'journal-proxy\.header'\), JOURNAL_PROXY_HEADER_LINE\)/);
     expect(indexSrc).not.toMatch(/MATRON_JOURNAL_PROXY_TOKEN/);
   });
 

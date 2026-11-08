@@ -102,6 +102,36 @@ describe('titleMatches', () => {
     expect(titleMatches('Release notes', 'Holiday rota for December')).toBe(false);
   });
 
+  it('does not count the pieces of a URL as matching words', () => {
+    const actual = 'Merge https://example.com/org/repo/pull/10 (live tracking fix)';
+    expect(titleMatches('Merge https://example.com/org/repo/pull/11 (search fix)', actual)).toBe(false);
+    expect(titleMatches('Merge https://example.com/org/repo/pull/1', actual)).toBe(false);
+    expect(titleMatches('https://example.com/org/repo/pull/10', 'Merge https://example.com/org/repo/pull/11')).toBe(false);
+    // Every other word the same: the address alone tells them apart.
+    expect(titleMatches('Merge https://example.com/org/repo/pull/11 (live tracking fix)', actual)).toBe(false);
+    expect(titleMatches('Merge https://example.com/org/repo/pull/10 live tracking fix', 'Merge live tracking fix')).toBe(false);
+    // Addresses keep their case and their parentheses.
+    expect(titleMatches('Fix https://example.com/Files/A', 'Fix https://example.com/Files/a')).toBe(false);
+    expect(titleMatches('Fix https://example.com/item(1) docs', 'Fix https://example.com/item(2) docs')).toBe(false);
+  });
+
+  it('still matches a title with a URL in it, written in full, cut short or without the URL', () => {
+    const actual = 'Merge https://example.com/org/repo/pull/10 (live tracking fix)';
+    expect(titleMatches(actual, actual)).toBe(true);
+    expect(titleMatches('Merge https://example.com/org/repo/pull/10', actual)).toBe(true);
+    expect(titleMatches('Merge https://example.com/org/repo/pu…', actual)).toBe(true);
+    expect(titleMatches('Merge (live tracking fix)', actual)).toBe(true);
+    expect(titleMatches('Merge https://example.com/org/repo/pull/10/ (live tracking)', actual)).toBe(true);
+    expect(titleMatches('https://example.com/org/repo/pu… live tracking', actual)).toBe(true);
+    expect(titleMatches('https://example.com/org/repo/pull/1...', actual)).toBe(true);
+    expect(titleMatches('Fix [https://example.com/a]', 'Fix https://example.com/a')).toBe(true);
+    // An address cut short inside wrapping punctuation is still cut short.
+    expect(titleMatches('Merge (https://example.com/org/repo/pull/1...)', 'Merge https://example.com/org/repo/pull/10')).toBe(true);
+    expect(titleMatches('Merge https://example.com/org/repo/pull/1..., then ship', 'Merge https://example.com/org/repo/pull/10 then ship')).toBe(true);
+    expect(titleMatches('Fix (see https://example.com/a)', 'Fix: see https://example.com/a')).toBe(true);
+    expect(titleMatches('Fix https://example.com/item(1) docs', 'Fix https://example.com/item(1) docs')).toBe(true);
+  });
+
   it('refuses link text that names no title at all', () => {
     expect(titleMatches('here', 'Merge: release notes export')).toBe(false);
     expect(titleMatches('', 'Merge: release notes export')).toBe(false);

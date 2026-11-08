@@ -42,6 +42,57 @@ describe('safeAttachmentFilename', () => {
 });
 
 describe('createItemAttachmentSaver', () => {
+  it('downloads at the same time, at most four at once, and keeps the list order', async () => {
+    const gates = new Map();
+    let running = 0;
+    let peak = 0;
+    const fetchMedia = vi.fn(async (ref) => {
+      running++;
+      peak = Math.max(peak, running);
+      await new Promise((resolve) => gates.set(ref, resolve));
+      running--;
+      return { buffer: Buffer.from(ref), contentType: 'text/csv' };
+    });
+    const { save } = fixture({ fetchMedia });
+    const list = ['b1', 'b2', 'b3', 'b4', 'b5', 'b6'].map((ref) => ({ blob_ref: ref, name: `${ref}.csv`, mime: 'text/csv' }));
+    const run = save({}, list);
+    await new Promise((r) => setImmediate(r));
+    expect(fetchMedia).toHaveBeenCalledTimes(4);
+    // The last of the first four lands first: the result still follows the list.
+    for (const ref of ['b4', 'b3', 'b2', 'b1']) {
+      gates.get(ref)();
+      await new Promise((r) => setImmediate(r));
+    }
+    gates.get('b6')();
+    gates.get('b5')();
+    const out = await run;
+    expect(peak).toBe(4);
+    expect(out.map((a) => a.path)).toEqual(list.map((a) => `/files/repo/${a.name}`));
+  });
+
+  it('fetches a blob once and writes one file when it is listed twice', async () => {
+    const { deps, fsImpl, save } = fixture();
+    const out = await save({}, [csv, { ...csv }]);
+    expect(deps.fetchMedia).toHaveBeenCalledTimes(1);
+    expect(out.map((a) => a.path)).toEqual(['/files/repo/audit.csv', '/files/repo/audit.csv']);
+    expect(fsImpl.writeFileSync).toHaveBeenCalledTimes(1);
+  });
+
+  it('two blobs with the same filename land under different names, whichever comes first', async () => {
+    const { fsImpl, save } = fixture();
+    const out = await save({}, [csv, { ...csv, blob_ref: 'b9' }]);
+    expect(new Set(out.map((a) => a.path))).toEqual(new Set(['/files/repo/audit.csv', '/files/repo/audit-1.csv']));
+    expect(fsImpl.writeFileSync).toHaveBeenCalledTimes(2);
+  });
+
+  it('a failed download leaves that attachment as a name and its siblings still save', async () => {
+    const fetchMedia = vi.fn(async (ref) => { if (ref === 'b1') throw new Error('boom'); return { buffer: Buffer.from(ref) }; });
+    const { save } = fixture({ fetchMedia });
+    const out = await save({}, [csv, { ...csv, blob_ref: 'b9', name: 'other.csv' }]);
+    expect(out[0]).toEqual(csv);
+    expect(out[1].path).toBe('/files/repo/other.csv');
+  });
+
   it('downloads a file attachment into the session directory and returns its path', async () => {
     const { deps, fsImpl, save } = fixture();
     const session = { workdir: '/w' };

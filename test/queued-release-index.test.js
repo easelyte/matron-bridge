@@ -300,7 +300,7 @@ describe('journal-input-router — release echo-ack wiring', () => {
     const onReleaseEcho = vi.fn();
     const onJournalEvent = consumer(onReleaseEcho);
     onJournalEvent({ type: 'prompt_reply', sender: 'agent:dev1', convo_id: 'c', payload: { kind: 'other', action: 'cancel' } });
-    onJournalEvent({ type: 'prompt_reply', sender: 'user:fantin', convo_id: 'c', payload: { kind: 'queued_release', action: 'cancel' } });
+    onJournalEvent({ type: 'prompt_reply', sender: 'user:carol', convo_id: 'c', payload: { kind: 'queued_release', action: 'cancel' } });
     expect(onReleaseEcho).not.toHaveBeenCalled();
   });
 });

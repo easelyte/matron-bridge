@@ -74,8 +74,8 @@ describe('sensitiveFilename', () => {
 
   it('falls back to a filename-looking token in the label', async () => {
     const { sensitiveFilename } = await import('../viewer/server.js');
-    expect(sensitiveFilename('install-jack.sh — dev-j setup script', undefined))
-      .toBe('install-jack.sh');
+    expect(sensitiveFilename('install-bob.sh — box-b setup script', undefined))
+      .toBe('install-bob.sh');
   });
 
   it('falls back to a label slug with .txt when nothing looks like a filename', async () => {
@@ -183,10 +183,10 @@ describe('POST /sensitive/reveal', () => {
   it('derives the filename from the label when the API sends none', async () => {
     apiResponse = {
       status: 200,
-      body: { label: 'install-jack.sh — dev-j setup', content: 'x' },
+      body: { label: 'install-bob.sh — box-b setup', content: 'x' },
     };
-    const res = await postReveal({ sensitiveId: 'abc', label: 'install-jack.sh — dev-j setup' });
-    expect((await res.json()).filename).toBe('install-jack.sh');
+    const res = await postReveal({ sensitiveId: 'abc', label: 'install-bob.sh — box-b setup' });
+    expect((await res.json()).filename).toBe('install-bob.sh');
   });
 
   it('sanitizes a hostile filename to a safe basename', async () => {

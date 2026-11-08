@@ -242,7 +242,7 @@ describe('sharing renderers', () => {
     expect(formatSharingError('contact_add', { error: 'not_found' })).toMatch(/no such user/);
     expect(formatSharingError('contact_add', { error: 'conflict', blocked_by: 'pending_in' })).toMatch(/Only the user can accept/);
     expect(formatSharingError('share', { error: 'conflict', blocked_by: 'not_contact' })).toMatch(/contact_add asks/);
-    expect(formatSharingError('share', { error: 'conflict', blocked_by: 'level_unavailable' })).toMatch(/only read-only/);
+    expect(formatSharingError('share', { error: 'conflict', blocked_by: 'level_unavailable' })).toMatch(/does not cross journals yet/);
     expect(formatSharingError('share', { error: 'conflict', blocked_by: 'private_mission' })).toMatch(/private box/);
     expect(formatSharingError('unshare', { error: 'forbidden' })).toMatch(/only the user/);
     expect(formatSharingError('shared_get', { error: 'not_found' })).toMatch(/mission_list shared: true/);

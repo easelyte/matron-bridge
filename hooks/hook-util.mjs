@@ -1,4 +1,4 @@
-import { readApiHeaderFile } from '../lib/api-header-file.js';
+import { readApiHeaderFile, apiHeaderFileProblem } from '../lib/api-header-file.js';
 
 // Shared bits for the Node ports of the bridge's hooks (used on Windows, where
 // the .sh versions would need Git Bash + jq + curl). Same contract as the shell
@@ -31,7 +31,16 @@ export function bridgePort(env = process.env) {
 
 // POST JSON to the bridge's loopback API; swallow every failure (the shell
 // hooks run curl -s … > /dev/null and exit 0 regardless).
+// A missing or unreadable token file is reported on stderr: the bridge will
+// refuse the call (401) and the hook cannot say so any other way.
+export function warnIfNoApiHeaderFile(file, stderr = process.stderr) {
+  const problem = apiHeaderFileProblem(file);
+  if (problem) stderr.write(`matron-bridge: ${problem} Until then the bridge refuses this hook's calls (401 Missing or unknown bridge session token).\n`);
+  return problem;
+}
+
 export async function postBridge(pathname, body, { port = bridgePort(), timeoutMs = 5000, env = process.env } = {}) {
+  warnIfNoApiHeaderFile(env.MATRON_BRIDGE_API_HEADER_FILE);
   try {
     await fetch(`http://127.0.0.1:${port}${pathname}`, {
       method: 'POST',

@@ -188,7 +188,7 @@ describe('phase 3 renderers', () => {
   });
 
   it('turn the hand-over refusals into sentences', () => {
-    for (const [code, re] of [['handed_over', /already been handed over/], ['mission_closed', /closed/], ['project_closed', /project is closed/], ['empty_project', /no open missions/], ['level_unavailable', /does not offer that level/]]) {
+    for (const [code, re] of [['handed_over', /already been handed over/], ['mission_closed', /closed/], ['project_closed', /project is closed/], ['empty_project', /no open missions/], ['level_unavailable', /not available for this share/]]) {
       expect(formatSharingError('share', { error: 'conflict', blocked_by: code })).toMatch(re);
     }
   });

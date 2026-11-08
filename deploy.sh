@@ -102,7 +102,7 @@ npm install --no-audit --no-fund
 # npm 10 strips the `libc` fields npm 11 wrote into the committed lockfile,
 # leaving ` M package-lock.json` behind; a fleet updater
 # script) then skips this checkout as locally modified on
-# every later pass (tracker #3956). The lockfile is the repo's, so put it back.
+# every later pass. The lockfile is the repo's, so put it back.
 if [ -f package-lock.json ] && ! git checkout -q -- package-lock.json; then
   fail "could not restore package-lock.json after npm install — refusing to restart on a modified lockfile"
 fi

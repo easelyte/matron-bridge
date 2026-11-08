@@ -372,15 +372,36 @@ describe('renderMemoryBlock', () => {
     expect(out).toContain('- x (feedback, global): line one line two');
     expect(out.split('\n- ')).toHaveLength(2);
   });
-  it('caps the block at 16 KB and says how many were left out', () => {
-    const many = Array.from({ length: 200 }, (_, i) => m(`m-${String(i).padStart(3, '0')}`, 'd'.repeat(200)));
+  it('lists a long list (120 memories with full-length descriptions) in full', () => {
+    const many = Array.from({ length: 120 }, (_, i) => m(`m-${String(i).padStart(3, '0')}`, 'd'.repeat(200)));
+    const out = renderMemoryBlock({ known: true, memories: many });
+    expect(out.split('\n- ').length - 1).toBe(120);
+    expect(out).not.toContain('Not listed in full');
+    expect(out).not.toContain('more — call memory_list');
+  });
+  it('past the cap, names the rest instead of dropping them', () => {
+    const many = Array.from({ length: 300 }, (_, i) => m(`m-${String(i).padStart(3, '0')}`, 'd'.repeat(200)));
     const out = renderMemoryBlock({ known: true, memories: many });
     expect(Buffer.byteLength(out, 'utf8')).toBeLessThanOrEqual(MEMORY_BLOCK_MAX_BYTES);
-    const tail = out.match(/… (\d+) more — call memory_list\.$/);
-    expect(tail).toBeTruthy();
     const shown = out.split('\n- ').length - 1;
-    expect(shown + Number(tail[1])).toBe(200);
-    expect(shown).toBeGreaterThan(50);
+    expect(shown).toBeGreaterThan(120);
+    const tail = out.match(/Not listed in full because the block is capped; call memory_get for any of these: (.+)\.$/);
+    expect(tail).toBeTruthy();
+    const named = tail[1].split(', ');
+    expect(shown + named.length).toBe(300);
+    expect(named[0]).toBe(`m-${String(shown).padStart(3, '0')}`);
+    expect(named.at(-1)).toBe('m-299');
+    expect(out).not.toContain('more — call memory_list');
+  });
+  it('past the names budget too, ends with a count so the cap is a real ceiling', () => {
+    const many = Array.from({ length: 3000 }, (_, i) => m(`m-${String(i).padStart(4, '0')}`, 'd'.repeat(200)));
+    const out = renderMemoryBlock({ known: true, memories: many });
+    expect(Buffer.byteLength(out, 'utf8')).toBeLessThanOrEqual(MEMORY_BLOCK_MAX_BYTES);
+    const shown = out.split('\n- ').length - 1;
+    const named = out.match(/call memory_get for any of these: (.+)\.\n/)[1].split(', ');
+    const more = out.match(/\n… (\d+) more — call memory_list\.$/);
+    expect(more).toBeTruthy();
+    expect(shown + named.length + Number(more[1])).toBe(3000);
   });
 });
 

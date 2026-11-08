@@ -186,7 +186,7 @@ describe('talk requests: asking another person by name', () => {
 
   it('agent_chat_start takes person or target_convo_id, and sends person to the bridge', () => {
     expect(toolDef).toMatch(/target_convo_id: z\.string\(\)\.optional\(\)/);
-    expect(toolDef).toMatch(/person: z\.string\(\)\.max\(64\)\.optional\(\)/);
+    expect(toolDef).toMatch(/person: z\.string\(\)\.max\(PERSON_MAX\)\.optional\(\)/);
     expect(toolDef).toMatch(/JSON\.stringify\(\{ roomId: ROOM_ID, target_convo_id, person, topic, justification, message, mission \}\)/);
     expect(toolDef).toMatch(/exactly one/i);
     expect(toolDef).toMatch(/Neither Coordinator can answer/);

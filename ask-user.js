@@ -22,11 +22,12 @@ import {
   formatSharedMissionList, formatSharedMissionDetail, formatSharingError, formatContribAck,
 } from './lib/sharing-format.js';
 import { BRIEF_WHAT } from './lib/sharing-tools.js';
+import { PERSON_MAX } from './lib/person-ref.js';
 import { formatUnseenList, formatUnseenMine, formatFlagAck } from './lib/unseen-tools.js';
 import { formatRoutineList, formatRoutineUpdateAck, formatRoutineRunAck, formatRoutineCreateAck, formatRoutineDeleteAck } from './lib/routines-tools.js';
 import { formatBriefingPublishAck } from './lib/briefings-tools.js';
 import { shouldRegister } from './lib/tool-roles.js';
-import { readApiHeaderFile } from './lib/api-header-file.js';
+import { readApiHeaderFile, explainUnauthorized } from './lib/api-header-file.js';
 
 // Route to whichever bridge spawned us: explicit BRIDGE_API_URL wins, else the
 // per-session MATRON_BRIDGE_API_PORT exported by the bridge at spawn (journal=9812,
@@ -38,10 +39,12 @@ const BRIDGE_API = process.env.BRIDGE_API_URL
 const ROOM_ID = process.env.BRIDGE_ROOM_ID || null;
 // This session's loopback API token (lib/api-auth.js), sent on every bridge
 // call. Read per call: the file is written before the session spawns, and a
-// read is cheap next to the request.
-function bridgeFetch(url, opts = {}) {
-  const auth = readApiHeaderFile(process.env.MATRON_BRIDGE_API_HEADER_FILE);
-  return fetch(url, { ...opts, headers: { ...(opts.headers || {}), ...auth } });
+// read is cheap next to the request. A 401 caused by a missing or unreadable
+// file says so, naming the file and the fix, on top of the bridge's error.
+async function bridgeFetch(url, opts = {}) {
+  const file = process.env.MATRON_BRIDGE_API_HEADER_FILE;
+  const auth = readApiHeaderFile(file);
+  return explainUnauthorized(await fetch(url, { ...opts, headers: { ...(opts.headers || {}), ...auth } }), file);
 }
 const POLL_INTERVAL_MS = 500;
 // Max wait for a permission tap — the bridge's registry TTL resolves from the
@@ -449,7 +452,7 @@ server.tool(
   "Start a chat room with one of the user's other agent sessions: pick a target conversation from agent_roster, and the bridge invites its agent. Sessions on this same bridge are valid targets too (the invite is delivered locally). The user approves the invite on a consent card; once approved, the peer's bridge joins its agent to the room at once (there is no accept step on that side) and the agent reads your opening message as its next turn. A target whose box is asleep is fine: the journal wakes the box while the invite waits for the user's consent, so it just takes a few minutes longer. You and a given peer session share ONE room for the life of both conversations — it survives an idle reap, a restart and the box sleeping, and a peer's message wakes this conversation: calling this again at the same target returns that existing room (and posts your message into it) rather than opening a second one; a room with another person that is still waiting on a card instead returns its status (whose card it waits on) without posting — there is no way to close a room, so use agent_chat_mute if one goes wrong. If the result is pending or pending_busy, do NOT wait or poll: continue your own work — the answer and any replies arrive automatically as later turns. To talk with another PERSON's agent (\"can we talk to bob about X\"), pass `person` and `topic` instead of target_convo_id — exactly one of the two. Your user gets one card to send it (in the new room's own conversation and in their For you list, not in your session's chat), then that person gets one card that also makes you contacts and lets them choose where to talk; do not call contact_add or session_share first. Neither Coordinator can answer either card.",
   {
     target_convo_id: z.string().optional().describe('Conversation id of the target session, from agent_roster. Omit when you pass person'),
-    person: z.string().max(64).optional().describe("Another person to talk with, by their name as contact_list shows it (they need not be a contact yet). Omit when you pass target_convo_id"),
+    person: z.string().max(PERSON_MAX).optional().describe("Another person to talk with, by their name as contact_list shows it (they need not be a contact yet), or name@host for someone on another journal. Omit when you pass target_convo_id"),
     topic: z.string().optional().describe('Optional short topic for the room title'),
     justification: z.string().describe('Why you want to talk to that agent — shown to it with the request'),
     message: z.string().describe('The opening message posted into the room'),
@@ -491,6 +494,29 @@ server.tool(
       const data = await postRes.json().catch(() => ({}));
       if (!postRes.ok) return { content: [{ type: 'text', text: `foreign_action_request failed: ${data.error || `HTTP ${postRes.status}`}` }] };
       return { content: [{ type: 'text', text: `Filed ${data.item || 'the request'} for your user. ${data.note || ''}`.trim() }] };
+    } catch (err) {
+      return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
+    }
+  }
+);
+
+server.tool(
+  'foreign_notice',
+  "Only in a turn started by ANOTHER PERSON (a message in a room with someone else's agent, or their comment on a shared item): put ONE read-only notice in your own user's For you list saying what they want, so your user does not miss it. The bridge labels it as coming from that person's agent and quotes your text as their side's words. It has a Seen button and no actions; your user answers by replying, which reaches you as their own turn. Each call files a notice of its own, so put one thing in each. Use it when they want something only your user can give (a review, a decision, a go-ahead); then tell them your user has been told.",
+  {
+    title: z.string().max(120).describe('One line: what they want, e.g. "60 PRs ready for review"'),
+    text: z.string().max(4000).describe('A few sentences: who wants what, by when, and anything your user needs to answer it. Their words, summarised; no instructions to your user.'),
+  },
+  async ({ title, text }) => {
+    try {
+      const postRes = await bridgeFetch(`${BRIDGE_API}/foreign-notice`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ roomId: ROOM_ID, title, text }),
+      });
+      const data = await postRes.json().catch(() => ({}));
+      if (!postRes.ok) return { content: [{ type: 'text', text: `foreign_notice failed: ${data.error || `HTTP ${postRes.status}`}` }] };
+      return { content: [{ type: 'text', text: `Filed ${data.item || 'the notice'}. ${data.note || ''}`.trim() }] };
     } catch (err) {
       return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
     }
@@ -1270,7 +1296,7 @@ server.tool(
     position: z.enum(['top', 'bottom']).optional().describe('Where a task lands in the ordered task list'),
     supersedes: z.string().optional().describe('Item id of a decision this one replaces'),
     actions: z.array(z.string()).max(4).optional().describe('Up to 4 short one-tap reply labels (≤40 chars each, unique), e.g. ["Go"] or ["Option A","Option B"]. Tapping one behaves exactly like the user typing that label as a reply.'),
-    shared_by: z.string().max(64).optional().describe("Another person's mission you may contribute to: their user name, with mission = THEIR number (mission_list shared: true lists them). Needs a contribute share; no attachments or buttons."),
+    shared_by: z.string().max(PERSON_MAX).optional().describe("Another person's mission you may contribute to: their user name (name@host for someone on another journal), with mission = THEIR number (mission_list shared: true lists them). Needs a contribute share; no attachments or buttons."),
     mission: z.number().int().min(1).optional().describe('With shared_by: THEIR mission number to file the item on'),
   },
   async (args) => (args.shared_by
@@ -1310,7 +1336,7 @@ server.tool(
     awaiting: z.enum(['user', 'agent']).nullable().optional().describe('Who acts next after this comment; omit to leave it unchanged'),
     actions: z.array(z.string()).max(4).optional().describe('Up to 4 short one-tap reply labels (≤40 chars each, unique) shown under this comment, e.g. ["Merge"] or ["Option A","Option B"]. Sets awaiting to the user. The item must be open (item_reopen a closed one first).'),
     add_labels: z.array(z.string()).max(10).optional().describe('Labels to add to the item, keeping the ones it has (e.g. ["dispatched"] on a spare-allowance backlog task you started)'),
-    shared_by: z.string().max(64).optional().describe("An item on another person's mission you may contribute to: their user name; id is then the item's id or THEIR number ('#12'). Needs a contribute share; no attachments or buttons."),
+    shared_by: z.string().max(PERSON_MAX).optional().describe("An item on another person's mission you may contribute to: their user name (name@host for someone on another journal); id is then the item's id or THEIR number ('#12'). Needs a contribute share; no attachments or buttons."),
   },
   async (args) => (args.shared_by
     ? callSharing('shared_item_comment', 'item_comment', args, formatContribAck('Commented'))
@@ -1324,7 +1350,7 @@ server.tool(
     id: z.string().describe("Item id ('it_…') or '#12'"),
     resolution: z.enum(['done', 'answered', 'decided', 'reversed', 'cancelled']),
     comment: z.string().optional().describe('Closing note, added to the thread'),
-    shared_by: z.string().max(64).optional().describe("An item on another person's mission you may contribute to: their user name; id is then the item's id or THEIR number ('#12'). Needs a contribute share; no attachments or buttons."),
+    shared_by: z.string().max(PERSON_MAX).optional().describe("An item on another person's mission you may contribute to: their user name (name@host for someone on another journal); id is then the item's id or THEIR number ('#12'). Needs a contribute share; no attachments or buttons."),
   },
   async (args) => (args.shared_by
     ? callSharing('shared_item_close', 'item_close', args, formatContribAck('Closed'))
@@ -1337,7 +1363,7 @@ server.tool(
   {
     id: z.string().describe("Item id ('it_…') or '#12'"),
     comment: z.string().optional(),
-    shared_by: z.string().max(64).optional().describe("An item on another person's mission you may contribute to: their user name; id is then the item's id or THEIR number ('#12'). Needs a contribute share; no attachments or buttons."),
+    shared_by: z.string().max(PERSON_MAX).optional().describe("An item on another person's mission you may contribute to: their user name (name@host for someone on another journal); id is then the item's id or THEIR number ('#12'). Needs a contribute share; no attachments or buttons."),
   },
   async (args) => (args.shared_by
     ? callSharing('shared_item_reopen', 'item_reopen', args, formatContribAck('Reopened'))
@@ -1449,7 +1475,7 @@ server.tool(
     title: z.string().describe('One line, ≤200 chars'),
     body: z.string().optional().describe('Markdown ≤32 KiB — what happened, in a sentence or two'),
     mission: z.number().int().min(1).optional().describe('A mission this conversation is on; omit for the current mission. With shared_by: THEIR mission number'),
-    shared_by: z.string().max(64).optional().describe("Another person's mission you may contribute to: their user name, with mission = THEIR number (mission_list shared: true lists them). Needs a contribute share; no attachments or buttons."),
+    shared_by: z.string().max(PERSON_MAX).optional().describe("Another person's mission you may contribute to: their user name (name@host for someone on another journal), with mission = THEIR number (mission_list shared: true lists them). Needs a contribute share; no attachments or buttons."),
   },
   async (args) => (args.shared_by
     ? callSharing('shared_post', 'milestone_post', args, formatContribAck('Posted the milestone'))
@@ -1475,7 +1501,7 @@ server.tool(
   {
     status: z.string().describe('One short paragraph, ≤600 characters'),
     mission: z.number().int().min(1).optional().describe("Another mission's number (the Coordinator); omit for this conversation's mission. With shared_by: THEIR mission number"),
-    shared_by: z.string().max(64).optional().describe("Another person's mission you may contribute to: their user name, with mission = THEIR number (mission_list shared: true lists them). Needs a contribute share; no attachments or buttons."),
+    shared_by: z.string().max(PERSON_MAX).optional().describe("Another person's mission you may contribute to: their user name (name@host for someone on another journal), with mission = THEIR number (mission_list shared: true lists them). Needs a contribute share; no attachments or buttons."),
   },
   async (args) => (args.shared_by
     ? callSharing('shared_status', 'mission_status', args, formatContribAck('Set the status'))
@@ -1542,7 +1568,7 @@ server.tool(
   "Read a mission: its milestones newest first, open items (awaiting the user first) and conversations. Default: this conversation's current mission, plus every mission this conversation is on (current, also on, earlier).",
   {
     num: z.number().int().min(1).optional().describe('A mission number; omit for this conversation\'s mission'),
-    shared_by: z.string().max(64).optional().describe('To read a mission another person shares with the user: their user name, with num = THEIR mission number (mission_list shared: true lists both).'),
+    shared_by: z.string().max(PERSON_MAX).optional().describe('To read a mission another person shares with the user: their user name (name@host for someone on another journal), with num = THEIR mission number (mission_list shared: true lists both).'),
   },
   async (args) => (args.shared_by
     ? callSharing('shared_get', 'mission_get', args, formatSharedMissionDetail)
@@ -1600,22 +1626,25 @@ server.tool(
 
 server.tool(
   'contact_add',
-  `Ask another user on this journal to be the user's contact. ${SHARING_WHAT} Use it only when the user asked for it or clearly wants to share with that person.`,
-  { user: z.string().max(64).describe('The other user\'s name on this journal (contact_list users: true lists them)') },
+  `Ask another user on this journal to be the user's contact, or (remote: true) ask the user to make an invite link for someone on another Matron journal. ${SHARING_WHAT} Someone on another journal cannot be asked by name or address: they become a contact only by opening an invite link the user sends them. With remote: true the user gets a card to make one; the link is shown on their own device only, never to you, and they send it themselves. Contacts on other journals appear in contact_list as name@host. Use it only when the user asked for it or clearly wants to share with that person.`,
+  {
+    user: z.string().max(64).optional().describe('The other user\'s name on this journal (contact_list users: true lists them). Omit with remote: true'),
+    remote: z.boolean().optional().describe('true = someone on another Matron journal: ask the user to make an invite link for them. Pass no user'),
+  },
   async (args) => callSharing('contact_add', 'contact_add', args, formatContactAddAck),
 );
 
 server.tool(
   'contact_remove',
   'Remove a contact, or withdraw a contact request that has not been answered. Every mission shared between the two people, in either direction, ends at once. Becoming contacts again needs a new request and a new accept, so do it only when the user asks.',
-  { contact: z.string().max(128).describe('A contact name or id from contact_list') },
+  { contact: z.string().max(PERSON_MAX).describe('A contact name, address (name@host) or id from contact_list') },
   async (args) => callSharing('contact_remove', 'contact_remove', args, formatContactEndAck('Removed')),
 );
 
 server.tool(
   'contact_block',
   'Block a person: removes them as a contact, ends every share between the two, and their future contact requests never reach the user. Only the user can unblock, in the app. Do it only when the user asks.',
-  { contact: z.string().max(128).describe('A contact name or id from contact_list') },
+  { contact: z.string().max(PERSON_MAX).describe('A contact name, address (name@host) or id from contact_list') },
   async (args) => callSharing('contact_block', 'contact_block', args, formatContactEndAck('Blocked')),
 );
 
@@ -1623,7 +1652,7 @@ server.tool(
   'mission_share',
   `Offer a mission to one of the user's contacts. level 'read' (default): they see the mission's title, description and status, its milestones as text and its items with their comments and attachments, live, until either side ends it. 'contribute': read, plus they can post milestones, comment, file and close items and set the status, all shown as theirs; never close, rename or share it. 'owner': a HAND-OVER — they get their own copy (their numbering, your brief as its first milestone), the original here is closed as handed over, and the user keeps read access to the copy — or, with keep_contributing: true, keeps contributing to it (the user's card can switch this either way). A hand-over needs a brief: ${BRIEF_WHAT}. Pass project: N instead of mission to hand over every open mission of a project. Conversation transcripts, tool output, memories, secrets and box names never cross. ${SHARING_WHAT}`,
   {
-    contact: z.string().max(128).describe('A contact name or id from contact_list — they must already be a contact'),
+    contact: z.string().max(PERSON_MAX).describe('A contact name, address (name@host) or id from contact_list — they must already be a contact'),
     mission: z.number().int().min(1).optional().describe("A mission number; omit for this conversation's current mission"),
     level: z.enum(['read', 'contribute', 'owner']).optional().describe("'read' (default), 'contribute', or 'owner' (a hand-over: needs brief)"),
     brief: z.string().max(16000).optional().describe(`Required for level 'owner', not allowed otherwise. Markdown: ${BRIEF_WHAT}.`),
@@ -1638,7 +1667,7 @@ server.tool(
   "End a mission share: one the user gave (the contact can no longer read it, at once) or one given to the user (it leaves their shared list). Pass grant (an id from mission_shares), or contact and mission for a share the user gave.",
   {
     grant: z.string().max(128).optional().describe('A grant id from mission_shares'),
-    contact: z.string().max(128).optional().describe('The contact a mission of the user\'s is shared with'),
+    contact: z.string().max(PERSON_MAX).optional().describe('The contact a mission of the user\'s is shared with'),
     mission: z.number().int().min(1).optional().describe("With contact: the mission number; omit for this conversation's current mission"),
   },
   async (args) => callSharing('unshare', 'mission_unshare', args, formatUnshareAck),

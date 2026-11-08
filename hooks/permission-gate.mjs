@@ -11,7 +11,7 @@ import {
   PERMISSION_GATE_FETCH_TIMEOUT_MS,
 } from '../lib/permission-prompt.js';
 import { readApiHeaderFile } from '../lib/api-header-file.js';
-import { readStdinText } from './hook-util.mjs';
+import { readStdinText, warnIfNoApiHeaderFile } from './hook-util.mjs';
 
 // The bridge bakes `--port <n> --room <id>` into the hook command at spawn.
 // Deliberately NOT read from the environment: a settings `env` block reaches
@@ -48,7 +48,12 @@ async function main() {
       body: JSON.stringify({ roomId: room, toolName }),
       signal: AbortSignal.timeout(PERMISSION_GATE_FETCH_TIMEOUT_MS),
     });
-    if (!res.ok) return permissionGateHookOutput(null);
+    if (!res.ok) {
+      const out = permissionGateHookOutput(null);
+      const problem = res.status === 401 ? warnIfNoApiHeaderFile(auth) : null;
+      if (problem) out.hookSpecificOutput.permissionDecisionReason = `${out.hookSpecificOutput.permissionDecisionReason} ${problem}`;
+      return out;
+    }
     return permissionGateHookOutput(await res.json());
   } catch {
     return permissionGateHookOutput(null);

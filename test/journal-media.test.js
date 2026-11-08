@@ -88,6 +88,45 @@ describe('createJournalMediaRouter — file/image', () => {
     expect(deps.injectBlocks).toHaveBeenCalledTimes(1);
   });
 
+  it('tells the user when an image is saved but could not be attached inline', async () => {
+    // A HEIC that would not convert: claude gets the saved file and a text
+    // hint, and the user gets a notice instead of a silent loss.
+    const { route, deps } = makeRouter({
+      fetchMedia: vi.fn(async () => ({ buffer: Buffer.from('heic'), contentType: 'image/heic' })),
+      buildSavedBlocks: vi.fn(async (_s, { onInlineSkip }) => {
+        onInlineSkip('the HEIC image could not be converted (decode failed)');
+        return [{ type: 'text', text: '(image not attached inline: ...)' }];
+      }),
+    });
+    await route(session, { type: 'image', blobRef: 'img-h', contentType: 'image/heic', name: 'shot.heic' }, ctx);
+    expect(deps.publishNotice).toHaveBeenCalledWith('convo-1',
+      expect.stringMatching(/can't see that image \(shot\.heic\) directly: the HEIC image could not be converted.*as a JPEG or PNG/));
+    expect(deps.injectBlocks).toHaveBeenCalledTimes(1);
+  });
+
+  it('suggests a smaller image, not a format change, when a PNG could not be shrunk', async () => {
+    const { route, deps } = makeRouter({
+      fetchMedia: vi.fn(async () => ({ buffer: Buffer.from('png'), contentType: 'image/png' })),
+      buildSavedBlocks: vi.fn(async (_s, { onInlineSkip }) => {
+        onInlineSkip('too large to attach inline and could not be downscaled');
+        return [{ type: 'text', text: '(image not attached inline: ...)' }];
+      }),
+    });
+    await route(session, { type: 'image', blobRef: 'img-big', contentType: 'image/png', name: 'big.png' }, ctx);
+    const text = deps.publishNotice.mock.calls[0][1];
+    expect(text).toMatch(/as a smaller image/);
+    expect(text).not.toMatch(/JPEG or PNG/);
+  });
+
+  it('posts no notice when the image went inline', async () => {
+    const { route, deps } = makeRouter({
+      fetchMedia: vi.fn(async () => ({ buffer: Buffer.from('img'), contentType: 'image/png' })),
+      buildSavedBlocks: vi.fn(async () => [{ type: 'image', source: {} }]),
+    });
+    await route(session, { type: 'image', blobRef: 'img-p', contentType: 'image/png', name: 'x.png' }, ctx);
+    expect(deps.publishNotice).not.toHaveBeenCalled();
+  });
+
   it('awaits an ASYNC buildSavedBlocks (the inline-image downscale path returns a promise)', async () => {
     const blocks = [{ type: 'text', text: 'Image saved to /w/big.jpg' }, { type: 'image', source: {} }];
     const { route, deps } = makeRouter({

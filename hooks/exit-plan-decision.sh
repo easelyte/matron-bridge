@@ -23,26 +23,39 @@ SID=$(echo "$INPUT" | jq -r '.session_id // empty')
 TUID=$(echo "$INPUT" | jq -r '.tool_use_id // empty')
 PLAN=$(echo "$INPUT" | jq -r '.tool_input.plan // empty')
 PORT="${MATRON_BRIDGE_API_PORT:-9802}"
+# The session's API token header comes from its 0600 file (never argv). A
+# missing file is reported on stderr; the bridge then refuses the call (401).
+AUTH="${MATRON_BRIDGE_API_HEADER_FILE:-}"
+if [ -z "$AUTH" ] || [ ! -r "$AUTH" ] || [ ! -s "$AUTH" ]; then
+  AUTH_PROBLEM="matron-bridge: this session's bridge token file ${AUTH:-(MATRON_BRIDGE_API_HEADER_FILE is not set)} is missing, unreadable or empty, so the bridge refuses this hook's call (401 Missing or unknown bridge session token). A /restart of this session re-mints it."
+  echo "$AUTH_PROBLEM" >&2
+  AUTH=/dev/null
+fi
 
 # --max-time 1800s = 30 min — generous window for the user to read & decide on
 # their phone. The bridge HTTP handler should hold the response with its own
 # slightly-shorter timer and reply with decision=deny on expiry so we never
 # exceed this curl ceiling.
 RESP=$(curl -s --max-time 1800 -X POST "http://127.0.0.1:${PORT}/plan-decision" \
-  -H @"${MATRON_BRIDGE_API_HEADER_FILE:-/dev/null}" \
+  -H @"$AUTH" \
   -H 'Content-Type: application/json' \
   -d "$(jq -nc --arg sid "$SID" --arg tuid "$TUID" --arg plan "$PLAN" \
         '{session_id:$sid,tool_use_id:$tuid,plan:$plan}')")
 
 if [ -z "$RESP" ]; then
-  # Bridge unreachable or timed out at curl level — default to deny so we
-  # don't accidentally execute an unreviewed plan.
-  jq -nc '{hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: "bridge unreachable; plan auto-denied"}}'
+  # Bridge unreachable or timed out at curl level — default to deny
+  # so we don't accidentally execute an unreviewed plan.
+  if [ -n "${AUTH_PROBLEM:-}" ]; then
+    jq -nc --arg r "$AUTH_PROBLEM Plan auto-denied." '{hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: $r}}'
+  else
+    jq -nc '{hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: "deny", permissionDecisionReason: "bridge unreachable; plan auto-denied"}}'
+  fi
   exit 0
 fi
 
 DECISION=$(echo "$RESP" | jq -r '.decision // "deny"')
 REASON=$(echo "$RESP" | jq -r '.reason // ""')
+if [ -z "$REASON" ] && [ -n "${AUTH_PROBLEM:-}" ]; then REASON="$AUTH_PROBLEM"; fi
 
 jq -nc --arg d "$DECISION" --arg r "$REASON" \
   '{hookSpecificOutput: {hookEventName: "PreToolUse", permissionDecision: $d, permissionDecisionReason: $r}}'

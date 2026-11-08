@@ -43,6 +43,13 @@ describe('createAgentInvites', () => {
       expect(op).toEqual({ op: 'agent_invite', room_id: 'r1', target_person: 'bob', from_convo_id: 'c1', topic: 'cover editor', mission: 4, justification: 'j' });
     });
 
+    it('a talk aimed at a session shared from another journal carries its roster id as target_convo_id', async () => {
+      const { inv, sendRoomOp, rooms } = makeInvites();
+      rooms.record('r1', { role: 'owner', state: 'pending', sessionRoomId: '!sess', person: 'bob@b.example', talk: true });
+      inv.invite({ roomId: 'r1', targetPerson: 'bob@b.example', targetConvoId: 'fs_1', fromConvoId: 'c1', justification: 'j' });
+      expect(sendRoomOp.mock.calls[0][0]).toEqual({ op: 'agent_invite', room_id: 'r1', target_person: 'bob@b.example', target_convo_id: 'fs_1', from_convo_id: 'c1', justification: 'j' });
+    });
+
     it('sends the turn\'s causes verbatim on the agent_invite frame', async () => {
       const { inv, sendRoomOp } = makeInvites({ sendRoomOp: vi.fn(() => false) });
       const causes = [{ kind: 'item_reply', ref: 'item:3@2026-01-01T00:00:00.000Z', at: 5 }];

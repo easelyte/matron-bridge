@@ -4,7 +4,7 @@
 // unreachable -> deny while the turn's flag file exists, nothing otherwise.
 import fs from 'node:fs';
 import { readApiHeaderFile } from '../lib/api-header-file.js';
-import { readStdinText } from './hook-util.mjs';
+import { readStdinText, warnIfNoApiHeaderFile } from './hook-util.mjs';
 
 const DENY = {
   hookSpecificOutput: {
@@ -37,7 +37,10 @@ async function main() {
     const res = await fetch(`http://127.0.0.1:${portNum}/foreign-check?room=${encodeURIComponent(room)}`, {
       method: 'POST', headers: { 'Content-Type': 'application/json', ...readApiHeaderFile(auth) }, body: input, signal: AbortSignal.timeout(10_000),
     });
-    if (!res.ok) return fallback();
+    if (!res.ok) {
+      if (res.status === 401) warnIfNoApiHeaderFile(auth);
+      return fallback();
+    }
     const data = await res.json();
     if (data && typeof data === 'object' && Object.keys(data).length === 0) return null;
     return data?.hookSpecificOutput?.permissionDecision === 'deny' ? data : fallback();

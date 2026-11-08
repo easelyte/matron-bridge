@@ -1,5 +1,5 @@
 import { describe, it, expect, vi } from 'vitest';
-import { createWakeHandler, WAKE_COALESCE_MS, wakeTokenOk } from '../lib/wake-route.js';
+import { createWakeHandler, WAKE_COALESCE_MS, wakeTokenOk, wakeTargetsFromEnv, wakeRouteName } from '../lib/wake-route.js';
 
 const CONVO = 'convo-a';
 const TEXT = 'check the overnight queue';
@@ -164,5 +164,56 @@ describe('wake route while the bridge is going down', () => {
   it('still reports not-configured as 404 before the availability check', async () => {
     const { handle } = setup({ convoId: '', unavailable: () => true });
     expect((await handle()).status).toBe(404);
+  });
+});
+
+describe('named wake targets', () => {
+  it('reads each listed target from its own env pair', () => {
+    const { targets, problems } = wakeTargetsFromEnv({
+      MATRON_WAKE_TARGETS: 'chat, chat-2',
+      MATRON_WAKE_CONVO_ID_CHAT: 'convo-c',
+      MATRON_WAKE_TEXT_CHAT: 'a chat is waiting',
+      MATRON_WAKE_CONVO_ID_CHAT_2: 'convo-d',
+      MATRON_WAKE_TEXT_CHAT_2: 'a chat is waiting (odd)',
+    });
+    expect(problems).toEqual([]);
+    expect([...targets]).toEqual([
+      ['chat', { convoId: 'convo-c', text: 'a chat is waiting' }],
+      ['chat-2', { convoId: 'convo-d', text: 'a chat is waiting (odd)' }],
+    ]);
+  });
+
+  it('has none when the list is unset or empty', () => {
+    expect(wakeTargetsFromEnv({}).targets.size).toBe(0);
+    expect(wakeTargetsFromEnv({ MATRON_WAKE_TARGETS: ' , ' }).targets.size).toBe(0);
+  });
+
+  it('leaves out, and reports, a malformed, repeated or half-configured target', () => {
+    const { targets, problems } = wakeTargetsFromEnv({
+      MATRON_WAKE_TARGETS: 'Chat,a_b,../x,ok,ok,half,' + 'x'.repeat(33),
+      MATRON_WAKE_CONVO_ID_OK: 'convo-ok',
+      MATRON_WAKE_TEXT_OK: 'text',
+      MATRON_WAKE_CONVO_ID_HALF: 'convo-half',
+      MATRON_WAKE_TEXT_HALF: '   ',
+    });
+    expect([...targets.keys()]).toEqual(['ok']);
+    expect(problems).toHaveLength(6);
+    expect(problems.join('\n')).toContain('"ok" is listed twice');
+    expect(problems.join('\n')).toContain('MATRON_WAKE_TEXT_HALF');
+  });
+
+  it.each([
+    ['/wake', ''],
+    ['/wake/chat', 'chat'],
+    ['/wake/chat-2', 'chat-2'],
+    ['/wake/', null],
+    ['/wake/Chat', null],
+    ['/wake/chat/x', null],
+    ['/wake/..', null],
+    ['/wake/chat%2F', null],
+    ['/wakeup', null],
+    ['/other', null],
+  ])('maps %s to %j', (pathname, name) => {
+    expect(wakeRouteName(pathname)).toBe(name);
   });
 });

@@ -4,7 +4,7 @@ import { createConsentClient } from '../lib/consent-client.js';
 
 const NOW = 1_790_000_000_000;
 const spawnAsk = { kind: 'spawn', id: 'sp-1', created_at: NOW - 5 * 60_000, from_device_id: 7, from_name: 'coord-box', from_convo_id: 'c-coord', from_convo_title: 'Coordinator', target_device_id: 12, target_name: 'elm', target_state: 'asleep', workdir: '/home/alice/proj', task: 'fix the flaky test\nand report back', topic: 'flaky test', model: 'opus[1m]', link: true, mission_num: 61, item_num: 640 };
-const chatAsk = { kind: 'chat', id: 'room-1/12', created_at: NOW - 3 * 3_600_000, request: 'invite', room_id: 'room-1', room_title: 'A ↔ B', target_device_id: 12, from_device_id: 7, from_name: 'box-2', from_convo_id: 'c-2', from_convo_title: 'Dev 2', to_device_id: 12, to_name: 'elm', to_convo_id: 'c-e', to_convo_title: 'Eric session', target_state: 'online', topic: 'review', justification: 'need eyes on the diff' };
+const chatAsk = { kind: 'chat', id: 'room-1/12', created_at: NOW - 3 * 3_600_000, request: 'invite', room_id: 'room-1', room_title: 'A ↔ B', target_device_id: 12, from_device_id: 7, from_name: 'box-2', from_convo_id: 'c-2', from_convo_title: 'Dev 2', to_device_id: 12, to_name: 'elm', to_convo_id: 'c-e', to_convo_title: 'Elm session', target_state: 'online', topic: 'review', justification: 'need eyes on the diff' };
 
 const TR_ID = `tr_${'a'.repeat(32)}`;
 const transferAsk = { kind: 'transfer', id: TR_ID, created_at: NOW - 10 * 60_000, from_device_id: 7, from_name: 'box-a', from_convo_id: 'c-a', from_convo_title: 'Migration', room_id: 'room-1', room_title: 'A ↔ B', to_names: ['box-b'], name: 'staging.sql.gz', size: 1610612736, sha256: 'ab'.repeat(32), scan_verdict: 'not_scanned', scan_findings: [], reason: 'the staging dump\nfor the migration test', item_num: 650 };
@@ -174,7 +174,7 @@ describe('consent formatting', () => {
   });
   it('formatPendingAsk: a chat invite names both sides, the topic, the justification and the call; a join names the room', () => {
     const text = formatPendingAsk(chatAsk, { now: NOW });
-    expect(text).toContain('chat room-1/12 — 3 h ago: box-2 — session "Dev 2" [c-2] asks to chat with elm — session "Eric session" about "review" (box online)');
+    expect(text).toContain('chat room-1/12 — 3 h ago: box-2 — session "Dev 2" [c-2] asks to chat with elm — session "Elm session" about "review" (box online)');
     expect(text).toContain("why, in box-2's words: need eyes on the diff");
     expect(text).toContain('consent_decide(kind: "chat", id: "room-1/12", decision: approve|decline, reason: …)');
     const join = formatPendingAsk({ ...chatAsk, request: 'join', to_name: 'dev-a', room_title: 'triage' }, { now: NOW });

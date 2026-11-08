@@ -62,27 +62,50 @@ describe('items handlers', () => {
     expect(client.create.mock.calls[0][0]).toMatchObject({ supersedes: 'it_2' });
   });
 
-  // Multi-attachment atomicity: all paths are validated (local gates
-  // only) before ANY blob is uploaded, so a bad path among several cannot orphan
-  // the earlier, already-uploaded ones.
-  it('create: validates all attachment paths before uploading any blob', async () => {
-    const uploads = [];
-    const uploadLocalFile = vi.fn(async (_s, p, opts) => {
-      if (!opts?.validateOnly) uploads.push(p);
-      if (p.endsWith('.png')) {
-        return { ok: true, media: { blob_ref: 'b-' + p, mime: 'image/png', name: p, size: 3, isImage: true } };
-      }
-      return { ok: false, status: 404, body: { error: `file not found: ${p}` } };
+  it('create: uploads overlap, at most four at once, and attachments stay in the order listed', async () => {
+    let running = 0;
+    let peak = 0;
+    const paths = ['a.png', 'b.png', 'c.png', 'd.png', 'e.png', 'f.png'];
+    const uploadLocalFile = vi.fn(async (_s, p) => {
+      running++;
+      peak = Math.max(peak, running);
+      // Later files finish first.
+      await new Promise((r) => setTimeout(r, 2 * (paths.length - paths.indexOf(p))));
+      running--;
+      return { ok: true, media: { blob_ref: 'b-' + p, mime: 'image/png', name: p, size: 3 } };
     });
-    const client = { create: vi.fn(async () => ({ status: 201, data: { item: { id: 'it_1', num: 1 } } })) };
-    const sessions = new Map([['!r:s', { roomId: '!r:s', workdir: '/w', journalConvoId: 'c1' }]]);
-    const h = createItemsHandlers({ sessions, journalConvoIdFor: () => 'c1', client, uploadLocalFile });
+    const { h, client } = fixture({}, { uploadLocalFile });
+    const r = await h.create({ roomId: '!r:s', kind: 'task', title: 'T', attachments: paths });
+    expect(r.status).toBe(201);
+    expect(peak).toBe(4);
+    expect(client.create.mock.calls[0][0].attachments.map((a) => a.name)).toEqual(paths);
+  });
 
-    const r = await h.create({ roomId: '!r:s', kind: 'task', title: 'T', attachments: ['ok.png', 'bad.txt'] });
+  it('create: the earliest failure in the list is reported, and files not yet started are not uploaded', async () => {
+    const uploadLocalFile = vi.fn(async (_s, p) => {
+      if (p === 'late.txt') return { ok: false, status: 500, body: { error: 'late' } };
+      await new Promise((r) => setTimeout(r, 5));
+      if (p === 'early.txt') return { ok: false, status: 404, body: { error: 'early' } };
+      return { ok: true, media: { blob_ref: 'b-' + p, mime: 'image/png', name: p, size: 3 } };
+    });
+    const { h, client } = fixture({}, { uploadLocalFile });
+    const r = await h.create({ roomId: '!r:s', kind: 'task', title: 'T', attachments: ['early.txt', 'a.png', 'b.png', 'late.txt', 'never.png'] });
     expect(r.status).toBe(404);
-    // The valid first file was NEVER actually uploaded — the invalid second path
-    // was caught in the validation pass first.
-    expect(uploads).toEqual([]);
+    expect(r.body.error).toBe('early');
+    expect(uploadLocalFile.mock.calls.map((c) => c[1])).not.toContain('never.png');
+    expect(client.create).not.toHaveBeenCalled();
+  });
+
+  it('create: a path that fails its check refuses the write before any file uploads', async () => {
+    const checkLocalFile = vi.fn(async (_s, p) => (p === 'nope.png'
+      ? { ok: false, status: 404, body: { error: `file not found: ${p}` } }
+      : { ok: true }));
+    const { h, client, uploadLocalFile } = fixture({}, { checkLocalFile });
+    const r = await h.create({ roomId: '!r:s', kind: 'task', title: 'T', attachments: ['a.png', 'nope.png', 'b.png'] });
+    expect(r.status).toBe(404);
+    expect(r.body.error).toBe('file not found: nope.png');
+    expect(checkLocalFile).toHaveBeenCalledTimes(3);
+    expect(uploadLocalFile).not.toHaveBeenCalled();
     expect(client.create).not.toHaveBeenCalled();
   });
 
@@ -208,6 +231,25 @@ describe('items handlers', () => {
     const { h, client } = fixture();
     await h.list({ roomId: '!r:s', cursor: 'cur_1', limit: 10 });
     expect(client.list.mock.calls[0][0]).toMatchObject({ cursor: 'cur_1', limit: 10 });
+  });
+
+  it('get: the item and its comments download side by side and keep the thread order', async () => {
+    const item = { id: 'it_1', attachments: [{ blob_ref: 'b0', name: '0.csv', mime: 'text/csv' }] };
+    const comments = [1, 2, 3].map((n) => ({ id: `ic_${n}`, attachments: [{ blob_ref: `b${n}`, name: `${n}.csv`, mime: 'text/csv' }] }));
+    let running = 0;
+    let peak = 0;
+    const saveAttachments = vi.fn(async (_s, list) => {
+      running++;
+      peak = Math.max(peak, running);
+      await new Promise((r) => setTimeout(r, 5));
+      running--;
+      return list.map((a) => ({ ...a, path: `/files/${a.name}` }));
+    });
+    const { h } = fixture({ get: vi.fn(async () => ({ status: 200, data: { item, comments } })) }, { saveAttachments });
+    const r = await h.get({ roomId: '!r:s', id: 'it_1' });
+    expect(peak).toBe(4);
+    expect(r.body.item.attachments[0].path).toBe('/files/0.csv');
+    expect(r.body.comments.map((c) => c.id)).toEqual(['ic_1', 'ic_2', 'ic_3']);
   });
 
   it('get: downloads each comment\'s file attachments through saveAttachments and returns their paths', async () => {

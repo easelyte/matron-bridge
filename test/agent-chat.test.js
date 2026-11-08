@@ -3028,6 +3028,56 @@ describe('chatStart with a person (talk request)', () => {
     expect(invites.invite).not.toHaveBeenCalled();
   });
 
+  it('asks the journal for someone on another journal by address, like anyone else', async () => {
+    const { handlers, invites } = makeFixture({ inviteOutcome: { kind: 'pending_quiet' } });
+    const res = await handlers.chatStart({ ...talk, person: 'bob@B.example' });
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe('pending');
+    expect(invites.invite.mock.calls[0][0]).toMatchObject({ targetPerson: 'bob@b.example' });
+    expect((await handlers.chatStart({ ...talk, person: 'bob@' })).status).toBe(400);
+  });
+
+  it('a session shared from another journal is a talk request to that person, aimed at the session', async () => {
+    const roster = { ...ROSTER, people: [{ person: 'bob@b.example', sessions: [{ convo_id: 'fs_1', title: 'Bob Q3', agent_device_id: null, remote: true }] }] };
+    const { handlers, invites } = makeFixture({ inviteOutcome: { kind: 'pending_quiet' }, publisher: { fetchRoster: async () => roster } });
+    const listed = await handlers.roster({ roomId: '!sess' });
+    expect(listed.body.people[0].sessions[0]).toMatchObject({ id: 'fs_1', remote: true, agent_device_id: null });
+    const res = await handlers.chatStart({ roomId: '!sess', target_convo_id: 'fs_1', topic: 'q3', justification: 'ask about q3', message: 'hello bob' });
+    expect(res.status).toBe(200);
+    expect(res.body.status).toBe('pending');
+    expect(res.body.note).not.toMatch(/choose where to talk/);
+    expect(invites.invite.mock.calls[0][0]).toMatchObject({ targetPerson: 'bob@b.example', targetConvoId: 'fs_1' });
+  });
+
+  it('a talk to the person and a talk at their shared session are separate rooms', async () => {
+    const roster = { ...ROSTER, people: [{ person: 'bob@b.example', sessions: [{ convo_id: 'fs_1', title: 'Bob Q3', agent_device_id: null, remote: true }, { convo_id: 'fs_2', title: 'Bob Q4', agent_device_id: null, remote: true }] }] };
+    const { handlers, invites } = makeFixture({ inviteOutcome: { kind: 'pending_quiet' }, personRoomState: async () => ({ status: 200, data: { person_room: { state: 'joined' } } }), publisher: { fetchRoster: async () => roster } });
+    const base = { roomId: '!sess', justification: 'ask', message: 'hello bob' };
+    const talk1 = await handlers.chatStart({ ...base, person: 'bob@b.example' });
+    const s1 = await handlers.chatStart({ ...base, target_convo_id: 'fs_1' });
+    const s2 = await handlers.chatStart({ ...base, target_convo_id: 'fs_2' });
+    const s1again = await handlers.chatStart({ ...base, target_convo_id: 'fs_1' });
+    expect(new Set([talk1.body.room_id, s1.body.room_id, s2.body.room_id]).size).toBe(3);
+    expect(s1again.body.room_id).toBe(s1.body.room_id);
+    expect(invites.invite).toHaveBeenCalledTimes(3);
+    expect(invites.invite.mock.calls.map((c) => c[0].targetConvoId ?? null)).toEqual([null, 'fs_1', 'fs_2']);
+  });
+
+  it('says the session is no longer shared when the journal answers not_found for it', async () => {
+    const roster = { ...ROSTER, people: [{ person: 'bob@b.example', sessions: [{ convo_id: 'fs_1', title: 'Bob Q3', agent_device_id: null, remote: true }] }] };
+    const { handlers } = makeFixture({ inviteOutcome: { kind: 'error', code: 'not_found' }, publisher: { fetchRoster: async () => roster } });
+    const res = await handlers.chatStart({ roomId: '!sess', target_convo_id: 'fs_1', justification: 'ask about q3', message: 'hello bob' });
+    expect(res.status).toBe(404);
+    expect(res.body.error).toMatch(/^bob@b\.example no longer shares that session/);
+  });
+
+  it('says a talk across journals needs an existing contact when the journal answers not_found', async () => {
+    const { handlers } = makeFixture({ inviteOutcome: { kind: 'error', code: 'not_found' } });
+    const res = await handlers.chatStart({ ...talk, person: 'carol@b.example' });
+    expect(res.status).toBe(404);
+    expect(res.body.error).toMatch(/^carol@b\.example is not a contact on another journal that can be asked/);
+  });
+
   it('asks the journal by person: no device, no conversation, the 👤 title, and a record that keeps the person', async () => {
     const { handlers, calls, invites } = makeFixture({ inviteOutcome: { kind: 'pending_quiet' } });
     const res = await handlers.chatStart({ ...talk, mission: 3 });

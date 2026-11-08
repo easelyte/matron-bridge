@@ -41,8 +41,6 @@ const BASE = Object.freeze({
           '-y',
           'chrome-devtools-mcp',
           '--no-usage-statistics',
-          '--chromeArg=--no-sandbox',
-          '--chromeArg=--disable-setuid-sandbox',
         ],
       },
     },
@@ -115,8 +113,6 @@ const BASE_WRAP = Object.freeze({
         args: [
           'node', './node_modules/chrome-devtools-mcp/build/src/bin/chrome-devtools-mcp.js',
           '--no-usage-statistics',
-          '--chromeArg=--no-sandbox',
-          '--chromeArg=--disable-setuid-sandbox',
         ],
       },
     },
@@ -137,8 +133,6 @@ describe('buildMcpServers — repo-relative command resolution (xvfb-wrap.sh)', 
     expect(config.mcpServers['chrome-devtools'].args).toEqual([
       'node', '/opt/bridge/node_modules/chrome-devtools-mcp/build/src/bin/chrome-devtools-mcp.js',
       '--no-usage-statistics',
-      '--chromeArg=--no-sandbox',
-      '--chromeArg=--disable-setuid-sandbox',
     ]);
   });
 
@@ -497,5 +491,18 @@ describe('committed browser extra runs the locked chrome-devtools-mcp', () => {
   it('starts the package\'s own bin script from the bridge\'s node_modules', () => {
     expect(server.args[0]).toBe('node');
     expect(server.args[1]).toBe(`./node_modules/chrome-devtools-mcp/${locked.bin['chrome-devtools-mcp']}`);
+  });
+});
+
+// Browser sessions open untrusted pages, so Chrome must keep its renderer
+// sandbox. It works as an unprivileged user under Xvfb; nothing in the
+// committed browser extra may switch it off.
+describe('committed browser extra keeps Chrome\'s sandbox on', () => {
+  const config = JSON.parse(readFileSync(fileURLToPath(new URL('../mcp-config.json', import.meta.url)), 'utf8'));
+  const server = config.mcpExtras.browser['chrome-devtools'];
+
+  it('passes no flag that disables the sandbox', () => {
+    const sandboxOff = server.args.filter((a) => /no-sandbox|disable-setuid-sandbox|no-zygote-sandbox|disable-seccomp/i.test(a));
+    expect(sandboxOff).toEqual([]);
   });
 });

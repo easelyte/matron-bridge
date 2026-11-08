@@ -5,8 +5,11 @@ import {
   appendInlineImageBlocks,
   INLINE_IMAGE_DEFAULTS,
 } from '../lib/inline-image.js';
+import { readFileSync } from 'node:fs';
+import { isHeif, decodeHeif } from '../lib/heif-decode.js';
 
-// Real image fixtures generated with sharp — no binary files in the repo, and
+// Real image fixtures generated with sharp (sharp cannot write HEIC, so that
+// one is a checked-in file, see test/fixtures/README-heic.md), and
 // the assertions decode the output with sharp again so they exercise actual
 // image behavior (dimensions, format, alpha), not mock plumbing.
 
@@ -146,6 +149,113 @@ describe('prepareInlineImage — skip cases', () => {
   });
 });
 
+// An iPhone-like HEIC: 1170x2532 (a screenshot's size), 10-bit HEVC, coded
+// as a 3x5 grid of 512px tiles cropped to size, with a thumbnail. Four
+// horizontal bands top to bottom: red, green, blue, white. sharp reads its
+// header but cannot decode the pixels.
+const HEIC_GRID = readFileSync(new URL('./fixtures/heic-grid-10bit.heic', import.meta.url));
+
+async function pixelAt(jpeg, x, y) {
+  const { data, info } = await sharp(jpeg).raw().toBuffer({ resolveWithObject: true });
+  const i = (y * info.width + x) * info.channels;
+  return [data[i], data[i + 1], data[i + 2]];
+}
+
+describe('prepareInlineImage — HEIC', () => {
+  it('fixture sanity: sharp alone cannot decode it', async () => {
+    await expect(sharp(HEIC_GRID).jpeg().toBuffer()).rejects.toThrow();
+  });
+
+  it('converts a 10-bit grid HEIC to a downscaled JPEG with the right pixels', async () => {
+    const res = await prepareInlineImage(HEIC_GRID, 'image/heic');
+    expect(res.action).toBe('replace');
+    expect(res.mediaType).toBe('image/jpeg');
+    // 1170x2532 fitted inside 1568: long edge 1568, aspect kept.
+    expect(res.height).toBe(1568);
+    expect(res.width).toBe(Math.round(1170 * 1568 / 2532));
+    const meta = await sharp(res.buffer).metadata();
+    expect(meta.format).toBe('jpeg');
+    // Every tile landed in the right place: sample each band, including
+    // ones in the cropped right-hand and bottom tiles.
+    const x = res.width - 5;
+    const band = res.height / 4;
+    const [r1, g1, b1] = await pixelAt(res.buffer, x, Math.round(band * 0.5));
+    expect(r1).toBeGreaterThan(180); expect(g1).toBeLessThan(80); expect(b1).toBeLessThan(80);
+    const [r2, g2] = await pixelAt(res.buffer, 10, Math.round(band * 1.5));
+    expect(g2).toBeGreaterThan(140); expect(r2).toBeLessThan(80);
+    const [, , b3] = await pixelAt(res.buffer, x, Math.round(band * 2.5));
+    expect(b3).toBeGreaterThan(180);
+    const white = await pixelAt(res.buffer, x, res.height - 5);
+    for (const c of white) expect(c).toBeGreaterThan(230);
+  });
+
+  it('converts a HEIC whatever type it was declared as', async () => {
+    const res = await prepareInlineImage(HEIC_GRID, 'image/jpeg');
+    expect(res.action).toBe('replace');
+    expect(res.mediaType).toBe('image/jpeg');
+  });
+
+  it('still passes a JPEG labelled image/heic through sharp', async () => {
+    const res = await prepareInlineImage(await flatJpeg(400, 300), 'image/heic');
+    expect(res.action).toBe('replace');
+    expect(res.width).toBe(400);
+  });
+
+  it('skips with a HEIC-specific reason when the file is damaged', async () => {
+    const res = await prepareInlineImage(HEIC_GRID.subarray(0, 600), 'image/heic');
+    expect(res.action).toBe('skip');
+    expect(res.reason).toMatch(/HEIC image could not be converted/);
+  });
+
+  it('skips when the decode runs past its timeout', async () => {
+    const res = await prepareInlineImage(HEIC_GRID, 'image/heic', { heif: { timeoutMs: 1 } });
+    expect(res.action).toBe('skip');
+    expect(res.reason).toMatch(/timed out/);
+  });
+
+  it('leaves AVIF to sharp', async () => {
+    const avif = await sharp({ create: { width: 2000, height: 1000, channels: 3, background: '#3c3' } })
+      .avif().toBuffer();
+    const res = await prepareInlineImage(avif, 'image/avif');
+    expect(res.action).toBe('replace');
+    expect([res.width, res.height]).toEqual([1568, 784]);
+  });
+
+  it('runs concurrent conversions one at a time and completes them all', async () => {
+    const results = await Promise.all([1, 2, 3].map(() => prepareInlineImage(HEIC_GRID, 'image/heic')));
+    for (const res of results) expect(res.action).toBe('replace');
+  });
+
+  it('skips an image over the decode pixel limit before decoding it', async () => {
+    const res = await prepareInlineImage(HEIC_GRID, 'image/heic', { heif: { maxPixels: 1000 } });
+    expect(res.action).toBe('skip');
+    expect(res.reason).toMatch(/1170x2532/);
+  });
+});
+
+describe('isHeif / decodeHeif', () => {
+  it('recognises HEIF brands and nothing else', async () => {
+    expect(isHeif(HEIC_GRID)).toBe(true);
+    expect(isHeif(await flatJpeg(10, 10))).toBe(false);
+    expect(isHeif(Buffer.from('ftypheic-ish garbage'))).toBe(false);
+    // An AVIF lists the structural brand mif1 too; it must stay with sharp.
+    const avif = await sharp({ create: { width: 64, height: 48, channels: 3, background: '#c33' } })
+      .avif().toBuffer();
+    expect(avif.toString('latin1', 4, 8)).toBe('ftyp');
+    expect(isHeif(avif)).toBe(false);
+    const avifMif1 = Buffer.from('\0\0\0\x18ftypavif\0\0\0\0mif1miaf', 'latin1');
+    expect(isHeif(avifMif1)).toBe(false);
+    const heicMajorMif1 = Buffer.from('\0\0\0\x18ftypmif1\0\0\0\0mif1heic', 'latin1');
+    expect(isHeif(heicMajorMif1)).toBe(true);
+  });
+
+  it('decodes the full-size primary image to RGBA', async () => {
+    const { data, width, height } = await decodeHeif(HEIC_GRID);
+    expect([width, height]).toEqual([1170, 2532]);
+    expect(data.length).toBe(1170 * 2532 * 4);
+  });
+});
+
 describe('appendInlineImageBlocks', () => {
   const savePath = '/w/photo.jpg';
   const original = Buffer.from('original-bytes');
@@ -190,5 +300,18 @@ describe('appendInlineImageBlocks', () => {
     expect(blocks[0].text).toContain(savePath);
     expect(blocks[0].text).toContain('image/heic is not supported');
     expect(blocks[0].text).toMatch(/Read/);
+    // Read can't display HEIC, so the hint says to convert first.
+    expect(blocks[0].text).toMatch(/convert it to JPEG or PNG first/);
+  });
+
+  it('keeps the plain Read hint for an API-readable type', () => {
+    const blocks = [];
+    appendInlineImageBlocks(blocks, {
+      buffer: original, mime: 'image/png',
+      inline: { action: 'skip', reason: 'too large to attach inline' },
+      savePath,
+    });
+    expect(blocks[0].text).toMatch(/use the Read tool to view it/);
+    expect(blocks[0].text).not.toMatch(/convert/);
   });
 });
