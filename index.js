@@ -4632,13 +4632,17 @@ function handleInteractiveScreenUpdate(session, update) {
   // wrap, and a wrapped OAuth URL's first line is identical on every sign-in
   // attempt, so a retry's fresh link read as already sent and never reached
   // the user.
-  // A prefix match counts as seen: a mid-repaint capture can cut a URL
-  // short, and the cut and full forms must not read as two links. Two sign-in
-  // attempts differ inside the query (state, challenge), never by a prefix.
+  // A mid-repaint capture can cut a URL short: a cut of a link already sent
+  // is not new, but a fuller URL extending a cut that was sent IS (the cut
+  // was unusable), and it replaces the cut. Two sign-in attempts differ
+  // inside the query (state, challenge), never by a prefix.
   const seen = [...session.surfacedUrls];
-  const newUrls = allUrls.filter(u => !seen.some(v => v.startsWith(u) || u.startsWith(v)));
+  const newUrls = allUrls.filter(u => !seen.some(v => v.startsWith(u)));
   if (newUrls.length === 0 && !hasInputCue) return;
-  for (const u of newUrls) session.surfacedUrls.add(u);
+  for (const u of newUrls) {
+    for (const v of seen) if (u.startsWith(v)) session.surfacedUrls.delete(v);
+    session.surfacedUrls.add(u);
+  }
   // Build a clean cue-specific message instead of dumping the raw
   // screen. If the formatter can't make sense of the cue, skip rather
   // than spam a screen-dump full of status chrome.

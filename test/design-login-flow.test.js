@@ -175,7 +175,9 @@ describe('sign-in relay fixes', async () => {
 
   it('holds bridge-generated input while a sign-in dialog is open', () => {
     expect(signInDialogHoldsInput({ iv: {}, _designLoginWatch: { stop() {} } })).toBe(true);
-    expect(signInDialogHoldsInput({ iv: {}, _accountFlowReturnToPrint: true })).toBe(true);
+    // A /login borrow flag alone is not an open dialog: a cancelled /login
+    // keeps it, and notes must not wait on that.
+    expect(signInDialogHoldsInput({ iv: {}, _accountFlowReturnToPrint: true })).toBe(false);
     expect(signInDialogHoldsInput({ iv: {} })).toBe(false);
     expect(signInDialogHoldsInput({ iv: null, _designLoginWatch: {} })).toBe(false);
   });

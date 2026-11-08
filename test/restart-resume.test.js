@@ -1,3 +1,4 @@
+import { signInDialogHoldsInput } from '../lib/design-login-flow.js';
 import { afterEach, expect, it, vi } from 'vitest';
 import fs, { readFileSync } from 'node:fs';
 import os from 'node:os';
@@ -39,10 +40,17 @@ it('hands restart notes through the conversation resume path and propagates hand
     journalResumeConvo: () => target,
     sendToSession: (session, blocks) => { delivered.push({ session, text: blocks[0].text }); return true; },
     journalRouteTextToSession: vi.fn(),
-    sessionOccupied, effortFlowHoldsInput: () => false,
+    sessionOccupied, effortFlowHoldsInput: () => false, signInDialogHoldsInput,
     restartLatch: { beginInput: () => () => {} },
   };
   const deliver = runInNewContext(`${source.slice(start, end)}\ndeliverRestartNote`, context);
+  // An open /design-login dialog defers the note (typed now it would be
+  // taken as the pasted code); once the watch stops it goes through.
+  target.iv = {};
+  target._designLoginWatch = { stop() {} };
+  expect(await deliver({ convoId: 'alice', text: 'Continue work' })).toEqual({ deferred: true });
+  expect(delivered).toEqual([]);
+  target._designLoginWatch = null;
   expect(await deliver({ convoId: 'alice', text: 'Continue work' })).toBe(true);
   expect(delivered).toEqual([{ session: target, text: 'Continue work' }]);
   context.sendToSession = () => false;
@@ -115,7 +123,7 @@ it.each(['refused', 'throwing'])('retries a %s router through the production ada
   const f = recovery();
   const route = vi.fn(() => { if (failure === 'throwing') throw new Error('unavailable'); return false; });
   const deliver = runInNewContext(`${adapterBody}\ndeliverRestartNote`, {
-    journalRouteTextToSession: vi.fn(), sessionOccupied, effortFlowHoldsInput: () => false, restartLatch: null, findSessionByClaudeSessionId: () => ({ alive: true }), sendToSession: route,
+    journalRouteTextToSession: vi.fn(), sessionOccupied, effortFlowHoldsInput: () => false, signInDialogHoldsInput, restartLatch: null, findSessionByClaudeSessionId: () => ({ alive: true }), sendToSession: route,
   });
   const boot = f.boot({ schedule: setTimeout, deliver });
   boot.reconcile(); boot.listenerReady();
@@ -173,7 +181,7 @@ it.each(['/stop carry on', '!stop', 'y', '1', '/compact'])('delivers a stored no
   const commands = vi.fn();
   const send = vi.fn(() => true);
   const deliver = runInNewContext(`${adapterBody}\ndeliverRestartNote`, {
-    restartLatch: null, findSessionByClaudeSessionId: () => session, sessionOccupied, effortFlowHoldsInput: () => false,
+    restartLatch: null, findSessionByClaudeSessionId: () => session, sessionOccupied, effortFlowHoldsInput: () => false, signInDialogHoldsInput,
     sendToSession: send, journalRouteTextToSession: commands,
   });
   expect(await deliver({ convoId: 'alice', text })).toEqual({ deferred: true });
@@ -195,7 +203,7 @@ it.each(['busy', '_awaitingInputReady', 'effort', 'waitingForAnswer', 'pendingIn
   const send = vi.fn(() => true);
   const deliver = runInNewContext(`${adapterBody}\ndeliverRestartNote`, {
     restartLatch: null, findSessionByClaudeSessionId: () => session,
-    sessionOccupied, effortFlowHoldsInput: target => target.effort === true, sendToSession: send,
+    sessionOccupied, effortFlowHoldsInput: target => target.effort === true, signInDialogHoldsInput, sendToSession: send,
   });
   const boot = f.boot({ schedule: setTimeout, deliver });
   boot.reconcile(); boot.listenerReady();
