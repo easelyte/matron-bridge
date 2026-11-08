@@ -89,7 +89,7 @@ import { resolveShareTarget } from './lib/share-target.js';
 import { createInteractiveSession } from './lib/interactive-session.js';
 import { projectDirFor, transcriptPathFor, findTranscriptBySessionId } from './lib/transcript-dir.js';
 import { extractUrls, isIdleReadyScreen, extractPreamble, preambleMatchesText, compactScreenText, AUTO_ENTER_COMPACT_RE, loginSuccessNearAutoEnterCue, stripAnsi, findInputCue } from './lib/prompt-detector.js';
-import { DESIGN_LOGIN_COMMAND, DESIGN_LOGIN_CODE_REFUSED_MESSAGE, classifyDesignLoginOutput, designLoginCodeRefused, designLoginOutcomeMessage, ownsDesignLoginFinish } from './lib/design-login-flow.js';
+import { DESIGN_LOGIN_COMMAND, DESIGN_LOGIN_CODE_REFUSED_MESSAGE, classifyDesignLoginOutput, designLoginCodeRefused, designLoginOutcomeMessage, ownsDesignLoginFinish, signInDialogHoldsInput } from './lib/design-login-flow.js';
 import { formatTuiCueMessage } from './lib/tui-cue-message.js';
 import {
   buildMcpServers,
@@ -4622,18 +4622,26 @@ function handleInteractiveScreenUpdate(session, update) {
   // claude redraws (e.g. spinner ticks). The detector also dedups but
   // only within one session run — we want lifetime dedup across restarts.
   session.surfacedUrls = session.surfacedUrls || new Set();
-  const newUrls = urls.filter(u => !session.surfacedUrls.has(u));
-  if (newUrls.length === 0 && !hasInputCue) return;
-  for (const u of newUrls) session.surfacedUrls.add(u);
   // Un-wrap URLs that claude broke across lines at terminal width so
   // the parsed URL set is correct (`...redir\nect_uri=...` → joined).
   const unwrappedScreen = unwrapUrls(
     screen.split('\n').map(l => l.trim()).join('\n')
   );
+  const allUrls = extractUrls(unwrappedScreen);
+  // Newness is judged on the unwrapped URLs: the detector's are cut at the
+  // wrap, and a wrapped OAuth URL's first line is identical on every sign-in
+  // attempt, so a retry's fresh link read as already sent and never reached
+  // the user.
+  // A prefix match counts as seen: a mid-repaint capture can cut a URL
+  // short, and the cut and full forms must not read as two links. Two sign-in
+  // attempts differ inside the query (state, challenge), never by a prefix.
+  const seen = [...session.surfacedUrls];
+  const newUrls = allUrls.filter(u => !seen.some(v => v.startsWith(u) || u.startsWith(v)));
+  if (newUrls.length === 0 && !hasInputCue) return;
+  for (const u of newUrls) session.surfacedUrls.add(u);
   // Build a clean cue-specific message instead of dumping the raw
   // screen. If the formatter can't make sense of the cue, skip rather
   // than spam a screen-dump full of status chrome.
-  const allUrls = extractUrls(unwrappedScreen);
   const message = formatTuiCueMessage(unwrappedScreen, allUrls, { hasNewUrls: newUrls.length > 0 });
   // Auto-Enter decision is independent of message formatting: an
   // acknowledgment screen the formatter can't summarise must STILL be
@@ -16585,7 +16593,7 @@ async function deliverRestartNote(entry) {
     if (!session || !session.alive) session = journalResumeConvo(entry.convoId);
     if (!session || !session.alive) return false;
     if (sessionOccupied(session) || session._awaitingInputReady
-      || effortFlowHoldsInput(session)) return { deferred: true };
+      || effortFlowHoldsInput(session) || signInDialogHoldsInput(session)) return { deferred: true };
     return sendToSession(session, [{ type: 'text', text: entry.text }], { plainTurn: true }) === true;
   } finally { finishInput?.(); }
 }
