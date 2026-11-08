@@ -4157,6 +4157,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
           restarted._accountLogoutPending = session._accountLogoutPending;
           restarted._effortFlowReturnToPrint = session._effortFlowReturnToPrint;
           restarted._postReadySlashCommand = session._postReadySlashCommand;
+          restarted._designLoginFlow = session._designLoginFlow;
         }
         restarted.originRoomId = session.originRoomId;
         restarted.firstMessageCaptured = session.firstMessageCaptured;
@@ -4798,6 +4799,13 @@ function armDesignLoginWatch(session) {
   if (!iv || typeof iv.on !== 'function') return;
   session._designLoginWatch?.stop();
   const roomId = session.roomId;
+  // One token per attempt: the finish acts only while the room's session
+  // still holds THIS token, so neither an abandoned flow (/mode print leaves
+  // a session without it) nor an earlier attempt on the same TUI (a retry
+  // replaces it) can end the current one. The iv crash-restart copies it
+  // onto the replacement, so a finish that was pending still lands there.
+  const flow = {};
+  session._designLoginFlow = flow;
   let raw = '';
   let settleTimer = null;
   let refusalShown = false;
@@ -4816,7 +4824,7 @@ function armDesignLoginWatch(session) {
     if (outcome) {
       watch.stop();
       debug(`design-login finished (${outcome})`);
-      scheduleDesignLoginFinish(roomId, iv, outcome, LOGIN_RETURN_TO_PRINT_DELAY_MS);
+      scheduleDesignLoginFinish(roomId, flow, outcome, LOGIN_RETURN_TO_PRINT_DELAY_MS);
       return;
     }
     // A refused code leaves the TUI on "Press Enter to retry, or any other
@@ -4840,7 +4848,7 @@ function armDesignLoginWatch(session) {
   const cap = setTimeout(() => {
     watch.stop();
     debug('design-login watch timed out');
-    scheduleDesignLoginFinish(roomId, iv, null, 0);
+    scheduleDesignLoginFinish(roomId, flow, null, 0);
   }, DESIGN_LOGIN_WATCH_CAP_MS);
   if (typeof cap.unref === 'function') cap.unref();
   iv.on('pty-data', onData);
@@ -4850,26 +4858,26 @@ function armDesignLoginWatch(session) {
 // Report the outcome and, for a borrowed session, switch back to print. A
 // refused switch (a turn running, a prompt open) retries quietly like the
 // /effort return; only the last try tells the user to type /mode print.
-// Bound to the TUI the watch was armed on: a flow abandoned with /mode print
-// (or replaced by a restart) leaves a new session in the room, possibly
-// mid-way through a NEWER /design-login with the same borrow flag, and an
-// old timer must not end that one.
-function scheduleDesignLoginFinish(roomId, iv, outcome, delayMs, attempt = 0) {
+// Bound to the attempt's token (see armDesignLoginWatch), not to the room or
+// the shared borrow flag: an old timer must not end a newer attempt.
+function scheduleDesignLoginFinish(roomId, flow, outcome, delayMs, attempt = 0) {
   const t = setTimeout(() => {
     const current = sessions.get(roomId);
-    if (!current?.alive || current.iv !== iv) return;
+    if (!current?.alive || current._designLoginFlow !== flow) return;
     const sendReply = current.sendCallback || (() => {});
     const sendHtml = current.sendHtml || ((plain) => sendReply(plain));
     if (!shouldRunAccountFlowReturn(current)) {
       // The user's own interactive session: report the result, stay put. A
       // timeout there is not news (the TUI shows its own state).
+      current._designLoginFlow = null;
       if (outcome) sendReply(designLoginOutcomeMessage(outcome, { returning: false }));
       return;
     }
     if (!planModeSwitch(current, false).ok && attempt < DESIGN_LOGIN_RETRY_LIMIT) {
-      scheduleDesignLoginFinish(roomId, iv, outcome, DESIGN_LOGIN_RETRY_MS, attempt + 1);
+      scheduleDesignLoginFinish(roomId, flow, outcome, DESIGN_LOGIN_RETRY_MS, attempt + 1);
       return;
     }
+    current._designLoginFlow = null;
     const switched = applyModeSwitch(roomId, current, false, {
       sendReply, sendHtml,
       announcement: designLoginOutcomeMessage(outcome),

@@ -113,6 +113,10 @@ describe('/design-login wiring (source inspection)', () => {
     expect(caseBody).toMatch(/session\.iv\.sendText\(DESIGN_LOGIN_COMMAND\)[\s\S]*armDesignLoginWatch\(session\);/);
   });
 
+  it('the iv crash-restart carries the attempt token to the replacement', () => {
+    expect(src).toMatch(/restarted\._designLoginFlow = session\._designLoginFlow;/);
+  });
+
   it('the readiness watcher arms the result watch when it types a parked /design-login', () => {
     expect(src).toMatch(/if \(parkedSlash === DESIGN_LOGIN_COMMAND\) armDesignLoginWatch\(session\);/);
   });
@@ -123,6 +127,6 @@ describe('/design-login wiring (source inspection)', () => {
     expect(fn).toMatch(/if \(switched\) current\._accountFlowReturnToPrint = false;/);
     expect(fn).toMatch(/shouldRunAccountFlowReturn\(current\)/);
     // An abandoned flow's timer must not end a newer flow in the same room.
-    expect(fn).toMatch(/current\.iv !== iv\) return;/);
+    expect(fn).toMatch(/current\._designLoginFlow !== flow\) return;/);
   });
 });
