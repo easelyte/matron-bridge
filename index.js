@@ -88,7 +88,8 @@ import { computeEditDiff } from './lib/edit-diff.js';
 import { resolveShareTarget } from './lib/share-target.js';
 import { createInteractiveSession } from './lib/interactive-session.js';
 import { projectDirFor, transcriptPathFor, findTranscriptBySessionId } from './lib/transcript-dir.js';
-import { extractUrls, isIdleReadyScreen, extractPreamble, preambleMatchesText, compactScreenText, AUTO_ENTER_COMPACT_RE, loginSuccessNearAutoEnterCue } from './lib/prompt-detector.js';
+import { extractUrls, isIdleReadyScreen, extractPreamble, preambleMatchesText, compactScreenText, AUTO_ENTER_COMPACT_RE, loginSuccessNearAutoEnterCue, stripAnsi, findInputCue } from './lib/prompt-detector.js';
+import { DESIGN_LOGIN_COMMAND, DESIGN_LOGIN_CODE_REFUSED_MESSAGE, classifyDesignLoginOutput, designLoginCodeRefused, designLoginOutcomeMessage, ownsDesignLoginFinish } from './lib/design-login-flow.js';
 import { formatTuiCueMessage } from './lib/tui-cue-message.js';
 import {
   buildMcpServers,
@@ -4156,6 +4157,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
           restarted._accountLogoutPending = session._accountLogoutPending;
           restarted._effortFlowReturnToPrint = session._effortFlowReturnToPrint;
           restarted._postReadySlashCommand = session._postReadySlashCommand;
+          restarted._designLoginFlow = session._designLoginFlow;
         }
         restarted.originRoomId = session.originRoomId;
         restarted.firstMessageCaptured = session.firstMessageCaptured;
@@ -4776,6 +4778,117 @@ function handleUnclassifiedPrompt(session, { screen }) {
 // interactive session back to print mode — long enough for the TUI to paint
 // its idle screen so planModeSwitch doesn't refuse the switch.
 const LOGIN_RETURN_TO_PRINT_DELAY_MS = 2500;
+
+// /design-login from chat (lib/design-login-flow.js). The bridge types the
+// command, the generic screen-update relay surfaces its OAuth link, and this
+// watch reads the PTY output written after the command for the result line
+// that ends the flow. A session the bridge switched to interactive mode for
+// the flow (_accountFlowReturnToPrint, the /login flag, so every abandon and
+// crash-restart path that already handles it covers this flow too) goes back
+// to print mode; a session the user put in interactive mode stays there and
+// just gets the result. The cap outlives the TUI's own 5-minute OAuth
+// timeout, whose message is itself a result line.
+const DESIGN_LOGIN_WATCH_CAP_MS = 7 * 60 * 1000;
+const DESIGN_LOGIN_SETTLE_MS = 400;
+const DESIGN_LOGIN_BUFFER_LIMIT = 65536;
+const DESIGN_LOGIN_RETRY_MS = 5000;
+const DESIGN_LOGIN_RETRY_LIMIT = 24;
+
+function armDesignLoginWatch(session) {
+  const iv = session.iv;
+  if (!iv || typeof iv.on !== 'function') return;
+  session._designLoginWatch?.stop();
+  const roomId = session.roomId;
+  // One token per attempt: the finish acts only while the room's session
+  // still holds THIS token, so neither an abandoned flow (/mode print leaves
+  // a session without it) nor an earlier attempt on the same TUI (a retry
+  // replaces it) can end the current one. The iv crash-restart copies it
+  // onto the replacement, so a finish that was pending still lands there.
+  const flow = {};
+  session._designLoginFlow = flow;
+  let raw = '';
+  let settleTimer = null;
+  let refusalShown = false;
+  const watch = {
+    stop() {
+      iv.removeListener('pty-data', onData);
+      if (settleTimer) clearTimeout(settleTimer);
+      clearTimeout(cap);
+      if (session._designLoginWatch === watch) session._designLoginWatch = null;
+    },
+  };
+  const check = () => {
+    settleTimer = null;
+    const text = stripAnsi(raw);
+    const outcome = classifyDesignLoginOutput(text);
+    if (outcome) {
+      watch.stop();
+      debug(`design-login finished (${outcome})`);
+      scheduleDesignLoginFinish(roomId, flow, outcome, LOGIN_RETURN_TO_PRINT_DELAY_MS);
+      return;
+    }
+    // A refused code leaves the TUI on "Press Enter to retry, or any other
+    // key to cancel." with no URL, which the generic relay does not surface.
+    // Say it once per refusal: a new sign-in screen re-arms the notice.
+    if (!refusalShown && designLoginCodeRefused(text)) {
+      refusalShown = true;
+      raw = '';
+      if (session.sendCallback) session.sendCallback(DESIGN_LOGIN_CODE_REFUSED_MESSAGE);
+    } else if (refusalShown && findInputCue(text) === 'oauth') {
+      refusalShown = false;
+      raw = '';
+    }
+  };
+  const onData = (data) => {
+    raw += String(data);
+    if (raw.length > DESIGN_LOGIN_BUFFER_LIMIT) raw = raw.slice(-DESIGN_LOGIN_BUFFER_LIMIT);
+    if (settleTimer) clearTimeout(settleTimer);
+    settleTimer = setTimeout(check, DESIGN_LOGIN_SETTLE_MS);
+  };
+  const cap = setTimeout(() => {
+    watch.stop();
+    debug('design-login watch timed out');
+    scheduleDesignLoginFinish(roomId, flow, null, 0);
+  }, DESIGN_LOGIN_WATCH_CAP_MS);
+  if (typeof cap.unref === 'function') cap.unref();
+  iv.on('pty-data', onData);
+  session._designLoginWatch = watch;
+}
+
+// Report the outcome and, for a borrowed session, switch back to print. A
+// refused switch (a turn running, a prompt open) retries quietly like the
+// /effort return; only the last try tells the user to type /mode print.
+// Bound to the attempt's token (see armDesignLoginWatch), not to the room or
+// the shared borrow flag: an old timer must not end a newer attempt.
+function scheduleDesignLoginFinish(roomId, flow, outcome, delayMs, attempt = 0) {
+  const t = setTimeout(() => {
+    const current = sessions.get(roomId);
+    if (!ownsDesignLoginFinish(current, flow)) return;
+    const sendReply = current.sendCallback || (() => {});
+    const sendHtml = current.sendHtml || ((plain) => sendReply(plain));
+    if (!shouldRunAccountFlowReturn(current)) {
+      // The user's own interactive session: report the result, stay put. A
+      // timeout there is not news (the TUI shows its own state).
+      current._designLoginFlow = null;
+      if (outcome) sendReply(designLoginOutcomeMessage(outcome, { returning: false }));
+      return;
+    }
+    if (!planModeSwitch(current, false).ok && attempt < DESIGN_LOGIN_RETRY_LIMIT) {
+      scheduleDesignLoginFinish(roomId, flow, outcome, DESIGN_LOGIN_RETRY_MS, attempt + 1);
+      return;
+    }
+    current._designLoginFlow = null;
+    const switched = applyModeSwitch(roomId, current, false, {
+      sendReply, sendHtml,
+      announcement: designLoginOutcomeMessage(outcome),
+      refusalAnnouncement: `${designLoginOutcomeMessage(outcome, { returning: false })} I couldn't switch back to non-interactive mode automatically — type /mode print when ready.`,
+    });
+    if (switched) current._accountFlowReturnToPrint = false;
+    const holder = sessions.get(roomId);
+    if (holder?.alive) maybeFlushRoomDelivery(holder);
+  }, delayMs);
+  if (typeof t.unref === 'function') t.unref();
+}
 
 // --- Structured Question Handling ---
 
@@ -6991,6 +7104,9 @@ function startResumeReadyWatcher(session) {
                  && session.iv.sendText(parkedSlash) !== false) {
         parkedSlashTyped = true;
         debug(`typed parked ${parkedSlash} into ready TUI`);
+        // A /design-login-from-print flow ends on a result line, not on a
+        // press-Enter screen: watch for it (see armDesignLoginWatch).
+        if (parkedSlash === DESIGN_LOGIN_COMMAND) armDesignLoginWatch(session);
         // An /effort-from-print flow: record the write like any bridge-typed
         // /effort (lib/effort-tracker.js), accept its confirmation on the
         // user's behalf (they asked for this level in so many words), and
@@ -8907,6 +9023,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         `/mode [interactive|print] — Show or switch interactive vs non-interactive\n` +
         `/login — Log in to your Anthropic account (auto-switches to interactive mode)\n` +
         `/logout — Log out of your Anthropic account (auto-switches to interactive mode)\n` +
+        `/design-login — Authorize Claude Design access for /design-sync and /design consent (auto-switches to interactive mode)\n` +
         `/cost — Show session cost\n` +
         `/usage — Show token usage\n` +
         `/limits — Show subscription usage limits (session & weekly)\n` +
@@ -8953,6 +9070,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
           ['/mode [interactive|print]', 'Show or switch interactive vs non-interactive mode'],
           ['/login', 'Log in to your Anthropic account (auto-switches to interactive mode)'],
           ['/logout', 'Log out of your Anthropic account (auto-switches to interactive mode)'],
+          ['/design-login', 'Authorize Claude Design access for /design-sync and /design consent (auto-switches to interactive mode)'],
           ['/cost', 'Show session cost'],
           ['/usage', 'Show token usage'],
           ['/limits', 'Show subscription usage limits (session &amp; weekly)'],
@@ -9191,6 +9309,10 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         await sendReply(`No active session. /${cmdWord} runs inside a session — start one first.`);
         break;
       }
+      // An account command supersedes a /design-login still finishing: its
+      // pending return would otherwise switch modes under this flow.
+      session._designLoginWatch?.stop();
+      session._designLoginFlow = null;
       // Any session.iv — even a dead one — takes this branch: falling
       // through to the mode switch would hit planModeSwitch's "already
       // interactive" no-op (it only checks iv truthiness) and silently do
@@ -9273,6 +9395,62 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         // handler uses this to confirm the logout (and, with the flag
         // above, persist print mode).
         next._accountLogoutPending = cmdWord === 'logout';
+      }
+      break;
+    }
+
+    // /design-login (design-system access for /design-sync and /design
+    // consent) is TUI-only like /login: a print session answers "isn't
+    // available in this environment". Same route as the '!login' case: type
+    // it into an interactive session, or switch a print session to
+    // interactive and park it for the ready TUI. Its end is a result line
+    // rather than a press-Enter screen, so armDesignLoginWatch (not the
+    // auto-Enter branch) reports the outcome and owns the return to print.
+    // /design itself is not intercepted: /design consent and /design revoke
+    // run in print mode as they are.
+    case '!design-login': {
+      const session = sessions.get(roomId);
+      if (!session || !session.alive) {
+        await sendReply('No active session. /design-login runs inside a session — start one first.');
+        break;
+      }
+      if (session.agent === AGENT_CODEX) {
+        await sendReply('/design-login is a Claude Code command. Switch this chat to Claude (/switch claude) to run it.');
+        break;
+      }
+      // A /login that just succeeded is about to switch this session back to
+      // print mode; starting the design sign-in now would be torn down by it.
+      if (session._accountFlowReturnScheduled) {
+        await sendReply('Still finishing the login — send /design-login again in a few seconds.');
+        break;
+      }
+      if (session.iv) {
+        if (session.iv.alive && session._awaitingInputReady) {
+          const previouslyParked = session._postReadySlashCommand;
+          session._postReadySlashCommand = DESIGN_LOGIN_COMMAND;
+          session._accountLogoutPending = false;
+          await sendReply(previouslyParked && previouslyParked !== DESIGN_LOGIN_COMMAND
+            ? `Queued /design-login (replacing the queued ${previouslyParked}) — it will run as soon as the session is ready.`
+            : 'The session is still resuming — /design-login will run as soon as it\'s ready.');
+          break;
+        }
+        if (session.iv.sendText(DESIGN_LOGIN_COMMAND) === false) {
+          await sendReply('Could not reach the session TUI — try /restart, then /design-login again.');
+          break;
+        }
+        session._accountLogoutPending = false;
+        armDesignLoginWatch(session);
+        await sendReply('Signing in to Claude Design…');
+        break;
+      }
+      const next = applyModeSwitch(roomId, session, true, {
+        sendReply, sendHtml,
+        announcement: 'Signing in to Claude Design — switching to interactive mode to complete…',
+      });
+      if (next) {
+        next._postReadySlashCommand = DESIGN_LOGIN_COMMAND;
+        next._accountFlowReturnToPrint = true;
+        next._accountLogoutPending = false;
       }
       break;
     }

@@ -441,10 +441,11 @@ describe('account-flow flag hygiene (source inspection)', () => {
     expect(assigns.length).toBe(2);
     // _accountFlowReturnToPrint means "the bridge borrowed iv mode from a
     // print session" — only the print branch may arm it (on the replacement
-    // session), never the already-interactive branches.
+    // session), never the already-interactive branches. Two print branches
+    // borrow it: /login//logout and /design-login.
     const arms = src.match(/session\._accountFlowReturnToPrint = true;/g) || [];
     expect(arms.length).toBe(0);
     const nextArms = src.match(/next\._accountFlowReturnToPrint = true;/g) || [];
-    expect(nextArms.length).toBe(1);
+    expect(nextArms.length).toBe(2);
   });
 });
