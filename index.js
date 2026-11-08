@@ -89,7 +89,7 @@ import { resolveShareTarget } from './lib/share-target.js';
 import { createInteractiveSession } from './lib/interactive-session.js';
 import { projectDirFor, transcriptPathFor, findTranscriptBySessionId } from './lib/transcript-dir.js';
 import { extractUrls, isIdleReadyScreen, extractPreamble, preambleMatchesText, compactScreenText, AUTO_ENTER_COMPACT_RE, loginSuccessNearAutoEnterCue, stripAnsi, findInputCue } from './lib/prompt-detector.js';
-import { DESIGN_LOGIN_COMMAND, DESIGN_LOGIN_CODE_REFUSED_MESSAGE, classifyDesignLoginOutput, designLoginCodeRefused, designLoginOutcomeMessage } from './lib/design-login-flow.js';
+import { DESIGN_LOGIN_COMMAND, DESIGN_LOGIN_CODE_REFUSED_MESSAGE, classifyDesignLoginOutput, designLoginCodeRefused, designLoginOutcomeMessage, ownsDesignLoginFinish } from './lib/design-login-flow.js';
 import { formatTuiCueMessage } from './lib/tui-cue-message.js';
 import {
   buildMcpServers,
@@ -4863,7 +4863,7 @@ function armDesignLoginWatch(session) {
 function scheduleDesignLoginFinish(roomId, flow, outcome, delayMs, attempt = 0) {
   const t = setTimeout(() => {
     const current = sessions.get(roomId);
-    if (!current?.alive || current._designLoginFlow !== flow) return;
+    if (!ownsDesignLoginFinish(current, flow)) return;
     const sendReply = current.sendCallback || (() => {});
     const sendHtml = current.sendHtml || ((plain) => sendReply(plain));
     if (!shouldRunAccountFlowReturn(current)) {
@@ -9309,6 +9309,10 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         await sendReply(`No active session. /${cmdWord} runs inside a session — start one first.`);
         break;
       }
+      // An account command supersedes a /design-login still finishing: its
+      // pending return would otherwise switch modes under this flow.
+      session._designLoginWatch?.stop();
+      session._designLoginFlow = null;
       // Any session.iv — even a dead one — takes this branch: falling
       // through to the mode switch would hit planModeSwitch's "already
       // interactive" no-op (it only checks iv truthiness) and silently do
@@ -9412,6 +9416,12 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       }
       if (session.agent === AGENT_CODEX) {
         await sendReply('/design-login is a Claude Code command. Switch this chat to Claude (/switch claude) to run it.');
+        break;
+      }
+      // A /login that just succeeded is about to switch this session back to
+      // print mode; starting the design sign-in now would be torn down by it.
+      if (session._accountFlowReturnScheduled) {
+        await sendReply('Still finishing the login — send /design-login again in a few seconds.');
         break;
       }
       if (session.iv) {

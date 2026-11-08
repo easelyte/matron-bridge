@@ -6,6 +6,7 @@ import {
   classifyDesignLoginOutput,
   designLoginCodeRefused,
   designLoginOutcomeMessage,
+  ownsDesignLoginFinish,
 } from '../lib/design-login-flow.js';
 import { BRIDGE_COMMAND_NAMES, classifyBridgeCommand } from '../lib/command-dispatch.js';
 
@@ -84,6 +85,29 @@ describe('designLoginOutcomeMessage', () => {
   });
 });
 
+describe('ownsDesignLoginFinish', () => {
+  const flow = {};
+  it('owns the room while the live session holds the same attempt token', () => {
+    expect(ownsDesignLoginFinish({ alive: true, _designLoginFlow: flow }, flow)).toBe(true);
+  });
+  it('a retry on the same TUI replaces the token, so the older finish lets go', () => {
+    expect(ownsDesignLoginFinish({ alive: true, _designLoginFlow: {} }, flow)).toBe(false);
+  });
+  it('an abandoned flow or a /login meanwhile leaves no token', () => {
+    expect(ownsDesignLoginFinish({ alive: true, _designLoginFlow: null }, flow)).toBe(false);
+    expect(ownsDesignLoginFinish({ alive: true }, flow)).toBe(false);
+  });
+  it('a dead or missing session is never owned', () => {
+    expect(ownsDesignLoginFinish({ alive: false, _designLoginFlow: flow }, flow)).toBe(false);
+    expect(ownsDesignLoginFinish(undefined, flow)).toBe(false);
+    expect(ownsDesignLoginFinish({ alive: true, _designLoginFlow: undefined }, undefined)).toBe(false);
+  });
+  it('a replacement that carried the token over still owns it', () => {
+    const replacement = { alive: true, _designLoginFlow: flow, iv: {} };
+    expect(ownsDesignLoginFinish(replacement, flow)).toBe(true);
+  });
+});
+
 describe('/design-login routing', () => {
   it('is a bridge command', () => {
     expect(BRIDGE_COMMAND_NAMES.has('design-login')).toBe(true);
@@ -113,6 +137,13 @@ describe('/design-login wiring (source inspection)', () => {
     expect(caseBody).toMatch(/session\.iv\.sendText\(DESIGN_LOGIN_COMMAND\)[\s\S]*armDesignLoginWatch\(session\);/);
   });
 
+  it('/login supersedes a pending design-login finish, and /design-login waits out a /login return', () => {
+    const loginStart = src.indexOf("case '!login':");
+    const loginBody = src.slice(loginStart, src.indexOf("case '!design-login': {", loginStart));
+    expect(loginBody).toMatch(/session\._designLoginFlow = null;/);
+    expect(caseBody).toMatch(/if \(session\._accountFlowReturnScheduled\) \{/);
+  });
+
   it('the iv crash-restart carries the attempt token to the replacement', () => {
     expect(src).toMatch(/restarted\._designLoginFlow = session\._designLoginFlow;/);
   });
@@ -127,6 +158,6 @@ describe('/design-login wiring (source inspection)', () => {
     expect(fn).toMatch(/if \(switched\) current\._accountFlowReturnToPrint = false;/);
     expect(fn).toMatch(/shouldRunAccountFlowReturn\(current\)/);
     // An abandoned flow's timer must not end a newer flow in the same room.
-    expect(fn).toMatch(/current\._designLoginFlow !== flow\) return;/);
+    expect(fn).toMatch(/if \(!ownsDesignLoginFinish\(current, flow\)\) return;/);
   });
 });
