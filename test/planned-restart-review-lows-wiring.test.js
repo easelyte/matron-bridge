@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { runInNewContext } from 'node:vm';
 import { describe, expect, it, vi } from 'vitest';
-import { createWakeHandler } from '../lib/wake-route.js';
+import { createWakeHandler, wakeTargetsFromEnv } from '../lib/wake-route.js';
 
 // The real function text is cut out of index.js and run against fakes, so the
 // guards are exercised as shipped rather than matched as source text.
@@ -110,11 +110,11 @@ describe('listen-time restart token failure', () => {
 });
 
 describe('/wake availability as wired in index.js', () => {
-  const source = between('const handleWake = createWakeHandler({', '\n// send_attachment into a room: a journal transfer');
+  const source = between('function makeWakeHandler(convoId, text) {', '\n// send_attachment into a room: a journal transfer');
   function wire({ shuttingDown = false, stamped = false } = {}) {
     const session = { alive: true, roomId: 'room-a' };
     const context = {
-      createWakeHandler, shuttingDown, plannedRestartRuntime: { stamped },
+      createWakeHandler, wakeTargetsFromEnv, console, shuttingDown, plannedRestartRuntime: { stamped },
       process: { env: { MATRON_WAKE_CONVO_ID: 'convo-a', MATRON_WAKE_TEXT: 'wake up' } },
       findSessionByClaudeSessionId: vi.fn(() => session),
       journalResumeConvo: vi.fn(() => session),
@@ -122,7 +122,7 @@ describe('/wake availability as wired in index.js', () => {
       journalPublishNotice: vi.fn(),
       journalConvoIdFor: () => 'convo-a',
     };
-    runInNewContext(`${source}\nglobalThis.handle = handleWake;`, context);
+    runInNewContext(`${source}\nglobalThis.handle = wakeHandlers.get('');`, context);
     return context;
   }
 

@@ -432,7 +432,7 @@ it('guards every ingress and rejects unknown dispatcher callers', () => {
     'journalNotifyRoomEvent', 'approvePlanBuild', 'secretRequests', 'agentSpawnHandlers',
     'apiServer', 'runPreReapHandoff', 'drainPreReapCompact',
     // POST /wake (lib/wake-route.js): routes through journalRouteTextToSession, which holds the latch.
-    'handleWake',
+    'makeWakeHandler',
     // Recovery turn after a crash restart: routes through journalRouteTextToSession, which holds the latch.
     'onCrashRestart',
     // Boot-time note hand-off: runs once at startup, before any latch can exist.
