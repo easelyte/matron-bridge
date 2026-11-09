@@ -58,6 +58,7 @@ const buildPeerRuntime = new Function(
   'setForeignFlag',
   'clearForeignFlag',
   'effortFlowHoldsInput',
+  'signInDialogHoldsInput',
   'drainPreReapCompact',
   `const restartLatch = null;
    const plannedRestartAvailable = false;
@@ -146,6 +147,7 @@ function makeRuntime({ target = session(), persistImpl, markBusyOnInject = false
     () => {}, // setForeignFlag
     () => {}, // clearForeignFlag
     () => false, // effortFlowHoldsInput
+    () => false, // signInDialogHoldsInput
     () => false, // drainPreReapCompact
   );
   return {

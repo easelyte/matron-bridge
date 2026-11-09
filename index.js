@@ -4837,6 +4837,7 @@ function armDesignLoginWatch(session) {
       watch.stop();
       debug(`design-login finished (${outcome})`);
       releaseDesignLoginBusy(session, flow, { dialogClosed: true });
+      if (!session.busy) flushAfterDesignLogin(session);
       scheduleDesignLoginFinish(roomId, flow, outcome, LOGIN_RETURN_TO_PRINT_DELAY_MS);
       return;
     }
@@ -4885,7 +4886,15 @@ function releaseDesignLoginBusy(session, flow, { dialogClosed }) {
   inflightMarker.noteTurnEnd(journalConvoIdFor(session));
   journalSessionState(session, 'waiting');
   journalActivity(session, 'idle');
-  if (dialogClosed) maybeFlushRoomDelivery(session);
+  if (dialogClosed) flushAfterDesignLogin(session);
+}
+
+// The dialog has closed: what the user sent meanwhile (queued behind the
+// phantom turn) goes first, then room input, the same order a real turn end
+// uses. Also runs when a refusal already cleared busy.
+function flushAfterDesignLogin(session) {
+  if (!session.alive) return;
+  if (flushPendingSessionQueue(session) !== true) maybeFlushRoomDelivery(session);
 }
 
 // Report the outcome and, for a borrowed session, switch back to print. A
@@ -11522,7 +11531,7 @@ function pendingPeerFor(roomId) {
 function sessionOccupiedForRoomDelivery(session) {
   return !!session.busy || !!session._awaitingInputReady
     || !!session.waitingForAnswer || !!session.pendingInteractivePrompt
-    || effortFlowHoldsInput(session);
+    || effortFlowHoldsInput(session) || signInDialogHoldsInput(session);
 }
 
 // A turn another person starts needs more: no turn of any kind may still be

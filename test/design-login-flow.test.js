@@ -224,7 +224,9 @@ describe('designLoginEndsPhantomTurn', async () => {
       inflightMarker: { noteTurnEnd: id => ended.push(id) },
       journalConvoIdFor: () => 'c1', journalSessionState: () => {}, journalActivity: () => {},
       maybeFlushRoomDelivery: s => flushed.push(s),
+      flushPendingSessionQueue: s => { queueFlushes.push(s); return false; },
     };
+    const queueFlushes = [];
     const { arm } = runInNewContext(`${src.slice(start, end)}\n({ arm: armDesignLoginWatch })`, ctx);
     const iv = new EventEmitter();
     const session = { roomId: 'r', alive: true, iv, sendCallback: () => {} };
@@ -243,9 +245,17 @@ describe('designLoginEndsPhantomTurn', async () => {
     await wait();
     expect(session.busy).toBe(false);
     expect(session.currentTurn).toBe(null);
-    expect(flushed).toEqual([session]);
+    // Dialog closed: the user queue drains first, then room input.
+    expect(queueFlushes[0]).toBe(session);
+    expect(flushed[0]).toBe(session);
     expect(ended.length).toBe(2);
     expect(finishes.length).toBe(1);
+  });
+
+  it('room delivery waits while the dialog is open', () => {
+    const src = readFileSync(fileURLToPath(new URL('../index.js', import.meta.url)), 'utf-8');
+    const fn = src.slice(src.indexOf('function sessionOccupiedForRoomDelivery('), src.indexOf('function sessionOccupiedForRoomDelivery(') + 400);
+    expect(fn).toMatch(/signInDialogHoldsInput\(session\);/);
   });
 
   it('a pending prompt keeps its wait', async () => {
