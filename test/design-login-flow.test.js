@@ -202,9 +202,54 @@ describe('designLoginEndsPhantomTurn', async () => {
     expect(designLoginEndsPhantomTurn({ ...busy, busy: false })).toBe(false);
     expect(designLoginEndsPhantomTurn({ ...busy, iv: null })).toBe(false);
   });
-  it('the watch releases busy on a result and on a refusal', () => {
+  // Runs the real watch + release functions from index.js on a fake PTY.
+  it('ends the phantom turn on a result, and holds room input on a refusal', async () => {
+    const { runInNewContext } = await import('node:vm');
+    const { EventEmitter } = await import('node:events');
+    const prompt = await import('../lib/prompt-detector.js');
+    const flowLib = await import('../lib/design-login-flow.js');
     const src = readFileSync(fileURLToPath(new URL('../index.js', import.meta.url)), 'utf-8');
-    const fn = src.slice(src.indexOf('function armDesignLoginWatch('), src.indexOf('function releaseDesignLoginBusy('));
-    expect((fn.match(/releaseDesignLoginBusy\(session\);/g) || []).length).toBe(2);
+    const start = src.indexOf('function armDesignLoginWatch(');
+    const end = src.indexOf('// Report the outcome and, for a borrowed session, switch back to print.');
+    const flushed = [];
+    const finishes = [];
+    const ended = [];
+    const ctx = {
+      ...flowLib, stripAnsi: prompt.stripAnsi, findInputCue: prompt.findInputCue,
+      setTimeout, clearTimeout, debug: () => {},
+      DESIGN_LOGIN_WATCH_CAP_MS: 60000, DESIGN_LOGIN_SETTLE_MS: 5, DESIGN_LOGIN_BUFFER_LIMIT: 65536,
+      LOGIN_RETURN_TO_PRINT_DELAY_MS: 1,
+      scheduleDesignLoginFinish: (...a) => finishes.push(a),
+      endTurn: s => { s.currentTurn = null; },
+      inflightMarker: { noteTurnEnd: id => ended.push(id) },
+      journalConvoIdFor: () => 'c1', journalSessionState: () => {}, journalActivity: () => {},
+      maybeFlushRoomDelivery: s => flushed.push(s),
+    };
+    const { arm } = runInNewContext(`${src.slice(start, end)}\n({ arm: armDesignLoginWatch })`, ctx);
+    const iv = new EventEmitter();
+    const session = { roomId: 'r', alive: true, iv, sendCallback: () => {} };
+    arm(session);
+    const wait = () => new Promise(r => setTimeout(r, 30));
+    // The user pastes a wrong code: the paste began a turn.
+    session.busy = true; session.currentTurn = { causes: [] };
+    iv.emit('pty-data', " That code wasn't accepted.\n Press Enter to retry, or any other key to cancel.");
+    await wait();
+    expect(session.busy).toBe(false);
+    expect(session.currentTurn).toBe(null);
+    expect(flushed).toEqual([]);
+    // The retry's code is right.
+    session.busy = true; session.currentTurn = { causes: [] };
+    iv.emit('pty-data', '\n Browser didn\'t open? Paste code here if prompted >\n  ⎿  Design-system access authorized.');
+    await wait();
+    expect(session.busy).toBe(false);
+    expect(session.currentTurn).toBe(null);
+    expect(flushed).toEqual([session]);
+    expect(ended.length).toBe(2);
+    expect(finishes.length).toBe(1);
+  });
+
+  it('a pending prompt keeps its wait', async () => {
+    const { designLoginEndsPhantomTurn: ends } = await import('../lib/design-login-flow.js');
+    expect(ends({ alive: true, iv: {}, busy: true, pendingInteractivePrompt: { kind: 'menu' } })).toBe(false);
   });
 });

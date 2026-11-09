@@ -4816,7 +4816,7 @@ function armDesignLoginWatch(session) {
   // a session without it) nor an earlier attempt on the same TUI (a retry
   // replaces it) can end the current one. The iv crash-restart copies it
   // onto the replacement, so a finish that was pending still lands there.
-  const flow = {};
+  const flow = { turnAtArm: session.currentTurn || null };
   session._designLoginFlow = flow;
   let raw = '';
   let settleTimer = null;
@@ -4836,7 +4836,7 @@ function armDesignLoginWatch(session) {
     if (outcome) {
       watch.stop();
       debug(`design-login finished (${outcome})`);
-      releaseDesignLoginBusy(session);
+      releaseDesignLoginBusy(session, flow, { dialogClosed: true });
       scheduleDesignLoginFinish(roomId, flow, outcome, LOGIN_RETURN_TO_PRINT_DELAY_MS);
       return;
     }
@@ -4845,7 +4845,7 @@ function armDesignLoginWatch(session) {
     // Say it once per refusal: a new sign-in screen re-arms the notice.
     if (!refusalShown && designLoginCodeRefused(text)) {
       refusalShown = true;
-      releaseDesignLoginBusy(session);
+      releaseDesignLoginBusy(session, flow, { dialogClosed: false });
       raw = '';
       if (session.sendCallback) session.sendCallback(DESIGN_LOGIN_CODE_REFUSED_MESSAGE);
     } else if (refusalShown && findInputCue(text) === 'oauth') {
@@ -4870,17 +4870,22 @@ function armDesignLoginWatch(session) {
 }
 
 // The pasted code reaches the TUI as an ordinary message, which marks the
-// session busy, but the dialog consumes it and no claude turn runs, so no
-// Stop hook ever clears busy: every later message sat in the queue (the same
-// failure class /effort works around, see lib/effort-command.js). A result
-// or a refusal ends that phantom turn.
-function releaseDesignLoginBusy(session) {
+// session busy and begins a turn, but the dialog consumes it and no claude
+// turn runs, so no Stop hook ever ends it: every later message sat in the
+// queue (the same failure class /effort works around, see
+// lib/effort-command.js). A result or a refusal ends that phantom turn: busy,
+// the turn record (only one begun after the watch armed) and the in-flight
+// marker. Queued room input is flushed only once the dialog has CLOSED: on a
+// refusal it stays open, and anything typed would answer its retry prompt.
+function releaseDesignLoginBusy(session, flow, { dialogClosed }) {
   if (!designLoginEndsPhantomTurn(session)) return;
-  debug('design-login: clearing busy left by the pasted code');
+  debug('design-login: ending the turn the pasted code began');
   session.busy = false;
+  if (session.currentTurn && session.currentTurn !== flow.turnAtArm) endTurn(session);
+  inflightMarker.noteTurnEnd(journalConvoIdFor(session));
   journalSessionState(session, 'waiting');
   journalActivity(session, 'idle');
-  maybeFlushRoomDelivery(session);
+  if (dialogClosed) maybeFlushRoomDelivery(session);
 }
 
 // Report the outcome and, for a borrowed session, switch back to print. A
