@@ -115,8 +115,8 @@ describe('/design-login routing', () => {
     expect(DESIGN_LOGIN_COMMAND).toBe('/design-login');
   });
 
-  it('leaves /design to Claude Code (consent and revoke run in print mode)', () => {
-    expect(classifyBridgeCommand('/design consent')).toBe(null);
+  it('leaves /design and /design-sync to the ordinary route', () => {
+    expect(classifyBridgeCommand('/design a sign-in screen')).toBe(null);
     expect(classifyBridgeCommand('/design-sync')).toBe(null);
   });
 });
@@ -275,5 +275,46 @@ describe('sign-in card needs an OAuth URL', async () => {
     const screen = `Browser didn't open? Use the url below\n${oauth}\nPaste code here if prompted >`;
     const msg = formatTuiCueMessage(screen, ['https://support.claude.com/en/articles/1', oauth]);
     expect(msg.parts.map(p => p.plain)).toContain(oauth);
+  });
+});
+
+describe('designNeedsInteractive', async () => {
+  const { designNeedsInteractive } = await import('../lib/design-login-flow.js');
+  const print = { agent: 'claude', iv: null };
+  it('a brief or bare /design on a Claude print session switches', () => {
+    expect(designNeedsInteractive('/design A sign-in screen', print)).toBe(true);
+    expect(designNeedsInteractive('/design', print)).toBe(true);
+  });
+  it('only the /design word itself', () => {
+    expect(designNeedsInteractive('/design-sync', print)).toBe(false);
+    expect(designNeedsInteractive('please /design this', print)).toBe(false);
+  });
+  it('consent and revoke stay in print', () => {
+    expect(designNeedsInteractive('/design consent', print)).toBe(false);
+    expect(designNeedsInteractive('/design REVOKE', print)).toBe(false);
+  });
+  it('interactive and Codex sessions take it as typed', () => {
+    expect(designNeedsInteractive('/design A screen', { agent: 'claude', iv: {} })).toBe(false);
+    expect(designNeedsInteractive('/design A screen', { agent: 'codex', iv: null })).toBe(false);
+  });
+});
+
+describe('/design wiring (source inspection)', () => {
+  const src = readFileSync(fileURLToPath(new URL('../index.js', import.meta.url)), 'utf-8');
+  const start = src.indexOf('if (designNeedsInteractive(trimmed, session)');
+  const body = src.slice(start, src.indexOf('if (session.codexPrompts?.active', start));
+  it('switches only an idle, unheld print session and keeps the ordinary route otherwise', () => {
+    expect(start).toBeGreaterThan(0);
+    expect(body).toMatch(/!sessionOccupied\(session\)/);
+    expect(body).toMatch(/!effortFlowHoldsInput\(session\)/);
+    expect(body).not.toMatch(/_accountFlowReturnToPrint/);
+    expect(body).toMatch(/sendToSession\(next, \[\{ type: 'text', text: trimmed \}\], \{ skipJournalMirror: true, causes \}\)/);
+  });
+  it('a failed spawn that replaced the session reports instead of routing to the dead one', () => {
+    expect(body).toMatch(/if \(sessions\.get\(session\.roomId\) !== session\) \{/);
+  });
+  it('/mode interactive announces readiness', () => {
+    expect(src).toMatch(/if \(switched && wantInteractive\) switched\._announceInteractiveReady = true;/);
+    expect(src).toMatch(/session\.sendCallback\(INTERACTIVE_READY_MESSAGE\)/);
   });
 });

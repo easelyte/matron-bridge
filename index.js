@@ -89,7 +89,7 @@ import { resolveShareTarget } from './lib/share-target.js';
 import { createInteractiveSession } from './lib/interactive-session.js';
 import { projectDirFor, transcriptPathFor, findTranscriptBySessionId } from './lib/transcript-dir.js';
 import { extractUrls, isIdleReadyScreen, extractPreamble, preambleMatchesText, compactScreenText, AUTO_ENTER_COMPACT_RE, loginSuccessNearAutoEnterCue, stripAnsi, findInputCue } from './lib/prompt-detector.js';
-import { DESIGN_LOGIN_COMMAND, DESIGN_LOGIN_CODE_REFUSED_MESSAGE, classifyDesignLoginOutput, designLoginCodeRefused, designLoginOutcomeMessage, ownsDesignLoginFinish, signInDialogHoldsInput, designLoginEndsPhantomTurn } from './lib/design-login-flow.js';
+import { DESIGN_LOGIN_COMMAND, DESIGN_LOGIN_CODE_REFUSED_MESSAGE, classifyDesignLoginOutput, designLoginCodeRefused, designLoginOutcomeMessage, ownsDesignLoginFinish, signInDialogHoldsInput, designLoginEndsPhantomTurn, designNeedsInteractive, DESIGN_SWITCH_ANNOUNCEMENT, INTERACTIVE_READY_MESSAGE } from './lib/design-login-flow.js';
 import { formatTuiCueMessage } from './lib/tui-cue-message.js';
 import {
   buildMcpServers,
@@ -7098,6 +7098,10 @@ function startResumeReadyWatcher(session) {
       session.queuedMessages.push(...outbox);
       outbox.length = 0;
     }
+    if (session._announceInteractiveReady) {
+      session._announceInteractiveReady = false;
+      if (session.alive && session.sendCallback) session.sendCallback(INTERACTIVE_READY_MESSAGE);
+    }
     debug(`iv resume-ready (${reason}); flushing ${outbox.length} held message(s)${carriedQueue ? ` + ${session.queuedMessages.length} carried queued` : ''}`);
     // A /login- or /logout-initiated mode switch parked its command here:
     // type it the moment the TUI is ready, via iv.sendText — no busy,
@@ -9329,7 +9333,10 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         break;
       }
       const wantInteractive = target === 'interactive';
-      applyModeSwitch(roomId, session, wantInteractive, { sendReply, sendHtml });
+      const switched = applyModeSwitch(roomId, session, wantInteractive, { sendReply, sendHtml });
+      // The switch line goes out at once, but the resumed TUI takes a few
+      // seconds more; say when it is ready (the resume-ready watcher's finish).
+      if (switched && wantInteractive) switched._announceInteractiveReady = true;
       break;
     }
 
@@ -10052,6 +10059,39 @@ async function journalRouteTextToSession(session, body, { keepRestartBudget = fa
       },
     });
     if (dispatchedCommand) return;
+
+    // /design <brief> on a Claude print session needs the Artifact tool,
+    // which print mode withholds (the session would answer that /design "only
+    // manages agent access"). Switch to interactive and hand the brief to the
+    // new session, where the resume hold keeps it until the TUI is ready. The
+    // chat STAYS interactive: design is a back-and-forth, so the user sends
+    // /mode print when done. Only an idle, unheld print session switches;
+    // anything else (a turn running, an effort flow, an open prompt, an
+    // interactive or Codex session, /design consent and /design revoke) takes
+    // the ordinary route below, queue included.
+    if (designNeedsInteractive(trimmed, session) && !sessionOccupied(session)
+        && !effortFlowHoldsInput(session)) {
+      const ctx = journalSessionCommandCtx(session);
+      const next = applyModeSwitch(session.roomId, session, true, {
+        sendReply: ctx.sendReply, sendHtml: ctx.sendHtml,
+        announcement: DESIGN_SWITCH_ANNOUNCEMENT,
+      });
+      if (next) {
+        if (sendToSession(next, [{ type: 'text', text: trimmed }], { skipJournalMirror: true, causes }) !== true) {
+          ctx.sendReply('Switched to interactive mode, but couldn\'t hand it the brief — send /design again.');
+        }
+        return;
+      }
+      // A failed interactive spawn also returns null, but it has already
+      // replaced this session with a print fallback (and said so): the brief
+      // can't run there, so say how to retry instead of routing it to the
+      // dead session.
+      if (sessions.get(session.roomId) !== session) {
+        ctx.sendReply('Your design brief was not run. Send /design again once interactive mode works, or try /mode interactive first.');
+        return;
+      }
+      // Refused (applyModeSwitch said why): the text goes the ordinary way.
+    }
 
     if (session.codexPrompts?.active && !/^!(esc|escape)$/i.test(trimmed)) {
       const asyncQuestion = session.codexPrompts.active.kind === 'async-question';
