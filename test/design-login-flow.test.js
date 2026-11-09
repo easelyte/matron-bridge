@@ -263,3 +263,17 @@ describe('designLoginEndsPhantomTurn', async () => {
     expect(ends({ alive: true, iv: {}, busy: true, pendingInteractivePrompt: { kind: 'menu' } })).toBe(false);
   });
 });
+
+describe('sign-in card needs an OAuth URL', async () => {
+  const { formatTuiCueMessage } = await import('../lib/tui-cue-message.js');
+  it('a repainted old sign-in screen next to a PR link is not a sign-in', () => {
+    const screen = 'Paste code here if prompted >\nDesign login cancelled.\nMerged as https://github.com/acme/repo/pull/17';
+    expect(formatTuiCueMessage(screen, ['https://github.com/acme/repo/pull/17'])).toBe(null);
+  });
+  it('a live sign-in screen still gets the card with its OAuth URL', () => {
+    const oauth = 'https://claude.com/cai/oauth/authorize?code=true&state=a';
+    const screen = `Browser didn't open? Use the url below\n${oauth}\nPaste code here if prompted >`;
+    const msg = formatTuiCueMessage(screen, ['https://support.claude.com/en/articles/1', oauth]);
+    expect(msg.parts.map(p => p.plain)).toContain(oauth);
+  });
+});
