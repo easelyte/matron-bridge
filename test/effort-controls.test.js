@@ -334,7 +334,7 @@ describe('MCP tool wiring (source inspection)', () => {
     expect(src.match(/session\._effortFlowReturnToPrint = null;/g)?.length).toBe(2);
     // New input waits while the typed /effort settles (Bugbot): user sends and room delivery.
     expect(src).toContain('if (session.busy || effortFlowHoldsInput(session)) {');
-    expect(src).toContain('|| !!session.waitingForAnswer || !!session.pendingInteractivePrompt\n    || effortFlowHoldsInput(session);');
+    expect(src).toContain('|| !!session.waitingForAnswer || !!session.pendingInteractivePrompt\n    || effortFlowHoldsInput(session) || signInDialogHoldsInput(session);');
     // Bugbot on 799390a: slash input queues during the hold, the room inbox
     // drains after it, and a crash-restart replacement re-arms the return.
     expect(src).toContain('if (session.iv && !effortFlowHoldsInput(session) && isIvSlashPassthrough(trimmed)) {');
