@@ -310,6 +310,9 @@ describe('/design wiring (source inspection)', () => {
     expect(body).not.toMatch(/_accountFlowReturnToPrint/);
     expect(body).toMatch(/sendToSession\(next, \[\{ type: 'text', text: trimmed \}\], \{ skipJournalMirror: true, causes \}\)/);
   });
+  it('a failed spawn that replaced the session reports instead of routing to the dead one', () => {
+    expect(body).toMatch(/if \(sessions\.get\(session\.roomId\) !== session\) \{/);
+  });
   it('/mode interactive announces readiness', () => {
     expect(src).toMatch(/if \(switched && wantInteractive\) switched\._announceInteractiveReady = true;/);
     expect(src).toMatch(/session\.sendCallback\(INTERACTIVE_READY_MESSAGE\)/);

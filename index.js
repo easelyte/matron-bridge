@@ -10082,6 +10082,14 @@ async function journalRouteTextToSession(session, body, { keepRestartBudget = fa
         }
         return;
       }
+      // A failed interactive spawn also returns null, but it has already
+      // replaced this session with a print fallback (and said so): the brief
+      // can't run there, so say how to retry instead of routing it to the
+      // dead session.
+      if (sessions.get(session.roomId) !== session) {
+        ctx.sendReply('Your design brief was not run. Send /design again once interactive mode works, or try /mode interactive first.');
+        return;
+      }
       // Refused (applyModeSwitch said why): the text goes the ordinary way.
     }
 
