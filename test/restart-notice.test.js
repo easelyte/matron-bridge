@@ -460,6 +460,7 @@ function inputWiring() {
   const h = wiredSetup('pty');
   Object.assign(h.context, {
     dispatchJournalBridgeCommand: async () => false, dispatchPlanBuild: async () => false,
+    designNeedsInteractive: () => false,
     dispatchJournalRescueKeystroke: async () => false, maybeResolveInteractivePrompt: () => false,
     armOperatorCompact: () => {}, journalPublishNotice: () => {}, JOURNAL_RESUME_NOTICE: 'Continue.',
     findSessionByClaudeSessionId: () => h.session, console: { warn() {}, log() {} },

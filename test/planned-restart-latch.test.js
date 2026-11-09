@@ -8,6 +8,7 @@ import { createPlannedRestartState } from '../lib/planned-restart-state.js';
 import { createRestartNotes } from '../lib/restart-notes.js';
 import { createPlannedRestart } from '../lib/planned-restart.js';
 import { runInNewContext } from 'node:vm';
+import { designNeedsInteractive } from '../lib/design-login-flow.js';
 import { parse } from 'espree';
 import { evaluateQuiet } from '../lib/restart-quiet.js';
 import { createJournalMediaRouter } from '../lib/journal-media.js';
@@ -292,7 +293,9 @@ function indexFunction(name, context) {
   const source = fs.readFileSync(new URL('../index.js', import.meta.url), 'utf8');
   const start = source.indexOf(`function ${name}(`);
   const end = source.indexOf('\n}\n', start) + 2;
-  return runInNewContext(`${source.slice(start, end)}; ${name}`, { ...turnCause, ...context });
+  // The /design switch check runs on every routed text; these inputs are
+  // never /design, so the real predicate answers false.
+  return runInNewContext(`${source.slice(start, end)}; ${name}`, { ...turnCause, designNeedsInteractive, ...context });
 }
 
 it('holds room input while foreign context is pending and releases after delivery', async () => {

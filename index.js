@@ -9070,7 +9070,6 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         `/login — Log in to your Anthropic account (auto-switches to interactive mode)\n` +
         `/logout — Log out of your Anthropic account (auto-switches to interactive mode)\n` +
         `/design-login — Authorize Claude Design access for /design-sync and /design consent (auto-switches to interactive mode)\n` +
-        `/design <brief> — Make a Claude Design canvas (switches to interactive mode and stays; /mode print when done)\n` +
         `/cost — Show session cost\n` +
         `/usage — Show token usage\n` +
         `/limits — Show subscription usage limits (session & weekly)\n` +
@@ -9118,7 +9117,6 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
           ['/login', 'Log in to your Anthropic account (auto-switches to interactive mode)'],
           ['/logout', 'Log out of your Anthropic account (auto-switches to interactive mode)'],
           ['/design-login', 'Authorize Claude Design access for /design-sync and /design consent (auto-switches to interactive mode)'],
-          ['/design &lt;brief&gt;', 'Make a Claude Design canvas (switches to interactive mode and stays; /mode print when done)'],
           ['/cost', 'Show session cost'],
           ['/usage', 'Show token usage'],
           ['/limits', 'Show subscription usage limits (session &amp; weekly)'],
@@ -9502,37 +9500,6 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         next._postReadySlashCommand = DESIGN_LOGIN_COMMAND;
         next._accountFlowReturnToPrint = true;
         next._accountLogoutPending = false;
-      }
-      break;
-    }
-
-    // /design <brief> (the Claude Design canvas generator) needs the Artifact
-    // tool, which print mode withholds: a print session answers that /design
-    // "only manages agent access". From print, switch to interactive and run
-    // the brief there once the TUI is ready (it is held in the resume outbox
-    // like any message sent during the hold). The chat STAYS interactive:
-    // design is a back-and-forth, so the user sends /mode print when done.
-    // Everything else is the user's message as typed: an interactive or Codex
-    // session, and /design consent and /design revoke, which work in print.
-    case '!design': {
-      const session = sessions.get(roomId);
-      const typed = '/' + text.slice(1);
-      if (!session || !session.alive) {
-        await sendReply('No active session. /design runs inside a session — start one first.');
-        break;
-      }
-      if (!designNeedsInteractive(text, session)) {
-        if (sendToSession(session, [{ type: 'text', text: typed }], { skipJournalMirror: true }) !== true) {
-          await sendReply('Could not reach the session — try /restart, then /design again.');
-        }
-        break;
-      }
-      const next = applyModeSwitch(roomId, session, true, {
-        sendReply, sendHtml,
-        announcement: DESIGN_SWITCH_ANNOUNCEMENT,
-      });
-      if (next && sendToSession(next, [{ type: 'text', text: typed }], { skipJournalMirror: true }) !== true) {
-        await sendReply('Switched to interactive mode, but couldn\'t hand it the brief — send /design again.');
       }
       break;
     }
@@ -10092,6 +10059,31 @@ async function journalRouteTextToSession(session, body, { keepRestartBudget = fa
       },
     });
     if (dispatchedCommand) return;
+
+    // /design <brief> on a Claude print session needs the Artifact tool,
+    // which print mode withholds (the session would answer that /design "only
+    // manages agent access"). Switch to interactive and hand the brief to the
+    // new session, where the resume hold keeps it until the TUI is ready. The
+    // chat STAYS interactive: design is a back-and-forth, so the user sends
+    // /mode print when done. Only an idle, unheld print session switches;
+    // anything else (a turn running, an effort flow, an open prompt, an
+    // interactive or Codex session, /design consent and /design revoke) takes
+    // the ordinary route below, queue included.
+    if (designNeedsInteractive(trimmed, session) && !sessionOccupied(session)
+        && !effortFlowHoldsInput(session)) {
+      const ctx = journalSessionCommandCtx(session);
+      const next = applyModeSwitch(session.roomId, session, true, {
+        sendReply: ctx.sendReply, sendHtml: ctx.sendHtml,
+        announcement: DESIGN_SWITCH_ANNOUNCEMENT,
+      });
+      if (next) {
+        if (sendToSession(next, [{ type: 'text', text: trimmed }], { skipJournalMirror: true, causes }) !== true) {
+          ctx.sendReply('Switched to interactive mode, but couldn\'t hand it the brief — send /design again.');
+        }
+        return;
+      }
+      // Refused (applyModeSwitch said why): the text goes the ordinary way.
+    }
 
     if (session.codexPrompts?.active && !/^!(esc|escape)$/i.test(trimmed)) {
       const asyncQuestion = session.codexPrompts.active.kind === 'async-question';
