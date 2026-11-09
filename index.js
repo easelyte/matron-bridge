@@ -89,7 +89,7 @@ import { resolveShareTarget } from './lib/share-target.js';
 import { createInteractiveSession } from './lib/interactive-session.js';
 import { projectDirFor, transcriptPathFor, findTranscriptBySessionId } from './lib/transcript-dir.js';
 import { extractUrls, isIdleReadyScreen, extractPreamble, preambleMatchesText, compactScreenText, AUTO_ENTER_COMPACT_RE, loginSuccessNearAutoEnterCue, stripAnsi, findInputCue } from './lib/prompt-detector.js';
-import { DESIGN_LOGIN_COMMAND, DESIGN_LOGIN_CODE_REFUSED_MESSAGE, classifyDesignLoginOutput, designLoginCodeRefused, designLoginOutcomeMessage, ownsDesignLoginFinish, signInDialogHoldsInput } from './lib/design-login-flow.js';
+import { DESIGN_LOGIN_COMMAND, DESIGN_LOGIN_CODE_REFUSED_MESSAGE, classifyDesignLoginOutput, designLoginCodeRefused, designLoginOutcomeMessage, ownsDesignLoginFinish, signInDialogHoldsInput, designLoginEndsPhantomTurn } from './lib/design-login-flow.js';
 import { formatTuiCueMessage } from './lib/tui-cue-message.js';
 import {
   buildMcpServers,
@@ -4836,6 +4836,7 @@ function armDesignLoginWatch(session) {
     if (outcome) {
       watch.stop();
       debug(`design-login finished (${outcome})`);
+      releaseDesignLoginBusy(session);
       scheduleDesignLoginFinish(roomId, flow, outcome, LOGIN_RETURN_TO_PRINT_DELAY_MS);
       return;
     }
@@ -4844,6 +4845,7 @@ function armDesignLoginWatch(session) {
     // Say it once per refusal: a new sign-in screen re-arms the notice.
     if (!refusalShown && designLoginCodeRefused(text)) {
       refusalShown = true;
+      releaseDesignLoginBusy(session);
       raw = '';
       if (session.sendCallback) session.sendCallback(DESIGN_LOGIN_CODE_REFUSED_MESSAGE);
     } else if (refusalShown && findInputCue(text) === 'oauth') {
@@ -4865,6 +4867,20 @@ function armDesignLoginWatch(session) {
   if (typeof cap.unref === 'function') cap.unref();
   iv.on('pty-data', onData);
   session._designLoginWatch = watch;
+}
+
+// The pasted code reaches the TUI as an ordinary message, which marks the
+// session busy, but the dialog consumes it and no claude turn runs, so no
+// Stop hook ever clears busy: every later message sat in the queue (the same
+// failure class /effort works around, see lib/effort-command.js). A result
+// or a refusal ends that phantom turn.
+function releaseDesignLoginBusy(session) {
+  if (!designLoginEndsPhantomTurn(session)) return;
+  debug('design-login: clearing busy left by the pasted code');
+  session.busy = false;
+  journalSessionState(session, 'waiting');
+  journalActivity(session, 'idle');
+  maybeFlushRoomDelivery(session);
 }
 
 // Report the outcome and, for a borrowed session, switch back to print. A

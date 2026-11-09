@@ -189,3 +189,22 @@ describe('sign-in relay fixes', async () => {
     expect(fn).toMatch(/signInDialogHoldsInput\(session\)\) return \{ deferred: true \};/);
   });
 });
+
+describe('designLoginEndsPhantomTurn', async () => {
+  const { designLoginEndsPhantomTurn } = await import('../lib/design-login-flow.js');
+  const busy = { alive: true, iv: {}, busy: true };
+  it('clears the busy mark the pasted code left', () => {
+    expect(designLoginEndsPhantomTurn(busy)).toBe(true);
+  });
+  it('leaves a real wait alone', () => {
+    expect(designLoginEndsPhantomTurn({ ...busy, pendingInteractivePrompt: {} })).toBe(false);
+    expect(designLoginEndsPhantomTurn({ ...busy, waitingForAnswer: true })).toBe(false);
+    expect(designLoginEndsPhantomTurn({ ...busy, busy: false })).toBe(false);
+    expect(designLoginEndsPhantomTurn({ ...busy, iv: null })).toBe(false);
+  });
+  it('the watch releases busy on a result and on a refusal', () => {
+    const src = readFileSync(fileURLToPath(new URL('../index.js', import.meta.url)), 'utf-8');
+    const fn = src.slice(src.indexOf('function armDesignLoginWatch('), src.indexOf('function releaseDesignLoginBusy('));
+    expect((fn.match(/releaseDesignLoginBusy\(session\);/g) || []).length).toBe(2);
+  });
+});
