@@ -89,7 +89,7 @@ import { resolveShareTarget } from './lib/share-target.js';
 import { createInteractiveSession } from './lib/interactive-session.js';
 import { projectDirFor, transcriptPathFor, findTranscriptBySessionId } from './lib/transcript-dir.js';
 import { extractUrls, isIdleReadyScreen, extractPreamble, preambleMatchesText, compactScreenText, AUTO_ENTER_COMPACT_RE, loginSuccessNearAutoEnterCue, stripAnsi, findInputCue } from './lib/prompt-detector.js';
-import { DESIGN_LOGIN_COMMAND, DESIGN_LOGIN_CODE_REFUSED_MESSAGE, classifyDesignLoginOutput, designLoginCodeRefused, designLoginOutcomeMessage, ownsDesignLoginFinish, signInDialogHoldsInput } from './lib/design-login-flow.js';
+import { DESIGN_LOGIN_COMMAND, DESIGN_LOGIN_CODE_REFUSED_MESSAGE, classifyDesignLoginOutput, designLoginCodeRefused, designLoginOutcomeMessage, ownsDesignLoginFinish, signInDialogHoldsInput, designLoginEndsPhantomTurn } from './lib/design-login-flow.js';
 import { formatTuiCueMessage } from './lib/tui-cue-message.js';
 import {
   buildMcpServers,
@@ -4816,7 +4816,7 @@ function armDesignLoginWatch(session) {
   // a session without it) nor an earlier attempt on the same TUI (a retry
   // replaces it) can end the current one. The iv crash-restart copies it
   // onto the replacement, so a finish that was pending still lands there.
-  const flow = {};
+  const flow = { turnAtArm: session.currentTurn || null };
   session._designLoginFlow = flow;
   let raw = '';
   let settleTimer = null;
@@ -4836,6 +4836,8 @@ function armDesignLoginWatch(session) {
     if (outcome) {
       watch.stop();
       debug(`design-login finished (${outcome})`);
+      releaseDesignLoginBusy(session, flow, { dialogClosed: true });
+      if (!session.busy) flushAfterDesignLogin(session);
       scheduleDesignLoginFinish(roomId, flow, outcome, LOGIN_RETURN_TO_PRINT_DELAY_MS);
       return;
     }
@@ -4844,6 +4846,7 @@ function armDesignLoginWatch(session) {
     // Say it once per refusal: a new sign-in screen re-arms the notice.
     if (!refusalShown && designLoginCodeRefused(text)) {
       refusalShown = true;
+      releaseDesignLoginBusy(session, flow, { dialogClosed: false });
       raw = '';
       if (session.sendCallback) session.sendCallback(DESIGN_LOGIN_CODE_REFUSED_MESSAGE);
     } else if (refusalShown && findInputCue(text) === 'oauth') {
@@ -4865,6 +4868,33 @@ function armDesignLoginWatch(session) {
   if (typeof cap.unref === 'function') cap.unref();
   iv.on('pty-data', onData);
   session._designLoginWatch = watch;
+}
+
+// The pasted code reaches the TUI as an ordinary message, which marks the
+// session busy and begins a turn, but the dialog consumes it and no claude
+// turn runs, so no Stop hook ever ends it: every later message sat in the
+// queue (the same failure class /effort works around, see
+// lib/effort-command.js). A result or a refusal ends that phantom turn: busy,
+// the turn record (only one begun after the watch armed) and the in-flight
+// marker. Queued room input is flushed only once the dialog has CLOSED: on a
+// refusal it stays open, and anything typed would answer its retry prompt.
+function releaseDesignLoginBusy(session, flow, { dialogClosed }) {
+  if (!designLoginEndsPhantomTurn(session)) return;
+  debug('design-login: ending the turn the pasted code began');
+  session.busy = false;
+  if (session.currentTurn && session.currentTurn !== flow.turnAtArm) endTurn(session);
+  inflightMarker.noteTurnEnd(journalConvoIdFor(session));
+  journalSessionState(session, 'waiting');
+  journalActivity(session, 'idle');
+  if (dialogClosed) flushAfterDesignLogin(session);
+}
+
+// The dialog has closed: what the user sent meanwhile (queued behind the
+// phantom turn) goes first, then room input, the same order a real turn end
+// uses. Also runs when a refusal already cleared busy.
+function flushAfterDesignLogin(session) {
+  if (!session.alive) return;
+  if (flushPendingSessionQueue(session) !== true) maybeFlushRoomDelivery(session);
 }
 
 // Report the outcome and, for a borrowed session, switch back to print. A
@@ -11501,7 +11531,7 @@ function pendingPeerFor(roomId) {
 function sessionOccupiedForRoomDelivery(session) {
   return !!session.busy || !!session._awaitingInputReady
     || !!session.waitingForAnswer || !!session.pendingInteractivePrompt
-    || effortFlowHoldsInput(session);
+    || effortFlowHoldsInput(session) || signInDialogHoldsInput(session);
 }
 
 // A turn another person starts needs more: no turn of any kind may still be

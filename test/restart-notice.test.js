@@ -71,7 +71,7 @@ function wiredSetup(backend, available = true) {
     persistSession: (roomId, id, cwd, origin, extra) => persisted.set(roomId,
       { journalConvoId: context.sessions.get(roomId)?.journalConvoId, ...extra }),
     getPersistedSession: roomId => persisted.get(roomId), persistControlState: noop,
-    flushRoomInbox: vi.fn(), drainPreReapCompact: () => false, effortFlowHoldsInput: () => false,
+    flushRoomInbox: vi.fn(), drainPreReapCompact: () => false, effortFlowHoldsInput: () => false, signInDialogHoldsInput: () => false,
     foreignSessions: { drainParked: () => false, end: noop }, canSwitchAgent: () => true,
     postControlNotice: noop, journalSessionCommandCtx: () => ({}),
     AGENT_CODEX: 'codex', AGENT_CLAUDE: 'claude',
