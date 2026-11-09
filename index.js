@@ -89,7 +89,7 @@ import { resolveShareTarget } from './lib/share-target.js';
 import { createInteractiveSession } from './lib/interactive-session.js';
 import { projectDirFor, transcriptPathFor, findTranscriptBySessionId } from './lib/transcript-dir.js';
 import { extractUrls, isIdleReadyScreen, extractPreamble, preambleMatchesText, compactScreenText, AUTO_ENTER_COMPACT_RE, loginSuccessNearAutoEnterCue, stripAnsi, findInputCue } from './lib/prompt-detector.js';
-import { DESIGN_LOGIN_COMMAND, DESIGN_LOGIN_CODE_REFUSED_MESSAGE, classifyDesignLoginOutput, designLoginCodeRefused, designLoginOutcomeMessage, ownsDesignLoginFinish, signInDialogHoldsInput, designLoginEndsPhantomTurn } from './lib/design-login-flow.js';
+import { DESIGN_LOGIN_COMMAND, DESIGN_LOGIN_CODE_REFUSED_MESSAGE, classifyDesignLoginOutput, designLoginCodeRefused, designLoginOutcomeMessage, ownsDesignLoginFinish, signInDialogHoldsInput, designLoginEndsPhantomTurn, designNeedsInteractive, DESIGN_SWITCH_ANNOUNCEMENT, INTERACTIVE_READY_MESSAGE } from './lib/design-login-flow.js';
 import { formatTuiCueMessage } from './lib/tui-cue-message.js';
 import {
   buildMcpServers,
@@ -7098,6 +7098,10 @@ function startResumeReadyWatcher(session) {
       session.queuedMessages.push(...outbox);
       outbox.length = 0;
     }
+    if (session._announceInteractiveReady) {
+      session._announceInteractiveReady = false;
+      if (session.alive && session.sendCallback) session.sendCallback(INTERACTIVE_READY_MESSAGE);
+    }
     debug(`iv resume-ready (${reason}); flushing ${outbox.length} held message(s)${carriedQueue ? ` + ${session.queuedMessages.length} carried queued` : ''}`);
     // A /login- or /logout-initiated mode switch parked its command here:
     // type it the moment the TUI is ready, via iv.sendText — no busy,
@@ -9066,6 +9070,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         `/login — Log in to your Anthropic account (auto-switches to interactive mode)\n` +
         `/logout — Log out of your Anthropic account (auto-switches to interactive mode)\n` +
         `/design-login — Authorize Claude Design access for /design-sync and /design consent (auto-switches to interactive mode)\n` +
+        `/design <brief> — Make a Claude Design canvas (switches to interactive mode and stays; /mode print when done)\n` +
         `/cost — Show session cost\n` +
         `/usage — Show token usage\n` +
         `/limits — Show subscription usage limits (session & weekly)\n` +
@@ -9113,6 +9118,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
           ['/login', 'Log in to your Anthropic account (auto-switches to interactive mode)'],
           ['/logout', 'Log out of your Anthropic account (auto-switches to interactive mode)'],
           ['/design-login', 'Authorize Claude Design access for /design-sync and /design consent (auto-switches to interactive mode)'],
+          ['/design &lt;brief&gt;', 'Make a Claude Design canvas (switches to interactive mode and stays; /mode print when done)'],
           ['/cost', 'Show session cost'],
           ['/usage', 'Show token usage'],
           ['/limits', 'Show subscription usage limits (session &amp; weekly)'],
@@ -9329,7 +9335,10 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         break;
       }
       const wantInteractive = target === 'interactive';
-      applyModeSwitch(roomId, session, wantInteractive, { sendReply, sendHtml });
+      const switched = applyModeSwitch(roomId, session, wantInteractive, { sendReply, sendHtml });
+      // The switch line goes out at once, but the resumed TUI takes a few
+      // seconds more; say when it is ready (the resume-ready watcher's finish).
+      if (switched && wantInteractive) switched._announceInteractiveReady = true;
       break;
     }
 
@@ -9493,6 +9502,37 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         next._postReadySlashCommand = DESIGN_LOGIN_COMMAND;
         next._accountFlowReturnToPrint = true;
         next._accountLogoutPending = false;
+      }
+      break;
+    }
+
+    // /design <brief> (the Claude Design canvas generator) needs the Artifact
+    // tool, which print mode withholds: a print session answers that /design
+    // "only manages agent access". From print, switch to interactive and run
+    // the brief there once the TUI is ready (it is held in the resume outbox
+    // like any message sent during the hold). The chat STAYS interactive:
+    // design is a back-and-forth, so the user sends /mode print when done.
+    // Everything else is the user's message as typed: an interactive or Codex
+    // session, and /design consent and /design revoke, which work in print.
+    case '!design': {
+      const session = sessions.get(roomId);
+      const typed = '/' + text.slice(1);
+      if (!session || !session.alive) {
+        await sendReply('No active session. /design runs inside a session — start one first.');
+        break;
+      }
+      if (!designNeedsInteractive(text, session)) {
+        if (sendToSession(session, [{ type: 'text', text: typed }], { skipJournalMirror: true }) !== true) {
+          await sendReply('Could not reach the session — try /restart, then /design again.');
+        }
+        break;
+      }
+      const next = applyModeSwitch(roomId, session, true, {
+        sendReply, sendHtml,
+        announcement: DESIGN_SWITCH_ANNOUNCEMENT,
+      });
+      if (next && sendToSession(next, [{ type: 'text', text: typed }], { skipJournalMirror: true }) !== true) {
+        await sendReply('Switched to interactive mode, but couldn\'t hand it the brief — send /design again.');
       }
       break;
     }

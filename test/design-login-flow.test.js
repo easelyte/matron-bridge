@@ -115,8 +115,8 @@ describe('/design-login routing', () => {
     expect(DESIGN_LOGIN_COMMAND).toBe('/design-login');
   });
 
-  it('leaves /design to Claude Code (consent and revoke run in print mode)', () => {
-    expect(classifyBridgeCommand('/design consent')).toBe(null);
+  it('intercepts /design, but not /design-sync', () => {
+    expect(classifyBridgeCommand('/design a sign-in screen')).toBe('!design a sign-in screen');
     expect(classifyBridgeCommand('/design-sync')).toBe(null);
   });
 });
@@ -275,5 +275,37 @@ describe('sign-in card needs an OAuth URL', async () => {
     const screen = `Browser didn't open? Use the url below\n${oauth}\nPaste code here if prompted >`;
     const msg = formatTuiCueMessage(screen, ['https://support.claude.com/en/articles/1', oauth]);
     expect(msg.parts.map(p => p.plain)).toContain(oauth);
+  });
+});
+
+describe('designNeedsInteractive', async () => {
+  const { designNeedsInteractive } = await import('../lib/design-login-flow.js');
+  const print = { agent: 'claude', iv: null };
+  it('a brief or bare /design on a Claude print session switches', () => {
+    expect(designNeedsInteractive('!design A sign-in screen', print)).toBe(true);
+    expect(designNeedsInteractive('!design', print)).toBe(true);
+  });
+  it('consent and revoke stay in print', () => {
+    expect(designNeedsInteractive('!design consent', print)).toBe(false);
+    expect(designNeedsInteractive('!design REVOKE', print)).toBe(false);
+  });
+  it('interactive and Codex sessions take it as typed', () => {
+    expect(designNeedsInteractive('!design A screen', { agent: 'claude', iv: {} })).toBe(false);
+    expect(designNeedsInteractive('!design A screen', { agent: 'codex', iv: null })).toBe(false);
+  });
+});
+
+describe('/design wiring (source inspection)', () => {
+  const src = readFileSync(fileURLToPath(new URL('../index.js', import.meta.url)), 'utf-8');
+  const start = src.indexOf("case '!design': {");
+  const body = src.slice(start, src.indexOf("case '!effort': {", start));
+  it('switches without arming a return to print, and hands the brief to the new session', () => {
+    expect(body).toMatch(/applyModeSwitch\(roomId, session, true,/);
+    expect(body).not.toMatch(/_accountFlowReturnToPrint/);
+    expect(body).toMatch(/sendToSession\(next, \[\{ type: 'text', text: typed \}\]/);
+  });
+  it('/mode interactive announces readiness', () => {
+    expect(src).toMatch(/if \(switched && wantInteractive\) switched\._announceInteractiveReady = true;/);
+    expect(src).toMatch(/session\.sendCallback\(INTERACTIVE_READY_MESSAGE\)/);
   });
 });
