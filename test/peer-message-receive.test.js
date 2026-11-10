@@ -7,6 +7,7 @@ import { createAgentChatHandlers } from '../lib/agent-chat.js';
 import { createRoomDelivery, formatRoomDeliveredNotice, formatRoomDeliveryFailedNotice } from '../lib/room-delivery.js';
 import { oneLine } from '../lib/peer-text.js';
 import { noticeMeta, roomNoticeMeta } from '../lib/system-notice.js';
+import { createJoinHold } from '../lib/room-join-hold.js';
 import { TURN_TIER, peerBatchTier, roomBatchTier, shouldPreemptForPriorityPeer } from '../lib/peer-priority.js';
 
 const indexSource = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
@@ -60,6 +61,7 @@ const buildPeerRuntime = new Function(
   'effortFlowHoldsInput',
   'signInDialogHoldsInput',
   'drainPreReapCompact',
+  'createJoinHold',
   `const restartLatch = null;
    const plannedRestartAvailable = false;
    ${sourceBetween('function journalConvoIdFor(', '// Reverse lookup for the journal return path:')}
@@ -149,6 +151,7 @@ function makeRuntime({ target = session(), persistImpl, markBusyOnInject = false
     () => false, // effortFlowHoldsInput
     () => false, // signInDialogHoldsInput
     () => false, // drainPreReapCompact
+    createJoinHold,
   );
   return {
     ...runtime,

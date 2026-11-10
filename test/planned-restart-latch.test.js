@@ -432,6 +432,8 @@ it('guards every ingress and rejects unknown dispatcher callers', () => {
     'journalOnText', 'journalMediaRouter', 'itemTurnRouter', 'deliverCoordinatorTurn', 'journalOnMedia',
     'carryOnConvo', 'fireTimer', 'fireAutoResume', 'applyControlSteps', 'restartNotices', 'flushRoomInbox',
     'handleCommand', 'peerDelivery', 'roomDelivery', 'foreignSessions', 'deliverRoomFrameTo', 'deliverInviteAsk', 'deliverAutoJoinedRequest',
+    // Upstream split: only called from deliverAutoJoinedRequest, which holds the latch.
+    'deliverAutoJoinedRequestHeld',
     'journalNotifyRoomEvent', 'approvePlanBuild', 'secretRequests', 'agentSpawnHandlers',
     'apiServer', 'runPreReapHandoff', 'drainPreReapCompact',
     // POST /wake (lib/wake-route.js): routes through journalRouteTextToSession, which holds the latch.
@@ -542,7 +544,9 @@ it.each(['acceptance', 'backlog', 'context'])('holds the latch while auto-join a
   const f = fixture();
   const source = fs.readFileSync(new URL('../index.js', import.meta.url), 'utf8');
   const start = source.indexOf('async function deliverAutoJoinedRequest(');
-  const body = source.slice(start, source.indexOf('\n}', start) + 2);
+  // The join is split in two (the held-frame wrapper and the delivery); take both.
+  const held = source.indexOf('async function deliverAutoJoinedRequestHeld(', start);
+  const body = source.slice(start, source.indexOf('\n}', held) + 2);
   let release, reached;
   const waiting = new Promise(resolve => { release = resolve; });
   const blocked = new Promise(resolve => { reached = resolve; });
@@ -555,6 +559,8 @@ it.each(['acceptance', 'backlog', 'context'])('holds the latch while auto-join a
     journalPublisher: { fetchMessages: async () => { await wait('backlog'); return { events: [] }; } },
     foreignSessions: { refreshContext: async () => { await wait('context'); } },
     roomDelivery: { deliver: delivered }, formatAutoJoinedRequest: () => 'continue',
+    roomJoinHold: { hold() {}, release: () => [] }, journalOnRoomFrameNow() {},
+    JOIN_BACKLOG_LIMIT: 20, selectJoinBacklog: events => ({ shown: events }),
   });
   const pending = handler({ roomId: 'alice' }, { room_id: 'bob', person: { name: 'alice' } }, {}, { addressed: true });
   await blocked;

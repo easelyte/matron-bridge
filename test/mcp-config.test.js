@@ -501,8 +501,10 @@ describe('committed browser extra keeps Chrome\'s sandbox on', () => {
   const config = JSON.parse(readFileSync(fileURLToPath(new URL('../mcp-config.json', import.meta.url)), 'utf8'));
   const server = config.mcpExtras.browser['chrome-devtools'];
 
-  it('passes no flag that disables the sandbox', () => {
+  // Fork: this host's Chrome needs exactly these two flags (kept as a
+  // fork-only delta). Nothing beyond them may switch the sandbox off.
+  it('passes no sandbox-off flag beyond the fork host pair', () => {
     const sandboxOff = server.args.filter((a) => /no-sandbox|disable-setuid-sandbox|no-zygote-sandbox|disable-seccomp/i.test(a));
-    expect(sandboxOff).toEqual([]);
+    expect(sandboxOff).toEqual(['--chromeArg=--no-sandbox', '--chromeArg=--disable-setuid-sandbox']);
   });
 });
