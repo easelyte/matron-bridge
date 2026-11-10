@@ -1,5 +1,9 @@
 import { describe, it, expect } from 'vitest';
-import { parseUsageLimits, parseResetsAt, resetsAtMs, deriveLimitId, formatLimits } from '../lib/usage-limits.js';
+import { readFileSync } from 'node:fs';
+import {
+  parseUsageLimits, parseResetsAt, resetsAtMs, deriveLimitId, formatLimits,
+  usageFetchTimeoutMs, DEFAULT_USAGE_FETCH_TIMEOUT_MS,
+} from '../lib/usage-limits.js';
 
 // Real `claude -p "/usage" --output-format text` output (subscription account).
 // Note the middot separator (·) is the literal character Claude Code emits.
@@ -373,15 +377,31 @@ describe('formatLimits', () => {
   });
 });
 
-import { usageFetchTimeoutMs, DEFAULT_USAGE_FETCH_TIMEOUT_MS } from '../lib/usage-limits.js';
+// `claude -p /usage` scans the box's local session transcripts, so on a box
+// with a few hundred sessions it runs for about 50 s. A fixed 30 s timeout
+// killed it and the account meters went missing from the status frame.
 describe('usageFetchTimeoutMs', () => {
-  it('defaults above the ~50s a large box needs', () => {
+  it('defaults well above the ~50 s a busy box needs', () => {
     expect(usageFetchTimeoutMs({})).toBe(DEFAULT_USAGE_FETCH_TIMEOUT_MS);
-    expect(DEFAULT_USAGE_FETCH_TIMEOUT_MS).toBeGreaterThan(60000);
+    expect(DEFAULT_USAGE_FETCH_TIMEOUT_MS).toBeGreaterThanOrEqual(120000);
   });
-  it('honours a valid override and ignores junk', () => {
+
+  it('honours a valid USAGE_FETCH_TIMEOUT_MS override', () => {
     expect(usageFetchTimeoutMs({ USAGE_FETCH_TIMEOUT_MS: '90000' })).toBe(90000);
-    expect(usageFetchTimeoutMs({ USAGE_FETCH_TIMEOUT_MS: 'abc' })).toBe(DEFAULT_USAGE_FETCH_TIMEOUT_MS);
-    expect(usageFetchTimeoutMs({ USAGE_FETCH_TIMEOUT_MS: '5' })).toBe(DEFAULT_USAGE_FETCH_TIMEOUT_MS);
+    expect(usageFetchTimeoutMs({ USAGE_FETCH_TIMEOUT_MS: ' 240000 ' })).toBe(240000);
+  });
+
+  it('falls back to the default on junk, sub-second or fractional values', () => {
+    for (const bad of ['', 'abc', '90000ms', '5', '0', '-1', '1500.5']) {
+      expect(usageFetchTimeoutMs({ USAGE_FETCH_TIMEOUT_MS: bad })).toBe(DEFAULT_USAGE_FETCH_TIMEOUT_MS);
+    }
+  });
+
+  it('is what the /usage one-shot in index.js waits for, not a fixed literal', () => {
+    const index = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
+    const start = index.indexOf('function fetchUsageLimitsText(');
+    const fn = index.slice(start, index.indexOf('\n}\n', start));
+    expect(fn).toMatch(/\}, usageFetchTimeoutMs\(\)\);/);
+    expect(fn).not.toMatch(/\}, \d+\);/);
   });
 });

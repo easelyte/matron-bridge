@@ -8136,7 +8136,9 @@ function buildSavedMediaBlocks(session, { buffer, mime, dims, isImage, ivFilenam
 
 // Run `claude -p "/usage"` as a one-shot and return its stdout. stdin is
 // ignored (not a pipe) so Claude Code doesn't wait ~3s for stdin data. Rejects
-// on spawn error, non-zero exit, or a timeout (usageFetchTimeoutMs, 180s default). Used by the /limits command.
+// on spawn error, non-zero exit, or a timeout (usageFetchTimeoutMs: 180 s by
+// default, USAGE_FETCH_TIMEOUT_MS to change it). Used by the /limits command
+// and the status-frame refresh.
 function fetchUsageLimitsText(cwd) {
   return new Promise((resolve, reject) => {
     const proc = spawn('claude', ['-p', '/usage', '--output-format', 'text'], {
