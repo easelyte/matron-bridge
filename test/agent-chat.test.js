@@ -1692,7 +1692,7 @@ describe('index.js routes + ask-user.js tools (source inspection)', () => {
     expect(askFn).toMatch(/roomDelivery\.deliver\(session, session\.roomId, \{ roomId: frame\.room_id/);
     // …which the user's copy must not inherit (it lives in lib, pinned there,
     // alongside the wake notice the reaped-target path publishes).
-    expect(indexSrc).toMatch(/import \{ createAgentInvites, formatInviteRequestNotice, formatAutoJoinedRequest, INVITE_WAKE_NOTICE \} from '\.\/lib\/agent-invites\.js';/);
+    expect(indexSrc).toMatch(/import \{ createAgentInvites, formatInviteRequestNotice, formatAutoJoinedRequest, selectJoinBacklog, INVITE_WAKE_NOTICE \} from '\.\/lib\/agent-invites\.js';/);
   });
 
   it('joins an approved remote invite on delivery: accept AWAITED after the ack, guest binding joined only on the journal\'s answer, agent told it is in the room', () => {
@@ -1723,7 +1723,9 @@ describe('index.js routes + ask-user.js tools (source inspection)', () => {
     // The async helper: a rejected promise must not escape onInviteFrame's
     // synchronous try/catch as an unhandled rejection.
     expect(body).toMatch(/deliverAutoJoinedRequest\(session, frame, room, \{ addressed \}\)\s*\n?\s*\.catch\(/);
-    const hStart = indexSrc.indexOf('async function deliverAutoJoinedRequest(session, frame, room, { addressed }) {');
+    // The work happens in the held helper; the wrapper holds the room's live
+    // frames around it (lib/room-join-hold.js).
+    const hStart = indexSrc.indexOf('async function deliverAutoJoinedRequestHeld(session, frame, room, { addressed }) {');
     expect(hStart).toBeGreaterThan(-1);
     const helper = indexSrc.slice(hStart, indexSrc.indexOf('\nfunction ', hStart + 1));
     const answer = helper.indexOf("const res = await agentInvites.answerAwait({ roomId: frame.room_id, peerDeviceId: null, accept: true });");
@@ -1746,16 +1748,28 @@ describe('index.js routes + ask-user.js tools (source inspection)', () => {
     expect(notice).toBeGreaterThan(answer);
     // …and on a rejected accept the room stays pending and the agent gets
     // the old accept/refuse ask (its agent_chat_accept retries the answer).
-    const fallback = helper.indexOf('if (!joined) { deliverInviteAsk(session, frame, room); return; }');
+    const fallback = helper.indexOf('if (!joined) { deliverInviteAsk(session, frame, room); return null; }');
     expect(fallback).toBeGreaterThan(notice);
     expect(strip(helper)).not.toMatch(/setState\(frame\.room_id, '(expired|refused|left)'\)/);
     // Otherwise the agent's turn is the joined-room text with the room
     // backlog (the opening message was published before the guest joined,
     // so fan-out never reached it), never the accept/refuse instruction.
-    const fetch = helper.indexOf('journalPublisher.fetchMessages(frame.room_id, { limit: 20 })');
+    const fetch = helper.indexOf('journalPublisher.fetchMessages(frame.room_id, { limit: JOIN_BACKLOG_LIMIT })');
     expect(fetch).toBeGreaterThan(fallback);
     expect(helper).toMatch(/roomDelivery\.deliver\(session, session\.roomId, \{[^}]*body: formatAutoJoinedRequest\(frame, \{ events/);
     expect(helper).not.toMatch(/Accept with agent_chat_accept\(/);
+  });
+
+  it('holds a room\'s live frames while joining it, so the join turn goes first and the backlog is not sent twice', () => {
+    const start = indexSrc.indexOf('function journalOnRoomFrame(room, frame) {');
+    const outer = indexSrc.slice(start, indexSrc.indexOf('\nfunction ', start + 1));
+    expect(outer).toMatch(/for \(const it of roomJoinHold\.offer\(frame\.convo_id, \{ room, frame \}\)\) journalOnRoomFrameNow\(it\.room, it\.frame\);/);
+    const w = indexSrc.indexOf('async function deliverAutoJoinedRequest(session, frame, room, { addressed }) {');
+    const wrapper = indexSrc.slice(w, indexSrc.indexOf('\nasync function ', w + 1));
+    // Held before the accept is sent, released in a finally after the turn.
+    expect(wrapper.indexOf('roomJoinHold.hold(frame.room_id)')).toBeLessThan(wrapper.indexOf('await deliverAutoJoinedRequestHeld('));
+    expect(wrapper).toMatch(/\} finally \{\s*\n\s*for \(const it of roomJoinHold\.release\(frame\.room_id, shown\)\)/);
+    expect(indexSrc).toMatch(/import \{ createJoinHold \} from '\.\/lib\/room-join-hold\.js';/);
   });
 
   it('an inbound journal frame reconciles a pending REMOTE guest binding to joined (first-use membership proof)', () => {
@@ -1766,7 +1780,7 @@ describe('index.js routes + ask-user.js tools (source inspection)', () => {
     // frame reaching this bridge for a room where it is a pending guest is
     // itself proof the journal has it joined. Same-bridge rooms are excluded:
     // there this device is the owner and receives everything regardless.
-    const start = indexSrc.indexOf('function journalOnRoomFrame(room, frame) {');
+    const start = indexSrc.indexOf('function journalOnRoomFrameNow(room, frame) {');
     expect(start).toBeGreaterThan(-1);
     const body = indexSrc.slice(start, indexSrc.indexOf('\nfunction ', start + 1));
     const reconcile = body.indexOf('reconcilePendingGuestOnFrame(room, frame)');
@@ -2697,7 +2711,7 @@ describe('mute wiring (source inspection)', () => {
   }
 
   it('journalOnRoomFrame records a remote peer\'s announced mute from agent frames only', () => {
-    expect(fnBody('journalOnRoomFrame')).toMatch(/notePeerMuteFromFrame\(room, frame\)/);
+    expect(fnBody('journalOnRoomFrameNow')).toMatch(/notePeerMuteFromFrame\(room, frame\)/);
     const body = fnBody('notePeerMuteFromFrame');
     expect(body).toMatch(/startsWith\('agent:'\)/);
     expect(body).toMatch(/parseMuteAnnouncementDetail\(frame\.payload\?\.body\)/);

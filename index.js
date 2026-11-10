@@ -63,6 +63,8 @@ import { createRoutinesClient } from './lib/routines-client.js';
 import { createRoutineHandlers } from './lib/routines-tools.js';
 import { createBriefingsClient } from './lib/briefings-client.js';
 import { createBriefingHandlers } from './lib/briefings-tools.js';
+import { createTimelineClient } from './lib/timeline-client.js';
+import { createTimelineHandlers } from './lib/timeline-tools.js';
 import { createMemoryClient } from './lib/memory-client.js';
 import { createMemoryHandlers } from './lib/memory-tools.js';
 import { createMemoryLookup } from './lib/memory-lookup.js';
@@ -220,14 +222,16 @@ import { atomicWriteFileSync } from './lib/atomic-write.js';
 import { shouldAnnounceOnline, recordOnlineAnnounced } from './lib/announce-once.js';
 import { createInflightMarker } from './lib/inflight-marker.js';
 import { cancelQueuedItem, dispatchBusyQueueMagicWord, notifyQueuedMessage, resolveQueueReleaseTap } from './lib/busy-queue.js';
+import { DEFAULT_EDIT_HOLD_MS } from './lib/queue-edit-hold.js';
 import { handlePickerValue, isResumeConvoId } from './lib/picker-dispatch.js';
 import { createPermissionRegistry, renderPermissionCard, permissionInputRefusal, permissionButtons, permissionSpawnArgs, resolveBypassMode, resolvePermissionTimeoutMs, isRootOutsideSandbox, guardRootBypass, ROOT_BYPASS_WARNING, resolvePermissionRequest, resolvePermissionCheck, buildPrintSessionSettings, foreignGateEntry, listSessionGrants, revokeSessionGrant } from './lib/permission-prompt.js';
 import { createPlanApprovalItems } from './lib/plan-approval-items.js';
 import { createSlowToolNotices, renderSlowToolNotice, resolveSlowToolNoticeMs, resolveSlowToolReminderMs } from './lib/slow-tool-notice.js';
 import { createJournalInputConsumer, resolvePromptChoice, resolvePromptChoices } from './lib/journal-input-router.js';
 import { createAgentRooms, INVITE_TTL_MS } from './lib/agent-rooms.js';
-import { createAgentInvites, formatInviteRequestNotice, formatAutoJoinedRequest, INVITE_WAKE_NOTICE } from './lib/agent-invites.js';
+import { createAgentInvites, formatInviteRequestNotice, formatAutoJoinedRequest, selectJoinBacklog, INVITE_WAKE_NOTICE } from './lib/agent-invites.js';
 import { resolveInviteTarget } from './lib/invite-target.js';
+import { createJoinHold } from './lib/room-join-hold.js';
 import { createRoomDelivery, formatRoomMessageNotice, formatRoomDeliveredNotice, formatRoomDeliveryFailedNotice, roomEchoLabel, roomFrameDisposition, ROOM_MESSAGE_QUEUED_NOTICE, ROOM_MUTED_NOT_DELIVERED_NOTICE, ROOM_WAKE_NOTICE, parseMuteAnnouncementDetail, formatUserUnmuteAnnouncement } from './lib/room-delivery.js';
 import { parseProcessTable, liveWorkChildren, workHold, keepAwakeUntil, mcpServerSignatures, createTransferHold, WORK_HOLD_LEASE_MS } from './lib/work-hold.js';
 import { keepAwakeMode, powerHoldFlags, createPowerHold, POWER_HOLD_TICK_MS } from './lib/power-hold.js';
@@ -255,7 +259,7 @@ import {
   beginSteerHold, endSteerHold, steerPendingTurn, takeUnstartedSteers, takeFailedSteer, resetClaudeSteer, claudeSteerEnabled,
   STEER_NOTICE, STEER_PROMPT_SUPERSEDED_NOTICE,
 } from './lib/claude-steer.js';
-import { isCompactCommand, compactBatchSize, hasQueuedCompact } from './lib/compact-priority.js';
+import { isCompactCommand, compactBatchSize, hasQueuedCompact, batchDeferralReason } from './lib/compact-priority.js';
 import { attachPendingMediaMirror, pendingMediaMirror } from './lib/media-mirror.js';
 import { seedJournalTitle, applyFallbackTitle, parseTitlePassResponse, withSessionShort, titleMarkerFor, hintIsEarnedTitle, recordTitleEarned } from './lib/journal-title-seed.js';
 import { createSummaryModel, parseSummaryProviders } from './lib/summary-model.js';
@@ -914,6 +918,12 @@ const routinesClient = createRoutinesClient({
 // Coordinator briefings (spec: matron-journal 2026-10-04 latest briefing):
 // the briefing_publish tool's journal client.
 const briefingsClient = createBriefingsClient({
+  baseUrl: journalHttpBase,
+  token: _journalToken,
+});
+// The Projects timeline's weekly stories: the timeline_week_read /
+// timeline_week_write tools' journal client.
+const timelineClient = createTimelineClient({
   baseUrl: journalHttpBase,
   token: _journalToken,
 });
@@ -3673,6 +3683,9 @@ function flushPendingSessionQueue(session) {
   // (lib/compact-priority.js). batchSize is the whole queue in every other
   // case, so the non-compact path is byte-for-byte what it always was.
   const batchSize = compactBatchSize(queue);
+  // The front message is held for editing (lib/queue-edit-hold.js): nothing
+  // goes until the edit is saved or cancelled, or the hold expires.
+  if (batchSize === 0) return false;
   const queued = queue.slice(0, batchSize);
   const deferred = queue.slice(batchSize);
   // Snapshot before detaching: snapshotQueuedReleaseBatch reads the batch's
@@ -3690,6 +3703,7 @@ function flushPendingSessionQueue(session) {
   const notice = queueFlushNotice('turnEnd', {
     queued: queued.length,
     deferred: deferred.length,
+    deferredBy: batchDeferralReason(queued),
     summary: formatQueueSummary(queued),
   });
   if (session.sendHtml) {
@@ -10293,6 +10307,10 @@ async function journalRouteTextToSession(session, body, { keepRestartBudget = fa
         convoId: journalConvoIdFor(session),
         fullText: trimmed,
         compactJump,
+        // A typed message can be edited in place while it waits. Not a jumping
+        // /compact: it is a command, and holding it would hold the whole queue.
+        editMode: compactJump ? null : 'replace',
+        editHoldMs: QUEUE_EDIT_HOLD_MS,
         // Codex can't be handed a single queued message while a turn is live:
         // flushQueue interrupts and returns 'deferred', then the turn-end flush
         // sends the whole queue — so "send just this one" would silently mean
@@ -10600,6 +10618,12 @@ async function journalQueueMedia(session, { blocks, mirrorToJournal, preview, fu
       // Same capability gate as the text path above.
       allowSendOne: session.agent !== AGENT_CODEX,
       source,
+      // A tracker reply is edited by holding it, cancelling it (which
+      // withdraws the comment) and posting the edited reply as a new
+      // comment: the journal comment is the record, so the bridge can't
+      // rewrite it in place. Other media can't be edited.
+      editMode: source?.item_id && source?.comment_id ? 'resend' : null,
+      editHoldMs: QUEUE_EDIT_HOLD_MS,
     });
   } catch (e) {
     console.warn(`[journal-media] queued-tile notify failed (media is queued): ${e.message}`);
@@ -10852,6 +10876,52 @@ function journalOnMedia(session, media, ctx) {
   journalMediaRouter(session, media, ctx);
 }
 
+// How long a queued message stays held while the user edits it before it is
+// released with its original text (lib/queue-edit-hold.js).
+const QUEUE_EDIT_HOLD_MS = Number(process.env.MATRON_QUEUE_EDIT_HOLD_MS) || DEFAULT_EDIT_HOLD_MS;
+
+// An edit hold ended (saved, cancelled or expired). If the agent went idle
+// while the message was held, nothing else will flush the queue, so deliver
+// it now — exactly what the turn end would have done.
+function queueEditHoldReleased(session) {
+  // The same "genuinely free" test room delivery uses: an open TUI menu or a
+  // resume hold clears busy but must not have queued text typed into it.
+  if (!session?.alive || sessionOccupiedForRoomDelivery(session)) return;
+  if (sessions.get(session.roomId) !== session) return;
+  if (!session.queuedMessages?.length) return;
+  if (flushPendingSessionQueue(session) !== true) maybeFlushRoomDelivery(session);
+}
+
+// A hold nobody released (the app closed mid-edit). The entry may have moved
+// to a replacement session since the hold began, so find whoever queues it now.
+function queueEditHoldExpired(blocks) {
+  for (const session of sessions.values()) {
+    if (!session.queuedMessages?.includes(blocks)) continue;
+    const minutes = Math.max(1, Math.round(QUEUE_EDIT_HOLD_MS / 60000));
+    journalPublishNotice(journalConvoIdFor(session),
+      `✎ A queued message was held for editing for ${minutes} minute${minutes === 1 ? '' : 's'} without being saved, so it goes with its original text.`);
+    queueEditHoldReleased(session);
+    return;
+  }
+}
+
+// The card for a queued message whose edit was just saved: same slot, new text.
+function postEditedQueueCard(session, { index, text }) {
+  const ctx = journalSessionCommandCtx(session);
+  const preview = text.length > 40 ? text.slice(0, 37) + '…' : text;
+  return notifyQueuedMessage(session, preview, {
+    sendReply: ctx.sendReply,
+    htmlEscape: escapeHtml,
+    queueRelease: journalInputConsumer.queueRelease,
+    convoId: journalConvoIdFor(session),
+    fullText: text,
+    allowSendOne: session.agent !== AGENT_CODEX,
+    editMode: 'replace',
+    editHoldMs: QUEUE_EDIT_HOLD_MS,
+    insertAt: index,
+  });
+}
+
 // Adapts journalRoutePromptReply to the router's routePromptReply(session,
 // {target_seq, choice, text}, {username}) interface.
 function journalOnPromptReply(session, answer, { username, seq, convoId: replyConvoId }) {
@@ -10888,6 +10958,13 @@ function journalOnPromptReply(session, answer, { username, seq, convoId: replyCo
       // un-actioned.
       notify: (message) => journalPublishNotice(convoId, message),
       formatQueueSummary,
+      // Edit on a queued card (lib/queue-edit-hold.js): the saved text
+      // arrives as the reply's own text.
+      text: answer?.text ?? null,
+      editHoldMs: QUEUE_EDIT_HOLD_MS,
+      onHoldExpired: queueEditHoldExpired,
+      onHoldReleased: queueEditHoldReleased,
+      postEditedCard: postEditedQueueCard,
     });
     return;
   }
@@ -12210,6 +12287,8 @@ function flushRoomInbox(session) {
 // turn at the turn-end seams (finishCodexTurn, iv onTurnEnd, print-mode
 // `case 'result'`). skipJournalMirror: the message already lives in the
 // room convo — mirroring it into the session convo would duplicate it.
+// Live room frames held while the bridge joins a room for the agent.
+const roomJoinHold = createJoinHold();
 const roomDelivery = createRoomDelivery({
   isBusy: (session, { foreign = false } = {}) => (foreign
     ? sessionOccupiedForForeignTurn(session)
@@ -12443,6 +12522,12 @@ function journalOnPeerMessage(frame) {
 // device's own echoes, dropped upstream, and delivered locally instead by
 // routeLocalRoomMessage).
 function journalOnRoomFrame(room, frame) {
+  // Held while the bridge is still joining this room (lib/room-join-hold.js):
+  // the join turn goes first, and what its backlog showed is not sent twice.
+  for (const it of roomJoinHold.offer(frame.convo_id, { room, frame })) journalOnRoomFrameNow(it.room, it.frame);
+}
+
+function journalOnRoomFrameNow(room, frame) {
   reconcilePendingGuestOnFrame(room, frame);
   notePeerMuteFromFrame(room, frame);
   deliverRoomFrameTo(room, frame);
@@ -13040,42 +13125,68 @@ function deliverInviteAsk(session, frame, room) {
 // coalescing, resume-hold flush), just a round-trip or two later. The
 // user's notice is published between the two, once the outcome is known,
 // so it sits above the agent's turn as for any request.
+// How much of the room the join turn reads.
+const JOIN_BACKLOG_LIMIT = 20;
+
 async function deliverAutoJoinedRequest(session, frame, room, { addressed }) {
+  // Fork: count the join as in-flight input so a planned restart waits for it.
   const finishInput = restartLatch?.beginInput();
+  // The other side may write as soon as the accept lands; hold the room's
+  // live frames until the join turn below has been handed over.
+  roomJoinHold.hold(frame.room_id);
+  let shown = null;
   try {
-    const res = await agentInvites.answerAwait({ roomId: frame.room_id, peerDeviceId: null, accept: true });
-    let joined = res.kind === 'answered';
-    let backlog = null;
-    // A conflict can mean the row is ALREADY joined: the guest binding is
-    // persisted 'pending' before the accept is sent and flips only on the
-    // answer, so a restart in that gap leaves the journal row joined with
-    // nothing to retry the local flip — and a peer re-inviting into the same
-    // room lands here again. The journal's detail is 'no pending invite' for
-    // every non-invited state, so a membership probe (one transcript read the
-    // journal 404s for a non-member) decides; a positive also serves as the
-    // backlog below.
-    if (!joined && res.code === 'conflict') {
-      const probe = await probeJoinedRoom(journalPublisher, frame.room_id);
-      if (probe.joined) { joined = true; backlog = probe.events; }
+    shown = await deliverAutoJoinedRequestHeld(session, frame, room, { addressed });
+  } finally {
+    for (const it of roomJoinHold.release(frame.room_id, shown)) {
+      // The binding as it is now (joined), not as it was when the frame came.
+      // One frame failing must not drop the ones after it.
+      try { journalOnRoomFrameNow(agentRooms.get(frame.room_id) || it.room, it.frame); } catch (e) {
+        try { console.warn(`[agent-invites] held frame for ${frame.room_id} failed: ${e?.message ?? e}`); } catch { /* logging must never throw */ }
+      }
     }
-    if (joined) {
-      agentRooms.setState(frame.room_id, 'joined');
-    } else {
-      console.warn(`[agent-invites] accept on delivery for ${frame.room_id} did not take (${res.code || res.kind}); room stays pending, asking the agent instead`);
-    }
-    publishInviteRequestNotice(session, frame, room, { addressed, joined });
-    if (!joined) { deliverInviteAsk(session, frame, room); return; }
-    if (!backlog) {
-      const page = await journalPublisher.fetchMessages(frame.room_id, { limit: 20 }).catch(() => null);
-      backlog = page ? page.events : null;
-    }
-    // A room with another person: the justification and the backlog are their
-    // agent's words, so the turn that reads them is a foreign one, with the
-    // room's context read first.
-    const person = typeof frame.person?.name === 'string' && frame.person.name ? frame.person.name : null;
-    if (person) await foreignSessions.refreshContext(frame.room_id).catch(() => null);
-    roomDelivery.deliver(session, session.roomId, { roomId: frame.room_id, roomTitle: room?.title || frame.topic || null, from: 'bridge', body: formatAutoJoinedRequest(frame, { events: backlog }), at: Date.now(), tier: TURN_TIER.PEER_COALESCED, ...(person ? { foreign: { person } } : {}) });
-  } finally { finishInput?.(); }
+    finishInput?.();
+  }
+}
+
+// Returns the backlog events the join turn showed, or null.
+async function deliverAutoJoinedRequestHeld(session, frame, room, { addressed }) {
+  const res = await agentInvites.answerAwait({ roomId: frame.room_id, peerDeviceId: null, accept: true });
+  let joined = res.kind === 'answered';
+  let backlog = null;
+  // A conflict can mean the row is ALREADY joined: the guest binding is
+  // persisted 'pending' before the accept is sent and flips only on the
+  // answer, so a restart in that gap leaves the journal row joined with
+  // nothing to retry the local flip — and a peer re-inviting into the same
+  // room lands here again. The journal's detail is 'no pending invite' for
+  // every non-invited state, so a membership probe (one transcript read the
+  // journal 404s for a non-member) decides; a positive also serves as the
+  // backlog below.
+  if (!joined && res.code === 'conflict') {
+    const probe = await probeJoinedRoom(journalPublisher, frame.room_id);
+    if (probe.joined) { joined = true; backlog = probe.events; }
+  }
+  if (joined) {
+    agentRooms.setState(frame.room_id, 'joined');
+  } else {
+    console.warn(`[agent-invites] accept on delivery for ${frame.room_id} did not take (${res.code || res.kind}); room stays pending, asking the agent instead`);
+  }
+  publishInviteRequestNotice(session, frame, room, { addressed, joined });
+  if (!joined) { deliverInviteAsk(session, frame, room); return null; }
+  if (!backlog) {
+    const page = await journalPublisher.fetchMessages(frame.room_id, { limit: JOIN_BACKLOG_LIMIT }).catch(() => null);
+    backlog = page ? page.events : null;
+  }
+  const more = Array.isArray(backlog) && backlog.length >= JOIN_BACKLOG_LIMIT;
+  // A room with another person: the justification and the backlog are their
+  // agent's words, so the turn that reads them is a foreign one, with the
+  // room's context read first.
+  const person = typeof frame.person?.name === 'string' && frame.person.name ? frame.person.name : null;
+  if (person) await foreignSessions.refreshContext(frame.room_id).catch(() => null);
+  roomDelivery.deliver(session, session.roomId, { roomId: frame.room_id, roomTitle: room?.title || frame.topic || null, from: 'bridge', body: formatAutoJoinedRequest(frame, { events: backlog, more }), at: Date.now(), ...(person ? { foreign: { person } } : {}) });
+  // Only what the turn showed: a held message the budget left out still
+  // comes live.
+  return Array.isArray(backlog) ? selectJoinBacklog(backlog).shown : null;
 }
 
 // Room-lifecycle FYI (late answers, peer left) surfaced to the bound session
@@ -14006,6 +14117,16 @@ const briefingHandlers = createBriefingHandlers({
   sessions,
   journalConvoIdFor,
   client: briefingsClient,
+  isCoordinator: (session, convoId) => session?.coordinator === true || (!!convoId && coordinatorLookup.snapshot().convoId === convoId),
+});
+
+// The timeline_week_read / timeline_week_write tool routes
+// (lib/timeline-tools.js), mounted below; same Coordinator test as the
+// briefing tool.
+const timelineHandlers = createTimelineHandlers({
+  sessions,
+  journalConvoIdFor,
+  client: timelineClient,
   isCoordinator: (session, convoId) => session?.coordinator === true || (!!convoId && coordinatorLookup.snapshot().convoId === convoId),
 });
 
@@ -15037,6 +15158,16 @@ const apiServer = createServer(async (req, res) => {
         return;
       }
 
+      // The timeline_week_read / timeline_week_write tool routes; same
+      // one-matcher allowlist shape. Story text is plain: no link check.
+      const timelineRoute = url.pathname.match(/^\/timeline\/(read|write)$/);
+      if (timelineRoute) {
+        const name = timelineRoute[1];
+        await respondAgentChatRoute(res, data, timelineHandlers[name],
+          (status, b) => debug(`timeline/${name} ${status} ${b.error || (b.week && typeof b.week === 'object' ? b.week.week : b.week || 'ok')}`));
+        return;
+      }
+
       // The contact_* / mission_share tool routes; same one-matcher
       // allowlist shape.
       const sharingRoute = url.pathname.match(/^\/sharing\/(contact_list|contact_add|contact_remove|contact_block|share|unshare|shares|shared_list|shared_get|shared_post|shared_status|shared_item_create|shared_item_comment|shared_item_close|shared_item_reopen)$/);
@@ -15215,6 +15346,7 @@ const apiServer = createServer(async (req, res) => {
           const notice = queueFlushNotice('sendNow', {
             queued: queued.length,
             deferred: deferred.length,
+            deferredBy: batchDeferralReason(queued),
             summary: formatQueueSummary(queued),
           });
           if (session.sendHtml) {
@@ -15290,6 +15422,9 @@ const apiServer = createServer(async (req, res) => {
             : `✕ Cancelled queued message (${remaining} remaining)`;
           session.sendCallback(msg);
         }
+        // The cancelled message may have been held for editing, blocking
+        // the rest while the agent sat idle.
+        if (remaining > 0) queueEditHoldReleased(session);
         res.writeHead(200);
         res.end(JSON.stringify({ ok: true, remaining }));
 

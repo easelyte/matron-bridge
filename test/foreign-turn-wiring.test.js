@@ -81,7 +81,7 @@ describe('index.js wiring', () => {
   });
 
   it('the auto-join turn and the fallback ask of a person room are foreign too', () => {
-    expect(fnBody(index, 'async function deliverAutoJoinedRequest(')).toMatch(/\.\.\.\(person \? \{ foreign: \{ person \} \} : \{\}\)/);
+    expect(fnBody(index, 'async function deliverAutoJoinedRequestHeld(')).toMatch(/\.\.\.\(person \? \{ foreign: \{ person \} \} : \{\}\)/);
     expect(fnBody(index, 'function deliverInviteAsk(')).toMatch(/\.\.\.\(person \? \{ foreign: \{ person \} \} : \{\}\)/);
     expect(fnBody(index, 'function journalInjectInviteRequest(')).toMatch(/frame\.person && session\.codex/);
   });

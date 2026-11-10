@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, afterEach } from 'vitest';
-import { createAgentInvites, formatInviteRequestNotice, formatAutoJoinedRequest } from '../lib/agent-invites.js';
+import { createAgentInvites, formatInviteRequestNotice, formatAutoJoinedRequest, selectJoinBacklog } from '../lib/agent-invites.js';
 import { createAgentRooms } from '../lib/agent-rooms.js';
 
 // Awaited stages inside invite()/join() resume on microtasks; drain a few
@@ -911,5 +911,56 @@ describe('formatAutoJoinedRequest', () => {
   it('never throws on a junk frame', () => {
     expect(() => formatAutoJoinedRequest(null)).not.toThrow();
     expect(() => formatAutoJoinedRequest({ room_id: 5, from_name: {}, topic: [] }, { events: 'nope' })).not.toThrow();
+  });
+});
+
+describe('formatAutoJoinedRequest backlog size', () => {
+  const request = { event: 'request', room_id: 'room-1', from_name: 'box-2', person: { name: 'bob@b.example' } };
+  const text = (body, seq = 1) => ({ type: 'text', sender: 'person:bob@b.example', seq, payload: { body } });
+
+  it('shows a long opening message whole, as a live message would be', () => {
+    // A brief of numbered items, well over the old 2,000-character cut.
+    const brief = Array.from({ length: 14 }, (_, i) => `${i + 1}. ${'item detail '.repeat(40)}`).join('\n');
+    expect(brief.length).toBeGreaterThan(6000);
+    const out = formatAutoJoinedRequest(request, { events: [text(brief)] });
+    expect(out).toContain('14. item detail');
+    expect(out).not.toContain('[cut here');
+  });
+
+  it('says where a cut message can be read whole', () => {
+    const out = formatAutoJoinedRequest(request, { events: [text('x'.repeat(20000))] });
+    expect(out).toContain('[cut here — agent_chat_read shows the whole message]');
+    expect(out).not.toContain('x'.repeat(16000));
+  });
+
+  it('keeps the newest messages within the budget and names the ones left out', () => {
+    const events = [text('a'.repeat(15000), 1), text('b'.repeat(15000), 2), text('c'.repeat(15000), 3), text('newest', 4)];
+    const out = formatAutoJoinedRequest(request, { events });
+    expect(out).toContain('(1 earlier message left out — agent_chat_read("room-1") shows it)');
+    expect(out).not.toContain('aaaa');
+    expect(out).toContain('bbbb');
+    expect(out).toContain('newest');
+  });
+});
+
+describe('selectJoinBacklog', () => {
+  const text = (body, seq) => ({ type: 'text', sender: 'agent:mac', seq, payload: { body } });
+
+  it('returns exactly the events the join turn shows, so only those count as delivered', () => {
+    const events = [text('a'.repeat(15000), 1), text('b'.repeat(15000), 2), text('c'.repeat(15000), 3), { type: 'noise', seq: 4 }, text('d', 5)];
+    const { shown, left } = selectJoinBacklog(events);
+    expect(shown.map((e) => e.seq)).toEqual([2, 3, 5]);
+    expect(left).toBe(1);
+  });
+
+  it('copes with a backlog that could not be read', () => {
+    expect(selectJoinBacklog(null)).toEqual({ shown: [], lines: [], left: 0 });
+  });
+
+  it('a full read of the room says there may be earlier messages', () => {
+    const request = { event: 'request', room_id: 'room-1', from_name: 'box-2' };
+    expect(formatAutoJoinedRequest(request, { events: [text('hi', 1)], more: true }))
+      .toContain('(there may be earlier messages — agent_chat_read("room-1") shows the whole room)');
+    expect(formatAutoJoinedRequest(request, { events: [text('hi', 1)] })).not.toContain('there may be earlier');
   });
 });

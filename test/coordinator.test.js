@@ -195,7 +195,7 @@ describe('playbook directory (spec 2026-10-01 coordinator routines)', () => {
       expect(heads.some((h) => h === `## Procedure: ${want}`), want).toBe(true);
     }
     const routines = files('routines/');
-    expect(routines).toEqual(['briefing.md', 'context-over.md', 'daily-sweep.md', 'deploy-window.md', 'disk-low.md', 'project-status.md', 'session-health.md', 'spare-allowance.md', 'stalled-session.md', 'unseen-digest.md']);
+    expect(routines).toEqual(['briefing.md', 'context-over.md', 'daily-sweep.md', 'deploy-window.md', 'disk-low.md', 'project-status.md', 'session-health.md', 'spare-allowance.md', 'stalled-session.md', 'unseen-digest.md', 'weekly-stories.md']);
     for (const n of routines) {
       const text = readFileSync(new URL(`routines/${n}`, root), 'utf8');
       expect(text.split('\n')[0]).toMatch(new RegExp(`^## Routine: ${n.replace(/\.md$/, '')} — `));
