@@ -166,7 +166,29 @@ describe('projects wiring', () => {
     expect(slice('project_merge')).toMatch(/into: z\.number\(\)\.int\(\)\.min\(1\)/);
     expect(slice('project_status', 'project_close')).toMatch(/status: z\.string\(\)/);
     expect(slice('project_list', 'project_get')).toMatch(/state: z\.enum\(\['open', 'closed'\]\)\.optional\(\)/);
+    const list = slice('project_list', 'project_get');
+    expect(list).toMatch(/live: z\.boolean\(\)\.optional\(\)/);
+    expect(list).toMatch(/brief: z\.boolean\(\)\.optional\(\)/);
+    expect(list).toMatch(/offset: z\.number\(\)\.int\(\)\.min\(0\)\.optional\(\)/);
+    expect(list).toMatch(/limit: z\.number\(\)\.int\(\)\.min\(1\)\.max\(200\)\.optional\(\)/);
+    expect(list).toContain('Long lists are paged: pass \\`live: true, brief: true\\` to see just the goals with open work.');
+    expect(list).toContain('the last line says how many and names the next call in full, with the same filters and the offset to pass');
+    expect(list).toContain("live is for open projects only: it is refused with state: 'closed'.");
+    const merge = slice('project_merge');
+    expect(merge).toContain('for near-duplicate projects, and for folding a project that holds a single mission into the goal it serves');
+    expect(merge).toContain('briefly, in a few lines, not merge by merge');
+    expect(merge).not.toContain('report each merge');
+    const update = askUser.slice(askUser.indexOf("server.tool(\n  'mission_update',"), askUser.indexOf("project: z.number", askUser.indexOf("server.tool(\n  'mission_update',")));
+    expect(update).toContain('e.g. the Coordinator filing a mission into the goal it serves.');
+    expect(askUser).not.toContain('a filing the user approved');
     expect(askUser).toMatch(/const PROJECT_WHAT = .*nothing to do with ~\/\.claude\/projects/);
+    expect(askUser).toMatch(/const PROJECT_WHAT = .*one goal with an end.*never a broad category/);
+    for (const [from, to] of [['mission_start', 'mission_create'], ['mission_create', 'mission_update']]) {
+      const tool = askUser.slice(askUser.indexOf(`server.tool(\n  '${from}',`), askUser.indexOf(`server.tool(\n  '${to}',`));
+      expect(tool, from).toContain('live: true, brief: true');
+      expect(tool, from).toContain('the goal');
+      expect(tool, from).toContain('a project of its own with the same name');
+    }
     expect(slice('project_list', 'project_get')).toContain('${PROJECT_WHAT}');
     expect(slice('project_create', 'project_update')).toContain('${PROJECT_WHAT}');
     expect(askUser).not.toMatch(/(?<!\w)convo_id:\s*z\./);
@@ -184,12 +206,15 @@ describe('projects wiring', () => {
     });
     const DEFINITION = 'A Project is the user\'s tracker object that groups related missions — not a working directory, and nothing to do with `~/.claude/projects`.';
 
-    it('both session prompts define a Project once and teach filing with project_list first', () => {
+    it('both session prompts define a Project once, as a goal, and teach filing with project_list first', () => {
       for (const [name, md] of [['BRIDGE_CLAUDE.md', claudeMd], ['BRIDGE_CODEX.md', codexMd]]) {
         const section = md.slice(md.indexOf('## Missions & milestones'));
         expect(section, name).toContain(DEFINITION);
         expect(section.split(DEFINITION).length - 1, name).toBe(1);
-        expect(section, name).toContain('When you start a mission, run `project_list` and file it into the project it belongs to');
+        expect(section, name).toContain('A project is one goal with an end ("Promo launch"), holding the missions that serve it.');
+        expect(section, name).toContain('When you start a mission, run `project_list` with `live: true, brief: true` and file the mission into the goal it serves');
+        expect(section, name).toContain('Leave `project` out only when the work serves none of them');
+        expect(section, name).toContain('Never create or pick a broad category project.');
         expect(section, name).toContain('the mission gets a project of its own with the same name');
         expect(section, name).toContain('it can never be taken out of one');
       }
@@ -215,19 +240,50 @@ describe('projects wiring', () => {
       expect(section).toContain('409 `not_linked`');
       expect(section).toContain('`{"project":"#P"}`');
       expect(section).toContain('`GET $BASE/projects?state=open`');
+      expect(section).toContain('every project in one reply: the route has no paging and no `live` or `brief` filter');
       expect(section).toContain('`POST $BASE/projects` `{"title":"...","body":"...","convo_id":"<id>"}`');
       expect(section).toContain('`PATCH $BASE/projects/:num`');
     });
 
-    it('the Coordinator brief: definition, project sweep, merges reported, ONE filing question, never without the answer', () => {
+    it('the Coordinator brief: projects are goals, filed without asking, never private work, closes still asked', () => {
       expect(coord).toContain('## Procedure: file projects');
       expect(coord).toContain(DEFINITION);
-      expect(coord).toContain('After the missions, refresh the projects: `project_list`, then for each open project `project_get N` and `project_status` with `num: N`');
-      expect(coord).toContain('`project_merge` with `num` the one to fold away and `into` the one to keep');
-      expect(coord).toContain('Report each merge in your reply: `Merged #A title into #B title — why`.');
-      expect(coord).toContain('Then file ONE question (`item_create`, `kind: "question"`) proposing which one-mission projects (a mission in a project of its own, made because none was named) belong in a bigger project, and which quiet missions to close.');
-      expect(coord).toContain('Never move a mission between projects, fold a one-mission project into another, or close a mission without the user\'s answer.');
-      expect(coord).toContain('`project_merge` to fold a one-mission project into the bigger one (or `mission_update` with `mission: N` and `project: P` to move one mission)');
+      const filing = coord.slice(coord.indexOf('## Procedure: file projects'), coord.indexOf('## Procedure: infrastructure alert'));
+      expect(filing).toContain('A project is one goal with an end, not a category');
+      expect(filing).toContain('you do it without asking');
+      expect(filing).toContain('`project_list` with `live: true, brief: true`');
+      expect(filing).toContain('`mission_update` with `mission: N` and `project: P`');
+      expect(filing).toContain('`project_merge` with `num` the one to fold away and `into` the one to keep');
+      expect(filing).toContain('`project_merge` (`num` the one-mission project, `into` the goal)');
+      expect(filing).toContain('`project_create`');
+      expect(filing).toContain('Read every page of `project_list` with `live: true, brief: true` before you move anything');
+      expect(filing).toContain('make exactly the call it names');
+      expect(filing).toContain('A one-mission project holds ONE mission in all, open and closed.');
+      expect(filing).toContain('First confirm with `project_get` that the project you are folding away holds a single mission');
+      expect(filing).toContain('is already a goal: it stays');
+      expect(filing).toContain('about 40 moves a turn');
+      expect(filing).toContain('Start every new pass again from `offset: 0`, never from an offset you saved');
+      expect(filing).toContain('until a full read shows nothing left to file');
+      expect(filing).toContain('a pass in which you move nothing ends the work');
+      expect(filing).not.toContain('the `offset` to carry on from');
+      expect(filing).toContain('Never move private work');
+      expect(filing).toContain('a refusal is final: skip it');
+      expect(filing).toContain('Never file into a broad category project');
+      expect(filing).toContain('`project_status`');
+      expect(filing).toContain('Do not close projects in bulk.');
+      expect(filing).toContain('"Folded 12 small projects into Promo launch"');
+      expect(filing).toContain("Close missions as the Close missions procedure says: one whose work is plainly finished and whose session is gone you close yourself; any other close needs the user's answer.");
+      expect(filing).not.toContain('Closing a mission still needs');
+      const closing = coord.slice(coord.indexOf('## Procedure: close missions'), coord.indexOf('## Procedure: refresh'));
+      expect(closing).toContain('propose it instead in the one question of missions to close that the File projects procedure files');
+      expect(coord).not.toContain('the Projects question');
+      // The filing question is gone: only closes are asked about.
+      expect(coord).not.toContain('Never move a mission between projects');
+      expect(coord).not.toMatch(/without the user's answer\. When they answer, apply exactly what they approved: `project_create`/);
+      expect(coord).not.toContain('proposing which one-mission projects');
+      expect(coord).not.toContain('filing question');
+      expect(coord).toContain('After the missions, refresh the projects: `project_list` (every page: while the last line says `n more`, make the call it names), then for each open project `project_get N` and `project_status` with `num: N`');
+      expect(coord).toMatch(/file one-mission projects into the goals they serve, as the File projects procedure says/);
       expect(coord).toMatch(/`project_list` for every open project/);
     });
   });

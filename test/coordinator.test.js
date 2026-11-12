@@ -180,8 +180,10 @@ describe('coordinator block file', () => {
     expect(block).toMatch(/Never call `mission_start` or `mission_join` for this conversation/);
   });
 
-  it('the fallback brief also forbids filing or closing missions without the user', () => {
-    expect(FALLBACK_COORDINATOR_BLOCK).toContain('Never move missions between projects, close them, or close a project without the user\'s answer.');
+  it('the fallback brief closes a project only with the user, and a mission alone only when plainly finished', () => {
+    expect(FALLBACK_COORDINATOR_BLOCK).toContain("Never close a project without the user's answer, and close a mission yourself only when its work is plainly finished and its session is gone; any other close needs the user's answer.");
+    expect(FALLBACK_COORDINATOR_BLOCK).not.toContain('Never close a mission or a project');
+    expect(FALLBACK_COORDINATOR_BLOCK).not.toMatch(/move missions between projects/);
   });
 });
 

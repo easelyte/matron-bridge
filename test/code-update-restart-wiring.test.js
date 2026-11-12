@@ -289,8 +289,8 @@ describe('code-update self-restart wiring', () => {
 
   it('carryOnConvo still delivers the literal "carry on" for a tap, and the marked text for the automatic path', () => {
     const fnCarry = index.slice(index.indexOf('async function carryOnConvo('), index.indexOf('async function carryOnConvo(') + 2400);
-    expect(fnCarry).toMatch(/async function carryOnConvo\(convoId, session, _sendReply, text = 'carry on', resumeNotice = undefined\)/);
-    expect(fnCarry).toMatch(/await journalRouteTextToSession\(target, text\);/);
+    expect(fnCarry).toMatch(/async function carryOnConvo\(convoId, session, _sendReply, text = 'carry on', resumeNotice = undefined, \{ causes = null, keepRestartBudget = false \} = \{\}\)/);
+    expect(fnCarry).toMatch(/await journalRouteTextToSession\(target, text, \{ causes, keepRestartBudget \}\);/);
     expect(fnCarry).toMatch(/journalResumeConvo\(convoId, resumeNotice\)/);
   });
 });

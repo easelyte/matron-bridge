@@ -1837,6 +1837,7 @@ describe('index.js queued-send finalizer', () => {
     expect(harness.dropItem).not.toHaveBeenCalled();
     expect(harness.journalPublishNotice).toHaveBeenCalledTimes(1);
     expect(harness.journalPublishNotice.mock.calls[0][1]).toMatch(/2 queued messages/);
+    expect(harness.journalPublishNotice.mock.calls[0][2]).toBeUndefined();
     // Each dropped entry gets its saved-media cleanup run — the batch is never
     // dispatched, so nothing else will unlink an orphaned upload file.
     expect(harness.runQueuedCleanup).toHaveBeenCalledTimes(2);

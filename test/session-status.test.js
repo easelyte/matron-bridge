@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { readFileSync, readdirSync } from 'fs';
 import { join, basename } from 'path';
 import { fileURLToPath } from 'url';
+import { effectiveExtras } from '../lib/mcp-config.js';
 import {
   sessionContextWindow,
   contextWindowFor,
@@ -14,7 +15,6 @@ import {
   compactTriggerFrom,
   contextGaugeText,
   buildSessionStatus,
-  publishedExtras,
   emailFromClaudeConfig,
   statusRepaintDue,
   STATUS_REPAINT_MS,
@@ -270,23 +270,6 @@ describe('contextGaugeText', () => {
     expect(contextGaugeText(null, 'claude-opus-4-8')).toBeNull();
     expect(contextGaugeText(0, 'claude-opus-4-8')).toBeNull();
     expect(contextGaugeText(undefined, 'claude-fable-5')).toBeNull();
-  });
-});
-
-describe('publishedExtras', () => {
-  const known = ['browser', 'share', 'circleci'];
-  it('unions the session choice with machine defaults, session first, deduped', () => {
-    expect(publishedExtras({ requested: ['browser'], defaults: ['share', 'browser'], known })).toEqual(['browser', 'share']);
-  });
-  it('drops a persisted name whose mcpExtras block no longer exists (spawn filters it too)', () => {
-    expect(publishedExtras({ requested: ['gone', 'browser'], defaults: [], known })).toEqual(['browser']);
-  });
-  it('is [] for a session without extras, and for a non-array requested', () => {
-    expect(publishedExtras({ requested: [], known })).toEqual([]);
-    expect(publishedExtras({ requested: undefined, known })).toEqual([]);
-  });
-  it('is [] when the transport spawns with no MCP config (legacy Codex exec)', () => {
-    expect(publishedExtras({ requested: ['browser'], defaults: ['share'], known, noMcp: true })).toEqual([]);
   });
 });
 
@@ -664,12 +647,35 @@ describe('index.js wiring', () => {
     expect(body).toContain('publishStatus(');
   });
 
-  it('journalStatus publishes extras through publishedExtras with the spawn inputs', () => {
+  it('journalStatus publishes extras from effectiveExtras (legacy Codex exec has none)', () => {
     const start = src.indexOf('function journalStatus(');
     const body = src.slice(start, src.indexOf('\nfunction ', start + 1));
-    expect(body).toMatch(/extras: publishedExtras\(\{\s*requested: session\.mcpExtras,\s*defaults: DEFAULT_MCP_EXTRAS,\s*known: KNOWN_MCP_EXTRAS,\s*noMcp: isCodex && !CODEX_APP_SERVER,/);
-    // ...and legacy exec really gets no MCP config, which is why noMcp.
+    expect(body).toContain('extras: isCodex && !CODEX_APP_SERVER ? [] : effectiveExtras(session.mcpExtras ?? [], DEFAULT_MCP_EXTRAS).filter(');
+    // ...and legacy exec really gets no MCP config, which is why [].
     expect(src).toContain('config: CODEX_APP_SERVER ? codexMcpConfig({');
+  });
+
+  it.each([
+    ['Claude', false, true],
+    ['Codex app-server', true, true],
+    ['Codex exec', true, false],
+  ])('journalStatus reports only active extras after share setup for %s', (_label, isCodex, appServer) => {
+    const start = src.indexOf('function journalStatus(');
+    const body = src.slice(start, src.indexOf('\nfunction ', start + 1));
+    // Evaluate the actual status argument without starting the bridge.
+    const expression = body.match(/^ {4}extras: (.+),$/m)[1];
+    const extrasFor = new Function('session', 'isCodex', 'CODEX_APP_SERVER', 'effectiveExtras', 'DEFAULT_MCP_EXTRAS', `return ${expression};`);
+    const statusFor = (session, defaults = []) => buildSessionStatus({
+      extras: extrasFor(session, isCodex, appServer, effectiveExtras, defaults),
+    });
+    const legacyExec = isCodex && !appServer;
+    // Pin-roots failure leaves no token, even though share was requested.
+    const session = { mcpExtras: ['browser', 'share'] };
+    expect(statusFor(session).extras).toEqual(legacyExec ? [] : ['browser']);
+    expect(statusFor({ mcpExtras: ['share'] }).extras).toEqual([]);
+    expect(statusFor({ mcpExtras: ['browser'] }, ['share']).extras).toEqual(legacyExec ? [] : ['browser']);
+    expect(statusFor({ ...session, showFileToken: 'share-token' }).extras).toEqual(legacyExec ? [] : ['browser', 'share']);
+    expect(session.mcpExtras).toEqual(['browser', 'share']);
   });
 
   it('journalStatus uses provider-specific model and effort options', () => {

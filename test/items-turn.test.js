@@ -130,7 +130,7 @@ describe('agent comments', () => {
   };
 
   it('words the head as another agent session, never the user, and skips tapped-label logic', () => {
-    const t = formatItemTurn(marker, { username: 'Worker B', viewerConvoId: 'c-a' });
+    const t = formatItemTurn(marker, { username: 'Worker B', convoId: 'c-a' });
     const lines = t.split('\n');
     expect(lines[0]).toBe(`📌 Item #${base.num} "Which auth library?" — session "Worker B" (another agent session, not the user) commented:`);
     expect(lines[1]).toBe('found a bug');
@@ -140,7 +140,7 @@ describe('agent comments', () => {
   });
 
   it('falls back to another session when unlabelled', () => {
-    const t = formatItemTurn({ ...marker, from_label: undefined }, { viewerConvoId: 'c-a' });
+    const t = formatItemTurn({ ...marker, from_label: undefined }, { convoId: 'c-a' });
     expect(t).toContain('session "another session" (another agent session, not the user) commented:');
   });
 
@@ -153,6 +153,8 @@ describe('agent comments', () => {
     expect(isAgentCommentMarker({ ...marker, agent_comment: undefined }, 'c-a')).toBe(false);
     expect(isAgentCommentMarker({ ...marker, action: 'closed' }, 'c-a')).toBe(false);
     expect(isAgentCommentMarker({ ...marker, from_convo_id: '' }, 'c-a')).toBe(false);
+    // A private commenter is flagged without naming its conversation.
+    expect(isAgentCommentMarker({ ...marker, from_convo_id: undefined, from_label: undefined }, 'c-a')).toBe(true);
     expect(isAgentCommentMarker(null, 'c-a')).toBe(false);
   });
 });

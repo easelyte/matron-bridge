@@ -75,3 +75,15 @@ describe('unseenNoticeMeta / roomNoticeMeta / controlNoticeKind', () => {
     expect(controlNoticeKind('compact')).toBe('control');
   });
 });
+
+describe('restart and slow-tool kinds', () => {
+  it('tags a restart line with its first line as the summary', () => {
+    expect(noticeMeta('restart', 'Claude Code session restarted.\nSession: abcd1234...\nWorkdir: /w'))
+      .toEqual({ kind: 'restart', icon: '🔄', summary: 'Claude Code session restarted.' });
+  });
+  it('lifts the leading icon off a slow-tool line, else uses the kind icon', () => {
+    expect(noticeMeta('slow_tool', '⏳ Still working', { summary: 'Bash still running (5m)' }))
+      .toEqual({ kind: 'slow_tool', icon: '⏳', summary: 'Bash still running (5m)' });
+    expect(noticeMeta('slow_tool', 'no emoji here').icon).toBe('⏳');
+  });
+});

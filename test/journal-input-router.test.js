@@ -136,6 +136,13 @@ describe('createJournalInputConsumer', () => {
       expect(deps.routeItemToSession.mock.calls[0][2]).toEqual({ username: 'another session' });
     });
 
+    it('accepts a flagged comment with no commenter fields (private commenter, or a journal that omits them)', () => {
+      const deps = makeDeps({ routeItemToSession: vi.fn() });
+      createJournalInputConsumer(deps)(baseFrame({ type: 'item', sender: 'agent:box-2', payload: agentPayload({ from_convo_id: undefined, from_label: undefined }) }));
+      expect(deps.routeItemToSession).toHaveBeenCalledTimes(1);
+      expect(deps.routeItemToSession.mock.calls[0][2]).toEqual({ username: 'another session' });
+    });
+
     it('drops the marker in the commenter\'s own conversation', () => {
       const deps = makeDeps({ routeItemToSession: vi.fn() });
       createJournalInputConsumer(deps)(baseFrame({ type: 'item', sender: 'agent:box-2', payload: agentPayload({ from_convo_id: 'convo-1', origin_convo_id: undefined }) }));
@@ -152,7 +159,7 @@ describe('createJournalInputConsumer', () => {
 
     it('does not trust the flag from a non-agent, non-user sender', () => {
       const deps = makeDeps({ routeItemToSession: vi.fn() });
-      createJournalInputConsumer(deps)(baseFrame({ type: 'item', sender: 'device:eve', payload: agentPayload() }));
+      createJournalInputConsumer(deps)(baseFrame({ type: 'item', sender: 'bot:eve', payload: agentPayload() }));
       expect(deps.routeItemToSession).not.toHaveBeenCalled();
     });
 

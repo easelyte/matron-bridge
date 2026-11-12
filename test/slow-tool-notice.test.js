@@ -6,6 +6,7 @@ import {
   isNoticeEligible,
   formatElapsed,
   renderSlowToolNotice,
+  slowToolNoticeSummary,
   DEFAULT_SLOW_TOOL_NOTICE_MS,
   DEFAULT_SLOW_TOOL_REMINDER_MS,
   MAX_SLOW_TOOL_NOTICE_MS,
@@ -212,5 +213,12 @@ describe('createSlowToolNotices', () => {
     nowMs = 1000;
     expect(() => pending.forEach(fn => fn())).not.toThrow();
     expect(log).toHaveBeenCalledWith(expect.stringContaining('transport down'));
+  });
+});
+
+describe('slowToolNoticeSummary', () => {
+  it('is a one-line form of the notice, with the tool and the elapsed time', () => {
+    expect(slowToolNoticeSummary({ toolName: 'Bash', elapsedMs: 300_000, reminder: false })).toBe('Bash still running (5m)');
+    expect(slowToolNoticeSummary({ toolName: 'Bash', elapsedMs: 600_000, reminder: true })).toBe('Bash is STILL running (10m)');
   });
 });

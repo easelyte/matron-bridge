@@ -502,6 +502,33 @@ server.tool(
 );
 
 server.tool(
+  'foreign_notice_review',
+  "Only in the review turn the bridge starts after you filed a foreign_notice: file your review of that notice for your own user, once. Say what the other side is asking, what your user already has on it, and 1 to 4 things your user might do. The bridge posts it under the notice with one button per action; nothing is done until your user taps one, which reaches you as their own turn.",
+  {
+    asking: z.string().max(1000).describe('What is being asked, in a sentence or two, in your own words'),
+    related: z.string().max(2000).optional().describe("Related work of your user's that you found: missions, items, earlier exchanges with this person. Leave out when there is none"),
+    actions: z.array(z.object({
+      label: z.string().max(40).describe('Button label, e.g. "Reply: yes" or "Ask for more detail"'),
+      does: z.string().max(300).describe('One sentence: what you will do if your user taps it'),
+    })).min(1).max(4).describe('1 to 4 things your user might do, most likely first'),
+  },
+  async ({ asking, related, actions }) => {
+    try {
+      const postRes = await bridgeFetch(`${BRIDGE_API}/foreign-notice-review`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ roomId: ROOM_ID, asking, related, actions }),
+      });
+      const data = await postRes.json().catch(() => ({}));
+      if (!postRes.ok) return { content: [{ type: 'text', text: `foreign_notice_review failed: ${data.error || `HTTP ${postRes.status}`}` }] };
+      return { content: [{ type: 'text', text: `Review filed. ${data.note || ''}`.trim() }] };
+    } catch (err) {
+      return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
+    }
+  }
+);
+
+server.tool(
   'foreign_notice',
   "Only in a turn started by ANOTHER PERSON (a message in a room with someone else's agent, or their comment on a shared item): put ONE read-only notice in your own user's For you list saying what they want, so your user does not miss it. The bridge labels it as coming from that person's agent and quotes your text as their side's words. It has a Seen button and no actions; your user answers by replying, which reaches you as their own turn. Each call files a notice of its own, so put one thing in each. Use it when they want something only your user can give (a review, a decision, a go-ahead); then tell them your user has been told.",
   {
@@ -896,11 +923,12 @@ server.tool(
   async (args) => callBriefing('publish', args, formatBriefingPublishAck),
 );
 
-// --- Projects timeline weekly stories ---
+// --- Projects: the written week ---
 // timeline_week_read / timeline_week_write go through the bridge loopback
 // (index.js mounts lib/timeline-tools.js at /timeline/read and
 // /timeline/write); the journal allows both to the Coordinator alone. A write
-// replaces the week's stories, so a retried call is harmless without a key.
+// replaces what was stored for the week, so a retried call is harmless without
+// a key.
 async function callTimeline(name, args, render) {
   const payload = { roomId: ROOM_ID, ...args };
   try {
@@ -919,34 +947,42 @@ async function callTimeline(name, args, render) {
 
 const TIMELINE_REF = z.union([z.string().min(1).max(64), z.number().int().positive()]);
 
+// Strict, so a call in the older shape (stories, a lede, a title on an entry)
+// is refused with the offending key named rather than quietly losing it.
+const TIMELINE_WEEK_WRITE_INPUT = z.strictObject({
+  week: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).describe('The Monday of the week, YYYY-MM-DD'),
+  entries: z.array(z.strictObject({
+    project: TIMELINE_REF.describe('The project: its id, or its number such as 12 or "#12"'),
+    sentence: z.string().min(1).max(300).describe('One sentence on what got done in this project that week, in plain words'),
+    next: z.string().max(300).optional().describe('What comes next, when the project\'s status says so'),
+    media_blob_id: z.string().max(128).optional().describe('A picture or video from the week\'s media list that shows the work well'),
+  })).max(8).describe('Up to 8 entries, one per project that mattered; an empty list for a quiet week'),
+  final: z.boolean().optional().describe('true freezes the week; allowed only once it has ended'),
+  notes: z.array(z.strictObject({
+    project_id: TIMELINE_REF,
+    note: z.string().min(1).max(300).describe('One sentence on where this project was left'),
+  })).max(50).optional().describe('A note for each project on the Went quiet list'),
+});
+
+const TIMELINE_WEEK_READ_INPUT = {
+  week: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe('The Monday of the week, YYYY-MM-DD. Omit for the current week.'),
+  index: z.boolean().optional().describe('true reads the week\'s index: every project that moved, with how much, in one result. Start here. Not with projects or offset.'),
+  projects: z.array(TIMELINE_REF).min(1).max(12).optional().describe('Read these projects in detail (milestones, items, pictures): up to 12 ids or numbers such as 12 or "#12", picked from the index. Not with index or offset.'),
+  offset: z.number().int().min(0).optional().describe('Reading everything a page at a time: the offset the last read gave. Omit for the first page. Not with index or projects.'),
+};
+
 server.tool(
   'timeline_week_read',
-  'Coordinator only. Read one week of the user\'s work for the Projects timeline: every project that moved (milestones, items, pictures), what is already written for it, and, for the current week, the Went quiet list. Use it before timeline_week_write, as the weekly-stories routine says.',
-  {
-    week: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional().describe('The Monday of the week, YYYY-MM-DD. Omit for the current week.'),
-  },
+  'Coordinator only. Read one week of the user\'s work for the Projects timeline. Start with `index: true`: for the current week the Went quiet list first, then every project that moved with how much (milestones, things done, things waiting on the user, pictures) and what is already written for the week, in one result. Then ask for the detail of the projects worth a card with `projects: [...]` (up to 12 a call): their milestones, items and pictures. With neither, it reads everything a page of projects at a time, and the last line gives the offset of the next page: that form remains for reading a whole week, which is rarely worth it. Use it before timeline_week_write, as the weekly-stories routine says.',
+  TIMELINE_WEEK_READ_INPUT,
   async (args) => callTimeline('read', args, formatTimelineReadAck),
 );
 
-server.tool(
+server.registerTool(
   'timeline_week_write',
-  'Coordinator only. Write one week of the Projects timeline: a short lede and up to 8 stories, plus a note for each project that went quiet. Plain sentences, as you would say them to a colleague: no links, no numbers (no PR or tracker numbers), no tool names. A story names the projects it covers by id or number; the journal refuses private work. Writing a week replaces what was stored for it. `final: true` freezes a week that has ended; a frozen week is rewritten only by passing `final: true` again.',
   {
-    week: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).describe('The Monday of the week, YYYY-MM-DD'),
-    lede: z.string().max(600).optional().describe('Two or three sentences for the whole week (≤600 characters), ending with how many things wait on the user, if any'),
-    stories: z.array(z.object({
-      title: z.string().min(1).max(80).describe('A short human title'),
-      sentence: z.string().min(1).max(300).describe('One sentence on what got done, in plain words'),
-      next: z.string().max(300).optional().describe('What comes next, when the projects\' statuses say so'),
-      project_ids: z.array(TIMELINE_REF).min(1).max(10).describe('The projects this story covers: ids, or numbers such as 12 or "#12"'),
-      item_ids: z.array(TIMELINE_REF).max(10).optional().describe('Only items still waiting on the user'),
-      media_blob_id: z.string().max(128).optional().describe('A picture or video from the week\'s media list that shows the work well'),
-    })).max(8).describe('Up to 8 stories; group related projects into one'),
-    final: z.boolean().optional().describe('true freezes the week; allowed only once it has ended'),
-    notes: z.array(z.object({
-      project_id: TIMELINE_REF,
-      note: z.string().min(1).max(300).describe('One sentence on where this project was left'),
-    })).max(50).optional().describe('A note for each project on the Went quiet list'),
+    description: 'Coordinator only. Write one week of Projects: up to 8 entries, one per project that mattered, each one sentence on what got done that week, an optional next step and an optional picture; plus a note for each project that went quiet. Plain sentences: no links, no numbers, no tool names. The project\'s name is the card\'s title, so do not repeat it. An entry names its project by id or number; the journal refuses private work. Writing a week replaces what was stored for it. `final: true` freezes a week that has ended; a frozen week is rewritten only by passing `final: true` again.',
+    inputSchema: TIMELINE_WEEK_WRITE_INPUT,
   },
   async (args) => callTimeline('write', args, formatTimelineWriteAck),
 );
@@ -1501,7 +1537,7 @@ const missionToolName = (op) => ({ start: 'mission_start', create: 'mission_crea
 
 server.tool(
   'mission_start',
-  "Start the mission for this conversation — the human-readable record of one piece of work, shared by every agent and app of this user. Do this as soon as you know what the work is (usually right after the user's first substantive input): name it and state the goal in body, with the whole conversation as context. Milestones are refused until the conversation has a mission. If it already has a current mission this returns that one unchanged; to move on to different work, mission_create the new mission and mission_join it. Run project_list first and pass project: N when the work belongs to an existing project; leave it out only when none fits, and the mission gets a project of its own with the same name.",
+  "Start the mission for this conversation — the human-readable record of one piece of work, shared by every agent and app of this user. Do this as soon as you know what the work is (usually right after the user's first substantive input): name it and state the goal in body, with the whole conversation as context. Milestones are refused until the conversation has a mission. If it already has a current mission this returns that one unchanged; to move on to different work, mission_create the new mission and mission_join it. A project is one goal with an end, holding the missions that serve it: run project_list with live: true, brief: true first and pass project: N for the goal the work serves; leave it out only when the work serves none of them, and the mission gets a project of its own with the same name. Never create or pick a broad category project.",
   {
     title: z.string().describe('One line, ≤200 chars — what the work is'),
     name: z.string().optional().describe("A short name of at most 40 characters that becomes the conversation's name in the apps; the title stays the full description"),
@@ -1513,7 +1549,7 @@ server.tool(
 
 server.tool(
   'mission_create',
-  "Create a mission WITHOUT joining this conversation to it (an unassigned mission) — for work you are handing to another agent, or new work you will mission_join yourself. Assign it by starting a session with agent_session_start and mission: N, or by asking a running agent (agent_chat_start) to mission_join N. mission_start is the one that creates AND joins, for your own work when this conversation has no mission yet. Pass project: N to file it in an existing project; without one it gets a project of its own with the same name. Returns the mission number.",
+  "Create a mission WITHOUT joining this conversation to it (an unassigned mission) — for work you are handing to another agent, or new work you will mission_join yourself. Assign it by starting a session with agent_session_start and mission: N, or by asking a running agent (agent_chat_start) to mission_join N. mission_start is the one that creates AND joins, for your own work when this conversation has no mission yet. Pass project: N to file it into the goal it serves (project_list with live: true, brief: true shows the goals with open work); without one it gets a project of its own with the same name. Never create or pick a broad category project. Returns the mission number.",
   {
     title: z.string().describe('One line, ≤200 chars — what the work is'),
     name: z.string().optional().describe("A short name of at most 40 characters that becomes the conversation's name in the apps; the title stays the full description"),
@@ -1540,7 +1576,7 @@ server.tool(
 
 server.tool(
   'mission_update',
-  "Rename a mission (its title or its short name), rewrite its standing description, or move it to another project (project: N — every mission is in exactly one project, so it can move but never be taken out). Default: this conversation's current mission. Pass `mission` to change another mission — e.g. the Coordinator applying a filing the user approved.",
+  "Rename a mission (its title or its short name), rewrite its standing description, or move it to another project (project: N — every mission is in exactly one project, so it can move but never be taken out). Default: this conversation's current mission. Pass `mission` to change another mission — e.g. the Coordinator filing a mission into the goal it serves.",
   {
     title: z.string().optional().describe('≤200 chars'),
     name: z.string().optional().describe("A short name of at most 40 characters that becomes the conversation's name in the apps; the title stays the full description"),
@@ -1760,12 +1796,18 @@ async function callProjects(name, args, render) {
   }
 }
 
-const PROJECT_WHAT = 'A Project is the user\'s tracker object that groups related missions (e.g. "Promo launch" groups the launch-day mission, the promo branch and SEO phase 2) — not a working directory, and nothing to do with ~/.claude/projects. Every mission is in exactly one project: the one named when it started, or one of its own with the same name.';
+const PROJECT_WHAT = 'A Project is the user\'s tracker object that groups related missions: one goal with an end (e.g. "Promo launch" holds the launch-day mission, the promo branch and SEO phase 2), never a broad category — not a working directory, and nothing to do with ~/.claude/projects. Every mission is in exactly one project: the one named when it started, or one of its own with the same name.';
 
 server.tool(
   'project_list',
-  `List the user's projects — open by default, state: 'closed' for closed ones — each with its status, its missions' activity (running / waiting / idle / quiet, and closed), needs-you and open-item counts, and when it last moved. Run it before you file a mission and before project_create: file into an existing project when one fits. ${PROJECT_WHAT}`,
-  { state: z.enum(['open', 'closed']).optional().describe("Default 'open'") },
+  `List the user's projects — open by default, state: 'closed' for closed ones — each with its status, its missions' activity (running / waiting / idle / quiet, and closed), needs-you and open-item counts, and when it last moved. Run it before you file a mission and before project_create: file into an existing project when one fits. Long lists are paged: pass \`live: true, brief: true\` to see just the goals with open work. When more remain, the last line says how many and names the next call in full, with the same filters and the offset to pass. live is for open projects only: it is refused with state: 'closed'. ${PROJECT_WHAT}`,
+  {
+    state: z.enum(['open', 'closed']).optional().describe("Default 'open'"),
+    live: z.boolean().optional().describe('true = only projects with at least one open mission; not with state: \'closed\''),
+    brief: z.boolean().optional().describe('true = one line per project (open missions, needs-you count, last activity) and no status'),
+    offset: z.number().int().min(0).optional().describe('Where the page starts, from the last line of the previous page; keep the other arguments the same. Default 0'),
+    limit: z.number().int().min(1).max(200).optional().describe('Projects per page. Default 60 (brief: 150)'),
+  },
   async (args) => callProjects('list', args, formatProjectList),
 );
 
@@ -1819,7 +1861,7 @@ server.tool(
 
 server.tool(
   'project_merge',
-  'Merge project #num into project #into: every mission in #num moves to #into, and #num closes as "Merged into #into" (its number keeps pointing there). The Coordinator only — for near-duplicate projects; report each merge to the user.',
+  'Merge project #num into project #into: every mission in #num moves to #into, and #num closes as "Merged into #into" (its number keeps pointing there). The Coordinator only — for near-duplicate projects, and for folding a project that holds a single mission into the goal it serves; report what was merged to the user briefly, in a few lines, not merge by merge.',
   {
     num: z.number().int().min(1).describe('The project to fold away'),
     into: z.number().int().min(1).describe('The project to keep'),

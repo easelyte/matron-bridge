@@ -30,7 +30,7 @@ import { buildRestartStatus } from './lib/box-status-restart.js';
 import { BRIDGE_BOOT_AT } from './lib/boot-time.js';
 import { spawn, execFileSync, execFile } from 'child_process';
 import {
-  createCrashWatch, lostWorkLikely, recoveryPrompt, crashNoticeText, burstNoticeText, CRASH_BURST_WINDOW_MS,
+  createCrashWatch, appendCrashLog, truncateSnapshot, describeExit, recoveryPrompt, burstNoticeText, CRASH_BURST_WINDOW_MS,
 } from './lib/crash-recovery.js';
 import { transcribeAudio, transcribeAudioSegments, resolveWhisperPrompt, makeWhisperPrompt, localWhisperAvailable } from './lib/transcribe.js';
 import { extractVideoFrames, videoFramesMessage } from './lib/video-frames.js';
@@ -226,7 +226,7 @@ import { DEFAULT_EDIT_HOLD_MS } from './lib/queue-edit-hold.js';
 import { handlePickerValue, isResumeConvoId } from './lib/picker-dispatch.js';
 import { createPermissionRegistry, renderPermissionCard, permissionInputRefusal, permissionButtons, permissionSpawnArgs, resolveBypassMode, resolvePermissionTimeoutMs, isRootOutsideSandbox, guardRootBypass, ROOT_BYPASS_WARNING, resolvePermissionRequest, resolvePermissionCheck, buildPrintSessionSettings, foreignGateEntry, listSessionGrants, revokeSessionGrant } from './lib/permission-prompt.js';
 import { createPlanApprovalItems } from './lib/plan-approval-items.js';
-import { createSlowToolNotices, renderSlowToolNotice, resolveSlowToolNoticeMs, resolveSlowToolReminderMs } from './lib/slow-tool-notice.js';
+import { createSlowToolNotices, renderSlowToolNotice, slowToolNoticeSummary, resolveSlowToolNoticeMs, resolveSlowToolReminderMs } from './lib/slow-tool-notice.js';
 import { createJournalInputConsumer, resolvePromptChoice, resolvePromptChoices } from './lib/journal-input-router.js';
 import { createAgentRooms, INVITE_TTL_MS } from './lib/agent-rooms.js';
 import { createAgentInvites, formatInviteRequestNotice, formatAutoJoinedRequest, selectJoinBacklog, INVITE_WAKE_NOTICE } from './lib/agent-invites.js';
@@ -272,7 +272,7 @@ import { codexOneShot } from './lib/codex-oneshot.js';
 import { activityStateChanged, truncateActivityDetail, shouldResumeThinkingAfterTool } from './lib/journal-activity.js';
 import { streamRefFor, armReplyRef, settleReplyRef } from './lib/journal-stream.js';
 import { contextFullToNative, briefContextReport } from './lib/context-command.js';
-import { buildSessionStatus, publishedExtras, contextTokensFromAssistantEvent, postCompactContextTokens, compactTriggerFrom, contextGaugeText, sessionContextWindow, emailFromClaudeConfig, isSidechainEvent, reconcileModelForWindow, hostVitals, startCpuSampler, stopCpuSampler, cpuPercent, ramPercent, cpuSampledAtMs, statusRepaintDue } from './lib/session-status.js';
+import { buildSessionStatus, contextTokensFromAssistantEvent, postCompactContextTokens, compactTriggerFrom, contextGaugeText, sessionContextWindow, emailFromClaudeConfig, isSidechainEvent, reconcileModelForWindow, hostVitals, startCpuSampler, stopCpuSampler, cpuPercent, ramPercent, cpuSampledAtMs, statusRepaintDue } from './lib/session-status.js';
 import { stallFromAssistantEvent, stallResetsAt } from './lib/stall-detector.js';
 import { spawnModelFallback, stallModelFallback, isFableModel } from './lib/fable-fallback.js';
 import { createRestartNotices, planSessionControl, validateControlParams, controlNotice, authorizeControl, mergeParkedSlot, JOURNAL_DEVICE_ID, JOURNAL_ONLY_ACTIONS, CONTROL_KINDS, TURN_STARTING_OPS, occupied as controlOccupied } from './lib/session-control.js';
@@ -2498,14 +2498,12 @@ function journalStatus(session) {
     // resolve it here rather than shipping a bare relative fragment.
     workdir: session.workdir ? path.resolve(session.workdir) : undefined,
     vitals,
-    // Spawn-time extras, filtered like the spawn itself (see publishedExtras).
-    // Always an array, so "off" reaches clients as [].
-    extras: publishedExtras({
-      requested: session.mcpExtras,
-      defaults: DEFAULT_MCP_EXTRAS,
-      known: KNOWN_MCP_EXTRAS,
-      noMcp: isCodex && !CODEX_APP_SERVER,
-    }),
+    // Spawn-time extras: the same effectiveExtras() list the spawn and the
+    // restart notice use (session choice plus machine defaults). Always an
+    // array, so "off" reaches clients as []. Legacy Codex exec spawns with an
+    // empty MCP config and so has none. Share's token is only minted after
+    // pinning roots succeeds, so a failed setup must not report it as on.
+    extras: isCodex && !CODEX_APP_SERVER ? [] : effectiveExtras(session.mcpExtras ?? [], DEFAULT_MCP_EXTRAS).filter(extra => extra !== 'share' || session.showFileToken),
   });
   // The shared account email cache is Claude-specific — strip it from Codex
   // frames. Codex supplies its own limits; host vitals stay on both.
@@ -2707,56 +2705,59 @@ function coordinatorRoleAtSpawn(roomId, resumeSessionId, options, persisted) {
   return role.coordinator;
 }
 
+// Once graceful shutdown has begun, a killed child must not be respawned by
+// the crash-restart handlers while the journal flush is still running.
 function shouldAutoRestart(exitCode, session, shuttingDown) {
   return !shuttingDown && exitCode !== 0 && session.restartCount < 3 && !session._resumeFailed;
 }
 
 // Crash restarts (lib/crash-recovery.js): the process died on its own and was
-// respawned. Count it, keep a durable record, flag a burst, and tell the
-// respawned agent what it lost. Returns the notice text for the chat.
+// respawned. Count it, keep a bounded record, flag a burst to the user, and
+// carry a session that died mid-turn on with a turn saying so.
 const crashWatch = createCrashWatch();
 const CRASH_LOG_FILE = path.join(os.homedir(), '.matron-bridge-crash-log.jsonl');
 const CRASH_RECOVERY_DELAY_MS = 2_000;
-// Off switch for the automatic recovery turn (the notice and burst alert stay on).
-const CRASH_RECOVERY_PROMPT = process.env.MATRON_CRASH_RECOVERY_PROMPT !== '0';
 
 function onCrashRestart(session, restarted, exitCode, signal = null) {
-  const wasBusy = !!session.busy;
-  const hadWork = lostWorkLikely({ busy: wasBusy, bgWorkObserved: session._bgWorkObserved });
+  // A child the bridge itself killed during shutdown is not a crash.
+  if (shuttingDown) return;
   try {
+    const wasBusy = !!session.busy;
     const convoId = journalConvoIdFor(restarted);
-    const result = crashWatch.note({ convoId, exitCode, signal, wasBusy, hadWork });
-    const record = { at: new Date().toISOString(), convoId, exitCode, signal, wasBusy, hadWork, concurrent: result.count };
-    try { fs.appendFileSync(CRASH_LOG_FILE, JSON.stringify(record) + '\n', { mode: 0o600 }); } catch { /* the record is best effort */ }
-    console.warn(`[crash-restart] ${convoId} exit=${exitCode} signal=${signal ?? 'none'} busy=${wasBusy} bgWork=${hadWork} concurrent=${result.count}`);
+    const result = crashWatch.note({ convoId, exitCode, signal, wasBusy });
+    appendCrashLog(CRASH_LOG_FILE, { at: new Date().toISOString(), convoId, exitCode, signal, wasBusy, concurrent: result.count });
+    console.warn(`[crash-restart] ${convoId} exit=${exitCode} signal=${signal ?? 'none'} busy=${wasBusy} concurrent=${result.count}`);
     if (result.burst) {
       console.error(`[crash-restart] BURST: ${result.count} sessions crashed within ${CRASH_BURST_WINDOW_MS / 1000}s; load=${os.loadavg().map(n => n.toFixed(2)).join(' ')}`);
-      // The signal's sender is not visible from here, but a snapshot taken
-      // now shows what else was running.
-      execFile('ps', ['-eo', 'pid,ppid,pgid,stat,etime,pcpu,pmem,args', '--sort=-pcpu'], { timeout: 5000, maxBuffer: 1 << 20 }, (err, out) => {
-        const top = err ? `ps failed: ${err.message}` : String(out).split('\n').slice(0, 30).map(l => l.slice(0, 200)).join('\n');
-        console.error(`[crash-restart] process snapshot at burst:\n${top}`);
+      // The sender of a signal is not visible from here, but a snapshot of the
+      // process table taken now shows what else was running. Same portable
+      // command the idle reaper uses; a failure only degrades the log line.
+      const { file, args } = processTableCommand();
+      execFile(file, args, { timeout: 5000, maxBuffer: 1 << 20 }, (err, out) => {
+        console.error(`[crash-restart] process snapshot at burst:\n${err ? `unavailable: ${err.message}` : truncateSnapshot(out)}`);
       });
-      const co = coordinatorLookup.snapshot();
-      if (co.convoId) {
-        journalPublishNotice(co.convoId, burstNoticeText({ count: result.count, exitCodes: result.events.map(e => e.exitCode) }));
-      }
+      // One notice: the Coordinator's chat, or without a Coordinator the chat
+      // of the session whose crash crossed the threshold.
+      const noticeConvoId = coordinatorLookup.snapshot().convoId || convoId;
+      const text = burstNoticeText({ count: result.count, exits: result.events.map(e => describeExit(e)) });
+      journalPublishNotice(noticeConvoId, text, noticeMeta('alert', text, {
+        icon: '⚠️', summary: `${result.count} sessions crashed within ${CRASH_BURST_WINDOW_MS / 1000}s`,
+      }));
     }
-    if (hadWork && CRASH_RECOVERY_PROMPT) {
-      const text = recoveryPrompt({ exitCode, signal, wasBusy });
+    if (wasBusy) {
+      const text = recoveryPrompt({ exitCode, signal });
       const timer = setTimeout(() => {
         const target = sessions.get(restarted.roomId);
         if (!target || !target.alive) return;
-        journalRouteTextToSession(target, text, { keepRestartBudget: true }).catch((e) => {
-          try { console.warn(`[crash-restart] recovery prompt failed for ${convoId}: ${e.message}`); } catch { /* logging must never throw */ }
-        });
+        // The bridge's carry-on delivery, as a carry-on turn: it is not the
+        // user's own message and must not read as one.
+        void carryOnConvo(convoId, target, null, text, undefined, { causes: [carryOnCause()], keepRestartBudget: true });
       }, CRASH_RECOVERY_DELAY_MS);
       timer.unref?.();
     }
   } catch (e) {
     try { console.warn(`[crash-restart] bookkeeping failed: ${e.message}`); } catch { /* logging must never throw */ }
   }
-  return crashNoticeText({ exitCode, signal, restartCount: restarted.restartCount, willResume: hadWork && CRASH_RECOVERY_PROMPT });
 }
 
 function createSession(roomId, workdir, resumeSessionId, options = {}) {
@@ -3142,7 +3143,9 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     reminderMs: resolveSlowToolReminderMs(process.env.MATRON_SLOW_TOOL_REMINDER_MS),
     notify: ({ toolName, elapsedMs, reminder }) => {
       if (!session.alive || typeof session.sendCallback !== 'function') return;
-      session.sendCallback(renderSlowToolNotice({ toolName, elapsedMs, reminder }));
+      const text = renderSlowToolNotice({ toolName, elapsedMs, reminder });
+      const meta = noticeMeta('slow_tool', text, { summary: slowToolNoticeSummary({ toolName, elapsedMs, reminder }) });
+      if (!sendKindNotice(session, 'slow_tool', text, markdownToHtml(text), meta)) session.sendCallback(text);
     },
     log: debug,
   });
@@ -3183,6 +3186,12 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
         journalSessionState(session, 'done');
         journalActivity(session, 'idle');
         journalEvictConvoInput(session);
+      } else if (shuttingDown) {
+        // The bridge killed this child itself: no respawn, and no "session
+        // ended" notice or done state either; leave the convo for the next
+        // boot to resume. Viewers still must not keep a stale thinking/tool
+        // indicator, so the activity overlay is cleared.
+        journalActivity(session, 'idle');
       } else if (shouldAutoRestart(exitCode, session, shuttingDown)) {
         requeueSteeredMessages(session, orphanSteers);
         // Auto-restart is about to replace `session` outright (no
@@ -3267,12 +3276,14 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
         restarted._journalState = session._journalState;
         restarted._journalConvoEstablished = session._journalConvoEstablished;
         sessions.set(roomId, restarted);
-        const crashText = onCrashRestart(session, restarted, exitCode, proc.signalCode);
+        onCrashRestart(session, restarted, exitCode, proc.signalCode);
         if (restarted.sendHtml) {
-          const n = notice('warning', `[${crashText}]`, escapeHtml(crashText));
+          const n = notice('warning',
+            `[Session crashed (exit ${exitCode}), restarted automatically — attempt ${restarted.restartCount}/3]`,
+            `Session crashed (exit ${exitCode}), restarted automatically — attempt <b>${restarted.restartCount}/3</b>`);
           restarted.sendHtml(n.plain, n.html);
         } else if (restarted.sendCallback) {
-          restarted.sendCallback(`[${crashText}]`);
+          restarted.sendCallback(`[Session crashed (exit ${exitCode}), restarted automatically — attempt ${restarted.restartCount}/3]`);
         }
       } else {
         // Notice BEFORE teardown: sendToRoom's journal mirror looks the
@@ -4122,6 +4133,18 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
         journalSessionState(session, 'done');
         journalActivity(session, 'idle');
         journalEvictConvoInput(session);
+      } else if (shuttingDown) {
+        // The bridge killed this child itself: no respawn, and no "session
+        // ended" notice or done state either; leave the convo for the next
+        // boot to resume. Viewers still must not keep a stale thinking/tool
+        // indicator, so the activity overlay is cleared.
+        journalActivity(session, 'idle');
+        // A /logout that finished while shutting down still resets a room that
+        // borrowed interactive mode for the flow, or the next boot resumes it
+        // as a TUI.
+        if (session._accountLogoutPending && exitCode === 0 && session._accountFlowReturnToPrint) {
+          persistSession(roomId, session.claudeSessionId, session.workdir, session.originRoomId, { interactiveMode: false });
+        }
       } else if (shouldAutoRestart(exitCode, session, shuttingDown)) {
         // See the matching print-mode branch's comment: the terminal exit
         // paths already emit idle on restart, this auto-restart branch
@@ -4224,12 +4247,14 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
         // sent right after the restart was typed into a still-loading TUI
         // and dropped (Bugbot, PR #162).
         enterResumeHold(restarted);
-        const crashText = onCrashRestart(session, restarted, exitCode);
+        onCrashRestart(session, restarted, exitCode);
         if (restarted.sendHtml) {
-          const n = notice('warning', `[${crashText}]`, escapeHtml(crashText));
+          const n = notice('warning',
+            `[Session crashed (exit ${exitCode}), restarted automatically — attempt ${restarted.restartCount}/3]`,
+            `Session crashed (exit ${exitCode}), restarted automatically — attempt <b>${restarted.restartCount}/3</b>`);
           restarted.sendHtml(n.plain, n.html);
         } else if (restarted.sendCallback) {
-          restarted.sendCallback(`[${crashText}]`);
+          restarted.sendCallback(`[Session crashed (exit ${exitCode}), restarted automatically — attempt ${restarted.restartCount}/3]`);
         }
       } else {
         // Notices FIRST, teardown second: sendToRoom's journal mirror looks
@@ -7394,6 +7419,22 @@ function notice(type, plainText, htmlContent) {
   };
 }
 
+// A bridge line in the session's chat, tagged payload.notice = {kind, icon,
+// summary} (lib/system-notice.js) so a client can recognise it without
+// matching the wording. Same delivery as session.sendHtml (sendToRoom), plus
+// the tag. Returns false when the session has no room to send through, so
+// the caller keeps its existing untagged path.
+function sendKindNotice(session, kind, plain, html, meta = noticeMeta(kind, plain)) {
+  if (!meta || !session?.roomId) return false;
+  try {
+    Promise.resolve(sendToRoom(session.roomId, plain, html, { notice: meta }))
+      .catch((e) => { try { debug(`sendKindNotice(${kind}) failed: ${e?.message ?? e}`); } catch { /* logging must never throw */ } });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function markdownToHtml(text) {
   let processed = text.replace(/\*\*`([^`\n]+)`\*\*/g, '‹b›‹code›$1‹/code›‹/b›');
 
@@ -8469,9 +8510,10 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         : '';
       const restartModelLine = restartModelFlag.model ? `\nModel: ${aliasLabel(restartModelFlag.model)}` : '';
       const restartPermNote = permissionNote(restarted);
-      await sendReply(
-        `${agentLabel(existing.agent)} session restarted.\nSession: ${restartSessionId ? restartSessionId.slice(0, 8) + '...' : '(new)'}\nWorkdir: ${restartWorkdir}${matronMdNote(restarted)}${extrasLine}${restartModelLine}${restartPermNote}`
-      );
+      const restartedLine = `${agentLabel(existing.agent)} session restarted.\nSession: ${restartSessionId ? restartSessionId.slice(0, 8) + '...' : '(new)'}\nWorkdir: ${restartWorkdir}${matronMdNote(restarted)}${extrasLine}${restartModelLine}${restartPermNote}`;
+      // Tagged for the apps (the summary is its first line); a restart with
+      // no live replacement session keeps the plain reply.
+      if (!restarted || !sendKindNotice(restarted, 'restart', restartedLine, markdownToHtml(restartedLine))) await sendReply(restartedLine);
       break;
     }
 
@@ -11221,7 +11263,7 @@ function sleepingConvoIdFor(roomId) {
 // chat is told while it comes back (the automatic path after a self-restart
 // says why — the default "session was idle, your message will be delivered"
 // copy would be wrong there: no message is coming).
-async function carryOnConvo(convoId, session, _sendReply, text = 'carry on', resumeNotice = undefined) {
+async function carryOnConvo(convoId, session, _sendReply, text = 'carry on', resumeNotice = undefined, { causes = null, keepRestartBudget = false } = {}) {
   let finishInput;
   try {
     finishInput = restartLatch?.beginInput();
@@ -11240,7 +11282,7 @@ async function carryOnConvo(convoId, session, _sendReply, text = 'carry on', res
       journalPublishNotice(convoId, '⚠️ That conversation can no longer be found or resumed.');
       return;
     }
-    await journalRouteTextToSession(target, text);
+    await journalRouteTextToSession(target, text, { causes, keepRestartBudget });
   } catch (e) {
     console.warn(`[inflight] carry-on delivery failed for convo=${convoId}: ${e.message}`);
     journalPublishNotice(convoId, `⚠️ Could not carry on: ${e.message}`);
@@ -12368,6 +12410,9 @@ const peerDelivery = createRoomDelivery({
 // tracker on the mission attached to it); acting beyond that takes an
 // "Allow once" tap from this session's own user.
 const FOREIGN_ACTIONS_FILE = path.join(os.homedir(), '.matron-bridge-foreign-actions.json');
+// Notices that were promised a review (foreign_notice): a review lost with the
+// process is said so under its notice after a restart.
+const FOREIGN_REVIEWS_FILE = path.join(os.homedir(), '.matron-bridge-foreign-reviews.json');
 const foreignSessions = createForeignSessions({
   sharing: sharingClient,
   items: itemsClient,
@@ -12380,8 +12425,20 @@ const foreignSessions = createForeignSessions({
     load: () => { try { return JSON.parse(fs.readFileSync(FOREIGN_ACTIONS_FILE, 'utf-8')); } catch { return {}; } },
     save: (obj) => atomicWriteFileSync(FOREIGN_ACTIONS_FILE, JSON.stringify(obj), { mode: 0o600 }),
   },
+  reviewStore: {
+    load: () => { try { return JSON.parse(fs.readFileSync(FOREIGN_REVIEWS_FILE, 'utf-8')); } catch { return {}; } },
+    save: (obj) => atomicWriteFileSync(FOREIGN_REVIEWS_FILE, JSON.stringify(obj), { mode: 0o600 }),
+  },
   log: console,
 });
+
+// Reviews a previous process still owed, and "no review" comments the
+// journal has not taken yet: tried shortly after start, then every few
+// minutes (an idle box has no turn-end seam to try at). Nothing owed,
+// nothing sent.
+const settleOwedReviews = () => { try { foreignSessions.settleMissedReviews(); } catch { /* never throw from a timer */ } };
+setTimeout(settleOwedReviews, 30_000).unref();
+setInterval(settleOwedReviews, 5 * 60_000).unref();
 
 function injectForeignRoomTurn(session, text, foreign) {
   // Codex has no PreToolUse gate: a Codex session never takes a turn from
@@ -14768,7 +14825,9 @@ const apiServer = createServer(async (req, res) => {
         const gSession = typeof data?.roomId === 'string' ? sessions.get(data.roomId) : null;
         if (gSession?.foreignTurn && !foreignSessions.routeAllowed(gSession, url.pathname, data)) {
           res.writeHead(403, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ error: `Not allowed in a turn another person (${gSession.foreignTurn.person}) started. Reply in the room, or ask your own user with foreign_action_request.` }));
+          res.end(JSON.stringify({ error: gSession.foreignTurn.review
+            ? 'Not allowed in a turn that reviews a notice from another person\'s side. Read your user\'s tracker, then file the review with foreign_notice_review.'
+            : `Not allowed in a turn another person (${gSession.foreignTurn.person}) started. Reply in the room, or ask your own user with foreign_action_request.` }));
           return;
         }
       }
@@ -14784,6 +14843,14 @@ const apiServer = createServer(async (req, res) => {
         const fnSession = sessions.get(data.roomId);
         if (!fnSession) { res.writeHead(404); res.end(JSON.stringify({ error: 'No session for roomId' })); return; }
         const out = await foreignSessions.raiseNotice(fnSession, data);
+        res.writeHead(out.status, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify(out.body));
+        return;
+      }
+      if (url.pathname === '/foreign-notice-review') {
+        const frSession = sessions.get(data.roomId);
+        if (!frSession) { res.writeHead(404); res.end(JSON.stringify({ error: 'No session for roomId' })); return; }
+        const out = await foreignSessions.postReview(frSession, data);
         res.writeHead(out.status, { 'Content-Type': 'application/json' });
         res.end(JSON.stringify(out.body));
         return;
@@ -16687,7 +16754,6 @@ function startBackgroundMarkerMaintenance() {
     for (const session of sessions.values()) {
       if (!session.alive || session._autoStopped) continue;
       const hasWork = sessionHasBackgroundWork(session, observed);
-      session._bgWorkObserved = { at: Date.now(), hasWork };
       if (session.busy) continue;
       const convoId = journalConvoIdFor(session);
       if (hasWork) inflightMarker.refreshBackground(convoId);

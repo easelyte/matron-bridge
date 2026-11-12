@@ -94,6 +94,11 @@ describe('itemCause', () => {
   const at = Date.UTC(2026, 0, 1, 12, 0, 0, 5);
   const iso = '2026-01-01T12:00:00.005Z';
 
+  it('is null for another agent session\'s comment: no user cause', () => {
+    const iso = '2026-10-01T10:00:00.000Z';
+    const p = { num: 12, agent_comment: true, action: 'commented', comment: { created_at: Date.parse(iso), body: 'hi' } };
+    expect(itemCause(p)).toBeNull();
+  });
   it('a typed reply is item_reply with item:<num>@<created_at ISO ms Z>', () => {
     const p = { action: 'commented', num: 12, comment: { body: 'use A', created_at: at } };
     expect(itemCause(p)).toEqual({ kind: 'item_reply', ref: `item:12@${iso}`, at: NOW });

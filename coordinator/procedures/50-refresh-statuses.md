@@ -12,7 +12,7 @@ Every mission and project carries a status: one short paragraph on its card in t
 
 **Projects**
 
-6. After the missions, refresh the projects: `project_list`, then for each open project `project_get N` and `project_status` with `num: N`: one short paragraph (at most 600 characters) summing up its missions, what is moving, what is waiting on the user, the next date or blocker. The same skip rules apply: leave a status the user wrote unless it is clearly out of date.
-7. Merge near-duplicate projects as you go, and file the one filing question, as the File projects procedure says.
+6. After the missions, refresh the projects: `project_list` (every page: while the last line says `n more`, make the call it names), then for each open project `project_get N` and `project_status` with `num: N`: one short paragraph (at most 600 characters) summing up its missions, what is moving, what is waiting on the user, the next date or blocker. `project_list` is paged: while its last line says `n more`, call it again with the `offset` that line names. The same skip rules apply: leave a status the user wrote unless it is clearly out of date.
+7. Merge near-duplicate projects as you go, and file one-mission projects into the goals they serve, as the File projects procedure says. You do not ask first.
 
 **Reply** in the chat with one line per mission and per project you changed: `#N title — the new status's first sentence`. If you changed none, say so in one line.
