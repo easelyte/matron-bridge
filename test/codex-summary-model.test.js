@@ -44,4 +44,9 @@ describe('availability gate', () => {
     expect(createCodexSummaryModel({ codexOneShot: vi.fn(), available: () => false, env: {} })).toBeNull();
     expect(createCodexSummaryModel({ codexOneShot: vi.fn(), available: () => { throw new Error('x'); }, env: {} })).toBeNull();
   });
+
+  it('generateWithModel returns the text with the model label', async () => {
+    const m = createCodexSummaryModel({ codexOneShot: async () => ({ text: ' T ' }), available: () => true, env: {} });
+    await expect(m.generateWithModel('p')).resolves.toEqual({ text: 'T', model: 'codex' });
+  });
 });
