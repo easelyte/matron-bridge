@@ -75,6 +75,18 @@ server.tool = (name, ...rest) => {
   if (!shouldRegister(name, 'worker')) toolCounts.wouldHide += 1;
   return registerTool(name, ...rest);
 };
+// The same filter for tools registered through registerTool (a config object
+// instead of positional arguments), e.g. timeline_week_write.
+const registerToolConfig = server.registerTool.bind(server);
+server.registerTool = (name, ...rest) => {
+  if (!shouldRegister(name, TOOL_ROLE)) {
+    toolCounts.hidden += 1;
+    return undefined;
+  }
+  toolCounts.registered += 1;
+  if (!shouldRegister(name, 'worker')) toolCounts.wouldHide += 1;
+  return registerToolConfig(name, ...rest);
+};
 
 server.tool(
   'request_secret',

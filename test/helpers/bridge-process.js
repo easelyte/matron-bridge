@@ -189,6 +189,9 @@ if (process.argv.includes('--print')) {
   });
 } else {
 /*SESSIONSETUP*/await import('../stub-claude.mjs');
+// An idle crash: the test creates crash-<pid> to make this exact child exit 1
+// without a turn in flight, so the bridge sees no lost work to recover.
+setInterval(() => { if (fs.existsSync(path.join(process.env.HOME, 'crash-' + process.pid))) process.exit(1); }, 25);
 process.stdout.write('\\n? for shortcuts\\n');
 }\n`;
     const sessionSetup = `
@@ -310,6 +313,9 @@ fs.watchFile(process.env.TRANSCRIPT_PATH, { interval: 25 }, async stat => {
       transcript(id) {
         const file = path.join(home, '.claude', 'projects', encodeProjectDir(workdir), `${id}.jsonl`);
         return fs.existsSync(file) ? fs.readFileSync(file, 'utf8').trim().split('\n').map(JSON.parse) : [];
+      },
+      crashIdle(pid) {
+        fs.writeFileSync(path.join(home, 'crash-' + pid), '');
       },
       stubLaunches() {
         const log = path.join(home, 'stub-launches');

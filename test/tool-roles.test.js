@@ -154,6 +154,8 @@ describe('ask-user.js tool list', () => {
 
   it('every COORDINATOR_ONLY name is a real registered tool', () => {
     const src = fs.readFileSync(path.join(ROOT, 'ask-user.js'), 'utf8');
-    for (const name of COORDINATOR_ONLY) expect(src).toContain(`server.tool(\n  '${name}'`);
+    for (const name of COORDINATOR_ONLY) {
+      expect(src.includes(`server.tool(\n  '${name}'`) || src.includes(`server.registerTool(\n  '${name}'`)).toBe(true);
+    }
   });
 });

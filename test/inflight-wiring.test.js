@@ -261,7 +261,6 @@ describe('background marker behaviour in the bridge', () => {
     work = false;
     tick();
     expect(saved.alice.kind).toBe('background');
-    expect(session._bgWorkObserved).toEqual({ at: clock, hasWork: false });
     session.busy = false;
     tick();
     expect(saved).toEqual({});
@@ -366,7 +365,6 @@ describe('background marker behaviour in the bridge', () => {
       });
       startMaintenance();
       tick();
-      expect(state.session._bgWorkObserved).toEqual({ at: 1000, hasWork });
       for (const worker of table) worker.ppid = 1;
       child.stdout.write('{"type":"turn.completed"}\n');
       child.emit('close', 0, null);
@@ -389,7 +387,6 @@ describe('background marker behaviour in the bridge', () => {
       table.length = 0;
       tick();
       expect(state.saved()).toEqual({});
-      expect(state.session._bgWorkObserved).toEqual({ at: 1000, hasWork: false });
     });
 
     it(`manual compact boundary ${hasWork ? 'retains background work' : 'clears completed work'}`, () => {

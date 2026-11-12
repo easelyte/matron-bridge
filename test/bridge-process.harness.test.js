@@ -249,7 +249,9 @@ it.each([true, false])('counts and starts resumed launches within the crash budg
       const child = launches().at(-1);
       expect(bridge.stubStarts()).toContain(child.pid);
       // node-pty reports signal exits as 0; use a nonzero stub exit for PTY.
-      if (interactive) bridge.sendText(session.claudeSessionId, '__crash__');
+      // An idle crash: a crash mid-turn also starts a recovery turn, which this
+      // test is not about.
+      if (interactive) bridge.crashIdle(child.pid);
       else process.kill(child.pid, 'SIGKILL'); // Only the fixture's recorded child.
       await vi.waitFor(() => {
         expect(launches()).toHaveLength(count + 2);
