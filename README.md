@@ -282,6 +282,44 @@ viewer signs its calls to the bridge cannot leave secret forms and one-time
 links failing until the machine reboots. `MATRON_CODE_UPDATE_RESTART=0` in
 the viewer's environment turns it off.
 
+### Planned restart on request
+
+`scripts/planned-restart.sh "<reason>" [--sha <sha>]` (a thin client for
+`POST /restart` on the loopback API) asks the bridge to restart onto the code
+on disk at the first quiet moment, and returns at once with the restart's id.
+It never forces anything: the bridge waits for as long as work runs.
+
+The restart goes ahead at the first poll (every 5 seconds) where all of these
+hold, and held at the poll before as well:
+
+- no session holds work: a running turn, a background job under the agent
+  process, a running subagent, or queued input. Unlike the update watcher above,
+  background jobs and subagents hold without an age cap, and a process table
+  that cannot be read counts as not quiet;
+- the collect window has passed (`MATRON_RESTART_COLLECT_MS`), so requests that
+  land minutes apart ride one restart; every new request restarts the window, up
+  to 30 minutes after the first;
+- the code is pinned: every requested `--sha` is `HEAD` or an ancestor of it,
+  and the tree has no tracked changes (a request without `--sha` asks only for a
+  config reload and needs `HEAD` to be the code already running);
+- `HEAD` has passed the same preflight the update watcher runs, within the last
+  five minutes.
+
+The bridge then records the restart, writes the update watcher's stamp and exits
+with 75 through the ordinary graceful shutdown. Requests persist in
+`~/.matron-bridge-restart-state.json` before they are acknowledged; calls while
+a restart is pending join it, and calls after the stamp is written get
+`503 restarting` with the restart's id, to retry once the bridge is back (the
+script exits 6). A bridge where planned restart cannot work (no git checkout, or the
+token file could not be written) answers `501`, and the script stops with exit 3
+and does not retry. What is holding the restart, and why, is reported under
+`restart` in `box_status`.
+
+The route is gated by a capability token the bridge writes at start to
+`~/.matron-bridge-restart.env` (mode 0600) and removes at exit. That keeps stray
+HTTP from other users and processes out; it does not stop a process running as
+the same user, so who may ask is the deployment's policy.
+
 ## Config (.env)
 
 | Variable | Description | Default |
@@ -302,6 +340,8 @@ the viewer's environment turns it off.
 | `MATRON_CODE_UPDATE_POLL_MS` | How often the checkout's HEAD reflog is read for new code | `60000` (1 minute) |
 | `MATRON_CODE_UPDATE_SETTLE_MS` | How old a HEAD move must be before the new tree is preflighted and trusted (the deploy's `npm install` runs after the pull) | `300000` (5 minutes) |
 | `MATRON_CODE_UPDATE_WARN_EVERY_MS` | How often the bridge logs that it is still waiting for a running turn before it can restart onto new code | `1800000` (30 minutes) |
+| `MATRON_PLANNED_RESTART` | `0` closes `POST /restart` (see "Planned restart on request" above). | on |
+| `MATRON_RESTART_COLLECT_MS` | How long after the last restart request the bridge waits before a planned restart can go ahead, so requests that land minutes apart ride one restart (capped at 30 minutes after the first request). `0` goes at the first quiet moment. | `300000` (5 minutes) |
 | `MATRON_CODE_UPDATE_FORCE_AFTER_MS` | Opt-in: after this long waiting for a running turn, restart anyway (the turn is cut off and carries on by itself, see the next row). `0` never forces. | `0` (never) |
 | `MATRON_CODE_UPDATE_AUTO_CARRY_ON` | After a forced self-restart (`MATRON_CODE_UPDATE_FORCE_AFTER_MS`) that cut turns off, resume those chats automatically with an `[auto-continue after bridge update]` turn instead of publishing a "Carry on" card. `0`/`false`/`off` keeps the card. | on |
 | `BASH_DEFAULT_TIMEOUT_MS` | Default timeout for a bridge-spawned Claude session's Bash tool call when the model sets none. Raises Claude Code's 120000 (2 min) built-in so long Codex reviews / test suites aren't SIGTERM'd mid-run. Positive integer ms; out-of-range (>`3600000` = 1h) is clamped, malformed is ignored. Applies at session spawn — restart to take effect. | `1200000` (20 min) |

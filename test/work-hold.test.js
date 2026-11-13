@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   WORK_HOLD_MAX_MS, WORK_HOLD_LEASE_MS, liveWorkChildren, workHold, keepAwakeUntil, parseProcessTable,
-  mcpServerSignatures, isMcpServerProcess, createTransferHold,
+  mcpServerSignatures, isMcpServerProcess, createTransferHold, holdKind,
 } from '../lib/work-hold.js';
 
 // A session with work in flight is not idle (a colleague's
@@ -172,6 +172,16 @@ describe('workHold', () => {
   it('caps at eight hours and leases the host marker fifteen minutes at a time', () => {
     expect(WORK_HOLD_MAX_MS).toBe(8 * 3600 * 1000);
     expect(WORK_HOLD_LEASE_MS).toBe(15 * 60 * 1000);
+  });
+});
+
+describe('holdKind', () => {
+  it('labels each hold reason without echoing a child command line', () => {
+    expect(holdKind(workHold({ busy: true, now: T0, idleSince: T0 }).reason)).toBe('busy');
+    expect(holdKind(workHold({ subagentCount: 1, now: T0, idleSince: T0 }).reason)).toBe('subagents');
+    expect(holdKind(workHold({ subagentCount: 3, now: T0, idleSince: T0 }).reason)).toBe('subagents');
+    const children = holdKind(workHold({ children: [{ pid: 1, args: 'deploy --token=hunter2' }], now: T0, idleSince: T0 }).reason);
+    expect(children).toBe('children');
   });
 });
 

@@ -22,7 +22,7 @@ describe('box status wiring', () => {
     // no valid block, and a null block would be "malformed", not "absent".
     expect(fn).toMatch(/\.\.\.\(activity \? \{ activity \} : \{\}\)/);
     expect(fn).toMatch(/\.\.\.\(accountEmail \? \{ account: \{ email: accountEmail \} \} : \{\}\)/);
-    expect(fn).toMatch(/if \(!activity && !limits && !disk && !accountEmail && !defaults\) return false;/);
+    expect(fn).toMatch(/if \(!activity && !limits && !disk && !accountEmail && !defaults && !restart\) return false;/);
     // This box's effective defaults for new sessions (agent_boxes, the
     // spawn consent card), from the same resolvers a start uses.
     expect(fn).toMatch(/const \{ agent, source \} = defaultAgentInfo\(\);/);

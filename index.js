@@ -131,6 +131,11 @@ import {
   DEFAULT_WARN_EVERY_MS as CODE_UPDATE_WARN_EVERY_DEFAULT_MS, DEFAULT_FORCE_AFTER_MS as CODE_UPDATE_FORCE_AFTER_DEFAULT_MS,
   parseMsOrOff as parseCodeUpdateMsOrOff,
 } from './lib/code-update-restart.js';
+import { createPlannedRestartState } from './lib/planned-restart-state.js';
+import { createPlannedRestart } from './lib/planned-restart.js';
+import { createRestartLatch } from './lib/restart-latch.js';
+import { buildRestartStatus } from './lib/box-status-restart.js';
+import { installRestartToken, removeRestartToken, decideRestartRequest, MAX_BODY_BYTES as RESTART_BODY_MAX_BYTES } from './lib/restart-api.js';
 import { createSubagentConvoTracker } from './lib/subagent-convos.js';
 import { createQueuedReleaseOutbox } from './lib/queued-release-outbox.js';
 import { createQueuedReleaseRetry } from './lib/queued-release-retry.js';
@@ -192,7 +197,7 @@ import { createAgentInvites, formatInviteRequestNotice, formatAutoJoinedRequest,
 import { resolveInviteTarget } from './lib/invite-target.js';
 import { createJoinHold } from './lib/room-join-hold.js';
 import { createRoomDelivery, formatRoomMessageNotice, formatRoomDeliveredNotice, formatRoomDeliveryFailedNotice, roomEchoLabel, roomFrameDisposition, ROOM_MESSAGE_QUEUED_NOTICE, ROOM_MUTED_NOT_DELIVERED_NOTICE, ROOM_WAKE_NOTICE, parseMuteAnnouncementDetail, formatUserUnmuteAnnouncement } from './lib/room-delivery.js';
-import { parseProcessTable, liveWorkChildren, workHold, keepAwakeUntil, mcpServerSignatures, createTransferHold, WORK_HOLD_LEASE_MS } from './lib/work-hold.js';
+import { parseProcessTable, liveWorkChildren, workHold, keepAwakeUntil, mcpServerSignatures, createTransferHold, holdKind, WORK_HOLD_LEASE_MS } from './lib/work-hold.js';
 import { keepAwakeMode, powerHoldFlags, createPowerHold, POWER_HOLD_TICK_MS } from './lib/power-hold.js';
 import { unmuteChoiceValue, ROOM_MUTE_ACTION_ID, ROOM_MUTE_KIND } from './lib/room-mute-cards.js';
 import { quotedField, peerField, PEER_NAME_MAX } from './lib/peer-text.js';
@@ -386,6 +391,14 @@ const CODE_UPDATE_FORCE_AFTER_MS = parseCodeUpdateMsOrOff(process.env.MATRON_COD
 // them. MATRON_CODE_UPDATE_AUTO_CARRY_ON=0 keeps the tap.
 const CODE_UPDATE_AUTO_CARRY_ON = codeUpdateAutoCarryOnEnabled(process.env.MATRON_CODE_UPDATE_AUTO_CARRY_ON);
 const SELF_RESTART_STAMP_FILE = path.join(os.homedir(), '.matron-bridge-self-restart.json');
+// Planned restart (lib/planned-restart.js): POST /restart records a request and
+// the bridge exits onto the code on disk at the first quiet moment, never
+// mid-turn. MATRON_PLANNED_RESTART=0 closes the route. The collect window
+// batches requests that land minutes apart into one restart.
+const PLANNED_RESTART_ENABLED = process.env.MATRON_PLANNED_RESTART !== '0';
+const RESTART_COLLECT_MS = parseCodeUpdateMsOrOff(process.env.MATRON_RESTART_COLLECT_MS, 5 * 60_000);
+let plannedRestartState = null;
+const plannedRestartRuntime = { gateVerdict: null };
 
 // Resume-readiness gate (iv-mode). A freshly-spawned `claude --resume` takes
 // several seconds to load the transcript — and longer if it auto-compacts —
@@ -1164,7 +1177,9 @@ function publishBoxStatus(reason) {
       ? { agent, model: codexDefaultModelNow(), effort: codexDefaultEffortNow(), source }
       : { agent, model: defaultModelNow(), effort: defaultEffortNow(), source };
   } catch { /* best-effort */ }
-  if (!activity && !limits && !disk && !accountEmail && !defaults) return false;
+  let restart = null;
+  try { restart = buildRestartStatus(plannedRestartState?.getState(), plannedRestartRuntime.gateVerdict); } catch { /* best-effort */ }
+  if (!activity && !limits && !disk && !accountEmail && !defaults && !restart) return false;
   const sent = journalPublisher.sendRoomOp({
     op: 'box_status',
     ...(activity ? { activity } : {}),
@@ -1172,6 +1187,7 @@ function publishBoxStatus(reason) {
     ...(disk ? { disk } : {}),
     ...(accountEmail ? { account: { email: accountEmail } } : {}),
     ...(defaults ? { defaults } : {}),
+    ...(restart ? { restart } : {}),
   });
   debug(`box_status (${reason}) ${sent ? 'sent' : 'not sent (journal not connected)'}`);
   return sent;
@@ -10966,15 +10982,17 @@ function startAutoResumeSweep() {
 // background work child, or a running subagent. Background work and subagents
 // use the idle reaper's age cap, a running turn never does. One process-table
 // read per call, shared by every live session. `unreadable` reports a failed
-// `ps`: the verdict then rests on in-memory signals alone.
-function sessionsHoldingRestart() {
+// `ps`: the verdict then rests on in-memory signals alone. With `ageCap`
+// false a background job or subagent holds however long it has been quiet (a
+// planned restart never ages out a holder); a running turn never aged out.
+function sessionsHoldingRestart({ ageCap = true } = {}) {
   const live = [...sessions.values()].filter(s => s.alive);
   if (!live.length) return { holders: [], unreadable: false };
   const table = readProcessTable();
   const now = Date.now();
   const holders = [];
   for (const s of live) {
-    const last = handoffIdleSince(s);
+    const last = ageCap ? handoffIdleSince(s) : now;
     // A quiet tool call can outlast the age cap without ending its turn.
     // Subagent tracking is in memory, so it survives a failed ps read.
     const hold = s.busy
@@ -10983,7 +11001,7 @@ function sessionsHoldingRestart() {
         ? workHold({ subagentCount: s.subagentConvos?.runningCount() ?? 0, idleSince: last, now })
         : sessionWorkHold(s, last, now, table);
     if (hold) {
-      holders.push({ session: s, reason: hold.reason });
+      holders.push({ session: s, reason: hold.reason, why: holdKind(hold.reason) });
       debug(`[code-update] ${s.roomId} holds the update: ${hold.reason}`);
     }
   }
@@ -12741,6 +12759,117 @@ const pendingPlanDecisions = new Map();
 
 const API_PORT = parseInt(process.env.MATRON_BRIDGE_API_PORT || '9802', 10);
 
+// --- Planned restart (lib/planned-restart.js) ---
+//
+// POST /restart records a request; the bridge exits onto the code on disk at
+// the first poll where the gate passes: nothing holds work (a turn, a background
+// child, a running subagent, queued input), the requested shas are pinned and
+// preflighted, and the collect window has gone. It never forces. The exit is the
+// code-update watcher's: the stamp, then gracefulShutdown with the restart exit
+// code. The state file survives the exit; the next boot marks the restart back.
+const PLANNED_RESTART_POLL_MS = 5000;
+const PLANNED_RESTART_BOOT_SETTLE_MS = 60_000;
+let RESTART_BOOT_SHA = null;
+let restartToken = null;
+if (PLANNED_RESTART_ENABLED) {
+  try {
+    const gitDir = resolveGitDir(__dirname);
+    RESTART_BOOT_SHA = (gitDir ? readHeadReflog(gitDir)?.sha : null) ?? null;
+    // Without a git checkout nothing can be pinned or preflighted, so no
+    // request could ever pass: leave the route closed rather than accept them.
+    if (!RESTART_BOOT_SHA) throw new Error('no checkout');
+    plannedRestartState = createPlannedRestartState();
+    plannedRestartState.persistBootSha(RESTART_BOOT_SHA);
+  } catch {
+    plannedRestartState = null;
+    console.warn('[restart] initialization failed; planned restart unavailable');
+  }
+}
+
+// What holds a planned restart: the code-update watcher's holds, uncapped, plus
+// every state in which a session is mid-turn or about to be: an open turn whose
+// `busy` flag is down (a prompt waiting for an answer, an unacknowledged
+// interrupt), input held while a resume loads, and queued input. A failed
+// process-table read is not quiet.
+function plannedRestartQuiet() {
+  const { holders, unreadable } = sessionsHoldingRestart({ ageCap: false });
+  const list = holders.map(({ session, why }) => ({ convoId: journalConvoIdFor(session) ?? session.roomId, why }));
+  for (const session of sessions.values()) {
+    if (!session.alive || holders.some(h => h.session === session)) continue;
+    const convoId = journalConvoIdFor(session) ?? session.roomId;
+    if (sessionOccupiedForForeignTurn(session)) list.push({ convoId, why: 'busy' });
+    else if (session.queuedMessages?.length > 0 || session._resumeOutbox?.length > 0 || roomDelivery.pendingCount(session.roomId) > 0) {
+      list.push({ convoId, why: 'queued_input' });
+    }
+  }
+  return { holders: list, probe_error: unreadable ? 'process_table' : null };
+}
+
+const plannedRestart = plannedRestartState ? createPlannedRestart({
+  repoDir: __dirname,
+  stateStore: plannedRestartState,
+  collectMs: RESTART_COLLECT_MS,
+  // A restart already pending when the process boots waits for the boot's own
+  // resumes and carry-ons (the carry-on delay is 15 s) before it can go.
+  notBefore: Date.now() + PLANNED_RESTART_BOOT_SETTLE_MS,
+  quiet: plannedRestartQuiet,
+  preflight: () => defaultPreflight(__dirname),
+  warn: message => console.warn(message),
+  onReady: verdict => restartLatch.onReady(verdict),
+}) : null;
+
+const restartLatch = plannedRestart ? createRestartLatch({
+  stateStore: plannedRestartState, bootId: BRIDGE_BOOT_ID,
+  available: () => !shuttingDown,
+  quiet: plannedRestartQuiet,
+  readCode: (requests, bootSha) => plannedRestart.readCode(requests, bootSha),
+  cacheKey: sha => plannedRestart.cacheKey(sha),
+  getPreflight: () => plannedRestart.getPreflight(),
+  writeStamp: stamp => writeSelfRestartStamp(SELF_RESTART_STAMP_FILE, stamp),
+  deleteStamp: () => {
+    try { fs.unlinkSync(SELF_RESTART_STAMP_FILE); }
+    catch (error) { if (error.code !== 'ENOENT') throw error; }
+  },
+  reportState: reason => publishBoxStatus(`restart ${reason}`),
+  gracefulShutdown: (signal, options) => { void gracefulShutdown(signal, options); },
+  log: message => console.log(`[restart] ${message}`),
+}) : null;
+
+if (plannedRestart) {
+  let previous;
+  let reported;
+  const timer = setInterval(() => {
+    try {
+      const state = plannedRestartState.getState().state;
+      const changed = state !== previous;
+      previous = state;
+      if (state === 'pending') {
+        const verdict = plannedRestart.tick();
+        plannedRestartRuntime.gateVerdict = verdict;
+        // Report a changed verdict, not every poll.
+        const summary = JSON.stringify({ ...verdict.waiting_on, collect: verdict.waiting_on.collect !== null });
+        if (changed || summary !== reported) { reported = summary; publishBoxStatus('restart gate'); }
+      } else if (changed) {
+        publishBoxStatus(`restart ${state}`);
+      }
+    } catch { console.warn('[restart] tick failed'); }
+  }, PLANNED_RESTART_POLL_MS);
+  timer.unref();
+}
+
+// Boot: a restart the previous process latched is over once this one is up.
+function reconcilePlannedRestartAtBoot() {
+  if (!plannedRestartState) return;
+  try {
+    const state = plannedRestartState.getState();
+    if (state.state !== 'restarting') return;
+    const code_mismatch = state.expected_sha != null && RESTART_BOOT_SHA !== state.expected_sha;
+    plannedRestartState.setState('back', { results: { code_mismatch } });
+    console.log(`[restart] back${code_mismatch ? ' (code differs from the expected sha)' : ''}`);
+    publishBoxStatus('restart back');
+  } catch { console.warn('[restart] boot reconciliation failed'); }
+}
+
 // POST /wake (lib/wake-route.js): wake one configured conversation with one
 // configured text, the way a timer firing does — resuming a reaped session.
 // Off unless both env vars are set; the request can choose neither.
@@ -13311,6 +13440,31 @@ const apiServer = createServer(async (req, res) => {
   if (refusal) {
     res.writeHead(403, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify({ error: `refused: ${refusal}` }));
+    return;
+  }
+
+  // POST /restart (lib/restart-api.js): record a planned-restart request. Its
+  // own capability token, like /shutdown; it never forces anything.
+  if (url.pathname === '/restart' && req.method === 'POST') {
+    const reply = (status, body) => {
+      res.writeHead(status, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(body));
+    };
+    if (!PLANNED_RESTART_ENABLED) { reply(404, { error: 'disabled' }); return; }
+    // 501, not 503: this will not clear by waiting (503 means restarting, retry after back).
+    if (!plannedRestartState || !restartToken) { reply(501, { error: 'planned restart unavailable' }); return; }
+    let raw = '';
+    try {
+      for await (const chunk of req) {
+        raw += chunk;
+        if (raw.length > RESTART_BODY_MAX_BYTES) { reply(413, { error: 'request too large' }); return; }
+      }
+    } catch { reply(400, { error: 'unreadable request' }); return; }
+    let body;
+    try { body = JSON.parse(raw || '{}'); } catch { reply(400, { error: 'Invalid JSON' }); return; }
+    const decision = decideRestartRequest({ headers: req.headers, token: restartToken.token, body, stateStore: plannedRestartState });
+    if (decision.status === 200) publishBoxStatus('restart request');
+    reply(decision.status, decision.body);
     return;
   }
 
@@ -14365,6 +14519,11 @@ const apiServer = createServer(async (req, res) => {
 });
 
 apiServer.listen(API_PORT, '127.0.0.1', () => {
+  if (plannedRestartState) {
+    restartToken = installRestartToken({ port: API_PORT });
+    if (restartToken) process.on('exit', () => { try { removeRestartToken(restartToken); } catch { /* best-effort */ } });
+    else console.warn('[restart] could not write the restart token file; POST /restart is disabled');
+  }
   console.log(`Local API listening on 127.0.0.1:${API_PORT}`);
   publishOperatorToken();
 });
@@ -15523,6 +15682,7 @@ async function main() {
   // queues frames FIFO until hello_ok, exactly as the eager control-convo
   // upsert above relies on, so nothing is dropped by publishing here.
   publishRestartCarryOnCards();
+  reconcilePlannedRestartAtBoot();
   // After the carry-on cards: a self-restart for new code must never land
   // before the previous process's interruptions have been surfaced.
   startCodeUpdateWatcher();

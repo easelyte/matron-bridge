@@ -1,6 +1,6 @@
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
-import { WORK_HOLD_MAX_MS, workHold, liveWorkChildren, parseProcessTable } from '../lib/work-hold.js';
+import { WORK_HOLD_MAX_MS, workHold, liveWorkChildren, parseProcessTable, holdKind } from '../lib/work-hold.js';
 import { handoffIdleSince } from '../lib/pre-reap-handoff.js';
 
 // Source-text assertions on index.js (the idiom of test/box-status-wiring.js
@@ -39,10 +39,10 @@ describe('code-update self-restart wiring', () => {
 
   it('counts a live session as holding when it is busy (the flag /sessions reports and restart_session parks on), has a background work child, or has a running subagent', () => {
     expect(fn).toContain('busySessions: () => sessionsHoldingRestart().holders.length,');
-    const holdStart = index.indexOf('function sessionsHoldingRestart() {');
+    const holdStart = index.indexOf('function sessionsHoldingRestart(');
     const holdFn = index.slice(holdStart, index.indexOf('\n}\n', holdStart) + 3);
     expect(holdFn).toMatch(/filter\(s => s\.alive\)/);
-    expect(holdFn).toContain('const last = handoffIdleSince(s);');
+    expect(holdFn).toContain('const last = ageCap ? handoffIdleSince(s) : now;');
     expect(holdFn).toContain('sessionWorkHold(s, last, now, table)');
     expect(holdFn).toContain("const hold = s.busy\n      ? { reason: 'turn in progress' }");
     expect(holdFn).toContain('workHold({ subagentCount: s.subagentConvos?.runningCount() ?? 0, idleSince: last, now })');
@@ -114,14 +114,14 @@ describe('code-update work holds', () => {
       if (unreadable) throw new Error('process table unavailable');
       return tableOutput;
     };
-    const make = new Function('sessions', 'Date', 'workHold', 'liveWorkChildren', 'parseProcessTable', 'handoffIdleSince', 'execFileSync', 'processTableCommand', 'stripJournalCreds', 'debug', 'MCP_SERVER_SIGNATURES', `
+    const make = new Function('sessions', 'Date', 'workHold', 'liveWorkChildren', 'parseProcessTable', 'handoffIdleSince', 'holdKind', 'execFileSync', 'processTableCommand', 'stripJournalCreds', 'debug', 'MCP_SERVER_SIGNATURES', `
       ${functionSource('readProcessTable')}
       ${functionSource('sessionChildPid')}
       ${functionSource('sessionWorkHold')}
       ${functionSource('sessionsHoldingRestart')}
-      return { busySessions: () => sessionsHoldingRestart().holders.length, readProcessTable };
+      return { busySessions: () => sessionsHoldingRestart().holders.length, holders: options => sessionsHoldingRestart(options), readProcessTable };
     `);
-    return make(new Map([['room', session]]), { now: () => now }, workHold, liveWorkChildren, parseProcessTable, handoffIdleSince, execFileSync, () => ({ file: 'ps', args: [] }), () => ({}), () => {}, []);
+    return make(new Map([['room', session]]), { now: () => now }, workHold, liveWorkChildren, parseProcessTable, handoffIdleSince, holdKind, execFileSync, () => ({ file: 'ps', args: [] }), () => ({}), () => {}, []);
   }
 
   it('holds a running turn even at or beyond the eight-hour age cap', () => {
@@ -129,6 +129,16 @@ describe('code-update work holds', () => {
       expect(harness({ busy: true, age, tableOutput: '' }).busySessions()).toBe(1);
     }
     expect(harness({ busy: true, alive: false }).busySessions()).toBe(0);
+  });
+
+  it('names what holds, and an uncapped call keeps background work and subagents past the age cap', () => {
+    const idle = { busy: false, age: WORK_HOLD_MAX_MS + 1 };
+    expect(harness(idle).holders().holders).toEqual([]);
+    expect(harness(idle).holders({ ageCap: false }).holders.map(h => h.why)).toEqual(['children']);
+    expect(harness({ ...idle, subagentCount: 1, tableOutput: '' }).holders({ ageCap: false }).holders.map(h => h.why)).toEqual(['subagents']);
+    expect(harness({ busy: true }).holders().holders.map(h => h.why)).toEqual(['busy']);
+    expect(harness({ unreadable: true }).holders().unreadable).toBe(true);
+    expect(harness().holders().unreadable).toBe(false);
   });
 
   it('stops holding a background process at the existing eight-hour age cap', () => {

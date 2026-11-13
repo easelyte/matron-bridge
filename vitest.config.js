@@ -21,6 +21,8 @@ const WINDOWS_EXCLUDES = [
   // bin/run-named-node is a POSIX sh launcher for macOS (and a plain exec
   // elsewhere); Windows starts node through its own .ps1 scripts.
   'test/run-named-node.test.js',
+  // A bash client script exercised with real curl and POSIX env handling.
+  'test/planned-restart-sh.test.js',
   // Integration suites that need ffmpeg / a journal.
   'test/journal-publisher.integration.test.js',
   'test/video-frames.integration.test.js',
