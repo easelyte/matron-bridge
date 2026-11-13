@@ -198,3 +198,11 @@ it('a held note left behind by a failed move still gets its card', () => {
   expect(takeNoteOnlyRecoveries({ stateStore: f.store, notesStore: f.notes })).toEqual(['bob']);
   expect(f.notes.listHeld('restart-a')).toEqual([]);
 });
+
+it('an unreadable held-note file does not disable recovery of pending notes', () => {
+  const f = fixture({ state: 'restarting', patch: { ...latched, participants: ['bob'] }, held: [] });
+  f.notes.putPending({ id: 'restart-a', convoId: 'bob', text: 't', writtenAt: 1 });
+  const notesStore = { listPending: () => f.notes.listPending(), removePending: (id, c) => f.notes.removePending(id, c),
+    listHeld: () => { throw new Error('corrupt'); }, removeHeld() {} };
+  expect(takeNoteOnlyRecoveries({ stateStore: f.store, notesStore })).toEqual(['bob']);
+});
