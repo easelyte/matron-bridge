@@ -90,7 +90,7 @@ import { computeEditDiff } from './lib/edit-diff.js';
 import { resolveShareTarget } from './lib/share-target.js';
 import { createInteractiveSession } from './lib/interactive-session.js';
 import { projectDirFor, transcriptPathFor, findTranscriptBySessionId } from './lib/transcript-dir.js';
-import { extractUrls, isIdleReadyScreen, extractPreamble, preambleMatchesText, compactScreenText, AUTO_ENTER_COMPACT_RE, loginSuccessNearAutoEnterCue, stripAnsi, findInputCue, unwrapScreenUrls, newUrlsAgainst } from './lib/prompt-detector.js';
+import { extractUrls, isIdleReadyScreen, extractPreamble, preambleMatchesText, compactScreenText, AUTO_ENTER_COMPACT_RE, loginSuccessNearAutoEnterCue, stripAnsi, findInputCue, unwrapScreenUrls, newUrlsAgainst, dropCutUrls } from './lib/prompt-detector.js';
 import { DESIGN_LOGIN_COMMAND, DESIGN_LOGIN_CODE_REFUSED_MESSAGE, classifyDesignLoginOutput, designLoginCodeRefused, designLoginOutcomeMessage, ownsDesignLoginFinish, signInDialogHoldsInput, designLoginEndsPhantomTurn, designNeedsInteractive, DESIGN_SWITCH_ANNOUNCEMENT, INTERACTIVE_READY_MESSAGE } from './lib/design-login-flow.js';
 import { formatTuiCueMessage } from './lib/tui-cue-message.js';
 import {
@@ -4653,7 +4653,7 @@ function handleInteractiveScreenUpdate(session, update) {
   // Un-wrap URLs that claude broke across lines at terminal width so
   // the parsed URL set is correct (`...redir\nect_uri=...` → joined).
   const unwrappedScreen = unwrapScreenUrls(screen);
-  const allUrls = extractUrls(unwrappedScreen);
+  const allUrls = dropCutUrls(extractUrls(unwrappedScreen));
   // Newness is judged on the unwrapped URLs: the detector's are cut at the
   // wrap, and a wrapped OAuth URL's first line is identical on every sign-in
   // attempt, so a retry's fresh link read as already sent and never reached

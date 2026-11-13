@@ -1,8 +1,9 @@
 import { describe, it, test, expect } from 'vitest';
 import fs from 'node:fs';
+import { formatTuiCueMessage } from '../lib/tui-cue-message.js';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
-import { classifyScreen, stripAnsi, stripInputBox, isIdleReadyScreen, PromptDetector, looksLikeUnclassifiedMenu, extractPreamble, preambleMatchesText, stripQueuedWidget, loginSuccessNearAutoEnterCue, extractUrls, unwrapScreenUrls, newUrlsAgainst } from '../lib/prompt-detector.js';
+import { classifyScreen, stripAnsi, stripInputBox, isIdleReadyScreen, PromptDetector, looksLikeUnclassifiedMenu, extractPreamble, preambleMatchesText, stripQueuedWidget, loginSuccessNearAutoEnterCue, extractUrls, unwrapScreenUrls, newUrlsAgainst, dropCutUrls } from '../lib/prompt-detector.js';
 
 const __dir = path.dirname(fileURLToPath(import.meta.url));
 
@@ -1121,17 +1122,21 @@ describe('PromptDetector', () => {
       const sent = [];
       return {
         sent,
-        onUpdate({ screen }) {
-          const all = extractUrls(unwrapScreenUrls(screen));
+        onUpdate({ screen, hasInputCue }) {
+          const unwrapped = unwrapScreenUrls(screen);
+          const all = dropCutUrls(extractUrls(unwrapped));
           const fresh = newUrlsAgainst(surfaced, all);
+          if (fresh.length === 0 && !hasInputCue) return;
           for (const u of fresh) {
             for (const v of [...surfaced]) if (u.startsWith(v)) surfaced.delete(v);
             surfaced.add(u);
           }
-          if (fresh.length) sent.push(...fresh);
+          const message = formatTuiCueMessage(unwrapped, all, { hasNewUrls: fresh.length > 0 });
+          for (const part of message?.parts || []) sent.push(part.plain);
         },
       };
     }
+    const urlsSent = relay => relay.sent.filter(m => m.startsWith('http'));
 
     async function settle(det, text) {
       det.feed(text);
@@ -1149,10 +1154,22 @@ describe('PromptDetector', () => {
       await settle(det, screenFor(cut));
       await settle(det, screenFor(full));
       expect(updates).toHaveLength(2);
-      expect(relay.sent).toEqual([cut, full]);
+      expect(urlsSent(relay)).toEqual([cut, full]);
       await settle(det, screenFor(full));
       expect(updates).toHaveLength(2);
-      expect(relay.sent).toEqual([cut, full]);
+      expect(urlsSent(relay)).toEqual([cut, full]);
+    });
+
+    it('delivers the full URL when a cut was repainted twice before it', async () => {
+      const det = new PromptDetector({ idleMs: 40 });
+      const relay = makeRelay();
+      det.on('screen-update', u => relay.onUpdate(u));
+      const cut = full.slice(0, 100);
+      await settle(det, screenFor(cut));
+      await settle(det, screenFor(cut));
+      await settle(det, screenFor(full));
+      await settle(det, screenFor(full));
+      expect(urlsSent(relay)).toEqual([cut, full]);
     });
 
     it('still suppresses a cut of an already-sent full URL', async () => {
@@ -1161,7 +1178,7 @@ describe('PromptDetector', () => {
       det.on('screen-update', u => relay.onUpdate(u));
       await settle(det, screenFor(full));
       await settle(det, screenFor(full.slice(0, 100)));
-      expect(relay.sent).toEqual([full]);
+      expect(urlsSent(relay)).toEqual([full]);
     });
 
     it('compares the unwrapped URL when the TUI wraps it at terminal width', async () => {
@@ -1174,7 +1191,7 @@ describe('PromptDetector', () => {
       await settle(det, screenFor(wrap(full)));
       expect(updates).toHaveLength(2);
       expect(updates[1].urls).toEqual([full]);
-      expect(relay.sent.at(-1)).toBe(full);
+      expect(urlsSent(relay).at(-1)).toBe(full);
     });
   });
 
