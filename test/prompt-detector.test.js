@@ -1,8 +1,9 @@
 import { describe, it, test, expect } from 'vitest';
 import fs from 'node:fs';
+import { formatTuiCueMessage } from '../lib/tui-cue-message.js';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
-import { classifyScreen, stripAnsi, stripInputBox, isIdleReadyScreen, PromptDetector, looksLikeUnclassifiedMenu, extractPreamble, preambleMatchesText, stripQueuedWidget, loginSuccessNearAutoEnterCue } from '../lib/prompt-detector.js';
+import { classifyScreen, stripAnsi, stripInputBox, isIdleReadyScreen, PromptDetector, looksLikeUnclassifiedMenu, extractPreamble, preambleMatchesText, stripQueuedWidget, loginSuccessNearAutoEnterCue, extractUrls, unwrapScreenUrls, newUrlsAgainst, dropCutUrls } from '../lib/prompt-detector.js';
 
 const __dir = path.dirname(fileURLToPath(import.meta.url));
 
@@ -1105,6 +1106,106 @@ describe('PromptDetector', () => {
     det.feed(`Claude needs you to sign in.\nOpen this URL: ${base.slice(0, 100)}\nPaste code here >`);
     await new Promise(r => setTimeout(r, 120));
     expect(updates).toHaveLength(1);
+  });
+
+  describe('cut-off URL then full URL (detector + relay)', () => {
+    const base = 'https://claude.com/cai/oauth/authorize?code=true&client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e&response_type=code';
+    const full = `${base}&state=abc123&code_challenge=xyz789`;
+    const screenFor = url => `Claude needs you to sign in.\nOpen this URL: ${url}\nPaste code here >`;
+
+    // The bridge relay (handleInteractiveScreenUpdate in index.js) judges
+    // newness on the unwrapped URLs against the session's surfaced set and
+    // sends one message per update that reaches it. Mirrors that step with
+    // the same shared helpers.
+    function makeRelay() {
+      const surfaced = new Set();
+      const sent = [];
+      return {
+        sent,
+        onUpdate({ screen, hasInputCue }) {
+          const unwrapped = unwrapScreenUrls(screen);
+          const all = dropCutUrls(extractUrls(unwrapped));
+          const fresh = newUrlsAgainst(surfaced, all);
+          if (fresh.length === 0 && !hasInputCue) return;
+          for (const u of fresh) {
+            for (const v of [...surfaced]) if (u.startsWith(v)) surfaced.delete(v);
+            surfaced.add(u);
+          }
+          const message = formatTuiCueMessage(unwrapped, [...fresh, ...all.filter(u => !fresh.includes(u))], { hasNewUrls: fresh.length > 0 });
+          for (const part of message?.parts || []) sent.push(part.plain);
+        },
+      };
+    }
+    const urlsSent = relay => relay.sent.filter(m => m.startsWith('http'));
+
+    async function settle(det, text) {
+      det.feed(text);
+      await new Promise(r => setTimeout(r, 120));
+    }
+
+    it('sends the full URL after a cut-off one, and not a repaint of it', async () => {
+      const det = new PromptDetector({ idleMs: 40 });
+      const relay = makeRelay();
+      const updates = [];
+      det.on('screen-update', u => { updates.push(u); relay.onUpdate(u); });
+      // The cut keeps >80 chars, so the old 80-char prefix signature could
+      // not tell it from the full URL.
+      const cut = full.slice(0, 100);
+      await settle(det, screenFor(cut));
+      await settle(det, screenFor(full));
+      expect(updates).toHaveLength(2);
+      expect(urlsSent(relay)).toEqual([cut, full]);
+      await settle(det, screenFor(full));
+      expect(updates).toHaveLength(2);
+      expect(urlsSent(relay)).toEqual([cut, full]);
+    });
+
+    it('delivers the full URL when a cut was repainted twice before it', async () => {
+      const det = new PromptDetector({ idleMs: 40 });
+      const relay = makeRelay();
+      det.on('screen-update', u => relay.onUpdate(u));
+      const cut = full.slice(0, 100);
+      await settle(det, screenFor(cut));
+      await settle(det, screenFor(cut));
+      await settle(det, screenFor(full));
+      await settle(det, screenFor(full));
+      expect(urlsSent(relay)).toEqual([cut, full]);
+    });
+
+    it('delivers a retry\'s fresh link, not the earlier one still in the buffer', async () => {
+      const det = new PromptDetector({ idleMs: 40 });
+      const relay = makeRelay();
+      det.on('screen-update', u => relay.onUpdate(u));
+      const a = `${base}&state=aaa111&code_challenge=ccc111`;
+      const b = `${base}&state=bbb222&code_challenge=ddd222`;
+      await settle(det, screenFor(a));
+      await settle(det, screenFor(a));
+      await settle(det, screenFor(b));
+      await settle(det, screenFor(b));
+      expect(urlsSent(relay)).toEqual([a, b]);
+    });
+
+    it('still suppresses a cut of an already-sent full URL', async () => {
+      const det = new PromptDetector({ idleMs: 40 });
+      const relay = makeRelay();
+      det.on('screen-update', u => relay.onUpdate(u));
+      await settle(det, screenFor(full));
+      await settle(det, screenFor(full.slice(0, 100)));
+      expect(urlsSent(relay)).toEqual([full]);
+    });
+
+    it('compares the unwrapped URL when the TUI wraps it at terminal width', async () => {
+      const det = new PromptDetector({ idleMs: 40 });
+      const relay = makeRelay();
+      const updates = [];
+      det.on('screen-update', u => { updates.push(u); relay.onUpdate(u); });
+      const wrap = url => url.replace(/(.{60})/g, '$1\n');
+      await settle(det, screenFor(wrap(full.slice(0, 100))));
+      await settle(det, screenFor(wrap(full)));
+      expect(updates).toHaveLength(2);
+      expect(updates[1].urls).toEqual([full]);
+      expect(urlsSent(relay).at(-1)).toBe(full);
+    });
   });
 
   it('suppresses a wizard repaint whose cue phrase flapped within the oauth family', async () => {

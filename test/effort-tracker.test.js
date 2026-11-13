@@ -191,7 +191,7 @@ describe('index.js effort-tracking wiring', () => {
   it('settles the confirmation from both answer paths (typed reply and journal tap)', () => {
     const typed = src.slice(
       src.indexOf('function maybeResolveInteractivePrompt('),
-      src.indexOf('function unwrapUrls('),
+      src.indexOf('function handleInteractiveScreenUpdate('),
     );
     expect(typed).toContain('noteEffortConfirmationAnswer(session, p,');
     const tapStart = src.indexOf('function journalRoutePromptReply(');
