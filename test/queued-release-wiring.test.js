@@ -74,6 +74,6 @@ describe('queued-release reconnect wiring (F1)', () => {
       .replace(/^function journalHandleInboundEvent\(frame\) \{/, '')
       .replace(/\s+/g, ' ')
       .trim();
-    expect(code).toBe('journalInputConsumer(frame); releaseLifecycle.onInboundEvent(); }');
+    expect(code).toBe('noteQuestionPromptEcho(frame); journalInputConsumer(frame); releaseLifecycle.onInboundEvent(); }');
   });
 });

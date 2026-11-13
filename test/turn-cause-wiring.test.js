@@ -15,9 +15,9 @@ const fnBody = (sig) => {
 describe('turn causes reach sendToSession from every turn source', () => {
   it('a user\'s message names itself by convo and seq, on the direct send and on the queue entry', () => {
     expect(fnBody('function journalOnText(')).toContain('const causes = seq != null && convoId ? [userMessageCause(convoId, seq)] : null;');
-    expect(fnBody('function journalOnText(')).toContain('journalRouteTextToSession(session, body, { steerable: true, causes })');
+    expect(fnBody('function journalOnText(')).toContain('journalRouteTextToSession(session, body, { causes })');
     const route = fnBody('async function journalRouteTextToSession(');
-    expect(route).toContain('{ keepRestartBudget = false, steerable = false, causes = null } = {}');
+    expect(route).toContain('{ keepRestartBudget = false, causes = null } = {}');
     expect(route).toContain('const entry = tagCauses(markJournalOrigin([{ type: \'text\', text: trimmed }]), causes);');
     expect(route.match(/sendTextToSession\(session, trimmed, \{ skipJournalMirror: true, causes \}\)/g)).toHaveLength(2);
   });
@@ -54,7 +54,7 @@ describe('turn causes reach sendToSession from every turn source', () => {
 
   it('queued and resume-held messages keep their causes, and the flush that sends them merges them', () => {
     expect(fnBody('function sendToSession(')).toContain('(session._resumeOutbox ||= []).push(tagCauses(skipJournalMirror ? markJournalOrigin(contentBlocks) : contentBlocks, causes));');
-    expect(fnBody('function dispatchMergedFlush(')).toContain('sendToSession(session, blocks, { skipJournalMirror: true, causes: queueCauses(queued) })');
+    expect(fnBody('function dispatchMergedFlush(')).toContain('sendToSession(session, blocks, { skipJournalMirror: true, causes: queueCauses(queued), queuedEntries: queued })');
     expect(fnBody('async function journalQueueMedia(')).toContain('const entry = tagCauses([...blocks], cause);');
   });
 
@@ -105,13 +105,13 @@ describe('a running turn only ever gains causes', () => {
 
   it('a send failure ends the turn only when that send began it', () => {
     const report = fnBody('function reportSessionSendFailure(');
-    expect(report).toContain('{ restoreJournalState = false, beganTurn = false } = {}');
+    expect(report).toContain('{ restoreJournalState = false, beganTurn = false, preserveRunningTurn = false } = {}');
     expect(report).toContain('if (beganTurn) endTurn(session);');
     expect(report.match(/endTurn\(/g)).toHaveLength(1);
     const send = fnBody('function sendToSession(');
-    // The three dispatch failures after the turn starts pass the flag; the
+    // The four dispatch failures after the turn starts pass the flag; the
     // validation rejects before it pass nothing, so they never end a turn.
-    expect(send.match(/\{ restoreJournalState: true, beganTurn \}/g)).toHaveLength(4);
+    expect(send.match(/\{ restoreJournalState: true, beganTurn(, preserveRunningTurn: steering)? \}/g)).toHaveLength(4);
     expect(send.match(/reportSessionSendFailure\(/g).length).toBeGreaterThanOrEqual(7);
   });
 

@@ -1,13 +1,15 @@
 // Behavioural tests for the index.js side of mid-turn Claude steering: the
-// journal busy branch, the steer writer, the result-handler hold and the
+// journal busy branch, the shared writer, the result-handler hold and the
 // backstop. The real functions are lifted out of index.js and run in a vm
 // context with stubbed collaborators.
 import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as steer from '../lib/claude-steer.js';
-import { markJournalOrigin } from '../lib/queue-flush.js';
+import { markJournalOrigin, planQueueFlush } from '../lib/queue-flush.js';
+import { queueCauses, tagCauses, mergeIntoTurn, mergeCauses, beginOrJoinTurn } from '../lib/turn-cause.js';
 import { hasQueuedCompact, isCompactCommand } from '../lib/compact-priority.js';
+import { createQueuedDispatcher } from '../lib/queued-dispatch.js';
 
 const source = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
 function sourceOf(name) {
@@ -19,24 +21,28 @@ function sourceOf(name) {
 }
 
 const LIFTED = [
-  'bumpTurnGeneration', 'clearPendingInterrupt', 'steerIntoRunningTurn', 'commitSteeredMessage',
+  'reportSessionSendFailure', 'notifyFinalUndeliveredQueue', 'retireSupersededQuestionCard', 'noteQuestionPromptEcho', 'journalHandleInboundEvent',
+  'clearPendingInterrupt', 'sendToSession', 'dispatchMergedFlush', 'applyPendingAgentHandoff', 'sendAllQuestions', 'notifyUndeliveredQueue', 'steerableBatchText', 'claudeSteerEligible', 'trySteerEntry', 'flushQueue', 'restoreQueuedBatch', 'commitSteeredMessage',
   'requeueSteeredMessages', 'settleDroppedSteers', 'releaseSteersToCli', 'requeueCancelledSteer',
   'requeueFailedSteer', 'supersedePromptsForSteerHold', 'beginHeldSteerTurn', 'releaseStaleSteerHold',
-  'handleClaudeEvent', 'journalRouteTextToSession', 'killSession',
+  'handleClaudeEvent', 'journalRouteTextToSession', 'killSession', 'recreateSession',
 ];
 const KEYWORDS = new Set(['if', 'for', 'while', 'switch', 'catch', 'function', 'return', 'typeof', 'new', 'await', 'async', 'super']);
 
 function setup({ session: overrides = {}, steerEnabled = true } = {}) {
-  const lifted = LIFTED.map(sourceOf).join('\n');
+  const close = source.indexOf("  proc.on('close', (exitCode) => {");
+  const closeBody = source.slice(close + "  proc.on('close', (exitCode) => {".length, source.indexOf('\n  });', close));
+  const lifted = LIFTED.map(sourceOf).join('\n') + `\nfunction closeSession(session, exitCode, proc = session.proc) {${closeBody}\n}`;
   const stdinWrite = vi.fn();
   const session = {
-    agent: 'claude', alive: true, busy: true, roomId: 'room', turnGeneration: 7, _cliInitGeneration: 7,
+    agent: 'claude', alive: true, busy: true, roomId: 'room', _turnInitSeen: true,
     proc: { stdin: { write: stdinWrite, writable: true } }, queuedMessages: null, queueNotifications: [],
-    responseBuffer: 'partial reply', toolCalls: ['tool A'], turnCount: 0, turnTier: 'peer',
+    responseBuffer: 'partial reply', toolCalls: ['tool A'], turnCount: 0,
     totalUsage: { input_tokens: 0, output_tokens: 0, cache_read: 0, cache_create: 0 },
     ...overrides,
   };
   const replies = [];
+  const frames = [];
   const ctxObj = { sendReply: vi.fn(async (m) => { replies.push(m); }), sendHtml: vi.fn(), sender: 'user' };
   const explicit = {
     console: { log() {}, warn() {}, error() {} },
@@ -44,16 +50,27 @@ function setup({ session: overrides = {}, steerEnabled = true } = {}) {
     setTimeout, clearTimeout,
     ...steer,
     CLAUDE_STEER_ENABLED: steerEnabled,
+    roomId: 'room', cwd: '.', shuttingDown: false,
     AGENT_CODEX: 'codex',
     randomUUID: (() => { let n = 0; return () => `steer-uuid-${++n}`; })(),
     sessions: new Map(),
-    markJournalOrigin, hasQueuedCompact, isCompactCommand,
+    markJournalOrigin, hasQueuedCompact, isCompactCommand, planQueueFlush, queueCauses, tagCauses, mergeIntoTurn, mergeCauses, beginOrJoinTurn,
+    pendingMediaMirror: () => [],
+    contextFullToNative: () => null,
+    AGENT_CLAUDE: 'claude',
     restartLatch: undefined,
     inflightMarker: { touch: vi.fn(), noteTurnStart: vi.fn(), noteTurnEnd: vi.fn() },
     foreignSessions: { end: vi.fn() },
     planItems: { opened: vi.fn() },
-    journalPublisher: { flushCursor: vi.fn() },
-    journalInputConsumer: { queueRelease: null },
+    journalPublisher: {
+      flushCursor: vi.fn(),
+      publishPromptReply: vi.fn((convoId, payload) => frames.push({ convo_id: convoId, type: 'prompt_reply', payload })),
+    },
+    findSessionByClaudeSessionId: (convoId) => convoId === 'convo' ? session : null,
+    journalInputConsumer: Object.assign(vi.fn(), { queueRelease: null }),
+    _releaseReconcileTimer: null,
+    releaseLifecycle: { onInboundEvent: vi.fn() },
+    journalMediaRouter: { hasInflightMedia: () => false },
     journalConvoIdFor: () => 'convo',
     journalSessionCommandCtx: () => ctxObj,
     dispatchJournalBridgeCommand: vi.fn(async () => false),
@@ -78,7 +95,7 @@ function setup({ session: overrides = {}, steerEnabled = true } = {}) {
     requeuedSteerAt: new WeakMap(),
     journalPublishUserItem: vi.fn(),
     // Passed by reference (not called) in the busy branch.
-    formatQueueSummary: vi.fn(), flushQueue: vi.fn(), clearQueueNotifications: vi.fn(),
+    formatQueueSummary: vi.fn(), clearQueueNotifications: vi.fn(),
     emitRelease: vi.fn(), escapeHtml: (t) => t,
   };
   // Every other function the lifted code calls becomes an inert stub; they
@@ -94,7 +111,25 @@ function setup({ session: overrides = {}, steerEnabled = true } = {}) {
   vm.createContext(context);
   vm.runInContext(lifted, context);
   context.sessions.set(session.roomId, session);
-  return { session, context, stdinWrite, replies, ctxObj };
+  // The fork keeps flushQueue and its release/restore helpers in
+  // lib/queued-dispatch.js; index.js only delegates to this dispatcher.
+  context.queuedDispatcher = createQueuedDispatcher({
+    queueRelease: { listLive: () => [], dropItem: vi.fn() },
+    emitRelease: context.emitRelease,
+    journalConvoIdFor: context.journalConvoIdFor,
+    dispatchMergedFlush: (...args) => context.dispatchMergedFlush(...args),
+    journalPublishNotice: context.journalPublishNotice,
+    runQueuedCleanup: vi.fn(),
+    sessions: context.sessions,
+    commitDispatchedUserTurn: context.commitDispatchedUserTurn,
+    journalPublishUserItem: context.journalPublishUserItem,
+    journalMirrorUserMedia: context.journalMirrorUserMedia,
+    dispatchDeferredCommand: context.dispatchDeferredCommand,
+    flushPendingSessionQueue: context.flushPendingSessionQueue,
+    maybeFlushRoomDelivery: context.maybeFlushRoomDelivery,
+    log: context.console,
+  });
+  return { session, context, stdinWrite, replies, frames, ctxObj };
 }
 
 const lifecycle = (state, uuid = 'steer-uuid-1') => ({ type: 'command_lifecycle', command_uuid: uuid, state });
@@ -103,20 +138,288 @@ const result = (text = 'done') => ({ type: 'result', result: text, usage: { inpu
 afterEach(() => vi.useRealTimers());
 
 describe('item turn steering wiring', () => {
-  it('uses the user gate and running-turn writer without posting a notice', () => {
+  it('steers item replies through the same helper as chat, carrying the reply cause', () => {
     const start = source.indexOf('const itemTurnRouter = createItemTurnRouter({');
     const wiring = source.slice(start, source.indexOf('\n});', start));
-    expect(wiring).toContain(`steerText: (session, { text }) => canSteerClaude(session, {`);
-    expect(wiring).toContain(`enabled: CLAUDE_STEER_ENABLED, origin: 'user', text, inputHeld: effortFlowHoldsInput(session),`);
-    expect(wiring).toContain(`}).ok && steerIntoRunningTurn(session, [{ type: 'text', text }])`);
+    expect(wiring).toContain('return trySteerEntry(session, entry);');
+    expect(wiring).toContain('entry.steerSource = source;');
     expect(wiring).not.toContain('STEER_NOTICE');
   });
 });
 
-describe('journal text into a running Claude turn', () => {
-  it('steers plain typed text: one stdin line with a uuid, nothing queued, notice posted, turn untouched', async () => {
+const userCause = [{ kind: 'user_message', ref: 'convo:5', at: 1 }];
+const reminderCause = [{ kind: 'reminder', at: 1 }];
+
+describe('shared running-turn writer', () => {
+  it.each(['media', 'reminder'])('tracks a forced %s flush and holds its follow-up', (kind) => {
+    vi.useFakeTimers();
+    const h = setup({ session: { _steerLifecycleSeen: true } });
+    const blocks = kind === 'media' ? [{ type: 'image', source: { type: 'base64', data: 'image' } }]
+      : [{ type: 'text', text: 'Reminder: check progress' }];
+    const entry = tagCauses(blocks, reminderCause);
+    expect(h.context.flushQueue(h.session, [entry], { convoId: 'convo', entries: [] })).toBe(true);
+    expect(h.stdinWrite).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(h.stdinWrite.mock.calls[0][0]).message.content).toEqual(blocks);
+    expect(h.session._steered.get('steer-uuid-1').state).toBe('written');
+    expect(h.session._turnInitSeen).toBe(true);
+    expect(h.session.responseBuffer).toBe('partial reply');
+    expect(h.context.commitDispatchedUserTurn).not.toHaveBeenCalled();
+    h.context.handleClaudeEvent(h.session, result());
+    expect(h.session.busy).toBe(true);
+    expect(h.session._steerHold).toBeTruthy();
+  });
+
+  it('keeps the original writer behaviour with the feature disabled', () => {
+    const h = setup({ steerEnabled: false });
+    expect(h.context.sendToSession(h.session, [{ type: 'text', text: 'follow up' }])).toBe(true);
+    expect(JSON.parse(h.stdinWrite.mock.calls[0][0]).uuid).toBeUndefined();
+    expect(h.session._steered).toBeUndefined();
+    expect(h.context.commitDispatchedUserTurn).toHaveBeenCalledTimes(1);
+  });
+
+  it.each(['dead', 'exited', 'signal', 'replaced', 'removed', 'stopped'])('reports failed writes when the session is %s', (state) => {
     const h = setup();
-    await h.context.journalRouteTextToSession(h.session, 'also check the tests', { steerable: true });
+    h.context.sendToSession(h.session, [{ type: 'text', text: 'follow up' }]);
+    if (state === 'dead') h.session.alive = false;
+    if (state === 'exited') h.session.proc.exitCode = 0;
+    if (state === 'signal') h.session.proc.signalCode = 'SIGTERM';
+    if (state === 'replaced') h.context.sessions.set('room', { alive: true });
+    if (state === 'removed') h.context.sessions.delete('room');
+    if (state === 'stopped') h.session._autoStopped = true;
+    h.stdinWrite.mock.calls[0][1](new Error('write failed'));
+    expect(h.session.queuedMessages).toBeNull();
+    expect(h.context.notifyQueuedMessage).not.toHaveBeenCalled();
+    expect(h.context.journalPublishNotice).toHaveBeenCalledWith('convo',
+      "⚠️ Couldn't deliver your queued message — the session ended before it was sent.");
+  });
+
+  it.each([userCause, null])('restores text editing on a failed typed steer with causes %j', (causes) => {
+    const h = setup();
+    h.context.sendToSession(h.session, [{ type: 'text', text: 'follow up' }], { causes });
+    h.stdinWrite.mock.calls[0][1](new Error('write failed'));
+    expect(h.context.notifyQueuedMessage).toHaveBeenCalledWith(h.session, 'follow up', expect.objectContaining({
+      editMode: 'replace', fullText: 'follow up',
+    }));
+  });
+
+  it.each([
+    ['/compact', null],
+    ['/compact keep the summary', null],
+    ['//compact', 'replace'],
+  ])('restores the normal queue edit mode for a failed send-now of %s', (text, editMode) => {
+    const h = setup();
+    const entry = tagCauses(markJournalOrigin([{ type: 'text', text }]), userCause);
+    expect(h.context.flushQueue(h.session, [entry], { convoId: 'convo', entries: [] })).toBe(true);
+    h.stdinWrite.mock.calls[0][1](new Error('write EPIPE'));
+    expect(h.session.queuedMessages).toHaveLength(1);
+    expect(h.context.notifyQueuedMessage).toHaveBeenCalledWith(h.session, text, expect.objectContaining({
+      editMode, fullText: text,
+    }));
+  });
+
+  it.each([1, 2])('reports %i messages requeued by EPIPE before a final close, once', (count) => {
+    const h = setup();
+    const queued = Array.from({ length: count }, (_, i) =>
+      tagCauses(markJournalOrigin([{ type: 'text', text: `follow up ${i}` }]), userCause));
+    h.context.flushQueue(h.session, queued, { convoId: 'convo', entries: [] });
+    const callback = h.stdinWrite.mock.calls[0][1];
+    callback(new Error('write EPIPE'));
+    expect(h.session.alive).toBe(true);
+    expect(h.session.queuedMessages).toHaveLength(count);
+    expect(h.context.journalPublishNotice).not.toHaveBeenCalled();
+    h.context.closeSession(h.session, 0);
+    callback(new Error('write EPIPE'));
+    expect(h.context.sessions.has('room')).toBe(false);
+    expect(h.context.journalPublishNotice).toHaveBeenCalledExactlyOnceWith('convo', count > 1
+      ? "⚠️ Couldn't deliver 2 queued messages — the session ended before they were sent."
+      : "⚠️ Couldn't deliver your queued message — the session ended before it was sent.");
+  });
+
+  it('carries an EPIPE requeue through auto-restart without an undelivered notice', () => {
+    const h = setup();
+    h.context.shouldAutoRestart.mockReturnValue(true);
+    h.context.createSession.mockReturnValue({});
+    h.context.journalInputConsumer.queueRelease = { carryForward: vi.fn() };
+    h.context.sendToSession(h.session, [{ type: 'text', text: 'follow up' }]);
+    h.stdinWrite.mock.calls[0][1](new Error('write EPIPE'));
+    h.context.closeSession(h.session, 1);
+    expect(h.context.sessions.get('room').queuedMessages).toBe(h.session.queuedMessages);
+    expect(h.context.journalPublishNotice).not.toHaveBeenCalled();
+  });
+
+  it.each(['exit', 'signal'])('retains a failed steer between %s and close for auto-restart', (event) => {
+    const h = setup({ session: { restartCount: 0 } });
+    vm.runInContext(sourceOf('shouldAutoRestart'), h.context);
+    const restarted = {};
+    h.context.createSession.mockReturnValue(restarted);
+    h.context.journalInputConsumer.queueRelease = { carryForward: vi.fn() };
+    h.context.sendToSession(h.session, [{ type: 'text', text: 'follow up' }]);
+    h.session.proc.exitCode = event === 'exit' ? 1 : null;
+    h.session.proc.signalCode = event === 'signal' ? 'SIGTERM' : null;
+    const callback = h.stdinWrite.mock.calls[0][1];
+    callback(new Error('write EPIPE'));
+    expect(h.session._steered.size).toBe(1);
+    expect(h.context.journalPublishNotice).not.toHaveBeenCalled();
+    expect(h.context.notifyQueuedMessage).not.toHaveBeenCalled();
+    h.context.closeSession(h.session, h.session.proc.exitCode);
+    callback(new Error('write EPIPE'));
+    expect(restarted.queuedMessages).toEqual([[{ type: 'text', text: 'follow up' }]]);
+    expect(h.context.notifyQueuedMessage).toHaveBeenCalledTimes(1);
+    expect(h.context.journalPublishNotice).not.toHaveBeenCalled();
+  });
+
+  it.each(['clean exit', 'restart limit', 'resume failure', 'shutdown'])('reports a failed steer after a final %s', (reason) => {
+    const h = setup({ session: { restartCount: reason === 'restart limit' ? 3 : 0 } });
+    vm.runInContext(sourceOf('shouldAutoRestart'), h.context);
+    h.context.sendToSession(h.session, [{ type: 'text', text: 'follow up' }]);
+    h.session.proc.exitCode = reason === 'clean exit' ? 0 : 1;
+    h.session._resumeFailed = reason === 'resume failure';
+    h.context.shuttingDown = reason === 'shutdown';
+    h.stdinWrite.mock.calls[0][1](new Error('write EPIPE'));
+    expect(h.session._steered.size).toBe(0);
+    h.context.closeSession(h.session, h.session.proc.exitCode);
+    expect(h.context.notifyQueuedMessage).not.toHaveBeenCalled();
+    expect(h.context.journalPublishNotice).toHaveBeenCalledExactlyOnceWith('convo',
+      "⚠️ Couldn't deliver your queued message — the session ended before it was sent.");
+  });
+
+  it.each([false, true])('leaves transferred queue notices to the replacement (steering enabled: %s)', (steerEnabled) => {
+    const queued = [[{ type: 'text', text: 'follow up' }]];
+    const h = setup({ steerEnabled, session: { queuedMessages: queued } });
+    const next = { alive: true, busy: false };
+    h.context.createSession.mockImplementation(() => {
+      h.context.sessions.set('room', next);
+      return next;
+    });
+    h.context.journalInputConsumer.queueRelease = { carryForward: vi.fn() };
+    h.context.flushPendingSessionQueue.mockImplementation((session) => {
+      session.queuedMessages = null;
+      return true;
+    });
+    expect(h.context.recreateSession('room', {}, h.ctxObj)).toBe(next);
+    expect(h.context.flushPendingSessionQueue).toHaveBeenCalledWith(next);
+    expect(h.session.queuedMessages).toBe(queued);
+    expect(h.session._queueTransferred).toBe(steerEnabled ? true : undefined);
+    h.context.closeSession(h.session, 0);
+    expect(h.context.journalPublishNotice).not.toHaveBeenCalled();
+    // A later queue on the replacement still gets its own final notice.
+    next.queuedMessages = queued;
+    h.context.notifyFinalUndeliveredQueue(next, []);
+    expect(h.context.journalPublishNotice).toHaveBeenCalledTimes(steerEnabled ? 1 : 0);
+  });
+
+  it('restores item reply editing and source on a restart', () => {
+    const h = setup();
+    const entry = tagCauses(markJournalOrigin([{ type: 'text', text: 'reply' }]), [{ kind: 'item_reply', at: 1 }]);
+    entry.steerSource = { item_id: 'item', comment_id: 'comment' };
+    expect(h.context.trySteerEntry(h.session, entry)).toBe(true);
+    h.context.killSession(h.session, 'SIGTERM', { preserveQueue: true });
+    expect(h.context.notifyQueuedMessage).toHaveBeenCalledWith(h.session, 'reply', expect.objectContaining({
+      editMode: 'resend', source: entry.steerSource,
+    }));
+  });
+
+  it('reports every unstarted message in a merged batch on final exit', () => {
+    const h = setup();
+    const queued = ['first', 'second'].map(text => tagCauses(markJournalOrigin([{ type: 'text', text }]), userCause));
+    h.context.flushQueue(h.session, queued, { convoId: 'convo', entries: [] });
+    h.context.killSession(h.session);
+    expect(h.context.journalPublishNotice).toHaveBeenCalledWith('convo',
+      "⚠️ Couldn't deliver 2 queued messages — the session ended before they were sent.");
+    expect(h.context.notifyQueuedMessage).not.toHaveBeenCalled();
+    h.context.killSession(h.session);
+    expect(h.context.journalPublishNotice).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([false, true])('retires question cards with a targeted prompt reply (echo delayed: %s)', (delayed) => {
+    const sendButtonMessage = vi.fn();
+    const h = setup({ session: { pendingQuestions: [{ question: 'Which?', options: [{ label: 'A' }] }], sendButtonMessage } });
+    h.context.sendAllQuestions(h.session);
+    expect(h.session.questionPromptIds).toEqual(['steer-uuid-1']);
+    expect(sendButtonMessage.mock.calls[0][5]).toMatchObject({ prompt_id: 'steer-uuid-1', mode: 'pick_one' });
+    const echo = { type: 'prompt', sender: 'agent:bridge', convo_id: 'convo', seq: 42,
+      payload: sendButtonMessage.mock.calls[0][5] };
+    if (!delayed) h.context.journalHandleInboundEvent(echo);
+    h.session.waitingForAnswer = 'text-reply';
+    h.context.supersedePromptsForSteerHold(h.session, {});
+    if (delayed) {
+      expect(h.frames).toEqual([]);
+      h.context.journalHandleInboundEvent(echo);
+    }
+    expect(h.frames).toEqual([{ convo_id: 'convo', type: 'prompt_reply', payload: {
+      target_seq: 42, choice: null, text: steer.STEER_PROMPT_SUPERSEDED_NOTICE,
+    } }]);
+    expect(h.context.emitRelease).not.toHaveBeenCalled();
+    h.context.journalHandleInboundEvent(echo);
+    expect(h.frames).toHaveLength(1);
+  });
+
+  it.each(['close', 'kill'])('combines queued and unstarted steer counts on final %s, once', (exit) => {
+    const h = setup();
+    const batch = ['first', 'second'].map(text => tagCauses(markJournalOrigin([{ type: 'text', text }]), userCause));
+    h.context.flushQueue(h.session, batch, { convoId: 'convo', entries: [] });
+    h.session.queuedMessages = [[{ type: 'text', text: 'third' }]];
+    if (exit === 'kill') h.context.killSession(h.session);
+    h.context.closeSession(h.session, 0);
+    expect(h.context.journalPublishNotice).toHaveBeenCalledExactlyOnceWith('convo',
+      "⚠️ Couldn't deliver 3 queued messages — the session ended before they were sent.");
+  });
+
+  it('forgets normally answered question cards without retiring them again on echo', () => {
+    const h = setup({ session: {
+      pendingQuestions: [{ question: 'Which?', options: [{ label: 'A' }] }],
+      sendButtonMessage: vi.fn(), waitingForAnswer: 'text-reply',
+    } });
+    h.context.sendAllQuestions(h.session);
+    vm.runInContext(sourceOf('submitAnswer'), h.context);
+    h.context.submitAnswer(h.session, 'A');
+    expect(h.session.questionPromptCards.size).toBe(0);
+    h.context.journalHandleInboundEvent({ type: 'prompt', sender: 'agent:bridge', convo_id: 'convo', seq: 42,
+      payload: { prompt_id: 'steer-uuid-1' } });
+    expect(h.frames).toEqual([]);
+    expect(h.context.sendTextToSession).toHaveBeenCalledWith(h.session, 'A', { skipJournalMirror: true, causes: null });
+  });
+
+  it('keeps the running turn and reports an immediate steering write failure', () => {
+    const currentTurn = { causes: userCause, startedAt: 1 };
+    const sendCallback = vi.fn();
+    const h = setup({ session: { currentTurn, sendCallback } });
+    h.stdinWrite.mockImplementation(() => { throw new Error('EPIPE'); });
+    expect(h.context.sendToSession(h.session, [{ type: 'text', text: 'follow up' }])).toBe(false);
+    expect(h.session.busy).toBe(true);
+    expect(h.session.currentTurn).toBe(currentTurn);
+    expect(h.context.endTurn).not.toHaveBeenCalled();
+    expect(h.context.inflightMarker.noteTurnEnd).not.toHaveBeenCalled();
+    expect(h.context.journalSessionState).not.toHaveBeenCalled();
+    expect(h.context.journalActivity).not.toHaveBeenCalled();
+    expect(sendCallback).toHaveBeenCalledExactlyOnceWith('Could not send the message to Claude: EPIPE');
+    expect(h.session._steered.size).toBe(0);
+  });
+
+  it.each([false, true])('consumes a steered handoff only after a successful write (throws: %s)', (throws) => {
+    const pending = { prompt: 'Shared context', toIndex: 2 };
+    const h = setup({ session: { _pendingAgentHandoff: pending } });
+    h.context.persistSession = vi.fn();
+    h.context.recordConversationMessage = vi.fn();
+    vm.runInContext(sourceOf('commitDispatchedUserTurn'), h.context);
+    h.context.prependHandoffPrompt.mockImplementation((blocks) => [{ type: 'text', text: pending.prompt }, ...blocks]);
+    if (throws) h.stdinWrite.mockImplementation(() => { throw new Error('EPIPE'); });
+    expect(h.context.sendToSession(h.session, [{ type: 'text', text: 'follow up' }])).toBe(!throws);
+    expect(JSON.parse(h.stdinWrite.mock.calls[0][0]).message.content[0].text).toBe(pending.prompt);
+    expect(h.session._pendingAgentHandoff).toBe(throws ? pending : null);
+    expect(h.context.recordConversationMessage).not.toHaveBeenCalled();
+    if (!throws) {
+      expect(h.session._agentHistoryCursor).toBe(2);
+      h.context.handleClaudeEvent(h.session, lifecycle('started'));
+      expect(h.context.recordConversationMessage).toHaveBeenCalledWith(h.session, 'user', 'follow up');
+    }
+  });
+});
+
+describe('journal text into a running Claude turn', () => {
+  it('steers plain typed text through flushQueue: one stdin line with a uuid, nothing queued, notice posted', async () => {
+    const h = setup();
+    await h.context.journalRouteTextToSession(h.session, 'also check the tests', { causes: userCause });
     expect(h.stdinWrite).toHaveBeenCalledTimes(1);
     const line = JSON.parse(h.stdinWrite.mock.calls[0][0]);
     expect(line).toMatchObject({ type: 'user', uuid: 'steer-uuid-1', session_id: '', parent_tool_use_id: null });
@@ -126,39 +429,91 @@ describe('journal text into a running Claude turn', () => {
     expect(h.replies).toEqual([steer.STEER_NOTICE]);
     expect(h.session.responseBuffer).toBe('partial reply');
     expect(h.session.toolCalls).toEqual(['tool A']);
-    expect(h.session.turnGeneration).toBe(7);
     expect(h.session.busy).toBe(true);
     expect(h.session._steered.get('steer-uuid-1').state).toBe('written');
     // History waits for the CLI to start the message.
     expect(h.context.commitDispatchedUserTurn).not.toHaveBeenCalled();
     expect(h.context.journalSessionState).not.toHaveBeenCalled();
-    // The running turn now carries operator work.
-    expect(h.session.turnTier).toBeNull();
+    // The queued card (if any) is retired by the dispatcher's finalizeSentQueue
+    // (lib/queued-dispatch.js); this entry never had one, so no release goes out.
+    expect(h.context.emitRelease).not.toHaveBeenCalled();
+  });
+
+  it('merges the message cause into the running turn and keeps the turn cause list intact', async () => {
+    const running = [{ kind: 'routine', ref: 'routine:nightly@t', at: 1 }];
+    const h = setup({ session: { currentTurn: { causes: running, startedAt: 1 } } });
+    await h.context.journalRouteTextToSession(h.session, 'also check the tests', { causes: userCause });
+    expect(h.session.currentTurn.causes.map(c => c.kind)).toEqual(['routine', 'user_message']);
+    expect(h.session.currentTurn.causes[1].ref).toBe('convo:5');
+  });
+
+  it('keeps the merged causes on the turn the CLI runs for a held steer', async () => {
+    const h = setup({ session: { currentTurn: { causes: [{ kind: 'user_message', ref: 'convo:1', at: 1 }], startedAt: 1 } } });
+    await h.context.journalRouteTextToSession(h.session, 'follow up', { causes: [{ kind: 'user_message', ref: 'convo:2', at: 2 }] });
+    h.context.handleClaudeEvent(h.session, lifecycle('queued'));
+    h.context.handleClaudeEvent(h.session, result('first reply'));
+    expect(h.session.busy).toBe(true);
+    expect(h.session.currentTurn.causes.map(c => c.ref)).toEqual(['convo:1', 'convo:2']);
+    expect(h.context.endTurn).not.toHaveBeenCalled();
+    h.context.handleClaudeEvent(h.session, lifecycle('started'));
+    h.context.handleClaudeEvent(h.session, result('second reply'));
+    expect(h.session.busy).toBe(false);
+    expect(h.context.endTurn).toHaveBeenCalledTimes(1);
   });
 
   it('falls back to the queue when the stdin write throws', async () => {
     const h = setup();
     h.stdinWrite.mockImplementation(() => { throw new Error('EPIPE'); });
-    await h.context.journalRouteTextToSession(h.session, 'also check the tests', { steerable: true });
+    await h.context.journalRouteTextToSession(h.session, 'also check the tests', { causes: userCause });
     expect(h.session.queuedMessages).toHaveLength(1);
+    expect(h.session.queuedMessages[0]).toEqual([{ type: 'text', text: 'also check the tests' }]);
+    expect(h.session.queueNotifications).toEqual([]);
     expect(h.context.notifyQueuedMessage).toHaveBeenCalledTimes(1);
     expect(h.replies).toEqual([]);
     expect(h.session._steered?.size ?? 0).toBe(0);
   });
 
+  it('falls back to the queue when the turn has already ended (not busy: nothing is written into a dead turn)', async () => {
+    const h = setup({ session: { busy: false } });
+    expect(h.context.claudeSteerEligible(h.session, [markJournalOrigin([{ type: 'text', text: 'late' }])])).toBe(false);
+    expect(h.context.trySteerEntry(h.session, Object.assign(markJournalOrigin([{ type: 'text', text: 'late' }]), { cause: userCause }))).toBe(false);
+    expect(h.stdinWrite).not.toHaveBeenCalled();
+    expect(h.session.queuedMessages).toBeNull();
+  });
+
+  it('a steer the CLI never started goes back on the queue when the turn is over', () => {
+    const h = setup();
+    h.context.sendToSession(h.session, [{ type: 'text', text: 'late words' }]);
+    h.context.handleClaudeEvent(h.session, lifecycle('queued'));
+    h.context.handleClaudeEvent(h.session, lifecycle('cancelled'));
+    expect(h.session.queuedMessages).toHaveLength(1);
+    expect(h.session.queuedMessages[0]).toEqual([{ type: 'text', text: 'late words' }]);
+    expect(h.context.notifyQueuedMessage).toHaveBeenCalledTimes(1);
+  });
+
+  it('a requeued steer keeps its causes', async () => {
+    const h = setup();
+    await h.context.journalRouteTextToSession(h.session, 'late words', { causes: userCause });
+    h.context.handleClaudeEvent(h.session, lifecycle('queued'));
+    h.context.handleClaudeEvent(h.session, lifecycle('cancelled'));
+    expect(h.session.queuedMessages).toHaveLength(1);
+    expect(h.session.queuedMessages[0].cause.map(c => c.ref)).toEqual(['convo:5']);
+  });
+
   const queuedCases = [
     ['a non-empty queue', { queuedMessages: [markJournalOrigin([{ type: 'text', text: 'earlier' }])] }, {}],
     ['a pending interrupt', { pendingInterrupt: { cancel() {} } }, {}],
-    ['a turn the CLI has not opened yet', { _cliInitGeneration: 6 }, {}],
+    ['a turn the CLI has not opened yet', { _turnInitSeen: false }, {}],
     ['a Codex session', { agent: 'codex' }, {}],
     ['an interactive session', { iv: { alive: true } }, {}],
     ['a turn another person started', { foreignTurn: { person: 'p' } }, {}],
-    ['a non-user source (timer, reminder, carry-on)', {}, { steerable: false }],
+    ['a non-user source (timer, reminder, carry-on)', {}, { causes: reminderCause }],
+    ['a message with no cause', {}, { causes: null }],
   ];
   it.each(queuedCases)('queues as before for %s', async (_label, sessionOverrides, opts) => {
     const h = setup({ session: sessionOverrides });
     const before = h.session.queuedMessages?.length || 0;
-    await h.context.journalRouteTextToSession(h.session, 'also check the tests', { steerable: true, ...opts });
+    await h.context.journalRouteTextToSession(h.session, 'also check the tests', { causes: userCause, ...opts });
     expect(h.stdinWrite).not.toHaveBeenCalled();
     expect(h.session.queuedMessages).toHaveLength(before + 1);
     expect(h.context.notifyQueuedMessage).toHaveBeenCalledTimes(1);
@@ -166,29 +521,47 @@ describe('journal text into a running Claude turn', () => {
 
   it('queues a /compact as before (and it still jumps the queue)', async () => {
     const h = setup();
-    await h.context.journalRouteTextToSession(h.session, '/compact', { steerable: true });
+    await h.context.journalRouteTextToSession(h.session, '/compact', { causes: userCause });
     expect(h.stdinWrite).not.toHaveBeenCalled();
     expect(h.session.queuedMessages).toHaveLength(1);
   });
 
-  it('queues everything when MATRON_CLAUDE_STEER is off', async () => {
+  it('flag off (the default): every mid-turn message queues exactly as before', async () => {
     const h = setup({ steerEnabled: false });
-    await h.context.journalRouteTextToSession(h.session, 'also check the tests', { steerable: true });
+    await h.context.journalRouteTextToSession(h.session, 'also check the tests', { causes: userCause });
     expect(h.stdinWrite).not.toHaveBeenCalled();
     expect(h.session.queuedMessages).toHaveLength(1);
+    expect(h.context.notifyQueuedMessage).toHaveBeenCalledTimes(1);
+    expect(h.replies).toEqual([]);
+    expect(h.session._steered).toBeUndefined();
   });
 
-  it('journalOnText is the only caller that marks text steerable', () => {
-    const calls = [...source.matchAll(/journalRouteTextToSession\([^)]*steerable: true/g)];
-    expect(calls).toHaveLength(1);
-    expect(sourceOf('journalOnText')).toContain('steerable: true');
+  it('flag off: an explicit flush (send) mid-turn does not steer either', () => {
+    const h = setup({ steerEnabled: false });
+    const entry = Object.assign(markJournalOrigin([{ type: 'text', text: 'x' }]), { cause: userCause });
+    expect(h.context.claudeSteerEligible(h.session, [entry])).toBe(false);
+  });
+
+  it('an explicit flush (send) of the queued batch steers it when the flag is on', () => {
+    const h = setup();
+    const entry = Object.assign(markJournalOrigin([{ type: 'text', text: 'x' }]), { cause: userCause });
+    const queue = [entry];
+    h.session.queuedMessages = null;
+    expect(h.context.flushQueue(h.session, queue, { convoId: 'convo', entries: [] })).toBe(true);
+    expect(h.stdinWrite).toHaveBeenCalledTimes(1);
+    expect(h.session.currentTurn.causes.map(c => c.kind)).toContain('user_message');
+  });
+
+  it('mirrors none of it itself: journal-origin text is not re-published', async () => {
+    const h = setup();
+    await h.context.journalRouteTextToSession(h.session, 'also check the tests', { causes: userCause });
+    expect(h.context.journalPublishUserItem).not.toHaveBeenCalled();
   });
 });
-
 describe('result handling with a steered message', () => {
   it('folded (started before result): normal turn end, queue flushed', () => {
     const h = setup({ session: { queuedMessages: [[{ type: 'text', text: 'q' }]] } });
-    h.context.steerIntoRunningTurn(h.session, [{ type: 'text', text: 'steer' }]);
+    h.context.sendToSession(h.session, [{ type: 'text', text: 'steer' }]);
     h.context.handleClaudeEvent(h.session, lifecycle('queued'));
     h.context.handleClaudeEvent(h.session, lifecycle('started'));
     h.context.handleClaudeEvent(h.session, result());
@@ -201,12 +574,11 @@ describe('result handling with a steered message', () => {
   it('next-turn case: holds busy through the steered turn, then ends normally', () => {
     vi.useFakeTimers();
     const h = setup({ session: { queuedMessages: [[{ type: 'text', text: 'q' }]] } });
-    h.context.steerIntoRunningTurn(h.session, [{ type: 'text', text: 'steer' }]);
+    h.context.sendToSession(h.session, [{ type: 'text', text: 'steer' }]);
     h.context.handleClaudeEvent(h.session, lifecycle('queued'));
     h.context.handleClaudeEvent(h.session, result('first reply'));
     expect(h.context.flushResponse).toHaveBeenCalledTimes(1);
     expect(h.session.busy).toBe(true);
-    expect(h.session.turnGeneration).toBe(8);
     expect(h.session.responseBuffer).toBe('');
     expect(h.session.toolCalls).toEqual([]);
     expect(h.context.flushPendingSessionQueue).not.toHaveBeenCalled();
@@ -218,7 +590,6 @@ describe('result handling with a steered message', () => {
     expect(h.session._steerHold).toBeTruthy();
 
     expect(h.context.commitDispatchedUserTurn).not.toHaveBeenCalled();
-    expect(h.session.turnTier).toBeNull();
     h.context.handleClaudeEvent(h.session, lifecycle('started'));
     expect(h.session._steerHold).toBeNull();
     // Committed after the first reply was flushed: history order matches the model's.
@@ -226,7 +597,7 @@ describe('result handling with a steered message', () => {
     expect(h.context.flushResponse.mock.invocationCallOrder[0])
       .toBeLessThan(h.context.commitDispatchedUserTurn.mock.invocationCallOrder[0]);
     h.context.handleClaudeEvent(h.session, { type: 'system', subtype: 'init' });
-    expect(h.session._cliInitGeneration).toBe(8);
+    expect(h.session._turnInitSeen).toBe(true);
     h.context.handleClaudeEvent(h.session, lifecycle('completed'));
     h.context.handleClaudeEvent(h.session, result('second reply'));
     expect(h.session.busy).toBe(false);
@@ -241,7 +612,7 @@ describe('result handling with a steered message', () => {
     vi.useFakeTimers();
     const h = setup();
     h.context.handleClaudeEvent(h.session, lifecycle('completed', 'some-other-command'));
-    h.context.steerIntoRunningTurn(h.session, [{ type: 'text', text: 'steer' }]);
+    h.context.sendToSession(h.session, [{ type: 'text', text: 'steer' }]);
     h.context.handleClaudeEvent(h.session, result());
     expect(h.session.busy).toBe(true);
   });
@@ -249,20 +620,20 @@ describe('result handling with a steered message', () => {
   it('older CLI (no lifecycle events ever): no hold, history committed, steering off for the process', () => {
     vi.useFakeTimers();
     const h = setup({ session: { queuedMessages: [[{ type: 'text', text: 'q' }]] } });
-    h.context.steerIntoRunningTurn(h.session, [{ type: 'text', text: 'steer' }]);
+    h.context.sendToSession(h.session, [{ type: 'text', text: 'steer' }]);
     h.context.handleClaudeEvent(h.session, result());
     expect(h.session.busy).toBe(false);
     expect(h.context.flushPendingSessionQueue).toHaveBeenCalledTimes(1);
     expect(h.context.commitDispatchedUserTurn).toHaveBeenCalledWith(h.session, 'steer', null);
     expect(h.session._steerLifecycleUnsupported).toBe(true);
-    expect(steer.canSteerClaude({ ...h.session, busy: true, queuedMessages: null }, { origin: 'user', text: 'x' }))
+    expect(steer.canSteerClaude({ ...h.session, busy: true, queuedMessages: null }, { enabled: true, origin: 'user', text: 'x' }))
       .toEqual({ ok: false, reason: 'no-lifecycle' });
   });
 
   it('backstop: nothing starts, so busy is released and the queue flushed', () => {
     vi.useFakeTimers();
     const h = setup({ session: { queuedMessages: [[{ type: 'text', text: 'q' }]] } });
-    h.context.steerIntoRunningTurn(h.session, [{ type: 'text', text: 'steer' }]);
+    h.context.sendToSession(h.session, [{ type: 'text', text: 'steer' }]);
     h.context.handleClaudeEvent(h.session, lifecycle('queued'));
     h.context.handleClaudeEvent(h.session, result());
     expect(h.session.busy).toBe(true);
@@ -277,7 +648,7 @@ describe('result handling with a steered message', () => {
   it('a second result while still holding (no init/started) ends the turn instead of holding again', () => {
     vi.useFakeTimers();
     const h = setup();
-    h.context.steerIntoRunningTurn(h.session, [{ type: 'text', text: 'steer' }]);
+    h.context.sendToSession(h.session, [{ type: 'text', text: 'steer' }]);
     h.context.handleClaudeEvent(h.session, lifecycle('queued'));
     h.context.handleClaudeEvent(h.session, result());
     expect(h.session.busy).toBe(true);
@@ -290,7 +661,7 @@ describe('result handling with a steered message', () => {
     vi.useFakeTimers();
     const cancel = vi.fn();
     const h = setup();
-    h.context.steerIntoRunningTurn(h.session, [{ type: 'text', text: 'steer' }]);
+    h.context.sendToSession(h.session, [{ type: 'text', text: 'steer' }]);
     h.context.handleClaudeEvent(h.session, lifecycle('queued'));
     h.session.pendingInterrupt = { cancel };
     h.context.handleClaudeEvent(h.session, result());
@@ -302,7 +673,7 @@ describe('result handling with a steered message', () => {
   it('a backstop is a no-op once the session is gone', () => {
     vi.useFakeTimers();
     const h = setup();
-    h.context.steerIntoRunningTurn(h.session, [{ type: 'text', text: 'steer' }]);
+    h.context.sendToSession(h.session, [{ type: 'text', text: 'steer' }]);
     h.context.handleClaudeEvent(h.session, lifecycle('queued'));
     h.context.handleClaudeEvent(h.session, result());
     h.session.alive = false;
@@ -334,7 +705,7 @@ describe('review follow-ups', () => {
     h.session.sendHtml = vi.fn();
     h.session.claudeSessionId = 'sid';
     h.session.pendingPlanDenialId = 'plan-1';
-    h.context.steerIntoRunningTurn(h.session, [{ type: 'text', text: 'actually, smaller scope' }]);
+    h.context.sendToSession(h.session, [{ type: 'text', text: 'actually, smaller scope' }]);
     h.context.handleClaudeEvent(h.session, lifecycle('queued'));
     h.context.handleClaudeEvent(h.session, planResult());
     expect(h.session.busy).toBe(true);
@@ -359,21 +730,28 @@ describe('review follow-ups', () => {
   it('a question the turn ended on is superseded during a hold, and its reply text still flushes', () => {
     vi.useFakeTimers();
     const h = setup();
-    h.context.steerIntoRunningTurn(h.session, [{ type: 'text', text: 'never mind, use the default' }]);
+    h.context.sendToSession(h.session, [{ type: 'text', text: 'never mind, use the default' }]);
     h.context.handleClaudeEvent(h.session, lifecycle('queued'));
     h.session.waitingForAnswer = 'text-reply';
     h.session.pendingQuestions = [{ question: 'Which one?' }];
+    h.session.questionPromptIds = ['question-card'];
+    h.session.questionPromptCards = new Map([['question-card', { seq: 42, superseded: false }]]);
     h.context.handleClaudeEvent(h.session, result('Which one?'));
     expect(h.session.busy).toBe(true);
     expect(h.session.waitingForAnswer).toBeNull();
     expect(h.session.pendingQuestions).toBeNull();
+    expect(h.session.questionPromptIds).toEqual([]);
+    expect(h.context.journalPublisher.publishPromptReply).toHaveBeenCalledWith('convo', {
+      target_seq: 42, choice: null, text: steer.STEER_PROMPT_SUPERSEDED_NOTICE,
+    });
+    expect(h.context.emitRelease).not.toHaveBeenCalled();
     expect(h.context.flushResponse).toHaveBeenCalledTimes(1);
     expect(h.context.journalPublishNotice).toHaveBeenCalledWith('convo', steer.STEER_PROMPT_SUPERSEDED_NOTICE);
   });
 
   it('an async stdin write error puts the message back on the queue with a card', () => {
     const h = setup();
-    expect(h.context.steerIntoRunningTurn(h.session, [{ type: 'text', text: 'steer me' }])).toBe(true);
+    expect(h.context.sendToSession(h.session, [{ type: 'text', text: 'steer me' }])).toBe(true);
     const callback = h.stdinWrite.mock.calls[0][1];
     callback(new Error('write EPIPE'));
     expect(h.session.queuedMessages).toHaveLength(1);
@@ -387,7 +765,7 @@ describe('review follow-ups', () => {
 
   it('a write callback error after the CLI acknowledged the message does nothing', () => {
     const h = setup();
-    h.context.steerIntoRunningTurn(h.session, [{ type: 'text', text: 'steer me' }]);
+    h.context.sendToSession(h.session, [{ type: 'text', text: 'steer me' }]);
     h.context.handleClaudeEvent(h.session, lifecycle('queued'));
     h.stdinWrite.mock.calls[0][1](new Error('late'));
     expect(h.session.queuedMessages).toBeNull();
@@ -395,8 +773,8 @@ describe('review follow-ups', () => {
 
   it('a restart kill (queue carries over) requeues unstarted steers once; started ones are not resent', () => {
     const h = setup();
-    h.context.steerIntoRunningTurn(h.session, [{ type: 'text', text: 'first' }]);
-    h.context.steerIntoRunningTurn(h.session, [{ type: 'text', text: 'second' }]);
+    h.context.sendToSession(h.session, [{ type: 'text', text: 'first' }]);
+    h.context.sendToSession(h.session, [{ type: 'text', text: 'second' }]);
     h.context.handleClaudeEvent(h.session, lifecycle('started', 'steer-uuid-1'));
     h.context.handleClaudeEvent(h.session, lifecycle('queued', 'steer-uuid-2'));
     h.context.killSession(h.session, 'SIGTERM', { preserveQueue: true });
@@ -413,7 +791,7 @@ describe('review follow-ups', () => {
   it('system/init during a hold marks the steer started, so the next result does not hold again', () => {
     vi.useFakeTimers();
     const h = setup();
-    h.context.steerIntoRunningTurn(h.session, [{ type: 'text', text: 'steer' }]);
+    h.context.sendToSession(h.session, [{ type: 'text', text: 'steer' }]);
     h.context.handleClaudeEvent(h.session, lifecycle('queued'));
     h.context.handleClaudeEvent(h.session, result());
     expect(h.session.busy).toBe(true);
@@ -426,13 +804,13 @@ describe('review follow-ups', () => {
 
   it('a parked restart notice does not block steering', () => {
     const h = setup({ session: { _deferredControls: { restart_notice: { id: 'n' } } } });
-    expect(steer.canSteerClaude(h.session, { origin: 'user', text: 'hi' })).toEqual({ ok: true });
+    expect(steer.canSteerClaude(h.session, { enabled: true, origin: 'user', text: 'hi' })).toEqual({ ok: true });
   });
 });
 
 describe('second review: settling, cancellation, order, teardown', () => {
   const steerQueued = (h, text, n) => {
-    h.context.steerIntoRunningTurn(h.session, [{ type: 'text', text }]);
+    h.context.sendToSession(h.session, [{ type: 'text', text }]);
     h.context.handleClaudeEvent(h.session, lifecycle('queued', `steer-uuid-${n}`));
   };
 
@@ -558,6 +936,8 @@ describe('second review: settling, cancellation, order, teardown', () => {
     expect(h.context.notifyQueuedMessage).not.toHaveBeenCalled();
     expect(h.session.queuedMessages).toBeNull();
     expect(h.session._steered).toBeNull();
+    expect(h.context.journalPublishNotice).toHaveBeenCalledWith('convo',
+      "⚠️ Couldn't deliver your queued message — the session ended before it was sent.");
   });
 
   it('the exit handler requeues only in its auto-restart branch, before the queue is copied', () => {
@@ -569,6 +949,8 @@ describe('second review: settling, cancellation, order, teardown', () => {
     expect(requeue).toBeGreaterThan(branch);
     expect(copy).toBeGreaterThan(requeue);
     expect(source.slice(close, branch)).not.toContain('requeueSteeredMessages(');
+    expect(source.slice(close, branch)).toContain('notifyFinalUndeliveredQueue(session, orphanSteers);');
+    expect(source.slice(close, branch)).toContain('!shouldAutoRestart(exitCode, session, shuttingDown)');
   });
 
   it('init during a hold marks only the oldest waiting steer started; the next one holds the next result', () => {

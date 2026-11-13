@@ -64,7 +64,7 @@ function wiredSetup(backend, available = true) {
   let timerId = 0;
   const noop = () => {};
   const context = {
-    ...turnCause, inflightTurnOrigin: () => ({}), loadMatronMd: () => ({ block: '' }), apiHeaderFileFor: () => null, restartLatch: undefined, TURN_TIER, bumpTurnGeneration: noop, clearTurnClassification: noop, console: { warn: vi.fn() }, queueMicrotask, CONTROL_KINDS, TURN_STARTING_OPS, planSessionControl, controlNotice,
+    ...turnCause, inflightTurnOrigin: () => ({}), loadMatronMd: () => ({ block: '' }), apiHeaderFileFor: () => null, restartLatch: undefined, CLAUDE_STEER_ENABLED: false, TURN_TIER, bumpTurnGeneration: noop, clearTurnClassification: noop, console: { warn: vi.fn() }, queueMicrotask, CONTROL_KINDS, TURN_STARTING_OPS, planSessionControl, controlNotice,
     createRestartNotices, plannedRestartAvailable: available, plannedRestartState: available ? h.store : null,
     sessions: new Map([['room-a', h.session]]),
     journalConvoIdFor: session => session.journalConvoId || session.claudeSessionId,

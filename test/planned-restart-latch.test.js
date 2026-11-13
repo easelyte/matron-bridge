@@ -442,6 +442,9 @@ it('guards every ingress and rejects unknown dispatcher callers', () => {
     'onCrashRestart',
     // Boot-time note hand-off: runs once at startup, before any latch can exist.
     'deliverRestartNote',
+    // Mid-turn steering (lib/claude-steer.js): called only from journalRouteTextToSession
+    // and itemTurnRouter, both latched; the write itself goes through sendToSession's beginInput.
+    'trySteerEntry',
   ]);
   const edges = new Map(), guarded = new Set(), unknown = [];
   function walk(node, owner) {

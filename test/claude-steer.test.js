@@ -1,12 +1,12 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   STEER_HOLD_BACKSTOP_MS, applySteerLifecycle, beginSteerHold, buildSteerLine, canSteerClaude,
-  claudeSteerEnabled, dropUnstartedSteers, endSteerHold, noteSteerWritten, resetClaudeSteer, steerPendingTurn,
+  claudeSteerEnabled, dropUnstartedSteers, endSteerHold, noteSteerWritten, resetClaudeSteer, steerOriginFromCauses, steerPendingTurn,
 } from '../lib/claude-steer.js';
 
 function steerable(overrides = {}) {
   return {
-    agent: 'claude', alive: true, busy: true, turnGeneration: 4, _cliInitGeneration: 4,
+    agent: 'claude', alive: true, busy: true, _turnInitSeen: true,
     proc: { stdin: { write: vi.fn(), writable: true } }, queuedMessages: null,
     ...overrides,
   };
@@ -14,19 +14,44 @@ function steerable(overrides = {}) {
 const ctx = (overrides = {}) => ({ enabled: true, origin: 'user', text: 'also check the tests', ...overrides });
 
 describe('claudeSteerEnabled', () => {
-  it('defaults on and turns off only for 0/false/off', () => {
-    expect(claudeSteerEnabled({})).toBe(true);
-    expect(claudeSteerEnabled({ MATRON_CLAUDE_STEER: '1' })).toBe(true);
-    expect(claudeSteerEnabled({ MATRON_CLAUDE_STEER: 'yes' })).toBe(true);
-    for (const v of ['0', 'false', 'off', 'OFF', ' False ']) {
-      expect(claudeSteerEnabled({ MATRON_CLAUDE_STEER: v })).toBe(false);
+  it('queues in Matron by default and steers only when queueing is turned off', () => {
+    expect(claudeSteerEnabled({})).toBe(false);
+    expect(claudeSteerEnabled({ MATRON_CLAUDE_QUEUE_IN_MATRON: '' })).toBe(false);
+    expect(claudeSteerEnabled({ MATRON_CLAUDE_QUEUE_IN_MATRON: 'no' })).toBe(false);
+    for (const v of ['1', 'true', 'on']) {
+      expect(claudeSteerEnabled({ MATRON_CLAUDE_QUEUE_IN_MATRON: v })).toBe(false);
     }
+    for (const v of ['0', 'false', 'off', 'OFF', ' False ']) {
+      expect(claudeSteerEnabled({ MATRON_CLAUDE_QUEUE_IN_MATRON: v })).toBe(true);
+    }
+  });
+});
+
+describe('steerOriginFromCauses', () => {
+  const entry = (...kinds) => Object.assign([{ type: 'text', text: 'x' }], { cause: kinds.map(kind => ({ kind })) });
+  it('is user only when every entry carries only user message or item reply causes', () => {
+    expect(steerOriginFromCauses([entry('user_message')])).toBe('user');
+    expect(steerOriginFromCauses([entry('user_message'), entry('item_reply')])).toBe('user');
+  });
+  it('is null for reminders, carry-ons, taps, mixed or cause-less entries', () => {
+    expect(steerOriginFromCauses([entry('reminder')])).toBeNull();
+    expect(steerOriginFromCauses([entry('carry_on')])).toBeNull();
+    expect(steerOriginFromCauses([entry('item_tap')])).toBeNull();
+    expect(steerOriginFromCauses([entry('user_message'), entry('room_message')])).toBeNull();
+    expect(steerOriginFromCauses([entry('user_message', 'other')])).toBeNull();
+    expect(steerOriginFromCauses([[{ type: 'text', text: 'x' }]])).toBeNull();
+    expect(steerOriginFromCauses([])).toBeNull();
   });
 });
 
 describe('canSteerClaude', () => {
   it('accepts plain user text into a running, initialised print-mode turn', () => {
     expect(canSteerClaude(steerable(), ctx())).toEqual({ ok: true });
+  });
+
+  it('accepts the session queue itself as the batch being flushed', () => {
+    const queue = [[{ type: 'text', text: 'now' }]];
+    expect(canSteerClaude(steerable({ queuedMessages: queue }), ctx({ batch: queue }))).toEqual({ ok: true });
   });
 
   const cases = [
@@ -43,8 +68,8 @@ describe('canSteerClaude', () => {
     ['no-process', s => { s.proc.stdin.writable = false; }, {}],
     ['no-process', s => { s._autoStopped = true; }, {}],
     ['input-held', s => s, { inputHeld: true }],
-    ['pre-init', s => { s._cliInitGeneration = 3; }, {}],
-    ['pre-init', s => { delete s._cliInitGeneration; }, {}],
+    ['pre-init', s => { s._turnInitSeen = false; }, {}],
+    ['pre-init', s => { delete s._turnInitSeen; }, {}],
     ['interrupt-pending', s => { s.pendingInterrupt = { cancel() {} }; }, {}],
     ['compact-running', s => { s._operatorCompactPending = true; }, {}],
     ['deferred-command', s => { s._deferredCommandText = '!restart'; }, {}],
@@ -56,6 +81,7 @@ describe('canSteerClaude', () => {
     ['awaiting-answer', s => { s.pendingPlan = 'plan'; }, {}],
     ['queue-not-empty', s => { s.queuedMessages = [[{ type: 'text', text: 'earlier' }]]; }, {}],
     ['queue-not-empty', s => { s.queuedMessages = [[{ type: 'text', text: '/compact' }]]; }, {}],
+    ['queue-not-empty', s => { s.queuedMessages = [[{ type: 'text', text: 'later' }]]; }, { batch: [[{ type: 'text', text: 'this one' }]] }],
     ['empty', s => s, { text: '   ' }],
     ['command', s => s, { text: '/compact' }],
     ['command', s => s, { text: '//literal' }],

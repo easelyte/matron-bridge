@@ -1,3 +1,4 @@
+import { STEER_NOTICE } from '../lib/claude-steer.js';
 import { describe, it, expect, vi } from 'vitest';
 import { formatItemTurn, createItemTurnRouter, isTurnWorthy, isAgentCommentMarker } from '../lib/items-turn.js';
 
@@ -312,10 +313,11 @@ describe('createItemTurnRouter', () => {
     expect(steerText).toHaveBeenCalledWith(session, {
       text: formatItemTurn(payload, { username: 'alice', body: 'fetched body', convoId: 'c1' }),
       cause: expect.objectContaining({ kind: action === 'tap' ? 'item_tap' : 'item_reply' }),
+      source: { item_id: base.item_id, comment_id: 'ic' },
     });
     expect(deps.queueText).not.toHaveBeenCalled();
     expect(deps.injectBlocks).not.toHaveBeenCalled();
-    expect(deps.publishNotice).not.toHaveBeenCalled();
+    expect(deps.publishNotice).toHaveBeenCalledExactlyOnceWith('c1', STEER_NOTICE);
   });
 
   it.each(['false', 'throw'])('queues when steering returns %s', async (outcome) => {
@@ -342,6 +344,25 @@ describe('createItemTurnRouter', () => {
     expect(steerText).not.toHaveBeenCalled();
     expect(deps.queueText).toHaveBeenCalledTimes(1);
     expect(deps.injectBlocks).not.toHaveBeenCalled();
+  });
+
+  it.each(['image/png', 'application/pdf', 'audio/mp4'])('queues a busy reply with a %s attachment without steering', async (mime) => {
+    const steerText = vi.fn(() => true);
+    const { deps, route } = fixture({ steerText });
+    const session = { busy: true, journalConvoId: 'c1' };
+    const payload = { ...base, action: 'commented', comment: {
+      id: 'ic', body: 'use this', attachments: [{ blob_ref: 'blob', mime, name: 'attachment', transcript: 'voice reply' }],
+    } };
+    await route(session, { payload }, { username: 'user' });
+    await route(session, { payload }, { username: 'user' });
+    expect(steerText).not.toHaveBeenCalled();
+    expect(deps.queueText).toHaveBeenCalledTimes(1);
+    expect(deps.queueText).toHaveBeenCalledWith(session, expect.objectContaining({
+      text: expect.stringContaining('use this'),
+      source: { item_id: base.item_id, comment_id: 'ic' },
+    }));
+    expect(deps.injectBlocks).not.toHaveBeenCalled();
+    expect(deps.publishNotice).not.toHaveBeenCalled();
   });
 
   it('injects an idle reply without calling the steering seam', async () => {
