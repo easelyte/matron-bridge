@@ -88,6 +88,29 @@ describe('planned restart state', () => {
     expect(pending).toEqual(['r1', 'r1']);
   });
 
+  it('records who has been told once per restart, and only while pending', () => {
+    const { store } = make();
+    store.addRequest({ request_key: 'a' });
+    store.markNotified('r1', 'alice');
+    store.markNotified('r1', 'alice');
+    expect(Object.keys(store.getState().notified)).toEqual(['alice']);
+    expect(() => store.markNotified('other', 'bob')).toThrow('Invalid restart notice');
+    expect(() => store.markNotified('r1', '')).toThrow('Invalid restart notice');
+    store.setState('restarting');
+    expect(() => store.markNotified('r1', 'bob')).toThrow('Invalid restart notice');
+  });
+
+  it('starts each restart with nobody told, and reads a file written before notices existed', () => {
+    const { store } = make();
+    store.addRequest({ request_key: 'a' });
+    store.markNotified('r1', 'alice');
+    store.setState('back');
+    store.addRequest({ request_key: 'b' });
+    expect(store.getState().notified).toEqual({});
+    const old = make({ fs: fakeFs('{"id":"r0","state":"pending","requests":[],"participants":[]}') });
+    expect(old.store.getState().notified).toEqual({});
+  });
+
   it('keeps the first boot sha for the life of the process', () => {
     const { store } = make();
     store.persistBootSha('sha1');

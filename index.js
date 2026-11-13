@@ -135,6 +135,7 @@ import { createPlannedRestartState } from './lib/planned-restart-state.js';
 import { createPlannedRestart } from './lib/planned-restart.js';
 import { createRestartLatch } from './lib/restart-latch.js';
 import { createRestartNotes } from './lib/restart-notes.js';
+import { createRestartNotices } from './lib/restart-notice.js';
 import { createRestartBoot } from './lib/restart-boot.js';
 import { buildRestartStatus } from './lib/box-status-restart.js';
 import { installRestartToken, removeRestartToken, decideRestartRequest, MAX_BODY_BYTES as RESTART_BODY_MAX_BYTES } from './lib/restart-api.js';
@@ -12815,6 +12816,7 @@ const plannedRestart = plannedRestartState ? createPlannedRestart({
   // resumes and carry-ons (the carry-on delay is 15 s) before it can go.
   notBefore: Date.now() + PLANNED_RESTART_BOOT_SETTLE_MS,
   quiet: plannedRestartQuiet,
+  sessions: () => [...sessions.values()].filter(s => s.alive).map(s => ({ convoId: journalConvoIdFor(s) })),
   preflight: () => defaultPreflight(__dirname),
   warn: message => console.warn(message),
   onReady: verdict => restartLatch.onReady(verdict),
@@ -12833,6 +12835,23 @@ function plannedRestartParticipants(id) {
     return [];
   }
 }
+
+// The one notice per session that asks for a resume note. It goes out at a free
+// moment, as an ordinary bridge-framed turn, and a session that is busy is told
+// at a later poll.
+const restartNotices = plannedRestartState ? createRestartNotices({
+  stateStore: plannedRestartState,
+  sessions: () => [...sessions.values()].filter(s => s.alive),
+  convoIdOf: journalConvoIdFor,
+  // Not while the session refuses input (stopped). A send that keeps failing
+  // (a Codex sign-in left open, say) is given up on after three attempts.
+  ready: s => !sessionOccupiedForForeignTurn(s) && !s.queuedMessages?.length && !s._autoStopped,
+  log: message => console.warn(`[restart] ${message}`),
+  send: (s, text) => {
+    try { return sendTextToSession(s, text, { skipJournalMirror: true, causes: [plainCause('alert')] }) === true; }
+    catch { return false; }
+  },
+}) : null;
 
 const restartLatch = plannedRestart ? createRestartLatch({
   stateStore: plannedRestartState, bootId: BRIDGE_BOOT_ID,
@@ -12861,6 +12880,7 @@ if (plannedRestart) {
       const changed = state !== previous;
       previous = state;
       if (state === 'pending') {
+        try { restartNotices.notifyPending(); } catch { console.warn('[restart] notice failed'); }
         const verdict = plannedRestart.tick();
         plannedRestartRuntime.gateVerdict = verdict;
         // Report a changed verdict, not every poll.

@@ -315,6 +315,13 @@ token file could not be written) answers `501`, and the script stops with exit 3
 and does not retry. What is holding the restart, and why, is reported under
 `restart` in `box_status`.
 
+When a restart becomes pending, each live session gets one bridge-composed turn
+asking it to leave a resume note, at its next free moment; a session that
+starts or resumes meanwhile gets it too. The restart waits until every live
+session has been told, and `box_status.restart.waiting_on.unwarned` lists the
+ones not yet reached. Sessions told but with no note are listed as `no_note` in
+the results and are not resumed.
+
 A session can leave a resume note for the restart with `reminder_create` and
 `restart_note: true` (no `in`, `at`, `repeat` or `hold_awake`; it needs a pending
 restart, one note per session, the last write wins). The note is held in

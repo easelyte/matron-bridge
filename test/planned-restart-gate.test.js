@@ -2,10 +2,10 @@ import { describe, expect, it, vi } from 'vitest';
 import { createPlannedRestart } from '../lib/planned-restart.js';
 
 function make({ requests = [{ request_key: 'a', sha: 'bbb' }], bootSha = 'aaa', head = 'ccc', quiet, status = '',
-  ancestors = ['bbb'], preflight, onReady = () => ({ latched: false }), state: stateOverrides = {} } = {}) {
+  ancestors = ['bbb'], preflight, onReady = () => ({ latched: false }), state: stateOverrides = {}, sessions } = {}) {
   let t = 1_000_000;
   const state = { id: 'r1', state: 'pending', requests, boot_sha: bootSha,
-    first_request_at: t - 600_000, last_request_at: t - 600_000, ...stateOverrides };
+    first_request_at: t - 600_000, last_request_at: t - 600_000, notified: {}, ...stateOverrides };
   const git = vi.fn(args => {
     if (args[0] === 'rev-parse') return `${head}\n`;
     if (args[0] === 'merge-base') return ancestors.includes(args[2]);
@@ -16,7 +16,7 @@ function make({ requests = [{ request_key: 'a', sha: 'bbb' }], bootSha = 'aaa', 
   const warn = vi.fn();
   const gate = createPlannedRestart({
     repoDir: '/repo', stateStore: { getState: () => state }, git, fs, now: () => t, warn, onReady,
-    quiet: quiet ?? (() => ({ holders: [], probe_error: null })),
+    quiet: quiet ?? (() => ({ holders: [], probe_error: null })), ...(sessions ? { sessions } : {}),
     preflight: preflight ?? (() => Promise.resolve({ ok: true })),
   });
   return { gate, git, warn, state, advance: ms => { t += ms; } };
@@ -72,6 +72,21 @@ describe('planned restart gate', () => {
       fs: { readFileSync: () => Buffer.from('lock'), statSync: () => ({ ino: 1, mtimeMs: 2 }) } });
     expect(held.evaluate().waiting_on.collect).toEqual({ remaining_ms: 45_000 });
     expect(held.evaluate().would_pass).toBe(false);
+  });
+
+  it('holds the restart until every live session has been told', async () => {
+    const onReady = vi.fn(() => ({ latched: true }));
+    const live = [{ convoId: 'a' }, { convoId: 'b' }, { convoId: null }];
+    const { gate, state } = make({ onReady, sessions: () => live, state: { notified: { a: { at: 1 } } } });
+    gate.tick();
+    await settle();
+    gate.tick();
+    expect(gate.evaluate().waiting_on.unwarned).toEqual(['b']);
+    expect(onReady).not.toHaveBeenCalled();
+    state.notified.b = { at: 2 };
+    gate.tick();
+    gate.tick();
+    expect(onReady).toHaveBeenCalledTimes(1);
   });
 
   it('runs the preflight once per sha and reuses the result for five minutes', async () => {

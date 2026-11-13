@@ -76,6 +76,24 @@ describe('restart boot', () => {
     expect(f.notes.listPending()).toEqual([]);
   });
 
+  it('does not resume a session that was told but left no note', () => {
+    const f = fixture({ state: { participants: ['a'], notified: { a: { at: 1 }, b: { at: 1 } } } });
+    f.notes.hold('r1', 'a', 'n');
+    f.boot.reconcile();
+    f.boot.start();
+    expect(f.timers).toHaveLength(1);
+    expect(f.state.state).toBe('restarting');
+  });
+
+  it('reports no_note in the results once everyone is handled', async () => {
+    const f = fixture({ state: { participants: ['a'], notified: { a: { at: 1 }, b: { at: 1 } } } });
+    f.notes.hold('r1', 'a', 'n');
+    f.boot.reconcile();
+    f.boot.start();
+    await f.fire();
+    expect(f.state.results.no_note).toEqual(['b']);
+  });
+
   it('reports a different booted sha without blocking the resume', async () => {
     const f = fixture({ state: { participants: ['a'] }, bootSha: 'old' });
     f.notes.hold('r1', 'a', 'n');

@@ -100,6 +100,16 @@ describe('planned restart wiring', () => {
     expect(listen).toContain('restartBoot?.start()');
   });
 
+  it('tells each live session once, at a free moment and before the gate polls', () => {
+    const notices = part('const restartNotices = ', '\nconst restartLatch = ');
+    expect(notices).toContain('ready: s => !sessionOccupiedForForeignTurn(s) && !s.queuedMessages?.length && !s._autoStopped,');
+    expect(notices).toContain('sendTextToSession(s, text, { skipJournalMirror: true, causes: [plainCause(\'alert\')] }) === true');
+    const timer = part('if (plannedRestart) {\n  let previous;', '// Boot: carry');
+    expect(timer.indexOf('restartNotices.notifyPending()')).toBeGreaterThan(-1);
+    expect(timer.indexOf('restartNotices.notifyPending()')).toBeLessThan(timer.indexOf('plannedRestart.tick()'));
+    expect(block).toContain("sessions: () => [...sessions.values()].filter(s => s.alive).map(s => ({ convoId: journalConvoIdFor(s) })),");
+  });
+
   it('reports the restart in box_status', () => {
     const status = part('function publishBoxStatus(reason) {', '\nconst journalPublisher');
     expect(status).toContain('buildRestartStatus(plannedRestartState?.getState(), plannedRestartRuntime.gateVerdict)');
