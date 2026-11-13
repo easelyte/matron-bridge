@@ -173,5 +173,8 @@ describe('/design auto-switch through journalRouteTextToSession', () => {
     await h.route(BRIEF, { causes: CAUSES });
     expect(h.replies).toEqual(['Cannot switch right now.']);
     expect(h.sessions.get('room')).toBe(h.session);
+    // The brief still goes to the session as ordinary text, exactly once.
+    expect(h.context.sendTextToSession).toHaveBeenCalledOnce();
+    expect(h.context.sendTextToSession).toHaveBeenCalledWith(h.session, BRIEF, { skipJournalMirror: true, causes: CAUSES });
   });
 });
