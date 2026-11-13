@@ -43,14 +43,14 @@ const run = async f => {
 };
 
 // A pending request for the sha this boot already runs.
-it('drops a pending request already satisfied by an unplanned restart and delivers no continuation', async () => {
-  const f = fixture();
+it('drops a satisfied request; a marker chat gets only the legacy path, a note-only chat its note', async () => {
+  const f = fixture({ held: ['alice', 'bob'] });
   const boot = await run(f);
   expect(f.store.getState().state).toBe('cancelled');
   expect(f.store.getState().requests).toEqual([]);
   expect(f.notes.listHeld('restart-a')).toEqual([]);
   expect(f.notes.listPending()).toEqual([]);
-  expect(f.calls, 'no planned-restart continuation').toEqual([]);
+  expect(f.calls.map(c => c.convoId), 'alice (marker) is not noted; bob (no marker) is').toEqual(['bob']);
   // The legacy in-flight card path stays the single continuation for alice.
   expect(boot.suppressCard('alice', 'previous')).toBe(false);
   expect(f.logs.join('\n')).toMatch(/already satisfied/);
@@ -172,4 +172,14 @@ it('a later healthy boot does not resume chats already handed a recovery card', 
   await run(f);
   expect(f.calls, 'no unsolicited continuation after the fallback cards').toEqual([]);
   expect(f.notes.listPending()).toEqual([]);
+});
+
+it('a failed note removal still returns every card target', () => {
+  const f = fixture({ state: 'restarting', patch: { ...latched, participants: ['alice', 'bob'] }, held: [] });
+  for (const id of ['alice', 'bob']) f.notes.putPending({ id: 'restart-a', convoId: id, text: 't', writtenAt: 1 });
+  const notesStore = { listPending: () => f.notes.listPending(), removePending: (id, convoId) => {
+    if (convoId === 'bob') throw new Error('ENOSPC');
+    f.notes.removePending(id, convoId);
+  } };
+  expect(takeNoteOnlyRecoveries({ stateStore: f.store, notesStore })).toEqual(['alice', 'bob']);
 });
