@@ -29,14 +29,15 @@ describe('claudeSteerEnabled', () => {
 
 describe('steerOriginFromCauses', () => {
   const entry = (...kinds) => Object.assign([{ type: 'text', text: 'x' }], { cause: kinds.map(kind => ({ kind })) });
-  it('is user only when every entry carries only user message or item reply causes', () => {
+  it('is user only when every entry carries only user message, item reply or item tap causes', () => {
     expect(steerOriginFromCauses([entry('user_message')])).toBe('user');
     expect(steerOriginFromCauses([entry('user_message'), entry('item_reply')])).toBe('user');
+    expect(steerOriginFromCauses([entry('item_tap')])).toBe('user');
+    expect(steerOriginFromCauses([entry('item_reply', 'item_tap')])).toBe('user');
   });
-  it('is null for reminders, carry-ons, taps, mixed or cause-less entries', () => {
+  it('is null for reminders, carry-ons, mixed or cause-less entries', () => {
     expect(steerOriginFromCauses([entry('reminder')])).toBeNull();
     expect(steerOriginFromCauses([entry('carry_on')])).toBeNull();
-    expect(steerOriginFromCauses([entry('item_tap')])).toBeNull();
     expect(steerOriginFromCauses([entry('user_message'), entry('room_message')])).toBeNull();
     expect(steerOriginFromCauses([entry('user_message', 'other')])).toBeNull();
     expect(steerOriginFromCauses([[{ type: 'text', text: 'x' }]])).toBeNull();
