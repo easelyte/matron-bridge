@@ -17031,7 +17031,7 @@ function publishNoteOnlyRecoveryCards() {
     const persisted = loadPersistedSessions();
     const resumable = new Set(Object.values(persisted)
       .flatMap(rec => [rec?.journalConvoId, rec?.sessionId]).filter(Boolean));
-    for (const convoId of takeNoteOnlyRecoveries({ notesStore: createRestartNotes(), markerIds,
+    for (const convoId of takeNoteOnlyRecoveries({ stateStore: plannedRestartState, notesStore: createRestartNotes(), markerIds,
       isResumable: id => resumable.has(id) && isResumeConvoId(id) })) {
       journalPublishCardForConvo(convoId, {
         question: '⚠️ The bridge restarted and could not resume this chat by itself. Tap to carry on from where it left off.',

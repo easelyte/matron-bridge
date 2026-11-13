@@ -138,7 +138,7 @@ it('refuses shutdown and un-latches when the commit write fails', () => {
 it('hands note-only chats a recovery card list and clears their notes', () => {
   const f = fixture({ state: 'restarting', patch: { ...latched, participants: ['alice', 'bob', 'carol'] }, held: [] });
   for (const id of ['alice', 'bob', 'carol']) f.notes.putPending({ id: 'restart-a', convoId: id, text: 't', writtenAt: 1 });
-  const ids = takeNoteOnlyRecoveries({ notesStore: f.notes, markerIds: new Set(['alice']), isResumable: id => id !== 'carol' });
+  const ids = takeNoteOnlyRecoveries({ stateStore: f.store, notesStore: f.notes, markerIds: new Set(['alice']), isResumable: id => id !== 'carol' });
   expect(ids, 'alice has a marker card, carol has no session').toEqual(['bob']);
   expect(f.notes.listPending()).toEqual([]);
 });
@@ -154,7 +154,7 @@ it('index.js publishes one card for a note-only chat and none for a marker chat'
   const file = path.join(roots[roots.length - 1], 'inflight.json');
   fs.writeFileSync(file, JSON.stringify({ alice: { bootId: 'previous' } }));
   const publish = runInNewContext(`${body}\npublishNoteOnlyRecoveryCards`, {
-    plannedRestartState: {}, fs, INFLIGHT_FILE: file, takeNoteOnlyRecoveries, createRestartNotes: () => f.notes,
+    plannedRestartState: f.store, fs, INFLIGHT_FILE: file, takeNoteOnlyRecoveries, createRestartNotes: () => f.notes,
     loadPersistedSessions: () => ({ r1: { journalConvoId: 'alice' }, r2: { journalConvoId: 'bob' } }),
     isResumeConvoId: () => true, console: { warn() {} },
     journalPublishCardForConvo: (convoId, card) => { cards.push([convoId, card.options[0].value]); return true; },
@@ -162,4 +162,14 @@ it('index.js publishes one card for a note-only chat and none for a marker chat'
   publish();
   publish();
   expect(cards, 'exactly one card, for bob only').toEqual([['bob', 'resume:bob']]);
+});
+
+it('a later healthy boot does not resume chats already handed a recovery card', async () => {
+  const f = fixture({ state: 'restarting', patch: { ...latched, participants: ['alice', 'bob'], shutdown_committed_at: 999500 }, held: [] });
+  for (const id of ['alice', 'bob']) f.notes.putPending({ id: 'restart-a', convoId: id, text: 't', writtenAt: 1 });
+  takeNoteOnlyRecoveries({ stateStore: f.store, notesStore: f.notes, markerIds: new Set(['alice']) });
+  expect(f.store.getState().state).toBe('abandoned');
+  await run(f);
+  expect(f.calls, 'no unsolicited continuation after the fallback cards').toEqual([]);
+  expect(f.notes.listPending()).toEqual([]);
 });
