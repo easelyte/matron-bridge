@@ -163,15 +163,7 @@ describe('/design-login wiring (source inspection)', () => {
 });
 
 describe('sign-in relay fixes', async () => {
-  const { signInUrl } = await import('../lib/tui-cue-message.js');
   const { signInDialogHoldsInput } = await import('../lib/design-login-flow.js');
-
-  it('picks the OAuth URL over the support link /design-login shows above it', () => {
-    const help = 'https://support.claude.com/en/articles/17440474';
-    const oauth = 'https://claude.com/cai/oauth/authorize?code=true&client_id=x&state=a';
-    expect(signInUrl([help, oauth])).toBe(oauth);
-    expect(signInUrl([help])).toBe(help);
-  });
 
   it('holds bridge-generated input while a sign-in dialog is open', () => {
     expect(signInDialogHoldsInput({ iv: {}, _designLoginWatch: { stop() {} } })).toBe(true);

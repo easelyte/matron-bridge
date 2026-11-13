@@ -240,7 +240,7 @@ describe('boot subagent reconciliation', () => {
       journalPublisher: { upsertConvoBestEffort: (id, fields, callbacks) => {
         if (send === 'throw') throw new Error('unavailable');
         frames.push({ id, fields, callbacks });
-        if (send === 'delivered') callbacks.onLocalSendComplete();
+        if (send === 'delivered') callbacks.onDelivered();
         return send !== 'rejected';
       } },
       console: { warn, log() {} },
@@ -283,7 +283,7 @@ describe('boot subagent reconciliation', () => {
     expect(strictRecords(store)[0].addedAt).toBe(1001);
     expect(gate(store).quiet).toBe(false);
     expect(gate(store).holders).toContainEqual({ convoId: 'alice', why: 'subagents' });
-    h.frames[0].callbacks.onLocalSendComplete();
+    h.frames[0].callbacks.onDelivered();
     expect(strictRecords(store)).toEqual([{ ...old, addedAt: 1001 }]);
     expect(gate(store).quiet).toBe(false);
   });
@@ -331,7 +331,7 @@ describe('boot subagent reconciliation', () => {
     const h = repair({ send });
     expect(h.frames.map((frame) => frame.id)).toEqual([old.childConvoId]);
     expect(h.remove).not.toHaveBeenCalled();
-    h.frames[0].callbacks.onLocalSendComplete();
+    h.frames[0].callbacks.onDelivered();
     expect(h.remove).toHaveBeenCalledWith(old.childConvoId);
   });
 
@@ -358,9 +358,9 @@ it.each(['_resumeOutbox', '_awaitingInputReady'])('holds PTY input before accept
   sessions: [{ ...parent, [field]: field === '_resumeOutbox' ? ['hello'] : true }],
 }), 'queued_input'));
 
-// The fork's peer inbox is independent of session.queuedMessages. A pending
+// The room inbox is independent of session.queuedMessages. A pending
 // delivery must survive the seam where busy clears before its inbox drains.
-it.each(['roomDelivery', 'peerDelivery'])('holds the fork %s inbox until delivery', inbox => {
+it('holds the room inbox until delivery', () => {
   const session = { ...parent, busy: true };
   const inject = vi.fn(() => true);
   const delivery = createRoomDelivery({ isBusy: target => target.busy, injectTurn: inject });
@@ -374,5 +374,5 @@ it.each(['roomDelivery', 'peerDelivery'])('holds the fork %s inbox until deliver
   open(poll({ ...options, prev: { consecutiveQuiet: 1 } }), 2);
   expect(inject).toHaveBeenCalledOnce();
   const source = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
-  expect(source).toContain(`${inbox}.pendingCount(session.roomId) > 0`);
+  expect(source).toContain('roomDelivery.pendingCount(session.roomId) > 0');
 });

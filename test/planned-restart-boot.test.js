@@ -456,7 +456,7 @@ it.each(['final write', 'second notice', 'note removal', 'progress write'])('res
         notices.set(options.idemKey, payload);
       }
       if (fault === 'second notice' && convoId === 'bob' && fail) { fail = false; throw new Error('notice refused'); }
-      options.onLocalSendComplete(); return true;
+      options.onDelivered(); return true;
     } });
   await expect(cancel()).rejects.toThrow(/refused/);
   expect(f.state.getState().state).toBe('cancelling');
@@ -479,10 +479,10 @@ it.each(['delivered', 'evicted'])('retains held notes until a cancellation notic
     await expect(pending).rejects.toThrow('evicted');
     expect(f.notes.listHeld('restart-a')).toHaveLength(2);
   } else {
-    callbacks.onLocalSendComplete();
+    callbacks.onDelivered();
     await Promise.resolve();
     expect(f.notes.listHeld('restart-a').map(note => note.convoId)).toEqual(['bob']);
-    callbacks.onLocalSendComplete();
+    callbacks.onDelivered();
     await pending;
     expect(f.state.getState().state).toBe('cancelled');
   }
@@ -491,7 +491,7 @@ it.each(['delivered', 'evicted'])('retains held notes until a cancellation notic
 it('resumes durable cancellation during boot without delivering restart turns', async () => {
   const f = fixture({ patch: { state: 'cancelling', cancel_participants: ['alice', 'bob'], cancel_done: [] } });
   const cancel = createRestartCancellation({ stateStore: f.state, notesStore: f.notes,
-    publishText: (id, payload, options) => { options.onLocalSendComplete(); return true; } });
+    publishText: (id, payload, options) => { options.onDelivered(); return true; } });
   const resume = vi.fn(cancel);
   const boot = f.boot({ resumeCancel: resume });
   boot.reconcile(); boot.listenerReady();

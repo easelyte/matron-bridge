@@ -2381,11 +2381,10 @@ describe('index.js agent-chat room wiring (source inspection)', () => {
       expect(fn).toMatch(/return false;/);
     });
 
-    it('persistSession forwards the result on both the fail-open and fail-loud paths', () => {
+    it('persistSession forwards the fail-open write result', () => {
       const start = src.indexOf('function persistSession(');
       const persist = src.slice(start, src.indexOf('\nfunction getPersistedSession(', start));
-      expect(persist).toMatch(/if \(!failLoud\) return savePersistedSessions\(data\);/);
-      expect(persist).toMatch(/savePersistedSessionsOrThrow\(data\);\n\s*return true;/);
+      expect(persist).toMatch(/return savePersistedSessions\(data\);/);
     });
   });
 });

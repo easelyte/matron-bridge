@@ -4,8 +4,8 @@ import { spawnSync } from 'node:child_process';
 import { createServer, request } from 'node:http';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { buildSessionSettings } from '../lib/session-settings.js';
-import { classifyPermission } from '../lib/permission-eval.js';
+import { withForkPrintSettings } from '../lib/session-settings.js';
+import { buildPermissionSnapshot, classifyPermission } from '../lib/permission-eval.js';
 import { createJournalPublisher } from '../lib/journal-publisher.js';
 import {
   auditPermissionDecision,
@@ -221,8 +221,45 @@ describe('buildPermissionCardPayload', () => {
 
 describe('permission hook session settings', () => {
   function parsedSettings(mode) {
-    return JSON.parse(JSON.stringify(buildSessionSettings(mode)));
+    return JSON.parse(JSON.stringify(withForkPrintSettings({ hooks: { PreToolUse: [] } }, { bypass: mode === 'print' })));
   }
+
+  it('auto-approves show_file in a bypass session with permission cards enabled and no user grant', () => {
+    expect(process.env.MATRON_PERMISSION_CARDS).toBe('1');
+    expect(parsedSettings('print').hooks.PreToolUse.some(entry =>
+      entry.hooks?.some(hook => hook.command === HOOK)
+    )).toBe(true);
+    const requestPermissionDecision = vi.fn();
+    const target = {
+      claudeSessionId: 'session-1',
+      alive: true,
+      bypassMode: true,
+      permissionSnapshot: buildPermissionSnapshot({ sourcePaths: [] }),
+      permissionToken: PERMISSION_TOKEN,
+      requestPermissionDecision,
+    };
+    const pending = new Map();
+    const res = { writeHead: vi.fn(), end: vi.fn() };
+    const audit = vi.fn();
+
+    handlePermissionDecisionRoute({
+      data: { ...DEFAULT_INPUT, tool_name: 'mcp__show-file__show_file' },
+      res,
+      sessions: new Map([['room-1', target]]),
+      pendingPermissionDecisions: pending,
+      classifyPermissionFn: classifyPermission,
+      journalConvoIdForFn: () => 'convo-1',
+      evictPermissionSeq: vi.fn(),
+      auditPermissionDecisionFn: audit,
+      permissionToken: PERMISSION_TOKEN,
+    });
+
+    expect(res.writeHead).toHaveBeenCalledWith(200, { 'Content-Type': 'application/json' });
+    expect(JSON.parse(res.end.mock.calls[0][0])).toEqual({ decision: 'pass' });
+    expect(requestPermissionDecision).not.toHaveBeenCalled();
+    expect(pending.size).toBe(0);
+    expect(audit).toHaveBeenCalledWith(expect.objectContaining({ source: 'auto-allow' }));
+  });
 
   it('registers exactly one complete permission hook in print mode', () => {
     const preToolUse = parsedSettings('print').hooks.PreToolUse;
@@ -270,8 +307,6 @@ describe('permission hook spawn environment wiring (source inspection)', () => {
   });
 
   it('builds interactive spawn settings in iv mode', () => {
-    // The fork's tool allow-list rides on the foreign-gate + hook settings.
-    expect(interactiveSpawn).toContain("permissions: buildSessionSettings('iv').permissions,");
     expect(interactiveSpawn).toContain("'--settings', JSON.stringify(settings),");
   });
 

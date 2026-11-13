@@ -301,7 +301,7 @@ it('retries interrupted cancellation on later production ticks with one notice p
     createRestartCancellation, createRestartNotes: () => f.notes,
     journalPublisher: { publishText: (convoId, payload, options) => {
       if (!failed) { failed = true; return false; }
-      notices.push({ convoId, key: options.idemKey }); (options.onLocalSendComplete || options.onDelivered)(); return true;
+      notices.push({ convoId, key: options.idemKey }); (options.onDelivered || options.onDelivered)(); return true;
     } },
     plannedRestart: {}, codeUpdateWatcher: null, console: { warn() {} },
     publishRestartStatus() {}, queueRestartNotices() {},

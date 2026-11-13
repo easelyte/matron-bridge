@@ -407,14 +407,16 @@ describe('permission snapshot', () => {
     expect(classifyPermission(snapshot, 'mcp__server__allowed_tool')).toBe('allow');
   });
 
-  it('includes the bridge print-mode MCP permission in every snapshot (fork: lib/session-settings.js allow-list)', () => {
+  it('includes only the exact show_file infrastructure grant when no sources are given', () => {
     const snapshot = buildPermissionSnapshot({ sourcePaths: [] });
 
+    expect(snapshot.mcpAllow).toEqual(['mcp__show-file__show_file']);
     expect(snapshot.mcpDeny).toEqual([]);
     expect(snapshot.mcpAsk).toEqual([]);
     expect(snapshot.uncertain).toBe(false);
+    // Other tools remain default-gated (fail-closed).
     expect(classifyPermission(snapshot, 'mcp__show-file__show_file')).toBe('allow');
-    // Anything else is still default-gated (fail-closed).
+    expect(classifyPermission(snapshot, 'mcp__show-file__other')).toBe('default-gated');
     expect(classifyPermission(snapshot, 'mcp__other__tool')).toBe('default-gated');
   });
 });

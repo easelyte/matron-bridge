@@ -12,7 +12,6 @@ import { designNeedsInteractive } from '../lib/design-login-flow.js';
 import { parse } from 'espree';
 import { evaluateQuiet } from '../lib/restart-quiet.js';
 import { createJournalMediaRouter } from '../lib/journal-media.js';
-import { TURN_TIER } from '../lib/peer-priority.js';
 import { atomicWriteFileSync } from '../lib/atomic-write.js';
 import * as turnCause from '../lib/turn-cause.js';
 
@@ -431,7 +430,7 @@ it('guards every ingress and rejects unknown dispatcher callers', () => {
     'submitCodexAsyncAnswer', 'dispatchMergedFlush', 'runCodexControl', 'journalRouteTextToSession',
     'journalOnText', 'journalMediaRouter', 'itemTurnRouter', 'deliverCoordinatorTurn', 'journalOnMedia',
     'carryOnConvo', 'fireTimer', 'fireAutoResume', 'applyControlSteps', 'restartNotices', 'flushRoomInbox',
-    'handleCommand', 'peerDelivery', 'roomDelivery', 'foreignSessions', 'deliverRoomFrameTo', 'deliverInviteAsk', 'deliverAutoJoinedRequest',
+    'handleCommand', 'roomDelivery', 'foreignSessions', 'deliverRoomFrameTo', 'deliverInviteAsk', 'deliverAutoJoinedRequest',
     // Upstream split: only called from deliverAutoJoinedRequest, which holds the latch.
     'deliverAutoJoinedRequestHeld',
     'journalNotifyRoomEvent', 'approvePlanBuild', 'secretRequests', 'agentSpawnHandlers',
@@ -476,7 +475,7 @@ it('guards every ingress and rejects unknown dispatcher callers', () => {
     return [...(edges.get(owner) || [])].some(next => reachesGuard(next, seen));
   }
   const ingress = [
-    'handleCommand', 'peerDelivery', 'journalOnPeerMessage',
+    'handleCommand',
     'sendToSession', 'sendTextToSession', 'journalRouteTextToSession', 'journalOnText', 'journalOnMedia',
     'journalMediaRouter', 'fireTimer', 'journalOnRoomFrame', 'deliverRoomFrameTo', 'routeLocalRoomMessage',
     'routeLocalRoomFrame', 'journalInjectInviteRequest', 'deliverInviteAsk',
@@ -556,7 +555,7 @@ it.each(['acceptance', 'backlog', 'context'])('holds the latch while auto-join a
   const wait = async name => { if (dependency === name) { reached(); await waiting; } };
   const delivered = vi.fn();
   const handler = runInNewContext(`${body}\ndeliverAutoJoinedRequest`, {
-    restartLatch: f.latch, TURN_TIER,
+    restartLatch: f.latch,
     agentInvites: { answerAwait: async () => { await wait('acceptance'); return { kind: 'answered' }; } },
     agentRooms: { setState() {} }, publishInviteRequestNotice() {},
     journalPublisher: { fetchMessages: async () => { await wait('backlog'); return { events: [] }; } },

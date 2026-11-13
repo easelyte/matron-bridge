@@ -1,5 +1,5 @@
 // fork delta: withForkPrintSettings composes the fork's print-session
-// settings (tool allow-list + permission-card hook) onto upstream's
+// settings (permission-card hook) onto upstream's
 // buildPrintSessionSettings without double-gating a gated session.
 import { describe, expect, it } from 'vitest';
 import path from 'node:path';
@@ -29,13 +29,10 @@ describe('withForkPrintSettings', () => {
     expect(cmds.join(' ')).not.toContain('permission-decision.sh');
   });
 
-  it('unions the allow-lists without duplicates and keeps upstream\'s infra MCP allows', () => {
+  it('preserves upstream permissions without adding root tool allowances', () => {
     for (const bypass of [true, false]) {
-      const allow = compose(bypass).permissions.allow;
-      expect(new Set(allow).size).toBe(allow.length);
-      expect(allow).toContain('mcp__show-file__show_file');
-      expect(allow).toContain('Bash(*)');
-      expect(allow.some(a => a.startsWith('mcp__ask-user'))).toBe(true);
+      const base = buildPrintSessionSettings({ bypass, hooksDir, apiPort: 8787, roomId: '!r:x' });
+      expect(compose(bypass).permissions).toEqual(base.permissions);
     }
   });
 

@@ -1,4 +1,3 @@
-import { createQueuedDispatcher } from '../lib/queued-dispatch.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -11,7 +10,6 @@ import { normalizeModelArg } from '../lib/model-aliases.js';
 import { markJournalOrigin, planQueueFlush } from '../lib/queue-flush.js';
 import { normalizeAgent } from '../lib/agent-backend.js';
 import { getPersistedAgentState, mergeAgentStates, resolveNativeSessionIdForPersistence, snapshotAgentState } from '../lib/agent-handoff.js';
-import { TURN_TIER } from '../lib/peer-priority.js';
 import { EventEmitter } from 'node:events';
 import { InteractiveSession } from '../lib/interactive-session.js';
 import { createRestartNotices, validateControlParams, authorizeControl, JOURNAL_DEVICE_ID, JOURNAL_ONLY_ACTIONS, CONTROL_KINDS, planSessionControl, controlNotice, TURN_STARTING_OPS } from '../lib/session-control.js';
@@ -64,7 +62,7 @@ function wiredSetup(backend, available = true) {
   let timerId = 0;
   const noop = () => {};
   const context = {
-    ...turnCause, inflightTurnOrigin: () => ({}), loadMatronMd: () => ({ block: '' }), apiHeaderFileFor: () => null, restartLatch: undefined, CLAUDE_STEER_ENABLED: false, TURN_TIER, bumpTurnGeneration: noop, clearTurnClassification: noop, console: { warn: vi.fn() }, queueMicrotask, CONTROL_KINDS, TURN_STARTING_OPS, planSessionControl, controlNotice,
+    ...turnCause, inflightTurnOrigin: () => ({}), loadMatronMd: () => ({ block: '' }), apiHeaderFileFor: () => null, restartLatch: undefined, CLAUDE_STEER_ENABLED: false, bumpTurnGeneration: noop, clearTurnClassification: noop, console: { warn: vi.fn() }, queueMicrotask, CONTROL_KINDS, TURN_STARTING_OPS, planSessionControl, controlNotice,
     createRestartNotices, plannedRestartAvailable: available, plannedRestartState: available ? h.store : null,
     sessions: new Map([['room-a', h.session]]),
     journalConvoIdFor: session => session.journalConvoId || session.claudeSessionId,
@@ -488,13 +486,10 @@ function inputWiring() {
   };
   const latch = createRestartLatch(deps);
   h.context.restartLatch = latch;
-  h.context.queuedDispatcher = createQueuedDispatcher(new Proxy(h.context, {
-    get(target, key) {
-      if (key === 'queueRelease') return { listLive: () => [], dropItem() {} };
-      if (key === 'log') return target.console;
-      return target[key];
-    },
-  }));
+  h.context.journalInputConsumer = { queueRelease: { listLive: () => [], dropItem() {} } };
+  for (const name of ['snapshotQueuedReleaseBatch', 'queuedReleaseItemIds', 'liveQueuedReleaseEntries', 'restoreQueuedBatch', 'finalizeSentQueue']) {
+    h.load(`function ${name}(`, '\n}\n');
+  }
   return { ...h, deps, latch, shutdown, ready: () => latch.onReady({ sha: 'head', state: h.store.getState() }) };
 }
 
