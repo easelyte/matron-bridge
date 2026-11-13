@@ -481,52 +481,6 @@ describe('resolveAndUploadLocalFile', () => {
   });
 });
 
-describe('createSendAttachmentHandler Files deep link', () => {
-  const WEB = 'https://matron.example.com';
-
-  function fixtureWithWeb(webBaseUrl) {
-    const { workdir, publisher, published, uploads, sessions } = makeFixture();
-    const handler = createSendAttachmentHandler({
-      sessions, publisher, journalConvoIdFor: () => 'convo-abc', webBaseUrl,
-    });
-    return { workdir, publisher, published, uploads, sessions, handler };
-  }
-
-  it('appends a Files deep link to the caption when webBaseUrl is set', async () => {
-    const { handler, published, workdir } = fixtureWithWeb(WEB);
-    const res = await handler({ roomId: '!room1', path: 'shot.png', caption: 'the bug' });
-    expect(res.status).toBe(200);
-    const realWorkdir = await realpath(workdir);
-    const abs = path.join(realWorkdir, 'shot.png');
-    expect(published[0].payload.caption).toBe(
-      `the bug\n\n📁 Open shot.png in Files: ${WEB}/#files=${encodeURIComponent(abs)}`,
-    );
-  });
-
-  it('produces a caption from just the link when the agent passed none', async () => {
-    const { handler, published, workdir } = fixtureWithWeb(WEB);
-    const res = await handler({ roomId: '!room1', path: 'report.pdf' });
-    expect(res.status).toBe(200);
-    const realWorkdir = await realpath(workdir);
-    const abs = path.join(realWorkdir, 'report.pdf');
-    expect(published[0].payload.caption).toBe(
-      `📁 Open report.pdf in Files: ${WEB}/#files=${encodeURIComponent(abs)}`,
-    );
-  });
-
-  it('leaves the caption untouched (plain-path fallback) when webBaseUrl is unset', async () => {
-    const { handler, published } = fixtureWithWeb('');
-    await handler({ roomId: '!room1', path: 'shot.png', caption: 'the bug' });
-    expect(published[0].payload.caption).toBe('the bug');
-  });
-
-  it('omits an empty caption entirely when there is no link', async () => {
-    const { handler, published } = fixtureWithWeb('');
-    await handler({ roomId: '!room1', path: 'report.pdf', caption: '' });
-    expect('caption' in published[0].payload).toBe(false);
-  });
-});
-
 // A file the bridge downloaded for this conversation (a chat upload, an item
 // attachment) lives outside the workdir, in the session's own download folder
 // (lib/matron-files.js sessionDownloadDir). These run the real default

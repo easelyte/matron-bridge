@@ -47,7 +47,7 @@ describe('turn causes reach sendToSession from every turn source', () => {
   });
 
   it('a spawned session\'s opening turn is sent with the causes the start handler names', () => {
-    expect(index).toContain("injectTurn: (session, text, meta) => sendTextToSession(session, text, { skipJournalMirror: true, turnTier: 'autonomous', causes: meta?.causes ?? null }),");
+    expect(index).toContain("injectTurn: (session, text, meta) => sendTextToSession(session, text, { skipJournalMirror: true, causes: meta?.causes ?? null }),");
     const rpc = readFileSync(new URL('../lib/journal-rpc.js', import.meta.url), 'utf8');
     expect(rpc).toContain('injectTurn(session, opening, { causes: [spawnedCause(params.spawn_id)] })');
   });
@@ -69,7 +69,7 @@ describe('turn causes reach sendToSession from every turn source', () => {
   });
 
   it('room turns forward their causes; reminders and timers are reminder turns', () => {
-    expect(index.match(/causes: meta\?\.causes \?\? null/g).length).toBeGreaterThanOrEqual(3);
+    expect(index.match(/causes: meta\?\.causes \?\? null/g).length).toBeGreaterThanOrEqual(2);
     // Each delivered room message carries its seq, for the per-room span the
     // turn's cause names (lib/room-delivery.js), and a reply consumed inline
     // by a wait joins the running turn with its own.
@@ -123,8 +123,8 @@ describe('a running turn only ever gains causes', () => {
   });
 
   it('a Codex steer merges its entries\' causes into the running turn before it dispatches', () => {
-    const flush = readFileSync(new URL('../lib/queued-dispatch.js', import.meta.url), 'utf8');
-    const merge = flush.indexOf('const steerCauses = queueCauses(queued);\n        if (steerCauses) mergeIntoTurn(session, steerCauses);');
+    const flush = fnBody('function flushQueue(');
+    const merge = flush.indexOf('const steerCauses = queueCauses(queued);\n    if (steerCauses) mergeIntoTurn(session, steerCauses);');
     expect(merge).toBeGreaterThan(-1);
     expect(merge).toBeLessThan(flush.indexOf('session.codex.steer(blocks)'));
   });

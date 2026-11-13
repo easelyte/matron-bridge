@@ -9,7 +9,6 @@ import * as steer from '../lib/claude-steer.js';
 import { markJournalOrigin, planQueueFlush } from '../lib/queue-flush.js';
 import { queueCauses, tagCauses, mergeIntoTurn, mergeCauses, beginOrJoinTurn } from '../lib/turn-cause.js';
 import { hasQueuedCompact, isCompactCommand } from '../lib/compact-priority.js';
-import { createQueuedDispatcher } from '../lib/queued-dispatch.js';
 
 const source = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
 function sourceOf(name) {
@@ -22,7 +21,7 @@ function sourceOf(name) {
 
 const LIFTED = [
   'reportSessionSendFailure', 'notifyFinalUndeliveredQueue', 'retireSupersededQuestionCard', 'noteQuestionPromptEcho', 'journalHandleInboundEvent',
-  'clearPendingInterrupt', 'sendToSession', 'dispatchMergedFlush', 'applyPendingAgentHandoff', 'sendAllQuestions', 'notifyUndeliveredQueue', 'steerableBatchText', 'claudeSteerEligible', 'trySteerEntry', 'flushQueue', 'restoreQueuedBatch', 'commitSteeredMessage',
+  'clearPendingInterrupt', 'sendToSession', 'dispatchMergedFlush', 'applyPendingAgentHandoff', 'sendAllQuestions', 'notifyUndeliveredQueue', 'steerableBatchText', 'claudeSteerEligible', 'trySteerEntry', 'flushQueue', 'restoreQueuedBatch', 'snapshotQueuedReleaseBatch', 'queuedReleaseItemIds', 'liveQueuedReleaseEntries', 'finalizeSentQueue', 'commitSteeredMessage',
   'requeueSteeredMessages', 'settleDroppedSteers', 'releaseSteersToCli', 'requeueCancelledSteer',
   'requeueFailedSteer', 'supersedePromptsForSteerHold', 'beginHeldSteerTurn', 'releaseStaleSteerHold',
   'handleClaudeEvent', 'journalRouteTextToSession', 'killSession', 'recreateSession',
@@ -67,9 +66,8 @@ function setup({ session: overrides = {}, steerEnabled = true } = {}) {
       publishPromptReply: vi.fn((convoId, payload) => frames.push({ convo_id: convoId, type: 'prompt_reply', payload })),
     },
     findSessionByClaudeSessionId: (convoId) => convoId === 'convo' ? session : null,
-    journalInputConsumer: Object.assign(vi.fn(), { queueRelease: null }),
+    journalInputConsumer: Object.assign(vi.fn(), { queueRelease: { listLive: () => [], dropItem: vi.fn() } }),
     _releaseReconcileTimer: null,
-    releaseLifecycle: { onInboundEvent: vi.fn() },
     journalMediaRouter: { hasInflightMedia: () => false },
     journalConvoIdFor: () => 'convo',
     journalSessionCommandCtx: () => ctxObj,
@@ -111,24 +109,6 @@ function setup({ session: overrides = {}, steerEnabled = true } = {}) {
   vm.createContext(context);
   vm.runInContext(lifted, context);
   context.sessions.set(session.roomId, session);
-  // The fork keeps flushQueue and its release/restore helpers in
-  // lib/queued-dispatch.js; index.js only delegates to this dispatcher.
-  context.queuedDispatcher = createQueuedDispatcher({
-    queueRelease: { listLive: () => [], dropItem: vi.fn() },
-    emitRelease: context.emitRelease,
-    journalConvoIdFor: context.journalConvoIdFor,
-    dispatchMergedFlush: (...args) => context.dispatchMergedFlush(...args),
-    journalPublishNotice: context.journalPublishNotice,
-    runQueuedCleanup: vi.fn(),
-    sessions: context.sessions,
-    commitDispatchedUserTurn: context.commitDispatchedUserTurn,
-    journalPublishUserItem: context.journalPublishUserItem,
-    journalMirrorUserMedia: context.journalMirrorUserMedia,
-    dispatchDeferredCommand: context.dispatchDeferredCommand,
-    flushPendingSessionQueue: context.flushPendingSessionQueue,
-    maybeFlushRoomDelivery: context.maybeFlushRoomDelivery,
-    log: context.console,
-  });
   return { session, context, stdinWrite, replies, frames, ctxObj };
 }
 
@@ -435,7 +415,7 @@ describe('journal text into a running Claude turn', () => {
     expect(h.context.commitDispatchedUserTurn).not.toHaveBeenCalled();
     expect(h.context.journalSessionState).not.toHaveBeenCalled();
     // The queued card (if any) is retired by the dispatcher's finalizeSentQueue
-    // (lib/queued-dispatch.js); this entry never had one, so no release goes out.
+    // (flushQueue); this entry never had one, so no release goes out.
     expect(h.context.emitRelease).not.toHaveBeenCalled();
   });
 

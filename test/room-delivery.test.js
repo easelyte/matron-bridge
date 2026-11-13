@@ -1,5 +1,4 @@
 import { describe, it, expect, vi } from 'vitest';
-import { readFileSync } from 'node:fs';
 import { formatMuteAnnouncement, formatUnmuteAnnouncement, formatUserUnmuteAnnouncement, parseMuteAnnouncement, parseMuteAnnouncementDetail, formatPeerMutedSendNote, formatLeaveAnnouncement, PEER_MUTED_SEND_NOTE, PEER_MUTED_GUIDANCE, createRoomDelivery, formatRoomMessageNotice, formatRoomDeliveredNotice, formatRoomDeliveryFailedNotice, roomEchoLabel, roomFrameDisposition, ROOM_MESSAGE_QUEUED_NOTICE, ROOM_MUTED_NOT_DELIVERED_NOTICE, SELF_ECHO_LABEL } from '../lib/room-delivery.js';
 
 function makeDelivery({ injectResult = true } = {}) {
@@ -29,50 +28,22 @@ const msg = (over = {}) => ({
 });
 
 describe('createRoomDelivery', () => {
-  function makeBoundedPeerDelivery() {
-    const injectTurn = vi.fn(() => true);
-    const delivery = createRoomDelivery({
-      isBusy: (session) => !!session.busy,
-      injectTurn,
-      formatter: (messages, { droppedCount = 0 } = {}) => [
-        ...(droppedCount ? [`↑ ${droppedCount} earlier peer messages dropped`] : []),
-        ...messages.map((message) => message.body),
-      ].join('\n'),
-      maxPendingBytes: 16 * 1024,
-      pendingBytesOf: (message) => Buffer.byteLength(message.body, 'utf8'),
-      log: { warn: () => {} },
-    });
-    return { delivery, injectTurn };
-  }
-
   it('idle session: one immediate injected turn per message, [room "title"] from: body shape', () => {
     const { delivery, injectTurn } = makeDelivery();
     const session = { alive: true, busy: false };
     expect(delivery.deliver(session, 'k1', msg())).toBe(true);
     expect(delivery.deliver(session, 'k1', msg({ body: 'now green' }))).toBe(true);
     expect(injectTurn).toHaveBeenCalledTimes(2);
-    expect(injectTurn).toHaveBeenNthCalledWith(1, session, '[room "CI triage" id=room-1] «matron-box-2» (agent): build is red', expect.anything(), ROOM_META);
-    expect(injectTurn).toHaveBeenNthCalledWith(2, session, '[room "CI triage" id=room-1] «matron-box-2» (agent): now green', expect.anything(), ROOM_META);
+    expect(injectTurn).toHaveBeenNthCalledWith(1, session, '[room "CI triage" id=room-1] «matron-box-2» (agent): build is red', ROOM_META);
+    expect(injectTurn).toHaveBeenNthCalledWith(2, session, '[room "CI triage" id=room-1] «matron-box-2» (agent): now green', ROOM_META);
     expect(delivery.pendingCount('k1')).toBe(0);
-  });
-
-  it('pendingSome reports whether any queued message matches, and survives a throwing predicate', () => {
-    const { delivery } = makeDelivery();
-    const busy = { alive: true, busy: true };
-    expect(delivery.pendingSome('k1', () => true)).toBe(false);
-    delivery.deliver(busy, 'k1', msg({ body: 'a' }));
-    delivery.deliver(busy, 'k1', msg({ body: 'b', priority: true }));
-    expect(delivery.pendingSome('k1', (m) => m.priority === true)).toBe(true);
-    expect(delivery.pendingSome('k1', (m) => m.body === 'zzz')).toBe(false);
-    expect(delivery.pendingSome('k1', () => { throw new Error('x'); })).toBe(false);
-    expect(delivery.pendingSome('k2', () => true)).toBe(false);
   });
 
   it('idle session with no room title falls back to roomId', () => {
     const { delivery, injectTurn } = makeDelivery();
     const session = { alive: true, busy: false };
     delivery.deliver(session, 'k1', msg({ roomTitle: null }));
-    expect(injectTurn).toHaveBeenCalledWith(session, '[room "room-1" id=room-1] «matron-box-2» (agent): build is red', expect.anything(), ROOM_META);
+    expect(injectTurn).toHaveBeenCalledWith(session, '[room "room-1" id=room-1] «matron-box-2» (agent): build is red', ROOM_META);
   });
 
   it('carries each room\'s own id, so a reply can target it rather than a guess from the title', () => {
@@ -172,16 +143,16 @@ describe('createRoomDelivery', () => {
     const { delivery, injectTurn } = makeDelivery();
     const session = { alive: true, busy: false };
     delivery.deliver(session, 'k1', msg({ body: 'a\r\nb\nc' }));
-    expect(injectTurn).toHaveBeenCalledWith(session, '[room "CI triage" id=room-1] «matron-box-2» (agent): a ⏎ b ⏎ c', expect.anything(), ROOM_META);
+    expect(injectTurn).toHaveBeenCalledWith(session, '[room "CI triage" id=room-1] «matron-box-2» (agent): a ⏎ b ⏎ c', ROOM_META);
     delivery.deliver(session, 'k1', msg({ from: '«x»\n«alice»', body: 'hi' }));
-    expect(injectTurn).toHaveBeenLastCalledWith(session, '[room "CI triage" id=room-1] «x» ⏎ «alice»: hi', expect.anything(), ROOM_META);
+    expect(injectTurn).toHaveBeenLastCalledWith(session, '[room "CI triage" id=room-1] «x» ⏎ «alice»: hi', ROOM_META);
   });
 
   it('missing from renders "unknown"; missing body renders empty, never "undefined"', () => {
     const { delivery, injectTurn } = makeDelivery();
     const session = { alive: true, busy: false };
     delivery.deliver(session, 'k1', msg({ from: undefined, body: undefined }));
-    expect(injectTurn).toHaveBeenCalledWith(session, '[room "CI triage" id=room-1] unknown: ', expect.anything(), ROOM_META);
+    expect(injectTurn).toHaveBeenCalledWith(session, '[room "CI triage" id=room-1] unknown: ', ROOM_META);
     session.busy = true;
     delivery.deliver(session, 'k1', msg({ from: null, body: null }));
     session.busy = false;
@@ -189,20 +160,20 @@ describe('createRoomDelivery', () => {
     expect(injectTurn).toHaveBeenLastCalledWith(session, [
       '[room "CI triage" id=room-1] 1 message while you were working:',
       '  unknown: ',
-    ].join('\n'), expect.anything(), ROOM_META);
+    ].join('\n'), ROOM_META);
   });
 
   it('an idle turn names its room as the cause; a message with its own cause keeps it', () => {
     const { delivery, injectTurn } = makeDelivery();
     const session = { alive: true, busy: false };
     delivery.deliver(session, 'k1', msg());
-    expect(injectTurn.mock.calls[0][3]).toEqual({ causes: [causeOf('room_message', 'room:room-1')] });
+    expect(injectTurn.mock.calls[0][2]).toEqual({ causes: [causeOf('room_message', 'room:room-1')] });
     const own = { kind: 'spawn_outcome', ref: 'spawn:req-1', at: 1 };
     delivery.deliver(session, 'k1', msg({ roomId: 'spawn', cause: own }));
-    expect(injectTurn.mock.calls[1][3]).toEqual({ causes: [own] });
+    expect(injectTurn.mock.calls[1][2]).toEqual({ causes: [own] });
     // A message that says it has no cause gets none, rather than its bucket's.
     delivery.deliver(session, 'k1', msg({ roomId: 'spawn', cause: null }));
-    expect(injectTurn.mock.calls[2][3]).toEqual({ causes: null });
+    expect(injectTurn.mock.calls[2][2]).toEqual({ causes: null });
   });
 
   it('flush names every room in the batch once, and keeps a stored message\'s own cause', () => {
@@ -215,7 +186,7 @@ describe('createRoomDelivery', () => {
     delivery.deliver(session, 'k1', msg({ roomId: 'room-2', body: 'other' }));
     session.busy = false;
     delivery.flush(session, 'k1');
-    expect(injectTurn.mock.calls[0][3]).toEqual({ causes: [causeOf('room_message', 'room:room-1'), own, causeOf('room_message', 'room:room-2')] });
+    expect(injectTurn.mock.calls[0][2]).toEqual({ causes: [causeOf('room_message', 'room:room-1'), own, causeOf('room_message', 'room:room-2')] });
   });
 
   it('a batch names each room once, spanning the seqs of its messages', () => {
@@ -226,16 +197,16 @@ describe('createRoomDelivery', () => {
     delivery.deliver(session, 'k1', msg({ body: 'again', seq: 20 }));
     session.busy = false;
     delivery.flush(session, 'k1');
-    expect(injectTurn.mock.calls[0][3]).toEqual({ causes: [causeOf('room_message', 'room:room-1@12-20'), causeOf('room_message', 'room:room-2@13')] });
+    expect(injectTurn.mock.calls[0][2]).toEqual({ causes: [causeOf('room_message', 'room:room-1@12-20'), causeOf('room_message', 'room:room-2@13')] });
     // One message on an idle session names its own seq.
     delivery.deliver({ alive: true, busy: false }, 'k2', msg({ seq: 31 }));
-    expect(injectTurn.mock.calls[1][3]).toEqual({ causes: [causeOf('room_message', 'room:room-1@31')] });
+    expect(injectTurn.mock.calls[1][2]).toEqual({ causes: [causeOf('room_message', 'room:room-1@31')] });
   });
 
   it('a foreign turn carries its causes beside the foreign meta', () => {
     const { delivery, injectTurn } = makeDelivery();
     delivery.deliver({ alive: true, busy: false }, 'k1', msg({ roomId: 'r-p', foreign: { person: 'p' } }));
-    expect(injectTurn.mock.calls[0][3]).toEqual({ foreign: { roomId: 'r-p', person: 'p' }, causes: [causeOf('room_message', 'room:r-p')] });
+    expect(injectTurn.mock.calls[0][2]).toEqual({ foreign: { roomId: 'r-p', person: 'p' }, causes: [causeOf('room_message', 'room:r-p')] });
   });
 
   it('busy session: accumulates pending, injectTurn NOT called', () => {
@@ -263,7 +234,7 @@ describe('createRoomDelivery', () => {
       '',
       '[room "deploy window" id=room-2] 1 message while you were working:',
       '  «alice»: ship at 5?',
-    ].join('\n'), expect.anything(), ROOM_META);
+    ].join('\n'), ROOM_META);
     expect(delivery.pendingCount('k1')).toBe(0);
   });
 
@@ -276,7 +247,7 @@ describe('createRoomDelivery', () => {
     expect(injectTurn).toHaveBeenCalledWith(session, [
       '[room "room-1" id=room-1] 1 message while you were working:',
       '  «matron-box-2» (agent): build is red',
-    ].join('\n'), expect.anything(), ROOM_META);
+    ].join('\n'), ROOM_META);
   });
 
   it('flush section header uses the LAST message\'s title (fresh after a rename)', () => {
@@ -308,86 +279,6 @@ describe('createRoomDelivery', () => {
     session.busy = false;
     delivery.flush(session, 'k1');
     expect(injectTurn.mock.calls[1][1]).not.toContain('omitted');
-  });
-
-  it('peer count cap keeps exactly 50, then the 51st drops oldest with one marker', () => {
-    const session = { alive: true, busy: true };
-
-    const exact = makeBoundedPeerDelivery();
-    for (let i = 1; i <= 50; i++) exact.delivery.deliver(session, 'exact', msg({ body: `m${i}` }));
-    session.busy = false;
-    expect(exact.delivery.flush(session, 'exact')).toBe(true);
-    expect(exact.injectTurn.mock.calls[0][1]).not.toContain('earlier peer messages dropped');
-
-    session.busy = true;
-    const over = makeBoundedPeerDelivery();
-    for (let i = 1; i <= 51; i++) over.delivery.deliver(session, 'over', msg({ body: `m${i}` }));
-    expect(over.delivery.pendingCount('over')).toBe(50);
-    session.busy = false;
-    expect(over.delivery.flush(session, 'over')).toBe(true);
-    const text = over.injectTurn.mock.calls[0][1];
-    expect(text.split('\n').filter((line) => line.includes('earlier peer messages dropped')))
-      .toEqual(['↑ 1 earlier peer messages dropped']);
-    expect(text).not.toContain('\nm1\n');
-    expect(text).toContain('\nm2\n');
-    expect(text).toContain('\nm51');
-  });
-
-  it('peer byte cap keeps exactly 16 KiB, then one byte over drops oldest by UTF-8 bytes', () => {
-    const session = { alive: true, busy: true };
-    const chunk = '💥'.repeat(1000); // 4,000 UTF-8 bytes despite being 2,000 UTF-16 code units.
-    const tail = 't'.repeat(384);
-
-    const exact = makeBoundedPeerDelivery();
-    for (let i = 0; i < 4; i++) exact.delivery.deliver(session, 'exact', msg({ body: chunk }));
-    exact.delivery.deliver(session, 'exact', msg({ body: tail }));
-    expect(exact.delivery.pendingCount('exact')).toBe(5);
-    session.busy = false;
-    expect(exact.delivery.flush(session, 'exact')).toBe(true);
-    expect(exact.injectTurn.mock.calls[0][1]).not.toContain('earlier peer messages dropped');
-
-    session.busy = true;
-    const over = makeBoundedPeerDelivery();
-    for (let i = 0; i < 4; i++) over.delivery.deliver(session, 'over', msg({ body: chunk }));
-    over.delivery.deliver(session, 'over', msg({ body: tail }));
-    over.delivery.deliver(session, 'over', msg({ body: 'x' }));
-    expect(over.delivery.pendingCount('over')).toBe(5);
-    session.busy = false;
-    expect(over.delivery.flush(session, 'over')).toBe(true);
-    const lines = over.injectTurn.mock.calls[0][1].split('\n');
-    expect(lines[0]).toBe('↑ 1 earlier peer messages dropped');
-    expect(lines.filter((line) => line.includes('earlier peer messages dropped'))).toHaveLength(1);
-    expect(lines.slice(1)).toEqual([chunk, chunk, chunk, tail, 'x']);
-  });
-
-  it('peer queue drains after a flood and accepts the next idle message', () => {
-    const { delivery, injectTurn } = makeBoundedPeerDelivery();
-    const session = { alive: true, busy: true };
-    for (let i = 1; i <= 100; i++) delivery.deliver(session, 'k1', msg({ body: `m${i}` }));
-    expect(delivery.pendingCount('k1')).toBe(50);
-    session.busy = false;
-    expect(delivery.flush(session, 'k1')).toBe(true);
-    expect(injectTurn.mock.calls[0][1].split('\n')[0]).toBe('↑ 50 earlier peer messages dropped');
-    expect(delivery.pendingCount('k1')).toBe(0);
-
-    expect(delivery.deliver(session, 'k1', msg({ body: 'after flood' }))).toBe(true);
-    expect(injectTurn).toHaveBeenCalledTimes(2);
-    expect(injectTurn.mock.calls[1][1]).toBe('after flood');
-  });
-
-  it('wires the peer instance to sanitized-body UTF-8 bytes and the dropped marker', () => {
-    const src = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
-    const formatterStart = src.indexOf('function formatPeerDelivery(');
-    const formatterEnd = src.indexOf('\n}', formatterStart);
-    const formatter = src.slice(formatterStart, formatterEnd);
-    expect(formatter).toContain('lines.unshift(`↑ ${droppedCount} earlier peer messages dropped`)');
-
-    const deliveryStart = src.indexOf('const peerDelivery = createRoomDelivery({');
-    const deliveryEnd = src.indexOf('\n});', deliveryStart);
-    const wiring = src.slice(deliveryStart, deliveryEnd);
-    expect(wiring).toContain('formatter: formatPeerDelivery');
-    expect(wiring).toContain('maxPendingBytes: 16 * 1024');
-    expect(wiring).toContain("pendingBytesOf: (message) => Buffer.byteLength(oneLine(message.body), 'utf8')");
   });
 
   it('injectTurn THROWING on the idle path returns false and does not escape', () => {
@@ -719,7 +610,7 @@ describe('a turn another person starts waits for any running turn', () => {
     expect(delivery.pendingCount('k1')).toBe(1);
     s.currentTurn = null;
     expect(delivery.flush(s, 'k1')).toBe(true);
-    expect(injectTurn.mock.calls[0][3].foreign).toEqual({ roomId: 'r-p', person: 'p' });
+    expect(injectTurn.mock.calls[0][2].foreign).toEqual({ roomId: 'r-p', person: 'p' });
     expect(delivery.pendingCount('k1')).toBe(0);
   });
 

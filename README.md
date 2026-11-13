@@ -333,7 +333,6 @@ the viewer's environment turns it off.
 | `MATRON_CLAUDE_QUEUE_IN_MATRON` | Messages typed during a running print-mode Claude turn wait in Matron's queue. Set to `0` (or `false`/`off`) to write plain messages straight into the running turn instead (see Mid-turn steering) | `1` (queue in Matron) |
 | `HMAC_SECRET` | Shared secret for signed file viewer URLs | — |
 | `VIEWER_BASE_URL` | Public URL for file viewer | — |
-| `WEB_BASE_URL` | Web client base URL for Files deep links. When set, doc handoffs (send_attachment / show_file / item attachments) append an `Open in Files` link (`${WEB_BASE_URL}/#files=<abs>`, so set it to wherever the web app itself is served, including any path prefix); token-less (uses the operator's web session). Unset => handoffs fall back to the plain path. Set only after the matron-web deep-link build is deployed. | — |
 | `LINK_EXPIRY_MS` | Signed URL expiry in ms | `900000` (15 min) |
 | `MATRON_BRIDGE_API_PORT` | Internal API port (hooks, MCP, viewer) | `9802` |
 | `MATRON_BRIDGE_API_AUTH` | `off` stops checking the per-session tokens on the internal API (they are still issued). Leave it unset. Scripts run outside a session can list sessions (`POST /sessions`) with `curl -H @"${XDG_STATE_HOME:-$HOME/.local/state}/matron-bridge/api-operator.header"`, an owner-only file the bridge rewrites at each start | on |
@@ -547,7 +546,7 @@ matron-bridge/
 ├── BRIDGE_CODEX.md       # Extra instructions for bridge-spawned Codex turns
 ├── BRIDGE_NOTICES.md     # Notices block, appended while the user's notices setting is on
 ├── docs/codex.md         # Codex setup, switching, security, and troubleshooting
-├── docs/agent-rpc.md     # Agent RPC methods (recent_folders, start, read/edit_file, ops_snapshot)
+├── docs/agent-rpc.md     # Agent RPC methods (recent_folders, start, ops_snapshot)
 ├── mcp-config.json       # MCP server config for Claude Code
 ├── viewer/               # HMAC-signed file viewer
 ├── setup/                # OS-dispatching installer, service, optional local whisper

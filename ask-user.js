@@ -408,11 +408,11 @@ server.tool(
 
 server.tool(
   'agent_sessions',
-  "List this user's addressable agent sessions for direct coordination. Each entry includes its conversation id, title, state, agent kind, and whether it is this session; never target an entry where is_self is true.",
+  "List this user's agent sessions, including conversation id, title, state, agent kind, and is_self. Use the is_self row to find this session's own conversation id; use agent rooms to coordinate with other sessions.",
   {},
   async () => {
     try {
-      const postRes = await fetch(`${BRIDGE_API}/agent-sessions`, {
+      const postRes = await bridgeFetch(`${BRIDGE_API}/agent-sessions`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ roomId: ROOM_ID }),
@@ -422,38 +422,6 @@ server.tool(
         return { content: [{ type: 'text', text: `agent_sessions failed: ${data.error || `HTTP ${postRes.status}`}` }] };
       }
       return { content: [{ type: 'text', text: JSON.stringify(data.sessions || [], null, 2) }] };
-    } catch (err) {
-      return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
-    }
-  }
-);
-
-server.tool(
-  'agent_message',
-  "Send a concise coordination line to another of the operator's agent sessions. Choose target_convo from agent_sessions; use this for outcomes, questions, and decisions rather than running commentary.",
-  {
-    target_convo: z.string().min(1).describe('Conversation id of the target session, from agent_sessions'),
-    body: z.string().min(1).describe('The coordination line to send'),
-    priority: z
-      .boolean()
-      .optional()
-      .describe(
-        "Mark this as a priority message. The target surfaces it with a louder in-timeline marker, and while the target is mid-turn on lower-priority work (a coordinating peer turn, or autonomous work) a priority message may interrupt that turn so it is handled sooner. It never interrupts the operator's own in-progress turn or an equal-priority peer turn, and when the target is idle at a prompt it is delivered normally without interrupting. Use sparingly, for time-sensitive coordination.",
-      ),
-  },
-  async ({ target_convo, body, priority }) => {
-    try {
-      const postRes = await fetch(`${BRIDGE_API}/agent-message`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        // Only serialize priority when true — a normal message carries no priority at any hop.
-        body: JSON.stringify({ roomId: ROOM_ID, target_convo, body, ...(priority === true ? { priority: true } : {}) }),
-      });
-      const data = await postRes.json().catch(() => ({}));
-      if (!postRes.ok) {
-        return { content: [{ type: 'text', text: `agent_message failed: ${data.error || `HTTP ${postRes.status}`}` }] };
-      }
-      return { content: [{ type: 'text', text: JSON.stringify(data) }] };
     } catch (err) {
       return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
     }
@@ -1260,7 +1228,7 @@ server.tool(
   },
   async ({ room_id, target_convo_id, topic, justification }) => {
     try {
-      const postRes = await fetch(`${BRIDGE_API}/agent-chat-invite`, {
+      const postRes = await bridgeFetch(`${BRIDGE_API}/agent-chat-invite`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ roomId: ROOM_ID, room_id, target_convo_id, justification, ...(topic ? { topic } : {}) }),

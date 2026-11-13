@@ -83,7 +83,7 @@ describe('session control wiring (source inspection)', () => {
     expect(index).toContain('function flushRoomInbox(session) {');
   });
   it('parked controls and the automatic carry-on persist and are restored on resume', () => {
-    const ps = body('function persistSession(roomId, sessionId, workdir, originRoomId, extra, { failLoud = false } = {}) {', '\nfunction ');
+    const ps = body('function persistSession(roomId, sessionId, workdir, originRoomId, extra) {', '\nfunction ');
     expect(ps).toContain('if (live) derived._deferredControls = live._deferredControls || null;');
     expect(ps).toContain('if (live) derived._autoResume = live._autoResume || null;');
     // Restored for the ROOM, resume or not, in all three builders (Codex too).

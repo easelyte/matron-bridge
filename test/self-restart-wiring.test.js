@@ -1,6 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
-import { createQueuedDispatcher } from '../lib/queued-dispatch.js';
+import { runInNewContext } from 'node:vm';
 
 // The restart_session tool's two ends: the MCP surface in ask-user.js and the
 // endpoint/session wiring in index.js. index.js can't be imported (it starts a
@@ -140,10 +140,17 @@ describe('index.js self-restart loop budget', () => {
     const dispatchMergedFlush = vi.fn(() => true);
     const emitRelease = vi.fn();
     const journalPublishNotice = vi.fn();
-    const dispatcher = createQueuedDispatcher({
-      dispatchMergedFlush, emitRelease, journalPublishNotice,
-      journalConvoIdFor: () => 'convo', queueRelease: { listLive: () => [] },
-    });
+    const context = {
+      dispatchMergedFlush, emitRelease, journalPublishNotice, console,
+      restartLatch: undefined, AGENT_CODEX: 'codex',
+      journalConvoIdFor: () => 'convo', journalInputConsumer: { queueRelease: { listLive: () => [] } },
+    };
+    const names = ['flushQueue', 'restoreQueuedBatch', 'snapshotQueuedReleaseBatch', 'queuedReleaseItemIds', 'liveQueuedReleaseEntries', 'finalizeSentQueue'];
+    const functions = names.map(name => {
+      const start = src.indexOf(`function ${name}(`);
+      return src.slice(start, src.indexOf('\n}\n', start) + 2);
+    }).join('\n');
+    const dispatcher = runInNewContext(functions + '\n({ flushQueue })', context);
     const snapshot = { convoId: 'convo', entries: [], notifications: [notification] };
     expect(dispatcher.flushQueue(session, queued, snapshot)).toBe(false);
     expect(dispatchMergedFlush).not.toHaveBeenCalled();

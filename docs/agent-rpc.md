@@ -12,8 +12,6 @@ frame at 16 KiB. A method this bridge does not know answers
 |---|---|---|
 | `recent_folders` | New Chat folder picker, model/agent options, capacity blocks (`activity`, `limits`, `disk`, `account`) | `lib/journal-rpc.js` |
 | `start` | Start a session (New Chat / spawn relay) | `lib/journal-rpc.js` |
-| `read_file` | Read a file inside the pinned allowed roots, with its sha256 | `lib/read-file.js` |
-| `edit_file` | Guarded edit of an existing file (optional sha256 CAS) | `lib/edit-file.js` |
 | `ops_snapshot` | Read-only host / ops sections for the Ops page | `lib/ops-snapshot.js` |
 
 ## `ops_snapshot`

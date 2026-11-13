@@ -60,7 +60,7 @@ describe('usage-limit stall wiring (source inspection)', () => {
     expect(codex).toContain('_stall: null,');
     const iv = body('function createInteractiveSessionForRoom(', '\nfunction ');
     expect(iv).toContain('_stall: resumeSessionId ? (persistedForRoom?._stall || null) : null,');
-    const ps = body('function persistSession(roomId, sessionId, workdir, originRoomId, extra, { failLoud = false } = {}) {', '\nfunction ');
+    const ps = body('function persistSession(roomId, sessionId, workdir, originRoomId, extra) {', '\nfunction ');
     expect(ps).toContain('if (live) derived._stall = live._stall || null;');
   });
 });
