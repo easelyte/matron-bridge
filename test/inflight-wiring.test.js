@@ -503,7 +503,7 @@ describe('background marker behaviour in the bridge', () => {
       });
       const publish = vi.fn(() => true);
       const boot = runFunction('publishRestartCarryOnCards', {
-        JOURNAL_ENABLED: true, PLANNED_RESTART_ENABLED: false, inflightMarker: marker,
+        JOURNAL_ENABLED: true, publishNoteOnlyRecoveryCards() {}, PLANNED_RESTART_ENABLED: false, inflightMarker: marker,
         RESTART_CARRY_ON_MAX_AGE_MS: 6 * 3600 * 1000,
         takeSelfRestartStamp: () => stamp, SELF_RESTART_STAMP_FILE: 'unused',
         loadPersistedSessions: () => ({ 'room-a': { journalConvoId: 'alice' } }),
