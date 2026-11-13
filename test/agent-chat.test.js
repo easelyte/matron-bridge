@@ -359,7 +359,7 @@ describe('createAgentChatHandlers', () => {
       // The peer's conversation title ('Remote work') never earned a session
       // short, so that half of the tag falls back to its plain device name.
       expect(calls[0]).toEqual({ call: 'upsertConvo', convoId: chatRoomId, opts: { title: 'M:ab ↔️ box-2 — ci triage', sessionState: 'waiting' } });
-      expect(calls[1]).toEqual({ call: 'publishText', convoId: chatRoomId, payload: { body: 'hi, seen the red build?', from: 'agent' } });
+      expect(calls[1]).toEqual({ call: 'publishText', convoId: chatRoomId, payload: { body: 'hi, seen the red build?', from: 'agent', from_session: { convo_id: 'convo-sess' } } });
       expect(calls[2].fields).toEqual({
         role: 'owner', state: 'pending', sessionRoomId: '!sess', targetConvoId: 'convo-remote',
         peerDeviceId: 7, peerName: 'box-2', topic: 'ci triage', title: 'M:ab ↔️ box-2 — ci triage',
@@ -796,7 +796,7 @@ describe('createAgentChatHandlers', () => {
       const res = await f.handlers.chatSend({ roomId: '!sess', room_id: id, message: 'ping' });
       expect(res.status).toBe(200);
       expect(res.body).toEqual({ ok: true, note: 'sent — any reply will arrive as a later turn' });
-      expect(f.calls).toContainEqual({ call: 'publishText', convoId: id, payload: { body: 'ping', from: 'agent' } });
+      expect(f.calls).toContainEqual({ call: 'publishText', convoId: id, payload: { body: 'ping', from: 'agent', from_session: { convo_id: 'convo-sess' } } });
       expect(awaitRoomMessage).not.toHaveBeenCalled();
     });
 
@@ -827,7 +827,15 @@ describe('createAgentChatHandlers', () => {
       const f = makeFixture({ session: { currentTurn: turn }, publisher: { publishText: (convoId, payload, options) => sent.push({ convoId, payload, options }) } });
       const id = joined(f);
       expect((await f.handlers.chatSend({ roomId: '!sess', room_id: id, message: 'ping' })).status).toBe(200);
-      expect(sent).toEqual([{ convoId: id, payload: { body: 'ping', from: 'agent' }, options: { provenance: { fromConvoId: 'convo-sess', causes: turn.causes } } }]);
+      expect(sent).toEqual([{ convoId: id, payload: { body: 'ping', from: 'agent', from_session: { convo_id: 'convo-sess' } }, options: { provenance: { fromConvoId: 'convo-sess', causes: turn.causes } } }]);
+    });
+
+    it('stamps the session title beside its convo id when one is known, never a box name', async () => {
+      const sent = [];
+      const f = makeFixture({ session: { _journalTitleHint: '  Fix the build  ' }, publisher: { publishText: (convoId, payload) => sent.push(payload) } });
+      const id = joined(f);
+      expect((await f.handlers.chatSend({ roomId: '!sess', room_id: id, message: 'ping' })).status).toBe(200);
+      expect(sent).toEqual([{ body: 'ping', from: 'agent', from_session: { convo_id: 'convo-sess', title: 'Fix the build' } }]);
     });
 
     it('returns a quick reply from the wait window and caps wait_seconds at 60', async () => {
@@ -1086,7 +1094,7 @@ describe('createAgentChatHandlers', () => {
       // …and the owner can still post to B.
       const send = await handlers.chatSend({ roomId: '!sess', room_id: 'room-1', message: 'still here, B?' });
       expect(send.status).toBe(200);
-      expect(calls).toContainEqual({ call: 'publishText', convoId: 'room-1', payload: { body: 'still here, B?', from: 'agent' } });
+      expect(calls).toContainEqual({ call: 'publishText', convoId: 'room-1', payload: { body: 'still here, B?', from: 'agent', from_session: { convo_id: 'convo-sess' } } });
     });
 
     it('409s an owner ADMIT into a locally-dead room, but still allows the refusal', async () => {
@@ -2214,7 +2222,7 @@ describe('chatStart reuse (one room per session pair)', () => {
     // that agent"; reuse must not turn it into "say nothing" while reporting
     // success, or the caller believes it spoke and the peer heard nothing.
     expect(calls.filter((c) => c.call === 'publishText')).toEqual([
-      { call: 'publishText', convoId: roomId, payload: { body: 'me again', from: 'agent' } },
+      { call: 'publishText', convoId: roomId, payload: { body: 'me again', from: 'agent', from_session: { convo_id: 'convo-sess' } } },
     ]);
   });
 
@@ -3168,7 +3176,7 @@ describe('chatStart with a person (talk request)', () => {
     expect(again.body.note).toMatch(/existing room reused/);
     expect(invites.invite).toHaveBeenCalledTimes(1);
     expect(calls.filter((c) => c.call === 'publishText')).toEqual([
-      { call: 'publishText', convoId: first.body.room_id, payload: { body: 'also this', from: 'agent' } },
+      { call: 'publishText', convoId: first.body.room_id, payload: { body: 'also this', from: 'agent', from_session: { convo_id: 'convo-sess' } } },
     ]);
     // A different person is a different room.
     await handlers.chatStart({ ...talk, person: 'carol' });
