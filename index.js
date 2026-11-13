@@ -134,6 +134,8 @@ import {
 import { createPlannedRestartState } from './lib/planned-restart-state.js';
 import { createPlannedRestart } from './lib/planned-restart.js';
 import { createRestartLatch } from './lib/restart-latch.js';
+import { createRestartNotes } from './lib/restart-notes.js';
+import { createRestartBoot } from './lib/restart-boot.js';
 import { buildRestartStatus } from './lib/box-status-restart.js';
 import { installRestartToken, removeRestartToken, decideRestartRequest, MAX_BODY_BYTES as RESTART_BODY_MAX_BYTES } from './lib/restart-api.js';
 import { createSubagentConvoTracker } from './lib/subagent-convos.js';
@@ -12818,8 +12820,23 @@ const plannedRestart = plannedRestartState ? createPlannedRestart({
   onReady: verdict => restartLatch.onReady(verdict),
 }) : null;
 
+// Held resume notes (reminder_create restart_note: true): the participants of a
+// planned restart are the sessions that left one.
+const restartNotes = plannedRestartState ? createRestartNotes() : null;
+
+// A notes file that cannot be read must not stop every restart from latching:
+// the restart proceeds without participants and the notes stay on disk.
+function plannedRestartParticipants(id) {
+  try { return restartNotes.listHeld(id).map(note => note.convoId); }
+  catch {
+    console.warn('[restart] held notes unreadable; the restart will carry nobody on');
+    return [];
+  }
+}
+
 const restartLatch = plannedRestart ? createRestartLatch({
   stateStore: plannedRestartState, bootId: BRIDGE_BOOT_ID,
+  participants: id => plannedRestartParticipants(id),
   available: () => !shuttingDown,
   quiet: plannedRestartQuiet,
   readCode: (requests, bootSha) => plannedRestart.readCode(requests, bootSha),
@@ -12857,18 +12874,41 @@ if (plannedRestart) {
   timer.unref();
 }
 
-// Boot: a restart the previous process latched is over once this one is up.
-function reconcilePlannedRestartAtBoot() {
-  if (!plannedRestartState) return;
-  try {
-    const state = plannedRestartState.getState();
-    if (state.state !== 'restarting') return;
-    const code_mismatch = state.expected_sha != null && RESTART_BOOT_SHA !== state.expected_sha;
-    plannedRestartState.setState('back', { results: { code_mismatch } });
-    console.log(`[restart] back${code_mismatch ? ' (code differs from the expected sha)' : ''}`);
-    publishBoxStatus('restart back');
-  } catch { console.warn('[restart] boot reconciliation failed'); }
+// Boot: carry the participants of a restart the previous process latched on
+// with their notes, and mark the restart back once each has a verdict.
+const restartBoot = plannedRestartState ? createRestartBoot({
+  stateStore: plannedRestartState, notesStore: restartNotes, bootSha: RESTART_BOOT_SHA,
+  maxAgeMs: RESTART_CARRY_ON_MAX_AGE_MS, deliver: deliverRestartNote,
+  log: message => console.log(`[restart] ${message}`),
+}) : null;
+
+// Hand a note to its session, resuming the session if it was reaped or stopped.
+// False (retried) when the session is mid-turn or waiting on an answer: the note
+// must never be typed into an open question as its answer.
+const RESTART_RESUME_NOTICE = '🔄 The bridge restarted as planned — resuming this chat with your resume note.';
+async function deliverRestartNote(entry) {
+  let session = findSessionByClaudeSessionId(entry.convoId);
+  if (!session || !session.alive) session = journalResumeConvo(entry.convoId, RESTART_RESUME_NOTICE);
+  if (!session) return false;
+  if (session.busy || session.waitingForAnswer || session.pendingInteractivePrompt
+    || session.pendingUnclassifiedPrompt || session.codexPrompts?.active || session.currentTurn) return false;
+  return (await journalRouteTextToSession(session, entry.text, { causes: [carryOnCause()] })) !== false;
 }
+
+// Synchronous, here at module load: it must run before the local API accepts a
+// request, before any timer or input is dispatched, and before start() below
+// looks for pending notes. The box_status report follows with the next hello_ok.
+function reconcilePlannedRestartAtBoot() {
+  if (!restartBoot) return;
+  try {
+    restartBoot.reconcile();
+  } catch {
+    console.warn('[restart] boot recovery failed; held notes stay on disk');
+    // A restart stuck at `restarting` would refuse every later request.
+    try { plannedRestartState.setState('back', { results: { recovery_failed: true } }); } catch { /* the state file is unreadable */ }
+  }
+}
+reconcilePlannedRestartAtBoot();
 
 // POST /wake (lib/wake-route.js): wake one configured conversation with one
 // configured text, the way a timer firing does — resuming a reaped session.
@@ -13246,6 +13286,8 @@ const reminderHandlers = createReminderHandlers({
   sessions,
   journalConvoIdFor,
   timerStore,
+  restartNotes,
+  restartState: plannedRestartState ?? undefined,
   announce: announceAgentReminder,
 });
 
@@ -14524,6 +14566,7 @@ apiServer.listen(API_PORT, '127.0.0.1', () => {
     if (restartToken) process.on('exit', () => { try { removeRestartToken(restartToken); } catch { /* best-effort */ } });
     else console.warn('[restart] could not write the restart token file; POST /restart is disabled');
   }
+  try { restartBoot?.start(); } catch { console.warn('[restart] could not schedule resume notes'); }
   console.log(`Local API listening on 127.0.0.1:${API_PORT}`);
   publishOperatorToken();
 });
@@ -15682,7 +15725,6 @@ async function main() {
   // queues frames FIFO until hello_ok, exactly as the eager control-convo
   // upsert above relies on, so nothing is dropped by publishing here.
   publishRestartCarryOnCards();
-  reconcilePlannedRestartAtBoot();
   // After the carry-on cards: a self-restart for new code must never land
   // before the previous process's interruptions have been surfaced.
   startCodeUpdateWatcher();

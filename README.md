@@ -315,6 +315,20 @@ token file could not be written) answers `501`, and the script stops with exit 3
 and does not retry. What is holding the restart, and why, is reported under
 `restart` in `box_status`.
 
+A session can leave a resume note for the restart with `reminder_create` and
+`restart_note: true` (no `in`, `at`, `repeat` or `hold_awake`; it needs a pending
+restart, one note per session, the last write wins). The note is held in
+`~/.matron-bridge-restart-notes.json`, outside the timer set, so it can never
+fire early however long the restart waits. The sessions with a held note are the
+restart's participants. Once the restarted bridge's local API is up it carries
+them on one at a time (15 seconds after boot, 10 seconds apart), each with an
+`[auto-continue after planned bridge restart]` turn that quotes its note, and
+marks the restart `back` in `box_status` with an outcome per session. Delivery
+is at most once: an entry is marked before the hand-off, so a crash inside it
+is reported as `possibly_delivered` and not delivered again; a hand-off that
+fails outright is retried after a minute, three attempts in all, then `failed`.
+A restart older than `MATRON_RESTART_CARRY_ON_MAX_AGE_MS` (six hours by default) resumes nobody.
+
 The route is gated by a capability token the bridge writes at start to
 `~/.matron-bridge-restart.env` (mode 0600) and removes at exit. That keeps stray
 HTTP from other users and processes out; it does not stop a process running as

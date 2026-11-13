@@ -8,7 +8,10 @@ describe('planned restart wiring', () => {
   const part = (from, to) => {
     const start = index.indexOf(from);
     expect(start).toBeGreaterThan(-1);
-    return index.slice(start, to ? index.indexOf(to, start) : undefined);
+    if (!to) return index.slice(start);
+    const end = index.indexOf(to, start);
+    expect(end, `end marker ${to}`).toBeGreaterThan(start);
+    return index.slice(start, end);
   };
   const block = part('// --- Planned restart (lib/planned-restart.js) ---', '// POST /wake (lib/wake-route.js)');
 
@@ -43,7 +46,7 @@ describe('planned restart wiring', () => {
   });
 
   it('polls on an unref()d timer and reports a changed verdict rather than every poll', () => {
-    const timer = part('if (plannedRestart) {\n  let previous;', '// Boot: a restart');
+    const timer = part('if (plannedRestart) {\n  let previous;', '// Boot: carry');
     expect(timer).toMatch(/timer\.unref\(\)/);
     expect(timer).toContain('plannedRestart.tick()');
     expect(timer).toContain('summary !== reported');
@@ -72,13 +75,29 @@ describe('planned restart wiring', () => {
     expect(listen).toContain('removeRestartToken(restartToken)');
   });
 
-  it('marks a latched restart back at boot, after the carry-on cards and before the watcher starts', () => {
-    const main = part('async function main() {', 'main().catch');
-    expect(main).toMatch(/publishRestartCarryOnCards\(\);\n\s*reconcilePlannedRestartAtBoot\(\);[\s\S]*startCodeUpdateWatcher\(\);/);
+  it('recovers a latched restart at module load, before the local API listens and before start()', () => {
     const reconcile = part('function reconcilePlannedRestartAtBoot() {', '\n}\n');
-    expect(reconcile).toContain("state.state !== 'restarting'");
-    expect(reconcile).toContain("setState('back'");
-    expect(reconcile).toContain('code_mismatch');
+    expect(reconcile).toContain('restartBoot.reconcile()');
+    // A failed recovery must not leave the restart stuck at `restarting`.
+    expect(reconcile).toContain("setState('back', { results: { recovery_failed: true } })");
+    const call = index.indexOf('\nreconcilePlannedRestartAtBoot();\n');
+    expect(call).toBeGreaterThan(index.indexOf('function reconcilePlannedRestartAtBoot() {'));
+    expect(call).toBeLessThan(index.indexOf("apiServer.listen(API_PORT, '127.0.0.1', () => {"));
+    expect(part('async function main() {', 'main().catch')).not.toContain('reconcilePlannedRestartAtBoot');
+  });
+
+  it('carries participants on with their held notes: latch participants, boot recovery and delivery through the session router', () => {
+    expect(index).toContain('participants: id => plannedRestartParticipants(id),');
+    const boot = part('const restartBoot = ', '\nfunction reconcilePlannedRestartAtBoot');
+    expect(boot).toContain('bootSha: RESTART_BOOT_SHA');
+    expect(boot).toContain('maxAgeMs: RESTART_CARRY_ON_MAX_AGE_MS');
+    const deliver = part('async function deliverRestartNote(entry) {', '\n}\n');
+    expect(deliver).toContain('journalResumeConvo(entry.convoId, RESTART_RESUME_NOTICE)');
+    expect(deliver).toContain('session.busy || session.waitingForAnswer || session.pendingInteractivePrompt');
+    expect(deliver).toContain('session.pendingUnclassifiedPrompt || session.codexPrompts?.active || session.currentTurn');
+    expect(deliver).toContain('journalRouteTextToSession(session, entry.text, { causes: [carryOnCause()] })');
+    const listen = part("apiServer.listen(API_PORT, '127.0.0.1', () => {", "console.log(`Local API listening");
+    expect(listen).toContain('restartBoot?.start()');
   });
 
   it('reports the restart in box_status', () => {
