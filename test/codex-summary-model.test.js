@@ -13,6 +13,13 @@ describe('createCodexSummaryModel', () => {
     await expect(m.generate('p')).resolves.toBe('TITLE: x');
   });
 
+  it('flattens a structured { system, prompt } prompt to one string for stdin', async () => {
+    const seen = [];
+    const m = createCodexSummaryModel({ codexOneShot: async (p) => { seen.push(p); return { text: 'ok' }; }, env: {} });
+    await expect(m.generateWithModel({ system: 'FORMAT', prompt: 'Messages:\nhi' })).resolves.toEqual({ text: 'ok', model: 'codex' });
+    expect(seen).toEqual(['FORMAT\n\nMessages:\nhi']);
+  });
+
   it('throws when the run produced no text', async () => {
     const m = createCodexSummaryModel({ codexOneShot: async () => ({ text: null, reason: 'timeout' }), env: {} });
     await expect(m.generate('p')).rejects.toThrow(/timeout/);
