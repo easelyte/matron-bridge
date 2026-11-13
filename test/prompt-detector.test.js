@@ -1131,7 +1131,7 @@ describe('PromptDetector', () => {
             for (const v of [...surfaced]) if (u.startsWith(v)) surfaced.delete(v);
             surfaced.add(u);
           }
-          const message = formatTuiCueMessage(unwrapped, all, { hasNewUrls: fresh.length > 0 });
+          const message = formatTuiCueMessage(unwrapped, [...fresh, ...all.filter(u => !fresh.includes(u))], { hasNewUrls: fresh.length > 0 });
           for (const part of message?.parts || []) sent.push(part.plain);
         },
       };
@@ -1170,6 +1170,19 @@ describe('PromptDetector', () => {
       await settle(det, screenFor(full));
       await settle(det, screenFor(full));
       expect(urlsSent(relay)).toEqual([cut, full]);
+    });
+
+    it('delivers a retry\'s fresh link, not the earlier one still in the buffer', async () => {
+      const det = new PromptDetector({ idleMs: 40 });
+      const relay = makeRelay();
+      det.on('screen-update', u => relay.onUpdate(u));
+      const a = `${base}&state=aaa111&code_challenge=ccc111`;
+      const b = `${base}&state=bbb222&code_challenge=ddd222`;
+      await settle(det, screenFor(a));
+      await settle(det, screenFor(a));
+      await settle(det, screenFor(b));
+      await settle(det, screenFor(b));
+      expect(urlsSent(relay)).toEqual([a, b]);
     });
 
     it('still suppresses a cut of an already-sent full URL', async () => {

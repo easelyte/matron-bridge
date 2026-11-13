@@ -4672,7 +4672,11 @@ function handleInteractiveScreenUpdate(session, update) {
   // Build a clean cue-specific message instead of dumping the raw
   // screen. If the formatter can't make sense of the cue, skip rather
   // than spam a screen-dump full of status chrome.
-  const message = formatTuiCueMessage(unwrappedScreen, allUrls, { hasNewUrls: newUrls.length > 0 });
+  // Fresh URLs lead: the sign-in card picks the first OAuth link, and a
+  // stale one still in the capture buffer (a retry's earlier link) must not
+  // be sent in place of the fresh one just marked surfaced.
+  const orderedUrls = [...newUrls, ...allUrls.filter(u => !newUrls.includes(u))];
+  const message = formatTuiCueMessage(unwrappedScreen, orderedUrls, { hasNewUrls: newUrls.length > 0 });
   // Auto-Enter decision is independent of message formatting: an
   // acknowledgment screen the formatter can't summarise must STILL be
   // acknowledged, or claude sits blocked on a keystroke the user can't see.
