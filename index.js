@@ -45,7 +45,7 @@ import { createTransferReceiver } from './lib/transfer-receiver.js';
 import { createItemsHandlers } from './lib/items-tools.js';
 import { createReminderHandlers } from './lib/reminder-tools.js';
 import { createRestartNotes } from './lib/restart-notes.js';
-import { createRestartBoot, createRestartCancellation } from './lib/restart-boot.js';
+import { createRestartBoot, createRestartCancellation, takeNoteOnlyRecoveries } from './lib/restart-boot.js';
 import { createMissionsClient } from './lib/missions-client.js';
 import { createMissionsHandlers } from './lib/missions-tools.js';
 import { createSearchHandlers } from './lib/search-tools.js';
@@ -16929,6 +16929,7 @@ async function deliverRestartNote(entry) {
 
 function publishRestartCarryOnCards(boot = null) {
   if (!JOURNAL_ENABLED) return;
+  if (!boot) publishNoteOnlyRecoveryCards();
   let stale;
   try {
     // takeStale clears and PERSISTS before this returns, i.e. before a single
@@ -17016,6 +17017,28 @@ function publishRestartCarryOnCards(boot = null) {
       try { console.warn(`[inflight] carry-on card for convo=${rec.convoId} (age ${Math.round(rec.ageMs / 1000)}s) was NOT published — its marker is already cleared, so this interruption's card is lost`); } catch { /* logging must never throw */ }
     }
   }
+}
+
+// Planned-restart recovery is down (no boot reconciler): nothing will deliver
+// the restart notes it left pending. Chats with an in-flight marker get the
+// ordinary carry-on card from publishRestartCarryOnCards; chats that only had
+// a note (no marker) get one here. Runs before that function takes the markers.
+function publishNoteOnlyRecoveryCards() {
+  if (!plannedRestartState) return;
+  try {
+    let markerIds = new Set();
+    try { markerIds = new Set(Object.keys(JSON.parse(fs.readFileSync(INFLIGHT_FILE, 'utf8')) || {})); } catch { /* none readable */ }
+    const persisted = loadPersistedSessions();
+    const resumable = new Set(Object.values(persisted)
+      .flatMap(rec => [rec?.journalConvoId, rec?.sessionId]).filter(Boolean));
+    for (const convoId of takeNoteOnlyRecoveries({ notesStore: createRestartNotes(), markerIds,
+      isResumable: id => resumable.has(id) && isResumeConvoId(id) })) {
+      journalPublishCardForConvo(convoId, {
+        question: '⚠️ The bridge restarted and could not resume this chat by itself. Tap to carry on from where it left off.',
+        options: [{ id: `resume-${convoId}`, label: '▶️ Carry on', value: `resume:${convoId}` }],
+      });
+    }
+  } catch { console.warn('[restart] note-only recovery cards failed'); }
 }
 
 async function main() {
