@@ -177,9 +177,24 @@ it('a later healthy boot does not resume chats already handed a recovery card', 
 it('a failed note removal still returns every card target', () => {
   const f = fixture({ state: 'restarting', patch: { ...latched, participants: ['alice', 'bob'] }, held: [] });
   for (const id of ['alice', 'bob']) f.notes.putPending({ id: 'restart-a', convoId: id, text: 't', writtenAt: 1 });
-  const notesStore = { listPending: () => f.notes.listPending(), removePending: (id, convoId) => {
+  const notesStore = { listPending: () => f.notes.listPending(), listHeld: () => [], removeHeld() {}, removePending: (id, convoId) => {
     if (convoId === 'bob') throw new Error('ENOSPC');
     f.notes.removePending(id, convoId);
   } };
   expect(takeNoteOnlyRecoveries({ stateStore: f.store, notesStore })).toEqual(['alice', 'bob']);
+});
+
+it('a repeated handback after a failed removal does not card the chat twice', () => {
+  const f = fixture({ state: 'restarting', patch: { ...latched, participants: ['bob'] }, held: [] });
+  f.notes.putPending({ id: 'restart-a', convoId: 'bob', text: 't', writtenAt: 1 });
+  const notesStore = { listPending: () => f.notes.listPending(), listHeld: id => f.notes.listHeld(id),
+    removePending: () => { throw new Error('ENOSPC'); }, removeHeld: (id, c) => f.notes.removeHeld(id, c) };
+  expect(takeNoteOnlyRecoveries({ stateStore: f.store, notesStore })).toEqual(['bob']);
+  expect(takeNoteOnlyRecoveries({ stateStore: f.store, notesStore })).toEqual([]);
+});
+
+it('a held note left behind by a failed move still gets its card', () => {
+  const f = fixture({ state: 'restarting', patch: { ...latched, participants: ['bob'] }, held: ['bob'] });
+  expect(takeNoteOnlyRecoveries({ stateStore: f.store, notesStore: f.notes })).toEqual(['bob']);
+  expect(f.notes.listHeld('restart-a')).toEqual([]);
 });
