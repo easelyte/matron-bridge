@@ -129,9 +129,9 @@ npm run check >/dev/null || fail "syntax check failed — see 'npm run check'"
 echo "  - native bindings actually load, import chain resolves?"
 # The definitive test for the sharp class of failure: node --check parses but
 # never resolves imports, so only an actual import exercises the module graph
-# and the native .node binding. index.js pulls sharp via lib/inline-image.js.
-node --input-type=module \
-  -e "await import('sharp'); await import('./lib/inline-image.js')" \
+# and the native .node binding. Module mode loads index.js's whole static import
+# graph (sharp included) and exits before it reads .env or starts anything.
+MATRON_BRIDGE_PREFLIGHT=module node index.js \
   || fail "the new code cannot import its dependencies — refusing to restart a broken build"
 
 echo "  - the service we are about to restart exists?"

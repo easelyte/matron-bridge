@@ -61,32 +61,15 @@ const server = new McpServer({
   version: '1.0.0',
 });
 
-// Role-based tool list (lib/tool-roles.js): with BRIDGE_TOOL_ROLE=worker the
-// Coordinator-only tools are not registered. Unset or unknown means all tools.
-const TOOL_ROLE = process.env.BRIDGE_TOOL_ROLE || '';
-const toolCounts = { registered: 0, hidden: 0, wouldHide: 0 };
-const registerTool = server.tool.bind(server);
-server.tool = (name, ...rest) => {
-  if (!shouldRegister(name, TOOL_ROLE)) {
-    toolCounts.hidden += 1;
-    return undefined;
-  }
-  toolCounts.registered += 1;
-  if (!shouldRegister(name, 'worker')) toolCounts.wouldHide += 1;
-  return registerTool(name, ...rest);
-};
-// The same filter for tools registered through registerTool (a config object
-// instead of positional arguments), e.g. timeline_week_write.
-const registerToolConfig = server.registerTool.bind(server);
-server.registerTool = (name, ...rest) => {
-  if (!shouldRegister(name, TOOL_ROLE)) {
-    toolCounts.hidden += 1;
-    return undefined;
-  }
-  toolCounts.registered += 1;
-  if (!shouldRegister(name, 'worker')) toolCounts.wouldHide += 1;
-  return registerToolConfig(name, ...rest);
-};
+// Filter both SDK registration methods before any tools are registered.
+// Only a confirmed worker role hides tools; other roles keep the full list.
+const TOOL_ROLE = process.env.BRIDGE_TOOL_ROLE;
+for (const method of ['tool', 'registerTool']) {
+  const register = server[method].bind(server);
+  server[method] = (name, ...args) => shouldRegister(name, TOOL_ROLE)
+    ? register(name, ...args)
+    : undefined;
+}
 
 server.tool(
   'request_secret',
@@ -1905,7 +1888,6 @@ server.tool(
 
 // One boot line so the filter can be validated before it is enabled: with no
 // role set, "would hide" is what a worker session would lose.
-process.stderr.write(`[ask-user] tool role=${TOOL_ROLE || 'unset'} registered=${toolCounts.registered} hidden=${toolCounts.hidden} would-hide=${toolCounts.wouldHide}\n`);
 
 const transport = new StdioServerTransport();
 await server.connect(transport);

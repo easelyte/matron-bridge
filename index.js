@@ -91,7 +91,7 @@ import { resolveShareTarget } from './lib/share-target.js';
 import { createInteractiveSession } from './lib/interactive-session.js';
 import { projectDirFor, transcriptPathFor, findTranscriptBySessionId } from './lib/transcript-dir.js';
 import { extractUrls, isIdleReadyScreen, extractPreamble, preambleMatchesText, compactScreenText, AUTO_ENTER_COMPACT_RE, loginSuccessNearAutoEnterCue, stripAnsi, findInputCue, unwrapScreenUrls, newUrlsAgainst, dropCutUrls } from './lib/prompt-detector.js';
-import { DESIGN_LOGIN_COMMAND, DESIGN_LOGIN_CODE_REFUSED_MESSAGE, classifyDesignLoginOutput, designLoginCodeRefused, designLoginOutcomeMessage, ownsDesignLoginFinish, signInDialogHoldsInput, designLoginEndsPhantomTurn, designNeedsInteractive, DESIGN_SWITCH_ANNOUNCEMENT, INTERACTIVE_READY_MESSAGE } from './lib/design-login-flow.js';
+import { DESIGN_LOGIN_COMMAND, DESIGN_LOGIN_CODE_REFUSED_MESSAGE, classifyDesignLoginOutput, showsSignInScreen, designLoginCodeRefused, designLoginOutcomeMessage, ownsDesignLoginFinish, signInDialogHoldsInput, designLoginEndsPhantomTurn, designNeedsInteractive, DESIGN_SWITCH_ANNOUNCEMENT, INTERACTIVE_READY_MESSAGE } from './lib/design-login-flow.js';
 import { formatTuiCueMessage } from './lib/tui-cue-message.js';
 import {
   buildMcpServers,
@@ -106,7 +106,7 @@ import {
 } from './lib/mcp-config.js';
 import { aliasLabel, extractModelFlag, isValidModelArg, modelFromEvent, modelOptions, normalizeModelArg, VALID_ALIAS_HINT } from './lib/model-aliases.js';
 import { switchModelInSession, modelButtons, planPrintModelSwitch } from './lib/model-command.js';
-import { inflightMediaReplaceRefusal, INFLIGHT_MEDIA_REPLACE_REFUSAL } from './lib/session-replace-guard.js';
+import { INFLIGHT_MEDIA_REPLACE_REFUSAL } from './lib/session-replace-guard.js';
 import { writeSavedMediaFile, makeIdentityAwareCleanup } from './lib/saved-media-file.js';
 import {
   resolveInteractive,
@@ -165,6 +165,7 @@ import {
 } from './lib/code-update-restart.js';
 import { createSubagentConvoTracker } from './lib/subagent-convos.js';
 import { createQueuedReleaseOutbox } from './lib/queued-release-outbox.js';
+import { createQueuedReleaseRetry } from './lib/queued-release-retry.js';
 import { beginTurn, beginOrJoinTurn, joinHeldTurn, endTurn, mergeIntoTurn, mergeCauses, causesForAsk, userMessageCause, itemCause, plainCause, spawnOutcomeCause, carryOnCause, roomMessageCause, queueCauses, tagCauses } from './lib/turn-cause.js';
 import { createSubagentRunningStore } from './lib/subagent-running-store.js';
 import { selectStrandedChildren, strandedRepairFrames } from './lib/subagent-reconcile.js';
@@ -190,7 +191,7 @@ import {
   JOURNAL_CONTROL_HELP,
   JOURNAL_CONTROL_HELP_NOTE,
 } from './lib/command-dispatch.js';
-import { sendPrintInterrupt, isInterruptAck, applyInterruptAck, interruptAckSubtype, INTERRUPT_FALLBACK_MS, INTERRUPT_ACK_BACKSTOP_MS } from './lib/print-interrupt.js';
+import { sendPrintInterrupt, applyInterruptAck } from './lib/print-interrupt.js';
 import {
   checkFileLink,
   validateAndOpen,
@@ -248,7 +249,7 @@ import { createJournalMediaRouter, chooseNarration } from './lib/journal-media.j
 import { createItemTurnRouter } from './lib/items-turn.js';
 import { createItemAttachmentSaver } from './lib/item-attachments.js';
 import { createSecretRequests, isOwnSecretFileName, requestSecretForSession } from './lib/secret-requests.js';
-import { attachQueuedCleanup, markJournalOrigin, planQueueFlush, runQueuedCleanup } from './lib/queue-flush.js';
+import { attachQueuedCleanup, runQueuedCleanup, markJournalOrigin, planQueueFlush } from './lib/queue-flush.js';
 import { queueFlushNotice } from './lib/queue-flush-notice.js';
 import {
   canSteerClaude, buildSteerLine, noteSteerWritten, applySteerLifecycle, decideSteerHold, noteSteerTurnOpened,
@@ -257,14 +258,14 @@ import {
 } from './lib/claude-steer.js';
 import { isCompactCommand, compactBatchSize, hasQueuedCompact, batchDeferralReason } from './lib/compact-priority.js';
 import { attachPendingMediaMirror, pendingMediaMirror } from './lib/media-mirror.js';
-import { seedJournalTitle, applyFallbackTitle, parseTitlePassResponse, withSessionShort, titleMarkerFor, hintIsEarnedTitle, recordTitleEarned } from './lib/journal-title-seed.js';
+import { seedJournalTitle, applyFallbackTitle, withSessionShort, titleMarkerFor, recordTitleEarned } from './lib/journal-title-seed.js';
 import { createSummaryModel, parseSummaryProviders } from './lib/summary-model.js';
 import { createCodexSummaryModel } from './lib/codex-summary-model.js';
 import { GoogleGenerativeAI } from '@google/generative-ai';
 import { createSummaryModelNag } from './lib/summary-model-nag.js';
 import { createLoginExpiryNotice, isLoginExpiredText, loginExpiredFromAssistantEvent, loginExpiredMessage, loginExpiredCardText, loginButtons } from './lib/login-expiry.js';
-import { summaryWindow, buildSummaryPrompt, SUMMARY_MIN_NEW, splitSpoken, spokenPayload, spokenRefFor } from './lib/summary-pass.js';
 import { codexOneShot } from './lib/codex-oneshot.js';
+import { createTitleSummary } from './lib/title-summary.js';
 import { activityStateChanged, truncateActivityDetail, shouldResumeThinkingAfterTool } from './lib/journal-activity.js';
 import { streamRefFor, armReplyRef, settleReplyRef } from './lib/journal-stream.js';
 import { contextFullToNative, briefContextReport } from './lib/context-command.js';
@@ -1653,8 +1654,8 @@ function persistSession(roomId, sessionId, workdir, originRoomId, extra) {
   if (live) derived._badModelRecovered = !!live._badModelRecovered;
   if (live) derived._fableStallSwitched = !!live._fableStallSwitched;
   if (live) derived._autoResumeRetries = live._autoResumeRetries || 0;
-  // Whether the LLM title is earned (llmTitleEarned in maybeUpdatePinnedSummary's
-  // neighbourhood) — only once the live session knows; unknown keeps the record's.
+  // Whether the LLM title is earned (llmTitleEarned in lib/title-summary.js)
+  // — only once the live session knows; unknown keeps the record's.
   if (typeof live?._llmTitleEarned === 'boolean') derived.llmTitleEarned = live._llmTitleEarned;
   // The Claude effort level the bridge last wrote (lib/effort-tracker.js),
   // so a resume passes it back as --effort (spawnEffortFor). Only a live
@@ -1793,8 +1794,8 @@ const runStateOutbox = createRunStateOutbox({ file: RUN_STATE_OUTBOX_FILE, log: 
 // echo-ack flips records `acked`; the retry driver + boot reconcile read it.
 const releaseOutbox = createQueuedReleaseOutbox({ log: console });
 // The one-shot boot-reconcile guard + its quiet-period deferral timer live in
-// the emitRelease..journalUpsertConvo seam below (scheduleReleaseReconcile),
-// next to reconcileReleaseOutbox itself.
+// lib/queued-release-retry.js (scheduleReleaseReconcile), next to
+// reconcileReleaseOutbox itself.
 
 // Persistent record of subagent child convos currently `running`.
 // Written by each session's subagent tracker (add on mint, remove on finish);
@@ -1828,8 +1829,7 @@ function journalStartSessionForRpc({ workdir, mcpExtras, model = null, agent = n
   session.sendCallback = sessionSendReply;
   session.sendHtml = sessionSendHtml;
   session.sendButtonMessage = sessionSendButtons;
-  // Fresh Codex sessions have a stable journal id before their native thread
-  // starts. Persist requested settings even while the native id is unknown.
+  // Codex has a stable conversation id even before its native thread starts.
   const mintedConvoId = session.agent === AGENT_CODEX && !session.claudeSessionId;
   // Same rules as !start: the requested model is the session's model from the
   // first turn, and it must be set before persisting (the live snapshot reads
@@ -1839,12 +1839,7 @@ function journalStartSessionForRpc({ workdir, mcpExtras, model = null, agent = n
   // explicit `extra` — persistSession auto-carries mcpExtras but deliberately
   // not model.
   if (model) session.currentModel = model;
-  // A minted Codex convo id is persisted NOW too (Bugbot, PR #263):
-  // journalResumeConvo matches on the persisted journalConvoId/sessionId,
-  // both otherwise unset until thread.started, so an idle reap or bridge
-  // restart in that window would orphan the chat the app just opened. The
-  // live snapshot carries journalConvoId; the native id is still null and
-  // persistSession keeps it null rather than inventing one.
+  // Persist requested settings before the native thread starts as well.
   if ((mcpExtras.length > 0 || model || effort || mintedConvoId) && (session.claudeSessionId || mintedConvoId)) {
     persistSession(sessionRoomId, session.claudeSessionId, session.workdir, null,
       model ? { model, ...explicitModelFlag(model) } : undefined);
@@ -2069,128 +2064,14 @@ function journalOnReconnect() {
   scheduleReleaseReconcile();
 }
 
-function emitRelease(convoId, { promptId, action, releasedIds }, { mutate } = {}) {
-  const itemId = (Array.isArray(releasedIds) && releasedIds.length)
-    ? releasedIds[0]
-    : `${promptId}::0`;
-  const at = Date.now();
-  const recordKey = `${promptId}\0${itemId}\0${action}`;
-  const durable = releaseOutbox.put(recordKey, {
-    convoId,
-    promptId,
-    itemId,
-    action,
-    releasedIds: Array.isArray(releasedIds) ? releasedIds : [itemId],
-    status: 'pending',
-    at,
-  });
-  if (!durable) {
-    console.warn(`[queued-release-outbox] write-ahead failed for ${recordKey} — aborting release (card stays actionable)`);
-    return false;
-  }
-  try { mutate?.(); }
-  catch (e) { console.warn(`[emitRelease] mutate thunk threw for ${recordKey}: ${e?.message ?? String(e)}`); }
-  journalPublisher.publishPromptReply(convoId, {
-    kind: 'queued_release',
-    prompt_id: promptId,
-    action,
-    released: releasedIds,
-    at,
-  }, { idemKey: `qr\0${promptId}\0${itemId}\0${action}` });
-  return true;
-}
-
-// In-process retry driver (spec §3 step 6). Re-publishes every SAME-EPOCH
-// `pending` outbox record whose frame is not already in the outbound queue,
-// with its deterministic idem_key (so a re-publish of an already-journaled
-// release is a server-side dedup no-op). SKIPS `pending_inherited` (the state
-// gate — only boot reconcile touches those) and `acked`. Fired by two triggers
-// (onSendCapacity + onReconnect); the in-progress flag coalesces overlapping
-// fires into one pass.
-let _republishingReleases = false;
-function republishPendingReleases() {
-  if (_republishingReleases) return;
-  // O(1) fast path: this fires per confirmed frame on the hot output path
-  // (onSendCapacity). With no retry-eligible records the pendingCount gate
-  // avoids an O(all-releases-since-boot) list() allocation per streamed delta.
-  if (releaseOutbox.pendingCount() === 0) return;
-  _republishingReleases = true;
-  try {
-    for (const rec of releaseOutbox.list()) {
-      if (rec.status !== 'pending') continue; // skip pending_inherited + acked
-      const idemKey = `qr\0${rec.promptId}\0${rec.itemId}\0${rec.action}`;
-      if (journalPublisher.hasQueuedIdem(idemKey)) continue; // frame still queued
-      journalPublisher.publishPromptReply(rec.convoId, {
-        kind: 'queued_release',
-        prompt_id: rec.promptId,
-        action: rec.action,
-        released: rec.releasedIds,
-        at: rec.at,
-      }, { idemKey });
-    }
-  } finally {
-    _republishingReleases = false;
-  }
-}
-
-// Boot reconciliation (spec §5). The SOLE toucher of `pending_inherited`. For
-// each inherited orphan (a release a prior process wrote but never got acked),
-// emit a terminal `expired` release via the normal write-ahead path — never
-// blind-re-publish the original send/cancel (device_id may differ post-restart,
-// so a re-publish could double-ink; expired is the conservative honest state).
-function reconcileReleaseOutbox() {
-  for (const rec of releaseOutbox.list()) {
-    if (rec.status !== 'pending_inherited') continue;
-    const expiredKey = `${rec.promptId}\0${rec.itemId}\0expired`;
-    // emitRelease write-aheads the expired-recovery record (key === expiredKey,
-    // status `pending`) BEFORE publishing, then publishes the terminal `expired`
-    // release. On a second boot where the inherited record IS the expired record
-    // this relabels it back to `pending` in place under the same key. Returns
-    // false (fail-closed) if the durable write-ahead can't persist.
-    const emitted = emitRelease(rec.convoId, {
-      promptId: rec.promptId,
-      action: 'expired',
-      releasedIds: [rec.itemId],
-    });
-    // F2: only remove the inherited original when the expired release was
-    // durably emitted. If emitRelease fail-closed (disk fault), keep the
-    // inherited record so a later boot retries — never delete with nothing
-    // published, else `_releaseReconciled` would permanently orphan the card.
-    // F1 self-delete guard: also require rec.key !== expiredKey — on an
-    // expired-on-expired second boot the keys match, so we must NOT delete the
-    // record we just re-wrote.
-    if (emitted && rec.key !== expiredKey) releaseOutbox.remove(rec.key);
-  }
-  releaseOutbox.sweepAcked();
-}
-
-// --- Boot-reconcile deferral (F1 timing fix) ---
-// reconcileReleaseOutbox must NOT run before the reconnect replay that carries
-// the echo of a committed-but-unacked release (that echo flips the record
-// pending_inherited -> acked, so reconcile then correctly skips it). We defer
-// reconcile behind a quiet-period timer, re-armed by every replayed journal
-// frame, so it fires only once the replay stream has been quiet for the window.
-// One-shot: inherited records are a boot-only concern, so we reconcile exactly
-// once (the first hello_ok's replay); after that the timer is null forever.
-// Quiet window overridable via env (short by default — a boot replay burst is
-// bounded and steady-state single-convo traffic isn't sub-window-continuous).
-const RELEASE_RECONCILE_QUIET_MS = Number(process.env.MATRON_QUEUED_RELEASE_RECONCILE_QUIET_MS) || 750;
-let _releaseReconciled = false;
-let _releaseReconcileTimer = null;
-function runReleaseReconcile() {
-  _releaseReconcileTimer = null;
-  if (_releaseReconciled) return;
-  _releaseReconciled = true;
-  reconcileReleaseOutbox();
-}
-function scheduleReleaseReconcile() {
-  if (_releaseReconciled) return;
-  if (_releaseReconcileTimer) clearTimeout(_releaseReconcileTimer);
-  _releaseReconcileTimer = setTimeout(runReleaseReconcile, RELEASE_RECONCILE_QUIET_MS);
-  if (_releaseReconcileTimer && typeof _releaseReconcileTimer.unref === 'function') {
-    _releaseReconcileTimer.unref();
-  }
-}
+// Queued-release seam, retry driver and deferred boot reconcile
+// (lib/queued-release-retry.js).
+const {
+  emitRelease,
+  republishPendingReleases,
+  scheduleReleaseReconcile,
+  releaseReconcilePending,
+} = createQueuedReleaseRetry({ releaseOutbox, journalPublisher });
 
 function journalUpsertConvo(session, opts, options) {
   // SUMMARY_JOURNAL_PUBLISH=0 (fork kill switch): keep the roster summary text
@@ -3612,7 +3493,6 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
   if (!resumeSessionId && !options.journalConvoId && !persisted?.journalConvoId) {
     persistSession(roomId, session.claudeSessionId, cwd, null);
     journalFlushForSession(session);
-    journalSpawnStatus(session);
   }
   enqueueRestartNotice(session, { deferDrain: true });
   return session;
@@ -3660,28 +3540,8 @@ function handleCodexEvent(session, event) {
           console.log(`Updated Codex thread ID for room ${session.roomId}: ${event.thread_id}`);
         }
         if (journalIdMissing) {
-          // Restart carry-on, first-turn repair. A FRESH Codex conversation has
-          // NO convo id until this very line: createCodexSessionForRoom leaves
-          // both claudeSessionId and journalConvoId null when there is nothing
-          // to resume (index.js:1582-1583), so sendToSession's noteTurnStart —
-          // the `session.busy = true` seam — ran with null and returned early.
-          // The first turn is often the longest one, and it would silently get
-          // no card. touch() cannot repair this: it no-ops when no record
-          // exists. The conversation IS genuinely resumable by then, because
-          // persistSession fired just above.
-          //
-          // Gated on journalIdMissing, NOT on the enclosing block: a later
-          // thread-id change (nativeIdChanged alone) leaves journalConvoId
-          // untouched, so that turn is already marked under this same id and
-          // re-marking would reset startedAt/touchedAt on an in-flight turn.
-          // This branch can therefore fire at most once per conversation.
-          //
-          // journalConvoIdFor(session) is now session.journalConvoId ===
-          // event.thread_id — the identical id persistSession just wrote as
-          // both sessionId and journalConvoId, that publishRestartCarryOnCards
-          // keys the card on, and that journalResumeConvo matches. Claude
-          // print/iv are unaffected: they mint the id at construction
-          // (index.js:1337, 2024), so journalIdMissing is never true for them.
+          // Repair an older session that reached its first turn without a
+          // stable conversation id. Fresh sessions already have one at spawn.
           if (session.busy) inflightMarker.noteTurnStart(journalConvoIdFor(session), session.roomId, inflightTurnOrigin(session));
           journalFlushForSession(session);
         }
@@ -3803,13 +3663,23 @@ function flushPendingSessionQueue(session) {
 // from acting on its replacement. The replay is fire-and-forget: this runs
 // inside synchronous turn-end bookkeeping, and each command's case reports
 // its own outcome.
+// In-flight attachments gate replacing a session, but not a replay of a
+// command that was accepted before the attachment arrived: the replay runs
+// with _replayingDeferred set, so it neither refuses nor loses the command.
+function mediaGateActive(session) {
+  return !session?._replayingDeferred && journalMediaRouter.hasInflightMedia(session);
+}
+
 function dispatchDeferredCommand(session) {
   const text = session._deferredCommandText;
   if (!text) return false;
   session._deferredCommandText = null;
   if (!session.alive || sessions.get(session.roomId) !== session) return false;
   const ctx = journalSessionCommandCtx(session);
-  handleCommand(session.roomId, text, ctx.sendReply, ctx.sendHtml, ctx.sender).catch((err) => {
+  session._replayingDeferred = true;
+  handleCommand(session.roomId, text, ctx.sendReply, ctx.sendHtml, ctx.sender).finally(() => {
+    session._replayingDeferred = false;
+  }).catch((err) => {
     // The command failed, so nothing is pending any more. For a self-restart
     // this is what lets restart_session be called again instead of 409ing
     // on the flag the failed !restart left behind.
@@ -4864,17 +4734,11 @@ function handleUnclassifiedPrompt(session, { screen }) {
 // its idle screen so planModeSwitch doesn't refuse the switch.
 const LOGIN_RETURN_TO_PRINT_DELAY_MS = 2500;
 
-// /design-login from chat (lib/design-login-flow.js). The bridge types the
-// command, the generic screen-update relay surfaces its OAuth link, and this
-// watch reads the PTY output written after the command for the result line
-// that ends the flow. A session the bridge switched to interactive mode for
-// the flow (_accountFlowReturnToPrint, the /login flag, so every abandon and
-// crash-restart path that already handles it covers this flow too) goes back
-// to print mode; a session the user put in interactive mode stays there and
-// just gets the result. The cap outlives the TUI's own 5-minute OAuth
-// timeout, whose message is itself a result line.
+// Watch only output emitted after typing /design-login; stop on a result or timeout.
 const DESIGN_LOGIN_WATCH_CAP_MS = 7 * 60 * 1000;
 const DESIGN_LOGIN_SETTLE_MS = 400;
+// No sign-in screen this soon after typing the command: the CLI doesn't know it.
+const DESIGN_LOGIN_NO_SCREEN_MS = 20 * 1000;
 const DESIGN_LOGIN_BUFFER_LIMIT = 65536;
 const DESIGN_LOGIN_RETRY_MS = 5000;
 const DESIGN_LOGIN_RETRY_LIMIT = 24;
@@ -4884,42 +4748,42 @@ function armDesignLoginWatch(session) {
   if (!iv || typeof iv.on !== 'function') return;
   session._designLoginWatch?.stop();
   const roomId = session.roomId;
-  // One token per attempt: the finish acts only while the room's session
-  // still holds THIS token, so neither an abandoned flow (/mode print leaves
-  // a session without it) nor an earlier attempt on the same TUI (a retry
-  // replaces it) can end the current one. The iv crash-restart copies it
-  // onto the replacement, so a finish that was pending still lands there.
+  // A newer attempt or an abandoned mode switch invalidates this finish.
   const flow = { turnAtArm: session.currentTurn || null };
   session._designLoginFlow = flow;
   let raw = '';
   let settleTimer = null;
   let refusalShown = false;
+  let screenSeen = false;
   const watch = {
     stop() {
       iv.removeListener('pty-data', onData);
       if (settleTimer) clearTimeout(settleTimer);
       clearTimeout(cap);
+      clearTimeout(noScreen);
       if (session._designLoginWatch === watch) session._designLoginWatch = null;
     },
   };
   const check = () => {
     settleTimer = null;
     const text = stripAnsi(raw);
+    if (!screenSeen && showsSignInScreen(text)) {
+      screenSeen = true;
+      clearTimeout(noScreen);
+    }
     const outcome = classifyDesignLoginOutput(text);
     if (outcome) {
       watch.stop();
       debug(`design-login finished (${outcome})`);
-      releaseDesignLoginBusy(session, flow, { dialogClosed: true });
+      releaseDesignLoginBusy(session, flow);
       if (!session.busy) flushAfterDesignLogin(session);
       scheduleDesignLoginFinish(roomId, flow, outcome, LOGIN_RETURN_TO_PRINT_DELAY_MS);
       return;
     }
-    // A refused code leaves the TUI on "Press Enter to retry, or any other
-    // key to cancel." with no URL, which the generic relay does not surface.
-    // Say it once per refusal: a new sign-in screen re-arms the notice.
+    // Refusal keeps the dialog open: release the pasted-code turn, but hold room input.
     if (!refusalShown && designLoginCodeRefused(text)) {
       refusalShown = true;
-      releaseDesignLoginBusy(session, flow, { dialogClosed: false });
+      releaseDesignLoginBusy(session, flow);
       raw = '';
       if (session.sendCallback) session.sendCallback(DESIGN_LOGIN_CODE_REFUSED_MESSAGE);
     } else if (refusalShown && findInputCue(text) === 'oauth') {
@@ -4939,42 +4803,35 @@ function armDesignLoginWatch(session) {
     scheduleDesignLoginFinish(roomId, flow, null, 0);
   }, DESIGN_LOGIN_WATCH_CAP_MS);
   if (typeof cap.unref === 'function') cap.unref();
+  const noScreen = setTimeout(() => {
+    if (screenSeen) return;
+    watch.stop();
+    debug('design-login: no sign-in screen appeared');
+    releaseDesignLoginBusy(session, flow);
+    if (!session.busy) flushAfterDesignLogin(session);
+    scheduleDesignLoginFinish(roomId, flow, 'unrecognised', 0);
+  }, DESIGN_LOGIN_NO_SCREEN_MS);
+  if (typeof noScreen.unref === 'function') noScreen.unref();
   iv.on('pty-data', onData);
   session._designLoginWatch = watch;
 }
 
-// The pasted code reaches the TUI as an ordinary message, which marks the
-// session busy and begins a turn, but the dialog consumes it and no claude
-// turn runs, so no Stop hook ever ends it: every later message sat in the
-// queue (the same failure class /effort works around, see
-// lib/effort-command.js). A result or a refusal ends that phantom turn: busy,
-// the turn record (only one begun after the watch armed) and the in-flight
-// marker. Queued room input is flushed only once the dialog has CLOSED: on a
-// refusal it stays open, and anything typed would answer its retry prompt.
-function releaseDesignLoginBusy(session, flow, { dialogClosed }) {
-  if (!designLoginEndsPhantomTurn(session)) return;
+function releaseDesignLoginBusy(session, flow) {
+  // Pasted codes start a turn that the dialog consumes without a Stop hook.
+  if (!designLoginEndsPhantomTurn(session, flow)) return;
   debug('design-login: ending the turn the pasted code began');
   session.busy = false;
   if (session.currentTurn && session.currentTurn !== flow.turnAtArm) endTurn(session);
   inflightMarker.noteTurnEnd(journalConvoIdFor(session));
   journalSessionState(session, 'waiting');
   journalActivity(session, 'idle');
-  if (dialogClosed) flushAfterDesignLogin(session);
 }
 
-// The dialog has closed: what the user sent meanwhile (queued behind the
-// phantom turn) goes first, then room input, the same order a real turn end
-// uses. Also runs when a refusal already cleared busy.
 function flushAfterDesignLogin(session) {
   if (!session.alive) return;
   if (flushPendingSessionQueue(session) !== true) maybeFlushRoomDelivery(session);
 }
 
-// Report the outcome and, for a borrowed session, switch back to print. A
-// refused switch (a turn running, a prompt open) retries quietly like the
-// /effort return; only the last try tells the user to type /mode print.
-// Bound to the attempt's token (see armDesignLoginWatch), not to the room or
-// the shared borrow flag: an old timer must not end a newer attempt.
 function scheduleDesignLoginFinish(roomId, flow, outcome, delayMs, attempt = 0) {
   const t = setTimeout(() => {
     const current = sessions.get(roomId);
@@ -4982,10 +4839,8 @@ function scheduleDesignLoginFinish(roomId, flow, outcome, delayMs, attempt = 0) 
     const sendReply = current.sendCallback || (() => {});
     const sendHtml = current.sendHtml || ((plain) => sendReply(plain));
     if (!shouldRunAccountFlowReturn(current)) {
-      // The user's own interactive session: report the result, stay put. A
-      // timeout there is not news (the TUI shows its own state).
       current._designLoginFlow = null;
-      if (outcome) sendReply(designLoginOutcomeMessage(outcome, { returning: false }));
+      sendReply(designLoginOutcomeMessage(outcome, { returning: false }));
       return;
     }
     if (!planModeSwitch(current, false).ok && attempt < DESIGN_LOGIN_RETRY_LIMIT) {
@@ -5277,15 +5132,16 @@ function teardownSubagentTracking(session) {
     session.codexWatcher.stop().catch(() => {});
     session.codexWatcher = null;
   }
-  // Reclaim this session's codex-viz sink dir on teardown. The sink lives
-  // outside Claude Code's pruned project tree, so without this it lingers until
-  // the boot-time age-based sweep (pruneStaleCodexSinks, still the backstop).
-  // Guard on the same viz env gate that created the sink + wired the watcher
-  // (the watcher-dependency env source), so we never rm on a session that never
-  // ran viz. Best-effort — removeCodexSinkForSession never throws.
+  // Use the same visualization gate as watcher setup, even if setup failed.
+  // Remove once per session object, and never while another live session
+  // owns the same id: teardown runs again from the old process's close event,
+  // which can land after a resume has recreated the sink.
   const vizEnv = session.codexSpawnEnv || process.env;
-  if (vizEnv.MATRON_CODEX_VIZ === '1' && session.claudeSessionId) {
-    removeCodexSinkForSession(session.claudeSessionId);
+  if (vizEnv.MATRON_CODEX_VIZ === '1' && session.claudeSessionId && !session._codexSinkRemoved) {
+    session._codexSinkRemoved = true;
+    const resumed = [...sessions.values()].some(
+      (other) => other !== session && other.alive !== false && other.claudeSessionId === session.claudeSessionId);
+    if (!resumed) removeCodexSinkForSession(session.claudeSessionId);
   }
   if (session.subagentConvos) {
     session.subagentConvos.finishAll();
@@ -5391,12 +5247,12 @@ function reconcileStrandedSubagents(reason = 'startup', { beforeBootOnly = false
 // Watcher discovery: publish the child convo (running, linked to the parent,
 // titled from the sidecar meta) the instant the subagent's transcript appears,
 // even before it emits any event.
-function handleSubagentStart(session, { agentId, label, agentType }) {
+function handleSubagentStart(session, { agentId, label, agentType, workflowRunId, workflowPhase }) {
   if (!session || !session.subagentConvos) return;
-  session.subagentConvos.discover(agentId, { label, agentType });
+  session.subagentConvos.discover(agentId, { label, agentType, workflowRunId, workflowPhase });
 }
 
-function handleSubagentEvent(session, { agentId, label, agentType, event }) {
+function handleSubagentEvent(session, { agentId, label, agentType, workflowRunId, workflowPhase, event }) {
   if (!session || !session.alive) return;
   if (!event || !event.message) return;
   const content = event.message.content;
@@ -5406,7 +5262,7 @@ function handleSubagentEvent(session, { agentId, label, agentType, event }) {
   // Ensure the child convo exists, refresh its title, and publish the
   // per-subagent status (model/context from THIS subagent's own event). The
   // returned child carries the convo id every publish below routes to.
-  const child = session.subagentConvos.onEvent(agentId, { label, agentType, event });
+  const child = session.subagentConvos.onEvent(agentId, { label, agentType, workflowRunId, workflowPhase, event });
   if (!child) return;
   const convoId = child.convoId;
 
@@ -6176,21 +6032,6 @@ function handleClaudeEvent(session, event) {
         // becomes known, so repaint here rather than making the header wait
         // for the first turn end. Unthrottled: init fires once per spawn.
         journalStatus(session);
-        // Which turn generation the CLI has actually OPENED.
-        // Print mode emits exactly one system/init per TURN — verified against
-        // the live CLI: init, result, init, result across two sequential turns
-        // on one session id. The bridge bumps turnGeneration when it WRITES a
-        // prompt, which is earlier: the first turn's init trailed the write by
-        // ~6.9s in that probe (CLI startup + MCP load), a later turn's by ~27ms.
-        // An interrupt armed inside that gap is dropped by the CLI, which still
-        // returns an ordinary success receipt for it — so this stamp is
-        // what tells printModeInterrupt whether an ack can be believed. If a CLI
-        // version ever stops emitting per-turn init, the stamp goes stale, acks
-        // are never trusted, and interrupts degrade to their pre-ack 10s
-        // behaviour: a fail-safe direction, never a worse one. Deliberately
-        // placed after journalStatus so the header-repaint wiring assertion in
-        // test/session-status.test.js keeps its adjacency window.
-        session._cliInitGeneration = session.turnGeneration;
         // The CLI opened this turn: steering may write into it now, and a
         // steer hold was waiting for exactly this (marks the oldest waiting
         // steered message started even on a CLI that never reported it).
@@ -6478,6 +6319,10 @@ function handleClaudeEvent(session, event) {
       break;
     }
 
+    case 'control_response':
+      applyInterruptAck(session.pendingInterrupt, event);
+      break;
+
     // Progress on a message steered into a running turn (lib/claude-steer.js).
     // Bookkeeping only: never output, unknown uuids ignored.
     case 'command_lifecycle': {
@@ -6489,59 +6334,6 @@ function handleClaudeEvent(session, event) {
       if (session._steerHold && !steerPendingTurn(session)) {
         endSteerHold(session);
         releaseStaleSteerHold(session, 'held steered message was cancelled');
-      }
-      break;
-    }
-
-    // The CLI's acknowledgement of an interrupt we sent. Before
-    // this case these lines fell through to `default: break` and were dropped,
-    // so the bridge's only signal was "did a `result` arrive within 10s" — and
-    // that 10s wedge is the sole door into the turn-overlap window (busy
-    // cleared while the CLI is still running the turn; the operator sees an
-    // idle session, sends a message, the CLI folds it into the dying turn and
-    // it is lost with the abort).
-    //
-    // An ack proves the CLI is responsive, which is precisely what the wedge
-    // exists to test for, so it pushes the deadline out to a long backstop.
-    // applyInterruptAck owns the matching: only the PENDING interrupt's own
-    // request_id counts, and it is a no-op once the handle has fired, been
-    // cancelled, or been acked already. Nothing else about the turn changes.
-    case 'control_response': {
-      const pending = session.pendingInterrupt;
-      if (!pending) break;
-      if (applyInterruptAck(pending, event)) {
-        // Routine, and deliberately NOT the `[wedge]` prefix:
-        // `[wedge]` is the alertable "the overlap window opened" signal, and a
-        // successful ack is the opposite of that. Tagging both the same would
-        // make every ordinary interrupt look like an incident to a grep or an
-        // alert rule.
-        console.log(
-          '[interrupt] acked by claude (subtype %s), room %s — %dms unstick replaced with %dms backstop',
-          interruptAckSubtype(event), session.roomId, INTERRUPT_FALLBACK_MS, INTERRUPT_ACK_BACKSTOP_MS,
-        );
-      } else if (isInterruptAck(event, pending.requestId) && !pending.ackTrusted) {
-        // Matched, but armed before the CLI opened this turn, so the receipt is
-        // meaningless. Keeping the shorter unstick is the whole point —
-        // extending here would delay recovery for a turn that was never
-        // interrupted. Logged because it is genuinely interesting: it means the
-        // operator hit stop inside the CLI's startup window.
-        console.warn(
-          '[interrupt] ignoring pre-init control_response, room %s gen %d — the CLI acks an interrupt it dropped (claude-agent-sdk-typescript#429); keeping the %dms unstick',
-          session.roomId, session.turnGeneration, INTERRUPT_FALLBACK_MS,
-        );
-      } else if (!isInterruptAck(event, pending.requestId)) {
-        // A control_response arrived while OUR interrupt is still pending but
-        // it does not carry our request_id. Either a foreign control request
-        // (we send none today) or the CLI changed the envelope shape — in which
-        // case the ack silently stops matching and the 10s path quietly comes
-        // back. Cheap drift detector for the external contract this whole case
-        // depends on. The already-acked duplicate is
-        // NOT logged here: applyInterruptAck returns false for it too, but it
-        // does match, so it falls through both branches.
-        console.warn(
-          '[interrupt] control_response did not match the pending interrupt, room %s — wedge deadline unchanged; check the CLI control_response shape',
-          session.roomId,
-        );
       }
       break;
     }
@@ -6795,13 +6587,17 @@ function sendToSession(session, contentBlocks, { skipJournalMirror = false, fore
   // seam clears busy but keeps the running turn, so the reply typed into it
   // joins that turn rather than relabelling it, and a "no causes" side counts
   // as `other`. Mid-turn input (busy) adds its causes when it has some.
+  const wasBusy = session.busy;
   const beganTurn = beginOrJoinTurn(session, causes);
     session.busy = true;
     // A steering write joins the running turn: it is not a turn start, so no
     // turn generation bump (the interrupt-ack stamp keys on it) and no journal
     // state change.
-    if (!steering) bumpTurnGeneration(session);
     if (!steering) {
+      // Only a write that starts a turn from idle advances the generation. A busy
+      // flush (send now, interrupt magic word) joins the same running turn, and
+      // bumping would make an armed interrupt timer look stale.
+      if (!wasBusy) bumpTurnGeneration(session);
       inflightMarker.noteTurnStart(journalConvoIdFor(session), session.roomId, inflightTurnOrigin(session));
       journalSessionState(session, 'running');
       journalActivity(session, 'thinking');
@@ -7285,8 +7081,6 @@ function startResumeReadyWatcher(session) {
                  && session.iv.sendText(parkedSlash) !== false) {
         parkedSlashTyped = true;
         debug(`typed parked ${parkedSlash} into ready TUI`);
-        // A /design-login-from-print flow ends on a result line, not on a
-        // press-Enter screen: watch for it (see armDesignLoginWatch).
         if (parkedSlash === DESIGN_LOGIN_COMMAND) armDesignLoginWatch(session);
         // An /effort-from-print flow: record the write like any bridge-typed
         // /effort (lib/effort-tracker.js), accept its confirmation on the
@@ -7580,12 +7374,21 @@ function flushQueue(session, queued, releaseSnapshot = null) {
     // model may still have seen is counted too. Never replaced.
     const steerCauses = queueCauses(queued);
     if (steerCauses) mergeIntoTurn(session, steerCauses);
-    session._codexSteerPending = { queued };
+    const steerPending = { queued, handedOff: false };
+    session._codexSteerPending = steerPending;
     const pending = session.codex.steer(blocks);
     steering = true;
     void pending.then(sent => {
       session._codexSteerPending = false;
-      if (!session.alive || sessions.get(session.roomId) !== session) return;
+      if (!session.alive || sessions.get(session.roomId) !== session) {
+        // The replacement session may still hold these entries (restart with
+        // preserveQueue); only clean up ones nobody retains.
+        // handedOff: killSession gave this batch to the replacement, which may
+        // already have sent it; never delete files the new turn was told to read.
+        const retained = new Set(sessions.get(session.roomId)?.queuedMessages || []);
+        if (!sent && !steerPending.handedOff) for (const entry of queued) if (!retained.has(entry)) runQueuedCleanup(entry);
+        return;
+      }
       if (sent) {
         commitDispatchedUserTurn(session, blocks.filter(b => b.type === 'text').map(b => b.text).join('\n\n'), null);
         if (mirrorText) journalPublishUserItem(session, 'publishText', { body: mirrorText, from: 'user' });
@@ -7604,7 +7407,12 @@ function flushQueue(session, queued, releaseSnapshot = null) {
       }
     }).catch(() => {
       session._codexSteerPending = false;
-      if (!session.alive) return;
+      if (!session.alive || sessions.get(session.roomId) !== session) {
+        const retained = new Set(sessions.get(session.roomId)?.queuedMessages || []);
+        if (steerPending.handedOff) return;
+        for (const entry of queued) if (!retained.has(entry)) runQueuedCleanup(entry);
+        return;
+      }
       restore();
       session._codexUncertainSteer = true;
       journalPublishNotice(snapshot.convoId, 'Could not confirm Codex delivery. Messages retained; check before resending.');
@@ -7647,9 +7455,9 @@ function flushQueue(session, queued, releaseSnapshot = null) {
     //      against, so retain the batch for a later flush rather than dropping.
     if (!session.alive || session._autoStopped) {
       console.log(`[QUEUE] dropped queued message(s) (room ${session.roomId})`);
-      if (Array.isArray(queued)) for (const entry of queued) runQueuedCleanup(entry);
       // Their cards would otherwise sit offering Send / Cancel for messages
       // that no longer exist, and read as unanswered in the journal.
+      for (const entry of queued) runQueuedCleanup(entry);
       finalizeSentQueue(snapshot.convoId, snapshot.entries, 'expired');
       // journalPublishNotice already no-ops on a falsy convo id and fails
       // open like every journal call.
@@ -8120,212 +7928,20 @@ async function updateRoomName(roomId, name) {
   if (journalSession) journalUpsertConvo(journalSession, { title: name });
 }
 
-// Generate the title once: has this conversation's LLM title
-// already been earned? The live flag, then the persisted record's — either
-// one, true or false, is the answer (a /resume writes false when it gives
-// the conversation a non-LLM title) — then, for a record from before the
-// flag, hintIsEarnedTitle's reading of the current title. The derived answer
-// is kept on the session, which persistSession writes into the record: a yes
-// at once, a no with the next persist (only an applied LLM title turns it).
-function llmTitleEarned(session) {
-  if (typeof session._llmTitleEarned === 'boolean') return session._llmTitleEarned;
-  const persisted = getPersistedSession(session.roomId)?.llmTitleEarned;
-  if (typeof persisted === 'boolean') {
-    session._llmTitleEarned = persisted;
-    return persisted;
-  }
-  if (!hintIsEarnedTitle(session, { serverLabel: SERVER_LABEL, workdir: session.workdir })) {
-    session._llmTitleEarned = false;
-    return false;
-  }
-  markLlmTitleEarned(session);
-  return true;
-}
-
-// The first LLM title has been applied: never ask for one again, across
-// restarts too.
-function markLlmTitleEarned(session) {
-  session._llmTitleEarned = true;
-  persistSession(session.roomId, session.claudeSessionId, session.workdir,
-    session.originRoomId, { llmTitleEarned: true });
-}
-
-async function maybeUpdatePinnedSummary(session) {
-  // Name the convo from the first user message — the same summary
-  // `claude --resume` and /sessions display — instead of leaving the
-  // workdir seed. One-shot, and guarded to only ever replace the seed.
-  // With Gemini configured this covers the gap before the LLM rename's
-  // 5-message threshold (short chats never get there); without Gemini
-  // it is the only naming that runs.
-  applyFallbackTitle(session, { serverLabel: SERVER_LABEL, updateRoomName, workdir: session.workdir });
-  if (!summaryModel) {
-    // Nothing else in the bridge notices that summarization is off. Say so
-    // once, in the tracker, now that a conversation exists to file against.
-    summaryModelNag.maybeFile(journalConvoIdFor(session));
-    return;
-  }
-
-  if (!session.chatHistory) session.chatHistory = [];
-  debug(`maybeUpdatePinnedSummary: chatHistory.length=${session.chatHistory.length}`);
-
-  // NOTE: the every-5-messages modulo gate is GONE — the caller
-  // (maybeSummarizeAtTurnEnd) gates on >=SUMMARY_MIN_NEW new messages.
-
-  try {
-    // Use in-memory summary as source of truth
-    let currentSummary = session.pinnedSummaryText || '';
-    const bulletCount = (currentSummary.match(/^•/gm) || []).length;
-
-    // Check if we need to compact (>15 bullets)
-    if (bulletCount > 15 && currentSummary) {
-      const compactPrompt = `Condense this session summary into exactly 3 bullet points (using • prefix) capturing the key accomplishments. Keep it concise and focused on major milestones:\n\n${currentSummary}`;
-      currentSummary = (await summaryModel.generate(compactPrompt)).trim();
-      // Persist compacted result immediately so it isn't lost if the next LLM call fails to match
-      session.pinnedSummaryText = currentSummary;
-    }
-
-    // Incremental window: only messages since the last SUCCESSFUL pass
-    // (cursor advances below on success only), capped at 200, plus the
-    // prior ROSTER paragraph as a fenced context preamble.
-    const { messages, nextCount } = summaryWindow(session.chatHistory, session.lastSummaryMsgCount);
-    if (!messages.length) return;
-    // Which reply the spoken lines will belong to. Read here, in the same
-    // step as the window and BEFORE the model call below: that call takes
-    // seconds, and a reply flushed by the next turn meanwhile must not lend
-    // its ref to this window's lines.
-    const replyRef = spokenRefFor(messages, session._lastReplyRef);
-    // Once the title is earned the pass stops asking for one; roster,
-    // summary and spoken lines still update every turn.
-    const wantTitle = !llmTitleEarned(session);
-    const prompt = buildSummaryPrompt({
-      messages,
-      priorRoster: session.lastRosterText || null,
-      hasCumulative: Boolean(currentSummary),
-      wantTitle,
-      structured: true,
-    });
-
-    // The model travels with the text: another session's pass may finish
-    // in between, so nothing shared is read after this await.
-    const { text, model: writtenBy } = await summaryModel.generateWithModel(prompt);
-    // The spoken lines come out first; the title/summary parser gets the rest
-    // (see splitSpoken for why it must not see spoken prose).
-    const voiced = splitSpoken(text);
-    const parsed = parseTitlePassResponse(voiced.rest);
-
-    // Update room name (Element sidebar truncates visually, full name visible on hover)
-    // A TITLE the model wrote anyway after the title was earned is ignored.
-    if (wantTitle && parsed.title) {
-      // A spawned session's rename keeps its 🐣 — the marker is identity,
-      // not part of the disposable title text.
-      const name = withSessionShort(session.claudeSessionId || session.roomId, parsed.title.slice(0, 60), titleMarkerFor(session));
-      updateRoomName(session.roomId, name);
-      markLlmTitleEarned(session);
-    }
-
-    // Publish the roster summary to the journal so other agents' rosters show
-    // what this session is doing. Don't-clobber analysis: the journal's
-    // COALESCE keeps the existing summary whenever the field is omitted, and
-    // journalUpsertConvo only carries `summary` when this pass actually
-    // produced one. The seed path (lib/journal-title-seed.js), the state-only
-    // path (journalSessionState), and the hint-replay upserts in
-    // journalPublish never carry `summary` — the publisher's omit-don't-null
-    // handling makes that automatic. No fallback summary when the summary
-    // model is off: the roster shows '', which is honest.
-    if (parsed.roster) {
-      journalUpsertConvo(session, { summary: parsed.roster.slice(0, 1000) });
-    }
-
-    // TOC event: one per successful pass, anchored by its own journal seq.
-    // It also carries the spoken version of the agent's last reply for voice
-    // mode — {spoken, spoken_more?, spoken_ref}, all or none (spokenPayload).
-    // Old apps ignore the extra keys; the journal passes the payload through.
-    const toc = (parsed.added || parsed.summary || '').trim();
-    if (toc) {
-      journalPublish(session, 'publishSummary', {
-        toc: toc.slice(0, 300),
-        detail: (parsed.roster || '').slice(0, 1000),
-        model: writtenBy,
-        ...spokenPayload(voiced, replyRef),
-      });
-    }
-
-    // Cursor + roster memory advance ONLY on a successful, parseable pass —
-    // a failing provider replays the same window next turn (capped at 200).
-    if (toc || parsed.roster) {
-      session.lastSummaryMsgCount = nextCount;
-      if (parsed.roster) session.lastRosterText = parsed.roster;
-    }
-
-    // Build cumulative summary for pinned message
-    let updatedSummary = '';
-    if (parsed.added && currentSummary) {
-      updatedSummary = `${currentSummary}\n• ${parsed.added}`;
-    } else if (parsed.summary && !currentSummary) {
-      // Only use SUMMARY: for the initial summary, not after compaction
-      updatedSummary = `• ${parsed.summary}`;
-    } else if (currentSummary) {
-      // LLM didn't produce a match — keep the existing summary (e.g. after compaction)
-      updatedSummary = currentSummary;
-    }
-
-    if (updatedSummary) {
-      // Store accumulated summary in session (source of truth). Only the
-      // summary text itself has ongoing meaning, so that's all that gets
-      // persisted.
-      session.pinnedSummaryText = updatedSummary;
-      if (session.claudeSessionId) {
-        persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, {
-          chatHistory: session.chatHistory,
-          pinnedSummaryText: updatedSummary,
-          lastSummaryMsgCount: session.lastSummaryMsgCount ?? 0,
-          lastRosterText: session.lastRosterText || '',
-        });
-      }
-    } else if (session.claudeSessionId && (toc || parsed.roster)) {
-      // No cumulative summary change (e.g. a roster-only pass), but the
-      // cursor still advanced — persist it so a restart doesn't replay the
-      // same window.
-      persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, {
-        chatHistory: session.chatHistory,
-        lastSummaryMsgCount: session.lastSummaryMsgCount ?? 0,
-        lastRosterText: session.lastRosterText || '',
-      });
-    }
-  } catch (e) {
-    // warn, not debug: these failures were invisible in production (DEBUG is
-    // off), which made a chat that silently never got its title/summary
-    // undiagnosable after the fact.
-    console.warn(`[summary] title/summary pass failed for ${session.roomId}: ${e.message}`);
-  }
-}
-
-// Turn-end gate for the summary pass. Fire-and-forget with an explicit catch
-// (an un-awaited rejection would be fatal under Node 22 defaults) and a
-// re-entrancy latch — turn-ends can arrive while a prior LLM call is pending.
-// A trigger swallowed by the latch is coalesced into one rerun when the
-// in-flight pass settles; otherwise messages recorded during a slow LLM call
-// would wait for the NEXT turn-end, and a conversation that goes quiet right
-// after would keep a stale summary indefinitely. Bounded: at most one rerun
-// per dropped trigger, and the min-new gate re-checks before the rerun fires.
-function maybeSummarizeAtTurnEnd(session) {
-  const count = session.chatHistory?.length || 0;
-  if (count - (session.lastSummaryMsgCount || 0) < SUMMARY_MIN_NEW) return;
-  if (session._summaryTurnInFlight) {
-    session._summaryRerunQueued = true;
-    return;
-  }
-  session._summaryTurnInFlight = true;
-  maybeUpdatePinnedSummary(session)
-    .catch((e) => console.warn(`[summary] turn-end pass failed for ${session.roomId}: ${e.message}`))
-    .finally(() => {
-      session._summaryTurnInFlight = false;
-      if (session._summaryRerunQueued) {
-        session._summaryRerunQueued = false;
-        maybeSummarizeAtTurnEnd(session);
-      }
-    });
-}
+// Title and summary pass (lib/title-summary.js).
+const { maybeSummarizeAtTurnEnd } = createTitleSummary({
+  SERVER_LABEL,
+  applyFallbackTitle,
+  summaryModel,
+  summaryModelNag,
+  updateRoomName,
+  getPersistedSession,
+  persistSession,
+  journalConvoIdFor,
+  journalUpsertConvo,
+  journalPublish,
+  debug,
+});
 
 // Path of a session's on-disk transcript. Extraction + bounded reading live
 // in lib/session-summary.js (see its header for why the old synchronous
@@ -8409,26 +8025,24 @@ function safeMediaFilename(name) {
 // the pending-media mirror always carry the full-resolution original.
 function buildSavedMediaBlocks(session, { buffer, mime, dims, isImage, ivFilename, caption, workdirName, inline }) {
   const blocks = [];
-  // The absolute path this function wrote to disk (null if it wrote nothing —
-  // e.g. an upload-dir failure). Returned so a caller that ends up dropping the
-  // media (session torn down before delivery) can unlink the orphaned file.
-  // savedIdentity is the file's captured { dev, ino } so the drop-path cleanup
-  // unlinks only THIS file, never a later upload that recycled the same name.
-  let savedPath;
-  let savedIdentity;
-  let savedTmpPath;
+  let saved;
+  const save = (dir, name) => {
+    saved = writeSavedMediaFile(deduplicateFilename(dir, name), buffer, {
+      reselectPath: () => deduplicateFilename(dir, name),
+    });
+    return saved.path;
+  };
+  const result = (ivHandled) => ({
+    blocks, ivHandled,
+    cleanup: saved ? makeIdentityAwareCleanup(saved.path, saved.identity, { tmpPath: saved.tmpPath }) : null,
+  });
   if (session.iv) {
     // iv-mode: the PTY is text-only. Save the file OUTSIDE the repo and type
     // only an absolute-path annotation; Claude reads it with its Read tool.
     // No base64 blocks and no inline content dump (SDK mode keeps those).
     const dir = ivUploadDir(session.roomId);
-    const savePath = deduplicateFilename(dir, ivFilename);
-    // Install no-replace; on a name collision reselect a fresh deduplicated
-    // name. Annotate with the ACTUAL saved path (may differ after a reselect).
-    ({ path: savedPath, identity: savedIdentity, tmpPath: savedTmpPath } = writeSavedMediaFile(savePath, buffer, {
-      reselectPath: () => deduplicateFilename(dir, ivFilename),
-    }));
-    blocks.push({ type: 'text', text: ivUploadAnnotation({ msgtype: isImage ? 'm.image' : 'm.file', savePath: savedPath, caption }) });
+    const savePath = save(dir, ivFilename);
+    blocks.push({ type: 'text', text: ivUploadAnnotation({ msgtype: isImage ? 'm.image' : 'm.file', savePath, caption }) });
     // Journal mirror (upload + publish + markRead) is deferred to actual
     // dispatch time — see lib/media-mirror.js. Attaching it here (rather
     // than calling journalMirrorUserMedia now) is what stops a queued
@@ -8437,7 +8051,7 @@ function buildSavedMediaBlocks(session, { buffer, mime, dims, isImage, ivFilenam
     // journal media path never reads these back — its blob is already in the
     // journal — so the tag is simply inert there.)
     attachPendingMediaMirror(blocks, { buffer, mime, name: ivFilename, dims });
-    return { blocks, ivHandled: true, savedPath, savedIdentity, savedTmpPath };
+    return result(true);
   }
   // SDK mode: lead with the caption so claude reads the user's words before
   // the "Image saved to …" bookkeeping and the image itself — the order a
@@ -8450,25 +8064,13 @@ function buildSavedMediaBlocks(session, { buffer, mime, dims, isImage, ivFilenam
   const saveDir = sessionDownloadDir(session) || matronFilesDir(session.workdir);
   if (caption) blocks.push({ type: 'text', text: caption });
   if (isImage) {
-    // Save image to the session uploads dir
-    let imgPath;
-    try { imgPath = deduplicateFilename(saveDir, workdirName); }
-    catch (err) { blocks.push({ type: 'text', text: `[Upload failed: ${err.message}]` }); return { blocks, ivHandled: false }; }
-    ({ path: savedPath, identity: savedIdentity, tmpPath: savedTmpPath } = writeSavedMediaFile(imgPath, buffer, {
-      reselectPath: () => deduplicateFilename(saveDir, workdirName),
-    }));
-    blocks.push({ type: 'text', text: `Image saved to ${savedPath}` });
-    appendInlineImageBlocks(blocks, { buffer, mime, inline, savePath: savedPath });
+    const imgPath = save(saveDir, workdirName);
+    blocks.push({ type: 'text', text: `Image saved to ${imgPath}` });
+    appendInlineImageBlocks(blocks, { buffer, mime, inline, savePath: imgPath });
     attachPendingMediaMirror(blocks, { buffer, mime, name: workdirName, dims });
   } else {
-    // Save file to the session uploads dir
-    let savePath;
-    try { savePath = deduplicateFilename(saveDir, workdirName); }
-    catch (err) { blocks.push({ type: 'text', text: `[Upload failed: ${err.message}]` }); return { blocks, ivHandled: false }; }
-    ({ path: savedPath, identity: savedIdentity, tmpPath: savedTmpPath } = writeSavedMediaFile(savePath, buffer, {
-      reselectPath: () => deduplicateFilename(saveDir, workdirName),
-    }));
-    blocks.push({ type: 'text', text: `File saved to ${savedPath}` });
+    const savePath = save(saveDir, workdirName);
+    blocks.push({ type: 'text', text: `File saved to ${savePath}` });
     attachPendingMediaMirror(blocks, { buffer, mime, name: workdirName, dims });
 
     if (mime === 'application/pdf') {
@@ -8477,14 +8079,14 @@ function buildSavedMediaBlocks(session, { buffer, mime, dims, isImage, ivFilenam
         source: { type: 'base64', media_type: 'application/pdf', data: buffer.toString('base64') }
       });
     } else if (mime.startsWith('image/')) {
-      appendInlineImageBlocks(blocks, { buffer, mime, inline, savePath: savedPath });
+      appendInlineImageBlocks(blocks, { buffer, mime, inline, savePath });
     } else if (mime.startsWith('text/') || ['application/json', 'application/xml', 'application/javascript', 'application/csv'].includes(mime)) {
       blocks.push({ type: 'text', text: `Contents of ${workdirName}:\n${buffer.toString('utf-8')}` });
     } else {
-      blocks.push({ type: 'text', text: `Binary file (${mime}) saved to ${savedPath}. Use the Read tool to inspect it if needed.` });
+      blocks.push({ type: 'text', text: `Binary file (${mime}) saved to ${savePath}. Use the Read tool to inspect it if needed.` });
     }
   }
-  return { blocks, ivHandled: false, savedPath, savedIdentity, savedTmpPath };
+  return result(false);
 }
 
 // --- Command Handler ---
@@ -8769,6 +8371,10 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         await sendReply(`Waiting for turn to finish before restarting${replacedNote}. Send again with --force to restart immediately.`);
         return;
       }
+      if (mediaGateActive(existing)) {
+        await sendReply(INFLIGHT_MEDIA_REPLACE_REFUSAL);
+        return;
+      }
       // A forced restart discards any parked one along with `existing` —
       // recreateSession copies fields onto the replacement explicitly, and
       // _deferredCommandText is deliberately not among them.
@@ -8778,21 +8384,6 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         : (carriedExtras || []);
       const restartSessionId = existing.claudeSessionId;
       const restartWorkdir = existing.workdir;
-      // Refuse the restart (even --force) while a journal-media attachment for
-      // this conversation is still being prepared — recreateSession tears the
-      // session down and the media router would drop the in-flight file at its
-      // delivery-time canonicality guard, silently losing the upload. Same gate
-      // as /switch (canSwitchAgent) and /mode//model (their planners); checked
-      // AFTER the busy-defer above, so a mid-turn restart still parks and only a
-      // restart that would recreate the session right now is blocked. The
-      // router's gate is age-bounded, so a stalled prep can't wedge /restart.
-      const restartMediaRefusal = inflightMediaReplaceRefusal(
-        !!journalMediaRouter.hasInflightMedia?.(existing),
-      );
-      if (restartMediaRefusal.refuse) {
-        await sendReply(restartMediaRefusal.message);
-        return;
-      }
       await sendReply(`🔄 Restarting ${agentLabel(existing.agent)} session...`);
       const restarted = recreateSession(roomId, {
         mcpExtras: effectiveRestartExtras,
@@ -8805,12 +8396,9 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         bypass: restartBypass != null ? restartBypass
           : (typeof existing.bypassMode === 'boolean' ? existing.bypassMode : undefined),
       }, { sendReply, sendHtml });
-      if (!restarted) {
-        // recreateSession backstopped the teardown (media raced in during the
-        // ack await, or the session vanished) and already notified — don't
-        // claim a restart that didn't happen.
-        break;
-      }
+      // Refused at teardown (an attachment arrived during the reply await):
+      // recreateSession already said so; don't announce a restart.
+      if (!restarted) return;
       // Persist AFTER the recreate: recreateSession persists mid-flight from
       // the replacement's live snapshot, which cannot know the new model yet.
       if (restartModelFlag.model && restarted) {
@@ -9437,7 +9025,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         `/mode [interactive|print] — Show or switch interactive vs non-interactive\n` +
         `/login — Log in to your Anthropic account (auto-switches to interactive mode)\n` +
         `/logout — Log out of your Anthropic account (auto-switches to interactive mode)\n` +
-        `/design-login — Authorize Claude Design access for /design-sync and /design consent (auto-switches to interactive mode)\n` +
+        `/design-login — Authorize Claude Design access (auto-switches to interactive mode)\n` +
         `/cost — Show session cost\n` +
         `/usage — Show token usage\n` +
         `/limits — Show subscription usage limits (session & weekly)\n` +
@@ -9484,7 +9072,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
           ['/mode [interactive|print]', 'Show or switch interactive vs non-interactive mode'],
           ['/login', 'Log in to your Anthropic account (auto-switches to interactive mode)'],
           ['/logout', 'Log out of your Anthropic account (auto-switches to interactive mode)'],
-          ['/design-login', 'Authorize Claude Design access for /design-sync and /design consent (auto-switches to interactive mode)'],
+          ['/design-login', 'Authorize Claude Design access (auto-switches to interactive mode)'],
           ['/cost', 'Show session cost'],
           ['/usage', 'Show token usage'],
           ['/limits', 'Show subscription usage limits (session &amp; weekly)'],
@@ -9718,6 +9306,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
     // NOT sendToSession: account commands run no claude turn, so no Stop
     // hook would ever clear `busy` — the same failure class /effort works
     // around (see lib/effort-command.js).
+    case '!design-login':
     case '!login':
     case '!logout': {
       const cmdWord = cmd.slice(1);
@@ -9726,8 +9315,23 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         await sendReply(`No active session. /${cmdWord} runs inside a session — start one first.`);
         break;
       }
-      // An account command supersedes a /design-login still finishing: its
-      // pending return would otherwise switch modes under this flow.
+      const isDesign = cmdWord === 'design-login';
+      if (isDesign && session.agent === AGENT_CODEX) {
+        await sendReply('/design-login is a Claude Code command. Switch this chat to Claude (/switch claude) to run it.');
+        break;
+      }
+      if (isDesign && session._accountFlowReturnScheduled) {
+        await sendReply('Still finishing the login — send /design-login again in a few seconds.');
+        break;
+      }
+      // Typed mid-turn, the TUI may hold the command until the turn ends, and the
+      // no-sign-in-screen window would run out first. A re-run while a dialog is
+      // already open (its watch exists) is let through: a pasted code can leave
+      // busy set until the watch releases it.
+      if (isDesign && session.busy && !session._designLoginWatch) {
+        await sendReply('A turn is running — send /design-login again when it finishes.');
+        break;
+      }
       session._designLoginWatch?.stop();
       session._designLoginFlow = null;
       // Any session.iv — even a dead one — takes this branch: falling
@@ -9777,7 +9381,8 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         // logout mark left by an earlier /logout attempt that never
         // finished, or a later clean exit would be misreported as a logout.
         session._accountLogoutPending = cmdWord === 'logout';
-        await sendReply(cmdWord === 'logout' ? 'Logging out…' : 'Logging in…');
+        if (isDesign) armDesignLoginWatch(session);
+        await sendReply(isDesign ? 'Signing in to Claude Design…' : cmdWord === 'logout' ? 'Logging out…' : 'Logging in…');
         break;
       }
       // A zero-turn print chat used to be turned away here with "send any
@@ -9796,7 +9401,9 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       // nothing is parked.
       const next = applyModeSwitch(roomId, session, true, {
         sendReply, sendHtml,
-        announcement: cmdWord === 'logout'
+        announcement: isDesign
+          ? 'Signing in to Claude Design — switching to interactive mode to complete…'
+          : cmdWord === 'logout'
           ? 'Logging out — switching to interactive mode to complete…'
           : 'Logging in — switching to interactive mode to complete…',
       });
@@ -9812,62 +9419,6 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         // handler uses this to confirm the logout (and, with the flag
         // above, persist print mode).
         next._accountLogoutPending = cmdWord === 'logout';
-      }
-      break;
-    }
-
-    // /design-login (design-system access for /design-sync and /design
-    // consent) is TUI-only like /login: a print session answers "isn't
-    // available in this environment". Same route as the '!login' case: type
-    // it into an interactive session, or switch a print session to
-    // interactive and park it for the ready TUI. Its end is a result line
-    // rather than a press-Enter screen, so armDesignLoginWatch (not the
-    // auto-Enter branch) reports the outcome and owns the return to print.
-    // /design itself is not intercepted: /design consent and /design revoke
-    // run in print mode as they are.
-    case '!design-login': {
-      const session = sessions.get(roomId);
-      if (!session || !session.alive) {
-        await sendReply('No active session. /design-login runs inside a session — start one first.');
-        break;
-      }
-      if (session.agent === AGENT_CODEX) {
-        await sendReply('/design-login is a Claude Code command. Switch this chat to Claude (/switch claude) to run it.');
-        break;
-      }
-      // A /login that just succeeded is about to switch this session back to
-      // print mode; starting the design sign-in now would be torn down by it.
-      if (session._accountFlowReturnScheduled) {
-        await sendReply('Still finishing the login — send /design-login again in a few seconds.');
-        break;
-      }
-      if (session.iv) {
-        if (session.iv.alive && session._awaitingInputReady) {
-          const previouslyParked = session._postReadySlashCommand;
-          session._postReadySlashCommand = DESIGN_LOGIN_COMMAND;
-          session._accountLogoutPending = false;
-          await sendReply(previouslyParked && previouslyParked !== DESIGN_LOGIN_COMMAND
-            ? `Queued /design-login (replacing the queued ${previouslyParked}) — it will run as soon as the session is ready.`
-            : 'The session is still resuming — /design-login will run as soon as it\'s ready.');
-          break;
-        }
-        if (session.iv.sendText(DESIGN_LOGIN_COMMAND) === false) {
-          await sendReply('Could not reach the session TUI — try /restart, then /design-login again.');
-          break;
-        }
-        session._accountLogoutPending = false;
-        armDesignLoginWatch(session);
-        await sendReply('Signing in to Claude Design…');
-        break;
-      }
-      const next = applyModeSwitch(roomId, session, true, {
-        sendReply, sendHtml,
-        announcement: 'Signing in to Claude Design — switching to interactive mode to complete…',
-      });
-      if (next) {
-        next._postReadySlashCommand = DESIGN_LOGIN_COMMAND;
-        next._accountFlowReturnToPrint = true;
-        next._accountLogoutPending = false;
       }
       break;
     }
@@ -10245,10 +9796,12 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
 // session at all). Fails open like every other journal call.
 // `notice` ({kind, icon, summary}, lib/system-notice.js) marks a notice the
 // apps may show as one compact row that expands to `body`.
-function journalPublishNotice(convoId, body, notice = null) {
+// `silent` marks a line that is only a record (see timerCardPayload): the
+// journal and the apps show it and tell nobody.
+function journalPublishNotice(convoId, body, notice = null, { silent = false } = {}) {
   if (!JOURNAL_ENABLED || !convoId) return;
   try {
-    journalPublisher.publishText(convoId, { body, from: 'assistant', ...(notice ? { notice } : {}) });
+    journalPublisher.publishText(convoId, { body, from: 'assistant', ...(notice ? { notice } : {}), ...(silent ? { silent: true } : {}) });
   } catch (e) {
     try { console.warn(`[journal-input] notice publish failed: ${e.message}`); } catch { /* logging must never throw */ }
   }
@@ -10806,21 +10359,6 @@ function journalOnText(session, body, { username, seq, convoId }) {
 
 // media (file/image/voice-note) -> session. Thin wiring around the injectable
 // lib/journal-media.js orchestrator: the router hands us a resolved
-// True only while `session` is still the live, canonical session for its room:
-// alive AND the exact object the sessions map still points at. Media prep is
-// async (fetch/transcribe/build), so the session captured at routeMedia entry
-// can be stopped, idle-reaped, or replaced by an agent switch before delivery.
-// Revalidating here stops the router from recreating queue state on a dead or
-// detached session (media lost, card taps dangle). Single-operator: the map is
-// tiny, so the values scan is cheap.
-function isCanonicalLiveSession(session) {
-  if (!session || !session.alive) return false;
-  for (const s of sessions.values()) {
-    if (s === session) return true;
-  }
-  return false;
-}
-
 // {type, blobRef, contentType, name, size, dims}; the orchestrator fetches the
 // blob back out of the journal blob store and feeds it to the session —
 // audio transcribed and injected as if the user typed it, images/files saved
@@ -10882,7 +10420,14 @@ const journalMediaRouter = createJournalMediaRouter({
         narration,
       }),
     });
-    return blocks;
+    const cleanups = result.frames.map(({ path: filePath }) => {
+      const { dev, ino } = fs.lstatSync(filePath, { bigint: true });
+      return makeIdentityAwareCleanup(filePath, { dev, ino });
+    });
+    return { blocks, cleanup: () => {
+      for (const cleanup of cleanups) cleanup();
+      try { fs.rmdirSync(outDir); } catch { /* keep a nonempty directory */ }
+    } };
   },
   buildSavedBlocks: async (session, { buffer, mime, isImage, name, dims, caption, onInlineSkip = null }) => {
     const safeName = safeMediaFilename(name);
@@ -10898,20 +10443,10 @@ const journalMediaRouter = createJournalMediaRouter({
         if (typeof onInlineSkip === 'function') onInlineSkip(inline.reason);
       }
     }
-    const { blocks, savedPath, savedIdentity, savedTmpPath } = buildSavedMediaBlocks(session, {
+    return buildSavedMediaBlocks(session, {
       buffer, mime, dims: dims || undefined, isImage,
       ivFilename: safeName, caption, workdirName: safeName, inline,
     });
-    // Hand the router a cleanup closure so a drop AFTER the disk write (session
-    // torn down mid-prep, or unavailable at inject) doesn't orphan the saved
-    // file. The router only calls this on drop paths, never once the blocks are
-    // queued/injected. Identity-aware: it unlinks only the exact file we saved
-    // (matched by dev+ino), never a later upload that recycled the same path;
-    // it also sweeps a residual temp link (savedTmpPath) if the install couldn't.
-    return {
-      blocks,
-      cleanup: savedPath ? makeIdentityAwareCleanup(savedPath, savedIdentity, { tmpPath: savedTmpPath }) : null,
-    };
   },
   // causes: the user's media message(s) that started the turn (lib/turn-cause.js).
   injectText: (session, text, { causes = null } = {}) => sendTextToSession(session, text, { causes }),
@@ -10920,7 +10455,7 @@ const journalMediaRouter = createJournalMediaRouter({
   // rides in an injectBlocks turn, so the words are mirrored on their own.
   mirrorText: (session, text) => journalPublishUserItem(session, 'publishText', { body: text, from: 'user' }),
   queueMedia: (session, entry) => journalQueueMedia(session, entry),
-  isCanonicalSession: (session) => isCanonicalLiveSession(session),
+  isCanonicalSession: (session) => !!session?.alive && sessions.get(session.roomId) === session,
   echoToRoom: journalEchoToRoom,
   publishNotice: journalPublishNotice,
   escapeHtml,
@@ -10949,10 +10484,7 @@ async function journalQueueMedia(session, { blocks, mirrorToJournal, preview, fu
   if (!session.queuedMessages) session.queuedMessages = [];
   const entry = tagCauses([...blocks], cause);
   if (!mirrorToJournal) markJournalOrigin(entry);
-  // Carry the saved-file cleanup with the entry so a later cancel/eviction/
-  // dead-drop of THIS queued upload unlinks the file it wrote to disk. A
-  // successful flush never runs it (the dispatched file is consumed).
-  if (typeof cleanup === 'function') attachQueuedCleanup(entry, cleanup);
+  attachQueuedCleanup(entry, cleanup);
   session.queuedMessages.push(entry);
   const ctx = journalSessionCommandCtx(session);
   // The queued tile is cosmetic: the entry above IS queued and will flush at
@@ -11123,7 +10655,9 @@ async function journalOnCoordinator(convoId, { role }) {
   const plan = planCoordinatorTransition({
     role,
     agent: session.agent,
-    occupied: sessionOccupiedForRoomDelivery(session),
+    // In-flight media counts as occupied: the role then applies at the next
+    // spawn instead of a respawn that recreateSession would refuse.
+    occupied: sessionOccupiedForRoomDelivery(session) || mediaGateActive(session),
     busy: !!session.busy,
     persisted: getPersistedSession(roomId),
     // A `!model <x>` the user queued mid-turn is their pick; only the
@@ -11775,6 +11309,11 @@ function formatTimerFireAt(record) {
 // unanswered prompt, whether the timer is still pending, fired or
 // cancelled. The prompt_id (lib/timer-command.js timerPromptId) names the
 // card should anything need to refer to it.
+// It is also `silent: true`: the card is the chat's record of what was
+// scheduled, there to be seen and undone, and nobody needs telling about it.
+// A silent event sends no push and never counts as unread or unseen, on the
+// journal and in the apps. What the timer delivers when it fires is an
+// ordinary message and notifies as usual.
 function timerCardPayload(record, summary) {
   return {
     question: summary,
@@ -11782,6 +11321,7 @@ function timerCardPayload(record, summary) {
     mode: 'pick_one',
     prompt_id: timerPromptId(record),
     blocking: false,
+    silent: true,
   };
 }
 
@@ -11805,7 +11345,7 @@ async function announceAgentReminder(session, record) {
       [timerSendNowButton(record.id), timerCancelButton(record.id)],
       'pick_one', summary, escapeHtml(summary), timerCardPayload(record, summary));
   } else {
-    journalPublishNotice(journalConvoIdFor(session), summary);
+    journalPublishNotice(journalConvoIdFor(session), summary, null, { silent: true });
   }
 }
 
@@ -13579,8 +13119,8 @@ function journalHandleInboundEvent(frame) {
   // frame pushes the quiet-timer out (during the post-reconnect burst these are
   // the replay frames, which carry the release echoes), so reconcile runs only
   // once that stream has gone quiet. No-op after the one-shot reconcile has fired
-  // (_releaseReconcileTimer is null), so steady-state traffic pays only a null check.
-  if (_releaseReconcileTimer) scheduleReleaseReconcile();
+  // (releaseReconcilePending() is false), so steady-state traffic pays only that check.
+  if (releaseReconcilePending()) scheduleReleaseReconcile();
 }
 
 // Leave ONE room binding whose session key no longer resolves to a
@@ -13652,11 +13192,7 @@ function journalEvictConvoInput(session) {
     permissionSeams.finalizePendingPermissionsForConvo(convoId, 'session ended');
     journalInputConsumer.evictConvo(convoId, {
       clearQueue: () => {
-        // Unlink any saved-media files still queued at eviction — the queue is
-        // being discarded wholesale, so these uploads are never dispatched.
-        if (Array.isArray(session.queuedMessages)) {
-          for (const entry of session.queuedMessages) runQueuedCleanup(entry);
-        }
+        for (const entry of session.queuedMessages || []) runQueuedCleanup(entry);
         session.queuedMessages = null;
         session.queueNotifications = [];
       },
@@ -15579,7 +15115,8 @@ const apiServer = createServer(async (req, res) => {
           // Legacy queue entries have no durable item id. Preserve their
           // positional cancellation behavior while keeping both arrays in
           // lockstep.
-          queue.splice(queueIndex, 1);
+          const [removed] = queue.splice(queueIndex, 1);
+          runQueuedCleanup(removed);
           if (queueIndex < notifs.length) notifs.splice(queueIndex, 1);
         }
         const remaining = queue.length;
@@ -15803,11 +15340,8 @@ function hydrateAgentState(session, persisted, fromAgent = otherAgent(session.ag
 
 async function switchAgentSession(roomId, targetAgent, { sendReply }) {
   const existing = sessions.get(roomId);
-  // Block the switch while an attachment for this conversation is still being
-  // prepared: tearing the session down mid-prep would make the media router
-  // drop the in-flight file at its delivery-time canonicality guard.
   const decision = canSwitchAgent(existing, targetAgent, {
-    hasInflightMedia: !!journalMediaRouter.hasInflightMedia?.(existing),
+    hasInflightMedia: mediaGateActive(existing),
   });
   if (!decision.ok) {
     await sendReply(decision.message);
@@ -16176,7 +15710,7 @@ function applyModelSwitch(roomId, session, arg, { sendReply, sendHtml, explicit 
     return switched;
   }
   const decision = planPrintModelSwitch(session, arg, {
-    hasInflightMedia: !!journalMediaRouter.hasInflightMedia?.(session),
+    hasInflightMedia: mediaGateActive(session),
   });
   if (decision.defer) {
     // Mid-turn: park the switch on the shared deferred-command stash (see
@@ -16260,7 +15794,7 @@ function applyModeSwitch(roomId, session, wantInteractive, { sendReply, sendHtml
     return;
   }
   const decision = planModeSwitch(session, wantInteractive, {
-    hasInflightMedia: !!journalMediaRouter.hasInflightMedia?.(session),
+    hasInflightMedia: mediaGateActive(session),
   });
   if (!decision.ok) {
     // `refusalAnnouncement` replaces planModeSwitch's message for flows the
@@ -16302,18 +15836,8 @@ function applyModeSwitch(roomId, session, wantInteractive, { sendReply, sendHtml
 function recreateSession(roomId, overrides, { sendReply, sendHtml }) {
   const existing = sessions.get(roomId);
   if (!existing) return null;
-  // Synchronous backstop for the in-flight-media drain gate. The per-command
-  // pre-checks (/restart's inline guard, planModeSwitch / planPrintModelSwitch)
-  // all run BEFORE the caller's `await sendReply(...)` ack, so an attachment can
-  // begin routing during that await and be mid-prep when we tear down here — the
-  // media router would then drop it at its delivery-time canonicality guard.
-  // Re-check now, with NO async boundary before the teardown below, closing the
-  // await-race for /restart, /mode, and /model uniformly at their shared choke
-  // point. routeMedia marks in-flight synchronously on enqueue, so a frame that
-  // arrived during the await is visible here. Age-bounded upstream, so a stalled
-  // prep can't wedge replacement. Returns null (like the no-session case); the
-  // callers already handle a null replacement, and this path also notifies.
-  if (journalMediaRouter.hasInflightMedia?.(existing)) {
+  // Recheck at teardown, including attachments arriving during a reply await.
+  if (mediaGateActive(existing)) {
     sendReply(INFLIGHT_MEDIA_REPLACE_REFUSAL);
     return null;
   }
@@ -16478,72 +16002,29 @@ async function printModeInterrupt(session, sendReply) {
     await sendReply('Interrupt already sent — still waiting for claude to stop this turn.');
     return;
   }
-  // Correlate the wedge timer with the turn it is armed for.
-  // Several seams clear busy without clearPendingInterrupt (a prompt surfaces,
-  // esc-cancel), after which a NEWER turn can start inside the 10s window. The
-  // generation snapshot lets the wedge fire ONLY while the same turn is still
-  // running; if a newer turn has started (bumpTurnGeneration ran at its
-  // busy=true seam), the stale timer is suppressed instead of clearing the new
-  // turn's busy flag.
   const armedGeneration = session.turnGeneration;
-  // Can this interrupt's acknowledgement be believed? Only if the CLI has
-  // already opened THIS turn. Snapshotted at arm time, not ack
-  // time: if init had not arrived when we wrote the interrupt, the CLI had not
-  // started the turn, so there was nothing for it to interrupt — and its
-  // success receipt says otherwise.
-  const ackTrusted = session._cliInitGeneration === armedGeneration;
   const interruptHandle = sendPrintInterrupt({
     stdin: session.proc.stdin,
-    // The CLI's control_response ack replaces the 10s unstick below
-    // with this backstop (handleClaudeEvent's `control_response` case). It is a
-    // replacement, not a cancellation — a CLI that acks and then never delivers
-    // a result must still unstick, or every later message queues behind a busy
-    // flag nothing will clear. The no-ack path keeps the 10s deadline
-    // unchanged, which is the case this wedge was designed for.
-    backstopMs: INTERRUPT_ACK_BACKSTOP_MS,
-    ackTrusted,
+    ackTrusted: session._turnInitSeen === true,
     shouldFireWedge: () => session.turnGeneration === armedGeneration,
-    // Retire the handle when the timer fires, even if the wedge is suppressed
-    // Identity-checked so a newer interrupt's handle is never
-    // erased; a suppressed wedge must not leave a stale pendingInterrupt that
-    // rejects the next interrupt on the current turn as already-in-flight.
     onSettle: () => {
       if (session.pendingInterrupt === interruptHandle) session.pendingInterrupt = null;
     },
     onWedge: () => {
       if (!session.busy) return;
-      // Tripwire (option A). Nothing in this path logged before, so
-      // "has the wedge ever actually fired?" could only be answered by querying
-      // the journal DB for the chat notice below (52 days, 65 interrupts, zero
-      // firings). Stable greppable prefix, on purpose, and reserved for THIS —
-      // an actual firing, i.e. the turn-overlap window opening for real:
-      //   journalctl -u matron-bridge-journal | grep '[wedge]'
-      // Two distinct firings, kept distinguishable in BOTH the log and the
-      // operator notice: the CLI never answered at all (the
-      // original designed case, 10s), versus it acked and then never ended the
-      // turn (the backstop, 60s). They mean different things operationally, and
-      // quoting the 10s deadline to the operator when the CLI did respond and we
-      // then waited out the 60s backstop is misleading recovery evidence.
-      const acked = interruptHandle?.acknowledged === true;
-      console.warn(
-        '[wedge] interrupt %s after %dms, room %s gen %d — clearing busy',
-        acked ? 'acked but turn never ended' : 'unacknowledged',
-        acked ? INTERRUPT_ACK_BACKSTOP_MS : INTERRUPT_FALLBACK_MS,
-        session.roomId, armedGeneration,
-      );
       session.busy = false;
       releaseSteersToCli(session);
       // Deliberately NO noteTurnEnd: this is a defensive unstick after an
-      // interrupt got no acknowledgement, and the reply below says so — "the
+      // interrupt never produced a result, and the reply below says so — "the
       // turn may still be running". Further agent output is still possible,
       // and the `result` seam will clear the marker if it arrives. Clearing
       // here would drop a card for a turn that really was interrupted.
       journalSessionState(session, 'waiting');
       journalActivity(session, 'idle');
-      const wedgeNotice = acked
-        ? `⚠️ claude acknowledged the interrupt but the turn has not ended after ${Math.round(INTERRUPT_ACK_BACKSTOP_MS / 1000)}s — cleared busy state. The turn may still be running; !stop kills the session if it stays stuck.`
-        : `⚠️ No response to the interrupt after ${Math.round(INTERRUPT_FALLBACK_MS / 1000)}s — cleared busy state. The turn may still be running; !stop kills the session if it stays stuck.`;
-      Promise.resolve(sendReply(wedgeNotice)).catch(() => {});
+      const reason = interruptHandle.acknowledged
+        ? 'Claude acknowledged the interrupt but the turn did not end within 60s'
+        : 'No response to the interrupt after 10s';
+      Promise.resolve(sendReply(`⚠️ ${reason} — cleared busy state. The turn may still be running; /stop kills the session if it stays stuck.`)).catch(() => {});
     },
     onError: (err) => {
       Promise.resolve(sendReply(`Could not send interrupt: ${err.message}`)).catch(() => {});
@@ -16555,11 +16036,8 @@ async function printModeInterrupt(session, sendReply) {
   }
 }
 
-// Monotonic per-session turn counter. Bumped at EVERY
-// busy=true transition (sendToSession + the two direct prompt-answer /
-// plan-approval seams). printModeInterrupt snapshots this when it arms the
-// wedge timer so the timer can tell "still the turn I was armed for" from "a
-// newer turn is running now", and suppress itself in the latter case.
+// Steering joins an existing turn; normal writes and held follow-up turns
+// advance this counter so an old interrupt cannot clear a newer turn's busy.
 function bumpTurnGeneration(session) {
   session.turnGeneration = (session.turnGeneration || 0) + 1;
 }
@@ -16576,8 +16054,10 @@ function clearPendingInterrupt(session) {
 
 function killSession(session, signal = 'SIGTERM', { preserveQueue = false } = {}) {
   if (!session) return;
+  session._designLoginWatch?.stop();
   if (preserveQueue && session._codexSteerPending?.queued) {
     restoreQueuedBatch(session, session._codexSteerPending.queued);
+    session._codexSteerPending.handedOff = true;
     session._codexSteerPending = false;
     session._codexUncertainSteer = true;
     journalPublishNotice(journalConvoIdFor(session), 'Restart interrupted a send-now acknowledgement. Messages are retained but held; check the response before resending.');
@@ -16641,7 +16121,8 @@ function sessionChildPid(session) {
 // `ps` rather than /proc so the same call works on the macOS bridges, and
 // Get-CimInstance on Windows (lib/process-table.js) in the same line shape.
 // Fails closed to an empty table: with no table there are no work children,
-// and the idle clock rules as it did before — never the other way round.
+// and the idle clock rules as it did before. Mark failures so the update
+// watcher can fall back to the in-memory work signals.
 function readProcessTable() {
   try {
     const { file, args: ptArgs } = processTableCommand();
@@ -16651,7 +16132,7 @@ function readProcessTable() {
     return parseProcessTable(execFileSync(file, ptArgs, { encoding: 'utf8', timeout, maxBuffer: 16 * 1024 * 1024, env: stripJournalCreds(), windowsHide: true }));
   } catch (e) {
     debug(`readProcessTable failed: ${e.message}`);
-    return [];
+    return Object.assign([], { unreadable: true });
   }
 }
 
@@ -16674,7 +16155,8 @@ function sessionHasBackgroundWork(session, observed = readProcessTableStrict) {
 
 // {reason} when this session has work in flight (a turn running, or a live
 // descendant of its claude process that is not one of its configured MCP
-// servers — a tool call, a background task), null when the idle clock
+// servers — a tool call, a background task — or a running subagent),
+// null when the idle clock
 // should rule. See lib/work-hold.js.
 function sessionWorkHold(session, last, now, table) {
   return workHold({
@@ -16682,6 +16164,7 @@ function sessionWorkHold(session, last, now, table) {
     children: liveWorkChildren(sessionChildPid(session), table, MCP_SERVER_SIGNATURES),
     idleSince: last,
     now,
+    subagentCount: session.subagentConvos?.runningCount() ?? 0,
   });
 }
 

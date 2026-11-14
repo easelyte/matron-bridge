@@ -53,6 +53,7 @@ function startStallingBlobServer(bodies) {
 // plus a busy-queued remainder.
 function makeRouter(overrides = {}) {
   const deps = {
+    isCanonicalSession: () => true,
     fetchMedia: vi.fn(async () => ({ buffer: Buffer.from('bytes'), contentType: 'image/png' })),
     transcribe: vi.fn(async () => 'hello world'),
     // A box with local whisper installed; the journal-first batch test
@@ -65,9 +66,6 @@ function makeRouter(overrides = {}) {
     echoToRoom: vi.fn(),
     publishNotice: vi.fn(),
     escapeHtml: (s) => String(s),
-    // Our fork's stale-session guard is a required dependency; batch
-    // tests aren't exercising it, so default every session to canonical.
-    isCanonicalSession: () => true,
     log: silentLog,
     ...overrides,
   };

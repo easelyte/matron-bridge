@@ -158,6 +158,17 @@ describe('workHold', () => {
     expect(workHold({ busy: false, children, idleSince: T0 - WORK_HOLD_MAX_MS + 1, now: T0 })).not.toBeNull();
   });
 
+  it('holds on running subagents under the same age cap', () => {
+    for (const subagentCount of [1, 2]) {
+      expect(workHold({ subagentCount, idleSince: T0 - 3600_000, now: T0 }))
+        .toEqual({ reason: `${subagentCount} subagent${subagentCount === 1 ? '' : 's'} still running` });
+      expect(workHold({ subagentCount, idleSince: T0 - WORK_HOLD_MAX_MS, now: T0 })).toBeNull();
+    }
+    for (const subagentCount of [0, undefined, null, NaN, -1, '2']) {
+      expect(workHold({ subagentCount, idleSince: T0, now: T0 })).toBeNull();
+    }
+  });
+
   it('caps at eight hours and leases the host marker fifteen minutes at a time', () => {
     expect(WORK_HOLD_MAX_MS).toBe(8 * 3600 * 1000);
     expect(WORK_HOLD_LEASE_MS).toBe(15 * 60 * 1000);

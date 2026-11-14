@@ -228,19 +228,36 @@ describe('resolveGitDir / readHeadReflog', () => {
 describe('defaultPreflight', () => {
   it('runs node --check then the import test, in the checkout, and reports the first failure', async () => {
     const calls = [];
-    const exec = (bin, args, opts, cb) => { calls.push({ bin, args, cwd: opts.cwd }); cb(null, '', ''); };
-    expect(await defaultPreflight('/srv/bridge', { exec })).toEqual({ ok: true });
-    expect(calls.map(c => c.args[0])).toEqual(['--check', '--input-type=module']);
+    const exec = (bin, args, opts, cb) => { calls.push({ bin, args, cwd: opts.cwd, env: opts.env }); cb(null, '', ''); };
+    const readFileSync = () => "if (process.env.MATRON_BRIDGE_PREFLIGHT === 'module') process.exit(0);";
+    expect(await defaultPreflight('/srv/bridge', { exec, readFileSync })).toEqual({ ok: true });
+    expect(calls.map(c => c.args)).toEqual([['--check', 'index.js'], ['index.js']]);
     expect(calls.every(c => c.cwd === '/srv/bridge' && c.bin === process.execPath)).toBe(true);
-    expect(calls[1].args[2]).toMatch(/import\('sharp'\)/);
+    expect(calls[1].env.MATRON_BRIDGE_PREFLIGHT).toBe('module');
 
     const failing = (bin, args, opts, cb) => cb(new Error('exit 1'), '', 'SyntaxError: Unexpected token\n    at line 3\n');
-    const res = await defaultPreflight('/srv/bridge', { exec: failing });
+    const res = await defaultPreflight('/srv/bridge', { exec: failing, readFileSync });
     expect(res.ok).toBe(false);
     expect(res.error).toMatch(/--check index\.js: .*Unexpected token/);
 
     const throwing = () => { throw new Error('spawn ENOENT'); };
-    expect((await defaultPreflight('/srv/bridge', { exec: throwing })).ok).toBe(false);
+    expect((await defaultPreflight('/srv/bridge', { exec: throwing, readFileSync })).ok).toBe(false);
+  });
+
+  it('never runs index.js for a checkout without the module-mode marker (older revision)', async () => {
+    const calls = [];
+    const exec = (bin, args, opts, cb) => { calls.push({ args, env: opts.env }); cb(null, '', ''); };
+    const old = () => "import fs from 'node:fs'; startBridge();";
+    expect(await defaultPreflight('/srv/bridge', { exec, readFileSync: old })).toEqual({ ok: true });
+    expect(calls.map(c => c.args)).toEqual([
+      ['--check', 'index.js'],
+      ['--input-type=module', '-e', "await import('sharp'); await import('./lib/inline-image.js')"],
+    ]);
+    // An unreadable index.js falls back the same way.
+    calls.length = 0;
+    const unreadable = () => { throw new Error('ENOENT'); };
+    await defaultPreflight('/srv/bridge', { exec, readFileSync: unreadable });
+    expect(calls[1].args[0]).toBe('--input-type=module');
   });
 });
 
@@ -284,7 +301,7 @@ describe('createCodeUpdateWatcher — a landed update', () => {
     expect(state.preflights).toBe(1);
     expect(state.restarts).toEqual([{ sha: NEW, forced: false, busy: 0, waitedMs: 0 }]);
     expect(state.log.join('\n')).toMatch(/new code on disk: bbbbbbb \(running aaaaaaa\)/);
-    expect(state.log.join('\n')).toMatch(/no session mid-turn — restarting onto bbbbbbb/);
+    expect(state.log.join('\n')).toMatch(/no session has work in flight — restarting onto bbbbbbb/);
     // Once asked to restart, the watcher is done; a late tick must not ask twice.
     expect(await watcher.tick()).toEqual({ action: 'restarted' });
     expect(state.restarts).toHaveLength(1);
@@ -307,7 +324,7 @@ describe('createCodeUpdateWatcher — a landed update', () => {
     // deploy shell off mid-run. A running turn is a running turn.
     const { state, watcher } = harness({ head: { sha: NEW, at: T0 - DEFAULT_SETTLE_MS }, busy: 1 });
     await watcher.tick();
-    expect(state.log.join('\n')).toMatch(/Restarting when no session is mid-turn, forced after/);
+    expect(state.log.join('\n')).toMatch(/Restarting when no session has work in flight, forced after/);
     for (let m = 1; m <= 6 * 60; m++) {
       state.now = T0 + m * 60_000;
       expect((await watcher.tick()).action).toBe('waiting');
@@ -315,8 +332,8 @@ describe('createCodeUpdateWatcher — a landed update', () => {
     expect(state.restarts).toEqual([]);
     // Six hours of waiting: a warning at 30, 60, … 360 min, none before.
     expect(state.warn).toHaveLength(12);
-    expect(state.warn[0]).toMatch(/still waiting to restart onto bbbbbbb: 1 session\(s\) mid-turn for 30 min; a running turn is never cut off/);
-    expect(state.warn[11]).toMatch(/mid-turn for 360 min/);
+    expect(state.warn[0]).toMatch(/still waiting to restart onto bbbbbbb: 1 session\(s\) with work in flight \(a turn, background job or subagent\) for 30 min; work holds are age-capped/);
+    expect(state.warn[11]).toMatch(/work in flight \(a turn, background job or subagent\) for 360 min/);
     // The moment the turn ends, it goes.
     state.busy = 0;
     state.now = T0 + 361 * 60_000;

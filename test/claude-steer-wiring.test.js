@@ -6,6 +6,7 @@ import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import * as steer from '../lib/claude-steer.js';
+import { sendPrintInterrupt, applyInterruptAck } from '../lib/print-interrupt.js';
 import { markJournalOrigin, planQueueFlush } from '../lib/queue-flush.js';
 import { queueCauses, tagCauses, mergeIntoTurn, mergeCauses, beginOrJoinTurn } from '../lib/turn-cause.js';
 import { hasQueuedCompact, isCompactCommand } from '../lib/compact-priority.js';
@@ -21,7 +22,7 @@ function sourceOf(name) {
 
 const LIFTED = [
   'reportSessionSendFailure', 'notifyFinalUndeliveredQueue', 'retireSupersededQuestionCard', 'noteQuestionPromptEcho', 'journalHandleInboundEvent',
-  'clearPendingInterrupt', 'sendToSession', 'dispatchMergedFlush', 'applyPendingAgentHandoff', 'sendAllQuestions', 'notifyUndeliveredQueue', 'steerableBatchText', 'claudeSteerEligible', 'trySteerEntry', 'flushQueue', 'restoreQueuedBatch', 'snapshotQueuedReleaseBatch', 'queuedReleaseItemIds', 'liveQueuedReleaseEntries', 'finalizeSentQueue', 'commitSteeredMessage',
+  'bumpTurnGeneration', 'printModeInterrupt', 'submitAnswer', 'approvePlanBuild', 'clearPendingInterrupt', 'sendToSession', 'dispatchMergedFlush', 'applyPendingAgentHandoff', 'sendAllQuestions', 'notifyUndeliveredQueue', 'steerableBatchText', 'claudeSteerEligible', 'trySteerEntry', 'flushQueue', 'restoreQueuedBatch', 'commitSteeredMessage',
   'requeueSteeredMessages', 'settleDroppedSteers', 'releaseSteersToCli', 'requeueCancelledSteer',
   'requeueFailedSteer', 'supersedePromptsForSteerHold', 'beginHeldSteerTurn', 'releaseStaleSteerHold',
   'handleClaudeEvent', 'journalRouteTextToSession', 'killSession', 'recreateSession',
@@ -48,11 +49,13 @@ function setup({ session: overrides = {}, steerEnabled = true } = {}) {
     Date, JSON, Map, Set, Promise, Math, Number, String, Object, Array, Boolean, Error,
     setTimeout, clearTimeout,
     ...steer,
+    sendPrintInterrupt, applyInterruptAck,
     CLAUDE_STEER_ENABLED: steerEnabled,
     roomId: 'room', cwd: '.', shuttingDown: false,
     AGENT_CODEX: 'codex',
     randomUUID: (() => { let n = 0; return () => `steer-uuid-${++n}`; })(),
     sessions: new Map(),
+    journalMediaRouter: { hasInflightMedia: () => false },
     markJournalOrigin, hasQueuedCompact, isCompactCommand, planQueueFlush, queueCauses, tagCauses, mergeIntoTurn, mergeCauses, beginOrJoinTurn,
     pendingMediaMirror: () => [],
     contextFullToNative: () => null,
@@ -60,15 +63,14 @@ function setup({ session: overrides = {}, steerEnabled = true } = {}) {
     restartLatch: undefined,
     inflightMarker: { touch: vi.fn(), noteTurnStart: vi.fn(), noteTurnEnd: vi.fn() },
     foreignSessions: { end: vi.fn() },
-    planItems: { opened: vi.fn() },
+    planItems: { opened: vi.fn(), resolved: vi.fn() },
     journalPublisher: {
       flushCursor: vi.fn(),
       publishPromptReply: vi.fn((convoId, payload) => frames.push({ convo_id: convoId, type: 'prompt_reply', payload })),
     },
     findSessionByClaudeSessionId: (convoId) => convoId === 'convo' ? session : null,
-    journalInputConsumer: Object.assign(vi.fn(), { queueRelease: { listLive: () => [], dropItem: vi.fn() } }),
-    _releaseReconcileTimer: null,
-    journalMediaRouter: { hasInflightMedia: () => false },
+    journalInputConsumer: Object.assign(vi.fn(), { queueRelease: null }),
+    releaseReconcilePending: () => false,
     journalConvoIdFor: () => 'convo',
     journalSessionCommandCtx: () => ctxObj,
     dispatchJournalBridgeCommand: vi.fn(async () => false),
@@ -950,5 +952,124 @@ describe('second review: settling, cancellation, order, teardown', () => {
     expect(h.context.commitDispatchedUserTurn).toHaveBeenLastCalledWith(h.session, 'second', null);
     h.context.handleClaudeEvent(h.session, result());
     expect(h.session.busy).toBe(false);
+  });
+});
+
+describe('print interrupt acknowledgment wiring', () => {
+  const ack = (handle) => ({ type: 'control_response', response: { request_id: handle.requestId, subtype: 'success' } });
+
+  it('consumes only the pending request acknowledgment and waits 60s from it', async () => {
+    vi.useFakeTimers();
+    const h = setup();
+    await h.context.printModeInterrupt(h.session, h.ctxObj.sendReply);
+    const handle = h.session.pendingInterrupt;
+    h.context.handleClaudeEvent(h.session, { type: 'control_response', request_id: 'unrelated' });
+    expect(handle.acknowledged).toBe(false);
+    vi.advanceTimersByTime(9000);
+    h.context.handleClaudeEvent(h.session, ack(handle));
+    expect(handle.acknowledged).toBe(true);
+    vi.advanceTimersByTime(59999);
+    expect(h.session.busy).toBe(true);
+    vi.advanceTimersByTime(1);
+    expect(h.session.busy).toBe(false);
+    expect(h.session.pendingInterrupt).toBeNull();
+    expect(h.replies.at(-1)).toContain('within 60s');
+    expect(h.replies.at(-1)).toContain('/stop');
+  });
+
+  it('keeps the 10s fallback for an interrupt sent before init, even if init precedes the receipt', async () => {
+    vi.useFakeTimers();
+    const h = setup({ session: { _turnInitSeen: false } });
+    await h.context.printModeInterrupt(h.session, h.ctxObj.sendReply);
+    const handle = h.session.pendingInterrupt;
+    h.context.handleClaudeEvent(h.session, { type: 'system', subtype: 'init' });
+    h.context.handleClaudeEvent(h.session, ack(handle));
+    expect(handle.acknowledged).toBe(false);
+    vi.advanceTimersByTime(10000);
+    expect(h.session.busy).toBe(false);
+    expect(h.replies.at(-1)).toContain('after 10s');
+  });
+
+  it.each([false, true])('a result cancels the interrupt timer (acked: %s)', async (acked) => {
+    vi.useFakeTimers();
+    const h = setup();
+    await h.context.printModeInterrupt(h.session, h.ctxObj.sendReply);
+    if (acked) h.context.handleClaudeEvent(h.session, ack(h.session.pendingInterrupt));
+    h.context.handleClaudeEvent(h.session, result());
+    expect(h.session.pendingInterrupt).toBeNull();
+    h.session.busy = true;
+    const replies = h.replies.length;
+    vi.advanceTimersByTime(120000);
+    expect(h.session.busy).toBe(true);
+    expect(h.replies).toHaveLength(replies);
+  });
+
+  it.each([false, true])('an old timer cannot clear a newly dispatched turn (acked: %s)', async (acked) => {
+    vi.useFakeTimers();
+    const h = setup({ session: { turnGeneration: 1 } });
+    await h.context.printModeInterrupt(h.session, h.ctxObj.sendReply);
+    if (acked) h.context.handleClaudeEvent(h.session, ack(h.session.pendingInterrupt));
+    // A prompt can clear busy without a result. Its reply starts new work.
+    h.session.busy = false;
+    expect(h.context.sendToSession(h.session, [{ type: 'text', text: 'continue' }])).toBe(true);
+    expect(h.session.turnGeneration).toBe(2);
+    h.context.journalSessionState.mockClear();
+    vi.advanceTimersByTime(60000);
+    expect(h.context.journalSessionState).not.toHaveBeenCalled();
+    expect(h.session.busy).toBe(true);
+    expect(h.session.pendingInterrupt).toBeNull();
+    await h.context.printModeInterrupt(h.session, h.ctxObj.sendReply);
+    expect(h.session.pendingInterrupt).not.toBeNull();
+    h.context.clearPendingInterrupt(h.session);
+  });
+
+  it.each([false, true])('a busy flush keeps the generation so the armed timer still releases busy (acked: %s)', async (acked) => {
+    vi.useFakeTimers();
+    const h = setup({ session: { turnGeneration: 1 }, steerEnabled: false });
+    await h.context.printModeInterrupt(h.session, h.ctxObj.sendReply);
+    if (acked) h.context.handleClaudeEvent(h.session, ack(h.session.pendingInterrupt));
+    // "Send now": a busy write into the same stuck turn, not a new turn.
+    expect(h.session.busy).toBe(true);
+    expect(h.context.sendToSession(h.session, [{ type: 'text', text: 'now' }])).toBe(true);
+    expect(h.session.turnGeneration).toBe(1);
+    vi.advanceTimersByTime(60000);
+    expect(h.session.busy).toBe(false);
+    expect(h.session.pendingInterrupt).toBeNull();
+  });
+
+  it('does not erase a newer interrupt handle when an old timer settles', async () => {
+    vi.useFakeTimers();
+    const h = setup({ session: { turnGeneration: 1 } });
+    await h.context.printModeInterrupt(h.session, h.ctxObj.sendReply);
+    const newer = { cancel: vi.fn() };
+    h.session.pendingInterrupt = newer;
+    h.context.bumpTurnGeneration(h.session);
+    vi.advanceTimersByTime(10000);
+    expect(h.session.pendingInterrupt).toBe(newer);
+    expect(h.session.busy).toBe(true);
+  });
+
+  it('keeps steering in the same generation and advances a held follow-up turn', () => {
+    vi.useFakeTimers();
+    const h = setup({ session: { turnGeneration: 1 } });
+    h.context.sendToSession(h.session, [{ type: 'text', text: 'follow up' }]);
+    expect(h.session.turnGeneration).toBe(1);
+    h.context.handleClaudeEvent(h.session, lifecycle('queued'));
+    h.context.handleClaudeEvent(h.session, result());
+    expect(h.session.turnGeneration).toBe(2);
+    expect(h.session._turnInitSeen).toBe(false);
+  });
+
+  it.each(['submitAnswer', 'approvePlanBuild'])('advances the generation before the direct %s write', async (name) => {
+    const h = setup({ session: { busy: false, turnGeneration: 1, waitingForAnswer: 'question-tool', pendingPlanDenialId: 'plan-tool' } });
+    h.context.notice = () => ({ plain: 'Building', html: 'Building' });
+    h.context.writePromptAnswer = vi.fn((session) => {
+      expect(session.busy).toBe(true);
+      expect(session.turnGeneration).toBe(2);
+      expect(session._turnInitSeen).toBe(false);
+    });
+    if (name === 'submitAnswer') h.context.submitAnswer(h.session, 'answer');
+    else await h.context.approvePlanBuild(h.session, { sendHtml: vi.fn() });
+    expect(h.context.writePromptAnswer).toHaveBeenCalledTimes(1);
   });
 });

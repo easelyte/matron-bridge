@@ -8,7 +8,9 @@ import {
   notifyQueuedMessage,
   resolveQueueReleaseTap,
 } from '../lib/busy-queue.js';
+import { attachQueuedCleanup, runQueuedCleanup } from '../lib/queue-flush.js';
 import { compactBatchSize } from '../lib/compact-priority.js';
+import { createQueuedReleaseRetry } from '../lib/queued-release-retry.js';
 
 // Busy-queue magic words, notifications and queue-release taps
 // (lib/busy-queue.js). queuedMessages and queueNotifications must move in
@@ -1644,19 +1646,12 @@ describe('notifyQueuedMessage — compact jump tile', () => {
 
 describe('queued-release publisher wiring', () => {
   it('emitRelease write-aheads before publishing exactly one structured prompt_reply with a deterministic idem_key', () => {
-    const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
-    const start = src.indexOf('function emitRelease(convoId, { promptId, action, releasedIds }');
-    expect(start).toBeGreaterThan(-1);
-    const end = src.indexOf('\n}\n\n// In-process retry driver', start);
-    expect(end).toBeGreaterThan(start);
-
     const publishPromptReply = vi.fn();
     const put = vi.fn(() => true); // durable write-ahead
     const now = vi.spyOn(Date, 'now').mockReturnValue(1_722_000_000_000);
-    const emitRelease = runInNewContext(
-      `(${src.slice(start, end + 2)})`,
-      { journalPublisher: { publishPromptReply }, releaseOutbox: { put }, console, Date },
-    );
+    const { emitRelease } = createQueuedReleaseRetry({
+      journalPublisher: { publishPromptReply }, releaseOutbox: { put },
+    });
 
     try {
       const result = emitRelease('convo-1', {
@@ -1690,16 +1685,12 @@ describe('queued-release publisher wiring', () => {
   });
 
   it('emitRelease fail-closes when the write-ahead put returns false: no mutate, no publish', () => {
-    const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
-    const start = src.indexOf('function emitRelease(convoId, { promptId, action, releasedIds }');
-    const end = src.indexOf('\n}\n\n// In-process retry driver', start);
     const publishPromptReply = vi.fn();
     const put = vi.fn(() => false); // disk fault
     const mutate = vi.fn();
-    const emitRelease = runInNewContext(
-      `(${src.slice(start, end + 2)})`,
-      { journalPublisher: { publishPromptReply }, releaseOutbox: { put }, console, Date },
-    );
+    const { emitRelease } = createQueuedReleaseRetry({
+      journalPublisher: { publishPromptReply }, releaseOutbox: { put },
+    });
 
     const result = emitRelease('convo-1', {
       promptId: 'pr_9',
@@ -1743,13 +1734,13 @@ describe('index.js queued-send finalizer', () => {
       { promptId: 'pr_drifted', itemId: 'pr_drifted::0' },
     ]);
     const dispatchMergedFlush = vi.fn(() => dispatchResult);
-    const runQueuedCleanup = vi.fn();
     const flushQueue = runInNewContext(
       `(() => { ${src.slice(start, end)}; return flushQueue; })()`,
       {
-        restartLatch: undefined, runQueuedCleanup,
+        restartLatch: undefined,
         AGENT_CODEX: 'codex', CLAUDE_STEER_ENABLED: false,
         console: { log: vi.fn() },
+        runQueuedCleanup,
         dispatchMergedFlush,
         emitRelease,
         journalConvoIdFor: () => 'convo-1',
@@ -1826,6 +1817,16 @@ describe('index.js queued-send finalizer', () => {
     expect(harness.dropItem).toHaveBeenCalledTimes(1);
   });
 
+  it.each([true, false])('keeps saved files after live dispatch result=%s', dispatchResult => {
+    const harness = loadFlushHarness({ dispatchResult });
+    const cleanup = vi.fn();
+    const queued = [attachQueuedCleanup([{ type: 'text', text: 'saved file' }], cleanup)];
+    const session = { agent: 'claude', alive: true, busy: false, queuedMessages: null, roomId: 'room' };
+    expect(harness.flushQueue(session, queued)).toBe(dispatchResult);
+    expect(cleanup).not.toHaveBeenCalled();
+    if (!dispatchResult) expect(session.queuedMessages[0]).toBe(queued[0]);
+  });
+
   it('rolls the batch back without emitting or dropping releases when an ALIVE session rejects dispatch', () => {
     // #161 reconcile: retain-for-retry is reserved for a live session that
     // refused this flush. A dead/auto-stopped session takes the notify+drop
@@ -1852,12 +1853,14 @@ describe('index.js queued-send finalizer', () => {
     // permanent retry; every entry was acknowledged with a "📨 Queued" tile,
     // so drop it AND tell the user (matching merged master).
     const harness = loadFlushHarness({ dispatchResult: false });
-    const queued = [[{ type: 'text', text: 'a' }], [{ type: 'text', text: 'b' }]].slice(0, count);
+    const cleanup = vi.fn();
+    const queued = [[{ type: 'text', text: 'a' }], [{ type: 'text', text: 'b' }]].slice(0, count)
+      .map(entry => attachQueuedCleanup(entry, cleanup));
     const session = { agent: 'claude', alive, _autoStopped: autoStopped, busy: false, queuedMessages: null, roomId: '!room' };
 
     expect(harness.flushQueue(session, queued)).toBe(false);
     expect(session.queuedMessages).toBeNull(); // dropped, not retained
-    expect(harness.runQueuedCleanup.mock.calls.map(([entry]) => entry)).toEqual(queued);
+    expect(cleanup).toHaveBeenCalledTimes(count);
     expect(harness.emitRelease).not.toHaveBeenCalled();
     expect(harness.dropItem).not.toHaveBeenCalled();
     expect(harness.journalPublishNotice).toHaveBeenCalledTimes(1);

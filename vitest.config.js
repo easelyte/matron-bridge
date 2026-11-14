@@ -43,6 +43,7 @@ const WINDOWS_EXCLUDES = [
   'test/send-attachment.test.js',
   'test/setup-wizard.test.js',
   'test/subagent-watcher.test.js',
+  'test/subagent-watcher-workflow.test.js',
   'test/transcript-dir.test.js',
   'test/viewer-download.test.js',
   'test/viewer-view.test.js',

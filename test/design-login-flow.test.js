@@ -16,7 +16,7 @@ const SIGN_IN_SCREEN = [
   'Design login',
   'Authorize design-system access (read and write your organization\'s claude.ai/design projects) with your claude.ai',
   ' Browser didn\'t open? Use the url below to sign in (c to copy)',
-  'https://claude.com/cai/oauth/authorize?code=true&client_id=x&response_type=code',
+  'https://auth.example.test/oauth/authorize?code=true&client_id=x&response_type=code',
   ' ·  Waiting for browser authorization…',
   ' Paste code here if prompted >',
   ' Esc to cancel',
@@ -121,47 +121,6 @@ describe('/design-login routing', () => {
   });
 });
 
-describe('/design-login wiring (source inspection)', () => {
-  const src = readFileSync(fileURLToPath(new URL('../index.js', import.meta.url)), 'utf-8');
-  const caseStart = src.indexOf("case '!design-login': {");
-  const caseBody = src.slice(caseStart, src.indexOf("case '!effort': {", caseStart));
-
-  it('the print branch parks the command and borrows interactive mode on the replacement', () => {
-    expect(caseStart).toBeGreaterThan(0);
-    expect(caseBody).toMatch(/next\._postReadySlashCommand = DESIGN_LOGIN_COMMAND;/);
-    expect(caseBody).toMatch(/next\._accountFlowReturnToPrint = true;/);
-    expect(caseBody).not.toMatch(/session\._accountFlowReturnToPrint = true;/);
-  });
-
-  it('the interactive branch arms the result watch after typing', () => {
-    expect(caseBody).toMatch(/session\.iv\.sendText\(DESIGN_LOGIN_COMMAND\)[\s\S]*armDesignLoginWatch\(session\);/);
-  });
-
-  it('/login supersedes a pending design-login finish, and /design-login waits out a /login return', () => {
-    const loginStart = src.indexOf("case '!login':");
-    const loginBody = src.slice(loginStart, src.indexOf("case '!design-login': {", loginStart));
-    expect(loginBody).toMatch(/session\._designLoginFlow = null;/);
-    expect(caseBody).toMatch(/if \(session\._accountFlowReturnScheduled\) \{/);
-  });
-
-  it('the iv crash-restart carries the attempt token to the replacement', () => {
-    expect(src).toMatch(/restarted\._designLoginFlow = session\._designLoginFlow;/);
-  });
-
-  it('the readiness watcher arms the result watch when it types a parked /design-login', () => {
-    expect(src).toMatch(/if \(parkedSlash === DESIGN_LOGIN_COMMAND\) armDesignLoginWatch\(session\);/);
-  });
-
-  it('the return clears the borrow flag only on an actual switch', () => {
-    const fnStart = src.indexOf('function scheduleDesignLoginFinish(');
-    const fn = src.slice(fnStart, src.indexOf('// --- Structured Question Handling ---', fnStart));
-    expect(fn).toMatch(/if \(switched\) current\._accountFlowReturnToPrint = false;/);
-    expect(fn).toMatch(/shouldRunAccountFlowReturn\(current\)/);
-    // An abandoned flow's timer must not end a newer flow in the same room.
-    expect(fn).toMatch(/if \(!ownsDesignLoginFinish\(current, flow\)\) return;/);
-  });
-});
-
 describe('sign-in relay fixes', async () => {
   const { signInDialogHoldsInput } = await import('../lib/design-login-flow.js');
 
@@ -172,13 +131,6 @@ describe('sign-in relay fixes', async () => {
     expect(signInDialogHoldsInput({ iv: {}, _accountFlowReturnToPrint: true })).toBe(false);
     expect(signInDialogHoldsInput({ iv: {} })).toBe(false);
     expect(signInDialogHoldsInput({ iv: null, _designLoginWatch: {} })).toBe(false);
-  });
-
-  it('the held-note delivery defers on an open sign-in dialog', () => {
-    const src = readFileSync(fileURLToPath(new URL('../index.js', import.meta.url)), 'utf-8');
-    const start = src.indexOf('async function deliverRes' + 'tartNote(');
-    const fn = src.slice(start, start + 800);
-    expect(fn).toMatch(/signInDialogHoldsInput\(session\)\) return \{ deferred: true \};/);
   });
 });
 
@@ -202,14 +154,14 @@ describe('designLoginEndsPhantomTurn', async () => {
     const flowLib = await import('../lib/design-login-flow.js');
     const src = readFileSync(fileURLToPath(new URL('../index.js', import.meta.url)), 'utf-8');
     const start = src.indexOf('function armDesignLoginWatch(');
-    const end = src.indexOf('// Report the outcome and, for a borrowed session, switch back to print.');
+    const end = src.indexOf('function scheduleDesignLoginFinish(');
     const flushed = [];
     const finishes = [];
     const ended = [];
     const ctx = {
       ...flowLib, stripAnsi: prompt.stripAnsi, findInputCue: prompt.findInputCue,
       setTimeout, clearTimeout, debug: () => {},
-      DESIGN_LOGIN_WATCH_CAP_MS: 60000, DESIGN_LOGIN_SETTLE_MS: 5, DESIGN_LOGIN_BUFFER_LIMIT: 65536,
+      DESIGN_LOGIN_WATCH_CAP_MS: 60000, DESIGN_LOGIN_NO_SCREEN_MS: 60000, DESIGN_LOGIN_SETTLE_MS: 5, DESIGN_LOGIN_BUFFER_LIMIT: 65536,
       LOGIN_RETURN_TO_PRINT_DELAY_MS: 1,
       scheduleDesignLoginFinish: (...a) => finishes.push(a),
       endTurn: s => { s.currentTurn = null; },
@@ -244,6 +196,61 @@ describe('designLoginEndsPhantomTurn', async () => {
     expect(finishes.length).toBe(1);
   });
 
+  // A CLI build without /design-login never paints a sign-in screen.
+  it.each([
+    ['no sign-in screen shows', null, 'unrecognised'],
+    ['a sign-in screen showed', 'Waiting for browser authorization…', null],
+  ])('releases the watch when %s within the window', async (_name, screen, expected) => {
+    const { runInNewContext } = await import('node:vm');
+    const { EventEmitter } = await import('node:events');
+    const prompt = await import('../lib/prompt-detector.js');
+    const flowLib = await import('../lib/design-login-flow.js');
+    const src = readFileSync(fileURLToPath(new URL('../index.js', import.meta.url)), 'utf-8');
+    const start = src.indexOf('function armDesignLoginWatch(');
+    const end = src.indexOf('function scheduleDesignLoginFinish(');
+    const finishes = [];
+    const flushed = [];
+    const ctx = {
+      ...flowLib, stripAnsi: prompt.stripAnsi, findInputCue: prompt.findInputCue,
+      setTimeout, clearTimeout, debug: () => {},
+      DESIGN_LOGIN_WATCH_CAP_MS: 60000, DESIGN_LOGIN_NO_SCREEN_MS: 60, DESIGN_LOGIN_SETTLE_MS: 5, DESIGN_LOGIN_BUFFER_LIMIT: 65536,
+      scheduleDesignLoginFinish: (...a) => finishes.push(a),
+      endTurn: () => {}, inflightMarker: { noteTurnEnd: () => {} },
+      journalConvoIdFor: () => 'c1', journalSessionState: () => {}, journalActivity: () => {},
+      maybeFlushRoomDelivery: s => flushed.push(s), flushPendingSessionQueue: () => false,
+    };
+    const { arm } = runInNewContext(`${src.slice(start, end)}\n({ arm: armDesignLoginWatch })`, ctx);
+    const iv = new EventEmitter();
+    const session = { roomId: 'r', alive: true, iv, sendCallback: () => {} };
+    arm(session);
+    iv.emit('pty-data', screen ? `Design login\n${screen}` : 'Unknown command: /design-login');
+    await new Promise(r => setTimeout(r, 120));
+    if (expected) {
+      expect(session._designLoginWatch).toBe(null);
+      expect(iv.listenerCount('pty-data')).toBe(0);
+      expect(flushed).toEqual([session]);
+      expect(finishes).toHaveLength(1);
+      expect(finishes[0][2]).toBe(expected);
+      expect(flowLib.designLoginOutcomeMessage('unrecognised')).toMatch(/may not support/);
+    } else {
+      expect(session._designLoginWatch).not.toBe(null);
+      expect(finishes).toHaveLength(0);
+      session._designLoginWatch.stop();
+    }
+  });
+
+  it('does not type /design-login into a busy session', () => {
+    const src = readFileSync(fileURLToPath(new URL('../index.js', import.meta.url)), 'utf-8');
+    const at = src.indexOf("case '!design-login':");
+    const body = src.slice(at, src.indexOf("case '!logout'", at) + 6000);
+    const guard = body.indexOf('isDesign && session.busy && !session._designLoginWatch');
+    expect(guard).toBeGreaterThan(-1);
+    expect(body.slice(guard, guard + 300)).toMatch(/send \/design-login again when it finishes[\s\S]*?break;/);
+    // The guard sits before the watch reset and before anything is typed.
+    expect(guard).toBeLessThan(body.indexOf('session._designLoginWatch?.stop()'));
+    expect(guard).toBeLessThan(body.indexOf('iv.sendText('));
+  });
+
   it('room delivery waits while the dialog is open', () => {
     const src = readFileSync(fileURLToPath(new URL('../index.js', import.meta.url)), 'utf-8');
     const fn = src.slice(src.indexOf('function sessionOccupiedForRoomDelivery('), src.indexOf('function sessionOccupiedForRoomDelivery(') + 400);
@@ -267,6 +274,178 @@ describe('sign-in card needs an OAuth URL', async () => {
     const screen = `Browser didn't open? Use the url below\n${oauth}\nPaste code here if prompted >`;
     const msg = formatTuiCueMessage(screen, ['https://support.claude.com/en/articles/1', oauth]);
     expect(msg.parts.map(p => p.plain)).toContain(oauth);
+  });
+});
+
+describe('Design login lifecycle', async () => {
+  const { runInNewContext } = await import('node:vm');
+  const { vi, afterEach } = await import('vitest');
+  const flowLib = await import('../lib/design-login-flow.js');
+  const source = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
+  const functionSource = name => {
+    const start = source.indexOf(`\nfunction ${name}(`) + 1;
+    return source.slice(start, source.indexOf('\n}\n', start) + 2);
+  };
+  afterEach(() => vi.useRealTimers());
+
+  function finishSetup({ borrowed = true } = {}) {
+    vi.useFakeTimers();
+    const flow = {};
+    const session = { alive: true, iv: {}, _designLoginFlow: flow, _accountFlowReturnToPrint: borrowed, sendCallback: vi.fn() };
+    const context = {
+      ...flowLib, sessions: new Map([['room', session]]),
+      setTimeout, DESIGN_LOGIN_RETRY_MS: 10, DESIGN_LOGIN_RETRY_LIMIT: 2,
+      shouldRunAccountFlowReturn: s => !!s._accountFlowReturnToPrint,
+      planModeSwitch: vi.fn(() => ({ ok: true })),
+      applyModeSwitch: vi.fn(() => ({})), maybeFlushRoomDelivery: vi.fn(),
+    };
+    const finish = runInNewContext(`(${functionSource('scheduleDesignLoginFinish')})`, context);
+    return { session, flow, context, finish: outcome => finish('room', flow, outcome, 1) };
+  }
+
+  it('returns borrowed interactive mode after a result', () => {
+    const h = finishSetup();
+    h.finish('authorized');
+    vi.advanceTimersByTime(1);
+    expect(h.context.applyModeSwitch).toHaveBeenCalledWith('room', h.session, false, expect.objectContaining({
+      announcement: '✅ Claude Design access authorized — back to normal mode.',
+    }));
+    expect(h.session._accountFlowReturnToPrint).toBe(false);
+  });
+
+  it.each(['cancelled', 'failed', null])('reports %s and preserves user-selected interactive mode', outcome => {
+    const h = finishSetup({ borrowed: false });
+    h.finish(outcome);
+    vi.advanceTimersByTime(1);
+    expect(h.context.applyModeSwitch).not.toHaveBeenCalled();
+    expect(h.session.sendCallback).toHaveBeenCalledWith(flowLib.designLoginOutcomeMessage(outcome, { returning: false }));
+  });
+
+  it('ignores a finish superseded by another login attempt', () => {
+    const h = finishSetup();
+    h.finish('authorized');
+    h.session._designLoginFlow = {};
+    vi.advanceTimersByTime(1);
+    expect(h.context.applyModeSwitch).not.toHaveBeenCalled();
+    expect(h.session.sendCallback).not.toHaveBeenCalled();
+  });
+
+  it('retries a blocked return and retains the borrow mark if the switch fails', () => {
+    const h = finishSetup();
+    h.context.planModeSwitch.mockReturnValue({ ok: false });
+    h.context.applyModeSwitch.mockReturnValue(null);
+    h.finish('failed');
+    vi.advanceTimersByTime(21);
+    expect(h.context.planModeSwitch).toHaveBeenCalledTimes(3);
+    expect(h.context.applyModeSwitch).toHaveBeenCalledOnce();
+    expect(h.context.applyModeSwitch.mock.calls[0][3].refusalAnnouncement).toContain('/mode print');
+    expect(h.session._accountFlowReturnToPrint).toBe(true);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('does not end a turn that was running before the dialog opened', () => {
+    const turn = {};
+    expect(flowLib.designLoginEndsPhantomTurn({ alive: true, iv: {}, busy: true, currentTurn: turn }, { turnAtArm: turn })).toBe(false);
+    expect(flowLib.designLoginEndsPhantomTurn({ alive: true, iv: {}, busy: false, currentTurn: {} }, { turnAtArm: null })).toBe(true);
+  });
+
+  it('stops listening at the watch timeout and reports an unfinished flow', async () => {
+    vi.useFakeTimers();
+    const { EventEmitter } = await import('node:events');
+    const iv = new EventEmitter();
+    const session = { iv, roomId: 'room', alive: true };
+    const finish = vi.fn();
+    const arm = runInNewContext(`(${functionSource('armDesignLoginWatch')})`, {
+      setTimeout, clearTimeout, debug: () => {}, scheduleDesignLoginFinish: finish,
+      DESIGN_LOGIN_WATCH_CAP_MS: 100, DESIGN_LOGIN_SETTLE_MS: 5, DESIGN_LOGIN_NO_SCREEN_MS: 1000,
+    });
+    arm(session);
+    expect(iv.listenerCount('pty-data')).toBe(1);
+    vi.advanceTimersByTime(100);
+    expect(iv.listenerCount('pty-data')).toBe(0);
+    expect(session._designLoginWatch).toBeNull();
+    expect(finish).toHaveBeenCalledWith('room', session._designLoginFlow, null, 0);
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it('relays the fresh OAuth URL on retry and deduplicates wrapped URLs', async () => {
+    const prompt = await import('../lib/prompt-detector.js');
+    const { formatTuiCueMessage } = await import('../lib/tui-cue-message.js');
+    const update = runInNewContext(`(${functionSource('handleInteractiveScreenUpdate')})`, {
+      ...prompt, formatTuiCueMessage,
+      console: { log() {} }, journalSessionState() {}, journalActivity() {},
+    });
+    const send = vi.fn();
+    const session = { sendCallback: send };
+    const oldUrl = 'https://auth.example.test/oauth/authorize?state=old';
+    const newUrl = 'https://auth.example.test/oauth/authorize?state=new';
+    const show = screen => update(session, { screen, urls: prompt.extractUrls(screen), hasInputCue: true });
+    show(`Paste code here >\n${oldUrl}`);
+    expect(send.mock.calls[1][0]).toBe(oldUrl);
+    send.mockClear();
+    const retryScreen = `Paste code here >\n${oldUrl}\n${newUrl.replace('?state', '?st\nate')}`;
+    show(retryScreen);
+    expect(send.mock.calls[1][0]).toBe(newUrl);
+    send.mockClear();
+    show(retryScreen);
+    expect(send).not.toHaveBeenCalled();
+  });
+
+  function commandSetup(sessionOverrides = {}) {
+    const session = { alive: true, roomId: 'room', agent: 'claude', ...sessionOverrides };
+    const context = {
+      ...flowLib, sessions: new Map([['room', session]]), AGENT_CODEX: 'codex',
+      applyModeSwitch: vi.fn(() => ({})), armDesignLoginWatch: vi.fn(),
+    };
+    const start = source.indexOf("    case '!design-login':");
+    const end = source.indexOf("    case '!effort':", start);
+    // The production switch uses a canonical internal command key.
+    const run = runInNewContext(`(async function(roomId, sendReply, sendHtml) {
+      const cmd = '!design-login';
+      switch (cmd) { ${source.slice(start, end)} }
+    })`, context);
+    return { session, context, run: () => run('room', vi.fn(), vi.fn()) };
+  }
+
+  it('parks design login on the replacement print session using the account flow', async () => {
+    const h = commandSetup();
+    await h.run();
+    const next = h.context.applyModeSwitch.mock.results[0].value;
+    expect(next._postReadySlashCommand).toBe('/design-login');
+    expect(next._accountFlowReturnToPrint).toBe(true);
+    expect(h.session._accountFlowReturnToPrint).toBeUndefined();
+  });
+
+  it('waits for a resuming TUI before typing the command', async () => {
+    const sendText = vi.fn();
+    const h = commandSetup({ iv: { alive: true, sendText }, _awaitingInputReady: true });
+    await h.run();
+    expect(sendText).not.toHaveBeenCalled();
+    expect(h.session._postReadySlashCommand).toBe('/design-login');
+  });
+
+  it('types directly into a ready TUI and arms the result watch', async () => {
+    const sendText = vi.fn();
+    const h = commandSetup({ iv: { alive: true, sendText } });
+    await h.run();
+    expect(sendText).toHaveBeenCalledWith('/design-login');
+    expect(h.context.armDesignLoginWatch).toHaveBeenCalledWith(h.session);
+  });
+
+  it('does not start design login while an account return is scheduled', async () => {
+    const h = commandSetup({ _accountFlowReturnScheduled: true });
+    await h.run();
+    expect(h.context.applyModeSwitch).not.toHaveBeenCalled();
+    expect(h.context.armDesignLoginWatch).not.toHaveBeenCalled();
+  });
+});
+
+describe('sign-in dialog and restart-note delivery', () => {
+  it('the held-note delivery defers on an open sign-in dialog', () => {
+    const src = readFileSync(fileURLToPath(new URL('../index.js', import.meta.url)), 'utf-8');
+    const start = src.indexOf('async function deliverRes' + 'tartNote(');
+    const fn = src.slice(start, start + 800);
+    expect(fn).toMatch(/signInDialogHoldsInput\(session\)\) return \{ deferred: true \};/);
   });
 });
 
