@@ -3,8 +3,8 @@ import {
   handoffConfig, handoffIdleSince, handoffDue, planHandoff, handoffTurnText, handoffNotice, preReapCompactCommand, noteTurnStart,
   DEFAULT_HANDOFF_IDLE_MS, DEFAULT_COMPACT_PCT, STATUS_FRESH_GRACE_MS, HANDOFF_TURN_PREFIX,
 } from '../lib/pre-reap-handoff.js';
-
 import { isCompactCommand, hasQueuedCompact, compactBatchSize } from '../lib/compact-priority.js';
+
 
 const HOUR = 3_600_000;
 const MIN = 60_000;
@@ -144,12 +144,11 @@ describe('planHandoff', () => {
 describe('preReapCompactCommand', () => {
   it('passes one line of working-state instructions to the compact summarizer', () => {
     const command = preReapCompactCommand();
-    expect(typeof command).toBe('string');
     expect(command.startsWith('/compact ')).toBe(true);
     expect(command).not.toMatch(/[\r\n]/);
     expect(isCompactCommand(command)).toBe(true);
     for (const topic of [
-      'Preserve', 'session goal', "user's latest asks", 'mission', 'PR',
+      'session goal', "user's latest asks", 'mission', 'PR',
       'worktree', 'branch', 'names and paths', 'open tracker items',
       'unanswered questions', 'pending background jobs', 'reminders',
       'waits', 'promises made', 'exact next step',
@@ -165,6 +164,7 @@ describe('preReapCompactCommand', () => {
     const session = { _preReapHandoff: mark };
     noteTurnStart(session, command);
     expect(session._preReapHandoff).toBe(mark);
+    expect(handoffIdleSince(session)).toBe(T);
   });
 });
 

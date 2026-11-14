@@ -23,6 +23,9 @@ describe('timer and reminder cards', () => {
     const payload = body('function timerCardPayload(', '\n}\n');
     expect(payload).toContain('prompt_id: timerPromptId(record),');
     expect(payload).toContain('blocking: false,');
+    // ...and silent: the card is a record, so it sends no push and never
+    // counts as unread or unseen.
+    expect(payload).toContain('silent: true,');
     expect(payload).toContain("mode: 'pick_one',");
     const cards = index.match(/'pick_one', summary, escapeHtml\(summary\), timerCardPayload\(record, summary\)\);/g) || [];
     // The typed /timer confirmation and the agent's reminder_create card.
@@ -45,7 +48,12 @@ describe('queued-message cards', () => {
     const fin = body('function finalizeSentQueue(', '\nfunction ');
     expect(fin).toContain("action = 'send'");
     expect(fin).toMatch(/emitRelease\(convoId, \{\s*promptId: liveEntry\.promptId,\s*action,/);
-    const emit = body('function emitRelease(', '\nfunction ');
+    const retry = readFileSync(new URL('../lib/queued-release-retry.js', import.meta.url), 'utf8');
+    const emitStart = retry.indexOf('function emitRelease(');
+    expect(emitStart, 'function emitRelease( not found in lib/queued-release-retry.js').toBeGreaterThan(-1);
+    const emitEnd = retry.indexOf('\n  function ', emitStart);
+    expect(emitEnd, 'end of emitRelease not found in lib/queued-release-retry.js').toBeGreaterThan(emitStart);
+    const emit = retry.slice(emitStart, emitEnd);
     expect(emit).toMatch(/publishPromptReply\(convoId, \{\s*kind: 'queued_release',\s*prompt_id: promptId,/);
   });
 

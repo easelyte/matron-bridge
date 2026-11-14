@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
 import { describe, expect, it, vi } from 'vitest';
-import { markJournalOrigin, planQueueFlush } from '../lib/queue-flush.js';
+import { attachQueuedCleanup, runQueuedCleanup, markJournalOrigin, planQueueFlush } from '../lib/queue-flush.js';
 import { hasQueuedCompact } from '../lib/compact-priority.js';
 import { CodexPromptQueue } from '../lib/codex-prompts.js';
 import { queueCauses, joinHeldTurn, tagCauses, mergeIntoTurn } from '../lib/turn-cause.js';
@@ -14,7 +14,7 @@ const settle = () => new Promise(resolve => setImmediate(resolve));
 function setup() {
   let ack;
   const session = { agent: 'codex', alive: true, busy: true, roomId: 'room', queuedMessages: [], queueNotifications: [], codex: { transport: 'app-server', steer: vi.fn(() => new Promise(resolve => { ack = resolve; })), interrupt: vi.fn() } };
-  const context = vm.createContext({ restartLatch: undefined, AGENT_CODEX: 'codex', claudeSteerEligible: () => false, hasQueuedCompact, markJournalOrigin, planQueueFlush, queueCauses, joinHeldTurn, tagCauses, mergeIntoTurn, console,
+  const context = vm.createContext({ restartLatch: undefined, AGENT_CODEX: 'codex', claudeSteerEligible: () => false, hasQueuedCompact, markJournalOrigin, planQueueFlush, runQueuedCleanup, queueCauses, joinHeldTurn, tagCauses, mergeIntoTurn, console,
     sessions: new Map([['room', session]]), pendingMediaMirror: () => [], journalMirrorUserMedia: vi.fn(),
     commitDispatchedUserTurn: vi.fn(), journalPublishUserItem: vi.fn(), finalizeSentQueue: vi.fn(),
     journalPublishNotice: vi.fn(), journalConvoIdFor: () => 'convo', dispatchDeferredCommand: vi.fn(), flushPendingSessionQueue: vi.fn(), maybeFlushRoomDelivery: vi.fn(),
@@ -26,6 +26,17 @@ function setup() {
   return { session, context, batch, snapshot, ack: value => ack(value), flush: () => context.flushQueue(session, batch, snapshot) };
 }
 describe('bridge send-now steering', () => {
+  it.each([true, false])('settles file ownership after replacement with acknowledged=%s', async acknowledged => {
+    const h = setup();
+    const cleanup = vi.fn();
+    attachQueuedCleanup(h.batch[0], cleanup);
+    h.flush();
+    h.context.sessions.set('room', { alive: true });
+    h.ack(acknowledged);
+    await settle();
+    expect(cleanup).toHaveBeenCalledTimes(acknowledged ? 0 : 1);
+  });
+
   it('retains messages for a parked restart without attempting native steering', () => {
     const h = setup(); h.session._deferredCommandText = '!restart --browser';
     expect(h.flush()).toBe(false);

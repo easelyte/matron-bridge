@@ -5,41 +5,32 @@ import { join } from 'node:path';
 import { runInNewContext } from 'node:vm';
 import { createJournalInputConsumer } from '../lib/journal-input-router.js';
 import { createQueuedReleaseOutbox } from '../lib/queued-release-outbox.js';
+import { createQueuedReleaseRetry } from '../lib/queued-release-retry.js';
 
-// Extract the queued-release seam (emitRelease + republishPendingReleases +
-// reconcileReleaseOutbox + the boot-reconcile quiet-timer helpers) from index.js
-// and eval it in a sandbox with injected `releaseOutbox` + `journalPublisher`
-// stubs. This mirrors the source-extraction pattern already used by
-// busy-queue.test.js for emitRelease.
+// The queued-release seam (emitRelease + republishPendingReleases +
+// reconcileReleaseOutbox + the boot-reconcile quiet-timer helpers) lives in
+// lib/queued-release-retry.js; it is built with injected `releaseOutbox` +
+// `journalPublisher` stubs.
 //
-// The seam now reads process.env (RELEASE_RECONCILE_QUIET_MS) and arms a
-// setTimeout, so the sandbox provides a controllable process/timer surface:
+// The seam reads the quiet window from env (RELEASE_RECONCILE_QUIET_MS) and arms a
+// setTimeout, so the test injects a controllable env/timer surface:
 // setTimeout captures the callback (fire it via seam.__timers.fire()) and counts
 // arms, clearTimeout resets it.
 function loadSeam({ releaseOutbox, journalPublisher, env = {} }) {
-  const src = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
-  const start = src.indexOf('function emitRelease(convoId, { promptId, action, releasedIds }');
-  const end = src.indexOf('\nfunction journalUpsertConvo', start);
-  expect(start).toBeGreaterThan(-1);
-  expect(end).toBeGreaterThan(start);
   const timers = {
     cb: null,
     arms: 0,
     cleared: 0,
     fire() { const cb = this.cb; this.cb = null; if (cb) cb(); },
   };
-  const sandbox = {
+  const seam = createQueuedReleaseRetry({
     releaseOutbox,
     journalPublisher,
-    console,
-    Date,
-    process: { env },
+    env,
     setTimeout: (cb) => { timers.cb = cb; timers.arms += 1; return { unref() {} }; },
     clearTimeout: () => { timers.cleared += 1; timers.cb = null; },
-  };
-  runInNewContext(src.slice(start, end), sandbox);
-  sandbox.__timers = timers;
-  return sandbox; // exposes emitRelease, republishPendingReleases, reconcileReleaseOutbox, scheduleReleaseReconcile
+  });
+  return { ...seam, __timers: timers }; // exposes emitRelease, republishPendingReleases, reconcileReleaseOutbox, scheduleReleaseReconcile
 }
 
 // finalizeSentQueue lives outside the emitRelease seam; extract it on its own.

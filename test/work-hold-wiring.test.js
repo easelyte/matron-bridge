@@ -48,7 +48,7 @@ describe('work in flight holds the session and the box', () => {
 
   it('decides with the pure helper on the session\'s busy flag and live work children', () => {
     const body = fnBody('sessionWorkHold');
-    expect(body).toMatch(/workHold\(\{\s*busy: !!session\.busy,\s*children: liveWorkChildren\(sessionChildPid\(session\), table, MCP_SERVER_SIGNATURES\),\s*idleSince: last,\s*now,?\s*\}\)/);
+    expect(body).toMatch(/workHold\(\{\s*busy: !!session\.busy,\s*children: liveWorkChildren\(sessionChildPid\(session\), table, MCP_SERVER_SIGNATURES\),\s*idleSince: last,\s*now,\s*subagentCount: session\.subagentConvos\?\.runningCount\(\) \?\? 0,\s*\}\)/);
   });
 
   it('knows the MCP servers by the merged config claude is spawned with — every extras group, local overlay included', () => {
@@ -69,7 +69,7 @@ describe('work in flight holds the session and the box', () => {
     expect(body).toMatch(/const \{ file, args: ptArgs \} = processTableCommand\(\)/);
     expect(body).toMatch(/execFileSync\(file, ptArgs,/);
     expect(body).toMatch(/return parseProcessTable\(/);
-    expect(body).toMatch(/catch[\s\S]*return \[\];/);
+    expect(body).toMatch(/catch[\s\S]*return Object\.assign\(\[\], \{ unreadable: true \}\);/);
   });
 
   it('the keep-awake marker is the later of the reminder hold and the work lease, and is refreshable without a timer save', () => {

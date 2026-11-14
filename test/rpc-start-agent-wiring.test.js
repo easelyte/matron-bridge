@@ -30,18 +30,18 @@ describe('New Chat agent switch wiring (source inspection)', () => {
     expect(src).toMatch(/createSession\([\s\S]*?\.\.\.\(agent \? \{ agent \} : \{\}\)/);
   });
 
-  it('assigns a stable journal id at Codex construction and flushes the buffered seed', () => {
+  it('assigns a stable conversation id at Codex construction and persists fresh starts', () => {
     const src = block('function createCodexSessionForRoom(', 'function codexToolIndicator(');
-    expect(src).toMatch(/journalConvoId: options\.journalConvoId \|\| persisted\?\.journalConvoId \|\| resumeSessionId \|\| newSessionConvoId\(\)/);
-    expect(src).toMatch(/sessions\.set\(roomId, session\);[\s\S]*?journalFlushForSession\(session\)/);
+    expect(src).toContain('journalConvoId: options.journalConvoId || persisted?.journalConvoId || resumeSessionId || newSessionConvoId()');
+    expect(src).toMatch(/sessions\.set\(roomId, session\);[\s\S]*?if \(!resumeSessionId && !options\.journalConvoId && !persisted\?\.journalConvoId\) \{\s*persistSession\(roomId, session\.claudeSessionId, cwd, null\)/);
+    const event = block('function handleCodexEvent(', 'function flushPendingSessionQueue(');
+    expect(event).toContain('if (!session.journalConvoId) session.journalConvoId = event.thread_id;');
   });
 
-  it('persists a fresh Codex identity and requested settings before its native thread starts', () => {
-    const src = block('function createCodexSessionForRoom(', 'function codexToolIndicator(');
-    expect(src).toMatch(/sessions\.set\(roomId, session\);[\s\S]*?persistSession\(roomId, session\.claudeSessionId, cwd, null\)/);
-    const start = rpcStart();
-    expect(start).toMatch(/const mintedConvoId = session\.agent === AGENT_CODEX && !session\.claudeSessionId/);
-    expect(start).toMatch(/\(mcpExtras\.length > 0 \|\| model \|\| effort \|\| mintedConvoId\) && \(session\.claudeSessionId \|\| mintedConvoId\)/);
+  it('persists requested Codex settings before its native thread starts', () => {
+    const src = rpcStart();
+    expect(src).toContain('const mintedConvoId = session.agent === AGENT_CODEX && !session.claudeSessionId;');
+    expect(src).toMatch(/\(mcpExtras\.length > 0 \|\| model \|\| effort \|\| mintedConvoId\) && \(session\.claudeSessionId \|\| mintedConvoId\)/);
   });
 
   it('hands the handler a live Codex-availability check and the transport flag', () => {

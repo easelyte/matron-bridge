@@ -352,6 +352,15 @@ describe('createSubagentConvoTracker', () => {
     expect(publisher.calls.upsertConvo).toHaveLength(2);
   });
 
+  it('runningCount counts the children running now, and drops to zero once they finish', () => {
+    expect(tracker.runningCount()).toBe(0);
+    tracker.discover('agent-1', { label: 'A', agentType: null });
+    tracker.discover('agent-2', { label: 'B', agentType: null });
+    expect(tracker.runningCount()).toBe(2);
+    tracker.finishAll();
+    expect(tracker.runningCount()).toBe(0);
+  });
+
   it('does nothing (never throws) when the parent convo id is not yet known', () => {
     const t = createSubagentConvoTracker({
       publisher,

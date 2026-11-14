@@ -468,13 +468,14 @@ describe('parseTitlePassResponse (Gemini title-pass parsing)', () => {
   });
 });
 
-describe('title-pass wiring in index.js (source inspection)', () => {
+describe('title-pass wiring in index.js and lib/title-summary.js (source inspection)', () => {
   const indexSrc = readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
+  const passSrc = readFileSync(new URL('../lib/title-summary.js', import.meta.url), 'utf-8');
 
   it('routes the Gemini response through parseTitlePassResponse, with the spoken lines already cut out', () => {
     // The spoken lines (voice mode) are taken out by splitSpoken first; the
     // parser must be given what is left. See test/spoken-summary-wiring.test.js.
-    expect(indexSrc).toMatch(/const parsed = parseTitlePassResponse\(voiced\.rest\);/);
+    expect(passSrc).toMatch(/const parsed = parseTitlePassResponse\(voiced\.rest\);/);
   });
 
   it('builds the prompt via buildSummaryPrompt instead of hand-rolling it', () => {
@@ -482,11 +483,11 @@ describe('title-pass wiring in index.js (source inspection)', () => {
     // with the ROSTER line) moved to lib/summary-pass.js's buildSummaryPrompt,
     // which keeps its own coverage of the ROSTER-must-be-last invariant
     // (test/summary-pass.test.js) — index.js's job is just to call it.
-    expect(indexSrc).toMatch(/const prompt = buildSummaryPrompt\(\{/);
+    expect(passSrc).toMatch(/const prompt = buildSummaryPrompt\(\{/);
   });
 
   it('upserts the roster to the journal, sliced to the protocol cap', () => {
-    expect(indexSrc).toMatch(/journalUpsertConvo\(session, \{ summary: parsed\.roster\.slice\(0, 1000\) \}\);/);
+    expect(passSrc).toMatch(/journalUpsertConvo\(session, \{ summary: parsed\.roster\.slice\(0, 1000\) \}\);/);
   });
 
   it('names the room from the session short + parsed title — no SERVER_LABEL prefix', () => {
@@ -495,7 +496,7 @@ describe('title-pass wiring in index.js (source inspection)', () => {
     // rename can never reach — and it is what made two boxes both read
     // "DEV" in the chat list. The 2-char session short is the part that
     // tells two sessions on the SAME box apart, so it stays.
-    expect(indexSrc).toMatch(/const name = withSessionShort\(session\.claudeSessionId \|\| session\.roomId, parsed\.title\.slice\(0, 60\), titleMarkerFor\(session\)\);/);
+    expect(passSrc).toMatch(/const name = withSessionShort\(session\.claudeSessionId \|\| session\.roomId, parsed\.title\.slice\(0, 60\), titleMarkerFor\(session\)\);/);
   });
 
   it('names a resumed session with the session short but no SERVER_LABEL prefix, inferring the 🐣 marker from the persisted title', () => {
@@ -520,6 +521,7 @@ describe('title-pass wiring in index.js (source inspection)', () => {
 
   it('never rebuilds a `LABEL:` title prefix anywhere', () => {
     expect(indexSrc).not.toMatch(/\$\{SERVER_LABEL\}:/);
+    expect(passSrc).not.toMatch(/\$\{SERVER_LABEL\}:/);
   });
 });
 

@@ -252,15 +252,28 @@ undone within five minutes; use `-StopOnly`, which disables the task.
 `deploy.ps1`) hands itself to a one-shot Scheduled Task a few seconds out,
 because Task Scheduler would otherwise stop it along with the bridge.
 
+**Import preflight:** `MATRON_BRIDGE_PREFLIGHT=module node index.js` loads
+`index.js`'s whole static import graph (native bindings included) and exits 0
+before it reads `.env` or starts anything. `deploy.sh`, `deploy.ps1` and the
+self-restart check below all use it. Startup code added to `index.js` must stay
+below that early exit.
+
 **Self-restart onto new code (every platform):** a deploy that finds a live
 session (`deploy.sh --dry-run`, a fleet updater script) leaves the
 new code on disk and the old process running. The bridge notices by itself:
 it polls its checkout's HEAD reflog, lets a landed update settle for five
 minutes (so `npm install` has finished), proves the tree boots with the same
 preflight the deploy scripts run, and then exits for the supervisor to
-relaunch it at the first poll where no session is mid-turn. A running turn
-is never cut off: the bridge keeps waiting and logs a warning every 30
-minutes. A box that would rather force the restart after a while sets
+relaunch it at the first poll where no session has work in flight: a turn
+running, a background job (shell, monitor) still alive under the session's
+agent process, or a subagent running. A running turn always holds the
+update. Background jobs and subagents share the idle reaper's eight-hour
+cap from the session's last activity, so a stuck background job cannot
+defer updates forever. If the process table cannot be read, running turns
+and subagents still hold the update, with the cap applying only to
+subagents. While waiting,
+the bridge logs a warning every 30 minutes. A box that would rather force
+the restart after a while sets
 `MATRON_CODE_UPDATE_FORCE_AFTER_MS`; the interrupted chats then carry on by
 themselves (`MATRON_CODE_UPDATE_AUTO_CARRY_ON=0` gives them the "Carry on"
 card instead). Sessions between turns resume with their history on their next turn,
@@ -343,6 +356,8 @@ the viewer's environment turns it off.
 | `MATRON_WAKE_TOKEN` | Optional. When set, `POST /wake` is refused (403) unless the request carries it in an `X-Matron-Wake-Token` header — the internal API port is reachable by every local user, and a wake resumes a session | — |
 | `MCP_DEFAULT_EXTRAS` | Comma-separated MCP extras loaded for every session on this machine (e.g. `circleci`). Names must match `mcpExtras` keys in `mcp-config.json`/`mcp-config.local.json`. | _(none)_ |
 | `BRIDGE_PLUGIN_CACHE_DIR` | Dir plugin MCP servers (context7, serena, …) load from. Unset = an empty bridge-owned dir (no plugin MCPs, lean). Set to `~/.claude/plugins` or a curated dir to re-enable. | _(empty dir)_ |
+| `BRIDGE_TOOL_FILTER` | Set to `1` to hide Coordinator-only `ask-user` MCP tools from confirmed Claude worker sessions, in print and interactive modes. Unknown roles keep the full list. | off |
+| `BRIDGE_TOOL_ROLE` | Set per Claude session by the bridge when filtering is enabled: `worker`, `coordinator`, or `full`. Only `worker` hides tools; unset or unknown values keep every tool. | unset |
 | `DOWNLOAD_RATE_LIMIT` | Viewer requests per minute for file downloads and sensitive-link shell pages | `30` |
 | `PAGE_RATE_LIMIT` | Viewer requests per minute for rendered HTML pages (`/page`) | `60` |
 | `VIEWER_PAGE_BASE_URL` | Optional separate public URL (pointed at the same viewer) for `share_html_page` links | `VIEWER_BASE_URL` |
@@ -381,6 +396,14 @@ until its next spawn (the same point where the Coordinator prompt and model
 apply), so respawn it to load the Coordinator tools.
 
 ## Memory & MCP tuning
+
+Tool filtering reduces the worker's tool list; it does not change authorization.
+The list in `lib/tool-roles.js` covers project close/merge, routines, consent,
+session control, briefings, unseen summaries, and timeline read/write.
+`permission_request` and ordinary worker tools remain available. Roles are fixed
+at spawn: configuration changes or promotion to Coordinator need a respawn
+(for example, `/restart`) to refresh the list. Codex sessions and mobile clients
+are unaffected; this adds no client polling or background work.
 
 Sessions are lean by default so the bridge runs on small VPS boxes. Only the
 bridge's own `ask-user` MCP loads per session; everything else is opt-in.

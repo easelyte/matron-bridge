@@ -2,13 +2,13 @@ import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
 import { describe, expect, it } from 'vitest';
 import { armReplyRef, settleReplyRef } from '../lib/journal-stream.js';
-import { summaryWindow, buildSummaryPrompt, splitSpoken, spokenPayload, spokenRefFor } from '../lib/summary-pass.js';
-import { parseTitlePassResponse, withSessionShort, titleMarkerFor } from '../lib/journal-title-seed.js';
+import { createTitleSummary } from '../lib/title-summary.js';
 
 // The spoken summary (voice mode, matron-apple spec 2026-10-03 §1) as index.js
-// wires it. Importing index.js would start the bridge, so the two functions
-// under test are lifted out of its source and run in a vm with their
-// collaborators stubbed — the idiom of test/codex-progress.test.js. The
+// wires it. Importing index.js would start the bridge, so flushResponse is
+// lifted out of its source and run in a vm with its collaborators stubbed —
+// the idiom of test/codex-progress.test.js; the summary pass is imported from
+// lib/title-summary.js. The
 // pieces themselves are tested in test/journal-stream.test.js and
 // test/summary-pass.test.js; a break here is silent in production (voice mode
 // just loses its spoken line and falls back to the apps' own cleaner).
@@ -106,17 +106,15 @@ describe('reply ref wiring (flushResponse)', () => {
   });
 });
 
-// maybeUpdatePinnedSummary is run for real too, with the model and the journal
-// stubbed: `answer` is what the model returns, and the result is every journal
-// publish the pass made. `during` runs while the model call is in flight.
+// maybeUpdatePinnedSummary (lib/title-summary.js) is run for real too, with
+// the model and the journal stubbed: `answer` is what the model returns, and
+// the result is every journal publish the pass made. `during` runs while the model call is in flight.
 async function runPass(session, answer, { during } = {}) {
-  const start = src.indexOf('async function maybeUpdatePinnedSummary(');
-  const end = src.indexOf('\n}\n', start) + 2;
-  expect(start, 'could not find maybeUpdatePinnedSummary in index.js — this test needs updating').toBeGreaterThan(-1);
   const published = [];
-  const context = vm.createContext({
+  const context = createTitleSummary({
     applyFallbackTitle: () => {}, SERVER_LABEL: 'bridge', updateRoomName: () => {},
-    llmTitleEarned: () => false, markLlmTitleEarned: () => {},
+    // No persisted record and no earned hint: the pass asks for a title.
+    getPersistedSession: () => null,
     // The event names the model that wrote this pass's text (returned with
     // it), never the shared configuration label.
     summaryModel: {
@@ -125,14 +123,10 @@ async function runPass(session, answer, { during } = {}) {
       generateWithModel: async () => { during?.(); return { text: answer, model: 'test-model' }; },
     },
     summaryModelNag: { maybeFile: () => {} },
-    journalConvoIdFor: () => 'convo', debug: () => {}, console,
-    summaryWindow, buildSummaryPrompt, splitSpoken, spokenPayload, spokenRefFor,
-    parseTitlePassResponse, withSessionShort, titleMarkerFor,
+    journalConvoIdFor: () => 'convo', debug: () => {},
     journalUpsertConvo: () => {}, persistSession: () => {},
-    // JSON round trip: the payload is built inside the vm, in another realm.
     journalPublish: (_session, method, payload) => published.push({ method, payload: JSON.parse(JSON.stringify(payload)) }),
   });
-  vm.runInContext(src.slice(start, end), context);
   await context.maybeUpdatePinnedSummary(session);
   return published;
 }

@@ -1,25 +1,14 @@
-import { readFileSync } from 'node:fs';
-import vm from 'node:vm';
 import { describe, expect, it } from 'vitest';
-import { summaryWindow, buildSummaryPrompt, splitSpoken, spokenPayload, spokenRefFor } from '../lib/summary-pass.js';
-import { parseTitlePassResponse, withSessionShort, titleMarkerFor, hintIsEarnedTitle } from '../lib/journal-title-seed.js';
+import { createTitleSummary } from '../lib/title-summary.js';
 
 // "Generate the title once" as index.js wires it: the summary
 // pass asks for and applies TITLE only until the conversation has earned its
 // LLM title; roster, summary and spoken lines still update every pass.
-// Importing index.js would start the bridge, so llmTitleEarned,
-// markLlmTitleEarned and maybeUpdatePinnedSummary (contiguous in index.js)
-// are lifted out and run in a vm — the idiom of spoken-summary-wiring.test.js.
-const src = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
+// The pass lives in lib/title-summary.js; its collaborators are stubbed.
 
 function harness({ persisted = {}, answer = 'TITLE: export fix\nNEW: Fixed the export.\nROSTER: Fixing the nightly export.' } = {}) {
-  const start = src.indexOf('function llmTitleEarned(');
-  const passStart = src.indexOf('async function maybeUpdatePinnedSummary(');
-  const end = src.indexOf('\n}\n', passStart) + 2;
-  expect(start, 'could not find llmTitleEarned in index.js — this test needs updating').toBeGreaterThan(-1);
-  expect(passStart, 'llmTitleEarned must sit just before maybeUpdatePinnedSummary').toBeGreaterThan(start);
   const calls = { prompts: [], renames: [], persisted: [], published: [], upserts: [] };
-  const context = vm.createContext({
+  const context = createTitleSummary({
     applyFallbackTitle: () => {}, SERVER_LABEL: 'bridge',
     updateRoomName: (_roomId, name) => calls.renames.push(name),
     summaryModel: {
@@ -28,15 +17,12 @@ function harness({ persisted = {}, answer = 'TITLE: export fix\nNEW: Fixed the e
       generateWithModel: async (prompt) => { calls.prompts.push(prompt); return { text: answer, model: 'test-model' }; },
     },
     summaryModelNag: { maybeFile: () => {} },
-    journalConvoIdFor: () => 'convo', debug: () => {}, console,
-    summaryWindow, buildSummaryPrompt, splitSpoken, spokenPayload, spokenRefFor,
-    parseTitlePassResponse, withSessionShort, titleMarkerFor, hintIsEarnedTitle,
+    journalConvoIdFor: () => 'convo', debug: () => {},
     getPersistedSession: (roomId) => persisted[roomId] || null,
     journalUpsertConvo: (_s, opts) => calls.upserts.push(JSON.parse(JSON.stringify(opts))),
     persistSession: (_roomId, _sid, _wd, _origin, extra) => calls.persisted.push(JSON.parse(JSON.stringify(extra))),
     journalPublish: (_session, method, payload) => calls.published.push({ method, payload: JSON.parse(JSON.stringify(payload)) }),
   });
-  vm.runInContext(src.slice(start, end), context);
   return { calls, pass: (session) => context.maybeUpdatePinnedSummary(session) };
 }
 

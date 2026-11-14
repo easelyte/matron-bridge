@@ -75,7 +75,10 @@ Write-Host '  - syntax of every entrypoint (npm run check)?'
 if ((Invoke-Native 'npm' @('run', 'check') -Quiet) -ne 0) { Fail "syntax check failed - see 'npm run check'" }
 
 Write-Host '  - native bindings actually load, import chain resolves?'
-if ((Invoke-Native 'node' @('--input-type=module', '-e', "await import('sharp'); await import('./lib/inline-image.js')")) -ne 0) { Fail 'the new code cannot import its dependencies - refusing to restart a broken build' }
+$env:MATRON_BRIDGE_PREFLIGHT = 'module'
+$importCode = Invoke-Native 'node' @('index.js')
+Remove-Item Env:MATRON_BRIDGE_PREFLIGHT
+if ($importCode -ne 0) { Fail 'the new code cannot import its dependencies - refusing to restart a broken build' }
 
 Write-Host '  - the Scheduled Task we are about to restart exists?'
 $task = Get-ScheduledTask -TaskPath $TaskPath -TaskName $TaskName -ErrorAction SilentlyContinue
