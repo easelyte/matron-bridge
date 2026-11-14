@@ -3492,6 +3492,7 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
   sessions.set(roomId, session);
   if (!resumeSessionId && !options.journalConvoId && !persisted?.journalConvoId) {
     persistSession(roomId, session.claudeSessionId, cwd, null);
+    journalFlushForSession(session);
   }
   enqueueRestartNotice(session, { deferDrain: true });
   return session;
