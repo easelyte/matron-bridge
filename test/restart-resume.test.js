@@ -251,7 +251,7 @@ it.each(['/compact', '/context-full'])('keeps stored text out of native command 
   const body = source.slice(start, source.indexOf('\nfunction sendTextToSession(', start));
   const send = vi.fn(() => true), compact = vi.fn(() => true);
   const session = { alive: true, agent: 'codex', codex: { transport: 'app-server', send, compact } };
-  const context = new Proxy({ ...turnCause, inflightTurnOrigin: () => ({}), Date, restartLatch: null, AGENT_CODEX: 'codex', codexInput: blocks => blocks,
+  const context = new Proxy({ ...turnCause, inflightTurnOrigin: () => ({}), Date, restartLatch: null, accountLock: { isLocked: () => false }, AGENT_CODEX: 'codex', codexInput: blocks => blocks,
     isCompactCommand: value => value.startsWith('/compact'), contextFullToNative: () => '/context',
     applyPendingAgentHandoff: (target, blocks) => ({ blocks, pending: null }),
     inflightMarker: { noteTurnStart() {} }, journalConvoIdFor: () => 'alice',
@@ -322,7 +322,7 @@ it('retries cancellation after journal hello', () => {
   const start = source.indexOf('function handleJournalReconnect() {');
   const body = source.slice(start, source.indexOf('\n}', start) + 2);
   const retry = vi.fn();
-  const context = new Proxy({ transferSender: { resumeAll() { return Promise.resolve(); } }, transferReceiver: { catchUp() { return Promise.resolve(); } }, retryRestartCancellation: retry, coordinatorLookup: { refresh() {} }, memoryLookup: { refresh() {} }, userDefaults: { refresh() {} }, journalIdentity: { refresh() {} } }, { get: (target, key) => key in target ? target[key] : () => {} });
+  const context = new Proxy({ transferSender: { resumeAll() { return Promise.resolve(); } }, transferReceiver: { catchUp() { return Promise.resolve(); } }, retryRestartCancellation: retry, coordinatorLookup: { refresh: () => Promise.resolve() }, memoryLookup: { refresh() {} }, userDefaults: { refresh() {} }, journalIdentity: { refresh() {} } }, { get: (target, key) => key in target ? target[key] : () => {} });
   runInNewContext(`${body}\nhandleJournalReconnect()`, context);
   expect(retry).toHaveBeenCalledOnce();
 });

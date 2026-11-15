@@ -7,6 +7,8 @@ export default [
       'node_modules/**',
       'coverage/**',
       '.git/**',
+      // Vendored unchanged from the journal; a test pins its hash.
+      'lib/vendor/**',
     ],
   },
   js.configs.recommended,

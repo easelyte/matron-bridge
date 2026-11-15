@@ -78,7 +78,7 @@ describe('Codex authentication recovery in the bridge', () => {
   it.each([{ _codexLoginId: 'login' }, { _codexAccountCommandPending: true }])('keeps input out of the model while signing in: %j', state => {
     const session = { alive: true, codex: { transport: 'app-server', send: vi.fn() }, ...state };
     const reportSessionSendFailure = vi.fn(() => false);
-    const context = vm.createContext({ restartLatch: undefined, reportSessionSendFailure });
+    const context = vm.createContext({ restartLatch: undefined, reportSessionSendFailure, accountLock: { isLocked: () => false } });
     const start = source.indexOf('function sendToSession(');
     vm.runInContext(source.slice(start, source.indexOf('\n}\n', start) + 2), context);
     let dispatched;

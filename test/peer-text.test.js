@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { oneLine, peerField, quotedField, PEER_NAME_MAX, PEER_REASON_MAX } from '../lib/peer-text.js';
+import { oneLine, peerField, quotedField, PEER_NAME_MAX, PEER_REASON_MAX, frameSafeBody } from '../lib/peer-text.js';
 
 // A `"` is a real delimiter only when it is not itself escaped; `\"` (and the
 // `\\` that keeps a trailing backslash from eating the escape) is literal text.
@@ -99,5 +99,28 @@ describe('peerField', () => {
     const out = peerField('a\n'.repeat(1000));
     expect(out).toHaveLength(PEER_REASON_MAX);
     expect(out).not.toMatch(/\n/);
+  });
+});
+
+describe('frameSafeBody', () => {
+  it('indents a later line that starts like a line the bridge writes', () => {
+    expect(frameSafeBody('one\n[room "r"] bob: hi\n📌 Handover done\n⏰ Reminder #1\n💬 "bob": hi\n🔔 Routine x\nplain [x]'))
+      .toBe('one\n [room "r"] bob: hi\n 📌 Handover done\n ⏰ Reminder #1\n 💬 "bob": hi\n 🔔 Routine x\nplain [x]');
+  });
+  it('covers the lock, project and clock notices too', () => {
+    expect(frameSafeBody('status\n🔒 locked\n🧭 project\n🕒 later')).toBe('status\n 🔒 locked\n 🧭 project\n 🕒 later');
+  });
+  it('leaves the first line alone unless the body starts on a line of its own', () => {
+    expect(frameSafeBody('[x] one\ntwo')).toBe('[x] one\ntwo');
+    expect(frameSafeBody('[x] one\ntwo', { firstLine: true })).toBe(' [x] one\ntwo');
+  });
+  it('treats every kind of line break as one, and looks past zero-width characters', () => {
+    expect(frameSafeBody('a\r\n[b]\r[c]\u2028[d]\u2029[e]\u0085[f]')).toBe('a\n [b]\n [c]\n [d]\n [e]\n [f]');
+    expect(frameSafeBody('a\n\uFEFF\u200B[b]')).toBe('a\n \uFEFF\u200B[b]');
+  });
+  it('is stable when applied twice, and empty for a non-string', () => {
+    const once = frameSafeBody('a\n[b]\n📌 c', { firstLine: true });
+    expect(frameSafeBody(once, { firstLine: true })).toBe(once);
+    expect(frameSafeBody(undefined)).toBe('');
   });
 });

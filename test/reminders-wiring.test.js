@@ -50,6 +50,8 @@ describe('reminders wiring', () => {
     const fire = index.slice(index.indexOf('async function fireTimer'), index.indexOf('async function fireTimer') + 1600);
     expect(fire).toMatch(/record\.source === 'agent'/);
     expect(fire).toMatch(/⏰ Reminder #\$\{record\.id\}/);
+    // A later line of the reminder's text cannot start like a line the bridge writes.
+    expect(fire).toMatch(/ago: \$\{frameSafeBody\(String\(record\.text \?\? ''\)\)\}/);
   });
 
   it('registers the three reminder_* tools, each posting through callReminders with roomId', () => {

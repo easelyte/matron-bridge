@@ -43,7 +43,7 @@ function setup({ session: overrides = {} } = {}) {
     designNeedsInteractive, DESIGN_SWITCH_ANNOUNCEMENT, sessionOccupied, effortFlowHoldsInput,
     markJournalOrigin, tagCauses, queueCauses, hasQueuedCompact, isCompactCommand,
     AGENT_CLAUDE: 'claude', AGENT_CODEX: 'codex', CLAUDE_STEER_ENABLED: false,
-    restartLatch: undefined, sessions,
+    restartLatch: undefined, accountLock: { isLocked: () => false, hold: () => false }, boxLock: null, outsideWorkRefused: () => false, sessions,
     journalPublisher: { flushCursor: vi.fn() },
     journalSessionCommandCtx: () => ctxObj,
     journalConvoIdFor: () => 'convo',

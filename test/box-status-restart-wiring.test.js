@@ -35,7 +35,7 @@ describe('restart box status wiring', () => {
       const runtime = { gateVerdict: { waiting_on: { quiet: { holders: [], probe_error: null },
         code: null, preflight: null, collect: null, unwarned: [] } } };
       runInNewContext(publish.replace('export ', ''), {
-        JOURNAL_ENABLED: true, plannedRestartAvailable: true, plannedRestartState: store,
+        boxLock: null, JOURNAL_ENABLED: true, plannedRestartAvailable: true, plannedRestartState: store,
         plannedRestartRuntime: runtime, buildRestartStatus,
         sessions: new Map(), loadPersistedSessions: () => [], buildActivity: () => null,
         usageLimitsCache: null, codexLimits: { cache: null }, buildBoxVitals: () => null, hostVitals: () => null, buildLimits: () => null, DEFAULT_WORKDIR: '.', buildDisk: () => null,
@@ -99,7 +99,7 @@ it('publishes changed gate observations from the production timer and sanitizes 
     const runtime = { gateVerdict: null };
     let time = 0;
     const context = {
-      JOURNAL_ENABLED: true, plannedRestartAvailable: true, plannedRestartState: store, Date: { now: () => time },
+      boxLock: null, JOURNAL_ENABLED: true, plannedRestartAvailable: true, plannedRestartState: store, Date: { now: () => time },
       plannedRestartRuntime: runtime, plannedRestart: gate, buildRestartStatus,
       sessions: new Map(), loadPersistedSessions: () => [], buildActivity: () => null,
       usageLimitsCache: null, codexLimits: { cache: null }, buildBoxVitals: () => null, hostVitals: () => null, buildLimits: () => null, DEFAULT_WORKDIR: '.', buildDisk: () => null,
@@ -145,7 +145,7 @@ it('publishes restart alongside every fork capacity field', () => {
   };
   const fn = publish.slice(0, publish.indexOf('export function publishRestartStatus('));
   runInNewContext(fn + "\npublishBoxStatus('restart');", {
-    JOURNAL_ENABLED: true, sessions: new Map(), loadPersistedSessions: () => [],
+    boxLock: null, JOURNAL_ENABLED: true, sessions: new Map(), loadPersistedSessions: () => [],
     buildActivity: () => ({ busy: 1 }), usageLimitsCache: claudeCache, codexLimits: { cache: codexCache }, buildLimits,
     DEFAULT_WORKDIR: '.', buildDisk: () => ({ free: 10 }), getAccountEmail: () => 'alice@example.test',
     hostVitals: () => ({ cpu: 20 }), buildBoxVitals: value => value,

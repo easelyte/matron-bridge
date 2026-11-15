@@ -8,7 +8,8 @@ import { z } from 'zod';
 import { SECRET_CONTEXT_MAX_LENGTH } from './lib/secret-context.js';
 import { resolvePermissionTimeoutMs, classifyPermissionPostResponse, permissionInputRefusal } from './lib/permission-prompt.js';
 import { formatBox } from './lib/agent-boxes-format.js';
-import { itemLine, formatItemList, formatItemDetail, formatCommentAck, formatHandoverAck, withImageWarnings } from './lib/items-format.js';
+import { formatUsageHistory } from './lib/usage-history-tool.js';
+import { itemLine, formatItemList, formatItemDetail, formatCommentAck, formatHandoverAck, withImageWarnings, withStepUpNote } from './lib/items-format.js';
 import { formatStartAck, formatCreateAck, formatMilestoneAck, formatMissionDetail, missionLine, formatBlocked, formatJournalError, formatStatusAck, formatMissionList, formatJoinAck, formatLeaveAck, formatUpdateAck } from './lib/missions-format.js';
 import { formatSearchAll } from './lib/search-format.js';
 import { missionIdemKey, itemIdemKey } from './lib/missions-idem.js';
@@ -573,6 +574,28 @@ server.tool(
       const boxes = data.boxes || [];
       if (!boxes.length) return { content: [{ type: 'text', text: 'No boxes found.' }] };
       return { content: [{ type: 'text', text: boxes.map((b) => formatBox(b)).join('\n\n') }] };
+    } catch (err) {
+      return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
+    }
+  }
+);
+
+server.tool(
+  'usage_history',
+  "How much of each account's weekly allowance went unused, week by week: per Claude or Codex account (boxes on one login count once), the finished weeks with the percentage left unused when each reset, the week in progress, and the average. Use it when the user asks how much capacity was wasted or spare in past weeks, and in status reports. History starts when the journal began keeping it; agent_boxes has the live meters.",
+  {
+    weeks: z.number().int().min(1).max(104).optional().describe('How many weeks back to look (default 12, max 104)'),
+  },
+  async ({ weeks }) => {
+    try {
+      const postRes = await bridgeFetch(`${BRIDGE_API}/usage-history`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ roomId: ROOM_ID, ...(weeks !== undefined ? { weeks } : {}) }),
+      });
+      const data = await postRes.json().catch(() => ({}));
+      if (!postRes.ok) return { content: [{ type: 'text', text: `usage_history failed: ${data.error || `HTTP ${postRes.status}`}` }] };
+      return { content: [{ type: 'text', text: formatUsageHistory(data) }] };
     } catch (err) {
       return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
     }
@@ -1351,12 +1374,14 @@ server.tool(
     position: z.enum(['top', 'bottom']).optional().describe('Where a task lands in the ordered task list'),
     supersedes: z.string().optional().describe('Item id of a decision this one replaces'),
     actions: z.array(z.string()).max(4).optional().describe('Up to 4 short one-tap reply labels (≤40 chars each, unique), e.g. ["Go"] or ["Option A","Option B"]. Tapping one behaves exactly like the user typing that label as a reply.'),
+    step_up: z.boolean().optional().describe("true = the user must confirm the tap with Face ID or Touch ID (a signature from their device's approval key). Use for anything destructive or hard to undo. A typed reply never satisfies it. Cannot be un-set once filed: close the item and file a new one."),
+    subject: z.record(z.string(), z.string()).optional().describe('With step_up: what exactly is being approved, as a flat object of short strings (at most 12 keys), e.g. {"op":"drop_table","table":"orders","box":"box-a"}. Shown to the user verbatim and signed.'),
     shared_by: z.string().max(PERSON_MAX).optional().describe("Another person's mission you may contribute to: their user name (name@host for someone on another journal), with mission = THEIR number (mission_list shared: true lists them). Needs a contribute share; no attachments or buttons."),
     mission: z.number().int().min(1).optional().describe('With shared_by: THEIR mission number to file the item on'),
   },
   async (args) => (args.shared_by
     ? callSharing('shared_item_create', 'item_create', args, formatContribAck('Filed'))
-    : callItems('create', args, (d) => withImageWarnings(itemLine(d.item), d))),
+    : callItems('create', args, (d) => withStepUpNote(withImageWarnings(itemLine(d.item), d), d))),
 );
 
 server.tool(
@@ -1390,12 +1415,14 @@ server.tool(
     attachments: z.array(z.string()).optional().describe('Local file paths inside the working directory, or files the bridge downloaded for this conversation (at most 20). A body image `![caption](path)` naming one of them shows it in place; the rest show at the end'),
     awaiting: z.enum(['user', 'agent']).nullable().optional().describe('Who acts next after this comment; omit to leave it unchanged'),
     actions: z.array(z.string()).max(4).optional().describe('Up to 4 short one-tap reply labels (≤40 chars each, unique) shown under this comment, e.g. ["Merge"] or ["Option A","Option B"]. Sets awaiting to the user. The item must be open (item_reopen a closed one first).'),
+    step_up: z.boolean().optional().describe("true = the user must confirm the tap with Face ID or Touch ID (a signature from their device's approval key). Use for anything destructive or hard to undo. A typed reply never satisfies it. Needs actions."),
+    subject: z.record(z.string(), z.string()).optional().describe('With step_up: what exactly is being approved, as a flat object of short strings (at most 12 keys), e.g. {"op":"drop_table","table":"orders","box":"box-a"}. Shown to the user verbatim and signed.'),
     add_labels: z.array(z.string()).max(10).optional().describe('Labels to add to the item, keeping the ones it has (e.g. ["dispatched"] on a spare-allowance backlog task you started)'),
     shared_by: z.string().max(PERSON_MAX).optional().describe("An item on another person's mission you may contribute to: their user name (name@host for someone on another journal); id is then the item's id or THEIR number ('#12'). Needs a contribute share; no attachments or buttons."),
   },
   async (args) => (args.shared_by
     ? callSharing('shared_item_comment', 'item_comment', args, formatContribAck('Commented'))
-    : callItems('comment', args, (d) => withImageWarnings(formatCommentAck(d, args.awaiting), d))),
+    : callItems('comment', args, (d) => withStepUpNote(withImageWarnings(formatCommentAck(d, args.awaiting), d), d))),
 );
 
 server.tool(
@@ -1854,7 +1881,7 @@ const MEMORY_WHAT = "The user's memories are their standing rules and facts abou
 
 server.tool(
   'memory_save',
-  `Save or update one of the user's memories. ${MEMORY_WHAT} Save a memory the moment the user states such a rule — one memory per rule — and confirm in one line. The \`description\` is the one line every session sees at spawn, so write it as the actionable rule itself; put the why and the how in \`body\`. The same \`name\` overwrites the WHOLE memory, so send the body back when updating one. Not for project or code facts an ordinary session should keep in its own Claude Code memory directory.`,
+  `Save or update one of the user's memories. ${MEMORY_WHAT} Save a memory the moment the user states such a rule — one memory per rule — and confirm in one line. A save made outside a turn the user started themselves (a routine, a reminder, a room message, a spawn outcome), and any save on some boxes, is not applied: it becomes a proposal the user approves on a tracker item. The result then says NOT saved yet and names the item; say so in one line and carry on — the answer arrives as a later turn, so do not retry or record the rule another way. The \`description\` is the one line every session sees at spawn, so write it as the actionable rule itself; put the why and the how in \`body\`. The same \`name\` overwrites the WHOLE memory, so send the body back when updating one. Not for project or code facts an ordinary session should keep in its own Claude Code memory directory.`,
   {
     name: z.string().describe("Kebab-case slug, unique per user: lowercase letters, digits and dashes, ≤64 chars, e.g. 'avoid-box-a-and-box-b'. Reuse an existing name to update it."),
     description: z.string().describe('One line, ≤200 chars: the rule as every session should read it.'),
@@ -1881,7 +1908,7 @@ server.tool(
 
 server.tool(
   'memory_delete',
-  'Delete one of the user\'s memories — when the user retires a rule, or a memory turns out to be wrong. To change a memory, memory_save it under the same name instead.',
+  'Delete one of the user\'s memories — when the user retires a rule, or a memory turns out to be wrong. To change a memory, memory_save it under the same name instead. A delete made outside a turn the user started themselves, and any delete on some boxes, is a proposal the user approves on a tracker item: the result then says NOT deleted yet and names the item; say so in one line and carry on, do not retry.',
   { name: z.string().describe('The memory name') },
   async (args) => callMemory('delete', args, formatDeleteAck),
 );
@@ -1911,7 +1938,7 @@ async function callReminders(name, args, render) {
 
 server.tool(
   'reminder_create',
-  "Schedule a durable reminder to yourself: at the fire time the bridge delivers `text` into THIS conversation as a new turn (⏰ Reminder #N …), resuming the session if it was reaped. Unlike CronCreate / ScheduleWakeup, which live in this process and die at the bridge's idle reap (~1 h), on a restart, and when this dev box idle-stops, a reminder is persisted by the bridge, re-armed after a restart, and known to the host: the box may go to sleep meanwhile and is started again a few minutes before the reminder fires. Use this for anything further out than about an hour. The user sees a card with Send-now / Cancel buttons. For a planned restart handoff, pass `restart_note: true` without scheduling options: the note stays held until restart delivery. Otherwise pass exactly one of `in` or `at`. For standing check-ins (a morning and an evening sweep, say) pass `at` with `repeat: \"daily\"` and a `tz` such as \"Europe/London\": it fires at that wall-clock time every day, 08:00 staying 08:00 across the clock changes, and keeps its number until reminder_cancel ends it — set it once, never re-create it after each fire. A turn in progress or a background job you started that is still running already holds this session and this box awake (up to 8 hours from your last output), so a reminder is not needed for that. Set hold_awake: true ONLY when the work between now and then must not be interrupted across quiet gaps between turns (a watch, a long download you are not a parent of): it keeps this box from idle-stopping and this session from being reaped until the reminder fires, which costs shared host memory for every hour of it.",
+  "Schedule a durable reminder to yourself: at the fire time the bridge delivers `text` into THIS conversation as a new turn (⏰ Reminder #N …), resuming the session if it was reaped. Unlike CronCreate / ScheduleWakeup, which live in this process and die at the bridge's idle reap (~1 h), on a restart, and when this dev box idle-stops, a reminder is persisted by the bridge, re-armed after a restart, and known to the host: the box may go to sleep meanwhile and is started again a few minutes before the reminder fires. Use this for anything further out than about an hour. The user sees a card with Send-now / Cancel buttons. For a planned restart handoff, pass `restart_note: true` without scheduling options: the note stays held until restart delivery. Otherwise pass exactly one of `in` or `at`. For standing check-ins (a morning and an evening sweep, say) pass `at` with `repeat: \"daily\"` and a `tz` such as \"Europe/London\": it fires at that wall-clock time every day, 08:00 staying 08:00 across the clock changes, and keeps its number until reminder_cancel ends it — set it once, never re-create it after each fire. A turn in progress or a background job you started that is still running already holds this session and this box awake (up to 8 hours from your last output), so a reminder is not needed for that. Set hold_awake: true ONLY when the work between now and then must not be interrupted across quiet gaps between turns (a watch, a long download you are not a parent of): it keeps this box from idle-stopping and this session from being reaped until the reminder fires, which costs resources on its host for every hour of it.",
   {
     text: z.string().min(1).max(2000).describe('What to tell yourself when it fires — write it for your future self, with enough context to act on'),
     restart_note: z.boolean().optional().describe('Hold text for the pending planned restart. No in, at, repeat or hold_awake; replaces your prior note for this restart.'),
