@@ -323,8 +323,9 @@ describe('Claude spawn-path sink wiring', () => {
 
   it('routes both the print and interactive Claude launches through the sink setup', () => {
     expect(indexSource.match(/launchWithCodexSinkEnv\(\{/g)).toHaveLength(2);
-    expect(indexSource).toMatch(/launch: configuredEnv => spawn\('claude',[\s\S]*?env: configuredEnv/);
-    expect(indexSource).toMatch(/launch: configuredEnv => createInteractiveSession\(\{[\s\S]*?env: configuredEnv/);
+    expect(indexSource.match(/launch: configuredEnv => launchWithClaudePromptFile\(\{/g)).toHaveLength(2);
+    expect(indexSource).toMatch(/launch: promptArgs => spawn\('claude', promptArgs,[\s\S]*?env: configuredEnv/);
+    expect(indexSource).toMatch(/launch: promptArgs => createInteractiveSession\(\{[\s\S]*?claudeArgs: promptArgs,[\s\S]*?env: configuredEnv/);
   });
 
   it.each(['print', 'interactive'])(

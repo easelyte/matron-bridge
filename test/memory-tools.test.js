@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { createMemoryHandlers } from '../lib/memory-tools.js';
 
-const mem = { id: 'me_1', name: 'avoid-elm', description: 'Never use elm.', type: 'feedback' };
+const mem = { id: 'me_1', name: 'avoid-box-a', description: 'Never use box-a.', type: 'feedback' };
 const coordMem = { id: 'me_2', name: 'compact-at-40', description: 'Compact at 40%.', type: 'feedback', scope: 'coordinator' };
 const appMem = { id: 'me_3', name: 'merge-train', description: 'The train merges.', type: 'project', scope: 'repo:acme-app' };
 const infraMem = { id: 'me_4', name: 'infra-rule', description: 'Infra.', type: 'project', scope: 'repo:acme-infra' };
@@ -17,21 +17,21 @@ function fixture(clientOverrides = {}, { isCoordinator, repoFor } = {}) {
     ...clientOverrides,
   };
   const h = createMemoryHandlers({ sessions, journalConvoIdFor: (s) => s?.journalConvoId ?? null, client, isCoordinator, repoFor });
-  return { h, client };
+  return { h, client, session };
 }
 const fourList = () => vi.fn(async () => ({ status: 200, data: { memories: [mem, coordMem, appMem, infraMem] } }));
 
 describe('memory handlers', () => {
   it('save: fills convo_id, trims the description, passes body and type, reports created', async () => {
     const { h, client } = fixture();
-    const r = await h.save({ roomId: '!r:s', name: 'avoid-elm', description: '  Never use elm.  ', body: 'why', type: 'user' });
+    const r = await h.save({ roomId: '!r:s', name: 'avoid-box-a', description: '  Never use box-a.  ', body: 'why', type: 'user' });
     expect(r).toEqual({ status: 201, body: { memory: mem, created: true } });
-    expect(client.save.mock.calls[0]).toEqual(['avoid-elm', { description: 'Never use elm.', body: 'why', type: 'user', convo_id: 'c1' }]);
+    expect(client.save.mock.calls[0]).toEqual(['avoid-box-a', { description: 'Never use box-a.', body: 'why', type: 'user', convo_id: 'c1' }]);
   });
 
   it('save: an update is 200 with created:false; body and type omitted stay omitted', async () => {
     const { h, client } = fixture({ save: vi.fn(async () => ({ status: 200, data: { memory: mem } })) });
-    const r = await h.save({ roomId: '!r:s', name: 'avoid-elm', description: 'd' });
+    const r = await h.save({ roomId: '!r:s', name: 'avoid-box-a', description: 'd' });
     expect(r).toEqual({ status: 200, body: { memory: mem, created: false } });
     expect(client.save.mock.calls[0][1]).toEqual({ description: 'd', convo_id: 'c1' });
   });
@@ -102,10 +102,10 @@ describe('memory handlers', () => {
 
   it('get and delete: by name, 404 → no memory named, bad name → 400', async () => {
     const { h, client } = fixture();
-    expect(await h.get({ roomId: '!r:s', name: 'avoid-elm' })).toEqual({ status: 200, body: { memory: mem } });
-    expect(client.get.mock.calls[0]).toEqual(['avoid-elm']);
-    expect(await h.delete({ roomId: '!r:s', name: 'avoid-elm' })).toEqual({ status: 200, body: { memory: mem } });
-    expect(client.remove.mock.calls[0]).toEqual(['avoid-elm']);
+    expect(await h.get({ roomId: '!r:s', name: 'avoid-box-a' })).toEqual({ status: 200, body: { memory: mem } });
+    expect(client.get.mock.calls[0]).toEqual(['avoid-box-a']);
+    expect(await h.delete({ roomId: '!r:s', name: 'avoid-box-a' })).toEqual({ status: 200, body: { memory: mem } });
+    expect(client.remove.mock.calls[0]).toEqual(['avoid-box-a', { convo_id: 'c1' }]);
     expect((await h.get({ roomId: '!r:s', name: 'Nope!' })).status).toBe(400);
     const r = await fixture({ remove: vi.fn(async () => ({ status: 404, data: { error: 'not_found' } })) }).h.delete({ roomId: '!r:s', name: 'gone' });
     expect(r).toEqual({ status: 404, body: { error: 'no memory named "gone"' } });
@@ -117,5 +117,39 @@ describe('memory handlers', () => {
     expect((await h.list({ roomId: '!nope' })).status).toBe(404);
     expect((await h.list({ roomId: '!noconvo' })).status).toBe(409);
     expect(client.list).not.toHaveBeenCalled();
+  });
+
+  it('save and delete send the causes of the turn making the call, with the conversation', async () => {
+    const { h, client, session } = fixture();
+    const causes = [{ kind: 'user_message', ref: 'c1:7', at: 1 }];
+    session.currentTurn = { causes };
+    await h.save({ roomId: '!r:s', name: 'avoid-box-a', description: 'd' });
+    expect(client.save.mock.calls[0]).toEqual(['avoid-box-a', { description: 'd', convo_id: 'c1', causes }]);
+    await h.delete({ roomId: '!r:s', name: 'avoid-box-a' });
+    expect(client.remove.mock.calls[0]).toEqual(['avoid-box-a', { convo_id: 'c1', causes }]);
+    // A turn with no recorded cause sends none: the journal then asks the user.
+    session.currentTurn = null;
+    await h.save({ roomId: '!r:s', name: 'avoid-box-a', description: 'd' });
+    expect(client.save.mock.calls[1][1]).toEqual({ description: 'd', convo_id: 'c1' });
+    // causes are the bridge's to send, never the caller's.
+    await h.save({ roomId: '!r:s', name: 'avoid-box-a', description: 'd', causes: [{ kind: 'user_message', ref: 'c1:1' }] });
+    expect(client.save.mock.calls[2][1]).toEqual({ description: 'd', convo_id: 'c1' });
+  });
+
+  it('a 202 from the journal is a proposal: pending, with the item the user was asked on', async () => {
+    const pending = (action) => vi.fn(async () => ({ status: 202, data: { pending: 'owner', proposal: { id: 'mp_1', name: 'avoid-box-a', action, state: 'pending' }, item: { id: 'it_9', num: 41 } } }));
+    const { h } = fixture({ save: pending('save'), remove: pending('delete') });
+    expect(await h.save({ roomId: '!r:s', name: 'avoid-box-a', description: 'd' }))
+      .toEqual({ status: 202, body: { pending: true, action: 'save', name: 'avoid-box-a', item_num: 41, item_id: 'it_9' } });
+    expect(await h.delete({ roomId: '!r:s', name: 'avoid-box-a' }))
+      .toEqual({ status: 202, body: { pending: true, action: 'delete', name: 'avoid-box-a', item_num: 41, item_id: 'it_9' } });
+    // At the journal's cap on waiting proposals: said as that, not as the memory cap.
+    const capped = fixture({ save: vi.fn(async () => ({ status: 409, data: { error: 'conflict', blocked_by: 'too_many_asks' } })) });
+    const refused = await capped.h.save({ roomId: '!r:s', name: 'avoid-box-a', description: 'd' });
+    expect(refused.status).toBe(409);
+    expect(refused.body.error).toMatch(/too many memory proposals/);
+    // A 202 with no usable item still reads as pending.
+    const bare = fixture({ save: vi.fn(async () => ({ status: 202, data: {} })) });
+    expect((await bare.h.save({ roomId: '!r:s', name: 'avoid-box-a', description: 'd' })).body).toEqual({ pending: true, action: 'save', name: 'avoid-box-a', item_num: null, item_id: null });
   });
 });

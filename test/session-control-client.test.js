@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { createSessionControlHandlers } from '../lib/session-control-client.js';
+import { createSessionControlHandlers, USER_ONLY_CARRY_ON } from '../lib/session-control-client.js';
 
 function fixture({ coordinator = true, send = true } = {}) {
   const sent = [];
@@ -21,6 +21,24 @@ describe('session control client', () => {
     expect((await h.setModel({ roomId: '!coord', target_convo_id: 'x' })).status).toBe(400);
     expect((await h.carryOn({ roomId: '!coord', target_convo_id: 'x' })).status).toBe(400);
   });
+  it('accepts a caller the journal names as the Coordinator though it spawned before the role was known', async () => {
+    const sent = [];
+    // Spawned ordinary (coordinator:false) while GET /coordinator had not answered.
+    const sessions = new Map([['!coord', { alive: true, coordinator: false, journalConvoId: 'coord-convo' }], ['!plain', { alive: true, coordinator: false, journalConvoId: 'plain-convo' }]]);
+    const journalSays = 'coord-convo';
+    const h = createSessionControlHandlers({
+      sessions,
+      publisher: { sendRoomOp: (f) => { sent.push(f); return true; } },
+      journalConvoIdFor: (s) => s.journalConvoId,
+      isCoordinator: (s, convoId) => s?.coordinator === true || convoId === journalSays,
+      pendingTimeoutMs: 20,
+    });
+    await h.compact({ roomId: '!coord', target_convo_id: 'tgt' });
+    expect(sent).toHaveLength(1);
+    expect(sent[0]).toMatchObject({ op: 'session_control', from_convo_id: 'coord-convo', action: 'compact' });
+    expect((await h.compact({ roomId: '!plain', target_convo_id: 'tgt' })).status).toBe(403);
+    expect(sent).toHaveLength(1);
+  });
   it('sends the op and answers on the sent ack; the result frame becomes a notice in the Coordinator chat', async () => {
     const { h, sent, notices } = fixture();
     const p = h.setModel({ roomId: '!coord', target_convo_id: 'tgt', model: 'sonnet', agent: 'claude', reason: 'limit hit' });
@@ -31,8 +49,8 @@ describe('session control client', () => {
     h.onSessionControlFrame({ kind: 'session_control', event: 'sent', request_id: rid, target_waking: true });
     const res = await p;
     expect(res).toEqual({ status: 200, body: { sent: true, request_id: rid, target_waking: true } });
-    h.onSessionControlFrame({ kind: 'session_control', event: 'result', request_id: rid, ok: true, result: { applied: 'deferred', box: 'elm' } });
-    expect(notices).toEqual([['coord-convo', '⏳ Session model switch on elm parked: the session is busy; it applies at its next idle point.']]);
+    h.onSessionControlFrame({ kind: 'session_control', event: 'result', request_id: rid, ok: true, result: { applied: 'deferred', box: 'box-a' } });
+    expect(notices).toEqual([['coord-convo', '⏳ Session model switch on box-a parked: the session is busy; it applies at its next idle point.']]);
     // a duplicate result is ignored
     h.onSessionControlFrame({ kind: 'session_control', event: 'result', request_id: rid, ok: true, result: { applied: 'now' } });
     expect(notices).toHaveLength(1);
@@ -52,6 +70,15 @@ describe('session control client', () => {
     sessions.get('!coord').currentTurn = null;
     await h2.carryOn({ roomId: '!coord', target_convo_id: 'tgt', message: 'go' });
     expect('causes' in sent[2]).toBe(false);
+  });
+  it('tells the Coordinator to ask the user first when a carry-on is refused for a user-only box', async () => {
+    const { h, sent } = fixture();
+    const p = h.carryOn({ roomId: '!coord', target_convo_id: 'tgt', message: 'go' });
+    await new Promise((r) => setTimeout(r, 5));
+    expect(h.onOpError({ code: 'forbidden', ref: 'session_control', detail: 'user_only', requestId: sent[0].request_id })).toBe(true);
+    const r = await p;
+    expect(r.status).toBe(403);
+    expect(r.body.error).toBe(USER_ONLY_CARRY_ON);
   });
   it('maps journal error frames to HTTP statuses and times out without an ack', async () => {
     const { h, sent } = fixture();

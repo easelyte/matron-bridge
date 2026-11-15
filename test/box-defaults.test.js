@@ -25,7 +25,7 @@ describe('createBoxDefaultsStore', () => {
   });
 
   it('applies a live frame for this box and drops one for another box', () => {
-    const store = createBoxDefaultsStore({ identity: () => ({ deviceId: 7, name: 'elm' }), log: quiet });
+    const store = createBoxDefaultsStore({ identity: () => ({ deviceId: 7, name: 'box-a' }), log: quiet });
     expect(store.apply({ device_id: 8, default_agent: 'codex' })).toBe(false);
     expect(store.snapshot().known).toBe(false);
     expect(store.apply({ device_id: 7, default_agent: 'CODEX', default_model: null, default_effort: null })).toBe(true);

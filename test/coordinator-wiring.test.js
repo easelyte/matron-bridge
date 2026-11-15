@@ -28,7 +28,7 @@ describe('coordinator spawn wiring (source inspection)', () => {
   it('builds one lookup on the journal HTTP base and refreshes it at boot and on every hello_ok', () => {
     expect(index).toMatch(/const coordinatorLookup = createCoordinatorLookup\(\{\s*baseUrl: journalHttpBase,\s*token: _journalToken,/);
     const reconnect = body('function handleJournalReconnect()', '\nfunction ');
-    expect(reconnect).toContain('coordinatorLookup.refresh({ force: true });');
+    expect(reconnect).toContain('void coordinatorLookup.refresh({ force: true }).then(reconcileLiveCoordinator);');
     const boot = body('if (JOURNAL_ENABLED) {', '\nfunction expandHome(');
     expect(boot).toContain('coordinatorLookup.refresh({ force: true });');
   });
@@ -42,27 +42,48 @@ describe('coordinator spawn wiring (source inspection)', () => {
   it('an unknown role spawns an ordinary session and logs it — never a failed spawn', () => {
     const fn = body('function coordinatorRoleAtSpawn(', '\nfunction ');
     expect(fn).toContain('coordinatorLookup.roleFor(candidates)');
-    expect(fn).toContain('coordinatorLookup.refresh();');
+    expect(fn).toContain('if (role.known) coordinatorLookup.refresh();');
+    expect(fn).toContain('else void coordinatorLookup.refresh({ force: true }).then(reconcileLiveCoordinator);');
     expect(fn).toMatch(/starting as an ordinary session/);
     expect(fn).not.toMatch(/throw /);
+  });
+
+  it('a Coordinator that spawned before the role was known gets it through the assigned-event path', () => {
+    const fn = body('async function reconcileLiveCoordinator(truth) {', '\nasync function journalOnCoordinator(');
+    expect(fn).toContain('coordinatorNeedsAssigning({ truth, live: !!(session && session.alive), sessionCoordinator: session?.coordinator, pendingRole: session?._coordinatorPending ?? null })');
+    expect(fn).toContain("await journalOnCoordinator(truth.convoId, { role: 'assigned' });");
+    expect(fn).toMatch(/catch \(e\)/);
+  });
+
+  it('session control accepts the journal\'s current role holder, like the consent tools', () => {
+    const sc = body('sessionControlHandlers = createSessionControlHandlers({', '\n});');
+    expect(sc).toContain('isCoordinator: (session, convoId) => session?.coordinator === true || (!!convoId && coordinatorLookup.snapshot().convoId === convoId),');
   });
 
   it('print mode: prompt and disallowed tools come from claudeCoordinatorArgs', () => {
     const cs = body('function createSession(roomId, workdir, resumeSessionId, options = {}) {', '\nfunction ');
     expect(cs).toMatch(/const printCoord = claudeCoordinatorArgs\(\{ coordinator: !!options\.coordinator, basePrompt: trackerLinksNow\(BRIDGE_SYSTEM_PROMPT\), block: trackerLinksNow\(COORDINATOR_BLOCK\), baseDisallowed: \['AskUserQuestion'\], memoryBlock: memoryBlockNow\(\{ coordinator: !!options\.coordinator, workdir: cwd \}\), noticesBlock: noticesBlockNow\(\{ coordinator: !!options\.coordinator \}\), matronMdBlock: matronMd\.block \}\);/);
     expect(cs).toContain("'--disallowed-tools', ...printCoord.disallowedTools,");
-    expect(cs).toContain("'--append-system-prompt', printCoord.appendSystemPrompt,");
+    expect(cs).toContain('launch: configuredEnv => launchWithClaudePromptFile({');
+    expect(cs).toContain('prompt: printCoord.appendSystemPrompt,');
+    expect(cs).toContain('onError: failedSpawnProcess,');
+    expect(cs).toContain('runDir: ensureHeaderRunDir,');
+    expect(cs).toContain("launch: promptArgs => spawn('claude', promptArgs, {");
   });
 
   it('interactive mode: same helper, --disallowed-tools only when there is something to disallow', () => {
     const iv = body('function createInteractiveSessionForRoom(', '\nfunction ');
     expect(iv).toMatch(/const ivCoord = claudeCoordinatorArgs\(\{ coordinator: !!options\.coordinator, basePrompt: trackerLinksNow\(BRIDGE_SYSTEM_PROMPT\), block: trackerLinksNow\(COORDINATOR_BLOCK\), memoryBlock: memoryBlockNow\(\{ coordinator: !!options\.coordinator, workdir: cwd \}\), noticesBlock: noticesBlockNow\(\{ coordinator: !!options\.coordinator \}\), matronMdBlock: matronMd\.block \}\);/);
     expect(iv).toContain("...(ivCoord.disallowedTools.length ? ['--disallowed-tools', ...ivCoord.disallowedTools] : []),");
-    expect(iv).toContain("'--append-system-prompt', ivCoord.appendSystemPrompt,");
+    expect(iv).toContain('launch: configuredEnv => launchWithClaudePromptFile({');
+    expect(iv).toContain('prompt: ivCoord.appendSystemPrompt,');
+    expect(iv).toContain('runDir: ensureHeaderRunDir,');
+    expect(iv).toContain("exitEvent: 'exit',");
+    expect(iv).toContain('claudeArgs: promptArgs,');
   });
 
   it('no spawn site appends the bare BRIDGE_SYSTEM_PROMPT any more', () => {
-    expect(index).not.toContain("'--append-system-prompt', BRIDGE_SYSTEM_PROMPT");
+    expect(index).not.toContain("'--append-system-prompt',");
   });
 
   it('Codex: developer instructions and sandbox come from codexCoordinatorOptions', () => {

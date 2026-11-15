@@ -8,7 +8,7 @@ The backlog is open tracker tasks labelled `spare-allowance`, in the Tasks list'
    - its `Cost:` added to the allowance's current percent stays under about 90%;
    - one of the allowance's boxes has the task's repo (or matches `Boxes:`).
    Skip the allowance if nothing fits.
-2. Pick the box: the least busy of that allowance's boxes that has the repo. Never pick a box the user's memories reserve for a desk or other dedicated role, or one with a session stalled on a usage limit. Follow the user's memories on model and effort for the box (a Codex box, a box at its Fable limit).
+2. Pick the box: the least busy of that allowance's boxes that has the repo. Never pick a box the user's memories reserve for other work, or one with a session stalled on a usage limit. Follow the user's memories on model and effort for the box (a Codex box, a box at its Fable limit).
 3. Start it with `agent_session_start`. The task text says:
    - do the backlog task (by item number);
    - follow its instructions;

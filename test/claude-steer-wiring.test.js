@@ -63,6 +63,7 @@ function setup({ session: overrides = {}, steerEnabled = true } = {}) {
     restartLatch: undefined,
     inflightMarker: { touch: vi.fn(), noteTurnStart: vi.fn(), noteTurnEnd: vi.fn() },
     foreignSessions: { end: vi.fn() },
+    accountLock: { isLocked: () => false },
     planItems: { opened: vi.fn(), resolved: vi.fn() },
     journalPublisher: {
       flushCursor: vi.fn(),

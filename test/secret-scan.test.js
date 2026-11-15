@@ -20,6 +20,14 @@ const FAKE = {
   google: 'AI' + 'za' + 'Sy' + 'A1b2C3d4E5'.repeat(3) + '_-abc',
   anthropic: 'sk' + '-ant-' + 'api03-' + 'q'.repeat(30),
   openai: 'sk' + '-' + 'Ab12'.repeat(10),
+  openaiProject: 'sk' + '-proj-' + 'Ab1_-cD2'.repeat(6),
+  awsSecret: 'aws_secret' + '_access_key = ' + 'aB3/dE6+'.repeat(5),
+  gitlab: 'gl' + 'pat-' + 'a1B2c3D4e5'.repeat(2),
+  npm: 'np' + 'm_' + 'a1B2c3'.repeat(6),
+  slackConfig: 'xo' + 'xe-' + '1-abcdef',
+  slackSession: 'xo' + 'xs-' + '1234567890-abcdef',
+  stripeRestricted: 'r' + 'k_live_' + 'Zz09'.repeat(6),
+  sendgrid: 'S' + 'G.' + 'a1B2c3D4e5_'.repeat(2) + '.' + 'a'.repeat(43),
   password: 'pass' + 'word' + ' = "' + 'hunter2' + 'hunter2' + '"',
 };
 
@@ -174,9 +182,57 @@ describe('SECRET_PATTERNS', () => {
   it('has every kind from the spec', () => {
     const kinds = new Set(SECRET_PATTERNS.map((p) => p.kind));
     for (const k of ['private_key', 'aws_access_key', 'github_token', 'slack_token', 'stripe_key',
-      'google_api_key', 'anthropic_key', 'openai_key', 'jwt', 'url_credentials', 'password_assignment']) {
+      'google_api_key', 'anthropic_key', 'openai_key', 'jwt', 'url_credentials', 'password_assignment',
+      'aws_secret_key', 'gitlab_token', 'npm_token', 'sendgrid_key']) {
       expect(kinds.has(k), k).toBe(true);
     }
+  });
+});
+
+describe('token formats', () => {
+  const only = (text) => secretKindsIn(text).filter((k) => k !== 'password_assignment');
+  it.each([
+    ['openaiProject', 'openai_key'], ['openai', 'openai_key'], ['anthropic', 'anthropic_key'], ['gitlab', 'gitlab_token'],
+    ['npm', 'npm_token'], ['slack', 'slack_token'], ['slackConfig', 'slack_token'], ['slackSession', 'slack_token'],
+    ['stripe', 'stripe_key'], ['stripeRestricted', 'stripe_key'], ['sendgrid', 'sendgrid_key'], ['google', 'google_api_key'],
+    ['github', 'github_token'], ['githubPat', 'github_token'], ['awsSecret', 'aws_secret_key'],
+  ])('%s is flagged as %s, alone and inside a line', (name, kind) => {
+    expect(only(FAKE[name])).toEqual([kind]);
+    expect(only(`export KEY="${FAKE[name]}" # note`)).toEqual([kind]);
+  });
+
+  it('other OpenAI key prefixes with "-" and "_" in the body are flagged', () => {
+    for (const prefix of ['svcacct', 'admin']) expect(only('sk' + `-${prefix}-` + 'Ab1_-cD2'.repeat(6))).toEqual(['openai_key']);
+  });
+
+  it('an AWS secret access key counts only as the value of a name that says so', () => {
+    const value = 'aB3/dE6+'.repeat(5);
+    for (const line of [
+      'AWS_SECRET' + `_ACCESS_KEY=${value}`, 'aws_secret' + `_access_key: "${value}"`,
+      '"Secret' + `AccessKey": "${value}",`, 'awsSecret' + `AccessKey = '${value}'`,
+    ]) expect(secretKindsIn(line), line).toContain('aws_secret_key');
+    for (const line of [
+      value, `checksum = ${value}`, 'aws_secret' + '_access_key = ', 'aws_secret' + `_access_key = ${value.slice(0, 39)}`,
+      'aws_secret' + `_access_key = ${value}${value}`, 'aws_access' + `_key_id = ${value}`,
+    ]) expect(secretKindsIn(line), line).not.toContain('aws_secret_key');
+  });
+
+  it('look-alikes that are not tokens are left alone', () => {
+    for (const text of [
+      'npm_config_registry=https' + '://registry.example.com/', 'npm_' + 'a1B2c3'.repeat(5), 'xnpm_' + 'a1B2c3'.repeat(6), 'npm_' + 'a1B2c3'.repeat(7),
+      'glpat-', 'glpat-short', 'see the glpat- prefix', 'SG.short.short', 'MSG.' + 'a'.repeat(10), 'SG.' + 'a'.repeat(22) + '.' + 'a'.repeat(42) + ' ',
+      'sk-proj-', 'sk-proj-short', 'task-project-plan-for-the-next-quarter', 'xoxo-', 'xoxz-1', 'pk_live_' + 'Zz09'.repeat(6), 'sk_test_' + 'Zz09'.repeat(6),
+    ]) expect(only(text), text).toEqual([]);
+  });
+
+  it('the new patterns stay linear on long lines', () => {
+    const t = Date.now();
+    for (const text of [
+      'npm_'.repeat(1 << 18), ('npm_' + 'a'.repeat(35) + '_').repeat(1 << 14), 'SG.'.repeat(1 << 18), ('SG.' + 'a'.repeat(22) + '.').repeat(1 << 15),
+      'sk-proj-.'.repeat(1 << 17), ('sk-proj-' + 'a'.repeat(19) + '.').repeat(1 << 15), 'glpat-.'.repeat(1 << 17), ('secretaccesskey' + ' '.repeat(64)).repeat(1 << 13), 'secretaccesskey' + ' '.repeat(1 << 20),
+      ('secretaccesskey=' + 'a'.repeat(39) + ' ').repeat(1 << 14),
+    ]) expect(only(text)).toEqual([]);
+    expect(Date.now() - t).toBeLessThan(5000);
   });
 });
 

@@ -2,9 +2,7 @@
 #   docs:   https://docs.coderabbit.ai/guides/configure-coderabbit
 #   schema: https://storage.googleapis.com/coderabbit_public_assets/schema.v2.json
 #
-# Cursor's Bugbot already reviews the commits written in-house. CodeRabbit is
-# here for the pull requests nobody here wrote — on a public repo, the set that
-# actually needs a second reader.
+# Automatic review of pull requests, bot dependency bumps excluded.
 
 language: en-GB
 
@@ -18,9 +16,8 @@ reviews:
     drafts: false
 
     # Listed rather than left empty. An empty list means "the repository's
-    # default branch", and these repos disagree about what that is: five are on
-    # main, matron-bridge and matron-journal on master. One shared config
-    # cannot lean on it.
+    # default branch", and the repositories sharing this config do not all
+    # use the same one.
     base_branches:
       - main
       - master

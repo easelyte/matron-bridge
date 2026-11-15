@@ -38,6 +38,12 @@ import { prepareInlineImage, appendInlineImageBlocks } from './lib/inline-image.
 import { createSendAttachmentHandler, checkLocalUpload, resolveAndUploadLocalFile } from './lib/send-attachment.js';
 import { createPageLinkHandler } from './lib/page-link.js';
 import { createItemsClient } from './lib/items-client.js';
+import { readApprovalConfig } from './lib/approval-config.js';
+import { createApprovalGate } from './lib/approval-gate.js';
+import { createApprovalPaths } from './lib/approval-paths.js';
+import { createBoxLock } from './lib/box-lock.js';
+import { createAccountLock, ACCOUNT_LOCKED_LINE } from './lib/account-lock.js';
+import { createTapVerifier } from './lib/items-approval.js';
 import { createTransferClient } from './lib/transfer-client.js';
 import { createTransferSender } from './lib/transfer-sender.js';
 import { createTransferOutcomeNotify } from './lib/transfer-outcome.js';
@@ -61,6 +67,7 @@ import { createUnseenClient } from './lib/unseen-client.js';
 import { createUnseenHandlers, formatUnseenNudge } from './lib/unseen-tools.js';
 import { createRoutinesClient } from './lib/routines-client.js';
 import { createRoutineHandlers } from './lib/routines-tools.js';
+import { createUsageHistoryHandler } from './lib/usage-history-tool.js';
 import { createBriefingsClient } from './lib/briefings-client.js';
 import { createBriefingHandlers } from './lib/briefings-tools.js';
 import { createTimelineClient } from './lib/timeline-client.js';
@@ -68,6 +75,7 @@ import { createTimelineHandlers } from './lib/timeline-tools.js';
 import { createMemoryClient } from './lib/memory-client.js';
 import { createMemoryHandlers } from './lib/memory-tools.js';
 import { createMemoryLookup } from './lib/memory-lookup.js';
+import { formatProposalOutcome } from './lib/memory-format.js';
 import { createUserDefaultsLookup, defaultDeclinedText, defaultOfferFor, defaultSavedText, effectiveDefaultEffort, effectiveDefaultModel } from './lib/user-defaults.js';
 import { createBoxDefaultsStore, createBoxDefaultsSetter, resolveDefaultAgent, boxModelFor, boxEffortFor, codexEnvDefaults } from './lib/box-defaults.js';
 import { createUserSettings } from './lib/user-settings.js';
@@ -75,7 +83,7 @@ import { createJournalIdentity } from './lib/journal-identity.js';
 import { trackerUrlBase, renderTrackerLinks } from './lib/tracker-links.js';
 import { createTrackerLinkChecker, withTrackerLinkCheck, LINK_CHECK_FIELDS } from './lib/tracker-link-check.js';
 import { createRepoNameLookup } from './lib/repo-name.js';
-import { createCoordinatorLookup, loadCoordinatorBlock, loadNoticesBlock, renderNoticesBlock, claudeCoordinatorArgs, codexCoordinatorOptions, explicitModelFlag, explicitModelFlagForResume, coordinatorTurnText, planCoordinatorTransition, decideCoordinatorEvent, withCoordinatorModel, recreateSpawnModel, renderMemoryBlock } from './lib/coordinator.js';
+import { createCoordinatorLookup, coordinatorNeedsAssigning, loadCoordinatorBlock, loadNoticesBlock, renderNoticesBlock, claudeCoordinatorArgs, codexCoordinatorOptions, explicitModelFlag, explicitModelFlagForResume, coordinatorTurnText, planCoordinatorTransition, decideCoordinatorEvent, withCoordinatorModel, recreateSpawnModel, renderMemoryBlock } from './lib/coordinator.js';
 import { loadMatronMd, matronMdFileList, matronMdStatusLine } from './lib/matron-md.js';
 import { createServer } from 'http';
 import { createHmac, randomUUID, randomBytes, timingSafeEqual } from 'crypto';
@@ -176,7 +184,7 @@ import { formatSubagentToolBody, subagentToolStep } from './lib/subagent-tool-fo
 import { ivUploadDir, ivUploadAnnotation, ivUploadsRoot } from './lib/iv-uploads.js';
 import { matronFilesDir, matronFilesRoot, sessionDownloadDir } from './lib/matron-files.js';
 import { parseUsageLimits, formatLimits, createUsageMissLogger, usageFetchTimeoutMs } from './lib/usage-limits.js';
-import { resolveSpawnCwd, attachSpawnErrorHandler } from './lib/spawn-guard.js';
+import { resolveSpawnCwd, attachSpawnErrorHandler, failedSpawnProcess } from './lib/spawn-guard.js';
 import { withForkPrintSettings } from './lib/session-settings.js';
 import { hookEntry } from './lib/hook-command.js';
 import { buildPermissionSnapshot, classifyPermission } from './lib/permission-eval.js';
@@ -234,7 +242,7 @@ import { createRoomDelivery, formatRoomMessageNotice, formatRoomDeliveredNotice,
 import { parseProcessTable, liveWorkChildren, workHold, keepAwakeUntil, mcpServerSignatures, createTransferHold, WORK_HOLD_LEASE_MS } from './lib/work-hold.js';
 import { keepAwakeMode, powerHoldFlags, createPowerHold, POWER_HOLD_TICK_MS } from './lib/power-hold.js';
 import { unmuteChoiceValue, ROOM_MUTE_ACTION_ID, ROOM_MUTE_KIND } from './lib/room-mute-cards.js';
-import { quotedField, peerField, PEER_NAME_MAX } from './lib/peer-text.js';
+import { quotedField, peerField, frameSafeBody, PEER_NAME_MAX } from './lib/peer-text.js';
 import { createRoomReplyWaiters } from './lib/room-reply-waiters.js';
 import { createAgentChatHandlers, probeJoinedRoom, roomAgentLabel } from './lib/agent-chat.js';
 import {
@@ -306,6 +314,7 @@ import { createJournalReadProxy } from './lib/journal-read-proxy.js';
 import { loopbackRefusal } from './lib/loopback-guard.js';
 import { createApiAuth, viewerApiKey, apiAuthRefusal, namedSessionRoom, operatorHeaderPath } from './lib/api-auth.js';
 import { createRunDir, headerRunRoot, healHeaderFile, writeHeaderFile } from './lib/header-files.js';
+import { launchWithClaudePromptFile } from './lib/claude-prompt-file.js';
 import { codexMcpConfig } from './lib/codex-mcp.js';
 import { handleCodexControl, isCodexAuthError, offerCodexBuild, listCodexThreads, mergeCodexThreads } from './lib/codex-controls.js';
 import { createCodexAccountReader, codexSessionOptions } from './lib/codex-account.js';
@@ -936,9 +945,15 @@ const memoryClient = createMemoryClient({
 //
 // The run directory holds the session API header files too.
 let HEADER_RUN_DIR = null;
+function ensureHeaderRunDir() {
+  if (!HEADER_RUN_DIR) {
+    HEADER_RUN_DIR = createRunDir(headerRunRoot());
+    process.once('exit', () => { try { fs.rmSync(HEADER_RUN_DIR, { recursive: true, force: true }); } catch { /* best effort */ } });
+  }
+  return HEADER_RUN_DIR;
+}
 try {
-  HEADER_RUN_DIR = createRunDir(headerRunRoot());
-  process.once('exit', () => { try { fs.rmSync(HEADER_RUN_DIR, { recursive: true, force: true }); } catch { /* best effort */ } });
+  ensureHeaderRunDir();
 } catch (e) {
   console.warn(`[api] could not create the header file directory under ${headerRunRoot()}: ${e.message}`);
 }
@@ -1136,6 +1151,123 @@ function refreshJournalIdentity(opts) {
     return name;
   });
 }
+// The account lock (lib/account-lock.js): the journal's `panic` broadcast.
+// While it holds, running turns are interrupted and nothing new starts on
+// this box, from any source, until the journal clears it. Persisted, so a
+// bridge that restarts while disconnected stays locked until its next hello.
+const ACCOUNT_LOCK_FILE = path.join(os.homedir(), '.matron-bridge-account-lock.json');
+const accountLock = createAccountLock({
+  stateFile: ACCOUNT_LOCK_FILE,
+  onLock: () => stopTurnsForAccountLock(),
+  onClear: (held) => releaseAfterAccountLock(held),
+  log: console,
+});
+if (accountLock.isLocked()) console.warn('account lock: this account was locked when the bridge last ran; nothing starts until the journal clears it');
+
+// One line per conversation per lock, in the bridge's own voice.
+function noticeAccountLocked(convoId) {
+  if (accountLock.shouldNotify(convoId)) journalPublishNotice(convoId, `🔒 ${ACCOUNT_LOCKED_LINE}`);
+}
+
+// Interrupt every running turn, the same way the user's own interrupt does
+// (Esc for an interactive session, the interrupt control request or signal
+// otherwise), and say why in each conversation that was stopped.
+function stopTurnsForAccountLock() {
+  for (const session of sessions.values()) {
+    try {
+      if (!session?.alive || !session.busy) continue;
+      if (session.iv && session.iv.alive) {
+        session.iv.sendKeystroke('esc');
+        session.pendingUnclassifiedPrompt = false;
+        session.busy = false;
+        inflightMarker.noteTurnEnd(journalConvoIdFor(session));
+        endTurn(session);
+      } else {
+        printModeInterrupt(session, () => {}).catch(() => {});
+      }
+      noticeAccountLocked(journalConvoIdFor(session));
+    } catch (e) {
+      try { console.warn(`[account-lock] could not interrupt a session: ${e?.message ?? e}`); } catch { /* logging must never throw */ }
+    }
+  }
+}
+
+// After the clear: what fell due while locked is delivered now, and every
+// idle session gets the turn-end seam it missed, so messages that waited in
+// its queue or its room inbox go in.
+function releaseAfterAccountLock(held) {
+  for (const session of sessions.values()) {
+    try {
+      if (!session?.alive || session.busy) continue;
+      if (!flushPendingSessionQueue(session)) maybeFlushRoomDelivery(session);
+    } catch (e) {
+      try { console.warn(`[account-lock] could not flush a session after the clear: ${e?.message ?? e}`); } catch { /* logging must never throw */ }
+    }
+  }
+  for (const item of Array.isArray(held) ? held : []) {
+    if (item && item.kind === 'timer' && item.record && typeof item.record === 'object') {
+      fireTimer(item.record).catch((e) => {
+        try { console.warn(`[account-lock] a held reminder could not be delivered: ${e?.message ?? e}`); } catch { /* logging must never throw */ }
+      });
+    }
+  }
+}
+
+// Approval keys (journal protocol "Approval keys (step-up)"). With
+// MATRON_APPROVAL_KEYS_FILE set this box verifies the user's signed approval
+// itself before it starts a session, joins a chat or takes a file
+// (lib/approval-gate.js, lib/approval-paths.js). Unset, nothing changes. A
+// keys file that cannot be trusted stops the bridge here rather than letting
+// it run ungated.
+const APPROVAL_NONCES_FILE = path.join(os.homedir(), '.matron-bridge-approval-nonces.json');
+let APPROVAL_CONFIG;
+let approvalGate;
+try {
+  APPROVAL_CONFIG = readApprovalConfig(process.env, { journalWsUrl: JOURNAL_WS_URL });
+  approvalGate = createApprovalGate({
+    keysFile: APPROVAL_CONFIG.keysFile,
+    maxAgeMs: APPROVAL_CONFIG.maxAgeMs,
+    noncesFile: APPROVAL_NONCES_FILE,
+    journalHost: APPROVAL_CONFIG.journalHost,
+    user: () => journalIdentity.name(),
+    log: console,
+  });
+} catch (e) {
+  console.error(`[approval-gate] ${e.message}`);
+  process.exit(1);
+}
+console.log(approvalGate.enabled ? `approval gate: on, ${approvalGate.keyCount()} keys` : 'approval gate: off');
+// Locked mode and lockdown (lib/box-lock.js): only on a box with pinned
+// keys. MATRON_LOCKED=1 makes it take outside input only during a signed
+// unlock window; lockdown after repeated forged approvals applies either way.
+const BOX_LOCK_FILE = path.join(os.homedir(), '.matron-bridge-box-lock.json');
+const boxLock = approvalGate.enabled ? createBoxLock({
+  gate: approvalGate,
+  locked: APPROVAL_CONFIG.locked,
+  maxMinutes: APPROVAL_CONFIG.unlockMaxMinutes,
+  stateFile: BOX_LOCK_FILE,
+  boxName: () => journalPublisher.identity()?.name ?? null,
+  fileNotice: ({ title, body, labels }) => itemsClient.create({ kind: 'notice', title, body, labels, convo_id: JOURNAL_CONTROL_CONVO_ID }),
+  // Tell the journal at once: the apps show the lock from its copy.
+  onChange: () => {
+    try { journalPublisher.sendRoomOp({ op: 'box_status', locked: boxLock.report() }); } catch { /* the next hello carries it */ }
+    // An unlock lets the room messages that were held in their inboxes go.
+    try { drainHeldRoomDeliveries(); } catch (e) { try { console.warn(`[box-lock] draining held room messages failed: ${e?.message ?? e}`); } catch { /* logging must never throw */ } }
+  },
+  log: console,
+}) : null;
+if (boxLock && APPROVAL_CONFIG.locked) console.log(`locked mode: on (unlock windows of at most ${APPROVAL_CONFIG.unlockMaxMinutes} minutes)`);
+const approvalPaths = createApprovalPaths({ gate: approvalGate, identity: () => journalPublisher.identity(), lockdown: () => !!boxLock && boxLock.inLockdown(), peersAllowed: () => !boxLock || boxLock.allowsPeer(), log: console });
+// Work from outside this box (another session, the journal's own nudges) is
+// refused while the account is locked, or the box is in locked mode with no
+// unlock window open.
+function outsideWorkRefused() {
+  return accountLock.isLocked() || (!!boxLock && !boxLock.allowsPeer());
+}
+// A signed tap on a tracker item, checked against the pinned keys so the
+// agent is told whether it verified on this box. null with the gate off.
+const tapVerifier = createTapVerifier({ gate: approvalGate, getItem: (id) => itemsClient.getAsStored(id) });
+
 const trackerUrlBaseNow = () => trackerUrlBase({ httpBase: journalHttpBase, userName: journalIdentity.name() });
 function trackerLinksNow(text) {
   return renderTrackerLinks(text, trackerUrlBaseNow());
@@ -1267,8 +1399,9 @@ function handleJournalReconnect() {
   refreshCodexLimits();
   // A fresh epoch may follow a gap in which the Coordinator moved; the
   // replayed `coordinator` events cover a live bridge, this covers a cursor
-  // reset (snapshot_required) that skipped them.
-  coordinatorLookup.refresh({ force: true });
+  // reset (snapshot_required) that skipped them. The answer also catches a
+  // Coordinator session that spawned while the role was unknown.
+  void coordinatorLookup.refresh({ force: true }).then(reconcileLiveCoordinator);
   memoryLookup.refresh({ force: true });
   userDefaults.refresh({ force: true });
   refreshJournalIdentity({ force: true });
@@ -1359,6 +1492,7 @@ function publishBoxStatus(reason) {
     ...(vitals ? { vitals } : {}),
     ...(defaults ? { defaults } : {}),
     ...(restart ? { restart } : {}),
+    ...(boxLock ? { locked: boxLock.report() } : {}),
   });
   debug(`box_status (${reason}) ${sent ? 'sent' : 'not sent (journal not connected)'}`);
   return sent;
@@ -1395,6 +1529,10 @@ const journalPublisher = createJournalPublisher({
   // subagent reconcile AND (via journalOnReconnect) #536's release retry + deferred
   // boot reconcile. See handleJournalReconnect below.
   onReconnect: handleJournalReconnect,
+  onPanic: (panic, { hello }) => (hello ? accountLock.onHello(panic) : accountLock.onFrame(panic)),
+  // The box's lock, said on every hello: a hello without it reads as "not
+  // locked". A box without approval keys sends nothing.
+  helloExtras: () => (boxLock ? { locked: boxLock.report() } : null),
   // The user's settings: hello_ok's (or GET /settings when it carries none)
   // and every pushed change.
   onSettings: (settings, { hello }) => { if (hello) userSettings.onHello(settings); else userSettings.apply(settings); },
@@ -1931,6 +2069,9 @@ const journalRpcHandler = createRpcRequestHandler({
   // the target, park while occupied, apply through the /model, /switch,
   // /compact and turn-injection paths. Late-bound like joinMission.
   controlSession: (params, meta) => journalControlSession(params, meta),
+  approvals: approvalPaths,
+  boxLock,
+  accountLocked: () => accountLock.isLocked(),
   // Spawn onto a mission: join the new conversation before its opening turn
   // (lib/journal-rpc.js start). Late-bound — missionsHandlers is constructed
   // further down; this only runs once the socket is live.
@@ -2635,7 +2776,12 @@ function coordinatorRoleAtSpawn(roomId, resumeSessionId, options, persisted) {
     options.presetSessionId,
   ];
   const role = coordinatorLookup.roleFor(candidates);
-  coordinatorLookup.refresh();
+  // Role not known yet: ask the journal now, and once it answers, give this
+  // session the role if it is the Coordinator (reconcileLiveCoordinator).
+  // The session is in `sessions` by then: the answer comes back on a later
+  // tick than this synchronous spawn.
+  if (role.known) coordinatorLookup.refresh();
+  else void coordinatorLookup.refresh({ force: true }).then(reconcileLiveCoordinator);
   memoryLookup.refresh();
   userDefaults.refresh();
   refreshJournalIdentity();
@@ -2866,7 +3012,6 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     '--output-format', 'stream-json',
     ...permissionSpawnArgs(bypassMode),
     '--disallowed-tools', ...printCoord.disallowedTools,
-    '--append-system-prompt', printCoord.appendSystemPrompt,
     '--include-partial-messages',
     '--strict-mcp-config',
     '--mcp-config', mcpConfigPathFor(effectiveMcpExtras),
@@ -2921,12 +3066,18 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     workdir: cwd,
     sessionId: identity.sessionId,
     configureOptions: { warn: message => console.warn(message) },
-    launch: configuredEnv => spawn('claude', args, {
-      cwd,
-      env: configuredEnv,
-      stdio: ['pipe', 'pipe', 'pipe'],
-      // No console window per session on Windows (no-op elsewhere).
-      windowsHide: true,
+    launch: configuredEnv => launchWithClaudePromptFile({
+      prompt: printCoord.appendSystemPrompt,
+      onError: failedSpawnProcess,
+      args,
+      runDir: ensureHeaderRunDir,
+      launch: promptArgs => spawn('claude', promptArgs, {
+        cwd,
+        env: configuredEnv,
+        stdio: ['pipe', 'pipe', 'pipe'],
+        // No console window per session on Windows (no-op elsewhere).
+        windowsHide: true,
+      }),
     }),
   });
 
@@ -3602,6 +3753,8 @@ function handleCodexEvent(session, event) {
 }
 
 function flushPendingSessionQueue(session) {
+  // Held, not dropped, while the account is locked.
+  if (accountLock.isLocked()) return false;
   if (session._codexSteerPending || session._codexUncertainSteer) return false;
   if (!session.alive || !session.queuedMessages?.length) return false;
   const queue = session.queuedMessages;
@@ -3860,7 +4013,6 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     // The Coordinator runs without file-editing tools (spec §2c). iv mode has
     // no other disallowed tool, so an ordinary session gets no flag at all.
     ...(ivCoord.disallowedTools.length ? ['--disallowed-tools', ...ivCoord.disallowedTools] : []),
-    '--append-system-prompt', ivCoord.appendSystemPrompt,
     '--strict-mcp-config',
     '--mcp-config', mcpConfigPathFor(effectiveMcpExtras),
     '--settings', JSON.stringify(settings),
@@ -3892,12 +4044,18 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     workdir: cwd,
     sessionId,
     configureOptions: { warn: message => console.warn(message) },
-    launch: configuredEnv => createInteractiveSession({
-      roomId,
-      workdir: cwd,
-      sessionId,
-      claudeArgs,
-      env: configuredEnv,
+    launch: configuredEnv => launchWithClaudePromptFile({
+      prompt: ivCoord.appendSystemPrompt,
+      args: claudeArgs,
+      runDir: ensureHeaderRunDir,
+      exitEvent: 'exit',
+      launch: promptArgs => createInteractiveSession({
+        roomId,
+        workdir: cwd,
+        sessionId,
+        claudeArgs: promptArgs,
+        env: configuredEnv,
+      }),
     }),
   });
 
@@ -6501,6 +6659,13 @@ function sendToSession(session, contentBlocks, { skipJournalMirror = false, fore
   const finishInput = restartLatch?.beginInput();
   try {
     if (!session.alive || session._autoStopped) return false;
+    // The account lock: no turn starts, whatever asked for it (the user, a
+    // peer, a reminder, a routine, a carry-on, the bridge itself). Every turn
+    // goes through here, so this is the backstop behind the per-path refusals.
+    if (accountLock.isLocked()) {
+      noticeAccountLocked(journalConvoIdFor(session));
+      return false;
+    }
     // Backstop for the foreign-turn gate: a turn of the session's own that
     // starts while no turn is running ends any foreign turn a seam missed.
   // Mid-turn input leaves it armed — stricter, never looser. "No turn is
@@ -8167,6 +8332,14 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
   if (nativeSession?.alive && await runCodexControl(nativeSession, text, sendReply)) return;
   const parts = text.split(/\s+/);
   const cmd = parts[0].toLowerCase();
+
+  // A box with approval keys starts sessions only on the user's signed
+  // approval (the app's New Chat, or an approved spawn). A typed command
+  // carries none, and the journal cannot check one for it.
+  if (approvalGate.enabled && (cmd === '!start' || cmd === '!workdir')) {
+    await sendReply('🔒 This box starts sessions only with your signed approval. Start one from New Chat in the app.');
+    return;
+  }
 
   switch (cmd) {
     case '!start': {
@@ -10562,6 +10735,7 @@ const itemTurnRouter = createItemTurnRouter({
   // item arrives with transcript:null and only the bridge can fill it in.
   setTranscript: (id, commentId, body) => itemsClient.setTranscript(id, commentId, body),
   getItem: (id) => itemsClient.get(id),
+  verifyTap: tapVerifier ? (payload) => tapVerifier.forMarker(payload) : null,
   // A turn held for the journal's transcript may outlive its session.
   resolveSession: (convoId) => findSessionByClaudeSessionId(convoId),
   log: console,
@@ -10622,6 +10796,22 @@ function journalOnItem(session, item, ctx) {
 // injected turn (queued behind a running turn, never dropped). A Coordinator
 // that is not running only has its persisted model updated; its next resume
 // reads the role from the cache.
+// A Coordinator that spawned while the role was unknown (lib/coordinator.js
+// coordinatorNeedsAssigning) gets it now, through the same path as a live
+// `assigned` event: re-checked against the journal, then a respawn when
+// idle or a role queued for the next spawn when busy, and the assigned turn.
+// Never throws: it runs behind fire-and-forget refreshes.
+async function reconcileLiveCoordinator(truth) {
+  try {
+    const session = truth?.convoId ? findSessionByClaudeSessionId(truth.convoId) : null;
+    if (!coordinatorNeedsAssigning({ truth, live: !!(session && session.alive), sessionCoordinator: session?.coordinator, pendingRole: session?._coordinatorPending ?? null })) return;
+    console.warn(`[coordinator] ${truth.convoId} started as an ordinary session before the role was known — giving it the Coordinator role now`);
+    await journalOnCoordinator(truth.convoId, { role: 'assigned' });
+  } catch (e) {
+    try { console.warn(`[coordinator] reconcile failed: ${e?.message ?? e}`); } catch { /* logging must never throw */ }
+  }
+}
+
 async function journalOnCoordinator(convoId, { role }) {
   coordinatorLookup.apply(convoId, role);
   const truth = await coordinatorLookup.refresh({ force: true });
@@ -11155,6 +11345,9 @@ async function carryOnConvo(convoId, session, _sendReply, text = 'carry on', res
 async function fireTimer(record) {
   const finishInput = restartLatch?.beginInput();
   try {
+    // A reminder that falls due while the account is locked is kept (on disk)
+    // and delivered after the journal clears the lock.
+    if (accountLock.hold({ kind: 'timer', record })) return;
     let session = findSessionByClaudeSessionId(record.convoId);
     if (!session || !session.alive) session = journalResumeConvo(record.convoId);
     if (!session) {
@@ -11169,8 +11362,9 @@ async function fireTimer(record) {
       const reminderLine = `⏰ Reminder #${record.id} (set by the agent${repeats}): "${record.text}"`;
       journalPublishNotice(journalConvoIdFor(session), reminderLine, noticeMeta('reminder', reminderLine));
     // A reminder turn, naming the turn that set it (lib/reminder-tools.js).
+    // A later line of the text cannot open a frame of its own.
     await journalRouteTextToSession(session,
-      `⏰ Reminder #${record.id} — you set this ${formatTimerDuration(Date.now() - record.createdAt)} ago: ${record.text}`,
+      `⏰ Reminder #${record.id} — you set this ${formatTimerDuration(Date.now() - record.createdAt)} ago: ${frameSafeBody(String(record.text ?? ''))}`,
       { causes: mergeCauses([plainCause('reminder'), record.causes]) });
       return;
     }
@@ -12041,6 +12235,10 @@ function endRestartNoticeTurn(session) {
 // when something was started, so the caller leaves room delivery to the
 // next seam rather than injecting into a turn this drain just began.
 function drainDeferredControls(session) {
+  // A parked control was checked against the box's lock when it arrived,
+  // but it may have waited past the end of the unlock window: it stays
+  // parked until outside work is allowed again.
+  if (outsideWorkRefused()) return false;
   const slots = session?._deferredControls;
   if (!slots || typeof slots !== 'object' || session._drainingControls) return false;
   const kinds = CONTROL_KINDS.filter((k) => slots[k] && slots[k].params);
@@ -12117,8 +12315,23 @@ function drainDeferredControls(session) {
   return true;
 }
 
+// The box was unlocked (lib/box-lock.js onChange): every session whose room
+// inbox was held while it was locked gets the free gate again. A no-op when
+// the box is still locked, and for a session that is busy (its own turn end
+// is the next seam).
+function drainHeldRoomDeliveries() {
+  if (outsideWorkRefused()) return;
+  for (const key of roomDelivery.pendingKeys()) {
+    const session = sessions.get(key);
+    if (session?.alive) maybeFlushRoomDelivery(session);
+  }
+}
+
 function maybeFlushRoomDelivery(session) {
   if (sessionOccupiedForRoomDelivery(session)) return;
+  // Held where they are while the account is locked: a flush empties the
+  // inbox before it injects, and the injection would be refused.
+  if (accountLock.isLocked()) return;
   // The user's answer to an "Allow once" ask goes before the room inbox: it
   // continues a conversation the other person is waiting on.
   if (foreignSessions.drainParked(session)) return;
@@ -12141,8 +12354,9 @@ function flushRoomInbox(session) {
   // and no notice to publish (the ordinary idle path never queued anything).
   const queued = roomDelivery.pendingCount(session.roomId);
   const flushed = roomDelivery.flush(session, session.roomId);
-  // null: another person's turn is waiting for a running turn to end; it
-  // stays queued for the next seam, with nothing to report yet.
+  // null: another person's turn is waiting for a running turn to end, or
+  // the box is locked; the messages stay queued for the next seam (or the
+  // next unlock), with nothing to report yet.
   if (!queued || flushed === null) return;
   // A flush delivers one turn's worth: own messages and each other person's
   // room go in separate turns, so some may still be waiting (they get their
@@ -12162,6 +12376,14 @@ function flushRoomInbox(session) {
 // Live room frames held while the bridge joins a room for the agent.
 const roomJoinHold = createJoinHold();
 const roomDelivery = createRoomDelivery({
+  // Queued messages stay queued while the box is locked with no unlock
+  // window open (the same rule a message meets when it arrives) and while
+  // the account is locked: sendToSession refuses then, and a flush that
+  // emptied the inbox into that refusal would lose the batch.
+  isHeld: () => outsideWorkRefused(),
+  // A message that has to go behind others already waiting is only queued;
+  // the one gated drain decides when the inbox goes, and reports it.
+  requestDrain: (session) => maybeFlushRoomDelivery(session),
   isBusy: (session, { foreign = false } = {}) => (foreign
     ? sessionOccupiedForForeignTurn(session)
     : sessionOccupiedForRoomDelivery(session)),
@@ -12638,6 +12860,12 @@ function noticeCodexDeclinedPersonRoom(session, frame) {
 }
 
 function journalInjectInviteRequest(frame) {
+  // A same-bridge request does not pass the invites manager's frame
+  // handler, where the account lock refuses the others.
+  if (accountLock.isLocked() && frame.local) {
+    agentInvites.onInviteFrame({ event: 'answer', room_id: frame.room_id, accept: false, reason: 'account_locked', from_device_id: frame.from_device_id });
+    return;
+  }
   // request  -> a peer wants THIS bridge's session to join frame.room_id
   // join_request -> a peer asks to join a room THIS bridge owns
   const isJoin = frame.event === 'join_request';
@@ -12961,7 +13189,10 @@ agentInvites = createAgentInvites({
   sendRoomOp: journalPublisher.sendRoomOp,
   rooms: agentRooms,
   injectRequestTurn: journalInjectInviteRequest,
-  notifyRoom: journalNotifyRoomEvent,
+  approvals: approvalPaths,
+  accountLocked: () => accountLock.isLocked(),
+  // An invite's late answer carries the peer's words into a turn.
+  notifyRoom: (...args) => { if (!outsideWorkRefused()) journalNotifyRoomEvent(...args); },
   onMemberLeft: (roomId, fromDeviceId) => { forgetLeftMemberMute(roomId, fromDeviceId).catch(() => {}); },
   log: console,
 });
@@ -12992,6 +13223,19 @@ const journalInputConsumer = createJournalInputConsumer({
   // A `memory` marker on any of this bridge's conversations: the user's
   // memories changed, so the cached index is re-read (spec 2026-09-27).
   onMemoryEvent: () => { memoryLookup.refresh({ force: true }); },
+  // What became of a memory save or delete this conversation proposed
+  // (the journal's `memory_proposal` event): a turn for the live session,
+  // delivered like a spawn outcome (injected when idle, coalesced when
+  // busy). It names no cause, so nothing the agent does in that turn counts
+  // as the user's ask. A session that is gone hears nothing: the item the
+  // user answered is the record.
+  onMemoryProposal: (convoId, payload) => {
+    const text = formatProposalOutcome(payload);
+    if (!text || outsideWorkRefused()) return;
+    const session = findSessionByClaudeSessionId(convoId);
+    if (!session || !session.alive) return;
+    roomDelivery.deliver(session, session.roomId, { roomId: 'memory', roomTitle: 'memory', from: 'bridge', body: text, at: Date.now(), cause: null });
+  },
   onCoordinatorEvent: (convoId, ev) => {
     journalOnCoordinator(convoId, ev).catch((e) => {
       try { console.warn(`[coordinator] handling ${ev?.role} for ${convoId} failed: ${e?.message ?? e}`); } catch { /* logging must never throw */ }
@@ -13081,6 +13325,18 @@ const journalInputConsumer = createJournalInputConsumer({
   routeRoomFrame: journalOnRoomFrame,
   selfAgentName: () => journalPublisher.identity()?.name || null,
   ownerName: () => journalIdentity.name(),
+  // Locked mode: outside an unlock window the user's input and other
+  // sessions' messages are refused here, before any session is found or
+  // woken. The user is told in the conversation; a peer is told in the room.
+  // The account lock comes first and has no exceptions; it says its line
+  // once per conversation.
+  inputLock: { verdict: (kind, keyId) => (accountLock.isLocked() ? accountLock.verdict() : (boxLock ? boxLock.verdict(kind, keyId) : { ok: true })) },
+  onInputRefused: (convoId, line) => {
+    if (accountLock.isLocked()) noticeAccountLocked(convoId);
+    else journalPublishNotice(convoId, `🔒 ${line}`);
+  },
+  onRoomRefused: (room, frame, line) => { journalPublisher.publishText(frame.convo_id, { body: line, from: 'agent' }); },
+  verifySignedTap: tapVerifier ? (payload) => tapVerifier.forDelivery(payload) : null,
   // A user message arrived before the owner's name was known: ask /me now;
   // the router replays what it held once the name is in.
   onOwnerUnknown: () => refreshJournalIdentity({ force: true }),
@@ -13602,6 +13858,8 @@ function transferTargetsFor(roomId, fromConvoId) {
 }
 transferReceiver = createTransferReceiver({
   client: transferClient,
+  approvals: approvalPaths,
+  accountLocked: () => accountLock.isLocked(),
   stateFile: TRANSFER_INBOX_FILE,
   log: console,
   dirFor: (target) => path.join(sessionDownloadDir(target) || matronFilesDir(target?.workdir), 'inbox'),
@@ -13706,6 +13964,9 @@ const itemsHandlers = createItemsHandlers({
   uploadLocalFile: (session, reqPath, opts) => resolveAndUploadLocalFile({ session, reqPath, publisher: journalPublisher, ...opts }),
   checkLocalFile: (session, reqPath) => checkLocalUpload({ session, reqPath }),
   saveAttachments: saveItemAttachments,
+  // MATRON_STEP_UP_ALL=1: every question this box files needs a signed tap.
+  stepUpAll: APPROVAL_CONFIG.stepUpAll,
+  verifyTap: tapVerifier ? (thread, comment) => tapVerifier.forThread(thread, comment) : null,
 });
 
 const missionsHandlers = createMissionsHandlers({
@@ -13786,6 +14047,8 @@ const consentHandlers = createConsentHandlers({
 // journal re-reads the role on every ask) or its session cannot be brought
 // back.
 function journalHandleConsentFrame(frame) {
+  // A nudge starts a Coordinator turn: not while outside work is refused.
+  if (outsideWorkRefused()) return;
   if (!frame || frame.event !== 'pending') return;
   const text = formatConsentNudge(frame);
   if (!text) return;
@@ -13849,6 +14112,8 @@ const timelineHandlers = createTimelineHandlers({
 // more. Delivered to the Coordinator exactly like a consent nudge — resumed
 // if idle-reaped, the same text left as a notice in its chat.
 function journalHandleUnseenFrame(frame) {
+  // A nudge starts a Coordinator turn: not while outside work is refused.
+  if (outsideWorkRefused()) return;
   if (!frame || frame.event !== 'pending') return;
   const text = formatUnseenNudge(frame, { trackerBase: trackerUrlBaseNow() });
   if (!text) return;
@@ -13918,9 +14183,17 @@ sessionControlHandlers = createSessionControlHandlers({
   sessions,
   publisher: journalPublisher,
   journalConvoIdFor,
+  // Same test as the consent tools: the spawn-time flag, or the journal's
+  // current role holder.
+  isCoordinator: (session, convoId) => session?.coordinator === true || (!!convoId && coordinatorLookup.snapshot().convoId === convoId),
   notify: (convoId, text) => journalPublishNotice(convoId, text, noticeMeta('control', text)),
   compactSelf: (d) => selfCompactHandler(d),
   log: console,
+});
+
+// usage_history MCP tool: a plain read of the journal's weekly usage history.
+const usageHistoryHandler = createUsageHistoryHandler({
+  fetchUsageHistory: (weeks) => journalPublisher.fetchUsageHistory(weeks),
 });
 
 agentSpawnHandlers = createAgentSpawnHandlers({
@@ -14729,6 +15002,12 @@ const apiServer = createServer(async (req, res) => {
       if (url.pathname === '/agent-chat-read') {
         await respondAgentChatRoute(res, data, agentChatHandlers.chatRead,
           (status, b) => debug(`agent-chat-read ${status} ${data?.room_id} ${b.error || `${(b.messages || []).length} messages`}`));
+        return;
+      }
+
+      if (url.pathname === '/usage-history') {
+        await respondAgentChatRoute(res, data, usageHistoryHandler,
+          (status, b) => debug(`usage-history ${status} ${b.error || `${(b.accounts || []).length} accounts`}`));
         return;
       }
 

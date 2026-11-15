@@ -13,6 +13,7 @@ import {
   isModelExplicit,
   planCoordinatorTransition,
   decideCoordinatorEvent,
+  coordinatorNeedsAssigning,
   withCoordinatorModel,
   recreateSpawnModel,
   COORDINATOR_MODEL,
@@ -336,12 +337,12 @@ describe('MATRON.md block plumbing', () => {
 describe('renderMemoryBlock', () => {
   const m = (name, description = `Rule ${name}.`, type = 'feedback', scope) => ({ id: `me_${name}`, name, type, description, ...(scope ? { scope } : {}) });
   it('lists name (type, scope): description per memory, sorted by name, and says which scopes are listed', () => {
-    const out = renderMemoryBlock({ known: true, memories: [m('b-two'), m('a-one', 'Never use elm.', 'user')] });
+    const out = renderMemoryBlock({ known: true, memories: [m('b-two'), m('a-one', 'Never use box-a.', 'user')] });
     expect(out.startsWith('## Your memories\n\n')).toBe(true);
     expect(out).toContain('memory_save');
     expect(out).toContain('Listed here: the global memories only (this session has no repo).\n');
     expect(out).not.toContain('left out');
-    expect(out.endsWith('\n- a-one (user, global): Never use elm.\n- b-two (feedback, global): Rule b-two.')).toBe(true);
+    expect(out.endsWith('\n- a-one (user, global): Never use box-a.\n- b-two (feedback, global): Rule b-two.')).toBe(true);
   });
   it('an ordinary session gets global and its repo, and is told what was left out and how to see it', () => {
     const memories = [m('c-rule', 'Compact.', 'feedback', 'coordinator'), m('app-rule', 'Train.', 'project', 'repo:acme-app'), m('infra-rule', 'Infra.', 'project', 'repo:acme-infra'), m('g-rule'), m('odd', 'Odd.', 'feedback', 'team:ops')];
@@ -639,5 +640,23 @@ describe('recreateSpawnModel (final review #1)', () => {
   it('Codex keeps its explicit null and ignores any pending model', () => {
     expect(recreateSpawnModel({ agent: 'codex', currentModel: null, pendingModel: 'opus[1m]' })).toBeNull();
     expect(recreateSpawnModel({ agent: 'codex', currentModel: 'gpt-5' })).toBe('gpt-5');
+  });
+});
+
+describe('coordinatorNeedsAssigning', () => {
+  const truth = { fetched: true, known: true, convoId: 'a' };
+  it('a live session the journal names, spawned without the role, gets it', () => {
+    expect(coordinatorNeedsAssigning({ truth, live: true, sessionCoordinator: false })).toBe(true);
+  });
+  it('nothing when the answer was not fetched, the role is unknown, or nobody holds it', () => {
+    expect(coordinatorNeedsAssigning({ truth: { ...truth, fetched: false }, live: true, sessionCoordinator: false })).toBe(false);
+    expect(coordinatorNeedsAssigning({ truth: { fetched: false, known: false, convoId: null }, live: true, sessionCoordinator: false })).toBe(false);
+    expect(coordinatorNeedsAssigning({ truth: { ...truth, convoId: null }, live: true, sessionCoordinator: false })).toBe(false);
+    expect(coordinatorNeedsAssigning({ truth: null, live: true, sessionCoordinator: false })).toBe(false);
+  });
+  it('nothing for a session that is not running, already has the role, or has a role change queued', () => {
+    expect(coordinatorNeedsAssigning({ truth, live: false, sessionCoordinator: false })).toBe(false);
+    expect(coordinatorNeedsAssigning({ truth, live: true, sessionCoordinator: true })).toBe(false);
+    expect(coordinatorNeedsAssigning({ truth, live: true, sessionCoordinator: false, pendingRole: 'assigned' })).toBe(false);
   });
 });

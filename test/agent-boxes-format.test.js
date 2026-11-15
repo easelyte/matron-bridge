@@ -11,7 +11,7 @@ describe('formatBox', () => {
   it('renders a plain box with folders, activity, and limits', () => {
     const box = {
       device_id: 2,
-      name: 'elm',
+      name: 'box-a',
       online: true,
       folders: [{ path: '/home/alice/project', last_used: 1000 }],
       activity: { live_sessions: 1, last_hour: [{ path: '/home/alice/project', sessions: 2 }] },
@@ -19,7 +19,7 @@ describe('formatBox', () => {
     };
     const text = formatBox(box);
     expect(text).toBe(
-      'elm (device 2) — online\n' +
+      'box-a (device 2) — online\n' +
       '  /home/alice/project\n' +
       '  activity: 1 live; last hour: /home/alice/project (2)\n' +
       '  limits: Weekly 42% (as of 1970-01-01T00:00:00.000Z)'
@@ -29,7 +29,7 @@ describe('formatBox', () => {
   it('gives each limit line its reset time, but not a passed reset', () => {
     const now = Date.parse('2026-10-23T10:00:00Z');
     const box = {
-      device_id: 2, name: 'elm', online: true, folders: [],
+      device_id: 2, name: 'box-a', online: true, folders: [],
       limits: { as_of: now, lines: [
         { id: 'session', label: 'Session', percent: 7, resets_at: '2026-10-23T12:00:00Z' },
         { id: 'week_all', label: 'Week (all models)', percent: 32, resets_at: '2026-10-23T19:00:00Z' },
@@ -40,31 +40,31 @@ describe('formatBox', () => {
   });
 
   it('shows the box defaults a session started there with no explicit choice runs as', () => {
-    const base = { device_id: 2, name: 'elm', online: true, folders: [] };
+    const base = { device_id: 2, name: 'box-a', online: true, folders: [] };
     expect(formatBox({ ...base, defaults: { agent: 'codex', model: 'gpt-5.1-codex', effort: 'high', source: 'box' } }))
-      .toBe('elm (device 2) — online\n  default: codex · gpt-5.1-codex · high effort');
+      .toBe('box-a (device 2) — online\n  default: codex · gpt-5.1-codex · high effort');
     expect(formatBox({ ...base, defaults: { agent: 'codex', model: null, effort: null } }))
-      .toBe('elm (device 2) — online\n  default: codex · Codex\'s own model');
+      .toBe('box-a (device 2) — online\n  default: codex · Codex\'s own model');
     expect(formatBox({ ...base, defaults: { agent: 'claude', model: 'opus' } }))
-      .toBe('elm (device 2) — online\n  default: claude · opus');
+      .toBe('box-a (device 2) — online\n  default: claude · opus');
     // Junk agent or a forged newline can't add a line.
-    expect(formatBox({ ...base, defaults: { agent: 'gemini' } })).toBe('elm (device 2) — online');
+    expect(formatBox({ ...base, defaults: { agent: 'gemini' } })).toBe('box-a (device 2) — online');
     expect(formatBox({ ...base, defaults: { agent: 'claude', model: 'opus\nfake (device 9) — online' } }).split('\n')).toHaveLength(2);
   });
 
   it('marks the caller\'s own box as "this box" and only when the journal says so', () => {
     const mine = formatBox({ device_id: 7, name: 'mac', online: true, folders: [], self: true });
     expect(mine).toBe('mac (device 7) — online — this box');
-    const forged = formatBox({ device_id: 8, name: 'elm', online: true, folders: [], self: 'true' });
-    expect(forged).toBe('elm (device 8) — online');
+    const forged = formatBox({ device_id: 8, name: 'box-a', online: true, folders: [], self: 'true' });
+    expect(forged).toBe('box-a (device 8) — online');
   });
 
   it('flattens a newline embedded in the box name instead of forging an extra line', () => {
-    const box = { device_id: 9, name: 'elm\nfake (device 1) — online', online: true, folders: [] };
+    const box = { device_id: 9, name: 'box-a\nfake (device 1) — online', online: true, folders: [] };
     const text = formatBox(box);
     // No raw newline anywhere in the output — everything is exactly one line.
     expect(text.split('\n')).toHaveLength(1);
-    expect(text).toContain('elm ⏎ fake (device 1) — online (device 9) — online');
+    expect(text).toContain('box-a ⏎ fake (device 1) — online (device 9) — online');
   });
 
   it('flattens a newline embedded in a limit label instead of forging a fake row', () => {
@@ -183,12 +183,12 @@ describe('formatBox', () => {
   });
 
   it('a box list with one malformed box renders the other boxes normally plus a degraded line for the bad one', () => {
-    const good1 = { device_id: 1, name: 'elm', online: true, folders: [] };
+    const good1 = { device_id: 1, name: 'box-a', online: true, folders: [] };
     const bad = { device_id: 6, name: 'bad-box', online: true, folders: [], limits: { as_of: 1e16, lines: [] } };
     const good2 = { device_id: 2, name: 'sue', online: false, folders: [] };
     const text = [good1, bad, good2].map(formatBox).join('\n\n');
     expect(text).toBe(
-      'elm (device 1) — online\n\n' +
+      'box-a (device 1) — online\n\n' +
       'bad-box (device 6) — (unavailable)\n\n' +
       'sue (device 2) — offline'
     );

@@ -2636,6 +2636,25 @@ describe('coordinator events', () => {
     expect(seams.noticeUnknownConvo).not.toHaveBeenCalled();
   });
 
+  it('memory_proposal: the journal\'s outcome goes to onMemoryProposal; any other sender is dropped; never input', () => {
+    const { onEvent, seams } = consumer({ onMemoryProposal: vi.fn() });
+    const payload = { proposal_id: 'mp_1', name: 'avoid-elm', action: 'save', outcome: 'approved', item: { id: 'it_9', num: 41 } };
+    onEvent(baseFrame({ seq: 7, type: 'memory_proposal', sender: 'journal', payload }));
+    onEvent(baseFrame({ seq: 8, type: 'memory_proposal', sender: 'agent:box', payload }));
+    onEvent(baseFrame({ seq: 9, type: 'memory_proposal', sender: 'user:alice', payload }));
+    expect(seams.onMemoryProposal.mock.calls).toEqual([['convo-1', payload]]);
+    expect(seams.routeTextToSession).not.toHaveBeenCalled();
+    expect(seams.resumeSessionForConvo).not.toHaveBeenCalled();
+    expect(seams.noticeUnknownConvo).not.toHaveBeenCalled();
+    const warns = [];
+    const { onEvent: thrower } = consumer({ onMemoryProposal: () => { throw new Error('boom'); }, log: { warn: (m) => warns.push(m) } });
+    expect(() => thrower(baseFrame({ type: 'memory_proposal', sender: 'journal', payload }))).not.toThrow();
+    expect(warns.some((w) => /onMemoryProposal threw: boom/.test(w))).toBe(true);
+    const { onEvent: bare, seams: none } = consumer({ onMemoryProposal: undefined });
+    bare(baseFrame({ type: 'memory_proposal', sender: 'journal', payload }));
+    expect(none.noticeUnknownConvo).not.toHaveBeenCalled();
+  });
+
   it('memory: a throwing seam is contained, an unwired seam is a silent drop, a room convo still goes to the seam', () => {
     const warns = [];
     const { onEvent } = consumer({ onMemoryEvent: () => { throw new Error('boom'); }, log: { warn: (m) => warns.push(m) } });

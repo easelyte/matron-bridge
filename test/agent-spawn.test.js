@@ -46,7 +46,7 @@ describe('createAgentSpawnHandlers', () => {
       expect(sent).toHaveLength(1);
       expect(sent[0].op).toBe('spawn_targets');
       expect(typeof sent[0].request_id).toBe('string');
-      const boxesPayload = [{ device_id: 2, name: 'elm', online: true, folders: [], activity: { live_sessions: 0, last_hour: [] } }];
+      const boxesPayload = [{ device_id: 2, name: 'box-a', online: true, folders: [], activity: { live_sessions: 0, last_hour: [] } }];
       handlers.onSpawnFrame({ kind: 'spawn', event: 'targets', request_id: sent[0].request_id, boxes: boxesPayload });
       const res = await p;
       expect(res).toEqual({ status: 200, body: { boxes: boxesPayload } });
@@ -418,8 +418,8 @@ describe('createAgentSpawnHandlers', () => {
     // Coordinator answered the card — the parent must not hear "the user".
     it('decided_by coordinator — declined and started name the Coordinator and its reason, one-lined', async () => {
       const ctx = await armStarted();
-      ctx.handlers.onSpawnFrame({ kind: 'spawn', event: 'outcome', request_id: 'row-1', outcome: 'declined', decided_by: 'coordinator', reason: 'elm is a last-resort box\nuse box-2' });
-      expect(ctx.notices[0].text).toMatch(/declined on the user's behalf \(decided by the user's Coordinator: elm is a last-resort box ⏎ use box-2\)\./);
+      ctx.handlers.onSpawnFrame({ kind: 'spawn', event: 'outcome', request_id: 'row-1', outcome: 'declined', decided_by: 'coordinator', reason: 'box-a is a last-resort box\nuse box-2' });
+      expect(ctx.notices[0].text).toMatch(/declined on the user's behalf \(decided by the user's Coordinator: box-a is a last-resort box ⏎ use box-2\)\./);
       expect(ctx.notices[0].text).not.toMatch(/the user declined/);
       const ctx2 = await armStarted();
       ctx2.handlers.onSpawnFrame({ kind: 'spawn', event: 'outcome', request_id: 'row-1', outcome: 'started', child_convo_id: 'child-1', decided_by: 'coordinator', reason: 'follows the box rules' });

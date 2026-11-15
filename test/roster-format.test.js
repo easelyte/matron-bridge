@@ -21,10 +21,10 @@ describe('rosterLine', () => {
     }
   });
   it('shows the user\'s pin label before the title of a pinned conversation', () => {
-    expect(rosterLine({ id: 'c5', title: '[aa] Yes, I accept', session_state: 'waiting', agent_device_id: 7, pin: { label: 'Help desk', emoji: '📮' } }, 1, NOW))
-      .toBe('- c5 — 📌 📮 Help desk · "[aa] Yes, I accept" [waiting] (agent 7)');
-    expect(rosterLine({ id: 'c6', title: 'X', session_state: 'waiting', agent_device_id: 7, pin: { label: 'Release\ndesk', emoji: '' } }, 1, NOW))
-      .toBe('- c6 — 📌 Release desk · "X" [waiting] (agent 7)');
+    expect(rosterLine({ id: 'c5', title: '[aa] Yes, I accept', session_state: 'waiting', agent_device_id: 7, pin: { label: 'Docs chat', emoji: '📚' } }, 1, NOW))
+      .toBe('- c5 — 📌 📚 Docs chat · "[aa] Yes, I accept" [waiting] (agent 7)');
+    expect(rosterLine({ id: 'c6', title: 'X', session_state: 'waiting', agent_device_id: 7, pin: { label: 'Release\nnotes', emoji: '' } }, 1, NOW))
+      .toBe('- c6 — 📌 Release notes · "X" [waiting] (agent 7)');
     expect(rosterLine({ id: 'c7', title: 'X', session_state: 'waiting', agent_device_id: 7, pin: { label: '' } }, 1, NOW))
       .toBe('- c7 — "X" [waiting] (agent 7)');
   });
