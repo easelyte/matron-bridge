@@ -13234,7 +13234,11 @@ const journalInputConsumer = createJournalInputConsumer({
     if (!text || outsideWorkRefused()) return;
     const session = findSessionByClaudeSessionId(convoId);
     if (!session || !session.alive) return;
-    roomDelivery.deliver(session, session.roomId, { roomId: 'memory', roomTitle: 'memory', from: 'bridge', body: text, at: Date.now(), cause: null });
+    // Fork: count the delivery as in-flight input so a planned restart waits for it.
+    const finishInput = restartLatch?.beginInput();
+    try {
+      roomDelivery.deliver(session, session.roomId, { roomId: 'memory', roomTitle: 'memory', from: 'bridge', body: text, at: Date.now(), cause: null });
+    } finally { finishInput?.(); }
   },
   onCoordinatorEvent: (convoId, ev) => {
     journalOnCoordinator(convoId, ev).catch((e) => {

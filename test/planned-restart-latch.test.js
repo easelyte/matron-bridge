@@ -375,7 +375,7 @@ it.each(['onInput', 'beforeRequest', 'retryCleanup', 'onReady'])('recovers faile
 it('holds PTY buffered input until it is accepted and requires fresh quiet polls', () => {
   const f = fixture();
   const session = { alive: true, roomId: 'alice', journalConvoId: 'alice', iv: {}, _awaitingInputReady: true };
-  const send = indexFunction('sendToSession', { restartLatch: f.latch, notePreReapTurnStart() {}, AGENT_CODEX: 'codex' });
+  const send = indexFunction('sendToSession', { restartLatch: f.latch, accountLock: { isLocked: () => false }, notePreReapTurnStart() {}, AGENT_CODEX: 'codex' });
   expect(send(session, [{ type: 'text', text: 'hello' }])).toBe(true);
   expect(session.busy).toBeUndefined();
   const observe = prev => evaluateQuiet({ sessions: [session], prev,
@@ -444,6 +444,8 @@ it('guards every ingress and rejects unknown dispatcher callers', () => {
     // Mid-turn steering (lib/claude-steer.js): called only from journalRouteTextToSession
     // and itemTurnRouter, both latched; the write itself goes through sendToSession's beginInput.
     'trySteerEntry',
+    // Memory-proposal outcome turn (onMemoryProposal): holds the latch around roomDelivery.deliver.
+    'journalInputConsumer',
   ]);
   const edges = new Map(), guarded = new Set(), unknown = [];
   function walk(node, owner) {
