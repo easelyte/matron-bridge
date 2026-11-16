@@ -100,7 +100,7 @@ import { computeEditDiff } from './lib/edit-diff.js';
 import { resolveShareTarget } from './lib/share-target.js';
 import { createInteractiveSession } from './lib/interactive-session.js';
 import { projectDirFor, transcriptPathFor, findTranscriptBySessionId } from './lib/transcript-dir.js';
-import { extractUrls, isIdleReadyScreen, extractPreamble, preambleMatchesText, compactScreenText, AUTO_ENTER_COMPACT_RE, loginSuccessNearAutoEnterCue, stripAnsi, findInputCue, unwrapScreenUrls, newUrlsAgainst, dropCutUrls } from './lib/prompt-detector.js';
+import { extractUrls, isIdleReadyScreen, extractPreamble, preambleMatchesText, compactScreenText, AUTO_ENTER_COMPACT_RE, loginSuccessNearAutoEnterCue, stripAnsi, findInputCue, unwrapScreenUrls, newUrlsAgainst, dropCutUrls, isCutOf } from './lib/prompt-detector.js';
 import { DESIGN_LOGIN_COMMAND, DESIGN_LOGIN_CODE_REFUSED_MESSAGE, classifyDesignLoginOutput, showsSignInScreen, designLoginCodeRefused, designLoginOutcomeMessage, ownsDesignLoginFinish, signInDialogHoldsInput, designLoginEndsPhantomTurn, designNeedsInteractive, DESIGN_SWITCH_ANNOUNCEMENT, INTERACTIVE_READY_MESSAGE } from './lib/design-login-flow.js';
 import { formatTuiCueMessage } from './lib/tui-cue-message.js';
 import {
@@ -657,10 +657,7 @@ const SHOW_FILE_GLOBAL_BYTE_BUDGET = SHOW_FILE_MAX_IN_FLIGHT * SHOW_FILE_MAX_BYT
 // reserves before an upload and releases in its finally). An object so the
 // extracted handler can mutate it by reference.
 const showFileBudget = { inFlight: 0, reservedBytes: 0 };
-// Content-identity dedup ledger for show_file: a repeat publish of the
-// same file within the TTL window (typically an LLM agent re-calling show_file
-// after an error) returns the prior media_id instead of re-publishing a duplicate
-// bubble. Process-lifetime singleton; bounded by TTL + LRU cap; fail-open.
+// Retry dedup for show_file (lib/media-dedup-ledger.js). In-memory, TTL + size bounded.
 const showFileDedupLedger = createMediaDedupLedger();
 const SHOW_FILE_UPLOAD_TIMEOUT_MS = parseShowFileUploadTimeoutMs(
   process.env.SHOW_FILE_UPLOAD_TIMEOUT_MS,
@@ -1600,30 +1597,7 @@ function expandHome(p) {
   return p;
 }
 
-// Pin the viewer's authorization root ONCE, at session creation, BEFORE the
-// agent process exists — the same trusted-boundary rule pinAllowedRootsSync
-// documents and that showFilePinnedRoots already follows. Resolving
-// session.workdir later, at tool-event time, would pin whatever the agent had
-// already moved into its place, so the token would carry a VALID identity for
-// the WRONG directory. Returns the serializable identity triples the signed
-// token carries, or null (no viewer links) if the workdir cannot be pinned.
-function pinViewerRootIdentities(cwd) {
-  if (!cwd) return null;
-  try {
-    return pinAllowedRootsSync([cwd]).roots
-      .map(({ realPath, dev, ino }) => ({ realPath, dev, ino }));
-  } catch (error) {
-    console.warn(`[file-link] viewer links disabled for ${cwd}: failed to pin workdir (${error.message})`);
-    return null;
-  }
-}
-
-// `rootIdentities` is the session's pinned viewer root (above). Deliberately a
-// PARAMETER and not a fresh resolve: this runs synchronously on the bridge's
-// event loop for every Edit/Write/MultiEdit event, so it must do no filesystem
-// I/O at all — a workdir on a stalled NFS/FUSE mount would otherwise wedge
-// every session, HTTP route and WebSocket in the process.
-function generateFileLink(filePath, workdir, rootIdentities) {
+function generateFileLink(filePath, workdir, pinnedRoots = null) {
   if (!HMAC_SECRET || !VIEWER_BASE_URL) return null;
   // Normalize BEFORE gating and signing: a relative session.workdir (or
   // target) would otherwise resolve against the wrong process cwd in the
@@ -1638,23 +1612,24 @@ function generateFileLink(filePath, workdir, rootIdentities) {
     console.log(`file-link denied (${gate.reason}): ${absTarget}`);
     return null;
   }
-  // Carry the workdir's filesystem IDENTITY (realPath + dev/ino) in the signed
-  // token, not just its name. A pathname is not an authorization boundary: a
-  // workdir renamed and replaced by a symlink after the link is minted would
-  // otherwise relocate the boundary with the attacker, and the viewer's
-  // serve-time re-resolve of that name cannot tell the difference. The guard
-  // re-stats the pinned identity on every serve and rejects a dev/ino change.
-  // A scoped link we cannot pin is a link we do not mint.
-  let roots = null;
+  const exp = Math.floor((Date.now() + LINK_EXPIRY_MS) / 1000);
+  // Sign the workdir's pinned identity, not just its pathname, so a workdir
+  // renamed and replaced after the link is minted is rejected at serve time.
+  // Prefer the root pinned at session creation; otherwise pin now (a failure to
+  // resolve means no link, the caller renders plain text).
+  let roots;
   if (absWorkdir) {
-    roots = Array.isArray(rootIdentities) && rootIdentities.length ? rootIdentities : null;
-    if (!roots) {
-      console.log(`file-link denied (bad-workdir): ${absTarget}`);
+    try {
+      const pinned = pinnedRoots?.roots?.[0] || pinAllowedRootsSync([absWorkdir]).roots[0];
+      roots = [{ realPath: pinned.realPath, dev: pinned.dev, ino: pinned.ino }];
+    } catch (err) {
+      console.log(`file-link denied (${err.reason || 'bad-workdir'}): ${absTarget}`);
       return null;
     }
   }
-  const exp = Math.floor((Date.now() + LINK_EXPIRY_MS) / 1000);
-  const payload = Buffer.from(JSON.stringify({ path: absTarget, exp, workdir: absWorkdir, roots })).toString('base64url');
+  const payload = Buffer.from(JSON.stringify(roots
+    ? { path: absTarget, exp, workdir: absWorkdir, roots }
+    : { path: absTarget, exp, workdir: absWorkdir })).toString('base64url');
   const sig = createHmac('sha256', HMAC_SECRET).update(payload).digest('base64url');
   return `${VIEWER_BASE_URL}/view?token=${payload}.${sig}`;
 }
@@ -2319,7 +2294,7 @@ function buildEditDiffPayload(session, toolName, input, label) {
   return {
     file_path: absPath,
     display_path: input.file_path,
-    viewer_url: generateFileLink(absPath, session.workdir, session.viewerRootIdentities),
+    viewer_url: generateFileLink(absPath, session.workdir, session.showFilePinnedRoots),
     tool: toolName,
     label: label || null,
     diff: result.diff,
@@ -2940,10 +2915,6 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   if (rootDowngraded) console.warn(`[permissions] ${roomId}: ${ROOT_BYPASS_WARNING}`);
   const effectiveMcpExtras = effectiveExtras(mcpExtras, DEFAULT_MCP_EXTRAS);
   const shareEnabled = effectiveMcpExtras.includes('share');
-  // Pinned here, at the trusted boundary, for the same reason as
-  // showFilePinnedRoots below — but scoped to the workdir alone, since a
-  // viewer link's scope is the session's workdir, not the artifact roots.
-  const viewerRootIdentities = pinViewerRootIdentities(cwd);
   let showFileToken;
   let showFilePinnedRoots = null;
   if (shareEnabled) {
@@ -3056,7 +3027,6 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     codexSpawnEnv: spawnEnv,
     ...(showFileToken ? { showFileToken } : {}),
     showFilePinnedRoots,
-    viewerRootIdentities,
     _showFileInFlight: 0,
     mcpExtras,
     bypassMode: requestedBypassMode,
@@ -3405,10 +3375,6 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
   const effort = pickedEffort || persistedCodexState.effort || (fresh && options.effort !== 'default' ? codexDefaultEffortNow() : null) || null;
   const mcpExtras = options.mcpExtras ?? persistedCodexState.mcpExtras ?? persisted?.mcpExtras ?? [];
   const extras = effectiveExtras(mcpExtras, DEFAULT_MCP_EXTRAS);
-  // Pinned here, at the trusted boundary, for the same reason as
-  // showFilePinnedRoots below — but scoped to the workdir alone, since a
-  // viewer link's scope is the session's workdir, not the artifact roots.
-  const viewerRootIdentities = pinViewerRootIdentities(cwd);
   let showFileToken;
   let showFilePinnedRoots = null;
   if (CODEX_APP_SERVER && extras.includes('share')) {
@@ -3457,7 +3423,6 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
     mcpExtras,
     ...(showFileToken ? { showFileToken } : {}),
     showFilePinnedRoots,
-    viewerRootIdentities,
     responseBuffer: '',
     sendCallback: null,
     pendingPlan: null,
@@ -3879,10 +3844,6 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     : (Array.isArray(persistedForRoom?.mcpExtras) ? persistedForRoom.mcpExtras : []);
   const effectiveMcpExtras = effectiveExtras(mcpExtras, DEFAULT_MCP_EXTRAS);
   const shareEnabled = effectiveMcpExtras.includes('share');
-  // Pinned here, at the trusted boundary, for the same reason as
-  // showFilePinnedRoots below — but scoped to the workdir alone, since a
-  // viewer link's scope is the session's workdir, not the artifact roots.
-  const viewerRootIdentities = pinViewerRootIdentities(cwd);
   let showFileToken;
   let showFilePinnedRoots = null;
   if (shareEnabled) {
@@ -4023,7 +3984,6 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     codexSpawnEnv: interactiveEnv,
     ...(showFileToken ? { showFileToken } : {}),
     showFilePinnedRoots,
-    viewerRootIdentities,
     _showFileInFlight: 0,
     mcpExtras,
     responseBuffer: '',
@@ -4683,12 +4643,9 @@ function handleInteractiveScreenUpdate(session, update) {
   const newUrls = newUrlsAgainst(seen, allUrls);
   if (newUrls.length === 0 && !hasInputCue) return;
   for (const u of newUrls) {
-    for (const v of seen) if (u.startsWith(v)) session.surfacedUrls.delete(v);
+    for (const v of seen) if (isCutOf(v, u)) session.surfacedUrls.delete(v);
     session.surfacedUrls.add(u);
   }
-  // Build a clean cue-specific message instead of dumping the raw
-  // screen. If the formatter can't make sense of the cue, skip rather
-  // than spam a screen-dump full of status chrome.
   // Fresh URLs lead: the sign-in card picks the first OAuth link, and a
   // stale one still in the capture buffer (a retry's earlier link) must not
   // be sent in place of the fresh one just marked surfaced.
@@ -5488,23 +5445,19 @@ function handleClaudeEvent(session, event) {
   }
 
   // Re-home the subagent watcher when the session changes cwd mid-flight
-  // (EnterWorktree). Claude relocates the subagents dir to the new cwd's
-  // project-dir encoding, so a watcher frozen on the spawn cwd polls a stale
-  // path and subagent cards stop rendering. Stream events carry the
-  // live per-entry cwd; track the last one seen so we only act on a real move,
-  // then let the watcher re-point (a no-op when the encoded dir is unchanged).
+  // (EnterWorktree). Stream events carry the live cwd; act only on a change.
   if (session.subagentWatcher && typeof event.cwd === 'string' && event.cwd
       && event.cwd !== session._lastWatcherCwd) {
     session._lastWatcherCwd = event.cwd;
     if (session.subagentWatcher.repoint(event.cwd)) {
-      console.log(`[subagent-rehome] room ${session.roomId}: session ${String(session.claudeSessionId).slice(0, 8)}… moved to ${event.cwd}; re-pointed subagent watcher`);
+      console.log(`[subagent-rehome] room ${session.roomId}: moved to ${event.cwd}; re-pointed subagent watcher`);
     }
   }
 
-  // Workflow-tool runs: the Workflow tool_use, its launch
-  // tool_result (run id) and the run's task_notification drive per-run
-  // discovery of subagents/workflows/<runId>/ agents. One seam; the routing
-  // lives in lib/subagent-watcher.js where it is tested with real event shapes.
+  // Workflow-tool runs: the Workflow tool_use, its launch tool_result (run id)
+  // and the run's task_notification drive per-run discovery of
+  // subagents/workflows/<runId>/ agents. One seam; the routing lives in
+  // lib/subagent-watcher.js where it is tested with real event shapes.
   routeWorkflowStreamEvent(session.subagentWatcher, event);
 
   // Log all event types for plan mode debugging

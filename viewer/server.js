@@ -327,12 +327,10 @@ app.get('/view', async (req, res) => {
 
   try {
     // Serve-time boundary (lib/file-link-guard.js): fd-pinned symlink,
-    // sensitivity, scope-containment, and size checks. scopeFromToken prefers
-    // the token's PINNED root identity over its bare workdir pathname, so a
-    // workdir swapped out after the link was minted is rejected rather than
-    // followed. Legacy tokens without a workdir still get everything but
-    // containment. Every rejection — denied, missing, oversize — is a uniform
-    // 404 so the response leaks nothing about why.
+    // sensitivity, workdir-containment, and size checks. Legacy tokens
+    // without a workdir still get everything but containment. Every
+    // rejection — denied, missing, oversize — is a uniform 404 so the
+    // response leaks nothing about why.
     const { content, realPath } = await validateAndOpen(data.path, scopeFromToken(data));
     res.type('html').send(renderHtml(path.basename(realPath), content.toString('utf-8')));
   } catch (err) {
@@ -407,8 +405,6 @@ app.get('/page', pageLimiter, async (req, res) => {
 
   try {
     if (!isPageFile(data.path)) throw new FileLinkDenied('not-html');
-    // scopeFromToken: the token's pinned root identity, not its bare workdir
-    // pathname (same boundary as /view and /download).
     const { content } = await validateAndOpen(data.path, {
       ...scopeFromToken(data),
       maxBytes: MAX_PAGE_BYTES,

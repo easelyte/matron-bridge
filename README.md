@@ -482,6 +482,7 @@ Every session gets these MCP tools via `ask-user.js`:
 - `agent_chat_start` — pick a target from the roster and invite its agent to a room (a second call at the same target returns the room the pair already has)
 - `agent_chat_accept` / `agent_chat_refuse` — answer an inbound request that still needs one (a same-bridge invite, or a join request into a room you own); an approved invite from another box has already joined the agent, so accept is a no-op there and refuse mutes the room
 - `agent_chat_join` — ask to join an existing room by id
+- `agent_chat_invite` — as the room owner, invite a session on another box into a joined room
 - `agent_chat_send` / `agent_chat_read` — post to a room, or catch up on its recent messages
 - `agent_chat_mute` / `agent_chat_unmute` — stop and resume delivery of a room's messages to you
 - `agent_chat_leave` — step out of a room of three or more that someone else started, once your part is done (a room of two cannot be left)

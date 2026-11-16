@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll } from 'vitest';
-import { mkdtempSync, writeFileSync, rmSync, realpathSync, symlinkSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync, realpathSync, symlinkSync, renameSync, mkdirSync } from 'node:fs';
+import { pinAllowedRootsSync } from '../lib/file-link-guard.js';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { createPageLinkHandler, pageLinkTtlSeconds, PAGE_LINK_DEFAULT_DAYS, PAGE_LINK_MAX_DAYS } from '../lib/page-link.js';
@@ -15,7 +16,7 @@ beforeAll(() => {
   writeFileSync(path.join(workdir, 'notes.txt'), 'hi');
   writeFileSync(path.join(outside, 'other.html'), '<html></html>');
   symlinkSync(path.join(outside, 'other.html'), path.join(workdir, 'escape.html'));
-  const sessions = new Map([['room-1', { workdir }], ['room-nowd', {}]]);
+  const sessions = new Map([['room-1', { workdir, showFilePinnedRoots: pinAllowedRootsSync([workdir]) }], ['room-nowd', {}], ['room-nopin', { workdir }]]);
   handler = createPageLinkHandler({ sessions, secret: SECRET, baseUrl: 'https://viewer.example.com' });
 });
 afterAll(() => {
@@ -69,6 +70,32 @@ describe('page-link handler', () => {
     const { status, body } = await handler({ roomId: 'room-1', path: 'notes.txt' });
     expect(status).toBe(403);
     expect(body.error).toMatch(/html/);
+  });
+
+  it('refuses a session whose root was never pinned', async () => {
+    const { status } = await handler({ roomId: 'room-nopin', path: 'pack.html' });
+    expect(status).toBe(403);
+  });
+
+  it('refuses when the workdir was moved aside and replaced by a symlink after the pin', async () => {
+    const base = realpathSync.native(mkdtempSync(path.join(tmpdir(), 'page-link-swap-')));
+    const wd = path.join(base, 'work');
+    const elsewhere = path.join(base, 'elsewhere');
+    mkdirSync(wd);
+    mkdirSync(elsewhere);
+    writeFileSync(path.join(wd, 'pack.html'), '<p>mine</p>');
+    writeFileSync(path.join(elsewhere, 'pack.html'), '<p>theirs</p>');
+    const sessions = new Map([['r', { workdir: wd, showFilePinnedRoots: pinAllowedRootsSync([wd]) }]]);
+    const h = createPageLinkHandler({ sessions, secret: SECRET, baseUrl: 'https://viewer.example.com' });
+    renameSync(wd, path.join(base, 'work.bak'));
+    symlinkSync(elsewhere, wd);
+    try {
+      const { status, body } = await h({ roomId: 'r', path: 'pack.html' });
+      expect(status).toBe(403);
+      expect(body.url).toBeUndefined();
+    } finally {
+      rmSync(base, { recursive: true, force: true });
+    }
   });
 
   it('refuses a path outside the workdir', async () => {

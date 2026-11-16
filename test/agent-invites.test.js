@@ -731,6 +731,48 @@ describe('createAgentInvites', () => {
       expect(rooms.get('r1').state).toBe('joined');
     });
   });
+
+  describe('hasUnansweredInvite()', () => {
+    const busyInvite = async (inv, roomId = 'r1') => {
+      const p = inv.invite({ roomId, targetDeviceId: 7, justification: 'j' });
+      inv.onInviteFrame({ kind: 'invite', event: 'delivered', room_id: roomId });
+      await flush();
+      inv.onInviteFrame({ kind: 'invite', event: 'ack', room_id: roomId, session_state: 'busy' });
+      return p;
+    };
+
+    it('stays set after a pending_busy return and clears when the answer frame arrives', async () => {
+      const { inv } = makeInvites();
+      await expect(busyInvite(inv)).resolves.toEqual({ kind: 'pending_busy' });
+      expect(inv.hasUnansweredInvite('r1')).toBe(true);
+      expect(inv.hasUnansweredInvite('r2')).toBe(false);
+      inv.onInviteFrame({ kind: 'invite', event: 'answer', room_id: 'r1', accept: false, reason: 'no', from_device_id: 7 });
+      expect(inv.hasUnansweredInvite('r1')).toBe(false);
+    });
+
+    it('lapses after the invite TTL when no answer ever arrives', async () => {
+      vi.useFakeTimers();
+      const { inv } = makeInvites();
+      const p = inv.invite({ roomId: 'r1', targetDeviceId: 7, justification: 'j' });
+      await vi.advanceTimersByTimeAsync(60_000);
+      await expect(p).resolves.toEqual({ kind: 'pending_quiet' });
+      expect(inv.hasUnansweredInvite('r1')).toBe(true);
+      await vi.advanceTimersByTimeAsync(29 * 60_000);
+      expect(inv.hasUnansweredInvite('r1')).toBe(true);
+      await vi.advanceTimersByTimeAsync(2 * 60_000);
+      expect(inv.hasUnansweredInvite('r1')).toBe(false);
+    });
+
+    it('is not set when the invite is answered within the call', async () => {
+      const { inv } = makeInvites();
+      const p = inv.invite({ roomId: 'r1', targetDeviceId: 7, justification: 'j' });
+      inv.onInviteFrame({ kind: 'invite', event: 'delivered', room_id: 'r1' });
+      await flush();
+      inv.onInviteFrame({ kind: 'invite', event: 'answer', room_id: 'r1', accept: true, peer_device_id: 7, from_device_id: 7 });
+      await expect(p).resolves.toMatchObject({ kind: 'accepted' });
+      expect(inv.hasUnansweredInvite('r1')).toBe(false);
+    });
+  });
 });
 
 // The USER-facing half of an inbound request (index.js publishes this via
