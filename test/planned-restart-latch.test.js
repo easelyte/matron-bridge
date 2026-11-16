@@ -305,7 +305,7 @@ it('holds room input while foreign context is pending and releases after deliver
   const session = { alive: true, roomId: 'alice' };
   const route = indexFunction('deliverRoomFrameTo', {
     restartLatch: f.latch, sessions: new Map([['alice', session]]), journalPublisher: { identity: () => null },
-    personOfSender: () => 'bob', personLabel: () => 'bob',
+    personOfSender: () => 'bob', personLabel: () => 'bob', foreignGateBlocked: () => null, foreignGateNotice: () => '',
     maybeFlushRoomDelivery() {}, roomEchoLabel: () => null,
     roomFrameDisposition: () => 'deliver', agentRooms: { isMuted: () => false },
     foreignSessions: { refreshContext: () => pending },

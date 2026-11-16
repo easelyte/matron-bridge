@@ -504,7 +504,7 @@ describe('wiring (source inspection)', () => {
   });
 
   it('typed text offers in-place edit (not a jumping /compact); tracker replies offer resend', () => {
-    expect(src).toMatch(/editMode: compactJump \? null : 'replace'/);
-    expect(src).toMatch(/editMode: source\?\.item_id && source\?\.comment_id \? 'resend' : null/);
+    expect(src).toMatch(/editMode: compactJump \|\| bridgeOrigin \? null : 'replace'/);
+    expect(src).toMatch(/editMode: !bridgeOrigin && source\?\.item_id && source\?\.comment_id \? 'resend' : null/);
   });
 });

@@ -17,7 +17,7 @@ describe('turn causes reach sendToSession from every turn source', () => {
     expect(fnBody('function journalOnText(')).toContain('const causes = seq != null && convoId ? [userMessageCause(convoId, seq)] : null;');
     expect(fnBody('function journalOnText(')).toContain('journalRouteTextToSession(session, body, { causes })');
     const route = fnBody('async function journalRouteTextToSession(');
-    expect(route).toContain('{ keepRestartBudget = false, causes = null } = {}');
+    expect(route).toContain('{ keepRestartBudget = false, causes = null, bridgeOrigin = false } = {}');
     expect(route).toContain('const entry = tagCauses(markJournalOrigin([{ type: \'text\', text: trimmed }]), causes);');
     expect(route.match(/sendTextToSession\(session, trimmed, \{ skipJournalMirror: true, causes \}\)/g)).toHaveLength(2);
   });
@@ -65,7 +65,7 @@ describe('turn causes reach sendToSession from every turn source', () => {
 
   it('an item reply\'s cause rides the inject and the queue', () => {
     expect(index).toContain("injectBlocks: (session, blocks, { causes = null } = {}) => sendToSession(session, blocks, { skipJournalMirror: true, causes }),");
-    expect(index).toMatch(/queueText: \(session, \{ text, preview, source, cause = null \}\) => journalQueueMedia\(session, \{[\s\S]{0,160}?\n {4}cause,\n/);
+    expect(index).toMatch(/queueText: \(session, \{ text, preview, source, cause = null, bridgeOrigin = false \}\) => journalQueueMedia\(session, \{[\s\S]{0,160}?\n {4}cause,\n {4}bridgeOrigin,\n/);
   });
 
   it('room turns forward their causes; reminders and timers are reminder turns', () => {
@@ -79,8 +79,8 @@ describe('turn causes reach sendToSession from every turn source', () => {
     const fire = fnBody('async function fireTimer(');
     // The user's /timer is a reminder turn; the agent's own reminder names
     // the turn that set it beside it.
-    expect(fire.match(/\{ causes: \[plainCause\('reminder'\)\] \}/g)).toHaveLength(1);
-    expect(fire).toContain("{ causes: mergeCauses([plainCause('reminder'), record.causes]) }");
+    expect(fire.match(/\{ bridgeOrigin: true, causes: \[plainCause\('reminder'\)\] \}/g)).toHaveLength(1);
+    expect(fire).toContain("{ bridgeOrigin: true, causes: mergeCauses([plainCause('reminder'), record.causes]) }");
     // A self-restart's continuation names the restarting turn's causes beside `other`.
     expect(index).toContain("const entry = tagCauses([{ type: 'text', text }], mergeCauses([plainCause('other'), causesForAsk(session)]));");
   });

@@ -189,7 +189,7 @@ describe('wiring in index.js', () => {
     expect(fn).toMatch(/if \(wasBusy\) \{[\s\S]*?carryOnConvo\(convoId, target, null, text, undefined, \{ causes: \[carryOnCause\(\)\], keepRestartBudget: true \}\)/);
     expect(carryOnCause().kind).toBe('carry_on');
     const carry = source.slice(source.indexOf('async function carryOnConvo('), source.indexOf('async function carryOnConvo(') + 2400);
-    expect(carry).toContain('journalRouteTextToSession(target, text, { causes, keepRestartBudget })');
+    expect(carry).toContain('journalRouteTextToSession(target, text, { bridgeOrigin: true, causes, keepRestartBudget })');
   });
 
   it('ignores child exits during shutdown and falls back to the session chat for the notice', () => {

@@ -47,11 +47,18 @@ describe('transfer receiver wiring', () => {
   });
 
   it("the sender's outcome lines go through the wake-capable room path, not a live-only notify", () => {
+    const made = index.indexOf('const notifyTransferSession = createTransferOutcomeNotify({');
+    expect(made).toBeGreaterThan(-1);
+    const notifier = index.slice(made, index.indexOf('\n});\n', made));
+    expect(notifier).toMatch(/getRoom: \(roomId\) => agentRooms\.get\(roomId\),\s*deliverRoomFrameTo,/);
     const start = index.indexOf('transferSender = createTransferSender({');
     expect(start).toBeGreaterThan(-1);
     const body = index.slice(start, index.indexOf('\n});\n', start));
-    expect(body).toMatch(/notify: createTransferOutcomeNotify\(\{\s*getRoom: \(roomId\) => agentRooms\.get\(roomId\),\s*deliverRoomFrameTo,/);
-    expect(body).not.toContain('.alive');
-    expect(body).not.toContain('roomDelivery.deliver(');
+    expect(body).toMatch(/notify: notifyTransferSession,/);
+    expect(body).toMatch(/onCreated: notifyTransferSession,/);
+    for (const text of [notifier, body]) {
+      expect(text).not.toContain('.alive');
+      expect(text).not.toContain('roomDelivery.deliver(');
+    }
   });
 });

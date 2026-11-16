@@ -53,7 +53,7 @@ describe('session control wiring (source inspection)', () => {
     // So does the effort, and on its own it goes through applyControlEffort.
     expect(fn).toContain("...(step.effort && step.agent === AGENT_CLAUDE ? { claudeEffort: step.effort } : {}),");
     expect(fn).toContain('await applyControlEffort(current, step.effort, ctx);');
-    expect(fn).toContain("await journalRouteTextToSession(current, step.command || '/compact', { keepRestartBudget: !!step.command });");
+    expect(fn).toContain("await journalRouteTextToSession(current, step.command || '/compact', { bridgeOrigin: true, keepRestartBudget: !!step.command });");
     // The planner's causes reach the turn (lib/turn-cause.js).
     expect(fn).toContain('const causes = step.causes ?? (step.cause ? [step.cause] : null);');
     expect(fn).toContain('sendTextToSession(current, step.text, { skipJournalMirror: true, causes })');
@@ -127,9 +127,9 @@ describe('automatic carry-on wiring (source inspection)', () => {
     expect(fire).toContain('if (controlOccupied(session)) return;');
     expect(fire).toContain('session._autoResume = null;');
     expect(fire).toContain("if (shouldCompactBefore(session._lastContextTokens, contextWindowForSession(session))) {");
-    expect(fire).toContain("await journalRouteTextToSession(session, '/compact');");
+    expect(fire).toContain("await journalRouteTextToSession(session, '/compact', { bridgeOrigin: true });");
     expect(fire).toContain("await journalRouteTextToSession(sessions.get(roomId) || session, slot.text || (slot.kind === 'model_recovery' ? BAD_MODEL_RECOVERY_TEXT : AUTO_RESUME_TEXT),");
-    expect(fire).toContain("{ causes: slot.source === 'coordinator' ? [carryOnCause(slot.carryOnId)] : null });");
+    expect(fire).toContain("{ bridgeOrigin: true, causes: slot.source === 'coordinator' ? [carryOnCause(slot.carryOnId)] : null });");
     expect(fire).toContain("slot.kind === 'model_recovery'");
     // A thrown delivery puts the slot back unless something newer was armed.
     expect(fire).toContain('if (!live._autoResume) { live._autoResume = slot; persistControlState(live); }');

@@ -259,7 +259,7 @@ server.tool(
 
 server.tool(
   'send_attachment',
-  'Send a file from disk into the Matron chat as a real attachment: images (png/jpg/gif/webp/heic) render inline; PDFs, logs, and other files appear as tappable file attachments. Use this for screenshots, plots, generated documents, and build artifacts instead of describing them or pasting their contents. Do NOT use for secrets or credential files — use share_sensitive_data for those. The file must be inside the session working directory or be one the bridge downloaded for this conversation (a file the user sent here, or an item attachment), and attachments are capped at 50 MB. With chat_room_id the file goes to the other agents in that room instead: each room file needs the user\'s approval on a card, may be up to 10 GB, and uploads in the background — the tool returns at once and the outcome arrives in the room. Keep it purposeful: send the artifact the user needs, not every intermediate file.',
+  'Send a file from disk into the Matron chat as a real attachment: images (png/jpg/gif/webp/heic) render inline; PDFs, logs, and other files appear as tappable file attachments. Use this for screenshots, plots, generated documents, and build artifacts instead of describing them or pasting their contents. Do NOT use for secrets or credential files — use share_sensitive_data for those. The file must be inside the session working directory or be one the bridge downloaded for this conversation (a file the user sent here, or an item attachment), and attachments are capped at 50 MB. With chat_room_id the file goes to the other agents in that room instead: each room file needs the user\'s approval on a card, may be up to 10 GB, and uploads in the background — the tool returns at once, you are told in the room when the approval card has been filed, and the outcome arrives there too. Keep it purposeful: send the artifact the user needs, not every intermediate file.',
   {
     path: z.string().describe('Path to the file — absolute, or relative to the session working directory'),
     caption: z.string().optional().describe('Optional caption rendered with the attachment, like a message body. For a room file it is shown on the approval card as your note: say what the file is and why you are sending it'),
@@ -276,8 +276,8 @@ server.tool(
       if (!postRes.ok) {
         return { content: [{ type: 'text', text: `send_attachment failed: ${data.error || `HTTP ${postRes.status}`}` }] };
       }
-      if (data.status === 'pending_approval') {
-        return { content: [{ type: 'text', text: `"${data.name}" (${data.size} bytes) is waiting for approval to go into room ${chat_room_id}. ${data.note || ''}`.trim() }] };
+      if (data.status === 'queued') {
+        return { content: [{ type: 'text', text: `"${data.name}" (${data.size} bytes) is queued to go into room ${chat_room_id}. ${data.note || ''}`.trim() }] };
       }
       return { content: [{ type: 'text', text: `Sent ${data.kind} "${data.name}" (${data.size} bytes) into ${chat_room_id ? `room ${chat_room_id}` : 'the chat'}.` }] };
     } catch (err) {
