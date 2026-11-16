@@ -93,6 +93,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 import os from 'os';
+import { GoogleGenerativeAI } from '@google/generative-ai';
 import { createLiveOutputStore, sweepOrphanedLogs } from './lib/live-output.js';
 import { createToolStreamPump, toolOutputSnippet, decodeByteExact } from './lib/tool-stream-pump.js';
 import { computeEditDiff } from './lib/edit-diff.js';
@@ -258,7 +259,6 @@ import { attachPendingMediaMirror, pendingMediaMirror } from './lib/media-mirror
 import { seedJournalTitle, applyFallbackTitle, withSessionShort, titleMarkerFor, recordTitleEarned } from './lib/journal-title-seed.js';
 import { createSummaryModel, parseSummaryProviders } from './lib/summary-model.js';
 import { createCodexSummaryModel } from './lib/codex-summary-model.js';
-import { GoogleGenerativeAI } from '@google/generative-ai';
 import { createSummaryModelNag } from './lib/summary-model-nag.js';
 import { createLoginExpiryNotice, isLoginExpiredText, loginExpiredFromAssistantEvent, loginExpiredMessage, loginExpiredCardText, loginButtons } from './lib/login-expiry.js';
 import { codexOneShot } from './lib/codex-oneshot.js';
@@ -266,7 +266,7 @@ import { createTitleSummary } from './lib/title-summary.js';
 import { activityStateChanged, truncateActivityDetail, shouldResumeThinkingAfterTool } from './lib/journal-activity.js';
 import { streamRefFor, armReplyRef, settleReplyRef } from './lib/journal-stream.js';
 import { contextFullToNative, briefContextReport } from './lib/context-command.js';
-import { buildSessionStatus, contextTokensFromAssistantEvent, postCompactContextTokens, compactTriggerFrom, contextGaugeText, sessionContextWindow, emailFromClaudeConfig, isSidechainEvent, reconcileModelForWindow, hostVitals, startCpuSampler, stopCpuSampler, cpuPercent, ramPercent, cpuSampledAtMs, statusRepaintDue } from './lib/session-status.js';
+import { buildSessionStatus, contextTokensFromAssistantEvent, postCompactContextTokens, compactTriggerFrom, contextGaugeText, sessionContextWindow, emailFromClaudeConfig, isSidechainEvent, hostVitals, startCpuSampler, stopCpuSampler, cpuPercent, ramPercent, cpuSampledAtMs, statusRepaintDue } from './lib/session-status.js';
 import { stallFromAssistantEvent, stallResetsAt } from './lib/stall-detector.js';
 import { spawnModelFallback, stallModelFallback, isFableModel } from './lib/fable-fallback.js';
 import { createRestartNotices, planSessionControl, validateControlParams, controlNotice, authorizeControl, mergeParkedSlot, JOURNAL_DEVICE_ID, JOURNAL_ONLY_ACTIONS, CONTROL_KINDS, TURN_STARTING_OPS, occupied as controlOccupied } from './lib/session-control.js';
@@ -3322,9 +3322,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
             `Session crashed (exit ${exitCode}), restarted automatically — attempt <b>${restarted.restartCount}/3</b>`);
           restarted.sendHtml(n.plain, n.html);
         } else if (restarted.sendCallback) {
-          restarted.sendCallback(
-            `[Session crashed (exit ${exitCode}), restarted automatically — attempt ${restarted.restartCount}/3]`
-          );
+          restarted.sendCallback(`[Session crashed (exit ${exitCode}), restarted automatically — attempt ${restarted.restartCount}/3]`);
         }
       } else {
         // Notice BEFORE teardown: sendToRoom's journal mirror looks the
@@ -4276,9 +4274,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
             `Session crashed (exit ${exitCode}), restarted automatically — attempt <b>${restarted.restartCount}/3</b>`);
           restarted.sendHtml(n.plain, n.html);
         } else if (restarted.sendCallback) {
-          restarted.sendCallback(
-            `[Session crashed (exit ${exitCode}), restarted automatically — attempt ${restarted.restartCount}/3]`
-          );
+          restarted.sendCallback(`[Session crashed (exit ${exitCode}), restarted automatically — attempt ${restarted.restartCount}/3]`);
         }
       } else {
         // Notices FIRST, teardown second: sendToRoom's journal mirror looks
@@ -4414,6 +4410,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
   // Subagent activity watcher — see createSession() for the rationale.
   setupSubagentWatcher(session, cwd, sessionId);
   // After sessions.set for the same reason as in createSession.
+  if (ivRootDowngraded) postRootBypassWarning(roomId);
   return session;
 }
 
@@ -5457,7 +5454,7 @@ function handleClaudeEvent(session, event) {
   // This is the reliable source in iv-mode, where the system/init event (and
   // thus session.initData.model) never arrives.
   const capturedModel = modelFromEvent(event);
-  if (capturedModel) session.currentModel = reconcileModelForWindow(session.currentModel, capturedModel);
+  if (capturedModel) session.currentModel = capturedModel;
 
   // Capture session ID from any event that carries it. Claude sessions
   // pre-assign their id at spawn (planSessionIdentity), so for them this is
@@ -6710,9 +6707,6 @@ function sendToSession(session, contentBlocks, { skipJournalMirror = false, fore
   const wasBusy = session.busy;
   const beganTurn = beginOrJoinTurn(session, causes);
     session.busy = true;
-    // A steering write joins the running turn: it is not a turn start, so no
-    // turn generation bump (the interrupt-ack stamp keys on it) and no journal
-    // state change.
     if (!steering) {
       // Only a write that starts a turn from idle advances the generation. A busy
       // flush (send now, interrupt magic word) joins the same running turn, and
@@ -6729,12 +6723,12 @@ function sendToSession(session, contentBlocks, { skipJournalMirror = false, fore
     }
 
     // /context-full is a bridge-only command — claude itself knows only
-    // /context. Rewrite it here, the single choke point every transport
-    // funnels through (Matrix messages, journal-routed text, queue flushes),
-    // and arm the one-shot flag flushResponse consumes to let the resulting
-    // report through untrimmed. Placed after the journal mirror above so the
-    // journal records what the user actually typed. Plain /context needs no
-    // marking: flushResponse trims any context report by default.
+    // /context. Rewrite it here, the single choke point every input funnels
+    // through (journal-routed text, queue flushes), and arm the one-shot flag
+    // flushResponse consumes to let the resulting report through untrimmed.
+    // Placed after the journal mirror above so the journal records what the user
+    // actually typed. Plain /context needs no marking: flushResponse trims any
+    // context report by default.
     if (!plainTurn && contentBlocks.length === 1 && contentBlocks[0].type === 'text') {
       const nativeContext = contextFullToNative(contentBlocks[0].text);
       if (nativeContext) {
@@ -8821,6 +8815,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       // Rename after the session exists (not before) so updateRoomName's
       // roomId -> session lookup — used to journal-mirror the title — finds it.
       await updateRoomName(sessionRoomId, roomName);
+
       // Persist immediately — we already know the agent session ID.
       // session.workdir, not actualWorkdir: createSession may have degraded a
       // missing workdir to a fallback, and persisting the missing path would
@@ -10237,22 +10232,11 @@ async function journalRouteTextToSession(session, body, { keepRestartBudget = fa
     if (session.iv && !effortFlowHoldsInput(session) && isIvSlashPassthrough(trimmed)) {
       return sendTextToSession(session, trimmed, { skipJournalMirror: true, causes });
       }
-      // Busy-queue magic words — the SAME classifier and implementation the
-      // old Matrix busy branch used (lib/busy-queue.js), checked at the same
-      // point (busy, not a TUI slash passthrough). Feedback goes through
-      // ctx.sendReply — a fresh sendToRoom text that also mirrors into the
-      // journal, like every other command reply. The Matrix tile-edit half of
-      // the old seams are gone (outbound Matrix sends retired):
-      // editMessage is null (lib/busy-queue.js no-ops it), and
-      // stripQueueNotificationLinks is now clearQueueNotifications — same
-      // array-clearing effect minus the Matrix edit loop, still needed so a
-      // 'send'/'interrupt' flush doesn't leave stale notif entries to misalign
-      // a later re-queue (see clearQueueNotifications above). Kept as named
-      // keys (rather than omitted) so the wiring stays self-documenting and
-      // the source-inspection pin in test/busy-queue.test.js still finds both
-      // identifiers. Only sendHtml is omitted: journal feedback stays plain. A
-      // flush still goes through the one true flushQueue (single merged send +
-      // origin-aware mirroring) — never a second flush path.
+      // Busy-queue magic words (lib/busy-queue.js), checked while busy and
+      // after the TUI slash passthrough. Feedback goes through ctx.sendReply,
+      // which mirrors into the journal like every other command reply; a flush
+      // goes through the one flushQueue (single merged send + origin-aware
+      // mirroring) and clears the notifications with clearQueueNotifications.
       const ctx = journalSessionCommandCtx(session);
     const handledMagicWord = !bridgeOrigin && await dispatchBusyQueueMagicWord(trimmed, session, {
         sendReply: ctx.sendReply,
@@ -10264,21 +10248,20 @@ async function journalRouteTextToSession(session, body, { keepRestartBudget = fa
         emitRelease,
       });
       if (handledMagicWord) return;
-      // Print-mode Claude with MATRON_CLAUDE_QUEUE_IN_MATRON=0: plain text the
-      // user typed goes into the running turn through flushQueue
-      // (lib/claude-steer.js) instead of waiting in the queue. Anything that
-      // cannot steer, and a refused write, falls through to the queue below so
-      // nothing is lost.
+      // Print-mode Claude with MATRON_CLAUDE_QUEUE_IN_MATRON=0: plain text the user typed
+      // goes into the running turn through flushQueue (lib/claude-steer.js)
+      // instead of waiting in the queue. Anything that cannot steer, and a
+      // refused write, falls through to the queue below so nothing is lost.
       const steerEntry = tagCauses(markJournalOrigin([{ type: 'text', text: trimmed }]), causes);
       if (bridgeOrigin) markBridgeOrigin(steerEntry);
       if (trySteerEntry(session, steerEntry)) {
         if (!bridgeOrigin) await ctx.sendReply(STEER_NOTICE);
         return;
       }
-      // Queue like a Matrix message would, but marked journal-origin so the
-      // eventual flushQueue send skips the journal mirror — the journal
-      // already has this text as the client's own send row, and re-mirroring
-      // on flush would show a duplicate in Matron (see lib/queue-flush.js).
+      // Queue it, marked journal-origin so the eventual flushQueue send skips
+      // the journal mirror — the journal already has this text as the client's
+      // own send row, and re-mirroring on flush would show a duplicate in Matron
+      // (see lib/queue-flush.js).
       if (!session.queuedMessages) session.queuedMessages = [];
       // /compact jumps the queue and travels alone (lib/compact-priority.js).
       // Unshifting is what makes the jump real, and it also gives the flush side
@@ -12617,7 +12600,7 @@ function deliverRoomFrameTo(room, frame) {
     // delivery at all: no injected turn, no pending-inbox growth, and no reply
     // waiter — which is why it sits above all three. Only the decision lives in
     // lib/room-delivery.js (roomFrameDisposition), because index.js can't be
-    // imported by a test. It also sits above the WAKE below:
+    // imported by a test. It also sits above the WAKE below (Bugbot on #288):
     // a muted binding whose session the reaper took down must stay down —
     // waking it only to drop the frame as muted would hand a peer that keeps
     // writing exactly the respawn-per-message the mute was reached for.
@@ -13614,9 +13597,6 @@ function resumePersistedSession(roomId, prev, { skipJournalMirror = false } = {}
   newSession.lastSummaryMsgCount = prev.lastSummaryMsgCount || 0;
   if (typeof prev.llmTitleEarned === 'boolean') newSession._llmTitleEarned = prev.llmTitleEarned;
   newSession.lastRosterText = prev.lastRosterText || '';
-  // Carry + harden the activity-inferred repo signal across auto-resume:
-  // this idle-reap/restart path is distinct from the explicit /resume path and
-  // must not drop the durable signal either.
   newSession.sendCallback = sendReply;
   newSession.sendHtml = sendHtmlFn;
   newSession.sendButtonMessage = (prompt, buttons, mode, plainText, html, payload) =>
