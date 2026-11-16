@@ -107,6 +107,7 @@ describe('Allow once', () => {
     expect(r.fs.onItemReply(s, { item_id: 'it_1', action: 'commented', comment: { action: ALLOW_LABEL } })).toBe(true);
     expect(s.foreignTurn).toMatchObject({ person: 'tim' });
     expect(r.sent.at(-1)[1]).toMatch(/allowed ONE call, once: Bash/);
+    expect(r.sent.at(-1)[1]).toContain('Allowed input:\n```json\n{"command":"git log -3"}\n```');
     expect(r.closed[0]).toEqual(['it_1', { resolution: 'answered', comment: 'Allowed once.' }]);
     expect((await r.fs.check(s, { tool_name: 'Bash', tool_input: { command: 'git log -4' } })).decision).toBe('deny');
     expect((await r.fs.check(s, { tool_name: 'Bash', tool_input: { command: 'git log -3' } })).decision).toBe('allow');

@@ -89,7 +89,7 @@ describe('pre-reap handoff wiring', () => {
     expect(drain).toContain('if (!mark || !mark.compactPending) return false;');
     expect(drain).toContain('if (!session.alive || session._autoStopped || controlOccupied(session)) return false;');
     expect(drain).toContain('mark.compactPending = false;');
-    expect(drain).toContain("journalRouteTextToSession(session, preReapCompactCommand(), { causes: [plainCause('handoff')] })");
+    expect(drain).toContain("journalRouteTextToSession(session, preReapCompactCommand(), { bridgeOrigin: true, causes: [plainCause('handoff')] })");
   });
 
   it('a real user turn re-arms it: text, media, item replies and prompt answers from the journal', () => {

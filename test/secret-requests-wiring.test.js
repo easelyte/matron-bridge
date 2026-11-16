@@ -76,7 +76,8 @@ describe('bridge wiring', () => {
     expect(wiring).toMatch(/getSession: \(roomId\) => \{[\s\S]*?s && s\.alive \? s : null;/);
     expect(wiring).toMatch(/resumeSession: \(roomId, notice\) => journalResumeRoom\(roomId, notice\)/);
     expect(wiring).toContain('sendToSession(');
-    expect(wiring).toContain('journalQueueMedia(');
+    expect(wiring).toContain('queue: queueSecretTurn');
+    expect(index).toMatch(/function queueSecretTurn[\s\S]*?journalQueueMedia\(session, \{[\s\S]*?bridgeOrigin: true/);
     expect(wiring).toContain('journalPublishNotice(');
   });
 

@@ -236,6 +236,160 @@ describe('transfer sender', () => {
     expect(readState(fx.stateFile).jobs).toEqual({});
   });
 
+  const createdSender = (fx, body, extra = {}) => {
+    const client = fakeClient();
+    client.create = vi.fn(async () => ({ ok: true, status: 201, body: { transfer_id: 'tr-1', chunk_bytes: 4, chunks: 4, ...body } }));
+    const notify = vi.fn();
+    const onCreated = vi.fn();
+    const sender = createTransferSender({ client, scan: cleanScan, stateFile: fx.stateFile, log: silent, notify, onCreated, chunkBytes: 4, ...extra });
+    return { client, notify, onCreated, sender };
+  };
+
+  it('the session hears of the approval card only once the transfer and card exist', async () => {
+    const fx = fixture();
+    const client = fakeClient();
+    let releaseCreate;
+    client.create = vi.fn(() => new Promise((resolve) => {
+      releaseCreate = () => resolve({ ok: true, status: 201, body: { transfer_id: 'tr-1', chunk_bytes: 4, chunks: 4, item_id: 'it_1' } });
+    }));
+    const notify = vi.fn();
+    const onCreated = vi.fn();
+    const sender = createTransferSender({ client, scan: cleanScan, stateFile: fx.stateFile, log: silent, notify, onCreated, chunkBytes: 4 });
+    sender.start(startArgs(fx));
+    await vi.waitFor(() => expect(client.create).toHaveBeenCalledTimes(1));
+    // The create is still in flight: nothing about a card yet.
+    expect(onCreated).not.toHaveBeenCalled();
+    releaseCreate();
+    await sender.idle();
+    expect(notify).not.toHaveBeenCalled();
+    expect(onCreated).toHaveBeenCalledTimes(1);
+    expect(onCreated).toHaveBeenCalledWith(expect.objectContaining({
+      sessionKey: '!s1', roomId: 'room-1', text: expect.stringMatching(/^\[transfer of "notes\.txt" waiting for approval: the user has an approval card/),
+    }));
+  });
+
+  it('item_id null: the transfer is waiting but the card could not be filed, and the notice says so', async () => {
+    const fx = fixture();
+    const { onCreated, sender } = createdSender(fx, { item_id: null });
+    sender.start(startArgs(fx));
+    await sender.idle();
+    expect(onCreated).toHaveBeenCalledTimes(1);
+    const text = onCreated.mock.calls[0][0].text;
+    expect(text).toMatch(/approval card could not be filed/);
+    expect(text).not.toMatch(/user has an approval card/);
+  });
+
+  it('item_id absent (an older journal): softer wording, no claim that a card exists', async () => {
+    const fx = fixture();
+    const { onCreated, sender } = createdSender(fx, {});
+    sender.start(startArgs(fx));
+    await sender.idle();
+    expect(onCreated).toHaveBeenCalledTimes(1);
+    const text = onCreated.mock.calls[0][0].text;
+    expect(text).toMatch(/filed an approval request/);
+    expect(text).not.toMatch(/has an approval card/);
+    expect(text).not.toMatch(/could not be filed/);
+  });
+
+  it('a notice lost to a crash or a failed tell is replayed on resume, then never again', async () => {
+    const fx = fixture();
+    const first = createdSender(fx, { item_id: 'it_1' }, {});
+    first.onCreated.mockImplementation(() => { throw new Error('delivery failed'); });
+    first.sender.start(startArgs(fx));
+    await first.sender.idle();
+    expect(first.onCreated).toHaveBeenCalledTimes(1);
+    expect(Object.values(readState(fx.stateFile).jobs)[0]).toMatchObject({ transferId: 'tr-1' });
+    expect(Object.values(readState(fx.stateFile).jobs)[0].createdNoticed).toBeFalsy();
+
+    // A restart: a new sender reads the state file and replays the notice.
+    const second = createdSender(fx, { item_id: 'it_1' }, {});
+    await second.sender.resumeAll();
+    expect(second.client.create).not.toHaveBeenCalled();
+    expect(second.onCreated).toHaveBeenCalledTimes(1);
+    expect(second.onCreated.mock.calls[0][0].text).toMatch(/user has an approval card/);
+    expect(Object.values(readState(fx.stateFile).jobs)[0]).toMatchObject({ createdNoticed: true });
+
+    // And not a third time.
+    const third = createdSender(fx, { item_id: 'it_1' }, {});
+    await third.sender.resumeAll();
+    expect(third.onCreated).not.toHaveBeenCalled();
+  });
+
+  it('a notifier that answers false (no room binding yet) leaves the notice owed', async () => {
+    const fx = fixture();
+    const first = createdSender(fx, { item_id: 'it_1' });
+    first.onCreated.mockReturnValue(false);
+    first.sender.start(startArgs(fx));
+    await first.sender.idle();
+    expect(Object.values(readState(fx.stateFile).jobs)[0].createdNoticed).toBeFalsy();
+  });
+
+  it('a job saved by a bridge from before the notice existed is not given a notice on resume', async () => {
+    const fx = fixture();
+    writeFileSync(fx.stateFile, JSON.stringify({ jobs: { old: { transferId: 'tr-1', absPath: fx.absPath, size: fx.size, mtimeMs: fx.mtimeMs, sha256: 'x', roomId: 'room-1', fromConvoId: 'c', sessionKey: '!s1', name: 'notes.txt', startedAt: Date.now(), lastProgressAt: Date.now(), stalls: 0, uploaded: true } } }));
+    const { onCreated, sender } = createdSender(fx, {});
+    await sender.resumeAll();
+    expect(onCreated).not.toHaveBeenCalled();
+  });
+
+  it('a refused create never claims an approval card', async () => {
+    const fx = fixture();
+    const client = fakeClient();
+    client.create = vi.fn(async () => ({ ok: false, status: 413, body: { error: 'quota_exceeded' } }));
+    const notify = vi.fn();
+    const onCreated = vi.fn();
+    const sender = createTransferSender({ client, scan: cleanScan, stateFile: fx.stateFile, log: silent, notify, onCreated, chunkBytes: 4 });
+    sender.start(startArgs(fx));
+    await sender.idle();
+    expect(onCreated).not.toHaveBeenCalled();
+    expect(notify).toHaveBeenCalledTimes(1);
+    expect(notify.mock.calls[0][0].text).not.toMatch(/approval card/);
+  });
+
+  it('a non-transient refusal of the status read after create tells the session why, and drops the job', async () => {
+    const fx = fixture();
+    const client = fakeClient();
+    client.status = vi.fn(async () => ({ ok: false, status: 403, body: { error: 'forbidden' } }));
+    const notify = vi.fn();
+    const sender = createTransferSender({ client, scan: cleanScan, stateFile: fx.stateFile, log: silent, notify, chunkBytes: 4 });
+    sender.start(startArgs(fx));
+    await sender.idle();
+    expect(client.putChunk).not.toHaveBeenCalled();
+    const texts = notify.mock.calls.map((c) => c[0].text);
+    expect(texts).toContainEqual(expect.stringMatching(/^\[transfer of "notes\.txt" (failed|stopped): .*forbidden/));
+    expect(readState(fx.stateFile).jobs).toEqual({});
+  });
+
+  it('a 404 on the status read after create says the outcome is unknown rather than failed', async () => {
+    const fx = fixture();
+    const client = fakeClient();
+    client.status = vi.fn(async () => ({ ok: false, status: 404, body: { error: 'not_found' } }));
+    const notify = vi.fn();
+    const sender = createTransferSender({ client, scan: cleanScan, stateFile: fx.stateFile, log: silent, notify, chunkBytes: 4 });
+    sender.start(startArgs(fx));
+    await sender.idle();
+    const texts = notify.mock.calls.map((c) => c[0].text);
+    expect(texts).toContainEqual(expect.stringMatching(/^\[transfer of "notes\.txt" stopped: .*not_found.*unknown/));
+    expect(readState(fx.stateFile).jobs).toEqual({});
+  });
+
+  it('a resumed, already uploaded job whose status read is refused tells the session', async () => {
+    const fx = fixture();
+    const client = fakeClient();
+    const notify = vi.fn();
+    const first = createTransferSender({ client, scan: cleanScan, stateFile: fx.stateFile, log: silent, notify, chunkBytes: 4 });
+    first.start(startArgs(fx));
+    await first.idle();
+    expect(Object.values(readState(fx.stateFile).jobs)[0]).toMatchObject({ uploaded: true });
+    notify.mockClear();
+    client.status = vi.fn(async () => ({ ok: false, status: 404, body: { error: 'not_found' } }));
+    const second = createTransferSender({ client, scan: cleanScan, stateFile: fx.stateFile, log: silent, notify, chunkBytes: 4 });
+    await second.resumeAll();
+    expect(notify).toHaveBeenCalledTimes(1);
+    expect(notify.mock.calls[0][0].text).toMatch(/^\[transfer of "notes\.txt" stopped: .*not_found/);
+    expect(readState(fx.stateFile).jobs).toEqual({});
+  });
+
   it('a declined outcome is told once, however many times the journal says so', async () => {
     const fx = fixture();
     const client = fakeClient();
@@ -287,7 +441,7 @@ describe('transfer sender', () => {
     expect(Object.values(readState(fx.stateFile).jobs)[0]).toMatchObject({ uploaded: true, stalls: 0 });
   });
 
-  it('a refused status while waiting out hashing tells the session it failed', async () => {
+  it('a refused status while waiting out hashing tells the session, as every unreadable status does', async () => {
     const fx = fixture();
     const client = fakeClient();
     client.complete = vi.fn(async () => ({ ok: false, status: 409, body: { error: 'conflict', detail: 'hashing' } }));
@@ -298,8 +452,24 @@ describe('transfer sender', () => {
     const sender = createTransferSender({ client, scan: cleanScan, stateFile: fx.stateFile, log: silent, notify, sleep: async () => {}, chunkBytes: 4 });
     sender.start(startArgs(fx));
     await sender.idle();
-    expect(notify).toHaveBeenCalledWith(expect.objectContaining({ text: '[transfer of "notes.txt" failed: not_found]' }));
+    expect(notify).toHaveBeenCalledTimes(1);
+    expect(notify.mock.calls[0][0].text).toMatch(/^\[transfer of "notes\.txt" stopped: not_found; .*outcome is unknown/);
     expect(readState(fx.stateFile).jobs).toEqual({});
+  });
+
+  it('a 403 on the status read while waiting out hashing says why, without claiming the outcome is unknown', async () => {
+    const fx = fixture();
+    const client = fakeClient();
+    client.complete = vi.fn(async () => ({ ok: false, status: 409, body: { error: 'conflict', detail: 'hashing' } }));
+    const open = client.status;
+    let statuses = 0;
+    client.status = vi.fn(async (id) => (++statuses === 1 ? open(id) : { ok: false, status: 403, body: { error: 'forbidden' } }));
+    const notify = vi.fn();
+    const sender = createTransferSender({ client, scan: cleanScan, stateFile: fx.stateFile, log: silent, notify, sleep: async () => {}, chunkBytes: 4 });
+    sender.start(startArgs(fx));
+    await sender.idle();
+    expect(notify).toHaveBeenCalledTimes(1);
+    expect(notify.mock.calls[0][0].text).toBe('[transfer of "notes.txt" stopped: forbidden]');
   });
 
   it('a complete still hashing after every wait is tried again later, never cancelled', async () => {

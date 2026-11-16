@@ -160,6 +160,20 @@ describe('turn text', () => {
     expect(allowanceTurnText(bare, { toolName: 'Bash', decision: 'allow', why: 'see the log' })).toMatch(/allowed ONE call, once: Bash/);
     expect(allowanceTurnText(bare, { toolName: 'Bash', decision: 'decline' })).toMatch(/declined/);
   });
+  it('the allowance turn shows the allowed input verbatim and labels the reason as the reason', () => {
+    const input = { message: 'run ```ls``` please', room_id: 'r1' };
+    const text = allowanceTurnText(bare, { toolName: 'agent_chat_send', decision: 'allow', why: 'pass it on', toolInput: input });
+    expect(text).toMatch(/Your reason when you asked: "pass it on"/);
+    expect(text).not.toMatch(/asked for \("pass it on"\)/);
+    const m = text.match(/Allowed input:\n(`{3,})json\n([^\n]*)\n\1$/);
+    expect(m).not.toBeNull();
+    expect(m[1].length).toBe(4);
+    expect(JSON.parse(m[2])).toEqual(input);
+    expect(actionHash('agent_chat_send', JSON.parse(m[2]))).toBe(actionHash('agent_chat_send', input));
+    const noReason = allowanceTurnText(bare, { toolName: 'Bash', decision: 'allow', toolInput: {} });
+    expect(noReason).not.toMatch(/reason/);
+    expect(noReason).toMatch(/```json\n\{\}\n```$/);
+  });
   it('the item shows the exact input and two buttons', () => {
     const it = actionRequestItem({ turn: bare, toolName: 'Bash', toolInput: { command: 'ls ```' }, why: 'list' });
     expect(it.actions).toEqual(['Allow once', 'Decline']);

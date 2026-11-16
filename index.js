@@ -60,7 +60,8 @@ import { createProjectsHandlers } from './lib/projects-tools.js';
 import { createConsentClient } from './lib/consent-client.js';
 import { createConsentHandlers, formatConsentNudge } from './lib/consent-tools.js';
 import { createSharingClient } from './lib/sharing-client.js';
-import { personOfSender, personLabel, foreignFlagPath, setForeignFlag, clearForeignFlag, foreignHookOutput } from './lib/foreign-turn.js';
+import { personOfSender, personLabel, foreignFlagPath, setForeignFlag, clearForeignFlag, foreignHookOutput, claudeSessionFlagKey, claudeSessionFlagDir } from './lib/foreign-turn.js';
+import { foreignGateBlockedReason, managedHookPolicy } from './lib/claude-managed-settings.js';
 import { createForeignSessions } from './lib/foreign-session.js';
 import { createSharingHandlers } from './lib/sharing-tools.js';
 import { createUnseenClient } from './lib/unseen-client.js';
@@ -227,7 +228,7 @@ import { createRecentFolders } from './lib/recent-folders.js';
 import { atomicWriteFileSync } from './lib/atomic-write.js';
 import { shouldAnnounceOnline, recordOnlineAnnounced } from './lib/announce-once.js';
 import { createInflightMarker } from './lib/inflight-marker.js';
-import { cancelQueuedItem, dispatchBusyQueueMagicWord, notifyQueuedMessage, resolveQueueReleaseTap } from './lib/busy-queue.js';
+import { cancelQueuedItem, countUserQueued, dispatchBusyQueueMagicWord, notifyQueuedMessage, resolveQueueReleaseTap } from './lib/busy-queue.js';
 import { DEFAULT_EDIT_HOLD_MS } from './lib/queue-edit-hold.js';
 import { handlePickerValue, isResumeConvoId } from './lib/picker-dispatch.js';
 import { createPermissionRegistry, renderPermissionCard, permissionInputRefusal, permissionButtons, permissionSpawnArgs, resolveBypassMode, resolvePermissionTimeoutMs, isRootOutsideSandbox, guardRootBypass, ROOT_BYPASS_WARNING, resolvePermissionRequest, resolvePermissionCheck, buildPrintSessionSettings, foreignGateEntry, listSessionGrants, revokeSessionGrant } from './lib/permission-prompt.js';
@@ -257,7 +258,7 @@ import { createJournalMediaRouter, chooseNarration } from './lib/journal-media.j
 import { createItemTurnRouter } from './lib/items-turn.js';
 import { createItemAttachmentSaver } from './lib/item-attachments.js';
 import { createSecretRequests, isOwnSecretFileName, requestSecretForSession } from './lib/secret-requests.js';
-import { attachQueuedCleanup, runQueuedCleanup, markJournalOrigin, planQueueFlush } from './lib/queue-flush.js';
+import { attachQueuedCleanup, runQueuedCleanup, markJournalOrigin, markBridgeOrigin, isBridgeOrigin, planQueueFlush } from './lib/queue-flush.js';
 import { queueFlushNotice } from './lib/queue-flush-notice.js';
 import {
   canSteerClaude, buildSteerLine, noteSteerWritten, applySteerLifecycle, decideSteerHold, noteSteerTurnOpened,
@@ -315,6 +316,7 @@ import { loopbackRefusal } from './lib/loopback-guard.js';
 import { createApiAuth, viewerApiKey, apiAuthRefusal, namedSessionRoom, operatorHeaderPath } from './lib/api-auth.js';
 import { createRunDir, headerRunRoot, healHeaderFile, writeHeaderFile } from './lib/header-files.js';
 import { launchWithClaudePromptFile } from './lib/claude-prompt-file.js';
+import { trimChatHistory } from './lib/chat-history-cap.js';
 import { codexMcpConfig } from './lib/codex-mcp.js';
 import { handleCodexControl, isCodexAuthError, offerCodexBuild, listCodexThreads, mergeCodexThreads } from './lib/codex-controls.js';
 import { createCodexAccountReader, codexSessionOptions } from './lib/codex-account.js';
@@ -6532,12 +6534,18 @@ function recordConversationMessage(session, role, text) {
     text: normalized,
     ...(role === 'assistant' && session.agent ? { agent: session.agent } : {}),
   });
+  // Bounded: the whole history is rewritten into the sessions file below, on
+  // every message (lib/chat-history-cap.js).
+  const dropped = trimChatHistory(session);
   // Once a message is dispatched to, or emitted by, the active native
   // session, that provider has seen the shared transcript through this item.
   session._agentHistoryCursor = session.chatHistory.length;
   debug(`Added ${role} message to chatHistory, length now: ${session.chatHistory.length}`);
   persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, {
     chatHistory: session.chatHistory,
+    // A cut moved the summary cursor; the record must not pair the shorter
+    // history with the old one.
+    ...(dropped > 0 ? { lastSummaryMsgCount: session.lastSummaryMsgCount || 0 } : {}),
   });
 }
 
@@ -6908,14 +6916,17 @@ function requeueSteeredMessages(session, entries) {
   for (const entry of entries.flatMap(entry => entry.queuedEntries
     ? entry.queuedEntries.map(blocks => ({ blocks, causes: blocks.cause, at: entry.at,
       historyText: blocks.filter(b => b.type === 'text').map(b => b.text).join('\n\n'),
-      source: blocks.steerSource }))
+      source: blocks.steerSource, bridgeOrigin: isBridgeOrigin(blocks) }))
     : [entry])) {
     if (!Array.isArray(entry.blocks) || !entry.blocks.length) continue;
+    // Raw steer entries can carry origin on their blocks instead of the entry.
+    const bridgeOrigin = entry.bridgeOrigin ?? isBridgeOrigin(entry.blocks);
     if (!session.queuedMessages) session.queuedMessages = [];
     if (!session.queueNotifications) session.queueNotifications = [];
     const queue = session.queuedMessages;
     const notifs = session.queueNotifications;
     const queued = tagCauses(markJournalOrigin([...entry.blocks]), entry.causes);
+    if (bridgeOrigin) markBridgeOrigin(queued);
     if (entry.source) queued.steerSource = entry.source;
     const at = Number.isFinite(entry.at) ? entry.at : 0;
     requeuedSteerAt.set(queued, at);
@@ -6932,8 +6943,9 @@ function requeueSteeredMessages(session, entries) {
       queueRelease: journalInputConsumer.queueRelease,
       convoId: journalConvoIdFor(session),
       fullText: text,
+      bridgeOrigin,
       source: entry.source || null,
-      editMode: entry.source?.item_id && entry.source?.comment_id ? 'resend'
+      editMode: bridgeOrigin ? null : entry.source?.item_id && entry.source?.comment_id ? 'resend'
         : entry.blocks.every(b => b.type === 'text') && !isCompactCommand(text)
           && (!entry.causes || entry.causes.every(c => c.kind === 'user_message')) ? 'replace' : null,
       editHoldMs: QUEUE_EDIT_HOLD_MS,
@@ -10118,7 +10130,7 @@ function armOperatorCompact(session, text) {
 // causes: what started the turn this text starts (lib/turn-cause.js), or
 // null when nothing identifiable did; a queued message keeps them on its
 // queue entry for the flush.
-async function journalRouteTextToSession(session, body, { keepRestartBudget = false, causes = null } = {}) {
+async function journalRouteTextToSession(session, body, { keepRestartBudget = false, causes = null, bridgeOrigin = false } = {}) {
   const finishInput = restartLatch?.beginInput();
   try {
     const trimmed = (body || '').trim();
@@ -10328,7 +10340,7 @@ async function journalRouteTextToSession(session, body, { keepRestartBudget = fa
       // flush still goes through the one true flushQueue (single merged send +
       // origin-aware mirroring) — never a second flush path.
       const ctx = journalSessionCommandCtx(session);
-      const handledMagicWord = await dispatchBusyQueueMagicWord(trimmed, session, {
+    const handledMagicWord = !bridgeOrigin && await dispatchBusyQueueMagicWord(trimmed, session, {
         sendReply: ctx.sendReply,
         formatQueueSummary,
         flushQueue,
@@ -10343,8 +10355,10 @@ async function journalRouteTextToSession(session, body, { keepRestartBudget = fa
       // (lib/claude-steer.js) instead of waiting in the queue. Anything that
       // cannot steer, and a refused write, falls through to the queue below so
       // nothing is lost.
-      if (trySteerEntry(session, tagCauses(markJournalOrigin([{ type: 'text', text: trimmed }]), causes))) {
-        await ctx.sendReply(STEER_NOTICE);
+      const steerEntry = tagCauses(markJournalOrigin([{ type: 'text', text: trimmed }]), causes);
+      if (bridgeOrigin) markBridgeOrigin(steerEntry);
+      if (trySteerEntry(session, steerEntry)) {
+        if (!bridgeOrigin) await ctx.sendReply(STEER_NOTICE);
         return;
       }
       // Queue like a Matrix message would, but marked journal-origin so the
@@ -10364,10 +10378,12 @@ async function journalRouteTextToSession(session, body, { keepRestartBudget = fa
       // right after the first. Refuse the repeat before the entry, the "📨
       // Queued" tile, and the release registration exist for it.
       if (compactJump && hasQueuedCompact(session.queuedMessages)) {
+      if (bridgeOrigin) return;
         await ctx.sendReply('🗜️ /compact is already queued — it will run as soon as this turn finishes.');
         return;
       }
     const entry = tagCauses(markJournalOrigin([{ type: 'text', text: trimmed }]), causes);
+    if (bridgeOrigin) markBridgeOrigin(entry);
     if (compactJump) session.queuedMessages.unshift(entry);
     else session.queuedMessages.push(entry);
     // Post the "📨 Queued" tile (shared notifyQueuedMessage,
@@ -10384,9 +10400,10 @@ async function journalRouteTextToSession(session, body, { keepRestartBudget = fa
       convoId: journalConvoIdFor(session),
       fullText: trimmed,
       compactJump,
+      bridgeOrigin,
       // A typed message can be edited in place while it waits. Not a jumping
       // /compact: it is a command, and holding it would hold the whole queue.
-      editMode: compactJump ? null : 'replace',
+      editMode: compactJump || bridgeOrigin ? null : 'replace',
       editHoldMs: QUEUE_EDIT_HOLD_MS,
       // Codex can't be handed a single queued message while a turn is live:
       // flushQueue interrupts and returns 'deferred', then the turn-end flush
@@ -10653,10 +10670,12 @@ const journalMediaRouter = createJournalMediaRouter({
 // it never re-mirrors. Async: notifyQueuedMessage awaits the tile send, exactly
 // like the text path. `cause` (one cause or a list: an item reply's, or a
 // media message's) rides on the entry for the flush (lib/turn-cause.js).
-async function journalQueueMedia(session, { blocks, mirrorToJournal, preview, fullText, cleanup, source = null, cause = null }) {
+async function journalQueueMedia(session, { blocks, mirrorToJournal, preview, fullText, cleanup, source = null, cause = null, bridgeOrigin = false }) {
   if (!session.queuedMessages) session.queuedMessages = [];
   const entry = tagCauses([...blocks], cause);
   if (!mirrorToJournal) markJournalOrigin(entry);
+  // Bridge-composed text queues silently: the card is for text a person wrote.
+  if (bridgeOrigin) markBridgeOrigin(entry);
   attachQueuedCleanup(entry, cleanup);
   session.queuedMessages.push(entry);
   const ctx = journalSessionCommandCtx(session);
@@ -10674,16 +10693,30 @@ async function journalQueueMedia(session, { blocks, mirrorToJournal, preview, fu
       // Same capability gate as the text path above.
       allowSendOne: session.agent !== AGENT_CODEX,
       source,
+      bridgeOrigin,
       // A tracker reply is edited by holding it, cancelling it (which
       // withdraws the comment) and posting the edited reply as a new
       // comment: the journal comment is the record, so the bridge can't
-      // rewrite it in place. Other media can't be edited.
-      editMode: source?.item_id && source?.comment_id ? 'resend' : null,
+      // rewrite it in place. Other media can't be edited, and neither can
+      // a bridge-composed turn.
+      editMode: !bridgeOrigin && source?.item_id && source?.comment_id ? 'resend' : null,
       editHoldMs: QUEUE_EDIT_HOLD_MS,
     });
   } catch (e) {
     console.warn(`[journal-media] queued-tile notify failed (media is queued): ${e.message}`);
   }
+}
+
+// The secret-request turns ("secret submitted", "request expired") are written
+// by the bridge, so they queue without a send/cancel card.
+function queueSecretTurn(session, { text, preview }) {
+  return journalQueueMedia(session, {
+    blocks: [{ type: 'text', text }],
+    mirrorToJournal: false,
+    preview,
+    fullText: text,
+    bridgeOrigin: true,
+  });
 }
 
 // A user-authored tracker marker (item comment / filed task / close / reopen)
@@ -10722,13 +10755,14 @@ const itemTurnRouter = createItemTurnRouter({
     entry.steerSource = source;
     return trySteerEntry(session, entry);
   },
-  queueText: (session, { text, preview, source, cause = null }) => journalQueueMedia(session, {
+  queueText: (session, { text, preview, source, cause = null, bridgeOrigin = false }) => journalQueueMedia(session, {
     blocks: [{ type: 'text', text }],
     mirrorToJournal: false,
     preview,
     fullText: text,
     source,
     cause,
+    bridgeOrigin,
   }),
   publishNotice: journalPublishNotice,
   // The journal strips any client-supplied transcript, so a voice note on an
@@ -10916,6 +10950,7 @@ async function deliverCoordinatorTurn(session, text) {
       mirrorToJournal: false,
       preview: text.split('\n')[0],
       fullText: text,
+      bridgeOrigin: true,
     });
     return;
   }
@@ -11316,7 +11351,7 @@ async function carryOnConvo(convoId, session, _sendReply, text = 'carry on', res
       journalPublishNotice(convoId, '⚠️ That conversation can no longer be found or resumed.');
       return;
     }
-    await journalRouteTextToSession(target, text, { causes, keepRestartBudget });
+    await journalRouteTextToSession(target, text, { bridgeOrigin: true, causes, keepRestartBudget });
   } catch (e) {
     console.warn(`[inflight] carry-on delivery failed for convo=${convoId}: ${e.message}`);
     journalPublishNotice(convoId, `⚠️ Could not carry on: ${e.message}`);
@@ -11365,12 +11400,12 @@ async function fireTimer(record) {
     // A later line of the text cannot open a frame of its own.
     await journalRouteTextToSession(session,
       `⏰ Reminder #${record.id} — you set this ${formatTimerDuration(Date.now() - record.createdAt)} ago: ${frameSafeBody(String(record.text ?? ''))}`,
-      { causes: mergeCauses([plainCause('reminder'), record.causes]) });
+      { bridgeOrigin: true, causes: mergeCauses([plainCause('reminder'), record.causes]) });
       return;
     }
     const timerLine = `⏰ Timer #${record.id}: sending "${record.text}"`;
     journalPublishNotice(journalConvoIdFor(session), timerLine, noticeMeta('reminder', timerLine));
-    await journalRouteTextToSession(session, record.text, { causes: [plainCause('reminder')] });
+    await journalRouteTextToSession(session, record.text, { bridgeOrigin: true, causes: [plainCause('reminder')] });
   } finally { finishInput?.(); }
 }
 
@@ -11804,13 +11839,13 @@ async function fireAutoResume(roomId, convoId, slot) {
         : '🕒 The usage limit has reset — carrying on automatically.', 'control');
     try {
       if (shouldCompactBefore(session._lastContextTokens, contextWindowForSession(session))) {
-        await journalRouteTextToSession(session, '/compact');
+      await journalRouteTextToSession(session, '/compact', { bridgeOrigin: true });
       }
     // A Coordinator's after_limit_reset carry-on is a carry-on turn, naming
     // the journal's record of it; the bridge's own automatic one names no
     // cause.
     await journalRouteTextToSession(sessions.get(roomId) || session, slot.text || (slot.kind === 'model_recovery' ? BAD_MODEL_RECOVERY_TEXT : AUTO_RESUME_TEXT),
-      { causes: slot.source === 'coordinator' ? [carryOnCause(slot.carryOnId)] : null });
+      { bridgeOrigin: true, causes: slot.source === 'coordinator' ? [carryOnCause(slot.carryOnId)] : null });
     } catch (e) {
       console.warn(`[auto-resume] carry-on failed for ${roomId}: ${e.message}`);
       // A thrown delivery must not lose the carry-on: put the slot back for
@@ -12147,7 +12182,7 @@ async function applyControlSteps(session, steps) {
         // A self-compact's own command (instructions included) is the session
         // talking to itself, not the user coming back: it must not hand
         // restart_session a fresh budget.
-        await journalRouteTextToSession(current, step.command || '/compact', { keepRestartBudget: !!step.command });
+      await journalRouteTextToSession(current, step.command || '/compact', { bridgeOrigin: true, keepRestartBudget: !!step.command });
         startedTurn = true;
       } else if (step.op === 'carry_on') {
       // The planner names what started the turn (lib/session-control.js):
@@ -12413,7 +12448,11 @@ const foreignSessions = createForeignSessions({
   sendText: (session, text) => sendTextToSession(session, text, { skipJournalMirror: true, foreign: true }),
   publishNotice: (convoId, text) => journalPublishNotice(convoId, text),
   isOccupied: sessionOccupiedForForeignTurn,
-  flag: { set: (key) => setForeignFlag(key), clear: (key) => clearForeignFlag(key) },
+  flag: { set: setForeignFlags, clear: clearForeignFlags },
+  // A turn another person started needs the PreToolUse gate. Where Claude
+  // Code's managed settings keep the bridge's own hooks from running and no
+  // managed gate stands in, the turn is not taken (as for Codex).
+  gateBlocked: (session) => (session?.codex ? null : foreignGateBlocked(session)),
   store: {
     load: () => { try { return JSON.parse(fs.readFileSync(FOREIGN_ACTIONS_FILE, 'utf-8')); } catch { return {}; } },
     save: (obj) => atomicWriteFileSync(FOREIGN_ACTIONS_FILE, JSON.stringify(obj), { mode: 0o600 }),
@@ -12433,10 +12472,75 @@ const settleOwedReviews = () => { try { foreignSessions.settleMissedReviews(); }
 setTimeout(settleOwedReviews, 30_000).unref();
 setInterval(settleOwedReviews, 5 * 60_000).unref();
 
+// The two flags a foreign turn arms: one by the bridge's session key (what
+// hooks/foreign-gate.* is baked with at spawn) and one by the Claude session
+// id (all a managed hooks/foreign-gate-managed.mjs knows). The second is
+// remembered per key, so it is cleared even if the id changes mid-turn.
+const claudeFlagKeys = new Map();
+function setForeignFlags(key) {
+  setForeignFlag(key);
+  const id = sessions.get(key)?.claudeSessionId;
+  if (!id) return;
+  const claudeKey = claudeSessionFlagKey(id);
+  try {
+    setForeignFlag(claudeKey, { dir: claudeSessionFlagDir() });
+  } catch (e) {
+    // Both or neither: begin() refuses the turn on a throw, and must not
+    // leave the first flag armed behind it.
+    clearForeignFlag(key);
+    throw e;
+  }
+  claudeFlagKeys.set(key, claudeKey);
+}
+function clearForeignFlags(key) {
+  clearForeignFlag(key);
+  const id = sessions.get(key)?.claudeSessionId;
+  for (const claudeKey of new Set([claudeFlagKeys.get(key), id ? claudeSessionFlagKey(id) : null])) {
+    if (claudeKey) clearForeignFlag(claudeKey, { dir: claudeSessionFlagDir() });
+  }
+  claudeFlagKeys.delete(key);
+}
+
+// The managed-settings policy for the gate (lib/claude-managed-settings.js),
+// read fresh every time: the files are small, and a cached answer could let
+// a call through in the window after an administrator changed them.
+let lastForeignGateReason = null;
+function readForeignGatePolicy() {
+  let reason = null;
+  let bridgeHooksRun = true;
+  try {
+    reason = foreignGateBlockedReason();
+    bridgeHooksRun = managedHookPolicy().bridgeHooksRun;
+  } catch { /* unreadable settings: as if there were none */ }
+  if (reason && reason !== lastForeignGateReason) console.warn(`[foreign] turns started by another person are refused here: ${reason}`);
+  lastForeignGateReason = reason;
+  return { reason, bridgeHooksRun };
+}
+// Why a turn another person started cannot be gated for this session, or
+// null when it can. An interactive session also needs the bridge's own Stop
+// hook to end the turn (iv-mode's turn-end seam), and managed-only hooks keep
+// that from running too.
+function foreignGateBlocked(session = null) {
+  const { reason, bridgeHooksRun } = readForeignGatePolicy();
+  if (reason) return reason;
+  if (session?.iv && !bridgeHooksRun) {
+    return "Claude Code's managed settings run only managed hooks, and an interactive session needs the bridge's own Stop hook to end such a turn";
+  }
+  return null;
+}
+const foreignGateNotice = (person, reason) => `⚠️ Not delivered: a turn started by another person (${person}) needs the bridge's safety gate, and it cannot run on this machine: ${reason}. The message is safe in the room.`;
+
 function injectForeignRoomTurn(session, text, foreign) {
   // Codex has no PreToolUse gate: a Codex session never takes a turn from
   // another person (deliverRoomFrameTo refuses earlier; belt and braces).
   if (session?.codex) return false;
+  // The same for a machine where the gate cannot run: a message already in
+  // the inbox when the managed settings changed is not delivered either.
+  const gateReason = foreignGateBlocked(session);
+  if (gateReason) {
+    journalPublishNotice(journalConvoIdFor(session), foreignGateNotice(foreign.person, gateReason));
+    return false;
+  }
   const turn = foreignSessions.turnFor(foreign.roomId, foreign.person, foreignSessions.cachedContext(foreign.roomId));
   return foreignSessions.inject(session, text, turn);
 }
@@ -12446,6 +12550,11 @@ function injectForeignRoomTurn(session, text, foreign) {
 function deliverForeignItemTurn(session, payload, person) {
   if (session?.codex) {
     journalPublishNotice(journalConvoIdFor(session), `⚠️ Not delivered: a Codex session cannot take a turn started by another person (${person}, on a tracker item). Switch this session to Claude to answer them.`);
+    return;
+  }
+  const gateReason = foreignGateBlocked(session);
+  if (gateReason) {
+    journalPublishNotice(journalConvoIdFor(session), foreignGateNotice(`${person}, on a tracker item`, gateReason).replace('The message is safe in the room.', 'The comment is safe on the item.'));
     return;
   }
   foreignSessions.deliverItemTurn(session, payload, person).catch((e) => {
@@ -12684,6 +12793,11 @@ function deliverRoomFrameTo(room, frame) {
       // another person. The message stays in the room; the user is told.
       if (session.codex) {
         journalPublishNotice(journalConvoIdFor(session), `⚠️ Not delivered: a Codex session cannot take a turn started by another person (${person}). Switch this session to Claude to talk with them.`);
+        return;
+      }
+      const gateReason = foreignGateBlocked(session);
+      if (gateReason) {
+        journalPublishNotice(journalConvoIdFor(session), foreignGateNotice(person, gateReason));
         return;
       }
     }
@@ -13704,12 +13818,7 @@ const secretRequests = createSecretRequests({
   // _resumeOutbox until the resumed TUI is ready to receive it.
   resumeSession: (roomId, notice) => journalResumeRoom(roomId, notice),
   inject: (session, text) => sendToSession(session, [{ type: 'text', text }], { skipJournalMirror: true }),
-  queue: (session, { text, preview }) => journalQueueMedia(session, {
-    blocks: [{ type: 'text', text }],
-    mirrorToJournal: false,
-    preview,
-    fullText: text,
-  }),
+  queue: queueSecretTurn,
   publishNotice: journalPublishNotice,
   // Is the turn naming this path still held for the room? A busy session
   // parks it on queuedMessages (journalQueueMedia above), a just-resumed one
@@ -13795,7 +13904,7 @@ function makeWakeHandler(convoId, text) {
     text,
     findSession: (id) => findSessionByClaudeSessionId(id),
     resumeConvo: (id) => journalResumeConvo(id),
-    routeText: (session, t) => journalRouteTextToSession(session, t),
+    routeText: (session, t) => journalRouteTextToSession(session, t, { bridgeOrigin: true }),
     publishNotice: (message, session) => journalPublishNotice(
       session ? journalConvoIdFor(session) : convoId, message),
     isPending: (session) => !!(session.busy || session.queuedMessages?.length || session._resumeOutbox?.length),
@@ -13815,15 +13924,18 @@ const wakeHandlers = new Map([['', makeWakeHandler(process.env.MATRON_WAKE_CONVO
 // deliverRoomFrameTo with its own binding (lib/transfer-outcome.js), so
 // busy coalescing and the mute apply, and a session the idle reap took
 // down while the upload ran is woken with the line.
+const notifyTransferSession = createTransferOutcomeNotify({
+  getRoom: (roomId) => agentRooms.get(roomId),
+  deliverRoomFrameTo,
+  log: console,
+});
 transferSender = createTransferSender({
   client: transferClient,
   stateFile: TRANSFERS_FILE,
   log: console,
-  notify: createTransferOutcomeNotify({
-    getRoom: (roomId) => agentRooms.get(roomId),
-    deliverRoomFrameTo,
-    log: console,
-  }),
+  notify: notifyTransferSession,
+  // Told only once the journal has created the transfer and its card.
+  onCreated: notifyTransferSession,
 });
 // Room files released to this device: downloaded into the receiving
 // session's inbox (outside any working tree) and announced to every bound
@@ -14406,11 +14518,14 @@ function apiNamedRoom(url, data) {
   return namedSessionRoom({
     roomQuery: url.pathname === '/foreign-check' ? url.searchParams.get('room') : null,
     data,
-    roomForClaudeSession: (id) => {
+    roomForClaudeSession: roomForClaudeSessionId,
+  });
+}
+
+function roomForClaudeSessionId(id) {
+  if (typeof id !== 'string' || !id) return null;
       for (const [roomId, s] of sessions) if (s.claudeSessionId === id) return roomId;
       return null;
-    },
-  });
 }
 
 const apiServer = createServer(async (req, res) => {
@@ -14725,7 +14840,17 @@ const apiServer = createServer(async (req, res) => {
       // before the generic gate below (its body is the hook input, not a
       // tool's). The room is in the query string, baked in at spawn.
       if (url.pathname === '/foreign-check') {
-        const room = url.searchParams.get('room');
+        // A managed gate (hooks/foreign-gate-managed.mjs) names no room: the
+        // session is the one whose Claude session id the hook input carries.
+        const managedCall = !url.searchParams.get('room');
+        const room = url.searchParams.get('room') || roomForClaudeSessionId(data?.session_id);
+        // Where the session's own gate runs, it decides and a managed one
+        // stands aside: two gates would spend one "Allow once" twice.
+        if (managedCall && readForeignGatePolicy().bridgeHooksRun) {
+          res.writeHead(200, { 'Content-Type': 'application/json' });
+          res.end('{}');
+          return;
+        }
         const fSession = room ? sessions.get(room) : null;
         // No such session or no foreign turn on record: nothing for this
         // gate to decide. The hook only asks while a flag exists, so this
@@ -14734,7 +14859,7 @@ const apiServer = createServer(async (req, res) => {
         if (fSession?.foreignTurn) {
           try { d = await foreignSessions.check(fSession, data); } catch { d = { decision: 'deny', reason: 'The foreign-turn check failed, so this call is blocked.' } };
         } else if (room) {
-          clearForeignFlag(room);
+          clearForeignFlags(room);
         }
         if (d.decision === 'deny' && fSession) {
           debug(`[foreign] ${room}: denied ${typeof data?.tool_name === 'string' ? data.tool_name : '?'}`);
@@ -15370,7 +15495,7 @@ const apiServer = createServer(async (req, res) => {
           return;
         }
         const queue = session.queuedMessages;
-        if (!queue || index < 0 || index >= queue.length) {
+        if (!queue || index < 0 || index >= queue.length || isBridgeOrigin(queue[Math.trunc(index)])) {
           res.writeHead(404);
           res.end(JSON.stringify({ error: 'No queued message at that index' }));
           return;
@@ -15402,8 +15527,8 @@ const apiServer = createServer(async (req, res) => {
           runQueuedCleanup(removed);
           if (queueIndex < notifs.length) notifs.splice(queueIndex, 1);
         }
-        const remaining = queue.length;
-        if (remaining === 0) session.queuedMessages = null;
+        const remaining = countUserQueued(session);
+        if (queue.length === 0) session.queuedMessages = null;
         if (session.sendCallback) {
           const msg = remaining === 0
             ? '✕ Cancelled queued message (queue empty)'
@@ -15412,7 +15537,7 @@ const apiServer = createServer(async (req, res) => {
         }
         // The cancelled message may have been held for editing, blocking
         // the rest while the agent sat idle.
-        if (remaining > 0) queueEditHoldReleased(session);
+        if (queue.length > 0) queueEditHoldReleased(session);
         res.writeHead(200);
         res.end(JSON.stringify({ ok: true, remaining }));
 
@@ -16548,7 +16673,7 @@ function drainPreReapCompact(session) {
   if (!mark || !mark.compactPending) return false;
   if (!session.alive || session._autoStopped || controlOccupied(session)) return false;
   mark.compactPending = false;
-  journalRouteTextToSession(session, preReapCompactCommand(), { causes: [plainCause('handoff')] }).catch((e) => {
+  journalRouteTextToSession(session, preReapCompactCommand(), { bridgeOrigin: true, causes: [plainCause('handoff')] }).catch((e) => {
     try { console.warn(`[pre-reap-handoff] compact failed for ${session.roomId}: ${e.message}`); } catch { /* never throw from a seam */ }
   });
   return true;

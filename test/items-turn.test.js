@@ -288,6 +288,21 @@ describe('createItemTurnRouter', () => {
     expect(text.startsWith('📌 (from Design review) Item')).toBe(true);
   });
 
+  it('an agent-authored comment on a busy session queues as bridge-origin (no card)', async () => {
+    const { deps, route } = fixture();
+    await route({ busy: true, journalConvoId: 'c1' }, { payload: { ...base, action: 'commented', agent_comment: true, from_convo_id: 'c2', comment: { id: 'ic', body: 'x', attachments: [] } } }, { username: 'alice' });
+    expect(deps.queueText).toHaveBeenCalledTimes(1);
+    expect(deps.queueText.mock.calls[0][1].bridgeOrigin).toBe(true);
+  });
+
+  it('the user\'s own reply and tap on a busy session queue unmarked (card)', async () => {
+    const { deps, route } = fixture();
+    await route({ busy: true }, { payload: { ...base, action: 'commented', comment: { id: 'ic', body: 'x', attachments: [] } } }, { username: 'alice' });
+    await route({ busy: true }, { payload: { ...base, action: 'commented', comment: { id: 'ic2', body: 'Go', action: 'Go', attachments: [] } } }, { username: 'alice' });
+    expect(deps.queueText).toHaveBeenCalledTimes(2);
+    for (const call of deps.queueText.mock.calls) expect(call[1].bridgeOrigin).toBeFalsy();
+  });
+
   it('queues while busy with a short preview', async () => {
     const { deps, route } = fixture();
     await route({ busy: true }, { payload: { ...base, action: 'commented', comment: { id: 'ic', body: 'x', attachments: [] } } }, { username: 'alice' });

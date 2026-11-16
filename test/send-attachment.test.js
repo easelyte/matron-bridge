@@ -276,8 +276,12 @@ describe('createSendAttachmentHandler', () => {
       const { handler, published, sender, uploadMedia, workdir } = makeRoomFixture({ sessionRoomId: '!room1', role: 'guest', state: 'joined' });
       const res = await handler({ roomId: '!room1', path: 'report.pdf', chat_room_id: 'room-1', caption: 'evidence' });
       expect(res.status).toBe(200);
-      expect(res.body).toMatchObject({ ok: true, status: 'pending_approval', name: 'report.pdf', size: 9 });
-      expect(res.body.note).toMatch(/approval card/);
+      // Only queued: the card does not exist until the background job has
+      // hashed, scanned and created the transfer, so the answer must not say so.
+      expect(res.body).toMatchObject({ ok: true, status: 'queued', name: 'report.pdf', size: 9 });
+      expect(res.body.status).not.toBe('pending_approval');
+      expect(res.body.note).not.toMatch(/has an approval card/i);
+      expect(res.body.note).toMatch(/will be told|you will be told/i);
       expect(uploadMedia).not.toHaveBeenCalled();
       expect(published).toHaveLength(0);
       const realWorkdir = await realpath(workdir);
