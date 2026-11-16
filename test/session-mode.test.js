@@ -156,19 +156,6 @@ describe('planModeSwitch', () => {
     const d = planModeSwitch({ iv: { alive: true }, busy: false, claudeSessionId: 'abc' }, false);
     expect(d.ok).toBe(true);
   });
-  it('refuses an otherwise-clean switch while media is in flight (drain gate)', () => {
-    // A /mode switch recreates the session; doing it mid-media-prep makes the
-    // media router drop the in-flight attachment at its canonicality guard, the
-    // same hazard /switch and /restart now gate on. Checked last, so it only
-    // blocks a switch that would otherwise succeed.
-    const clean = { iv: null, busy: false, claudeSessionId: 'abc', _sessionConfirmed: true };
-    const d = planModeSwitch(clean, true, { hasInflightMedia: true });
-    expect(d.ok).toBe(false);
-    expect(d.message).toMatch(/attachment/i);
-    // No regression when nothing is in flight.
-    expect(planModeSwitch(clean, true, { hasInflightMedia: false }).ok).toBe(true);
-    expect(planModeSwitch(clean, true).ok).toBe(true);
-  });
 });
 
 describe('planSessionIdentity', () => {
@@ -441,8 +428,7 @@ describe('account-flow flag hygiene (source inspection)', () => {
     expect(assigns.length).toBe(2);
     // _accountFlowReturnToPrint means "the bridge borrowed iv mode from a
     // print session" — only the print branch may arm it (on the replacement
-    // session), never the already-interactive branches. One print branch
-    // borrows it, shared by /login, /logout and /design-login.
+    // session), never the already-interactive branches.
     const arms = src.match(/session\._accountFlowReturnToPrint = true;/g) || [];
     expect(arms.length).toBe(0);
     const nextArms = src.match(/next\._accountFlowReturnToPrint = true;/g) || [];

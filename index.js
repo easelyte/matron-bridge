@@ -115,8 +115,8 @@ import {
 } from './lib/mcp-config.js';
 import { aliasLabel, extractModelFlag, isValidModelArg, modelFromEvent, modelOptions, normalizeModelArg, VALID_ALIAS_HINT } from './lib/model-aliases.js';
 import { switchModelInSession, modelButtons, planPrintModelSwitch } from './lib/model-command.js';
-import { INFLIGHT_MEDIA_REPLACE_REFUSAL } from './lib/session-replace-guard.js';
 import { writeSavedMediaFile, makeIdentityAwareCleanup } from './lib/saved-media-file.js';
+import { INFLIGHT_MEDIA_REPLACE_REFUSAL } from './lib/session-replace-guard.js';
 import {
   resolveInteractive,
   resolveModel,
