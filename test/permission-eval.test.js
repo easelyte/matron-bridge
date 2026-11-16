@@ -407,29 +407,14 @@ describe('permission snapshot', () => {
     expect(classifyPermission(snapshot, 'mcp__server__allowed_tool')).toBe('allow');
   });
 
-  it('includes only the exact show_file infrastructure grant when no sources are given', () => {
+  it('is empty and certain when no sources are given', () => {
     const snapshot = buildPermissionSnapshot({ sourcePaths: [] });
 
-    expect(snapshot.mcpAllow).toEqual(['mcp__show-file__show_file']);
+    expect(snapshot.mcpAllow).toEqual([]);
     expect(snapshot.mcpDeny).toEqual([]);
     expect(snapshot.mcpAsk).toEqual([]);
     expect(snapshot.uncertain).toBe(false);
-    // Other tools remain default-gated (fail-closed).
-    expect(classifyPermission(snapshot, 'mcp__show-file__show_file')).toBe('allow');
-    expect(classifyPermission(snapshot, 'mcp__show-file__other')).toBe('default-gated');
-    expect(classifyPermission(snapshot, 'mcp__other__tool')).toBe('default-gated');
-  });
-});
-
-describe('print-session snapshot wiring (source inspection)', () => {
-  const indexSource = readFileSync(path.resolve('index.js'), 'utf8');
-  const printSpawn = indexSource.slice(
-    indexSource.indexOf('function createSession('),
-    indexSource.indexOf('// --- Codex programmatic sessions ---'),
-  );
-
-  it('builds one immutable snapshot per print session (read by both the card hook and the classifier)', () => {
-    expect(printSpawn).toContain('permissionSnapshot: buildPermissionSnapshot({ workdir: cwd })');
-    expect((printSpawn.match(/permissionSnapshot[,:]/g) || [])).toHaveLength(1);
+    // No hardcoded default grant: an unknown tool is default-gated (fail-closed).
+    expect(classifyPermission(snapshot, 'mcp__show-file__show_file')).toBe('default-gated');
   });
 });

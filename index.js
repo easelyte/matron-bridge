@@ -156,6 +156,7 @@ import {
   setupCodexWatcherForSession,
 } from './lib/codex-watcher-setup.js';
 import { detectCodexBinary, launchWithCodexSinkEnv, pruneStaleCodexSinks, removeCodexSinkForSession } from './lib/codex-paths.js';
+import { hookEntry } from './lib/hook-command.js';
 import { liveLogDir, liveLogPath as liveLogPathFor, openOwnLiveLog } from './lib/live-log-dir.js';
 import { killProcessTree } from './lib/process-kill.js';
 import { processTableCommand, readProcessTableStrict } from './lib/process-table.js';
@@ -186,9 +187,6 @@ import { ivUploadDir, ivUploadAnnotation, ivUploadsRoot } from './lib/iv-uploads
 import { matronFilesDir, matronFilesRoot, sessionDownloadDir } from './lib/matron-files.js';
 import { parseUsageLimits, formatLimits, createUsageMissLogger, usageFetchTimeoutMs } from './lib/usage-limits.js';
 import { resolveSpawnCwd, attachSpawnErrorHandler, failedSpawnProcess } from './lib/spawn-guard.js';
-import { withForkPrintSettings } from './lib/session-settings.js';
-import { hookEntry } from './lib/hook-command.js';
-import { buildPermissionSnapshot, classifyPermission } from './lib/permission-eval.js';
 import { readSessionSummary, listSessionSummaries, listSessionIdsByMtime, pathExists } from './lib/session-summary.js';
 import {
   extractForceFlag,
@@ -233,6 +231,7 @@ import { DEFAULT_EDIT_HOLD_MS } from './lib/queue-edit-hold.js';
 import { handlePickerValue, isResumeConvoId } from './lib/picker-dispatch.js';
 import { createPermissionRegistry, renderPermissionCard, permissionInputRefusal, permissionButtons, permissionSpawnArgs, resolveBypassMode, resolvePermissionTimeoutMs, isRootOutsideSandbox, guardRootBypass, ROOT_BYPASS_WARNING, resolvePermissionRequest, resolvePermissionCheck, buildPrintSessionSettings, foreignGateEntry, listSessionGrants, revokeSessionGrant } from './lib/permission-prompt.js';
 import { createPlanApprovalItems } from './lib/plan-approval-items.js';
+import { buildPermissionSnapshot } from './lib/permission-eval.js';
 import { createSlowToolNotices, renderSlowToolNotice, slowToolNoticeSummary, resolveSlowToolNoticeMs, resolveSlowToolReminderMs } from './lib/slow-tool-notice.js';
 import { createJournalInputConsumer, resolvePromptChoice, resolvePromptChoices } from './lib/journal-input-router.js';
 import { createAgentRooms, INVITE_TTL_MS } from './lib/agent-rooms.js';
@@ -246,14 +245,6 @@ import { unmuteChoiceValue, ROOM_MUTE_ACTION_ID, ROOM_MUTE_KIND } from './lib/ro
 import { quotedField, peerField, frameSafeBody, PEER_NAME_MAX } from './lib/peer-text.js';
 import { createRoomReplyWaiters } from './lib/room-reply-waiters.js';
 import { createAgentChatHandlers, probeJoinedRoom, roomAgentLabel } from './lib/agent-chat.js';
-import {
-  auditPermissionDecision,
-  createPermissionDecisionBodyCollector,
-  createPermissionSeams,
-  createRequestPermissionDecision,
-  handlePermissionDecisionRoute,
-  PERMISSION_DECISION_TIMEOUT_MS,
-} from './lib/permission-registry.js';
 import { createJournalMediaRouter, chooseNarration } from './lib/journal-media.js';
 import { createItemTurnRouter } from './lib/items-turn.js';
 import { createItemAttachmentSaver } from './lib/item-attachments.js';
@@ -2977,7 +2968,6 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   if (rootDowngraded) console.warn(`[permissions] ${roomId}: ${ROOT_BYPASS_WARNING}`);
   const effectiveMcpExtras = effectiveExtras(mcpExtras, DEFAULT_MCP_EXTRAS);
   const shareEnabled = effectiveMcpExtras.includes('share');
-  const permissionToken = randomUUID();
   // Pinned here, at the trusted boundary, for the same reason as
   // showFilePinnedRoots below — but scoped to the workdir alone, since a
   // viewer link's scope is the session's workdir, not the artifact roots.
@@ -3019,11 +3009,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     '--mcp-config', mcpConfigPathFor(effectiveMcpExtras),
     // Additive inline settings: the bridge's hooks (and, when gated, the MCP
     // permission gate hook) merge with the on-disk settings, which all load.
-    // Add the permission-card hook on bypass sessions (lib/session-settings.js).
-    '--settings', JSON.stringify(withForkPrintSettings(
-      buildPrintSessionSettings({ bypass: bypassMode, hooksDir: path.join(__dirname, 'hooks'), apiPort: API_PORT, roomId, foreignFlag: foreignFlagPath(roomId), apiHeaderFile: apiHeaderFileFor(roomId) }),
-      { bypass: bypassMode },
-    )),
+    '--settings', JSON.stringify(buildPrintSessionSettings({ bypass: bypassMode, hooksDir: path.join(__dirname, 'hooks'), apiPort: API_PORT, roomId, foreignFlag: foreignFlagPath(roomId), apiHeaderFile: apiHeaderFileFor(roomId) })),
   ];
   const printModel = options.model === null
     ? undefined
@@ -3050,7 +3036,8 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   // stripped, read-proxy header file, node bin dir on PATH, per-session
   // SHOW_FILE_TOKEN.
   const spawnEnv = buildClaudeSpawnEnv({
-    mode: 'print',
+    coordinator: options.coordinator === true,
+    roleKnown: options.roleKnown === true,
     roomId,
     apiPort: API_PORT,
     journalProxyHeaderFile: JOURNAL_PROXY_HEADER_FILE,
@@ -3058,9 +3045,6 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     pluginCacheDir: PLUGIN_CACHE_DIR,
     showBashOutput: showBashOutputAtSpawn,
     showFileToken,
-    permissionToken,
-    coordinator: options.coordinator === true,
-    roleKnown: options.roleKnown === true,
   });
 
   const proc = launchWithCodexSinkEnv({
@@ -3101,7 +3085,6 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     ...(showFileToken ? { showFileToken } : {}),
     showFilePinnedRoots,
     viewerRootIdentities,
-    permissionToken,
     _showFileInFlight: 0,
     mcpExtras,
     bypassMode: requestedBypassMode,
@@ -3172,13 +3155,6 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     lastSummaryMsgCount: 0, // chatHistory index the summary pass has consumed through (persisted)
     lastRosterText: '',     // last ROSTER paragraph — preamble for the next incremental pass (persisted)
   };
-
-  session.requestPermissionDecision = createRequestPermissionDecision(session, {
-    journalPublisher,
-    pendingPermissionDecisions,
-    journalConvoIdFor,
-    timeoutMs: PERMISSION_DECISION_TIMEOUT_MS,
-  });
 
   // A spawn 'error' with no listener is fatal to the whole bridge (crash-loop
   // of 2026-07-16). Cleanup and the 3-restart cap stay in proc.on('close'),
@@ -4027,7 +4003,8 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
 
   // Child env (lib/spawn-env.js): same shape as the print spawn.
   const interactiveEnv = buildClaudeSpawnEnv({
-    mode: 'iv',
+    coordinator: options.coordinator === true,
+    roleKnown: options.roleKnown === true,
     roomId,
     apiPort: API_PORT,
     journalProxyHeaderFile: JOURNAL_PROXY_HEADER_FILE,
@@ -4035,8 +4012,6 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     pluginCacheDir: PLUGIN_CACHE_DIR,
     showBashOutput: showBashOutputAtSpawn,
     showFileToken,
-    coordinator: options.coordinator === true,
-    roleKnown: options.roleKnown === true,
   });
 
   debug(`Spawning interactive claude session ${sessionId} in ${cwd}`);
@@ -10046,12 +10021,6 @@ function journalEchoToRoom(session, plain, html) {
   sendToRoom(session.roomId, plain, html, { skipJournalMirror: true }).catch(() => {});
 }
 
-function journalEchoPromptAnswer(session, username, label) {
-  journalEchoToRoom(session,
-    `📱 ${username} answered: ${label}`,
-    `📱 <b>${escapeHtml(username)} answered:</b> ${escapeHtml(label)}`);
-}
-
 // ctx for a session-scoped command dispatch (Deliverable 1/2, journal side):
 // replies go through the NORMAL sendToRoom for the session's room id,
 // which publishes them into the session's journal convo. `sender` is who
@@ -11165,7 +11134,7 @@ function journalOnPromptReply(session, answer, { username, seq, convoId: replyCo
     journalPublishNotice(journalConvoIdFor(session), "Nothing to answer right now — there's no open prompt in this session.");
     return;
   }
-  journalEchoPromptAnswer(session, username, label);
+  journalEchoToRoom(session, `📱 ${username} answered: ${label}`, `📱 <b>${escapeHtml(username)} answered:</b> ${escapeHtml(label)}`);
 }
 
 function journalIsControlConvo(convoId) {
@@ -11271,28 +11240,6 @@ function journalResumeConvo(convoId, noticeText = JOURNAL_RESUME_NOTICE) {
     return null;
   } finally { finishInput?.(); }
 }
-
-// Canonical HTTP-side permission registry. Keys are the full permission tuple with
-// a NUL separator (`convo_id + "\0" + tool_use_id`);
-// journalConvoIdFor(session) and inbound
-// frame.convo_id provide the same stable conversation identity without
-// plumbing a transport-specific session_id through the router.
-const pendingPermissionDecisions = new Map();
-const permissionSeams = createPermissionSeams({ pendingPermissionDecisions });
-
-function resolveJournalPermissionReply(key, decision, { username } = {}) {
-  const pending = pendingPermissionDecisions.get(key);
-  const finalized = permissionSeams.resolvePermissionReply(key, decision, { username });
-  if (!finalized || finalized.source !== 'operator') return false;
-  const label = finalized.decision === 'allow' ? 'Allow' : 'Deny';
-  journalEchoPromptAnswer(findSessionByClaudeSessionId(pending.convoId), username, label);
-  return true;
-}
-
-// Assembled once and invoked from journalHandleInboundEvent (the `function`
-// declaration wired into createJournalPublisher near the top of this file —
-// hoisted, so that forward reference is safe). Permission registry operations
-// come from the same factory exercised by the router contract tests.
 
 // The same wake, addressed by ROOM rather than by convo — what an inbound
 // join_request has to work with, since a room record names its owning session
@@ -13360,8 +13307,6 @@ const journalInputConsumer = createJournalInputConsumer({
     });
   },
   routePromptReply: journalOnPromptReply,
-  ...permissionSeams,
-  resolvePermissionReply: resolveJournalPermissionReply,
   // The router calls resumeSessionForConvo(convoId, {username}), but
   // journalResumeConvo's 2nd param is the notice TEXT: drop the ctx here, or it
   // is published as `{"body":{"username":…}}` after every message that wakes a
@@ -13563,7 +13508,6 @@ function journalEvictConvoInput(session) {
     journalPublishNotice(convoId, formatRoomDeliveryFailedNotice(strandedRoomMessages));
   }
   if (convoId) {
-    permissionSeams.finalizePendingPermissionsForConvo(convoId, 'session ended');
     journalInputConsumer.evictConvo(convoId, {
       clearQueue: () => {
         for (const entry of session.queuedMessages || []) runQueuedCleanup(entry);
@@ -14755,15 +14699,8 @@ const apiServer = createServer(async (req, res) => {
   let body = '';
   let bodyBytes = 0;
   let showFileBodyTooLarge = false;
-  const permissionDecisionBody = url.pathname === '/permission-decision'
-    ? createPermissionDecisionBodyCollector({ res, auditPermissionDecisionFn: auditPermissionDecision })
-    : null;
   req.on('data', chunk => {
-    if (showFileBodyTooLarge || permissionDecisionBody?.tooLarge) return;
-    if (permissionDecisionBody) {
-      permissionDecisionBody.append(chunk);
-      return;
-    }
+    if (showFileBodyTooLarge) return;
     bodyBytes += chunk.length;
     if (url.pathname === '/show-file' && bodyBytes > 64 * 1024) {
       showFileBodyTooLarge = true;
@@ -14783,23 +14720,7 @@ const apiServer = createServer(async (req, res) => {
     body += chunk;
   });
   req.on('end', async () => {
-    if (showFileBodyTooLarge || permissionDecisionBody?.tooLarge) return;
-
-    if (url.pathname === '/permission-decision') {
-      handlePermissionDecisionRoute({
-        body: permissionDecisionBody.body,
-        res,
-        sessions,
-        pendingPermissionDecisions,
-        classifyPermissionFn: classifyPermission,
-        journalConvoIdForFn: journalConvoIdFor,
-        evictPermissionSeq: (key, convoId) => journalInputConsumer.evictPermissionSeq(key, convoId),
-        auditPermissionDecisionFn: auditPermissionDecision,
-        timeoutMs: PERMISSION_DECISION_TIMEOUT_MS,
-        permissionToken: req.headers['x-matron-permission-token'],
-      });
-      return;
-    }
+    if (showFileBodyTooLarge) return;
 
     if (url.pathname === '/show-file') {
       const { status, headers, body: resBody } = await processShowFile({
