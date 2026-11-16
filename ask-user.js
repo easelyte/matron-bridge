@@ -27,9 +27,9 @@ import { PERSON_MAX } from './lib/person-ref.js';
 import { formatUnseenList, formatUnseenMine, formatFlagAck } from './lib/unseen-tools.js';
 import { formatRoutineList, formatRoutineUpdateAck, formatRoutineRunAck, formatRoutineCreateAck, formatRoutineDeleteAck } from './lib/routines-tools.js';
 import { formatBriefingPublishAck } from './lib/briefings-tools.js';
-import { shouldRegister } from './lib/tool-roles.js';
 import { formatTimelineReadAck, formatTimelineWriteAck } from './lib/timeline-tools.js';
 import { readApiHeaderFile, explainUnauthorized } from './lib/api-header-file.js';
+import { shouldRegister } from './lib/tool-roles.js';
 
 // Route to whichever bridge spawned us: explicit BRIDGE_API_URL wins, else the
 // per-session MATRON_BRIDGE_API_PORT exported by the bridge at spawn (journal=9812,
@@ -1912,9 +1912,6 @@ server.tool(
   { name: z.string().describe('The memory name') },
   async (args) => callMemory('delete', args, formatDeleteAck),
 );
-
-// One boot line so the filter can be validated before it is enabled: with no
-// role set, "would hide" is what a worker session would lose.
 
 const transport = new StdioServerTransport();
 await server.connect(transport);
