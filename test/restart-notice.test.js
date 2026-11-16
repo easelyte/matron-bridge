@@ -87,7 +87,7 @@ function wiredSetup(backend, available = true) {
     sendToRoom: noop, markdownToHtml: text => text, escapeHtml: text => text,
     sendButtonMessage: noop, DEFAULT_WORKDIR: '.', planItems: { reconcileRestored: noop },
     setupSubagentWatcher: noop, postRootBypassWarning: noop,
-    pinViewerRootIdentities: () => [], expandHome: value => value, codexDefaultModelNow: () => null, codexDefaultEffortNow: () => null,
+    expandHome: value => value, codexDefaultModelNow: () => null, codexDefaultEffortNow: () => null,
     effectiveExtras: extras => extras, DEFAULT_MCP_EXTRAS: [], CODEX_APP_SERVER: false,
     codexCoordinatorOptions: () => ({}), CODEX_BRIDGE_PROMPT: '', COORDINATOR_BLOCK: '',
     CODEX_SANDBOX_MODE: '', CODEX_NETWORK_ACCESS: false, memoryBlockNow: noop, noticesBlockNow: noop,

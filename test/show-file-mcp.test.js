@@ -4,7 +4,6 @@ import { createShowFileHandler } from '../lib/show-file-mcp-adapter.js';
 const DENIAL_REASONS = [
   'sensitive',
   'outside-scope',
-  'path-race',
   'too-large',
   'not-a-file',
   'unreadable',
@@ -98,5 +97,19 @@ describe('show-file MCP adapter', () => {
     const result = await handleShowFile({ path: '/work/chart.png' });
 
     expect(result.content[0].text).toBe('Could not show chart.png: saturated (Retry-After: 1)');
+  });
+
+  it('tells the agent when the file was already shown and nothing was posted', async () => {
+    const fetchImpl = vi.fn().mockResolvedValue(new Response(
+      JSON.stringify({ ok: true, media_id: 'm1', kind: 'image', deduped: true, deduped_at: Date.UTC(2026, 0, 2, 3, 4, 5) }),
+      { status: 200, headers: { 'Content-Type': 'application/json' } },
+    ));
+    const handleShowFile = createShowFileHandler({ bridgeApi: 'http://bridge.test', token: 't', fetchImpl });
+
+    const result = await handleShowFile({ path: '/work/chart.png' });
+
+    expect(result.content[0].text).toContain('Already shown to operator at 2026-01-02T03:04:05.000Z');
+    expect(result.content[0].text).toContain('Not posted again');
+    expect(result.content[0].text).not.toMatch(/^Shown to operator/);
   });
 });

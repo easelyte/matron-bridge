@@ -4,6 +4,8 @@ import {
   parseShowFileUploadTimeoutMs,
   shareAgentMedia,
 } from '../lib/show-file.js';
+import { DEDUP_MAX_BYTES } from '../lib/show-file.js';
+import { createMediaDedupLedger } from '../lib/media-dedup-ledger.js';
 
 class MockFileLinkDenied extends Error {
   constructor(reason) {
@@ -71,7 +73,6 @@ describe('shareAgentMedia', () => {
       realPath: '/work/chart.PNG',
       size: content.length,
       sha256: 'sha-abc',
-      deduped: false,
     });
   });
 
@@ -188,133 +189,10 @@ describe('shareAgentMedia', () => {
   });
 });
 
-describe('shareAgentMedia dedup ledger', () => {
-  function makeLedger() {
-    const store = new Map();
-    return {
-      get: vi.fn((k) => store.get(k)),
-      set: vi.fn((k, v) => { store.set(k, v); }),
-      _store: store,
-    };
-  }
-
-  it('records the publish in the ledger on the first share', async () => {
-    const deps = makeDeps();
-    const dedupLedger = makeLedger();
-
-    const result = await share(deps, { token: 'tok-1', deps: { ...deps, dedupLedger } });
-
-    expect(deps.publish).toHaveBeenCalledTimes(1);
-    expect(dedupLedger.set).toHaveBeenCalledTimes(1);
-    expect(dedupLedger.set.mock.calls[0][1]).toEqual({ mediaId: 'media-123', kind: 'image' });
-    expect(result).toEqual(expect.objectContaining({ ok: true, media_id: 'media-123', deduped: false }));
-  });
-
-  it('skips the re-publish and returns the prior media_id on an identity match', async () => {
-    const dedupLedger = makeLedger();
-    const first = makeDeps();
-    await share(first, { token: 'tok-1', deps: { ...first, dedupLedger } });
-
-    // Second call: same token/realPath/sha256/caption → a fresh upload, but the
-    // publish must be suppressed and the prior media_id returned.
-    const second = makeDeps();
-    second.uploadMedia.mockResolvedValue({
-      media_id: 'media-DUPLICATE', content_type: 'image/png', size: 10, sha256: 'sha-abc',
-    });
-
-    const result = await share(second, { token: 'tok-1', deps: { ...second, dedupLedger } });
-
-    expect(second.uploadMedia).toHaveBeenCalledTimes(1); // upload still happens
-    expect(second.publish).not.toHaveBeenCalled();       // publish suppressed
-    expect(result).toEqual(expect.objectContaining({
-      ok: true,
-      media_id: 'media-123', // the PRIOR id, not media-DUPLICATE
-      kind: 'image',
-      deduped: true,
-    }));
-  });
-
-  it('does NOT dedup when the caption differs (intentional re-show is preserved)', async () => {
-    const dedupLedger = makeLedger();
-    const first = makeDeps();
-    await share(first, { token: 'tok-1', caption: 'v1', deps: { ...first, dedupLedger } });
-
-    const second = makeDeps();
-    const result = await share(second, { token: 'tok-1', caption: 'v2 — updated', deps: { ...second, dedupLedger } });
-
-    expect(second.publish).toHaveBeenCalledTimes(1);
-    expect(result).toEqual(expect.objectContaining({ deduped: false }));
-  });
-
-  it('does NOT dedup across different tokens (per-session scope)', async () => {
-    const dedupLedger = makeLedger();
-    const first = makeDeps();
-    await share(first, { token: 'tok-A', deps: { ...first, dedupLedger } });
-
-    const second = makeDeps();
-    const result = await share(second, { token: 'tok-B', deps: { ...second, dedupLedger } });
-
-    expect(second.publish).toHaveBeenCalledTimes(1);
-    expect(result).toEqual(expect.objectContaining({ deduped: false }));
-  });
-
-  it('still dedups via a locally-computed hash when the journal omits sha256 (version skew)', async () => {
-    const dedupLedger = makeLedger();
-    const content = Buffer.from('same-bytes');
-
-    const first = makeDeps({ content });
-    first.uploadMedia.mockResolvedValue({ media_id: 'media-partial-1' }); // no sha256
-    const r1 = await share(first, { token: 'tok-1', deps: { ...first, dedupLedger } });
-    expect(first.publish).toHaveBeenCalledTimes(1);
-    expect(dedupLedger.set).toHaveBeenCalledTimes(1); // recorded via local content hash
-    expect(r1).toEqual(expect.objectContaining({ deduped: false }));
-
-    const second = makeDeps({ content });
-    second.uploadMedia.mockResolvedValue({ media_id: 'media-partial-2' }); // no sha256, same bytes
-    const r2 = await share(second, { token: 'tok-1', deps: { ...second, dedupLedger } });
-    expect(second.publish).not.toHaveBeenCalled(); // suppressed on identical bytes
-    expect(r2).toEqual(expect.objectContaining({ media_id: 'media-partial-1', deduped: true }));
-  });
-
-  it('dedups an empty-string caption against an absent caption (payload-equivalent)', async () => {
-    const dedupLedger = makeLedger();
-    const first = makeDeps();
-    await share(first, { token: 'tok-1', caption: '', deps: { ...first, dedupLedger } });
-
-    const second = makeDeps();
-    const result = await share(second, { token: 'tok-1', caption: undefined, deps: { ...second, dedupLedger } });
-
-    expect(second.publish).not.toHaveBeenCalled(); // '' and absent publish identically → one identity
-    expect(result).toEqual(expect.objectContaining({ media_id: 'media-123', deduped: true }));
-  });
-
-  it('fails open and publishes normally when the ledger throws', async () => {
-    const dedupLedger = {
-      get: vi.fn(() => { throw new Error('ledger get boom'); }),
-      set: vi.fn(() => { throw new Error('ledger set boom'); }),
-    };
-    const deps = makeDeps();
-
-    const result = await share(deps, { token: 'tok-1', deps: { ...deps, dedupLedger } });
-
-    expect(deps.publish).toHaveBeenCalledTimes(1);
-    expect(result).toEqual(expect.objectContaining({ ok: true, media_id: 'media-123' }));
-  });
-
-  it('behaves exactly as before when no ledger is injected', async () => {
-    const deps = makeDeps();
-    const result = await share(deps, { token: 'tok-1' }); // no dedupLedger in deps
-
-    expect(deps.publish).toHaveBeenCalledTimes(1);
-    expect(result).toEqual(expect.objectContaining({ ok: true, media_id: 'media-123' }));
-  });
-});
-
 describe('denialToStatus', () => {
   it.each([
     ['sensitive', 403],
     ['outside-scope', 403],
-    ['path-race', 403],
     ['too-large', 413],
     ['not-a-file', 404],
     ['unreadable', 404],
@@ -348,5 +226,90 @@ describe('parseShowFileUploadTimeoutMs', () => {
 
     expect(parseShowFileUploadTimeoutMs('45000', warn)).toBe(45000);
     expect(warn).not.toHaveBeenCalled();
+  });
+});
+
+describe('shareAgentMedia retry dedup', () => {
+  const run = (deps, overrides = {}) => share(deps, { token: 'tok-1', ...overrides });
+
+  it('records the first publish and returns the same media_id on a retry without uploading again', async () => {
+    const dedupLedger = createMediaDedupLedger();
+    const first = makeDeps();
+    const r1 = await run({ ...first, dedupLedger });
+    expect(r1).toMatchObject({ ok: true, media_id: 'media-123' });
+    expect(r1.deduped).toBeUndefined();
+
+    const second = makeDeps();
+    const r2 = await run({ ...second, dedupLedger });
+    expect(r2).toMatchObject({ ok: true, media_id: 'media-123', kind: 'image', sha256: 'sha-abc', deduped: true });
+    // Neither a second stored blob nor a second bubble.
+    expect(second.uploadMedia).not.toHaveBeenCalled();
+    expect(second.publish).not.toHaveBeenCalled();
+  });
+
+  it('does not dedup when the caption, content, or session token differs', async () => {
+    const dedupLedger = createMediaDedupLedger();
+    await run({ ...makeDeps(), dedupLedger });
+
+    for (const [overrides, content] of [
+      [{ caption: 'new caption' }, undefined],
+      [{}, Buffer.from('different bytes')],
+      [{ token: 'tok-2' }, undefined],
+    ]) {
+      const deps = makeDeps(content ? { content } : {});
+      const r = await run({ ...deps, dedupLedger }, overrides);
+      expect(r.deduped).toBeUndefined();
+      expect(deps.uploadMedia).toHaveBeenCalledOnce();
+      expect(deps.publish).toHaveBeenCalledOnce();
+    }
+  });
+
+  it('reports when the earlier publish happened', async () => {
+    let t = 5000;
+    const dedupLedger = createMediaDedupLedger({ now: () => t });
+    await run({ ...makeDeps(), dedupLedger });
+    t = 9000;
+    const r = await run({ ...makeDeps(), dedupLedger });
+    expect(r).toMatchObject({ deduped: true, deduped_at: 5000 });
+  });
+
+  it('skips dedup (and the hash) for files over the size cap', async () => {
+    const dedupLedger = createMediaDedupLedger();
+    const big = Buffer.alloc(DEDUP_MAX_BYTES + 1);
+    await run({ ...makeDeps({ content: big }), dedupLedger });
+    const again = makeDeps({ content: big });
+    const r = await run({ ...again, dedupLedger });
+    expect(r.deduped).toBeUndefined();
+    expect(again.uploadMedia).toHaveBeenCalledOnce();
+    expect(dedupLedger.size).toBe(0);
+  });
+
+  it('treats an empty and a missing caption as the same publish', async () => {
+    const dedupLedger = createMediaDedupLedger();
+    await run({ ...makeDeps(), dedupLedger }, { caption: '' });
+    const r = await run({ ...makeDeps(), dedupLedger }, { caption: undefined });
+    expect(r.deduped).toBe(true);
+  });
+
+  it('does not record a failed upload, so the retry uploads again', async () => {
+    const dedupLedger = createMediaDedupLedger();
+    const failing = makeDeps();
+    failing.uploadMedia.mockResolvedValue(null);
+    expect(await run({ ...failing, dedupLedger })).toEqual({ denied: 'upload-failed' });
+    const retry = makeDeps();
+    const r = await run({ ...retry, dedupLedger });
+    expect(r.deduped).toBeUndefined();
+    expect(retry.publish).toHaveBeenCalledOnce();
+  });
+
+  it('fails open: a broken ledger warns and the publish proceeds', async () => {
+    const dedupLedger = { get: () => { throw new Error('boom'); }, set: () => { throw new Error('boom'); } };
+    const warn = vi.fn();
+    const deps = makeDeps();
+    const r = await run({ ...deps, dedupLedger, warn });
+    expect(r).toMatchObject({ ok: true });
+    expect(r.deduped).toBeUndefined();
+    expect(deps.publish).toHaveBeenCalledOnce();
+    expect(warn).toHaveBeenCalled();
   });
 });

@@ -3,7 +3,7 @@ import fs from 'node:fs';
 import { formatTuiCueMessage } from '../lib/tui-cue-message.js';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
-import { classifyScreen, stripAnsi, stripInputBox, isIdleReadyScreen, PromptDetector, looksLikeUnclassifiedMenu, extractPreamble, preambleMatchesText, stripQueuedWidget, loginSuccessNearAutoEnterCue, extractUrls, unwrapScreenUrls, newUrlsAgainst, dropCutUrls } from '../lib/prompt-detector.js';
+import { classifyScreen, stripAnsi, stripInputBox, isIdleReadyScreen, PromptDetector, looksLikeUnclassifiedMenu, extractPreamble, preambleMatchesText, stripQueuedWidget, loginSuccessNearAutoEnterCue, extractUrls, unwrapScreenUrls, newUrlsAgainst, dropCutUrls, isCutOf } from '../lib/prompt-detector.js';
 
 const __dir = path.dirname(fileURLToPath(import.meta.url));
 
@@ -1128,7 +1128,7 @@ describe('PromptDetector', () => {
           const fresh = newUrlsAgainst(surfaced, all);
           if (fresh.length === 0 && !hasInputCue) return;
           for (const u of fresh) {
-            for (const v of [...surfaced]) if (u.startsWith(v)) surfaced.delete(v);
+            for (const v of [...surfaced]) if (isCutOf(v, u)) surfaced.delete(v);
             surfaced.add(u);
           }
           const message = formatTuiCueMessage(unwrapped, [...fresh, ...all.filter(u => !fresh.includes(u))], { hasNewUrls: fresh.length > 0 });
@@ -1192,6 +1192,18 @@ describe('PromptDetector', () => {
       await settle(det, screenFor(full));
       await settle(det, screenFor(full.slice(0, 100)));
       expect(urlsSent(relay)).toEqual([full]);
+    });
+
+    it('treats a short URL that prefixes a sent one as a different link', () => {
+      const a = 'https://example.test/path?x=1';
+      expect(newUrlsAgainst([a], ['https://example.test/path'])).toEqual(['https://example.test/path']);
+      expect(dropCutUrls([a, 'https://example.test/path'])).toEqual([a, 'https://example.test/path']);
+    });
+
+    it('joins a wrapped tail that contains : @ ! ( ) , ;', () => {
+      const url = 'https://example.test/cb?next=a:b@c!d(e),f;g';
+      const screen = ['Open:', url.slice(0, 30), url.slice(30), 'Paste code here >'].join('\n');
+      expect(unwrapScreenUrls(screen)).toContain(url);
     });
 
     it('compares the unwrapped URL when the TUI wraps it at terminal width', async () => {

@@ -109,6 +109,44 @@ describe('SubagentWatcher.repoint (cwd rehome / EnterWorktree)', () => {
     w._scan();
     expect(starts).toContain('new');
   });
+
+  it('keeps an in-flight card updating when its transcript moves with the session dir', async () => {
+    const sessionId = `sid-${Math.random().toString(36).slice(2)}`;
+    const A = uniqueWorkdir('liveA');
+    const B = uniqueWorkdir('liveB');
+    const dirA = mkSubagentsDir(A, sessionId);
+    const dirB = mkSubagentsDir(B, sessionId);
+    const line = text => JSON.stringify({ type: 'assistant', message: { model: 'm', usage: {}, content: [{ type: 'text', text }] } }) + '\n';
+    const fileA = path.join(dirA, 'agent-live.jsonl');
+    fs.writeFileSync(fileA, line('before the move'));
+
+    const w = new SubagentWatcher({ workdir: A, sessionId });
+    watchers.push(w);
+    const events = [];
+    w.on('subagent-event', p => events.push(p.agentId));
+    w._scan();
+    expect(w.tails.has('agent-live.jsonl')).toBe(true);
+
+    // The session directory moves; the running subagent keeps appending there.
+    const fileB = path.join(dirB, 'agent-live.jsonl');
+    fs.renameSync(fileA, fileB);
+    expect(w.repoint(B)).toBe(true);
+    const before = events.length;
+    fs.appendFileSync(fileB, line('after the move'));
+
+    const deadline = Date.now() + 5000;
+    while (events.length <= before && Date.now() < deadline) await new Promise(r => setTimeout(r, 25));
+    expect(events.length).toBeGreaterThan(before);
+    // Only the new line is delivered; the earlier one is not replayed.
+    expect(events.length - before).toBe(1);
+  });
+});
+
+describe('stream-event wiring for repoint', () => {
+  it('re-points the watcher when an event carries a new cwd', () => {
+    const src = fs.readFileSync(new URL('../index.js', import.meta.url), 'utf-8');
+    expect(src).toMatch(/event\.cwd !== session\._lastWatcherCwd\) \{\s+session\._lastWatcherCwd = event\.cwd;\s+if \(session\.subagentWatcher\.repoint\(event\.cwd\)\)/);
+  });
 });
 
 // A subagent RESUMED via SendMessage comes back to life under its ORIGINAL
