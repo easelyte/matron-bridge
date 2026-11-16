@@ -14,7 +14,6 @@ journal-cursor.json
 .env.bak*
 
 node_modules
-run-state-outbox.json
 
 # Agent scratch (PR bodies, screenshots): never committed
 .superpowers/

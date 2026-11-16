@@ -179,8 +179,6 @@ import { createQueuedReleaseRetry } from './lib/queued-release-retry.js';
 import { beginTurn, beginOrJoinTurn, joinHeldTurn, endTurn, mergeIntoTurn, mergeCauses, causesForAsk, userMessageCause, itemCause, plainCause, spawnOutcomeCause, carryOnCause, roomMessageCause, queueCauses, tagCauses } from './lib/turn-cause.js';
 import { createSubagentRunningStore } from './lib/subagent-running-store.js';
 import { selectStrandedChildren, strandedRepairFrames } from './lib/subagent-reconcile.js';
-import { createSessionStateLifecycle } from './lib/session-state-lifecycle.js';
-import { createRunStateOutbox } from './lib/run-state-outbox.js';
 import { journalReemitCodexOutcomes } from './lib/codex-convos.js';
 import { formatSubagentToolBody, subagentToolStep } from './lib/subagent-tool-format.js';
 import { ivUploadDir, ivUploadAnnotation, ivUploadsRoot } from './lib/iv-uploads.js';
@@ -1325,14 +1323,6 @@ function noteLoginExpired(session, key = null) {
 const JOURNAL_CURSOR_FILE = process.env.JOURNAL_CURSOR_FILE
   ? path.resolve(expandHome(process.env.JOURNAL_CURSOR_FILE))
   : path.join(__dirname, 'journal-cursor.json');
-// Unconfirmed run-state transitions (see lib/run-state-outbox.js). Derived exactly like
-// JOURNAL_CURSOR_FILE above — env override, else a file in the bridge's OWN directory — because
-// the store has a single-writer invariant: a second bridge reading these records would not have
-// those conversations in its `sessions` map and would retire the first bridge's LIVE convos to
-// `done`. The __dirname default makes a dev bridge from another checkout isolated by default.
-const RUN_STATE_OUTBOX_FILE = process.env.MATRON_RUN_STATE_OUTBOX_FILE
-  ? path.resolve(expandHome(process.env.MATRON_RUN_STATE_OUTBOX_FILE))
-  : path.join(__dirname, 'run-state-outbox.json');
 const JOURNAL_CONTROL_CONVO_ID = process.env.JOURNAL_CONTROL_CONVO_ID || `bridge-${os.hostname()}`;
 // Bridge-side coalescing floor for in-progress assistant-text stream frames
 // (per convo+message). Defaults to the server hub's own ~5/s fan-out window;
@@ -1382,7 +1372,6 @@ function handleJournalReconnect() {
   // reemit lives in journalOnReconnect, so it is NOT duplicated here.
   reconcileStrandedSubagents('reconnect');
   journalOnReconnect();
-  republishSessionStates();
   retryRestartCancellation();
   // Every hello_ok is a fresh epoch for the journal's copy of this box's
   // status too (a box that just woke reports itself before anyone asks).
@@ -1531,7 +1520,7 @@ const journalPublisher = createJournalPublisher({
   onSettings: (settings, { hello }) => { if (hello) userSettings.onHello(settings); else userSettings.apply(settings); },
   // Send-completion retry trigger (the mandatory one): re-publishes an
   // overflow-evicted release frame on a healthy socket that never reconnects.
-  onSendCapacity: () => { republishPendingReleases(); retryRunStateRepairs(); sessionStateLatch.onCapacity(); },
+  onSendCapacity: () => { republishPendingReleases(); sessionStateLatch.onCapacity(); },
   // Agent-RPC dispatch. Arrow + late-bound const (journalRpcHandler is
   // defined below): safe for the same reason onEvent's forward reference
   // is — the callback only ever fires once the socket is live, long after
@@ -1911,12 +1900,6 @@ function findPersistedAgentSession(agent, sessionId) {
 // --- Session Manager ---
 
 const sessions = new Map(); // roomId -> session
-// DURABLE record of session_state transitions the server has not confirmed. Entered before the
-// publish, cleared on delivery, re-offered on every reconnect (republishSessionStates). Keyed by
-// convo rather than session because the terminal paths delete the session before publishing
-// `done` — see journalSessionState. On disk rather than in memory so a bridge RESTART mid-outage
-// does not lose the record and strand the row at `running` forever.
-const runStateOutbox = createRunStateOutbox({ file: RUN_STATE_OUTBOX_FILE, log: console });
 
 // Persistent, crash-safe write-ahead outbox for queued_release resolutions
 // (loop #536). Constructed here so it loads + relabels any inherited on-disk
@@ -2282,18 +2265,8 @@ const sessionStateLatch = createSessionStateLatch({
   resolveSession: (convoId) => findSessionByClaudeSessionId(convoId),
   warn: (m) => console.warn(m),
 });
-const sessionStateLifecycle = createSessionStateLifecycle({
-  runStateOutbox, sessionStateLatch, journalConvoIdFor, journalPublisher, sessions,
-  enabled: () => JOURNAL_ENABLED,
-});
 function journalSessionState(session, state) {
-  return sessionStateLifecycle.journalSessionState(session, state);
-}
-function republishSessionStates() {
-  return sessionStateLifecycle.republishSessionStates();
-}
-function retryRunStateRepairs() {
-  return sessionStateLifecycle.retryRunStateRepairs();
+  sessionStateLatch.offer(session, state);
 }
 
 // Mirror the bridge's current activity into an ephemeral typing/activity
