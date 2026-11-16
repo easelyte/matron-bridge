@@ -107,7 +107,6 @@ import {
   effectiveExtras,
   extractBypassFlag,
   extractMcpExtraFlags,
-  extractPromptFlag,
   knownMcpExtras,
   mergeMcpConfigs,
   parseDefaultExtras,
@@ -8308,23 +8307,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         return;
       }
 
-      // Extract --prompt "<text>" from the RAW arg string FIRST (quote-aware),
-      // before the whitespace-split flag extractors below consume tokens that
-      // may legitimately appear inside the prompt (e.g. a workdir path, or a
-      // flag-looking word). The prompt, if any, is injected as the session's
-      // first user message after spawn so dispatch is a single message.
-      const rawArgs = text.slice(text.indexOf(parts[0]) + parts[0].length);
-      const promptFlag = extractPromptFlag(rawArgs);
-      if (promptFlag.error) {
-        await sendReply(promptFlag.error);
-        return;
-      }
-      const initialPrompt = promptFlag.prompt;
-      const afterPromptTokens = promptFlag.rest.split(/\s+/).filter(Boolean);
-
-      // Opt-in permission mode: --bypass / --auto ride before the mcp
-      // extras, parsed off the post-prompt tokens.
-      const { bypass: startBypass, rest: afterBypass } = extractBypassFlag(afterPromptTokens);
+      const { bypass: startBypass, rest: afterBypass } = extractBypassFlag(parts.slice(1));
       const { extras: mcpExtras, rest: afterMcp } = extractMcpExtraFlags(afterBypass, KNOWN_MCP_EXTRAS);
       const agentFlags = extractAgentFlag(afterMcp);
       if (agentFlags.error) {
@@ -8408,21 +8391,10 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       // Show what the session actually got: machine defaults plus its own flags.
       const shownStartExtras = effectiveExtras(mcpExtras, DEFAULT_MCP_EXTRAS);
       const extrasNote = shownStartExtras.length > 0 ? ` (extras: ${shownStartExtras.join(', ')})` : '';
-      const promptNote = initialPrompt ? ' with your prompt' : '';
       const permNote = permissionNote(session);
       const startModelNote = startModel ? ` on ${aliasLabel(startModel)}` : '';
-      await sendReply(`${agentLabel(selectedAgent)} session started${startModelNote} in a new conversation${promptNote}${extrasNote}${permNote}.${matronMdNote(session)}`);
+      await sendReply(`${agentLabel(selectedAgent)} session started${startModelNote} in a new conversation${extrasNote}${permNote}.${matronMdNote(session)}`);
 
-      // Deliver the initial prompt (from --prompt) as the session's first user
-      // message. For iv sessions the TUI isn't input-ready at spawn, so arm the
-      // resume-ready hold: sendToSession buffers the text in _resumeOutbox and
-      // startResumeReadyWatcher flushes it once the TUI reaches its idle input
-      // box. For print/codex sessions enterResumeHold is a no-op and the text is
-      // written straight to stdin (the agent buffers it fine).
-      if (initialPrompt) {
-        enterResumeHold(session);
-        sendTextToSession(session, initialPrompt);
-      }
       break;
     }
 
