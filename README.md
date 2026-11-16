@@ -380,27 +380,6 @@ the viewer's environment turns it off.
 
 Voice notes are transcribed by the journal: at upload when it has a cloud speech-to-text key (`MATRON_STT_AZURE_KEY`), falling back to its own whisper when the cloud call fails; tracker-item voice notes also use the journal's whisper when it has no key (see the journal's protocol doc). For a voice note sent in chat the bridge asks `GET /media/:id/transcript`; when the journal has no words for it (its job failed, or never ran) the bridge asks it to try again with `POST /media/:id/transcript` and waits for the answer. A voice note on a tracker item follows the same order, and the words are written back to the item's comment. Only when the journal still has no words does the bridge run its own whisper, and only where it is installed (see `WHISPER_MODEL_PATH`); otherwise a chat voice note is not delivered (any text typed with it still is) and the user is told why, and a tracker item's turn goes out with `(transcription failed)` in place of the words (`(no transcript)` when the journal heard none). Videos sent in chat arrive as key frames, which needs ffmpeg and ffprobe on this machine, narrated from the journal's timestamped transcript of their audio, or by the local whisper fallback where installed.
 
-## Tool list by role
-
-By default every session gets the full `ask-user` tool list. Two variables
-narrow it:
-
-| Variable | Description | Default |
-|---|---|---|
-| `BRIDGE_TOOL_FILTER` | Bridge env opt-in. Set to `1` and the bridge gives each Claude session a `BRIDGE_TOOL_ROLE` of `coordinator` or `worker` at spawn. | off |
-| `BRIDGE_TOOL_ROLE` | Set per session by the bridge, read by `ask-user.js`. `worker` skips the Coordinator-only tools (`COORDINATOR_ONLY` in `lib/tool-roles.js`); `coordinator`, `full`, unset or any unknown value registers every tool. `permission_request` always registers. | unset |
-
-`ask-user.js` logs one stderr line at boot (`role`, `registered`, `hidden`,
-`would-hide`) so the effect can be checked before enabling the filter:
-`would-hide` is how many registered tools a worker would not see. A change to
-either variable applies to sessions spawned afterwards.
-
-The role is fixed when the session spawns. A session whose role the journal has
-not confirmed yet (cold cache) gets `full`. A session made Coordinator while a
-question, permission prompt or resume hold is pending keeps its worker list
-until its next spawn (the same point where the Coordinator prompt and model
-apply), so respawn it to load the Coordinator tools.
-
 ## Memory & MCP tuning
 
 Tool filtering reduces the worker's tool list; it does not change authorization.

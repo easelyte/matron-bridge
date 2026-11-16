@@ -219,10 +219,6 @@ describe('createJournalPublisher', () => {
 
     pub.upsertConvo('convo-2', {});
     pub.publishPrompt('convo-2', { question: 'Continue?', options: ['yes', 'no'], mode: 'pick_one' });
-    const permissionPublished = pub.publishPermissionRequest(
-      'convo-2',
-      { kind: 'permission', tool_use_id: 't0' },
-    );
     pub.publishToolOutput('convo-2', { tool_use_id: 't1', command: 'ls -la', viewer_url: 'https://x', expires_at: 123 });
     pub.publishDiff('convo-2', {
       file_path: '/w/a.swift', display_path: 'a.swift', viewer_url: null,
@@ -230,16 +226,10 @@ describe('createJournalPublisher', () => {
       added: 1, removed: 1, truncated: false, new_file: false,
     });
 
-    await waitFor(() => fake.received.filter(f => f.op === 'publish').length >= 4);
-    const [prompt, permissionRequest, toolOutput] = fake.received.filter(f => f.op === 'publish');
+    await waitFor(() => fake.received.filter(f => f.op === 'publish').length >= 3);
+    const [prompt, toolOutput] = fake.received.filter(f => f.op === 'publish');
     expect(prompt.type).toBe('prompt');
     expect(prompt.payload).toEqual({ question: 'Continue?', options: ['yes', 'no'], mode: 'pick_one' });
-    expect(permissionRequest).toMatchObject({
-      convo_id: 'convo-2',
-      type: 'permission_request',
-      payload: { kind: 'permission', tool_use_id: 't0' },
-    });
-    expect(permissionPublished).toBe(true);
     expect(toolOutput.type).toBe('tool_output');
     expect(toolOutput.payload).toEqual({ tool_use_id: 't1', command: 'ls -la', viewer_url: 'https://x', expires_at: 123 });
     const diffFrame = fake.received.find(f => f.op === 'publish' && f.type === 'diff');
@@ -345,49 +335,6 @@ describe('createJournalPublisher', () => {
     }
   });
 
-  it('onLocalSendComplete fires from the LOCAL ws.send write callback, not a server commit ack', async () => {
-    // Contract honesty: there is NO application-level per-frame server ack on this WS
-    // publish path. onLocalSendComplete fires when ws.send's write callback fires — i.e. once the
-    // frame has left THIS PROCESS'S local socket buffer — NOT once the server has persisted it.
-    // Prove it with a transport that confirms the local write for a publish frame but never forwards
-    // those bytes to the server: the callback must still fire, and the server must never receive it.
-    class LocalConfirmNoServerWebSocket extends WebSocket {
-      send(data, cb) {
-        let parsed;
-        try { parsed = JSON.parse(data); } catch { parsed = null; }
-        // Let the handshake + any non-publish control frame through so the socket establishes.
-        if (!parsed || (parsed.op !== 'publish' && parsed.op !== 'convo_upsert')) {
-          return super.send(data, cb);
-        }
-        // Confirm the LOCAL write (fire the callback) but drop the bytes on the floor — the server
-        // never sees them. This is precisely the socket-accepted-but-server-uncommitted window.
-        if (typeof cb === 'function') queueMicrotask(() => cb());
-      }
-    }
-
-    const fake = await startFakeServer();
-    const pub = createJournalPublisher({
-      url: fake.url, token: 'tok', log: silentLog, ...FAST_BACKOFF,
-      WebSocketImpl: LocalConfirmNoServerWebSocket,
-    });
-    await waitFor(() => fake.connections.length >= 1);
-
-    let fired = false;
-    pub.publishText('c1', { body: 'x', from: 'user' }, { onLocalSendComplete: () => { fired = true; } });
-
-    // The local-send callback fires...
-    await waitFor(() => fired);
-    expect(fired).toBe(true);
-
-    // ...yet the server NEVER received the publish frame. onLocalSendComplete is a local-send
-    // signal, not a durability/commit ack — the exact false-confidence the rename removes.
-    await new Promise((r) => setTimeout(r, 50));
-    expect(fake.received.some((f) => f.op === 'publish')).toBe(false);
-
-    pub.close();
-    await fake.close();
-  });
-
   it('keepalive: terminates and reconnects when pings go unanswered (half-open socket)', async () => {
     const fake = await startFakeServer();
     const pub = createJournalPublisher({
@@ -452,28 +399,6 @@ describe('createJournalPublisher', () => {
     await fake.close();
   });
 
-  it('notifies an evicted permission frame without allowing its callback to throw', async () => {
-    const port = await getFreePort();
-    const warnings = [];
-    const log = { warn: (...a) => warnings.push(a.join(' ')), error: () => {} };
-    const pub = createJournalPublisher({
-      url: `ws://127.0.0.1:${port}/ws`, token: 'tok', log, queueLimit: 1, ...FAST_BACKOFF,
-    });
-    let evictionCount = 0;
-
-    expect(pub.publishPermissionRequest('c1', { tool_use_id: 't0' }, {
-      onEvicted: () => {
-        evictionCount += 1;
-        throw new Error('test callback failure');
-      },
-    })).toBe(true);
-    expect(() => pub.publishText('c1', { body: 'newer', from: 'user' })).not.toThrow();
-
-    expect(evictionCount).toBe(1);
-    expect(warnings.some(w => w.includes('evicted callback failed: test callback failure'))).toBe(true);
-    pub.close();
-  });
-
   // The summary reconnect repair uses the best-effort path
   // specifically because it must not evict the outage backlog.
   it('carries summary on the best-effort upsert without evicting queued traffic', async () => {
@@ -486,7 +411,7 @@ describe('createJournalPublisher', () => {
     let evicted = 0;
 
     // Fill the bounded queue with real user traffic while disconnected.
-    expect(pub.publishPermissionRequest('c1', { tool_use_id: 't0' }, {
+    expect(pub.publishText('c1', { body: 't0', from: 'user' }, {
       onEvicted: () => { evicted += 1; },
     })).toBe(true);
 
@@ -498,37 +423,6 @@ describe('createJournalPublisher', () => {
     pub.publishText('c1', { body: 'newer', from: 'user' });
     expect(evicted).toBe(1);
     pub.close();
-  });
-
-  // A RETAINED repair drains at the queue tail, so it can land
-  // after a newer ordinary update of the same field and roll it back. Derived
-  // state opts out of retention and is re-offered from live state instead.
-  it('retain:false refuses instead of holding a stale repair behind the backlog', async () => {
-    const port = await getFreePort();
-    const pub = createJournalPublisher({
-      url: `ws://127.0.0.1:${port}/ws`, token: 'tok', log: silentLog, queueLimit: 1, ...FAST_BACKOFF,
-    });
-
-    // Disconnected: nothing pumps, so the bounded queue fills deterministically.
-    pub.publishText('c1', { body: 'backlog', from: 'user' });
-    expect(pub.upsertConvoBestEffort('c1', { summary: '• held' }, { retain: true })).toBe(false);
-    expect(pub.upsertConvoBestEffort('c1', { summary: '• refused' }, { retain: false })).toBe(false);
-
-    // Bring the journal up and let everything drain.
-    const fake = await startFakeServer({}, port);
-    await waitFor(() => fake.received.some(f => f.summary === '• held'));
-    await delay(100);
-
-    // The retained repair arrived — but only AFTER the backlog it was held
-    // behind. That tail position is exactly what would overwrite a newer
-    // ordinary update of the same field, which is why the summary repair does
-    // not use it.
-    const bodies = fake.received.map(f => f.summary ?? f.payload?.body);
-    expect(bodies.indexOf('• held')).toBeGreaterThan(bodies.indexOf('backlog'));
-    expect(fake.received.some(f => f.summary === '• refused')).toBe(false);
-
-    pub.close();
-    await fake.close();
   });
 
   it('sends summary on a best-effort upsert when the queue has headroom', async () => {
@@ -596,10 +490,6 @@ describe('createJournalPublisher', () => {
     const warnings = [];
     const log = { warn: (...a) => warnings.push(a.join(' ')), error: () => {} };
     const pub = createJournalPublisher({ url: '', token: '', log });
-    expect(pub.publishPermissionRequest(
-      'c1',
-      { kind: 'permission', tool_use_id: 't0' },
-    )).toBe(false);
 
     expect(() => {
       pub.upsertConvo('c1', { title: 'x', sessionState: 'running' });

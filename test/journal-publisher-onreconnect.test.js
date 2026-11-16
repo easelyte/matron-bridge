@@ -85,7 +85,7 @@ describe('journal publisher onReconnect', () => {
       socket.emit('message', JSON.stringify({ op: 'hello_ok' }));
       let repaired = false;
       expect(publisher.upsertConvoBestEffort('bob', { parentConvoId: 'alice', sessionState: 'done' },
-        { onLocalSendComplete: () => { repaired = true; } })).toBe(false);
+        { onDelivered: () => { repaired = true; } })).toBe(false);
       publisher.upsertConvo('bob', { parentConvoId: 'alice', sessionState: 'running' });
       for (let i = 0; i < 10; i++) {
         socket.confirmations.splice(0).forEach(confirm => confirm());

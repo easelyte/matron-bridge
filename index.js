@@ -93,6 +93,7 @@ import path from 'path';
 import { fileURLToPath } from 'url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 import os from 'os';
+import { GoogleGenerativeAI } from '@google/generative-ai';
 import { createLiveOutputStore, sweepOrphanedLogs } from './lib/live-output.js';
 import { createToolStreamPump, toolOutputSnippet, decodeByteExact } from './lib/tool-stream-pump.js';
 import { computeEditDiff } from './lib/edit-diff.js';
@@ -107,7 +108,6 @@ import {
   effectiveExtras,
   extractBypassFlag,
   extractMcpExtraFlags,
-  extractPromptFlag,
   knownMcpExtras,
   mergeMcpConfigs,
   parseDefaultExtras,
@@ -115,8 +115,8 @@ import {
 } from './lib/mcp-config.js';
 import { aliasLabel, extractModelFlag, isValidModelArg, modelFromEvent, modelOptions, normalizeModelArg, VALID_ALIAS_HINT } from './lib/model-aliases.js';
 import { switchModelInSession, modelButtons, planPrintModelSwitch } from './lib/model-command.js';
-import { INFLIGHT_MEDIA_REPLACE_REFUSAL } from './lib/session-replace-guard.js';
 import { writeSavedMediaFile, makeIdentityAwareCleanup } from './lib/saved-media-file.js';
+import { INFLIGHT_MEDIA_REPLACE_REFUSAL } from './lib/session-replace-guard.js';
 import {
   resolveInteractive,
   resolveModel,
@@ -156,6 +156,7 @@ import {
   setupCodexWatcherForSession,
 } from './lib/codex-watcher-setup.js';
 import { detectCodexBinary, launchWithCodexSinkEnv, pruneStaleCodexSinks, removeCodexSinkForSession } from './lib/codex-paths.js';
+import { hookEntry } from './lib/hook-command.js';
 import { liveLogDir, liveLogPath as liveLogPathFor, openOwnLiveLog } from './lib/live-log-dir.js';
 import { killProcessTree } from './lib/process-kill.js';
 import { processTableCommand, readProcessTableStrict } from './lib/process-table.js';
@@ -178,17 +179,12 @@ import { createQueuedReleaseRetry } from './lib/queued-release-retry.js';
 import { beginTurn, beginOrJoinTurn, joinHeldTurn, endTurn, mergeIntoTurn, mergeCauses, causesForAsk, userMessageCause, itemCause, plainCause, spawnOutcomeCause, carryOnCause, roomMessageCause, queueCauses, tagCauses } from './lib/turn-cause.js';
 import { createSubagentRunningStore } from './lib/subagent-running-store.js';
 import { selectStrandedChildren, strandedRepairFrames } from './lib/subagent-reconcile.js';
-import { createSessionStateLifecycle } from './lib/session-state-lifecycle.js';
-import { createRunStateOutbox } from './lib/run-state-outbox.js';
 import { journalReemitCodexOutcomes } from './lib/codex-convos.js';
 import { formatSubagentToolBody, subagentToolStep } from './lib/subagent-tool-format.js';
 import { ivUploadDir, ivUploadAnnotation, ivUploadsRoot } from './lib/iv-uploads.js';
 import { matronFilesDir, matronFilesRoot, sessionDownloadDir } from './lib/matron-files.js';
 import { parseUsageLimits, formatLimits, createUsageMissLogger, usageFetchTimeoutMs } from './lib/usage-limits.js';
 import { resolveSpawnCwd, attachSpawnErrorHandler, failedSpawnProcess } from './lib/spawn-guard.js';
-import { withForkPrintSettings } from './lib/session-settings.js';
-import { hookEntry } from './lib/hook-command.js';
-import { buildPermissionSnapshot, classifyPermission } from './lib/permission-eval.js';
 import { readSessionSummary, listSessionSummaries, listSessionIdsByMtime, pathExists } from './lib/session-summary.js';
 import {
   extractForceFlag,
@@ -233,6 +229,7 @@ import { DEFAULT_EDIT_HOLD_MS } from './lib/queue-edit-hold.js';
 import { handlePickerValue, isResumeConvoId } from './lib/picker-dispatch.js';
 import { createPermissionRegistry, renderPermissionCard, permissionInputRefusal, permissionButtons, permissionSpawnArgs, resolveBypassMode, resolvePermissionTimeoutMs, isRootOutsideSandbox, guardRootBypass, ROOT_BYPASS_WARNING, resolvePermissionRequest, resolvePermissionCheck, buildPrintSessionSettings, foreignGateEntry, listSessionGrants, revokeSessionGrant } from './lib/permission-prompt.js';
 import { createPlanApprovalItems } from './lib/plan-approval-items.js';
+import { buildPermissionSnapshot } from './lib/permission-eval.js';
 import { createSlowToolNotices, renderSlowToolNotice, slowToolNoticeSummary, resolveSlowToolNoticeMs, resolveSlowToolReminderMs } from './lib/slow-tool-notice.js';
 import { createJournalInputConsumer, resolvePromptChoice, resolvePromptChoices } from './lib/journal-input-router.js';
 import { createAgentRooms, INVITE_TTL_MS } from './lib/agent-rooms.js';
@@ -246,14 +243,6 @@ import { unmuteChoiceValue, ROOM_MUTE_ACTION_ID, ROOM_MUTE_KIND } from './lib/ro
 import { quotedField, peerField, frameSafeBody, PEER_NAME_MAX } from './lib/peer-text.js';
 import { createRoomReplyWaiters } from './lib/room-reply-waiters.js';
 import { createAgentChatHandlers, probeJoinedRoom, roomAgentLabel } from './lib/agent-chat.js';
-import {
-  auditPermissionDecision,
-  createPermissionDecisionBodyCollector,
-  createPermissionSeams,
-  createRequestPermissionDecision,
-  handlePermissionDecisionRoute,
-  PERMISSION_DECISION_TIMEOUT_MS,
-} from './lib/permission-registry.js';
 import { createJournalMediaRouter, chooseNarration } from './lib/journal-media.js';
 import { createItemTurnRouter } from './lib/items-turn.js';
 import { createItemAttachmentSaver } from './lib/item-attachments.js';
@@ -270,7 +259,6 @@ import { attachPendingMediaMirror, pendingMediaMirror } from './lib/media-mirror
 import { seedJournalTitle, applyFallbackTitle, withSessionShort, titleMarkerFor, recordTitleEarned } from './lib/journal-title-seed.js';
 import { createSummaryModel, parseSummaryProviders } from './lib/summary-model.js';
 import { createCodexSummaryModel } from './lib/codex-summary-model.js';
-import { GoogleGenerativeAI } from '@google/generative-ai';
 import { createSummaryModelNag } from './lib/summary-model-nag.js';
 import { createLoginExpiryNotice, isLoginExpiredText, loginExpiredFromAssistantEvent, loginExpiredMessage, loginExpiredCardText, loginButtons } from './lib/login-expiry.js';
 import { codexOneShot } from './lib/codex-oneshot.js';
@@ -278,7 +266,7 @@ import { createTitleSummary } from './lib/title-summary.js';
 import { activityStateChanged, truncateActivityDetail, shouldResumeThinkingAfterTool } from './lib/journal-activity.js';
 import { streamRefFor, armReplyRef, settleReplyRef } from './lib/journal-stream.js';
 import { contextFullToNative, briefContextReport } from './lib/context-command.js';
-import { buildSessionStatus, contextTokensFromAssistantEvent, postCompactContextTokens, compactTriggerFrom, contextGaugeText, sessionContextWindow, emailFromClaudeConfig, isSidechainEvent, reconcileModelForWindow, hostVitals, startCpuSampler, stopCpuSampler, cpuPercent, ramPercent, cpuSampledAtMs, statusRepaintDue } from './lib/session-status.js';
+import { buildSessionStatus, contextTokensFromAssistantEvent, postCompactContextTokens, compactTriggerFrom, contextGaugeText, sessionContextWindow, emailFromClaudeConfig, isSidechainEvent, hostVitals, startCpuSampler, stopCpuSampler, cpuPercent, ramPercent, cpuSampledAtMs, statusRepaintDue } from './lib/session-status.js';
 import { stallFromAssistantEvent, stallResetsAt } from './lib/stall-detector.js';
 import { spawnModelFallback, stallModelFallback, isFableModel } from './lib/fable-fallback.js';
 import { createRestartNotices, planSessionControl, validateControlParams, controlNotice, authorizeControl, mergeParkedSlot, JOURNAL_DEVICE_ID, JOURNAL_ONLY_ACTIONS, CONTROL_KINDS, TURN_STARTING_OPS, occupied as controlOccupied } from './lib/session-control.js';
@@ -1334,14 +1322,6 @@ function noteLoginExpired(session, key = null) {
 const JOURNAL_CURSOR_FILE = process.env.JOURNAL_CURSOR_FILE
   ? path.resolve(expandHome(process.env.JOURNAL_CURSOR_FILE))
   : path.join(__dirname, 'journal-cursor.json');
-// Unconfirmed run-state transitions (see lib/run-state-outbox.js). Derived exactly like
-// JOURNAL_CURSOR_FILE above — env override, else a file in the bridge's OWN directory — because
-// the store has a single-writer invariant: a second bridge reading these records would not have
-// those conversations in its `sessions` map and would retire the first bridge's LIVE convos to
-// `done`. The __dirname default makes a dev bridge from another checkout isolated by default.
-const RUN_STATE_OUTBOX_FILE = process.env.MATRON_RUN_STATE_OUTBOX_FILE
-  ? path.resolve(expandHome(process.env.MATRON_RUN_STATE_OUTBOX_FILE))
-  : path.join(__dirname, 'run-state-outbox.json');
 const JOURNAL_CONTROL_CONVO_ID = process.env.JOURNAL_CONTROL_CONVO_ID || `bridge-${os.hostname()}`;
 // Bridge-side coalescing floor for in-progress assistant-text stream frames
 // (per convo+message). Defaults to the server hub's own ~5/s fan-out window;
@@ -1391,7 +1371,6 @@ function handleJournalReconnect() {
   // reemit lives in journalOnReconnect, so it is NOT duplicated here.
   reconcileStrandedSubagents('reconnect');
   journalOnReconnect();
-  republishSessionStates();
   retryRestartCancellation();
   // Every hello_ok is a fresh epoch for the journal's copy of this box's
   // status too (a box that just woke reports itself before anyone asks).
@@ -1540,7 +1519,7 @@ const journalPublisher = createJournalPublisher({
   onSettings: (settings, { hello }) => { if (hello) userSettings.onHello(settings); else userSettings.apply(settings); },
   // Send-completion retry trigger (the mandatory one): re-publishes an
   // overflow-evicted release frame on a healthy socket that never reconnects.
-  onSendCapacity: () => { republishPendingReleases(); retryRunStateRepairs(); sessionStateLatch.onCapacity(); },
+  onSendCapacity: () => { republishPendingReleases(); sessionStateLatch.onCapacity(); },
   // Agent-RPC dispatch. Arrow + late-bound const (journalRpcHandler is
   // defined below): safe for the same reason onEvent's forward reference
   // is — the callback only ever fires once the socket is live, long after
@@ -1920,12 +1899,6 @@ function findPersistedAgentSession(agent, sessionId) {
 // --- Session Manager ---
 
 const sessions = new Map(); // roomId -> session
-// DURABLE record of session_state transitions the server has not confirmed. Entered before the
-// publish, cleared on delivery, re-offered on every reconnect (republishSessionStates). Keyed by
-// convo rather than session because the terminal paths delete the session before publishing
-// `done` — see journalSessionState. On disk rather than in memory so a bridge RESTART mid-outage
-// does not lose the record and strand the row at `running` forever.
-const runStateOutbox = createRunStateOutbox({ file: RUN_STATE_OUTBOX_FILE, log: console });
 
 // Persistent, crash-safe write-ahead outbox for queued_release resolutions
 // (loop #536). Constructed here so it loads + relabels any inherited on-disk
@@ -2291,18 +2264,8 @@ const sessionStateLatch = createSessionStateLatch({
   resolveSession: (convoId) => findSessionByClaudeSessionId(convoId),
   warn: (m) => console.warn(m),
 });
-const sessionStateLifecycle = createSessionStateLifecycle({
-  runStateOutbox, sessionStateLatch, journalConvoIdFor, journalPublisher, sessions,
-  enabled: () => JOURNAL_ENABLED,
-});
 function journalSessionState(session, state) {
-  return sessionStateLifecycle.journalSessionState(session, state);
-}
-function republishSessionStates() {
-  return sessionStateLifecycle.republishSessionStates();
-}
-function retryRunStateRepairs() {
-  return sessionStateLifecycle.retryRunStateRepairs();
+  sessionStateLatch.offer(session, state);
 }
 
 // Mirror the bridge's current activity into an ephemeral typing/activity
@@ -2977,7 +2940,6 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   if (rootDowngraded) console.warn(`[permissions] ${roomId}: ${ROOT_BYPASS_WARNING}`);
   const effectiveMcpExtras = effectiveExtras(mcpExtras, DEFAULT_MCP_EXTRAS);
   const shareEnabled = effectiveMcpExtras.includes('share');
-  const permissionToken = randomUUID();
   // Pinned here, at the trusted boundary, for the same reason as
   // showFilePinnedRoots below — but scoped to the workdir alone, since a
   // viewer link's scope is the session's workdir, not the artifact roots.
@@ -3019,11 +2981,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     '--mcp-config', mcpConfigPathFor(effectiveMcpExtras),
     // Additive inline settings: the bridge's hooks (and, when gated, the MCP
     // permission gate hook) merge with the on-disk settings, which all load.
-    // Add the permission-card hook on bypass sessions (lib/session-settings.js).
-    '--settings', JSON.stringify(withForkPrintSettings(
-      buildPrintSessionSettings({ bypass: bypassMode, hooksDir: path.join(__dirname, 'hooks'), apiPort: API_PORT, roomId, foreignFlag: foreignFlagPath(roomId), apiHeaderFile: apiHeaderFileFor(roomId) }),
-      { bypass: bypassMode },
-    )),
+    '--settings', JSON.stringify(buildPrintSessionSettings({ bypass: bypassMode, hooksDir: path.join(__dirname, 'hooks'), apiPort: API_PORT, roomId, foreignFlag: foreignFlagPath(roomId), apiHeaderFile: apiHeaderFileFor(roomId) })),
   ];
   const printModel = options.model === null
     ? undefined
@@ -3050,7 +3008,8 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   // stripped, read-proxy header file, node bin dir on PATH, per-session
   // SHOW_FILE_TOKEN.
   const spawnEnv = buildClaudeSpawnEnv({
-    mode: 'print',
+    coordinator: options.coordinator === true,
+    roleKnown: options.roleKnown === true,
     roomId,
     apiPort: API_PORT,
     journalProxyHeaderFile: JOURNAL_PROXY_HEADER_FILE,
@@ -3058,9 +3017,6 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     pluginCacheDir: PLUGIN_CACHE_DIR,
     showBashOutput: showBashOutputAtSpawn,
     showFileToken,
-    permissionToken,
-    coordinator: options.coordinator === true,
-    roleKnown: options.roleKnown === true,
   });
 
   const proc = launchWithCodexSinkEnv({
@@ -3101,7 +3057,6 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     ...(showFileToken ? { showFileToken } : {}),
     showFilePinnedRoots,
     viewerRootIdentities,
-    permissionToken,
     _showFileInFlight: 0,
     mcpExtras,
     bypassMode: requestedBypassMode,
@@ -3172,13 +3127,6 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     lastSummaryMsgCount: 0, // chatHistory index the summary pass has consumed through (persisted)
     lastRosterText: '',     // last ROSTER paragraph — preamble for the next incremental pass (persisted)
   };
-
-  session.requestPermissionDecision = createRequestPermissionDecision(session, {
-    journalPublisher,
-    pendingPermissionDecisions,
-    journalConvoIdFor,
-    timeoutMs: PERMISSION_DECISION_TIMEOUT_MS,
-  });
 
   // A spawn 'error' with no listener is fatal to the whole bridge (crash-loop
   // of 2026-07-16). Cleanup and the 3-restart cap stay in proc.on('close'),
@@ -3374,9 +3322,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
             `Session crashed (exit ${exitCode}), restarted automatically — attempt <b>${restarted.restartCount}/3</b>`);
           restarted.sendHtml(n.plain, n.html);
         } else if (restarted.sendCallback) {
-          restarted.sendCallback(
-            `[Session crashed (exit ${exitCode}), restarted automatically — attempt ${restarted.restartCount}/3]`
-          );
+          restarted.sendCallback(`[Session crashed (exit ${exitCode}), restarted automatically — attempt ${restarted.restartCount}/3]`);
         }
       } else {
         // Notice BEFORE teardown: sendToRoom's journal mirror looks the
@@ -4027,7 +3973,8 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
 
   // Child env (lib/spawn-env.js): same shape as the print spawn.
   const interactiveEnv = buildClaudeSpawnEnv({
-    mode: 'iv',
+    coordinator: options.coordinator === true,
+    roleKnown: options.roleKnown === true,
     roomId,
     apiPort: API_PORT,
     journalProxyHeaderFile: JOURNAL_PROXY_HEADER_FILE,
@@ -4035,8 +3982,6 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     pluginCacheDir: PLUGIN_CACHE_DIR,
     showBashOutput: showBashOutputAtSpawn,
     showFileToken,
-    coordinator: options.coordinator === true,
-    roleKnown: options.roleKnown === true,
   });
 
   debug(`Spawning interactive claude session ${sessionId} in ${cwd}`);
@@ -4329,9 +4274,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
             `Session crashed (exit ${exitCode}), restarted automatically — attempt <b>${restarted.restartCount}/3</b>`);
           restarted.sendHtml(n.plain, n.html);
         } else if (restarted.sendCallback) {
-          restarted.sendCallback(
-            `[Session crashed (exit ${exitCode}), restarted automatically — attempt ${restarted.restartCount}/3]`
-          );
+          restarted.sendCallback(`[Session crashed (exit ${exitCode}), restarted automatically — attempt ${restarted.restartCount}/3]`);
         }
       } else {
         // Notices FIRST, teardown second: sendToRoom's journal mirror looks
@@ -4467,6 +4410,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
   // Subagent activity watcher — see createSession() for the rationale.
   setupSubagentWatcher(session, cwd, sessionId);
   // After sessions.set for the same reason as in createSession.
+  if (ivRootDowngraded) postRootBypassWarning(roomId);
   return session;
 }
 
@@ -5510,7 +5454,7 @@ function handleClaudeEvent(session, event) {
   // This is the reliable source in iv-mode, where the system/init event (and
   // thus session.initData.model) never arrives.
   const capturedModel = modelFromEvent(event);
-  if (capturedModel) session.currentModel = reconcileModelForWindow(session.currentModel, capturedModel);
+  if (capturedModel) session.currentModel = capturedModel;
 
   // Capture session ID from any event that carries it. Claude sessions
   // pre-assign their id at spawn (planSessionIdentity), so for them this is
@@ -6763,9 +6707,6 @@ function sendToSession(session, contentBlocks, { skipJournalMirror = false, fore
   const wasBusy = session.busy;
   const beganTurn = beginOrJoinTurn(session, causes);
     session.busy = true;
-    // A steering write joins the running turn: it is not a turn start, so no
-    // turn generation bump (the interrupt-ack stamp keys on it) and no journal
-    // state change.
     if (!steering) {
       // Only a write that starts a turn from idle advances the generation. A busy
       // flush (send now, interrupt magic word) joins the same running turn, and
@@ -6782,12 +6723,12 @@ function sendToSession(session, contentBlocks, { skipJournalMirror = false, fore
     }
 
     // /context-full is a bridge-only command — claude itself knows only
-    // /context. Rewrite it here, the single choke point every transport
-    // funnels through (Matrix messages, journal-routed text, queue flushes),
-    // and arm the one-shot flag flushResponse consumes to let the resulting
-    // report through untrimmed. Placed after the journal mirror above so the
-    // journal records what the user actually typed. Plain /context needs no
-    // marking: flushResponse trims any context report by default.
+    // /context. Rewrite it here, the single choke point every input funnels
+    // through (journal-routed text, queue flushes), and arm the one-shot flag
+    // flushResponse consumes to let the resulting report through untrimmed.
+    // Placed after the journal mirror above so the journal records what the user
+    // actually typed. Plain /context needs no marking: flushResponse trims any
+    // context report by default.
     if (!plainTurn && contentBlocks.length === 1 && contentBlocks[0].type === 'text') {
       const nativeContext = contextFullToNative(contentBlocks[0].text);
       if (nativeContext) {
@@ -8360,23 +8301,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         return;
       }
 
-      // Extract --prompt "<text>" from the RAW arg string FIRST (quote-aware),
-      // before the whitespace-split flag extractors below consume tokens that
-      // may legitimately appear inside the prompt (e.g. a workdir path, or a
-      // flag-looking word). The prompt, if any, is injected as the session's
-      // first user message after spawn so dispatch is a single message.
-      const rawArgs = text.slice(text.indexOf(parts[0]) + parts[0].length);
-      const promptFlag = extractPromptFlag(rawArgs);
-      if (promptFlag.error) {
-        await sendReply(promptFlag.error);
-        return;
-      }
-      const initialPrompt = promptFlag.prompt;
-      const afterPromptTokens = promptFlag.rest.split(/\s+/).filter(Boolean);
-
-      // Opt-in permission mode: --bypass / --auto ride before the mcp
-      // extras, parsed off the post-prompt tokens.
-      const { bypass: startBypass, rest: afterBypass } = extractBypassFlag(afterPromptTokens);
+      const { bypass: startBypass, rest: afterBypass } = extractBypassFlag(parts.slice(1));
       const { extras: mcpExtras, rest: afterMcp } = extractMcpExtraFlags(afterBypass, KNOWN_MCP_EXTRAS);
       const agentFlags = extractAgentFlag(afterMcp);
       if (agentFlags.error) {
@@ -8460,21 +8385,10 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       // Show what the session actually got: machine defaults plus its own flags.
       const shownStartExtras = effectiveExtras(mcpExtras, DEFAULT_MCP_EXTRAS);
       const extrasNote = shownStartExtras.length > 0 ? ` (extras: ${shownStartExtras.join(', ')})` : '';
-      const promptNote = initialPrompt ? ' with your prompt' : '';
       const permNote = permissionNote(session);
       const startModelNote = startModel ? ` on ${aliasLabel(startModel)}` : '';
-      await sendReply(`${agentLabel(selectedAgent)} session started${startModelNote} in a new conversation${promptNote}${extrasNote}${permNote}.${matronMdNote(session)}`);
+      await sendReply(`${agentLabel(selectedAgent)} session started${startModelNote} in a new conversation${extrasNote}${permNote}.${matronMdNote(session)}`);
 
-      // Deliver the initial prompt (from --prompt) as the session's first user
-      // message. For iv sessions the TUI isn't input-ready at spawn, so arm the
-      // resume-ready hold: sendToSession buffers the text in _resumeOutbox and
-      // startResumeReadyWatcher flushes it once the TUI reaches its idle input
-      // box. For print/codex sessions enterResumeHold is a no-op and the text is
-      // written straight to stdin (the agent buffers it fine).
-      if (initialPrompt) {
-        enterResumeHold(session);
-        sendTextToSession(session, initialPrompt);
-      }
       break;
     }
 
@@ -8901,6 +8815,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       // Rename after the session exists (not before) so updateRoomName's
       // roomId -> session lookup — used to journal-mirror the title — finds it.
       await updateRoomName(sessionRoomId, roomName);
+
       // Persist immediately — we already know the agent session ID.
       // session.workdir, not actualWorkdir: createSession may have degraded a
       // missing workdir to a fallback, and persisting the missing path would
@@ -10046,12 +9961,6 @@ function journalEchoToRoom(session, plain, html) {
   sendToRoom(session.roomId, plain, html, { skipJournalMirror: true }).catch(() => {});
 }
 
-function journalEchoPromptAnswer(session, username, label) {
-  journalEchoToRoom(session,
-    `📱 ${username} answered: ${label}`,
-    `📱 <b>${escapeHtml(username)} answered:</b> ${escapeHtml(label)}`);
-}
-
 // ctx for a session-scoped command dispatch (Deliverable 1/2, journal side):
 // replies go through the NORMAL sendToRoom for the session's room id,
 // which publishes them into the session's journal convo. `sender` is who
@@ -10323,22 +10232,11 @@ async function journalRouteTextToSession(session, body, { keepRestartBudget = fa
     if (session.iv && !effortFlowHoldsInput(session) && isIvSlashPassthrough(trimmed)) {
       return sendTextToSession(session, trimmed, { skipJournalMirror: true, causes });
       }
-      // Busy-queue magic words — the SAME classifier and implementation the
-      // old Matrix busy branch used (lib/busy-queue.js), checked at the same
-      // point (busy, not a TUI slash passthrough). Feedback goes through
-      // ctx.sendReply — a fresh sendToRoom text that also mirrors into the
-      // journal, like every other command reply. The Matrix tile-edit half of
-      // the old seams are gone (outbound Matrix sends retired):
-      // editMessage is null (lib/busy-queue.js no-ops it), and
-      // stripQueueNotificationLinks is now clearQueueNotifications — same
-      // array-clearing effect minus the Matrix edit loop, still needed so a
-      // 'send'/'interrupt' flush doesn't leave stale notif entries to misalign
-      // a later re-queue (see clearQueueNotifications above). Kept as named
-      // keys (rather than omitted) so the wiring stays self-documenting and
-      // the source-inspection pin in test/busy-queue.test.js still finds both
-      // identifiers. Only sendHtml is omitted: journal feedback stays plain. A
-      // flush still goes through the one true flushQueue (single merged send +
-      // origin-aware mirroring) — never a second flush path.
+      // Busy-queue magic words (lib/busy-queue.js), checked while busy and
+      // after the TUI slash passthrough. Feedback goes through ctx.sendReply,
+      // which mirrors into the journal like every other command reply; a flush
+      // goes through the one flushQueue (single merged send + origin-aware
+      // mirroring) and clears the notifications with clearQueueNotifications.
       const ctx = journalSessionCommandCtx(session);
     const handledMagicWord = !bridgeOrigin && await dispatchBusyQueueMagicWord(trimmed, session, {
         sendReply: ctx.sendReply,
@@ -10350,21 +10248,20 @@ async function journalRouteTextToSession(session, body, { keepRestartBudget = fa
         emitRelease,
       });
       if (handledMagicWord) return;
-      // Print-mode Claude with MATRON_CLAUDE_QUEUE_IN_MATRON=0: plain text the
-      // user typed goes into the running turn through flushQueue
-      // (lib/claude-steer.js) instead of waiting in the queue. Anything that
-      // cannot steer, and a refused write, falls through to the queue below so
-      // nothing is lost.
+      // Print-mode Claude with MATRON_CLAUDE_QUEUE_IN_MATRON=0: plain text the user typed
+      // goes into the running turn through flushQueue (lib/claude-steer.js)
+      // instead of waiting in the queue. Anything that cannot steer, and a
+      // refused write, falls through to the queue below so nothing is lost.
       const steerEntry = tagCauses(markJournalOrigin([{ type: 'text', text: trimmed }]), causes);
       if (bridgeOrigin) markBridgeOrigin(steerEntry);
       if (trySteerEntry(session, steerEntry)) {
         if (!bridgeOrigin) await ctx.sendReply(STEER_NOTICE);
         return;
       }
-      // Queue like a Matrix message would, but marked journal-origin so the
-      // eventual flushQueue send skips the journal mirror — the journal
-      // already has this text as the client's own send row, and re-mirroring
-      // on flush would show a duplicate in Matron (see lib/queue-flush.js).
+      // Queue it, marked journal-origin so the eventual flushQueue send skips
+      // the journal mirror — the journal already has this text as the client's
+      // own send row, and re-mirroring on flush would show a duplicate in Matron
+      // (see lib/queue-flush.js).
       if (!session.queuedMessages) session.queuedMessages = [];
       // /compact jumps the queue and travels alone (lib/compact-priority.js).
       // Unshifting is what makes the jump real, and it also gives the flush side
@@ -11165,7 +11062,7 @@ function journalOnPromptReply(session, answer, { username, seq, convoId: replyCo
     journalPublishNotice(journalConvoIdFor(session), "Nothing to answer right now — there's no open prompt in this session.");
     return;
   }
-  journalEchoPromptAnswer(session, username, label);
+  journalEchoToRoom(session, `📱 ${username} answered: ${label}`, `📱 <b>${escapeHtml(username)} answered:</b> ${escapeHtml(label)}`);
 }
 
 function journalIsControlConvo(convoId) {
@@ -11271,28 +11168,6 @@ function journalResumeConvo(convoId, noticeText = JOURNAL_RESUME_NOTICE) {
     return null;
   } finally { finishInput?.(); }
 }
-
-// Canonical HTTP-side permission registry. Keys are the full permission tuple with
-// a NUL separator (`convo_id + "\0" + tool_use_id`);
-// journalConvoIdFor(session) and inbound
-// frame.convo_id provide the same stable conversation identity without
-// plumbing a transport-specific session_id through the router.
-const pendingPermissionDecisions = new Map();
-const permissionSeams = createPermissionSeams({ pendingPermissionDecisions });
-
-function resolveJournalPermissionReply(key, decision, { username } = {}) {
-  const pending = pendingPermissionDecisions.get(key);
-  const finalized = permissionSeams.resolvePermissionReply(key, decision, { username });
-  if (!finalized || finalized.source !== 'operator') return false;
-  const label = finalized.decision === 'allow' ? 'Allow' : 'Deny';
-  journalEchoPromptAnswer(findSessionByClaudeSessionId(pending.convoId), username, label);
-  return true;
-}
-
-// Assembled once and invoked from journalHandleInboundEvent (the `function`
-// declaration wired into createJournalPublisher near the top of this file —
-// hoisted, so that forward reference is safe). Permission registry operations
-// come from the same factory exercised by the router contract tests.
 
 // The same wake, addressed by ROOM rather than by convo — what an inbound
 // join_request has to work with, since a room record names its owning session
@@ -12725,7 +12600,7 @@ function deliverRoomFrameTo(room, frame) {
     // delivery at all: no injected turn, no pending-inbox growth, and no reply
     // waiter — which is why it sits above all three. Only the decision lives in
     // lib/room-delivery.js (roomFrameDisposition), because index.js can't be
-    // imported by a test. It also sits above the WAKE below:
+    // imported by a test. It also sits above the WAKE below (Bugbot on #288):
     // a muted binding whose session the reaper took down must stay down —
     // waking it only to drop the frame as muted would hand a peer that keeps
     // writing exactly the respawn-per-message the mute was reached for.
@@ -13360,8 +13235,6 @@ const journalInputConsumer = createJournalInputConsumer({
     });
   },
   routePromptReply: journalOnPromptReply,
-  ...permissionSeams,
-  resolvePermissionReply: resolveJournalPermissionReply,
   // The router calls resumeSessionForConvo(convoId, {username}), but
   // journalResumeConvo's 2nd param is the notice TEXT: drop the ctx here, or it
   // is published as `{"body":{"username":…}}` after every message that wakes a
@@ -13563,7 +13436,6 @@ function journalEvictConvoInput(session) {
     journalPublishNotice(convoId, formatRoomDeliveryFailedNotice(strandedRoomMessages));
   }
   if (convoId) {
-    permissionSeams.finalizePendingPermissionsForConvo(convoId, 'session ended');
     journalInputConsumer.evictConvo(convoId, {
       clearQueue: () => {
         for (const entry of session.queuedMessages || []) runQueuedCleanup(entry);
@@ -13725,9 +13597,6 @@ function resumePersistedSession(roomId, prev, { skipJournalMirror = false } = {}
   newSession.lastSummaryMsgCount = prev.lastSummaryMsgCount || 0;
   if (typeof prev.llmTitleEarned === 'boolean') newSession._llmTitleEarned = prev.llmTitleEarned;
   newSession.lastRosterText = prev.lastRosterText || '';
-  // Carry + harden the activity-inferred repo signal across auto-resume:
-  // this idle-reap/restart path is distinct from the explicit /resume path and
-  // must not drop the durable signal either.
   newSession.sendCallback = sendReply;
   newSession.sendHtml = sendHtmlFn;
   newSession.sendButtonMessage = (prompt, buttons, mode, plainText, html, payload) =>
@@ -14755,15 +14624,8 @@ const apiServer = createServer(async (req, res) => {
   let body = '';
   let bodyBytes = 0;
   let showFileBodyTooLarge = false;
-  const permissionDecisionBody = url.pathname === '/permission-decision'
-    ? createPermissionDecisionBodyCollector({ res, auditPermissionDecisionFn: auditPermissionDecision })
-    : null;
   req.on('data', chunk => {
-    if (showFileBodyTooLarge || permissionDecisionBody?.tooLarge) return;
-    if (permissionDecisionBody) {
-      permissionDecisionBody.append(chunk);
-      return;
-    }
+    if (showFileBodyTooLarge) return;
     bodyBytes += chunk.length;
     if (url.pathname === '/show-file' && bodyBytes > 64 * 1024) {
       showFileBodyTooLarge = true;
@@ -14783,23 +14645,7 @@ const apiServer = createServer(async (req, res) => {
     body += chunk;
   });
   req.on('end', async () => {
-    if (showFileBodyTooLarge || permissionDecisionBody?.tooLarge) return;
-
-    if (url.pathname === '/permission-decision') {
-      handlePermissionDecisionRoute({
-        body: permissionDecisionBody.body,
-        res,
-        sessions,
-        pendingPermissionDecisions,
-        classifyPermissionFn: classifyPermission,
-        journalConvoIdForFn: journalConvoIdFor,
-        evictPermissionSeq: (key, convoId) => journalInputConsumer.evictPermissionSeq(key, convoId),
-        auditPermissionDecisionFn: auditPermissionDecision,
-        timeoutMs: PERMISSION_DECISION_TIMEOUT_MS,
-        permissionToken: req.headers['x-matron-permission-token'],
-      });
-      return;
-    }
+    if (showFileBodyTooLarge) return;
 
     if (url.pathname === '/show-file') {
       const { status, headers, body: resBody } = await processShowFile({

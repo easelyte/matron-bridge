@@ -25,7 +25,7 @@ describe('tool roles', () => {
 });
 
 describe('Claude spawn tool role', () => {
-  const build = (options = {}, baseEnv = {}) => buildClaudeSpawnEnv({ mode: 'print', permissionToken: 't', baseEnv, ...options });
+  const build = (options = {}, baseEnv = {}) => buildClaudeSpawnEnv({ baseEnv, ...options });
 
   it.each([undefined, '', '0', 'true'])('requires the exact filter opt-in, got %s', (flag) => {
     for (const coordinator of [true, false]) {

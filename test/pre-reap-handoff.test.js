@@ -5,7 +5,6 @@ import {
 } from '../lib/pre-reap-handoff.js';
 import { isCompactCommand, hasQueuedCompact, compactBatchSize } from '../lib/compact-priority.js';
 
-
 const HOUR = 3_600_000;
 const MIN = 60_000;
 const T = Date.parse('2026-10-04T10:00:00.000Z');
@@ -177,9 +176,6 @@ describe('handoffTurnText', () => {
     expect(text).toContain('mission_status');
     expect(text).toContain('milestone_post');
     expect(text).toMatch(/nothing has changed/i);
-    expect(text).toContain("If this session's work is finished (its mission is done or it has completed the task it was given)");
-    expect(text).toContain('and /close has not been run since its last real work');
-    expect(text).toContain('run /close now (that is not new work); otherwise do nothing.');
     expect(text).toMatch(/do not start new work/i);
     expect(text).toMatch(/one line/i);
     expect(text).not.toContain('\n');

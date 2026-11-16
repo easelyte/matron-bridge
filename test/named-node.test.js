@@ -88,7 +88,7 @@ describe('child PATH under a named node copy', () => {
   it('Claude sessions get the real node directory, not the copy directory', () => {
     const env = buildClaudeSpawnEnv({
       baseEnv: { PATH: '/usr/bin:/bin', MATRON_REAL_NODE: REAL },
-      mode: 'print', execPath: COPY, platform: 'darwin', pathDelimiter: ':', roomId: 'r', apiPort: 1,
+      execPath: COPY, platform: 'darwin', pathDelimiter: ':', roomId: 'r', apiPort: 1,
     });
     expect(env.PATH).toBe('/opt/homebrew/Cellar/node/22.1.0/bin:/usr/bin:/bin');
   });

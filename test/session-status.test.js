@@ -8,7 +8,6 @@ import {
   contextWindowFor,
   sameModelFamily,
   subagentContextWindow,
-  reconcileModelForWindow,
   contextTokensFromUsage,
   contextTokensFromAssistantEvent,
   postCompactContextTokens,
@@ -98,31 +97,6 @@ describe('contextWindowFor', () => {
   it('handles a missing model', () => {
     expect(contextWindowFor(null)).toBe(200_000);
     expect(contextWindowFor(undefined)).toBe(200_000);
-  });
-});
-
-describe('reconcileModelForWindow', () => {
-  it('keeps the [1m] launch model when the bare stream id would narrow it', () => {
-    // A session launched as e.g. opus-4-6[1m], whose first assistant event
-    // reports the bare 200k-default id, must NOT drop to a 200k window.
-    expect(reconcileModelForWindow('claude-opus-4-6[1m]', 'claude-opus-4-6')).toBe('claude-opus-4-6[1m]');
-    expect(reconcileModelForWindow('claude-sonnet-4-5[1m]', 'claude-sonnet-4-5')).toBe('claude-sonnet-4-5[1m]');
-    // Widen-only also refuses a genuine downgrade in the event path (a real
-    // /model switch flows through its own path, not this reconcile).
-    expect(reconcileModelForWindow('claude-opus-4-6[1m]', 'claude-haiku-4-5')).toBe('claude-opus-4-6[1m]');
-  });
-
-  it('adopts the new model when it widens or matches the window', () => {
-    expect(reconcileModelForWindow('claude-opus-4-8', 'claude-opus-4-8[1m]')).toBe('claude-opus-4-8[1m]');
-    expect(reconcileModelForWindow('claude-opus-4-6', 'claude-opus-4-8')).toBe('claude-opus-4-8');
-    expect(reconcileModelForWindow('claude-fable-5', 'claude-mythos-5')).toBe('claude-mythos-5');
-  });
-
-  it('handles missing sides without narrowing', () => {
-    expect(reconcileModelForWindow(null, 'claude-opus-4-8')).toBe('claude-opus-4-8');
-    expect(reconcileModelForWindow('opus[1m]', null)).toBe('opus[1m]');
-    expect(reconcileModelForWindow(null, null)).toBe(null);
-    expect(reconcileModelForWindow(undefined, undefined)).toBe(null);
   });
 });
 
