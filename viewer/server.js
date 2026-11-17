@@ -7,7 +7,7 @@ import { generateSignedUrl, verifyToken, scopeFromToken, readPageToken } from '.
 import { formatSecretContextHtml, secretConversationUrl } from '../lib/secret-context.js';
 import { viewerApiKey, VIEWER_KEY_HEADER_NAME } from '../lib/api-auth.js';
 import { validateAndOpen, FileLinkDenied, MAX_DOWNLOAD_BYTES, MAX_PAGE_BYTES, PAGE_HEADERS, isPageFile } from '../lib/file-link-guard.js';
-import { createShortLinkReader, isShortCode, shortLinksFile } from '../lib/short-links.js';
+import { createShortLinkReader, shortLinksFile } from '../lib/short-links.js';
 export { generateSignedUrl, verifyToken };
 
 // Port resolution with a legacy-name fallback: the Matrix→Matron rename left
@@ -26,9 +26,6 @@ export function resolveViewerPort(env = process.env, warn = console.warn) {
 
 const PORT = resolveViewerPort();
 const SECRET = process.env.HMAC_SECRET;
-// Short links (lib/short-links.js): /l/<code> resolves to a token the bridge
-// stored, and the token then goes through its own route's handler below.
-const shortLinks = createShortLinkReader({ file: shortLinksFile() });
 
 const app = express();
 // App-wide urlencoded parsing keeps body-parser's 100 KB default — /sensitive
@@ -321,13 +318,10 @@ function renderSensitiveShell(label, token, mode, oneTime = true) {
 </html>`;
 }
 
-app.get('/view', (req, res) => {
+app.get('/view', async (req, res) => {
   const { token } = req.query;
   if (!token) return res.status(400).send('Missing token');
-  return serveView(req, res, token);
-});
 
-async function serveView(req, res, token) {
   const data = verifyToken(token);
   // Page and download tokens are minted for their own routes only.
   if (!data || data.dl === true || data.page === true) return res.status(403).send('Invalid or expired token');
@@ -344,7 +338,7 @@ async function serveView(req, res, token) {
     if (!(err instanceof FileLinkDenied)) console.error('Error reading file:', err);
     res.status(404).send('File not found');
   }
-}
+});
 
 // Bounds the disk reads a token holder — or a token guesser — can trigger.
 // In-memory store is fine here: one viewer process, restart resets are
@@ -359,13 +353,10 @@ const downloadLimiter = rateLimit({
   validate: { xForwardedForHeader: false },
 });
 
-app.get('/download', downloadLimiter, (req, res) => {
+app.get('/download', downloadLimiter, async (req, res) => {
   const { token } = req.query;
   if (!token) return res.status(400).send('Missing token');
-  return serveDownload(req, res, token);
-});
 
-async function serveDownload(req, res, token) {
   const data = verifyToken(token);
   // dl is the route discriminator — a /view token must not turn into a raw
   // download with the larger size budget just by switching the path.
@@ -386,7 +377,7 @@ async function serveDownload(req, res, token) {
     if (!(err instanceof FileLinkDenied)) console.error('Error reading file:', err);
     res.status(404).send('File not found');
   }
-}
+});
 
 // Own budget: a page link lives for days and is opened during screen
 // shares, so a burst of shell or download traffic must not 429 it (and vice
@@ -405,13 +396,10 @@ const pageLimiter = rateLimit({
 // the secret and sensitive-data routes this origin also serves. The usual
 // serve-time guards run on every open, so the link always shows the current
 // file and never anything outside the workdir or sensitive-named.
-app.get('/page', pageLimiter, (req, res) => {
+app.get('/page', pageLimiter, async (req, res) => {
   const { token } = req.query;
   if (!token) return res.status(400).send('Missing token');
-  return servePage(req, res, token);
-});
 
-async function servePage(req, res, token) {
   // The path and workdir are sealed inside the token (lib/viewer-tokens.js).
   const data = readPageToken(token);
   if (!data) return res.status(403).send('Invalid or expired token');
@@ -428,7 +416,7 @@ async function servePage(req, res, token) {
     if (!(err instanceof FileLinkDenied)) console.error('Error reading page:', err);
     res.status(404).send('File not found');
   }
-}
+});
 
 const BRIDGE_API_PORT = process.env.MATRON_BRIDGE_API_PORT || 9802;
 // The bridge's loopback API takes the viewer by a key derived from the HMAC
@@ -441,19 +429,14 @@ const bridgeAuth = () => {
 app.get('/secret', (req, res) => {
   const { token } = req.query;
   if (!token) return res.status(400).send('Missing token');
-  return serveSecretForm(req, res, token, token);
-});
 
-// `credential` is what the form posts back: the token itself, or the short
-// code it came in by, so a short link never puts the long token in the page.
-function serveSecretForm(req, res, token, credential) {
   const data = verifyToken(token);
   if (!data) return res.status(403).send('Invalid or expired token');
   if (!data.secretId || !data.label) return res.status(400).send('Invalid secret token');
 
   res.set({ 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer' });
-  res.type('html').send(renderSecretForm(data.label, credential, data.multiline === true, data.context, data.convoId));
-}
+  res.type('html').send(renderSecretForm(data.label, token, data.multiline === true, data.context, data.convoId));
+});
 
 // The secure-input POST's own budget and its own parser. The budget exists
 // for the same reason revealLimiter does — behind the tunnel every request is
@@ -478,7 +461,7 @@ app.post('/secret', secretLimiter, secretFormParser, async (req, res) => {
   // credential is not text to be tidied up.
   if (!token || typeof value !== 'string' || value === '') return res.status(400).send('Missing token or value');
 
-  const data = verifyToken(tokenForCredential(token, ['secret']));
+  const data = verifyToken(token);
   if (!data) return res.status(403).send('Invalid or expired token');
   if (!data.secretId) return res.status(400).send('Invalid secret token');
 
@@ -528,18 +511,13 @@ app.use('/secret', (err, req, res, next) => {
 app.get('/sensitive', downloadLimiter, (req, res) => {
   const { token } = req.query;
   if (!token) return res.status(400).send('Missing token');
-  return serveSensitiveShell(req, res, token, token);
-});
 
-// As with the secret form, `credential` is what the shell posts to
-// /sensitive/reveal: the token, or the short code it came in by.
-function serveSensitiveShell(req, res, token, credential) {
   const data = verifyToken(token);
   if (!data) return res.status(403).send('Invalid or expired token');
   if (!data.sensitiveId || !data.label) return res.status(400).send('Invalid sensitive data token');
 
-  res.type('html').send(renderSensitiveShell(data.label, credential, 'view', data.ot !== false));
-}
+  res.type('html').send(renderSensitiveShell(data.label, token, 'view', data.ot !== false));
+});
 
 // Direct-download variant: same shell, but the click saves straight to a file
 // instead of rendering the content. Requires dl:true in the token (same
@@ -548,17 +526,14 @@ function serveSensitiveShell(req, res, token, credential) {
 app.get('/sensitive-download', downloadLimiter, (req, res) => {
   const { token } = req.query;
   if (!token) return res.status(400).send('Missing token');
-  return serveSensitiveDownloadShell(req, res, token, token);
-});
 
-function serveSensitiveDownloadShell(req, res, token, credential) {
   const data = verifyToken(token);
   if (!data || data.dl !== true || !data.sensitiveId || !data.label) {
     return res.status(403).send('Invalid or expired token');
   }
 
-  res.type('html').send(renderSensitiveShell(data.label, credential, 'download', data.ot !== false));
-}
+  res.type('html').send(renderSensitiveShell(data.label, token, 'download', data.ot !== false));
+});
 
 // Own budget, deliberately not the GET one. Behind the tunnel every request
 // arrives from the loopback IP, so a shared limiter is one global counter —
@@ -583,7 +558,7 @@ app.post('/sensitive/reveal', revealLimiter, async (req, res) => {
   const { token } = req.body || {};
   if (!token) return res.status(400).json({ error: 'Missing token' });
 
-  const data = verifyToken(tokenForCredential(token, ['sensitive', 'sensitive-download']));
+  const data = verifyToken(token);
   if (!data || !data.sensitiveId) {
     return res.status(403).json({ error: 'Invalid or expired token' });
   }
@@ -604,53 +579,6 @@ app.post('/sensitive/reveal', revealLimiter, async (req, res) => {
     console.error('Sensitive data fetch error:', err);
     res.status(500).json({ error: 'Failed to reach bridge API' });
   }
-});
-
-// A credential posted back by the secret form or the sensitive shell: a long
-// token passes through untouched; a short code becomes the token it stands
-// for, provided it was minted for one of `routes`. Anything else becomes null,
-// which verifyToken rejects like any bad token.
-function tokenForCredential(credential, routes) {
-  if (!isShortCode(credential)) return credential;
-  const entry = shortLinks.resolve(credential);
-  return entry && routes.includes(entry.route) ? entry.token : null;
-}
-
-// Short links: /l/<code>. The page is served in place, not redirected to the
-// long link, so the long token never reaches the address bar, the history or
-// a Referer header. The code is looked up and its token handed to the same
-// handler, behind the same rate limit, the long link would have hit; every
-// check on the token (signature, expiry, route flag, one-time consumption on
-// the bridge) runs exactly as it does there. An unknown, malformed, expired
-// or pruned code gets the expired-token answer, so a reply never tells
-// whether a code ever existed. The lookup has its own budget too: it is the
-// one a code guesser would spend.
-const shortLinkLimiter = rateLimit({
-  windowMs: 60_000,
-  limit: parseInt(process.env.SHORT_LINK_RATE_LIMIT || '120', 10),
-  standardHeaders: false,
-  legacyHeaders: false,
-  validate: { xForwardedForHeader: false },
-});
-
-const SHORT_LINK_HANDLERS = {
-  view: { limiter: null, serve: (req, res, token) => serveView(req, res, token) },
-  download: { limiter: downloadLimiter, serve: (req, res, token) => serveDownload(req, res, token) },
-  page: { limiter: pageLimiter, serve: (req, res, token) => servePage(req, res, token) },
-  secret: { limiter: null, serve: (req, res, token, code) => serveSecretForm(req, res, token, code) },
-  sensitive: { limiter: downloadLimiter, serve: (req, res, token, code) => serveSensitiveShell(req, res, token, code) },
-  'sensitive-download': { limiter: downloadLimiter, serve: (req, res, token, code) => serveSensitiveDownloadShell(req, res, token, code) },
-};
-
-app.get('/l/:code', shortLinkLimiter, (req, res, next) => {
-  const { code } = req.params;
-  const entry = shortLinks.resolve(code);
-  const handler = entry && SHORT_LINK_HANDLERS[entry.route];
-  res.set({ 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer' });
-  if (!handler) return res.status(403).send('Invalid or expired token');
-  const serve = () => Promise.resolve(handler.serve(req, res, entry.token, code)).catch(next);
-  if (!handler.limiter) return serve();
-  return handler.limiter(req, res, (err) => (err ? next(err) : serve()));
 });
 
 function scriptJsonString(value) {
@@ -739,6 +667,37 @@ app.use('/plugin', express.static(PLUGIN_DIR, {
     }
   },
 }));
+
+// Short links (lib/short-links.js): /l/<code>, minted by the bridge for page,
+// sensitive-data and secret-request links. The code is looked up in the store
+// the bridge writes, and the request is then dispatched, in this process, to
+// the route the code was minted for with its token, exactly as if the long
+// link had been opened. Nothing is redirected, so the long token never
+// reaches the address bar, the history or a Referer; every check on the token
+// (signature, expiry, route flag, the bridge's one-time consumption) and the
+// route's own rate limit apply unchanged. The secret form and the sensitive
+// shell carry the token in their page body as they always have; a code and
+// its token grant exactly the same access, so that body tells the code's
+// holder nothing new. An unknown, malformed, expired or pruned code gets the
+// expired-token answer, so a reply never tells whether a code ever existed.
+// Lookups have their own budget on top of the route's: it is the one a code
+// guesser spends.
+const shortLinks = createShortLinkReader({ file: shortLinksFile() });
+const shortLinkLimiter = rateLimit({
+  windowMs: 60_000,
+  limit: parseInt(process.env.SHORT_LINK_RATE_LIMIT || '120', 10),
+  standardHeaders: false,
+  legacyHeaders: false,
+  validate: { xForwardedForHeader: false },
+});
+
+app.get('/l/:code', shortLinkLimiter, (req, res, next) => {
+  res.set({ 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer' });
+  const entry = shortLinks.resolve(req.params.code);
+  if (!entry) return res.status(403).send('Invalid or expired token');
+  req.url = `/${entry.route}?token=${encodeURIComponent(entry.token)}`;
+  return app.router.handle(req, res, next);
+});
 
 app.get('/health', (req, res) => res.send('ok'));
 

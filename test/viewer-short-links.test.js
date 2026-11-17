@@ -129,59 +129,45 @@ describe('codes that do not resolve', () => {
     }
   });
 
-  it('a code whose token was minted for another route cannot be replayed there', async () => {
-    // A page code posted to the sensitive reveal: rejected like a bad token.
-    const filePath = path.join(tmpDir, 'p.html');
-    writeFileSync(filePath, PAGE);
-    const { generatePageUrl } = await import('../lib/viewer-tokens.js');
-    const code = codeOf(await shorten(generatePageUrl(base, filePath, SECRET, 600, tmpDir)));
+  it('a code is not a token: posting one where a token is posted is refused', async () => {
+    sensitive.set('s-code', { content: 'value-code', oneTime: true });
+    const code = codeOf(await shorten(`${base}/sensitive?token=${signed({ sensitiveId: 's-code', label: 'k' })}`));
     const res = await fetch(`${base}/sensitive/reveal`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token: code }),
     });
     expect(res.status).toBe(403);
-    const sub = await fetch(`${base}/secret`, {
-      method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({ token: code, value: 'v' }).toString(),
-    });
-    expect(sub.status).toBe(403);
-    expect(secretSubmits).toHaveLength(0);
+    expect(sensitive.get('s-code').viewed).toBeUndefined();
   });
 
-  it('the posted-back credential must have been stored for that route, even when its token would pass', async () => {
-    // Tokens that would pass each POST's own checks, stored under a route the
-    // POST does not accept: only the route restriction can refuse them.
-    sensitive.set('s-route', { content: 'value-route', oneTime: true });
+  it('a code only ever opens the route it was minted for', async () => {
+    // A sensitive token stored as a page code goes to /page, which refuses it.
     const exp = Math.floor(Date.now() / 1000) + 300;
-    const sensitiveAsPage = writer.add({ route: 'page', token: signed({ sensitiveId: 's-route', label: 'k' }), exp });
-    const res = await fetch(`${base}/sensitive/reveal`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token: sensitiveAsPage }),
-    });
+    const code = writer.add({ route: 'page', token: signed({ sensitiveId: 's-x', label: 'k' }), exp });
+    const res = await fetch(`${base}/l/${code}`);
     expect(res.status).toBe(403);
-    expect(sensitive.get('s-route').viewed).toBeUndefined();
-
-    const secretAsSensitive = writer.add({ route: 'sensitive', token: signed({ secretId: 'sec-route', label: 'k' }), exp });
-    const sub = await fetch(`${base}/secret`, {
-      method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({ token: secretAsSensitive, value: 'v' }).toString(),
-    });
-    expect(sub.status).toBe(403);
-    expect(secretSubmits).toHaveLength(0);
+    expect(await res.text()).toBe('Invalid or expired token');
   });
 });
 
+// The token the shell or form carries in its body (what it posts back).
+function bodyToken(html) {
+  const m = html.match(/const TOKEN = ("[^"]*");/) || html.match(/name="token" value="([^"]*)"/);
+  return m[1].startsWith('"') ? JSON.parse(m[1]) : m[1];
+}
+
 describe('GET /l/<code> for sensitive data', () => {
-  it('serves the shell with the code, never the long token, in it', async () => {
+  it('serves the shell in place, consuming nothing, with the token only in the page body', async () => {
     sensitive.set('s1', { content: 'value-1', oneTime: true });
     const token = signed({ sensitiveId: 's1', label: 'k' });
     const short = await shorten(`${base}/sensitive?token=${token}`);
-    const res = await fetch(short);
+    const res = await fetch(short, { redirect: 'manual' });
     expect(res.status).toBe(200);
+    expect(res.headers.get('location')).toBeNull();
+    expect(res.headers.get('referrer-policy')).toBe('no-referrer');
+    expect(res.headers.get('cache-control')).toMatch(/no-store/);
     const html = await res.text();
-    expect(html).toContain(JSON.stringify(codeOf(short)));
-    expect(html).not.toContain(token);
-    expect(html).not.toContain(token.split('.')[0]);
+    expect(bodyToken(html)).toBe(token);
     expect(html).toContain('one-time link');
-    // The GET consumed nothing.
     expect(sensitive.get('s1').viewed).toBeUndefined();
   });
 
@@ -192,35 +178,41 @@ describe('GET /l/<code> for sensitive data', () => {
     expect(await res.text()).toContain('"download"');
   });
 
-  it('a one-time code is consumed exactly once, even by two concurrent reveals', async () => {
+  it('a one-time short link is consumed exactly once, even by two concurrent reveals', async () => {
     sensitive.set('s2', { content: 'value-2', oneTime: true });
-    const code = codeOf(await shorten(`${base}/sensitive?token=${signed({ sensitiveId: 's2', label: 'k' })}`));
-    const reveal = () => fetch(`${base}/sensitive/reveal`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token: code }),
+    const short = await shorten(`${base}/sensitive?token=${signed({ sensitiveId: 's2', label: 'k' })}`);
+    // Two tabs open the same short link, then both press Reveal at once.
+    const [a, b] = await Promise.all([fetch(short).then((r) => r.text()), fetch(short).then((r) => r.text())]);
+    const reveal = (html) => fetch(`${base}/sensitive/reveal`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token: bodyToken(html) }),
     });
-    const results = await Promise.all([reveal(), reveal()]);
-    const statuses = results.map((r) => r.status).sort();
-    expect(statuses).toEqual([200, 403]);
-    const ok = results.find((r) => r.status === 200);
-    expect((await ok.json()).content).toBe('value-2');
-    // And afterwards it stays consumed.
-    expect((await reveal()).status).toBe(403);
+    const results = await Promise.all([reveal(a), reveal(b)]);
+    expect(results.map((r) => r.status).sort()).toEqual([200, 403]);
+    expect((await results.find((r) => r.status === 200).json()).content).toBe('value-2');
+    // And afterwards it stays consumed; the shell still loads, the reveal does not.
+    const again = await fetch(short);
+    expect(again.status).toBe(200);
+    expect((await reveal(await again.text())).status).toBe(403);
   });
 
-  it('a multi-use code reveals until it expires', async () => {
+  it('a multi-use short link reveals more than once', async () => {
     sensitive.set('s3', { content: 'value-3', oneTime: false });
-    const code = codeOf(await shorten(`${base}/sensitive?token=${signed({ sensitiveId: 's3', label: 'k', ot: false })}`));
+    const short = await shorten(`${base}/sensitive?token=${signed({ sensitiveId: 's3', label: 'k', ot: false })}`);
+    const html = await (await fetch(short)).text();
+    expect(html).toContain('can be used more than once');
     for (let i = 0; i < 2; i++) {
       const res = await fetch(`${base}/sensitive/reveal`, {
-        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token: code }),
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token: bodyToken(html) }),
       });
       expect(res.status).toBe(200);
     }
   });
 
-  it('the long token still reveals directly', async () => {
+  it('the long link still works on its own', async () => {
     sensitive.set('s4', { content: 'value-4', oneTime: true });
     const token = signed({ sensitiveId: 's4', label: 'k' });
+    const shell = await fetch(`${base}/sensitive?token=${encodeURIComponent(token)}`);
+    expect(shell.status).toBe(200);
     const res = await fetch(`${base}/sensitive/reveal`, {
       method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token }),
     });
@@ -230,18 +222,16 @@ describe('GET /l/<code> for sensitive data', () => {
 });
 
 describe('GET /l/<code> for a secret request', () => {
-  it('serves the form posting the code back, and the submission reaches the bridge', async () => {
+  it('serves the form in place, and its submission reaches the bridge', async () => {
     const token = signed({ secretId: 'sec-9', label: 'Deploy key' });
     const short = await shorten(`${base}/secret?token=${token}`);
     const res = await fetch(short);
     expect(res.status).toBe(200);
     const html = await res.text();
-    expect(html).toContain(`name="token" value="${codeOf(short)}"`);
-    expect(html).not.toContain(token);
-
+    expect(html).toContain('Deploy key');
     const sub = await fetch(`${base}/secret`, {
       method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-      body: new URLSearchParams({ token: codeOf(short), value: 'dummy-not-a-secret' }).toString(),
+      body: new URLSearchParams({ token: bodyToken(html), value: 'dummy-not-a-secret' }).toString(),
     });
     expect(sub.status).toBe(200);
     expect(secretSubmits).toEqual([{ id: 'sec-9', body: { value: 'dummy-not-a-secret' } }]);

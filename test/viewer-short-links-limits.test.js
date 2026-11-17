@@ -74,7 +74,8 @@ describe('short-link rate limits', () => {
 
   it('the reveal POST keeps its own budget, so a spent lookup budget cannot block it', async () => {
     const res = await fetch(`${base}/sensitive/reveal`, {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token: sensitiveCode }),
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: signed({ sensitiveId: 's1', label: 'k' }) }),
     });
     expect(res.status).toBe(200);
   });
