@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { createRestartRequests, createKeyStore, PINNED_WATCHER_OPTIONS } from '../lib/restart-request.js';
+import { createRestartRequests, PINNED_WATCHER_OPTIONS } from '../lib/restart-request.js';
 import { createCodeUpdateWatcher } from '../lib/code-update-restart.js';
 import { createQuietReader } from '../lib/restart-quiet.js';
 
@@ -18,7 +18,6 @@ afterEach(() => { fs.rmSync(dir, { recursive: true, force: true }); });
 const files = () => ({
   stateFile: path.join(dir, 'state.json'),
   historyFile: path.join(dir, 'history.jsonl'),
-  keys: createKeyStore({ file: path.join(dir, 'keys.json') }),
 });
 const readState = () => JSON.parse(fs.readFileSync(path.join(dir, 'state.json'), 'utf8'));
 
@@ -416,5 +415,81 @@ describe('verdict published to the journal', () => {
       quiet: { holders: [{ convoId: 'c1', why: 'turn in progress' }], probe_error: null },
       code: expect.stringMatching(/waiting for HEAD to contain/), preflight: null, collect: null, unwarned: [],
     });
+  });
+});
+
+describe('review follow-ups', () => {
+  it('a cancel is durable before it is acknowledged: a crash after it restores nothing', async () => {
+    const a = build({ head: OLD });
+    await post(a.layer, { reason: 'deploy', sha: NEW, request_key: 'k1' });
+    expect((await a.layer.handle({ method: 'DELETE' })).body.cancelled).toBe(true);
+    const b = build({ head: OLD });
+    expect(b.layer.restore()).toBe(0);
+    expect(b.watcher.requested).toBeNull();
+  });
+
+  it('a cancel that cannot be written is refused and the request stays', async () => {
+    const { layer, watcher } = build({ head: OLD });
+    await post(layer, { reason: 'deploy', sha: NEW });
+    fs.rmSync(dir, { recursive: true, force: true });
+    expect((await layer.handle({ method: 'DELETE' })).status).toBe(503);
+    expect(watcher.requested).not.toBeNull();
+  });
+
+  it('a key stays the same request however long ago, with no store to expire or evict it', async () => {
+    const a = build({ head: NEW });
+    const first = await post(a.layer, { reason: 'deploy', sha: NEW, request_key: 'k0' });
+    a.layer.commitRestart({ sha: NEW });
+    const b = build({ head: NEW, bootSha: NEW });
+    b.world.now += 400 * 24 * 3600_000;
+    // Many later restarts do not push it out.
+    for (let i = 1; i <= 40; i++) {
+      await post(b.layer, { reason: `r${i}`, sha: NEW, request_key: `k${i}` });
+      b.layer.commitRestart({ sha: NEW });
+      build({ head: NEW, bootSha: NEW });
+    }
+    const c = build({ head: NEW, bootSha: NEW });
+    const again = await post(c.layer, { reason: 'late', sha: NEW, request_key: 'k0' });
+    expect(again).toMatchObject({ status: 200, body: { idempotent: true, id: first.body.id, state: 'back' } });
+  }, 30000);
+
+  it('the code holds are checked again right before the restart is recorded', async () => {
+    let touched = false;
+    const { layer, watcher, world } = build({ head: NEW, commandGate: async () => { if (!touched) { touched = true; world.dirty = true; } return { hold: false }; } });
+    await post(layer, { reason: 'deploy', sha: NEW });
+    const r = await watcher.tick();
+    expect(r.action).toBe('waiting');
+    expect(world.restarts).toHaveLength(0);
+    expect(readState().state).toBe('pending');
+    world.dirty = false;
+    expect((await watcher.tick()).action).toBe('restart');
+  });
+
+  it('refuses to record a restart without a verified boot sha, and adopts the watcher\'s reading once', async () => {
+    const { layer, watcher, world } = build({ head: NEW, bootSha: null });
+    await post(layer, { reason: 'deploy', sha: NEW });
+    expect((await watcher.tick()).action).toBe('waiting');
+    expect(world.restarts).toHaveLength(0);
+    layer.adoptBootSha(OLD);
+    layer.adoptBootSha(NEW);
+    expect((await watcher.tick()).action).toBe('restart');
+    expect(readState()).toMatchObject({ previous_sha: OLD, expected_sha: NEW });
+  });
+});
+
+describe('observed work starts the quiet count again', () => {
+  it('a turn seen by a peek between two gate readings means the next quiet reading is the first', () => {
+    const world = { now: T0, work: false };
+    const reader = createQuietReader(() => ({
+      sessions: new Map([['r1', { alive: true, busy: world.work }]]), bootAt: 0,
+      readProcessTable: () => ({ ok: true, table: [] }), listRunningSubagents: () => [],
+    }), { now: () => world.now, minGapMs: 5000 });
+    expect(reader.count().quiet).toBe(false);
+    world.work = true; world.now += 10_000;
+    expect(reader.peek().holders).toHaveLength(1);
+    world.work = false; world.now += 10_000;
+    expect(reader.count().quiet).toBe(false);
+    world.now += 10_000;
+    expect(reader.count().quiet).toBe(true);
   });
 });

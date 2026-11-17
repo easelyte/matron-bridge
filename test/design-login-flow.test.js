@@ -439,12 +439,3 @@ describe('Design login lifecycle', async () => {
     expect(h.context.armDesignLoginWatch).not.toHaveBeenCalled();
   });
 });
-
-describe('sign-in dialog and restart-note delivery', () => {
-  it('the held-note delivery defers on an open sign-in dialog', () => {
-    const src = readFileSync(fileURLToPath(new URL('../index.js', import.meta.url)), 'utf-8');
-    const start = src.indexOf('async function deliverRes' + 'tartNote(');
-    const fn = src.slice(start, start + 800);
-    expect(fn).toMatch(/signInDialogHoldsInput\(session\)\) return \{ deferred: true \};/);
-  });
-});

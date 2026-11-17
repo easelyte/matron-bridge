@@ -62,10 +62,15 @@ describe('code-update self-restart wiring', () => {
   });
 
   it('has one /restart route, on the layer, and the old routes are gone', () => {
-    expect(index.match(/url\.pathname === '\/restart'/g)).toHaveLength(1);
+    expect(index.match(/if \(url\.pathname === '\/restart'\) \{/g)).toHaveLength(1);
     expect(index).toMatch(/restartRequests\.handle\(\{ method: req\.method, body: data/);
     expect(index).not.toMatch(/\/restart\/dry-run|\/restart\/cancel/);
     expect(index).not.toMatch(/plannedRestart|restartLatch/);
+  });
+
+  it('the restart token is checked by the route, before any session-token check', () => {
+    expect(index).toMatch(/url\.pathname === '\/restart' && req\.headers\['x-matron-restart-token'\] !== undefined/);
+    expect(index.indexOf("req.headers['x-matron-restart-token'] !== undefined")).toBeLessThan(index.indexOf('if (req.method === \'GET\' && refuseApiCall(null)) return;'));
   });
 
   it('every input path holds the restart through the counter', () => {

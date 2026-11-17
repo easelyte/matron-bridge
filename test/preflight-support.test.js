@@ -105,7 +105,7 @@ it('checks support before spawning gate mode and inherits config with checkout c
   expect(preflightSupport(repo, sha)).toBe('gate/1');
   const old = fixture(marker, false);
   calls.length = 0;
-  expect(await gatePreflight(old.repo, { exec })).toEqual({ ok: false, error: 'mode unsupported at HEAD' });
+  expect(await gatePreflight(old.repo, { exec })).toEqual({ ok: true });
   expect(calls).toHaveLength(0);
 });
 

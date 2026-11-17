@@ -11925,6 +11925,7 @@ function startCodeUpdateWatcher() {
     ...PINNED_WATCHER_OPTIONS,
   });
   console.log(`[code-update] self-restart onto new code: ON (running ${boot.sha.slice(0, 7)}; poll ${CODE_UPDATE_POLL_MS}ms, settle ${CODE_UPDATE_SETTLE_MS}ms, never mid-turn; ${CODE_UPDATE_AUTO ? 'restarts on a HEAD move and on request' : 'request-only (MATRON_CODE_UPDATE_AUTO=0): restarts only on POST /restart'})`);
+  restartRequests.adoptBootSha(boot.sha);
   // A request that was pending when the previous process went away is asked for again.
   try { restartRequests.restore(); } catch (e) { console.warn(`[restart] could not restore the pending request: ${e?.message ?? e}`); }
   const timer = setInterval(() => {
@@ -14491,7 +14492,10 @@ const apiServer = createServer(async (req, res) => {
   // routes the viewer calls.
   const apiCaller = apiAuth.caller(req.headers);
   const wakeName = wakeRouteName(url.pathname);
-  const ownCredentialRoute = wakeName !== null || url.pathname === '/shutdown' || url.pathname === '/show-file';
+  // /restart with the per-boot restart token carries its own credential: the
+  // route validates it (a wrong one is 401) before any session-token check.
+  const ownCredentialRoute = wakeName !== null || url.pathname === '/shutdown' || url.pathname === '/show-file'
+    || (url.pathname === '/restart' && req.headers['x-matron-restart-token'] !== undefined);
   const refuseApiCall = (namedRoomId) => {
     if (!API_AUTH_ENFORCED || ownCredentialRoute) return false;
     const r = apiAuthRefusal({ caller: apiCaller, method: req.method, pathname: url.pathname, namedRoomId });

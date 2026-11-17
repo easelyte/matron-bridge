@@ -272,7 +272,8 @@ describe('/restart route wiring', () => {
   const route = index.slice(at, index.indexOf("if (req.method !== 'POST') {", at));
 
   it('needs the operator caller even when MATRON_BRIDGE_API_AUTH=off', () => {
-    expect(route).toMatch(/if \(apiCaller\?\.kind !== 'operator'\) \{[\s\S]*?res\.writeHead\(403/);
-    expect(route.indexOf("apiCaller?.kind !== 'operator'")).toBeLessThan(route.indexOf('bridgeRestartResponse('));
+    // The fork also lets the per-boot restart token in; nothing else gets past this.
+    expect(route).toMatch(/if \(!restartTokenOk && apiCaller\?\.kind !== 'operator'\) \{[\s\S]*?res\.writeHead\(403/);
+    expect(route.indexOf("apiCaller?.kind !== 'operator'")).toBeLessThan(route.indexOf('restartRequests.handle('));
   });
 });
