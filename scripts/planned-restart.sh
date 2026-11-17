@@ -49,9 +49,11 @@ usage() { echo 'usage: planned-restart.sh "<reason>" [--sha <sha>] [--request-ke
 # Port precedence, highest first:
 #   1. MATRON_BRIDGE_API_PORT in the environment (the configured port)
 #   2. the port line of the token file (the port the running bridge bound)
-#   3. MATRON_BRIDGE_API_PORT in the bridge checkout's own .env (this script
-#      lives in <checkout>/scripts), read as data, never sourced
-#   4. 9802, the bridge's own default and the one deploy.sh uses
+#   3. 9802, the bridge's own default and the one deploy.sh uses
+# The token file is written by the bridge when it binds its API, so it names
+# the port the running bridge actually listens on; nothing else is read to find
+# a port (in particular not the checkout's .env, whose grammar is not this
+# script's to re-implement).
 [[ $# -gt 0 && -n "$1" ]] || usage
 reason=$1; shift
 sha=''; request_key=''
@@ -80,48 +82,6 @@ done
 [[ -n "$node_bin" ]] || { echo 'node not found in a standard location' >&2; exit 2; }
 [[ -x /usr/bin/curl ]] || { echo '/usr/bin/curl not found' >&2; exit 2; }
 
-# The port the bridge checkout's .env configures: prints it, or 9802 when the
-# file does not set one, and fails (nothing is connected to) when the setting is
-# there but not a port. The file is data: it is read whole (a NUL byte fails),
-# matched line by line, never evaluated, never globbed. The last assignment
-# decides, as in the bridge's own loader. A value that opens a quote it does not
-# close continues on the following lines, which are skipped until it closes, so
-# a port-looking line inside another variable's value is not an assignment. An
-# invocation through a symlink, or a symlinked .env, is not trusted to name a
-# checkout: 9802.
-configured_port() {
-  local file="${0%/*}/../.env" raw line key value q rest open='' found='' invalid=0
-  if [[ -L "$0" || -L "$file" || ! -f "$file" || ! -r "$file" ]]; then printf '9802'; return 0; fi
-  raw=''
-  IFS= read -r -d '' raw < "$file"
-  [[ "$?" == 1 ]] || return 1
-  while IFS= read -r line || [[ -n "$line" ]]; do
-    line=${line%$'\r'}
-    if [[ -n "$open" ]]; then
-      [[ "$line" == *"$open"* ]] && open=''
-      continue
-    fi
-    [[ "$line" =~ ^[[:space:]]*(export[[:space:]]+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]] || continue
-    key=${BASH_REMATCH[2]}
-    value=${BASH_REMATCH[3]}
-    value=${value#"${value%%[![:space:]]*}"}
-    case "$value" in
-      \"*|\'*)
-        q=${value:0:1}
-        rest=${value:1}
-        if [[ "$rest" != *"$q"* ]]; then open=$q; continue; fi
-        value=${rest%%"$q"*} ;;
-      *)
-        value=${value%%[[:space:]]#*}
-        value=${value%"${value##*[![:space:]]}"} ;;
-    esac
-    [[ "$key" == MATRON_BRIDGE_API_PORT ]] || continue
-    if [[ "$value" =~ ^[1-9][0-9]{0,4}$ ]] && (( value <= 65535 )); then found=$value; invalid=0; else found=''; invalid=1; fi
-  done <<<"$raw"
-  (( invalid == 0 )) || return 1
-  printf '%s' "${found:-9802}"
-}
-
 read_token() {
   [[ -e "$env_file" ]] || { echo 'bridge restarting or down, retry after back' >&2; exit 4; }
   [[ -f "$env_file" && -r "$env_file" ]] || { echo 'malformed restart token file' >&2; exit 2; }
@@ -133,18 +93,14 @@ read_token() {
   token_line=${raw%%$'\n'*}
   [[ "$token_line" =~ ^MATRON_RESTART_TOKEN=([a-f0-9]{64})$ ]] || { echo 'malformed restart token file' >&2; exit 2; }
   token=${BASH_REMATCH[1]}
-  port=''
+  port=9802
   if [[ "$raw" == *$'\n'* ]]; then
     port_line=${raw#*$'\n'}
     [[ "$port_line" =~ ^MATRON_BRIDGE_API_PORT=([1-9][0-9]{0,4})$ ]] || { echo 'malformed restart token file' >&2; exit 2; }
     port=${BASH_REMATCH[1]}
     (( port <= 65535 )) || { echo 'malformed restart token file' >&2; exit 2; }
   fi
-  if [[ -n "$port_override" ]]; then
-    port=$port_override
-  elif [[ -z "$port" ]]; then
-    port=$(configured_port) || { echo 'invalid MATRON_BRIDGE_API_PORT in the bridge checkout .env' >&2; exit 2; }
-  fi
+  [[ -z "$port_override" ]] || port=$port_override
 }
 read_token
 payload=$(/usr/bin/env -i "$node_bin" -e '

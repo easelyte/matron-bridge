@@ -302,11 +302,10 @@ as data; do not source it. Malformed files exit with code 2.
 
 The port is, highest first: `MATRON_BRIDGE_API_PORT` in the environment (the
 configured port, always honoured, with or without an explicit token file); the
-port line of the token file (the port the running bridge bound); the
-`MATRON_BRIDGE_API_PORT` line of the bridge checkout's own `.env` (the script
-lives in `<checkout>/scripts`; the file is read as data, never sourced); `9802`,
-the bridge's own default and the one `deploy.sh` uses. To select another bridge
-explicitly, set `MATRON_RESTART_ENV_FILE` to its token file. Exit codes: 0
+port line of the token file (the bridge writes it when it binds its API, so it
+is the port the running bridge listens on); `9802`, the bridge's own default and
+the one `deploy.sh` uses. Nothing else is read to find a port. To select another
+bridge explicitly, set `MATRON_RESTART_ENV_FILE` to its token file. Exit codes: 0
 accepted (202) or already known (200 for a key seen before); 2 refused (the
 reason is printed: 400 bad request, 409 config-only request after HEAD moved or
 the watcher is off), or a malformed token file or port; 4 the bridge is down or
