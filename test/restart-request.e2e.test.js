@@ -1,6 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { execFileSync, execFile } from 'node:child_process';
 import { expect, it, vi } from 'vitest';
 import { startBridge } from './helpers/bridge-process.js';
 
@@ -117,3 +117,44 @@ it('a resume note survives the restart, is delivered to its chat after it, and i
     await bridge.close();
   }
 }, 240000);
+
+// The client script, from the bridge's own checkout, with nothing but HOME: the port comes from
+// the token file the bridge wrote, and a call needs no MATRON_* setting.
+const script = (bridge, args) => new Promise(resolve => {
+  execFile(path.join(bridge.checkout, 'scripts', 'planned-restart.sh'), args, { env: { HOME: bridge.home }, timeout: 20000 },
+    (error, stdout, stderr) => resolve({ status: error ? error.code : 0, stdout, stderr }));
+});
+
+it('the client script reaches a bridge on its own port with only HOME set: accepted, repeated with the same key, refused when config-only after HEAD moved', async () => {
+  const bridge = await startBridge({
+    confine: false, interactive: false, planned: true,
+    env: { MATRON_CODE_UPDATE_RESTART: '1', MATRON_CODE_UPDATE_AUTO: '0', MATRON_CODE_UPDATE_POLL_MS: '300', MATRON_CODE_UPDATE_SETTLE_MS: '100' },
+  });
+  try {
+    const branch = git(bridge, 'rev-parse', '--abbrev-ref', 'HEAD');
+    git(bridge, 'checkout', '-q', '-b', 'next');
+    git(bridge, 'commit', '-q', '--allow-empty', '-m', 'next');
+    const next = git(bridge, 'rev-parse', 'HEAD');
+    git(bridge, 'checkout', '-q', branch);
+
+    const first = await script(bridge, ['rehearsal: script', '--sha', next, '--request-key', 'script-1']);
+    expect(first.status, first.stderr).toBe(0);
+    const body = JSON.parse(first.stdout);
+    expect(body).toMatchObject({ request_key: 'script-1', requests: [{ sha: next, reason: 'rehearsal: script' }] });
+    // The same key again: success, the same request.
+    const again = await script(bridge, ['rehearsal: script', '--sha', next, '--request-key', 'script-1']);
+    expect(again.status, again.stderr).toBe(0);
+    expect(JSON.parse(again.stdout)).toMatchObject({ idempotent: true, id: body.id, state: 'pending' });
+    // HEAD moves (to the requested commit): a config-only request is now refused, with its reason.
+    git(bridge, 'merge', '-q', '--ff-only', 'next');
+    // Cancel the pending request before it can restart anything.
+    expect(await call(bridge, 'DELETE')).toMatchObject({ status: 200, body: { cancelled: true, id: body.id, state: 'cancelled' } });
+    const refused = await script(bridge, ['config only', '--request-key', 'script-2']);
+    expect(refused.status).toBe(2);
+    expect(refused.stderr).toContain('restart refused (HTTP 409)');
+    expect(refused.stderr).toContain('head moved (config-only)');
+    expect(bridge.supervisor.exits).toEqual([]);
+  } finally {
+    await bridge.close();
+  }
+}, 120000);

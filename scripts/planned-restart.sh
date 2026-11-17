@@ -30,10 +30,10 @@ if [[ "${1-}" != "--matron-restart-reexec=${MATRON_RESTART_CANARY:-unset}" || -z
   # The re-exec needs a path to this file; a bare name would be looked up via PATH.
   [[ "$0" == */* ]] || { echo 'run the script by path (absolute or ./relative), not by bare name' >&2; exit 2; }
   canary="$$.${RANDOM}${RANDOM}${RANDOM}.${EPOCHREALTIME-0}"
-  # The port override only counts together with an explicit token file, so an
-  # ambient port can never redirect the default token.
-  api_port=''
-  [[ -z "${MATRON_RESTART_ENV_FILE-}" ]] || api_port=${MATRON_BRIDGE_API_PORT-}
+  # The configured port (MATRON_BRIDGE_API_PORT) always counts: it is the one
+  # setting the bridge itself is started with, and a call that cannot reach the
+  # bridge is worse than one that follows its environment.
+  api_port=${MATRON_BRIDGE_API_PORT-}
   unset BASH_ENV ENV
   exec /usr/bin/env -i \
     HOME="${HOME-}" \
@@ -46,6 +46,12 @@ shift
 unset MATRON_RESTART_CANARY
 
 usage() { echo 'usage: planned-restart.sh "<reason>" [--sha <sha>] [--request-key <key>]' >&2; exit 2; }
+# Port precedence, highest first:
+#   1. MATRON_BRIDGE_API_PORT in the environment (the configured port)
+#   2. the port line of the token file (the port the running bridge bound)
+#   3. MATRON_BRIDGE_API_PORT in the bridge checkout's own .env (this script
+#      lives in <checkout>/scripts), read as data, never sourced
+#   4. 9802, the bridge's own default and the one deploy.sh uses
 [[ $# -gt 0 && -n "$1" ]] || usage
 reason=$1; shift
 sha=''; request_key=''
@@ -58,12 +64,10 @@ while [[ $# -gt 0 ]]; do
 done
 
 env_file=${MATRON_RESTART_ENV_FILE:-}
-port_override=''
+port_override=${MATRON_BRIDGE_API_PORT:-}
 if [[ -z "$env_file" ]]; then
   [[ -n "${HOME:-}" ]] || { echo 'HOME is not set' >&2; exit 2; }
   env_file="${HOME}/.matron-bridge-restart.env"
-elif [[ -n "${MATRON_BRIDGE_API_PORT:-}" ]]; then
-  port_override=$MATRON_BRIDGE_API_PORT
 fi
 if [[ -n "$port_override" ]]; then
   [[ "$port_override" =~ ^[1-9][0-9]{0,4}$ ]] && (( port_override <= 65535 )) || { echo 'invalid MATRON_BRIDGE_API_PORT' >&2; exit 2; }
@@ -76,6 +80,24 @@ done
 [[ -n "$node_bin" ]] || { echo 'node not found in a standard location' >&2; exit 2; }
 [[ -x /usr/bin/curl ]] || { echo '/usr/bin/curl not found' >&2; exit 2; }
 
+# The port the bridge checkout's .env configures, or 9802. Lines are matched,
+# never evaluated; the last valid line wins, as in the bridge's own loader.
+configured_port() {
+  local file="${0%/*}/../.env" line value found=''
+  if [[ -f "$file" && -r "$file" ]]; then
+    while IFS= read -r line || [[ -n "$line" ]]; do
+      if [[ "$line" =~ ^[[:space:]]*(export[[:space:]]+)?MATRON_BRIDGE_API_PORT=(.*)$ ]]; then
+        value=${BASH_REMATCH[2]%%#*}
+        value=${value//[[:space:]]/}
+        value=${value//\"/}
+        value=${value//\'/}
+        if [[ "$value" =~ ^[1-9][0-9]{0,4}$ ]] && (( value <= 65535 )); then found=$value; fi
+      fi
+    done < "$file"
+  fi
+  printf '%s' "${found:-9802}"
+}
+
 read_token() {
   [[ -e "$env_file" ]] || { echo 'bridge restarting or down, retry after back' >&2; exit 4; }
   [[ -f "$env_file" && -r "$env_file" ]] || { echo 'malformed restart token file' >&2; exit 2; }
@@ -87,7 +109,7 @@ read_token() {
   token_line=${raw%%$'\n'*}
   [[ "$token_line" =~ ^MATRON_RESTART_TOKEN=([a-f0-9]{64})$ ]] || { echo 'malformed restart token file' >&2; exit 2; }
   token=${BASH_REMATCH[1]}
-  port=9802
+  port=$(configured_port)
   if [[ "$raw" == *$'\n'* ]]; then
     port_line=${raw#*$'\n'}
     [[ "$port_line" =~ ^MATRON_BRIDGE_API_PORT=([1-9][0-9]{0,4})$ ]] || { echo 'malformed restart token file' >&2; exit 2; }
@@ -112,7 +134,7 @@ for attempt in 1 2; do
     # receive error 56) mean "retry after back"; anything else is not retryable.
     case "$curl_rc" in
       7) echo "bridge restarting or down, retry after back (port $port)" >&2; exit 4 ;;
-      28|52|56) echo 'bridge restarting or down, retry after back' >&2; exit 4 ;;
+      28|52|56) echo 'bridge restarting or down, retry after back (the same --request-key is safe to repeat)' >&2; exit 4 ;;
       *) echo "restart request failed (curl exit $curl_rc)" >&2; exit 2 ;;
     esac
   fi
@@ -122,6 +144,9 @@ for attempt in 1 2; do
     200|202) printf '%s' "$body"; exit 0 ;;
     401) if [[ "$attempt" == 1 ]]; then read_token; else echo 'token stale, bridge restarted; retry after back' >&2; exit 5; fi ;;
     503) echo 'retry after back' >&2; exit 6 ;;
+    # A request the bridge refused (a config-only request after HEAD moved, an
+    # invalid body) or cannot take (the watcher is off): its reason is in the body.
+    400|409) echo "restart refused (HTTP $status): $body" >&2; exit 2 ;;
     *) echo "restart request failed (HTTP $status)" >&2; exit 2 ;;
   esac
 done
