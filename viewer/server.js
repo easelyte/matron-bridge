@@ -7,6 +7,7 @@ import { generateSignedUrl, verifyToken, scopeFromToken, readPageToken } from '.
 import { formatSecretContextHtml, secretConversationUrl } from '../lib/secret-context.js';
 import { viewerApiKey, VIEWER_KEY_HEADER_NAME } from '../lib/api-auth.js';
 import { validateAndOpen, FileLinkDenied, MAX_DOWNLOAD_BYTES, MAX_PAGE_BYTES, PAGE_HEADERS, isPageFile } from '../lib/file-link-guard.js';
+import { createShortLinkReader, shortLinksFile } from '../lib/short-links.js';
 export { generateSignedUrl, verifyToken };
 
 // Port resolution with a legacy-name fallback: the Matrix→Matron rename left
@@ -666,6 +667,37 @@ app.use('/plugin', express.static(PLUGIN_DIR, {
     }
   },
 }));
+
+// Short links (lib/short-links.js): /l/<code>, minted by the bridge for page,
+// sensitive-data and secret-request links. The code is looked up in the store
+// the bridge writes, and the request is then dispatched, in this process, to
+// the route the code was minted for with its token, exactly as if the long
+// link had been opened. Nothing is redirected, so the long token never
+// reaches the address bar, the history or a Referer; every check on the token
+// (signature, expiry, route flag, the bridge's one-time consumption) and the
+// route's own rate limit apply unchanged. The secret form and the sensitive
+// shell carry the token in their page body as they always have; a code and
+// its token grant exactly the same access, so that body tells the code's
+// holder nothing new. An unknown, malformed, expired or pruned code gets the
+// expired-token answer, so a reply never tells whether a code ever existed.
+// Lookups have their own budget on top of the route's: it is the one a code
+// guesser spends.
+const shortLinks = createShortLinkReader({ file: shortLinksFile() });
+const shortLinkLimiter = rateLimit({
+  windowMs: 60_000,
+  limit: parseInt(process.env.SHORT_LINK_RATE_LIMIT || '120', 10),
+  standardHeaders: false,
+  legacyHeaders: false,
+  validate: { xForwardedForHeader: false },
+});
+
+app.get('/l/:code', shortLinkLimiter, (req, res, next) => {
+  res.set({ 'Cache-Control': 'no-store', 'Referrer-Policy': 'no-referrer' });
+  const entry = shortLinks.resolve(req.params.code);
+  if (!entry) return res.status(403).send('Invalid or expired token');
+  req.url = `/${entry.route}?token=${encodeURIComponent(entry.token)}`;
+  return app.router.handle(req, res, next);
+});
 
 app.get('/health', (req, res) => res.send('ok'));
 

@@ -198,6 +198,10 @@ The `share_html_page` tool gives an agent a signed `/page` link that renders one
 
 The viewer origin also serves the secret-request and sensitive-data pages, so pages are served with a `Content-Security-Policy: sandbox` header that has no `allow-same-origin`. The browser then runs the page in an opaque origin of its own. Its scripts cannot read from or post as the viewer origin, and it gets no cookies or storage. The policy also blocks network reads, form posts and framing by other sites, and `Referrer-Policy: no-referrer` keeps the link token out of the Referer of anything the page links to. To serve pages from a hostname of their own anyway, point a second public hostname at the same viewer and set `VIEWER_PAGE_BASE_URL`.
 
+### Short links
+
+Page, sensitive-data and secret-request links go out short, as `<viewer>/l/<code>`, instead of carrying the whole signed token. The code is 12 random letters and digits (about 71 bits) and stands for exactly one token: the bridge stores the pair in `~/.matron-bridge-short-links.json` (owner-only, pruned as codes expire), and the viewer looks the code up and serves the same response the long link would, in place rather than by redirect, so the long token never reaches the address bar, the browser history or a Referer. A code expires with its token, a one-time sensitive link is still consumed once, and an unknown, expired or malformed code gets the same answer as an expired token. Long links keep working. File links in diff cards stay long. Set `MATRON_SHORT_LINKS=off` to hand out long links only. The bridge and the viewer must run as the same user, or both be given the same `MATRON_SHORT_LINKS_FILE`.
+
 ### Live command output rides the journal protocol
 
 Live Bash output streams to Matron clients over the authenticated
@@ -432,6 +436,9 @@ is recorded in the restart's `results` (state file and history line).
 | `DOWNLOAD_RATE_LIMIT` | Viewer requests per minute for file downloads and sensitive-link shell pages | `30` |
 | `PAGE_RATE_LIMIT` | Viewer requests per minute for rendered HTML pages (`/page`) | `60` |
 | `VIEWER_PAGE_BASE_URL` | Optional separate public URL (pointed at the same viewer) for `share_html_page` links | `VIEWER_BASE_URL` |
+| `MATRON_SHORT_LINKS` | Set to `off` to hand out long signed links instead of short `/l/<code>` ones (see "Short links") | on |
+| `MATRON_SHORT_LINKS_FILE` | The short-link store, written by the bridge and read by the viewer | `~/.matron-bridge-short-links.json` |
+| `SHORT_LINK_RATE_LIMIT` | Viewer requests per minute for `/l/<code>` lookups, before the route's own limit | `120` |
 | `REVEAL_RATE_LIMIT` | Viewer requests per minute for `POST /sensitive/reveal`, counted separately so shell loads cannot exhaust it | `30` |
 | `WHISPER_MODEL_PATH` | whisper.cpp model for the optional local voice-note fallback. Used only when this file, and the `whisper-cli` built beside it, exist; the journal transcribes first, and the bridge never installs whisper itself | `~/.local/share/whisper-cpp/models/ggml-small.bin` |
 | `WHISPER_LANGUAGE` | Language for the local whisper fallback | `en` |

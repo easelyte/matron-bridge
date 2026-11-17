@@ -121,6 +121,22 @@ describe('page-link handler', () => {
     expect((await handler({ roomId: 'room-1', path: ['a'] })).status).toBe(400);
   });
 
+  it('hands out the shortened link when given a shortener, with the same expiry', async () => {
+    const seen = [];
+    const sessions = new Map([['room-1', { workdir, showFilePinnedRoots: pinAllowedRootsSync([workdir]) }]]);
+    const h = createPageLinkHandler({
+      sessions, secret: SECRET, baseUrl: 'https://viewer.example.com',
+      shorten: (url) => { seen.push(url); return 'https://viewer.example.com/l/AbCdEfGhIjKl'; },
+    });
+    const { status, body } = await h({ roomId: 'room-1', path: 'pack.html' });
+    expect(status).toBe(200);
+    expect(body.url).toBe('https://viewer.example.com/l/AbCdEfGhIjKl');
+    expect(seen).toHaveLength(1);
+    const data = readPageToken(tokenOf(seen[0]), SECRET);
+    expect(data.exp * 1000).toBeGreaterThan(body.expiresAt - 2000);
+    expect(data.exp * 1000).toBeLessThanOrEqual(body.expiresAt);
+  });
+
   it('500s when the viewer is not configured', async () => {
     const h = createPageLinkHandler({ sessions: new Map([['r', { workdir }]]), secret: '', baseUrl: '' });
     expect((await h({ roomId: 'r', path: 'pack.html' })).status).toBe(500);
