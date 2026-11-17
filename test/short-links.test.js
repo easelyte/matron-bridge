@@ -208,6 +208,28 @@ describe('writer and reader', () => {
     expect(readFileSync(`${file}.lock`, 'utf8')).toBe(`${process.pid} other-nonce`);
   });
 
+  it('puts back a live lock that replaced the dead one while it was being broken', () => {
+    writeFileSync(`${file}.lock`, '999999999 dead-nonce');
+    const old = new Date(Date.now() - 60_000);
+    utimesSync(`${file}.lock`, old, old);
+    let raced = false;
+    const racing = {
+      ...fs,
+      renameSync: (from, to) => {
+        if (!raced && from === `${file}.lock`) {
+          // Another contender broke the dead lock and took a fresh one first.
+          raced = true;
+          fs.unlinkSync(from);
+          writeFileSync(from, `${process.pid} live-nonce`);
+        }
+        return fs.renameSync(from, to);
+      },
+    };
+    expect(() => createShortLinkWriter({ file, now, fs: racing }).add({ route: 'page', token: 'z.s', exp: expIn(60) })).toThrow(/locked/);
+    expect(readFileSync(`${file}.lock`, 'utf8')).toBe(`${process.pid} live-nonce`);
+    expect(readdirSync(dir).filter((n) => n.includes('.stale-'))).toEqual([]);
+  });
+
   it('breaks a stale lock left by a crashed process', () => {
     writeFileSync(`${file}.lock`, '999999999 dead-nonce');
     const old = new Date(Date.now() - 60_000);
