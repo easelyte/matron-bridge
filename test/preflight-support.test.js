@@ -7,7 +7,10 @@ import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { afterEach, expect, it, vi } from 'vitest';
 import { preflightSupport } from '../lib/preflight-support.js';
-import { defaultPreflight } from '../lib/code-update-restart.js';
+import { createRestartPreflight } from '../lib/restart-preflight.js';
+
+// Upstream's module check passes; what is under test is the gate-mode step after it.
+const gatePreflight = (repo, options) => createRestartPreflight(repo, { base: async () => ({ ok: true }), ...options })();
 
 vi.mock('node:child_process', async importOriginal => {
   const actual = await importOriginal();
@@ -94,7 +97,7 @@ it('checks support before spawning gate mode and inherits config with checkout c
   const { repo, sha } = fixture();
   const calls = [];
   const exec = (bin, args, options, callback) => { calls.push({ bin, args, options }); callback(null, '', ''); };
-  expect(await defaultPreflight(repo, { mode: 'gate', exec })).toEqual({ ok: true });
+  expect(await gatePreflight(repo, { exec })).toEqual({ ok: true });
   expect(calls).toHaveLength(1);
   expect(calls[0].args).toEqual(['index.js']);
   expect(calls[0].options.cwd).toBe(repo);
@@ -102,23 +105,23 @@ it('checks support before spawning gate mode and inherits config with checkout c
   expect(preflightSupport(repo, sha)).toBe('gate/1');
   const old = fixture(marker, false);
   calls.length = 0;
-  expect(await defaultPreflight(old.repo, { mode: 'gate', exec })).toEqual({ ok: false, error: 'mode unsupported at HEAD' });
+  expect(await gatePreflight(old.repo, { exec })).toEqual({ ok: false, error: 'mode unsupported at HEAD' });
   expect(calls).toHaveLength(0);
 });
 
 it('refuses gate child errors, timeouts and spawn exceptions', async () => {
   const { repo } = fixture();
   for (const message of ['exit 1', 'timeout']) {
-    const result = await defaultPreflight(repo, { mode: 'gate', timeoutMs: 1,
+    const result = await gatePreflight(repo, { timeoutMs: 1,
       exec: (_bin, _args, options, callback) => {
         expect(options.timeout).toBe(1);
         callback(new Error(message), '', '');
       },
     });
     expect(result.ok).toBe(false);
-    expect(result.error).toContain(message);
+    expect(result.error).toMatch(/gate preflight failed/);
   }
-  expect((await defaultPreflight(repo, { mode: 'gate', exec: () => { throw new Error('spawn failed'); } })).ok).toBe(false);
+  expect((await gatePreflight(repo, { exec: () => { throw new Error('spawn failed'); } })).ok).toBe(false);
 });
 
 it('recognizes the exact protocol line in an entry point larger than one megabyte', () => {

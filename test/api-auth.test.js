@@ -146,10 +146,42 @@ describe('operator token file ownership', () => {
   });
 });
 
+describe('/restart routes', () => {
+  const routes = [['POST', '/restart'], ['GET', '/restart'], ['DELETE', '/restart']];
+  it('opens them to the operator token and nothing else on the operator list', () => {
+    for (const [method, pathname] of routes) {
+      expect(isOperatorRoute(method, pathname)).toBe(true);
+      expect(apiAuthRefusal({ caller: { kind: 'operator' }, method, pathname })).toBe(null);
+    }
+    expect(isOperatorRoute('PUT', '/restart')).toBe(false);
+    expect(isOperatorRoute('GET', '/sessions')).toBe(false);
+  });
+  it('refuses a session token and the viewer key', () => {
+    for (const [method, pathname] of routes) {
+      expect(apiAuthRefusal({ caller: { kind: 'viewer' }, method, pathname }).status).toBe(403);
+      expect(apiAuthRefusal({ caller: { kind: 'session', roomId: 'room-a' }, method, pathname })).not.toBe(null);
+      expect(apiAuthRefusal({ caller: null, method, pathname }).status).toBe(401);
+    }
+  });
+  it('refuses a real session token and viewer key end to end', () => {
+    const auth = createApiAuth({ viewerKey: viewerApiKey('secret') });
+    auth.ensure('room-a');
+    const session = auth.caller({ 'x-matron-session-token': auth.tokenFor('room-a') });
+    const viewer = auth.caller({ 'x-matron-viewer-key': viewerApiKey('secret') });
+    for (const [method, pathname] of routes) {
+      expect(apiAuthRefusal({ caller: session, method, pathname, namedRoomId: null }).status).toBe(403);
+      expect(apiAuthRefusal({ caller: viewer, method, pathname }).status).toBe(403);
+    }
+  });
+});
+
 // Every operator route, as isOperatorRoute lists them. Add a route here when
 // isOperatorRoute gains one, so it gets the same checks.
 const OPERATOR_ROUTES = [
   ['POST', '/sessions'],
+  ['POST', '/restart'],
+  ['GET', '/restart'],
+  ['DELETE', '/restart'],
 ];
 
 describe('operator routes refuse session tokens', () => {

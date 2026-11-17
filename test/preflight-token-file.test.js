@@ -22,7 +22,7 @@ it.each(['module', 'gate', 'invalid-config'])('leaves existing and absent token 
   const port = server.address().port;
   await new Promise(resolve => server.close(resolve));
   fs.writeFileSync(path.join(checkout, '.env'), `JOURNAL_WS_URL=ws://localhost:${port}/ws\nJOURNAL_TOKEN=fixture-only\n`);
-  if (mode === 'invalid-config') fs.appendFileSync(path.join(checkout, '.env'), 'MATRON_RESTART_COLLECT_MS=invalid\n');
+  if (mode === 'invalid-config') fs.appendFileSync(path.join(checkout, '.env'), 'MATRON_CODE_UPDATE_AUTO=sometimes\n');
   for (const contents of [null, `MATRON_RESTART_TOKEN=${'a'.repeat(64)}\n`,
     `MATRON_RESTART_TOKEN=${'a'.repeat(64)}\nMATRON_BRIDGE_API_PORT=${port}\n`]) {
     const home = fs.mkdtempSync(path.join(root, 'home-'));

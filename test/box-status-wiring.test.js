@@ -9,7 +9,7 @@ import { describe, expect, it } from 'vitest';
 // never reports simply shows no usage in every client.
 describe('box status wiring', () => {
   const index = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
-  const fn = index.slice(index.indexOf('function publishBoxStatus('), index.indexOf('function publishBoxStatus(') + 2600);
+  const fn = index.slice(index.indexOf('function publishBoxStatus('), index.indexOf('function publishBoxStatus(') + 3200);
 
   it('sends a box_status op built from the same capacity thunks as the recent_folders reply', () => {
     expect(fn).toMatch(/if \(!JOURNAL_ENABLED\) return false;/);

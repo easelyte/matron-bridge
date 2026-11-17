@@ -19,6 +19,7 @@ const WINDOWS_EXCLUDES = [
   'test/bridge-process.harness.test.js',
   'test/preflight-mode.test.js',
   'test/bridge-process.g7.test.js',
+  'test/restart-request.e2e.test.js',
   'test/codex-completion.test.js',
   'test/codex-redact-publish.test.js',
   // bin/run-named-node is a POSIX sh launcher for macOS (and a plain exec
@@ -58,6 +59,13 @@ const WINDOWS_EXCLUDES = [
   'test/projects-wiring.test.js',
   'test/unseen-wiring.test.js',
   'test/journal-rpc-handlers.test.js',
+  // Real git repositories and sh scripts in a temp dir.
+  'test/worktree.test.js',
+  'test/worktree-service.test.js',
+  'test/worktree-setup.test.js',
+  'test/worktree-setup-flow.test.js',
+  'test/worktree-cleanup.test.js',
+  'test/worktree-cleanup-service.test.js',
 ];
 
 export default defineConfig({

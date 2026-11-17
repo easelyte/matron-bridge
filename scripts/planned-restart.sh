@@ -119,7 +119,7 @@ for attempt in 1 2; do
   status=${out##*$'\n'}
   body=${out%$'\n'*}
   case "$status" in
-    200) printf '%s' "$body"; exit 0 ;;
+    200|202) printf '%s' "$body"; exit 0 ;;
     401) if [[ "$attempt" == 1 ]]; then read_token; else echo 'token stale, bridge restarted; retry after back' >&2; exit 5; fi ;;
     503) echo 'retry after back' >&2; exit 6 ;;
     *) echo "restart request failed (HTTP $status)" >&2; exit 2 ;;
