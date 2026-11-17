@@ -137,8 +137,9 @@ harnessSpawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
     const head = execFileSync('git', ['rev-parse', 'HEAD'], {
       cwd: bridge.checkout, encoding: 'utf8', env: { HOME: bridge.home, PATH: '/usr/bin:/bin' },
     }).trim();
-    const restartState = JSON.parse(fs.readFileSync(path.join(bridge.home, '.matron-bridge-restart-state.json'), 'utf8'));
-    expect(restartState.boot_sha).toBe(head);
+    expect(head).toMatch(/^[0-9a-f]{40}$/);
+    // The token file is written once the loopback API listens.
+    expect(bridge.token()).toMatch(/^[0-9a-f]{64}$/);
     if (fallback) {
       expect(bridge.supervisor.child.spawnargs[0]).toBe(process.execPath);
       expect(bridge.confined).toBe(false);

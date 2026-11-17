@@ -281,8 +281,8 @@ quiet moment: a command (argv split on whitespace, no shell) run with a
 5 s timeout at each poll once no session holds work. Exit 0 means restart,
 exit 1 means hold, with the first line of stdout as the reason, which the
 30-minute waiting warning repeats. Any other exit code, a spawn failure or a
-timeout counts as safe (logged). A hold expires after the work-hold age cap
-(eight hours) and the restart then goes ahead, logged; a forced restart
+timeout counts as safe (logged). A hold never expires in this fork: the restart keeps waiting and is cancelled with `DELETE /restart`. (Upstream lets it lapse after the work-hold age cap
+(eight hours) and the restart then goes ahead, logged.) In either case a forced restart
 (`MATRON_CODE_UPDATE_FORCE_AFTER_MS`) never asks the gate. Unset, nothing
 changes. Sessions between turns resume with their history on their next turn,
 as with any restart. The exit code is 75, non-zero on purpose: launchd only
@@ -310,6 +310,28 @@ port overrides are ignored. Connection refusal exits with code 4 and reports
 the port tried. Execute the script directly or use `bash -p` as above to
 avoid loading ambient shell startup files and exported functions.
 
+The client posts to the same `/restart` route as "Asking for a bridge restart"
+below, with the restart token in `X-Matron-Restart-Token` instead of the
+operator token, so a restart waits for the same holds and is never forced.
+On top of that request, the fork checks and remembers three things:
+
+- `--sha <commit>` pins the request. It is refused with 409 unless HEAD
+  descends from the commit, and the restart then waits unless HEAD still
+  does and the tree is clean. Without `--sha` the request is config-only: it
+  is refused with 409 once HEAD has moved since this process booted.
+- `--request-key <key>` makes the request idempotent, including across the
+  restart it causes: a retry with a key already seen answers 200 and requests
+  nothing. The keys live in `~/.matron-bridge-restart-keys.json` for a week.
+- Before the restart, every live session is told once to leave a resume note
+  (`reminder_create` with `restart_note: true`), and the restart waits until
+  they have been told.
+
+The client exits 0 on 202 (requested) and 200 (key already seen), 2 on 409
+with the bridge's reply on stderr. `GET /restart` with the same token is the
+dry run and `DELETE /restart` the cancel. A hold from `MATRON_RESTART_GATE_CMD`
+or from these checks never expires, so a restart is never pushed through; cancel
+it with `DELETE`.
+
 The file viewer follows the same rule: it watches the same checkout and,
 once new code has settled and the viewer module loads from it, exits with
 75 for its own supervisor to relaunch it. It has no turns to wait for. This
@@ -317,6 +339,27 @@ keeps the viewer and the bridge on the same code, so a change to how the
 viewer signs its calls to the bridge cannot leave secret forms and one-time
 links failing until the machine reboots. `MATRON_CODE_UPDATE_RESTART=0` in
 the viewer's environment turns it off.
+
+### Asking for a bridge restart
+
+A bridge restart can also be requested without any code change, for example
+to pick up a new `.env`. It goes through the same watcher, so it waits for
+the same holds, runs the same preflight, asks the same gate, warns every 30
+minutes and exits 75. The dry run's `gate` field is the gate's latest reason
+for holding a pending restart (null before it has been asked).
+The routes take the operator token only, even with `MATRON_BRIDGE_API_AUTH=off`
+(a session token or the viewer key is refused), and answer 409 when the
+watcher is not running:
+
+```sh
+H=${XDG_STATE_HOME:-$HOME/.local/state}/matron-bridge/api-operator.header
+curl -s -H @"$H" http://127.0.0.1:9802/restart            # dry run: who holds it, and why
+curl -s -H @"$H" -X POST -d '{"reason":"new .env"}' http://127.0.0.1:9802/restart
+curl -s -H @"$H" -X DELETE http://127.0.0.1:9802/restart   # cancel
+```
+
+`./deploy.sh --when-quiet` does the pull, install and preflight, then sends
+that POST instead of restarting at once.
 
 ## Config (.env)
 
@@ -369,7 +412,7 @@ the viewer's environment turns it off.
 | `MATRON_WAKE_TEXT` | The exact text `POST /wake` delivers to `MATRON_WAKE_CONVO_ID` | — |
 | `MATRON_WAKE_TARGETS` | Optional. Comma-separated names of further wake targets, for a box that runs more than one conversation needing a wake. `POST /wake/<name>` wakes target `<name>` (lowercase letters, digits and single dashes, up to 32 characters) with the conversation in `MATRON_WAKE_CONVO_ID_<NAME>` and the text in `MATRON_WAKE_TEXT_<NAME>`, where `<NAME>` is the name upper-cased with dashes as underscores (`chat-2` reads `MATRON_WAKE_CONVO_ID_CHAT_2`). Each target coalesces on its own, and `MATRON_WAKE_TOKEN` guards them all. A listed target missing either variable is off (404) and logged at startup | — |
 | `MATRON_WAKE_TOKEN` | Optional. When set, `POST /wake` is refused (403) unless the request carries it in an `X-Matron-Wake-Token` header — the internal API port is reachable by every local user, and a wake resumes a session | — |
-| `MATRON_RESTART_GATE_CMD` | Advisory hook for the self-restart onto new code (see above): a command, split on whitespace, run with a 5 s timeout once no session holds work, in its own process group (a timeout kills the whole group) and with a minimal environment: `PATH`, `HOME` and any `MATRON_RESTART_GATE_*` variables, not the bridge's tokens. Exit 0 = restart, exit 1 = hold (first stdout line is the reason shown in the waiting warning); anything else, or a timeout, counts as safe. A hold expires after eight hours. Never consulted for a forced restart | _(unset: no gate)_ |
+| `MATRON_RESTART_GATE_CMD` | Advisory hook for the self-restart onto new code (see above): a command, split on whitespace, run with a 5 s timeout once no session holds work, in its own process group (a timeout kills the whole group) and with a minimal environment: `PATH`, `HOME` and any `MATRON_RESTART_GATE_*` variables, not the bridge's tokens. Exit 0 = restart, exit 1 = hold (first stdout line is the reason shown in the waiting warning); anything else, or a timeout, counts as safe. A hold does not expire in this fork. Never consulted for a forced restart | _(unset: no gate)_ |
 | `MCP_DEFAULT_EXTRAS` | Comma-separated MCP extras loaded for every session on this machine (e.g. `circleci`). Names must match `mcpExtras` keys in `mcp-config.json`/`mcp-config.local.json`. | _(none)_ |
 | `BRIDGE_PLUGIN_CACHE_DIR` | Dir plugin MCP servers (context7, serena, …) load from. Unset = an empty bridge-owned dir (no plugin MCPs, lean). Set to `~/.claude/plugins` or a curated dir to re-enable. | _(empty dir)_ |
 | `BRIDGE_TOOL_FILTER` | Coordinator-only `ask-user` MCP tools are hidden from every session that is known not to be the Coordinator (Claude print and interactive, and Codex app-server sessions), which keeps each session's tool definitions about a quarter smaller. Set to `0` to give every session every tool. A session whose role is not known yet keeps the full list. | on |
@@ -425,6 +468,7 @@ bridge's own `ask-user` MCP loads per session; everything else is opt-in.
 | `!start [--claude\|--codex] [workdir]` | Start a session with the selected agent (optional custom workdir) |
 | `!start now` | Start a fresh session (skip resume offer) |
 | `!start --browser [workdir]` | Claude only: also load the chrome-devtools MCP (off by default to save ~400M/session). The flag is order-independent and also accepted by `!resume`, `!workdir`, and `!restart`. Chrome runs with its sandbox on, so on Linux the bridge must run as an unprivileged user (Chrome will not start sandboxed as root) with Xvfb and the Google Chrome package installed; the package's AppArmor profile lets it use the user namespaces Ubuntu otherwise restricts. |
+| `!start --worktree <name> [workdir]` | Start in a fresh git worktree (see "Worktree sessions"). Never the default; plain `!start` and New Chat always use the main checkout |
 | `!start --auto [workdir]` | Claude only: spawn with auto permission mode + Matron permission cards instead of the default `--dangerously-skip-permissions`. Also order-independent and accepted by `!resume`, `!workdir`, and `!restart`; pass `--bypass` instead to return to the default. See Permissions below. |
 | `!stop` | Stop the current session |
 | `!restart [--force] [--browser] [--bypass\|--auto]` | Restart the session; mid-turn it waits for the turn to finish unless `--force` is given (`--browser`/`--bypass`/`--auto` are Claude-only) |
@@ -598,6 +642,24 @@ CLAUDE.md and AGENTS.md are read by every Claude Code or Codex run in a reposito
 - **Seeing it.** The start, resume, workdir and restart messages and `/status` list the files a session loaded, e.g. `MATRON.md: MATRON.md (3.1 KB)`.
 
 **MATRON.md or a memory?** `MATRON.md` is part of the code: reviewed in pull requests, it follows the branch and applies to everyone's Matron sessions in the repository. Use it for how to work on that repository through Matron. A `repo:<name>` memory is one user's own standing rule, changed at once and private to them. Use it for personal preferences and anything about particular machines.
+
+## Worktree sessions
+
+`!start --worktree <name> [workdir]` starts the session in a fresh git worktree, so it can change code without touching your main checkout. It is opt-in per start: nothing else creates one, the choice is not remembered for the repository, and resuming a session never turns it into one.
+
+- **Where.** `<repo>/.claude/worktrees/<name>` on a new branch `wt/<name>`, cut from `origin/<default branch>` after a `git fetch`. `.claude/worktrees/` is added to the clone's `.git/info/exclude` (never to a `.gitignore`), and the folder picker (`recent_folders`) leaves worktrees out of its list. The name must make a valid branch name; if the branch or folder is taken, the start is refused and `<name>-2` is suggested. A repository with no `origin` is refused, and git's own error is passed through if the branch is checked out elsewhere. After the session has started, `git submodule update --init` runs when there is a `.gitmodules`, and `git lfs pull` when LFS is configured; both only warn if they fail. Git runs for all of this have no journal credential in their environment and no repository hooks.
+- **What the agent is told.** Every worktree session starts with a fixed notice: it is in worktree `<path>` on `wt/<name>`, and the dev server, public URL, OAuth callbacks and webhooks point at the main checkout, so it should test there or say what it could not test. The start message and `/status` show a `Worktree:` line. No `.env` is linked in.
+- **Resuming.** Resuming a session whose worktree was removed is refused with a message, and the session being replaced is left alone; the folder is never recreated empty.
+- **Setup script.** If the repository has `.matron/worktree-setup`, it can prepare the worktree (install dependencies and so on). It runs inside the worktree with `MATRON_MAIN_CHECKOUT` set to the main checkout, only after you approve that repository's script on a card in the new conversation, and only while it has the approved sha256: a changed script asks again. The real gates are the allowlist (`MATRON_WORKTREE_SETUP_ORIGINS`, empty means none) and the consent card; the fork check only detects an `upstream` remote, so it catches the usual fork setup and nothing more. The bytes you approved are the bytes that run (a private temp copy, never the file on disk), setup is refused on Windows, and it runs in the background after the session has started. It has a 10 minute limit, its output is logged under `~/.matron-bridge-worktree-logs/`, and a failure still starts the session, with a notice. The script can add lines to the agent's notice by writing them to the file named in `MATRON_WORKTREE_NOTICE_FILE`.
+- **Limits.** At most 5 worktrees per repository (`MATRON_WORKTREE_MAX`), and none when the disk has under 10 GB or 10% free.
+- **Size and the picker.** `recent_folders` lists worktrees grouped under their repository (`worktrees`), with a cached size; box status carries their count and total size. Sizes are measured in the background and cached, never on the request.
+- **Clean-up.** The `worktree_cleanup` RPC (`{convo_id, action: "archive" | "delete", discard?}`) removes a session's worktree only when it has no uncommitted changes, no untracked files other than ignored ones, no unpushed commits, and its branch is merged or pushed; then it runs `git worktree prune` and deletes `wt/<name>` only if merged. Commits that only the HEAD history holds (a detached HEAD, a reset or amend) count as unsaved work. Otherwise the worktree is kept and a notice says what is left. Discarding work that would be lost needs a signed tap: the reply says `needs_step_up`; sending `discard: true` makes the bridge file a step-up question ("Discard worktree") and return its id as `step_up_item`; once the user has tapped it, repeating the request with `step_up_item` removes the worktree. A discard is never honoured on the caller's word alone.
+
+| Variable | Description | Default |
+|---|---|---|
+| `MATRON_WORKTREE_MAX` | Most worktrees per repository | `5` |
+| `MATRON_WORKTREE_SETUP_ORIGINS` | Comma-separated origins whose `.matron/worktree-setup` may run, as `host/owner/repo` or `host/owner/*`. Empty means none | _(empty)_ |
+| `MATRON_WORKTREE_SETUP_TIMEOUT_MS` | Time limit for the setup script | `600000` (10 minutes) |
 
 ## How it works
 

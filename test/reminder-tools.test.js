@@ -1,17 +1,12 @@
 import { describe, it, expect, vi } from 'vitest';
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
 import { z } from 'zod';
-import { codexMcpConfig } from '../lib/codex-mcp.js';
-import { createReminderHandlers, reminderView, formatReminderLine, REMINDER_TEXT_MAX } from '../lib/reminder-tools.js';
+import { createReminderHandlers, reminderView, formatReminderLine, REMINDER_TEXT_MAX, REMINDER_ID_STRING } from '../lib/reminder-tools.js';
 import { createTimerStore, MIN_TIMER_MS, MAX_TIMER_MS } from '../lib/timer-command.js';
-import { createRestartNotes } from '../lib/restart-notes.js';
 
 const HOUR = 3_600_000;
 const NOW = new Date(2026, 8, 17, 10, 0, 0, 0).getTime(); // local 10:00
 
-function fixture({ announce } = {}) {
+function fixture({ announce, restartNotes } = {}) {
   const saves = [];
   const store = createTimerStore({
     load: () => null,
@@ -25,7 +20,7 @@ function fixture({ announce } = {}) {
   const sessions = new Map([['!r:s', session]]);
   const announceFn = announce || vi.fn(async () => {});
   const h = createReminderHandlers({
-    sessions, journalConvoIdFor: (s) => s?.journalConvoId ?? null, timerStore: store, now: () => NOW, announce: announceFn,
+    sessions, journalConvoIdFor: (s) => s?.journalConvoId ?? null, timerStore: store, now: () => NOW, announce: announceFn, restartNotes,
   });
   return { h, store, saves, session, announce: announceFn };
 }
@@ -142,6 +137,24 @@ describe('reminder handlers', () => {
     expect((await h.cancel({ roomId: '!r:s', id: 'all' })).status).toBe(404);
     expect(store.listForConvo('other')).toHaveLength(1);
   });
+
+  it('cancel takes the number as a string too, as some MCP clients send it ("261", "#261")', async () => {
+    const { h } = fixture();
+    const a = await h.create({ roomId: '!r:s', text: 'a', in: '1h' });
+    const b = await h.create({ roomId: '!r:s', text: 'b', in: '2h' });
+    expect((await h.cancel({ roomId: '!r:s', id: String(a.body.reminder.id) })).body.cancelled.map(x => x.text)).toEqual(['a']);
+    expect((await h.cancel({ roomId: '!r:s', id: ` #${b.body.reminder.id} ` })).body.cancelled.map(x => x.text)).toEqual(['b']);
+    for (const id of ['', '1.5', '-3', '12abc', 'ALL ', null]) {
+      expect((await h.cancel({ roomId: '!r:s', id })).status, `id ${JSON.stringify(id)}`).toBe(400);
+    }
+  });
+
+  it('the tool schema built from REMINDER_ID_STRING lets the string forms through to the handler', () => {
+    // Mirrors the union in ask-user.js (the wiring test pins it there).
+    const schema = z.union([z.number().int(), z.literal('all'), z.string().regex(REMINDER_ID_STRING)]);
+    for (const id of [261, 'all', '261', '#261', ' 261 ']) expect(schema.safeParse(id).success, `id ${JSON.stringify(id)}`).toBe(true);
+    for (const id of [1.5, '1.5', '-3', 'nope', '']) expect(schema.safeParse(id).success, `id ${JSON.stringify(id)}`).toBe(false);
+  });
 });
 
 describe('reminderView / formatReminderLine', () => {
@@ -232,123 +245,49 @@ describe('daily repeating reminders (repeat + tz)', () => {
   });
 });
 
-describe('restart note creation', () => {
-  function setup({ available = true, state = { id: 'restart-a', state: 'pending' }, hold = vi.fn((id, convoId, text) => ({ id, convoId, text, writtenAt: NOW })) } = {}) {
-    const setTimer = vi.fn();
-    const onFire = vi.fn();
-    const store = createTimerStore({ load: () => null, save: () => {}, now: () => NOW, setTimer, clearTimer: () => {}, onFire });
-    const restartState = { getState: vi.fn(() => state) };
-    const h = createReminderHandlers({ sessions: new Map([['box-a', { journalConvoId: 'alice', agent: 'codex' }]]),
-      journalConvoIdFor: s => s.journalConvoId, timerStore: store, restartState: available ? restartState : undefined, restartNotes: { hold }, now: () => NOW });
-    return { h, hold, store, setTimer, onFire, restartState };
-  }
-  const input = { roomId: 'box-a', restart_note: true, text: 'resume work' };
+describe('restart_note', () => {
+  const notesStub = () => ({ put: vi.fn() });
 
-  it('the registered tool forwards a delay-free Codex note, saves it and acknowledges the hold', async () => {
-    const root = mkdtempSync(path.join(os.tmpdir(), 'restart-notes-'));
-    try {
-      const options = { heldFile: path.join(root, 'held.json'), pendingFile: path.join(root, 'pending.json'), now: () => NOW };
-      const notes = createRestartNotes(options);
-      const { h } = setup({ hold: notes.hold });
-      const posts = [];
-      const fetch = async (url, init) => {
-        const body = JSON.parse(init.body);
-        posts.push(body);
-        const result = await h[url.split('/reminders/')[1]](body);
-        return { ok: result.status < 300, status: result.status, json: async () => result.body };
-      };
-      const tools = new Map();
-      const server = { tool: (name, description, schema, callback) => tools.set(name, { schema: z.object(schema), callback }) };
-      const source = readFileSync(new URL('../ask-user.js', import.meta.url), 'utf8');
-      const start = source.indexOf('async function callReminders(');
-      const end = source.lastIndexOf('server.tool(', source.indexOf("  'reminder_list',"));
-      Function('server', 'z', 'fetch', 'bridgeFetch', 'BRIDGE_API', 'ROOM_ID', 'formatReminderLine', source.slice(start, end))(
-        server, z, fetch, fetch, 'http://bridge', 'box-a', formatReminderLine);
-      const tool = tools.get('reminder_create');
-      const result = await tool.callback(tool.schema.parse({ restart_note: true, text: 'resume work' }));
-      expect(posts).toEqual([input]);
-      expect(createRestartNotes(options).listHeld('restart-a')).toEqual([
-        { id: 'restart-a', convoId: 'alice', text: 'resume work', writtenAt: NOW },
-      ]);
-      expect(result).toEqual({ content: [{ type: 'text', text: 'Restart note held for delivery after the planned restart.' }] });
-    } finally { rmSync(root, { recursive: true, force: true }); }
+  it('holds a note for the calling conversation and arms no timer', async () => {
+    const restartNotes = notesStub();
+    const { h, store, saves } = fixture({ restartNotes });
+    const r = await h.create({ roomId: '!r:s', text: ' resume the migration ', restart_note: true });
+    expect(r.status).toBe(201);
+    expect(restartNotes.put).toHaveBeenCalledWith('c1', ' resume the migration ');
+    expect(store.listForConvo('c1')).toHaveLength(0);
+    expect(saves).toHaveLength(0);
   });
 
-  it('accepts a delay-free note from a Codex session and never arms or fires a timer over 48 hours', async () => {
-    const { h, hold, store, setTimer, onFire } = setup();
-    expect((await h.create(input)).body.restart_note).toEqual({ id: 'restart-a', convoId: 'alice', text: 'resume work', writtenAt: NOW });
-    expect(hold).toHaveBeenCalledWith('restart-a', 'alice', 'resume work');
-    expect(store.listForConvo('alice')).toEqual([]);
-    vi.useFakeTimers();
-    try { await vi.advanceTimersByTimeAsync(48 * HOUR); } finally { vi.useRealTimers(); }
-    expect(setTimer).not.toHaveBeenCalled();
-    expect(onFire).not.toHaveBeenCalled();
-  });
-
-  it('accepts a note after the restart returns to pending', async () => {
-    const { h, restartState, hold } = setup();
-    restartState.getState.mockReturnValueOnce({ id: 'restart-a', state: 'restarting' });
-    expect((await h.create(input)).status).toBe(409);
-    expect((await h.create(input)).status).toBe(201);
-    expect(hold).toHaveBeenCalledTimes(1);
-  });
-
-  it.each([{ in: '1h' }, { at: '09:00' }, { repeat: 'daily' }, { hold_awake: true }, { hold_awake: false }, { in: null }])('rejects scheduling options on a note: %j', async extra => {
-    const { h, hold } = setup();
-    expect((await h.create({ ...input, ...extra })).status).toBe(400);
-    expect(hold).not.toHaveBeenCalled();
-  });
-
-  it.each([null, { state: 'pending', id: null }, { state: 'restarting', id: 'restart-a' }, { state: 'back', id: 'restart-a' }, { state: 'cancelled', id: 'restart-a' }, { state: 'abandoned', id: 'restart-a' }])('refuses a note without a pending restart: %j', async state => {
-    const { h, hold } = setup({ state });
-    expect((await h.create(input)).status).toBe(409);
-    expect(hold).not.toHaveBeenCalled();
-  });
-
-  it.each(['state', 'save', 'unavailable', 'not saved'])('refuses %s failures without acknowledging a note', async failure => {
-    const { h, hold, restartState } = setup({ available: failure !== 'unavailable', hold: vi.fn(() => { throw new Error('disk failure'); }) });
-    if (failure === 'not saved') hold.mockReturnValue(null);
-    if (failure === 'state') restartState.getState.mockImplementation(() => { throw new Error('unreadable'); });
-    expect((await h.create(input)).status).toBe(500);
-    if (failure === 'state' || failure === 'unavailable') expect(hold).not.toHaveBeenCalled();
-  });
-
-  it.each([null, 'true', 1])('rejects a nonboolean note flag %j', async flag => {
-    const { h, hold } = setup();
-    expect((await h.create({ ...input, restart_note: flag, in: '1h' })).status).toBe(400);
-    expect(hold).not.toHaveBeenCalled();
-  });
-
-  it('accepts the text limit and refuses limit plus one, empty and missing text', async () => {
-    const { h, hold } = setup();
-    expect((await h.create({ ...input, text: 'x'.repeat(REMINDER_TEXT_MAX) })).body.restart_note?.text).toHaveLength(REMINDER_TEXT_MAX);
-    for (const text of ['x'.repeat(REMINDER_TEXT_MAX + 1), '', ' ', null, undefined]) {
-      expect((await h.create({ ...input, text })).status).toBe(400);
+  it('refuses a time, repeat or hold_awake alongside it', async () => {
+    const restartNotes = notesStub();
+    const { h } = fixture({ restartNotes });
+    for (const extra of [{ in: '2h' }, { at: '09:00' }, { repeat: 'daily' }, { tz: 'Europe/London' }, { hold_awake: true }]) {
+      const r = await h.create({ roomId: '!r:s', text: 'n', restart_note: true, ...extra });
+      expect(r.status).toBe(400);
     }
-    expect(hold).toHaveBeenCalledTimes(1);
+    expect(restartNotes.put).not.toHaveBeenCalled();
   });
 
-  it('keeps false as an ordinary scheduled reminder', async () => {
-    const { h, hold } = setup();
-    expect((await h.create({ ...input, restart_note: false, in: '1h' })).body.reminder?.in_ms).toBe(HOUR);
-    expect(hold).not.toHaveBeenCalled();
+  it('reports a failed write to the agent and says the note was not set', async () => {
+    const restartNotes = { put: () => { throw new Error('ENOSPC'); } };
+    const { h } = fixture({ restartNotes });
+    const r = await h.create({ roomId: '!r:s', text: 'n', restart_note: true });
+    expect(r.status).toBe(500);
+    expect(r.body.error).toMatch(/NOT set/);
   });
-});
 
-it('exposes the delay-free boolean field through the shared Codex tool and wires durable note dependencies', () => {
-  const source = readFileSync(new URL('../ask-user.js', import.meta.url), 'utf8');
-  const create = source.slice(source.indexOf("  'reminder_create',"), source.indexOf("  'reminder_list',"));
-  const schemaText = create.slice(create.indexOf('  {'), create.indexOf('  async (args)'));
-  const schema = z.object(Function('z', `return (${schemaText.trim().replace(/,$/, '')})`)(z));
-  expect(schema.parse({ text: 'resume', restart_note: true })).toEqual({ text: 'resume', restart_note: true });
-  expect(schema.safeParse({ text: 'resume', restart_note: 'true' }).success).toBe(false);
-  const config = codexMcpConfig({ baseConfig: { mcpServers: { 'ask-user': { command: 'node', args: ['ask-user.js'] } } }, bridgeDir: process.cwd(), roomId: 'box-a', apiPort: 0 });
-  expect(config.mcp_servers['ask-user'].args.some(arg => arg.endsWith('ask-user.js'))).toBe(true);
-  expect(config.mcp_servers['ask-user'].disabled_tools).not.toContain('reminder_create');
-  const bridge = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
-  const wiring = bridge.slice(bridge.indexOf('const reminderHandlers ='), bridge.indexOf('// Parent-side agent-spawn handlers'));
-  expect(wiring).toContain('journalConvoIdFor,');
-  expect(wiring).toContain('restartState: plannedRestartAvailable ? plannedRestartState : undefined');
-  expect(wiring).toContain('restartNotes: createRestartNotes()');
-  expect(create).toContain("d.restart_note ? 'Restart note held");
+  it('is refused while a restart_session is parked for the session', async () => {
+    const restartNotes = notesStub();
+    const { h, session } = fixture({ restartNotes });
+    session._selfRestartPending = true;
+    const r = await h.create({ roomId: '!r:s', text: 'n', restart_note: true });
+    expect(r.status).toBe(400);
+    expect(r.body.error).toMatch(/continue_with/);
+    expect(restartNotes.put).not.toHaveBeenCalled();
+  });
+
+  it('is refused for an empty text', async () => {
+    const { h } = fixture({ restartNotes: notesStub() });
+    expect((await h.create({ roomId: '!r:s', text: '  ', restart_note: true })).status).toBe(400);
+  });
 });

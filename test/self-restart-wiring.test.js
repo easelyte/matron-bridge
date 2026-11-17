@@ -142,7 +142,7 @@ describe('index.js self-restart loop budget', () => {
     const journalPublishNotice = vi.fn();
     const context = {
       dispatchMergedFlush, emitRelease, journalPublishNotice, console,
-      restartLatch: undefined, AGENT_CODEX: 'codex',
+      restartInputs: { begin: () => () => {} }, AGENT_CODEX: 'codex',
       journalConvoIdFor: () => 'convo', journalInputConsumer: { queueRelease: { listLive: () => [] } },
     };
     const names = ['flushQueue', 'restoreQueuedBatch', 'snapshotQueuedReleaseBatch', 'queuedReleaseItemIds', 'liveQueuedReleaseEntries', 'finalizeSentQueue'];

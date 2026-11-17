@@ -58,6 +58,13 @@ const WINDOWS_EXCLUDES = [
   'test/projects-wiring.test.js',
   'test/unseen-wiring.test.js',
   'test/journal-rpc-handlers.test.js',
+  // Real git repositories and sh scripts in a temp dir.
+  'test/worktree.test.js',
+  'test/worktree-service.test.js',
+  'test/worktree-setup.test.js',
+  'test/worktree-setup-flow.test.js',
+  'test/worktree-cleanup.test.js',
+  'test/worktree-cleanup-service.test.js',
 ];
 
 export default defineConfig({

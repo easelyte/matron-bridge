@@ -23,9 +23,8 @@ if (PREFLIGHT_MODE === 'gate') {
     process.exit(1);
   }
 }
-import { createPlannedRestartState, supersedesWatcherRequests } from './lib/planned-restart-state.js';
-import { createPlannedRestart } from './lib/planned-restart.js';
-import { createRestartLatch } from './lib/restart-latch.js';
+import { createRestartGuard, createInputCounter } from './lib/restart-guard.js';
+import { createRestartPreflight } from './lib/restart-preflight.js';
 import { buildRestartStatus } from './lib/box-status-restart.js';
 import { BRIDGE_BOOT_AT } from './lib/boot-time.js';
 import { spawn, execFileSync, execFile } from 'child_process';
@@ -50,8 +49,7 @@ import { createTransferOutcomeNotify } from './lib/transfer-outcome.js';
 import { createTransferReceiver } from './lib/transfer-receiver.js';
 import { createItemsHandlers } from './lib/items-tools.js';
 import { createReminderHandlers } from './lib/reminder-tools.js';
-import { createRestartNotes } from './lib/restart-notes.js';
-import { createRestartBoot, createRestartCancellation, takeNoteOnlyRecoveries } from './lib/restart-boot.js';
+import { createRestartNotes, takeNoteDeliveries, restartNoteTurnText } from './lib/restart-notes.js';
 import { createMissionsClient } from './lib/missions-client.js';
 import { createMissionsHandlers } from './lib/missions-tools.js';
 import { createSearchHandlers } from './lib/search-tools.js';
@@ -87,6 +85,13 @@ import { createTrackerLinkChecker, withTrackerLinkCheck, LINK_CHECK_FIELDS } fro
 import { createRepoNameLookup } from './lib/repo-name.js';
 import { createCoordinatorLookup, coordinatorNeedsAssigning, loadCoordinatorBlock, loadNoticesBlock, renderNoticesBlock, claudeCoordinatorArgs, codexCoordinatorOptions, explicitModelFlag, explicitModelFlagForResume, coordinatorTurnText, planCoordinatorTransition, decideCoordinatorEvent, withCoordinatorModel, recreateSpawnModel, renderMemoryBlock } from './lib/coordinator.js';
 import { loadMatronMd, matronMdFileList, matronMdStatusLine } from './lib/matron-md.js';
+import { createWorktreeLedger } from './lib/worktree-ledger.js';
+import { createConsentStore } from './lib/worktree-setup.js';
+import { createSetupFlow } from './lib/worktree-setup-flow.js';
+import { createSizeCache } from './lib/worktree-size.js';
+import { createWorktreeService, WorktreeRemovedError } from './lib/worktree-service.js';
+import { createCleanupService, discardQuestion, verifyDiscardTap } from './lib/worktree-cleanup-service.js';
+import { extractWorktreeFlag, worktreeHeaderLine, worktreeNoticeBlock } from './lib/worktree.js';
 import { createServer } from 'http';
 import { createHmac, randomUUID, randomBytes, timingSafeEqual } from 'crypto';
 import fs from 'fs';
@@ -161,11 +166,11 @@ import { hookEntry } from './lib/hook-command.js';
 import { liveLogDir, liveLogPath as liveLogPathFor, openOwnLiveLog } from './lib/live-log-dir.js';
 import { killProcessTree } from './lib/process-kill.js';
 import { processTableCommand, readProcessTableStrict } from './lib/process-table.js';
-import { evaluateQuiet, currentBootSubagents, sessionBackgroundWork, sessionOccupied } from './lib/restart-quiet.js';
+import { evaluateQuiet, currentBootSubagents, sessionBackgroundWork } from './lib/restart-quiet.js';
 import { installShutdownToken, decideShutdown } from './lib/shutdown-endpoint.js';
 import { createWakeHandler, wakeTokenOk, WAKE_TOKEN_HEADER, wakeTargetsFromEnv, wakeRouteName } from './lib/wake-route.js';
 import {
-  createCodeUpdateWatcher, createCommandGate, resolveGitDir, readHeadReflog, defaultPreflight,
+  createCodeUpdateWatcher, createCommandGate, resolveGitDir, readHeadReflog,
   restartEnabled as codeUpdateRestartEnabled, parseMs as parseCodeUpdateMs,
   autoCarryOnEnabled as codeUpdateAutoCarryOnEnabled, writeSelfRestartStamp, takeSelfRestartStamp, selectAutoCarryOn,
   AUTO_CARRY_ON_TEXT as CODE_UPDATE_AUTO_CARRY_ON_TEXT, AUTO_CARRY_ON_DELAY_MS as CODE_UPDATE_AUTO_CARRY_ON_DELAY_MS,
@@ -322,12 +327,6 @@ const FALLBACK_CODEX_BRIDGE_PROMPT = 'You are running through Matron chat. Work 
 
 // --- Config ---
 
-const RESTART_COLLECT_MS = process.env.MATRON_RESTART_COLLECT_MS === undefined
-  ? 300_000 : Number(process.env.MATRON_RESTART_COLLECT_MS);
-if (!Number.isSafeInteger(RESTART_COLLECT_MS) || RESTART_COLLECT_MS < 0
-  || !/^[0-9]+$/.test(process.env.MATRON_RESTART_COLLECT_MS ?? '300000')) {
-  throw new Error('Invalid restart collect duration');
-}
 const API_PORT = parseInt(process.env.MATRON_BRIDGE_API_PORT || '9802', 10);
 
 // Gate mode rejects values that normal startup would warn about and replace.
@@ -491,6 +490,8 @@ const CODE_UPDATE_FORCE_AFTER_MS = parseCodeUpdateMsOrOff(process.env.MATRON_COD
 // them. MATRON_CODE_UPDATE_AUTO_CARRY_ON=0 keeps the tap.
 const CODE_UPDATE_AUTO_CARRY_ON = codeUpdateAutoCarryOnEnabled(process.env.MATRON_CODE_UPDATE_AUTO_CARRY_ON);
 const SELF_RESTART_STAMP_FILE = path.join(os.homedir(), '.matron-bridge-self-restart.json');
+// Notes a session left itself with reminder_create restart_note (lib/restart-notes.js).
+const restartNotes = createRestartNotes({ file: path.join(os.homedir(), '.matron-bridge-restart-notes.json') });
 
 // Resume-readiness gate (iv-mode). A freshly-spawned `claude --resume` takes
 // several seconds to load the transcript — and longer if it auto-compacts —
@@ -793,41 +794,73 @@ if (PREFLIGHT_MODE === 'gate') {
   console.error('[preflight] ok');
   process.exit(0);
 }
-const PLANNED_RESTART_ENABLED = process.env.MATRON_PLANNED_RESTART !== '0';
+// Restart token for scripts/planned-restart.sh: a per-boot capability, written
+// to ~/.matron-bridge-restart.env at listen time and removed on exit. It opens
+// /restart beside the operator token (see the route), nothing else.
 let RESTART_BOOT_SHA = null;
-let RESTART_TOKEN;
+const RESTART_TOKEN = randomBytes(32).toString('hex');
 const RESTART_ENV_FILE = path.join(os.homedir(), '.matron-bridge-restart.env');
 let restartTokenWritten = false;
-let plannedRestartState;
-let restartLatch;
-let restartBoot;
-let plannedRestartAvailable = false;
 // Never pass an inherited capability value to children.
 delete process.env.MATRON_RESTART_TOKEN;
 delete process.env.MATRON_RESTART_ENV_FILE;
-if (PLANNED_RESTART_ENABLED) {
-  // Capture the running checkout once; later checkout changes are gate inputs.
+process.env.MATRON_RESTART_ENV_FILE = RESTART_ENV_FILE;
+process.on('exit', () => {
   try {
-    RESTART_BOOT_SHA = execFileSync('git', ['rev-parse', 'HEAD'], {
-      cwd: __dirname, encoding: 'utf8', timeout: 5000, stdio: 'pipe',
-      env: { ...stripJournalCreds(), GIT_OPTIONAL_LOCKS: '0' },
-    }).trim() || null;
-  } catch { console.warn('[restart] boot HEAD unavailable'); }
-  try {
-    plannedRestartState = createPlannedRestartState({ onPending: () => queueRestartNotices() });
-    plannedRestartState.persistBootSha(RESTART_BOOT_SHA);
-    RESTART_TOKEN = randomBytes(32).toString('hex');
-    process.env.MATRON_RESTART_ENV_FILE = RESTART_ENV_FILE;
-    process.on('exit', () => {
-      try {
-        if (restartTokenWritten && fs.readFileSync(RESTART_ENV_FILE, 'utf8') === `MATRON_RESTART_TOKEN=${RESTART_TOKEN}\nMATRON_BRIDGE_API_PORT=${API_PORT}\n`) fs.unlinkSync(RESTART_ENV_FILE);
-      }
-      catch (error) { if (error.code !== 'ENOENT') console.warn('[restart] token cleanup failed'); }
+    if (restartTokenWritten && fs.readFileSync(RESTART_ENV_FILE, 'utf8') === `MATRON_RESTART_TOKEN=${RESTART_TOKEN}\nMATRON_BRIDGE_API_PORT=${API_PORT}\n`) fs.unlinkSync(RESTART_ENV_FILE);
+  }
+  catch (error) { if (error.code !== 'ENOENT') console.warn('[restart] token cleanup failed'); }
+});
+try {
+  // Captured once: the sha this process booted on (a config-only restart pins it).
+  RESTART_BOOT_SHA = execFileSync('git', ['rev-parse', 'HEAD'], {
+    cwd: __dirname, encoding: 'utf8', timeout: 5000, stdio: 'pipe',
+    env: { ...stripJournalCreds(), GIT_OPTIONAL_LOCKS: '0' },
+  }).trim() || null;
+} catch { console.warn('[restart] boot HEAD unavailable'); }
+// Input being delivered to a session (a message, a media download) holds a
+// restart until it has landed; upstream's work holds only see a turn once it
+// has started.
+const restartInputs = createInputCounter();
+let priorQuiet;
+let codeUpdateWatcher = null;
+// The fork's layer over upstream's restart request (lib/restart-guard.js).
+// Everything it reads is looked up when it runs: the sessions, the watcher and
+// the helpers below are defined further down this file.
+const restartGuard = createRestartGuard({
+  getWatcher: () => codeUpdateWatcher,
+  holds: () => sessionsHoldingRestart(),
+  repoDir: __dirname,
+  bootSha: RESTART_BOOT_SHA,
+  convoIdOf: session => journalConvoIdFor(session),
+  liveConvoIds: () => [...sessions.values()].filter(s => s.alive).map(s => s.journalConvoId || s.claudeSessionId),
+  // The fork's stricter quiet rule, for what upstream's holds do not read:
+  // answers awaited, queued input, Codex exec worker groups, an unreadable
+  // process table or subagent list (fail closed), and two quiet observations
+  // in a row. See lib/restart-quiet.js.
+  occupied: () => {
+    const out = [];
+    if (restartInputs.count > 0) out.push({ convoId: null, why: 'input_in_flight' });
+    const quiet = evaluateQuiet({
+      sessions, bootAt: BRIDGE_BOOT_AT, readProcessTable: readProcessTableStrict, prev: priorQuiet,
+      hasQueuedInput: session => roomDelivery.pendingCount(session.roomId) > 0 || effortFlowHoldsInput(session),
+      listRunningSubagents: () => {
+        const result = subagentRunningStore.listStrict();
+        if (result.ok !== true) throw new Error('subagents unavailable');
+        return result.records;
+      },
+      mcpSignatures: MCP_SERVER_SIGNATURES,
     });
-    plannedRestartAvailable = true;
-  } catch { console.warn('[restart] initialization failed; planned restart unavailable'); }
-}
-const plannedRestartRuntime = { stamped: false, verdict: null, gateVerdict: null };
+    priorQuiet = quiet;
+    for (const holder of quiet.holders) out.push({ convoId: holder.convoId, why: holder.why });
+    if (quiet.probe_error) out.push({ convoId: null, why: `probe_${quiet.probe_error}` });
+    if (!out.length && !quiet.quiet) out.push({ convoId: null, why: 'settling' });
+    return out;
+  },
+  commandGate: createCommandGate(process.env.MATRON_RESTART_GATE_CMD),
+  onChange: () => { queueRestartNotices(); publishRestartStatus('request'); },
+  warn: message => console.warn(message),
+});
 // Task & decision tracker (spec 2026-09-08). One client for the item_* tools
 // and the inbound item-turn router — HTTP
 // against the same host the media routes use, with the same bearer token.
@@ -1375,7 +1408,6 @@ function handleJournalReconnect() {
   // reemit lives in journalOnReconnect, so it is NOT duplicated here.
   reconcileStrandedSubagents('reconnect');
   journalOnReconnect();
-  retryRestartCancellation();
   // Every hello_ok is a fresh epoch for the journal's copy of this box's
   // status too (a box that just woke reports itself before anyone asks).
   publishBoxStatus('reconnect');
@@ -1464,7 +1496,10 @@ function publishBoxStatus(reason) {
       : { agent, model: defaultModelNow(), effort: defaultEffortNow(), source };
   } catch { /* best-effort */ }
   let restart = null;
-  try { restart = buildRestartStatus(plannedRestartState?.getState(), plannedRestartRuntime.gateVerdict); } catch { /* best-effort */ }
+  try { if (restartGuard?.pending()) restart = buildRestartStatus(restartGuard.getState(), restartGuard.lastVerdict); } catch { /* best-effort */ }
+  // Count and (cached) size of the worktrees this box made; omitted when none.
+  let worktreeSummary = null;
+  try { worktreeSummary = worktreeCleanup.summary(); } catch { /* best-effort */ }
   if (!activity && !limits && !disk && !accountEmail && !vitals && !defaults && !restart) return false;
   const sent = journalPublisher.sendRoomOp({
     op: 'box_status',
@@ -1475,6 +1510,7 @@ function publishBoxStatus(reason) {
     ...(vitals ? { vitals } : {}),
     ...(defaults ? { defaults } : {}),
     ...(restart ? { restart } : {}),
+    ...(worktreeSummary ? { worktrees: worktreeSummary } : {}),
     ...(boxLock ? { locked: boxLock.report() } : {}),
     ...pluginsReport(),
   });
@@ -1488,18 +1524,6 @@ export function publishRestartStatus(reason) {
   catch { return false; }
 }
 
-if (plannedRestartAvailable) {
-  for (const method of ['addRequest', 'setState']) {
-    const mutate = plannedRestartState[method].bind(plannedRestartState);
-    plannedRestartState[method] = (...args) => {
-      const priorId = plannedRestartState.getState().id;
-      const result = mutate(...args);
-      if (result.id !== priorId) plannedRestartRuntime.gateVerdict = null;
-      publishRestartStatus(method);
-      return result;
-    };
-  }
-}
 // A box_status carrying only `vitals`: the journal merges it into the box's
 // stored report, so this small frame never replaces the usage and activity
 // blocks. Called after each CPU sample; sends only when boxVitalsDue.
@@ -1742,6 +1766,41 @@ recentFolders.seedFrom(Object.values(loadPersistedSessions()).map((rec) => ({
   lastUsed: rec?.lastUsed,
 })));
 
+// Worktree sessions (`/start --worktree <name>`): the record of the worktrees
+// this bridge made.
+const worktreeLedger = createWorktreeLedger({ file: path.join(os.homedir(), '.matron-bridge-worktrees.json') });
+// Approval and running of a repository's worktree setup script.
+const worktreeSetup = createSetupFlow({
+  ledger: worktreeLedger,
+  consent: createConsentStore({ file: path.join(os.homedir(), '.matron-bridge-worktree-consent.json') }),
+  logDir: path.join(os.homedir(), '.matron-bridge-worktree-logs'),
+});
+const worktreeService = createWorktreeService({
+  ledger: worktreeLedger,
+  setup: worktreeSetup,
+});
+// Clean-up on archive/delete, and the picker view with cached sizes.
+const worktreeCleanup = createCleanupService({
+  ledger: worktreeLedger,
+  sizes: createSizeCache(),
+  // Discarding work that exists nowhere else needs a signed tap on a
+  // question this bridge files for exactly that worktree.
+  stepUp: {
+    file: async (args) => {
+      const res = await itemsClient.create({ ...discardQuestion(args), awaiting: 'user' });
+      return res?.status >= 200 && res.status < 300 && res.data?.step_up_ignored !== true ? (res.data?.item?.id ?? null) : null;
+    },
+    verify: async (itemId, subject) => {
+      const res = await itemsClient.getAsStored(itemId);
+      if (res?.status !== 200) return false;
+      return verifyDiscardTap(res.data, subject, {
+        check: tapVerifier ? (data, tap) => tapVerifier.forThread(data, tap) : null,
+      });
+    },
+    consume: (itemId) => itemsClient.close(itemId, { resolution: 'answered', comment: 'Discarded.' }),
+  },
+});
+
 function persistSession(roomId, sessionId, workdir, originRoomId, extra) {
   recentFolders.touch(workdir, Date.now());
   const data = loadPersistedSessions();
@@ -1978,6 +2037,18 @@ const journalRpcHandler = createRpcRequestHandler({
   },
   listPersistedSessions: () => Object.values(loadPersistedSessions()),
   listRememberedFolders: () => recentFolders.list(),
+  describeWorktrees: () => worktreeCleanup.describe(),
+  worktreeCleanup: (args) => worktreeCleanup.cleanup(args),
+  worktreeInUse: (wtPath) => {
+    const base = wtPath.replace(/\\/g, '/');
+    return [...sessions.values()].some((sess) => {
+      const dir = typeof sess?.workdir === 'string' ? sess.workdir.replace(/\\/g, '/') : '';
+      return sess?.alive && (dir === base || dir.startsWith(`${base}/`));
+    });
+  },
+  fileWorktreeNotice: ({ title, body, convoId }) => {
+    Promise.resolve(itemsClient.create({ kind: 'notice', title, body, labels: ['worktree'], convo_id: convoId || JOURNAL_CONTROL_CONVO_ID })).catch(() => {});
+  },
   defaultWorkdir: DEFAULT_WORKDIR,
   // Gates model selection (the `model` param and the picker's
   // model_options) — an RPC start mints a fresh convo, so this box default
@@ -2747,6 +2818,33 @@ function shouldAutoRestart(exitCode, session, shuttingDown) {
   return !shuttingDown && exitCode !== 0 && session.restartCount < 3 && !session._resumeFailed;
 }
 
+// Small seams over the worktree service, so the exit handlers and
+// recreateSession (lifted into sandboxes by some tests) call functions.
+function worktreeRemovedFor(workdir) { return worktreeService.removedFor(workdir); }
+// Like worktreeRemovedFor, but also follows a Claude transcript that moved
+// into a managed worktree (the session changed cwd mid-flight): if that
+// worktree is gone, the resume must be refused rather than started fresh on
+// the same id.
+function worktreeRemovedForResume(workdir, agent, sessionId) {
+  const direct = worktreeRemovedFor(workdir);
+  if (direct || agent !== AGENT_CLAUDE || !sessionId) return direct;
+  try {
+    if (fs.existsSync(transcriptPathFor(workdir, sessionId))) return null;
+    const found = findTranscriptBySessionId(sessionId);
+    return found?.workdir ? worktreeRemovedFor(found.workdir) : null;
+  } catch { return null; }
+}
+function worktreeRemovedMessage(entry) { return new WorktreeRemovedError(entry).message; }
+// An exit handler that would respawn a session into a removed worktree stops
+// instead (the respawn would resume in a different folder): marked like a
+// failed resume, with the reason said in the conversation.
+function noteWorktreeGone(session) {
+  const gone = worktreeRemovedFor(session.workdir);
+  if (!gone) return;
+  session._resumeFailed = true;
+  Promise.resolve(sendToRoom(session.roomId, worktreeRemovedMessage(gone))).catch(() => {});
+}
+
 // Crash restarts (lib/crash-recovery.js): the process died on its own and was
 // respawned. Count it, keep a bounded record, flag a burst to the user, and
 // carry a session that died mid-turn on with a turn saying so.
@@ -2797,7 +2895,9 @@ function onCrashRestart(session, restarted, exitCode, signal = null) {
 }
 
 function createSession(roomId, workdir, resumeSessionId, options = {}) {
-  restartLatch?.onInput();
+  // A removed bridge-made worktree is refused by the callers that resume or
+  // replace a session, BEFORE they destroy anything; createSession itself
+  // never throws for it.
   // A persisted workdir can stop existing between spawns (repo renamed,
   // worktree pruned). Node reports a missing spawn cwd as `spawn claude
   // ENOENT`, so degrade to a fallback dir here — before any agent branch —
@@ -2847,7 +2947,9 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
       // amnesia — the user can !workdir somewhere real afterwards. (Bugbot,
       // PR #216: without this, a found transcript was still demoted.)
       let usable = fs.existsSync(found.workdir);
-      if (!usable) {
+      // Never recreate a removed worktree as an empty folder.
+      const wasWorktree = !usable && !!worktreeRemovedFor(found.workdir);
+      if (!usable && !wasWorktree) {
         try {
           fs.mkdirSync(found.workdir, { recursive: true });
           usable = true;
@@ -2948,6 +3050,9 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     transcriptExists: (id) => fs.existsSync(transcriptPathFor(cwd, id)),
   });
   const matronMd = loadMatronMd(cwd);
+  // A bridge-made worktree adds its notice ahead of the repository's MATRON.md.
+  const worktreeInfo = worktreeService.info(cwd);
+  matronMd.block = [worktreeNoticeBlock(worktreeInfo), matronMd.block].filter(Boolean).join('\n\n');
   const printCoord = claudeCoordinatorArgs({ coordinator: !!options.coordinator, basePrompt: trackerLinksNow(BRIDGE_SYSTEM_PROMPT), block: trackerLinksNow(COORDINATOR_BLOCK), baseDisallowed: ['AskUserQuestion'], memoryBlock: memoryBlockNow({ coordinator: !!options.coordinator, workdir: cwd }), noticesBlock: noticesBlockNow({ coordinator: !!options.coordinator }), matronMdBlock: matronMd.block });
   const args = [
     '--print',
@@ -3030,6 +3135,8 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     // The MATRON.md files this spawn read (lib/matron-md.js), for the
     // start, resume and restart messages and /status.
     matronMd: { files: matronMd.files, truncated: matronMd.truncated },
+    // The bridge-made worktree this spawn runs in, or null (lib/worktree-service.js).
+    worktree: worktreeInfo,
     // The spawned session's effective env (shim prepended to PATH when
     // MATRON_CODEX_VIZ=1). The codex-viz activation guard must evaluate the
     // session's PATH, not the bridge's, to see the producer we just deployed.
@@ -3189,6 +3296,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     // server's 30-min idle sweep. Runs on every path below, including
     // auto-restart.
     sweepToolStreams(session);
+    noteWorktreeGone(session);
     clearPendingInterrupt(session);
     // Only a restart can retry input the CLI never started.
     const orphanSteers = takeUnstartedSteers(session);
@@ -3394,7 +3502,10 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
       console.warn(`[show-file] disabled for ${roomId}: failed to pin allowed roots (${error.message})`);
     }
   }
-  const matronMd = loadMatronMd(cwd);
+  const matronMd = loadMatronMd(cwd, { agent: 'codex' });
+  // A bridge-made worktree adds its notice ahead of the repository's MATRON.md.
+  const worktreeInfo = worktreeService.info(cwd);
+  matronMd.block = [worktreeNoticeBlock(worktreeInfo), matronMd.block].filter(Boolean).join('\n\n');
   const codexCoord = codexCoordinatorOptions({ coordinator: !!options.coordinator, baseInstructions: trackerLinksNow(CODEX_BRIDGE_PROMPT), block: trackerLinksNow(COORDINATOR_BLOCK), baseSandbox: CODEX_SANDBOX_MODE, memoryBlock: memoryBlockNow({ coordinator: !!options.coordinator, workdir: cwd }), noticesBlock: noticesBlockNow({ coordinator: !!options.coordinator }), matronMdBlock: matronMd.block });
   const Adapter = CODEX_APP_SERVER ? CodexAppServerSession : CodexExecSession;
   const codex = new Adapter({
@@ -3430,6 +3541,8 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
     // The MATRON.md files this spawn read (lib/matron-md.js), for the
     // start, resume and restart messages and /status.
     matronMd: { files: matronMd.files, truncated: matronMd.truncated },
+    // The bridge-made worktree this spawn runs in, or null (lib/worktree-service.js).
+    worktree: worktreeInfo,
     mcpExtras,
     ...(showFileToken ? { showFileToken } : {}),
     showFilePinnedRoots,
@@ -3924,6 +4037,9 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
   const { bypass: ivBypass, downgraded: ivRootDowngraded } = guardRootBypass(true);
   if (ivRootDowngraded) console.warn(`[permissions] ${roomId}: ${ROOT_BYPASS_WARNING}`);
   const matronMd = loadMatronMd(cwd);
+  // A bridge-made worktree adds its notice ahead of the repository's MATRON.md.
+  const worktreeInfo = worktreeService.info(cwd);
+  matronMd.block = [worktreeNoticeBlock(worktreeInfo), matronMd.block].filter(Boolean).join('\n\n');
   const ivCoord = claudeCoordinatorArgs({ coordinator: !!options.coordinator, basePrompt: trackerLinksNow(BRIDGE_SYSTEM_PROMPT), block: trackerLinksNow(COORDINATOR_BLOCK), memoryBlock: memoryBlockNow({ coordinator: !!options.coordinator, workdir: cwd }), noticesBlock: noticesBlockNow({ coordinator: !!options.coordinator }), matronMdBlock: matronMd.block });
   const claudeArgs = [...identity.cliArgs];
   claudeArgs.push(
@@ -3994,6 +4110,8 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     // The MATRON.md files this spawn read (lib/matron-md.js), for the
     // start, resume and restart messages and /status.
     matronMd: { files: matronMd.files, truncated: matronMd.truncated },
+    // The bridge-made worktree this spawn runs in, or null (lib/worktree-service.js).
+    worktree: worktreeInfo,
     codexSpawnEnv: interactiveEnv,
     ...(showFileToken ? { showFileToken } : {}),
     showFilePinnedRoots,
@@ -4120,6 +4238,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     // Same orphan-pump sweep as the print-mode close handler above: the
     // process exited on its own without the tool_result seam running.
     sweepToolStreams(session);
+    noteWorktreeGone(session);
     if (sessions.get(roomId) === session) {
       if (session._autoStopped) {
         // Idle reaper already posted its own notice; just clean up.
@@ -4375,7 +4494,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
   };
 
   sessions.set(roomId, session);
-  if (plannedRestartAvailable) enterResumeHold(session);
+  if (restartGuard?.pending()) enterResumeHold(session);
   enqueueRestartNotice(session, { deferDrain: true });
   // A plan item restored with this session may belong to a hook that died
   // with the old process (lib/plan-approval-items.js reconcileRestored).
@@ -6574,7 +6693,7 @@ function inflightTurnOrigin(session) {
 // (text the bridge injects itself, which has no other route into the
 // journal) leaves this false.
 function sendToSession(session, contentBlocks, { skipJournalMirror = false, foreign = false, plainTurn = false, causes = null, queuedEntries = null } = {}) {
-  const finishInput = restartLatch?.beginInput();
+  const finishInput = restartInputs.begin();
   try {
     if (!session.alive || session._autoStopped) return false;
     // The account lock: no turn starts, whatever asked for it (the user, a
@@ -7424,7 +7543,7 @@ function trySteerEntry(session, entry) {
 }
 
 function flushQueue(session, queued, releaseSnapshot = null) {
-  const finishInput = restartLatch?.beginInput();
+  const finishInput = restartInputs.begin();
   let steering = false;
   try {
   const snapshot = releaseSnapshot || snapshotQueuedReleaseBatch(session, queued);
@@ -8242,6 +8361,27 @@ async function availableCodexThreads(workdir, { cached = false, roomId = '' } = 
   return items;
 }
 
+// The approval card for a worktree's setup script: a tracker question on the
+// new session's conversation. The conversation row can trail the session's
+// start, so a refused create is retried a few times; if it never lands the
+// user is told the script did not run.
+async function fileWorktreeConsentCard(session, started) {
+  const spec = worktreeSetup.consentCard(started.entry, started.plan);
+  const convoId = journalConvoIdFor(session);
+  for (let attempt = 0; attempt < 4 && convoId; attempt++) {
+    try {
+      const res = await itemsClient.create({ ...spec, convo_id: convoId, awaiting: 'user' });
+      const id = res?.data?.item?.id;
+      if (res?.status >= 200 && res.status < 300 && id) {
+        worktreeSetup.rememberCard(started.entry.path, id);
+        return;
+      }
+    } catch { /* retried below */ }
+    await new Promise((r) => setTimeout(r, 1500 * (attempt + 1)));
+  }
+  try { session.sendCallback?.('Could not file the approval card for the worktree setup script, so it did not run.'); } catch { /* best effort */ }
+}
+
 async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
   const nativeSession = sessions.get(roomId);
   if (nativeSession?.alive && await runCodexControl(nativeSession, text, sendReply)) return;
@@ -8289,7 +8429,13 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         return;
       }
       const startModel = startModelFlag.model;
-      const arg = startModelFlag.rest[0];
+      // --worktree <name>: opt-in, per start. Never remembered for the repo.
+      const worktreeFlag = extractWorktreeFlag(startModelFlag.rest);
+      if (worktreeFlag.error) {
+        await sendReply(worktreeFlag.error);
+        return;
+      }
+      const arg = worktreeFlag.rest[0];
       const forceFresh = arg === 'now' || arg === 'fresh';
       const explicitWorkdir = arg && !forceFresh ? arg : null;
       let workdir = DEFAULT_WORKDIR;
@@ -8306,6 +8452,24 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
           return;
         }
         workdir = resolved;
+      }
+
+      let startedWorktree = null;
+      if (worktreeFlag.present) {
+        // Everything that can refuse (name, limits, disk, fetch, taken
+        // branch) happens here, before any session exists. The slow rest
+        // (submodules, LFS, an approved setup script) runs after the session
+        // has started.
+        try {
+          startedWorktree = await worktreeService.start({ workdir, name: worktreeFlag.name });
+        } catch (e) {
+          startedWorktree = { ok: false, error: e?.message || String(e) };
+        }
+        if (!startedWorktree.ok) {
+          await sendReply(`Worktree not created: ${startedWorktree.error}`);
+          return;
+        }
+        workdir = startedWorktree.cwd;
       }
 
       // Mint a fresh conversation id for this session
@@ -8349,8 +8513,17 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const extrasNote = shownStartExtras.length > 0 ? ` (extras: ${shownStartExtras.join(', ')})` : '';
       const permNote = permissionNote(session);
       const startModelNote = startModel ? ` on ${aliasLabel(startModel)}` : '';
-      await sendReply(`${agentLabel(selectedAgent)} session started${startModelNote} in a new conversation${extrasNote}${permNote}.${matronMdNote(session)}`);
-
+      const worktreeNote = startedWorktree ? `\n${worktreeHeaderLine(session.worktree)}` : '';
+      await sendReply(`${agentLabel(selectedAgent)} session started${startModelNote} in a new conversation${extrasNote}${permNote}.${matronMdNote(session)}${worktreeNote}`);
+      if (startedWorktree) {
+        if (startedWorktree.plan) void fileWorktreeConsentCard(session, startedWorktree);
+        // Submodules, LFS and an approved setup script, after the start.
+        startedWorktree.background().then((notes) => {
+          if (notes.length) session.sendCallback?.(notes.join('\n'));
+        }).catch((e) => {
+          try { console.warn(`[worktree] background steps failed: ${e?.message ?? e}`); } catch { /* logging must never throw */ }
+        });
+      }
       break;
     }
 
@@ -8735,6 +8908,12 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const effectiveResumeExtras = resumeExtras.length > 0
         ? resumeExtras
         : resumeState.mcpExtras;
+      // A removed bridge-made worktree cannot be resumed (see createSession).
+      const removedWorktree = worktreeRemovedForResume(actualWorkdir, selectedAgent, resumeSessionId);
+      if (removedWorktree) {
+        await sendReply(new WorktreeRemovedError(removedWorktree).message);
+        return;
+      }
       const session = createSession(sessionRoomId, actualWorkdir, resumeSessionId, {
         agent: selectedAgent,
         // An explicit --model overrides what this session last ran on.
@@ -8932,7 +9111,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const busyText = session.busy ? 'yes' : 'no';
 
       const plainStatus =
-        `Session active\nAgent: ${agentLabel(session.agent)}\nWorkdir: ${session.workdir}${matronMdNote(session)}\nSession ID: ${shortId}\n` +
+        `Session active\nAgent: ${agentLabel(session.agent)}\nWorkdir: ${session.workdir}${matronMdNote(session)}${session.worktree ? `\n${worktreeHeaderLine(session.worktree)}` : ''}\nSession ID: ${shortId}\n` +
         `Uptime: ${formatDuration(uptimeMs)}\nRestarts: ${session.restartCount}/3\nBusy: ${busyText}${codexDetails}`;
 
       const busyHtml = session.busy
@@ -8943,6 +9122,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         `<tr><td>State</td><td>${busyHtml}</td></tr>` +
         `<tr><td>Agent</td><td>${escapeHtml(agentLabel(session.agent))}</td></tr>` +
         `<tr><td>Workdir</td><td><code>${escapeHtml(session.workdir)}</code></td></tr>` +
+        (session.worktree ? `<tr><td>Worktree</td><td><code>${escapeHtml(session.worktree.branch)}</code></td></tr>` : '') +
         (matronMdFileList(session.matronMd) ? `<tr><td>MATRON.md</td><td>${escapeHtml(matronMdFileList(session.matronMd))}</td></tr>` : '') +
         `<tr><td>Session</td><td><code>${shortId}</code></td></tr>` +
         `<tr><td>Uptime</td><td>${formatDuration(uptimeMs)}</td></tr>` +
@@ -9070,6 +9250,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         `/start [--claude|--codex] — Start a new session (creates a new room)\n` +
         `/start [--claude|--codex] <workdir> — Start in a specific directory\n` +
         `/start --browser [workdir] — Add the chrome-devtools MCP (browser tools); off by default to save ~400M\n` +
+        `/start --worktree <name> [workdir] — Start in a fresh git worktree (.claude/worktrees/<name>, branch wt/<name>); off unless asked\n` +
         `/start --auto [workdir] — Run with auto permission mode + Matron permission cards instead of the default --dangerously-skip-permissions (--bypass switches back); also accepted by /restart, /resume, /workdir\n` +
         `/start --model <alias> [workdir] — Start on a specific Claude model (${VALID_ALIAS_HINT}, or a full claude-* name); also accepted by /restart, /resume, /workdir. Claude only\n` +
         `/stop — Stop the current session\n` +
@@ -9115,6 +9296,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
           ['/start [--claude|--codex]', 'Start a new session (creates a new room)'],
           ['/start [--claude|--codex] &lt;workdir&gt;', 'Start in a specific directory'],
           ['/start --browser [workdir]', 'Also enable chrome-devtools MCP (off by default to save ~400M)'],
+          ['/start --worktree <name> [workdir]', 'Start in a fresh git worktree (branch wt/<name> from origin); never the default'],
           ['/start --auto [workdir]', 'Run with auto permission mode + Matron permission cards instead of the default --dangerously-skip-permissions (--bypass switches back); also accepted by /restart, /resume, /workdir'],
           ['/start --model &lt;alias&gt; [workdir]', `Start on a specific Claude model (${escapeHtml(VALID_ALIAS_HINT)}, or a full <code>claude-*</code> name); also accepted by /restart, /resume, /workdir. Claude only`],
           ['/stop', 'Stop the current session'],
@@ -9999,7 +10181,7 @@ function armOperatorCompact(session, text) {
 // null when nothing identifiable did; a queued message keeps them on its
 // queue entry for the flush.
 async function journalRouteTextToSession(session, body, { keepRestartBudget = false, causes = null, bridgeOrigin = false } = {}) {
-  const finishInput = restartLatch?.beginInput();
+  const finishInput = restartInputs.begin();
   try {
     const trimmed = (body || '').trim();
     if (!trimmed) return;
@@ -10387,7 +10569,7 @@ function journalOnText(session, body, { username, seq, convoId }) {
 // installs it.
 const hasLocalWhisper = () => localWhisperAvailable({ modelPath: WHISPER_MODEL_PATH });
 const journalMediaRouter = createJournalMediaRouter({
-  beginInput: () => restartLatch?.beginInput(),
+  beginInput: () => restartInputs.begin(),
   fetchMedia: (blobRef) => journalPublisher.fetchMedia(blobRef),
   transcribe: async (buffer, mime) => transcribeAudio(buffer, mime, { modelPath: WHISPER_MODEL_PATH, language: WHISPER_LANGUAGE, prompt: await whisperPrompt() }),
   // The journal is the transcriber: it has the words already (transcribed at
@@ -10622,6 +10804,18 @@ function journalOnItem(session, item, ctx) {
   // never an ordinary 📌 turn that would hand the agent an unrestricted turn
   // in the middle of another person's conversation.
   if (foreignSessions.onItemReply(session, item?.payload)) return;
+  // A tap on the approval card of a worktree's setup script: the bridge's
+  // to apply, never a turn for the agent.
+  if (worktreeSetup.isCardReply(item?.payload)) {
+    worktreeSetup.onCardReply(item.payload).then((out) => {
+      if (!out) return;
+      Promise.resolve(itemsClient.close(item.payload.item_id, out.close)).catch(() => {});
+      try { session.sendCallback?.(out.message); } catch { /* best effort */ }
+    }).catch((e) => {
+      try { console.warn(`[worktree] setup approval failed: ${e?.message ?? e}`); } catch { /* logging must never throw */ }
+    });
+    return;
+  }
   const hasPendingPlan = !!(session.pendingPlan || session.pendingPlanDenialId || session.ivPendingPlanToolUseId);
   if (hasPendingPlan && planItems.isBuildReply(session, item?.payload)) {
     const cmdCtx = journalSessionCommandCtx(session);
@@ -11009,7 +11203,7 @@ function journalIsControlConvo(convoId) {
 // works for real. This is what makes /resume and the rest "free" per the
 // brief — nothing journal-specific had to be written for any of them.
 async function journalHandleControlCommand(body) {
-  const finishInput = restartLatch?.beginInput();
+  const finishInput = restartInputs.begin();
   try {
     const reply = (text) => journalPublishNotice(JOURNAL_CONTROL_CONVO_ID, text);
     const decision = classifyJournalControlCommand(body);
@@ -11081,7 +11275,7 @@ function resumeSleepingSession(roomId, prev, noticeConvoId, noticeText) {
 // input in _resumeOutbox until the resumed TUI is ready, and print mode's
 // stdin buffers), or null to fall back to the unknown-convo notice.
 function journalResumeConvo(convoId, noticeText = JOURNAL_RESUME_NOTICE) {
-  const finishInput = restartLatch?.beginInput();
+  const finishInput = restartInputs.begin();
   try {
     // Never publish a non-string notice: a mis-wired caller once passed the
     // router ctx here and it rendered as `{"username":…}` JSON.
@@ -11136,7 +11330,7 @@ function sleepingConvoIdFor(roomId) {
 async function carryOnConvo(convoId, session, _sendReply, text = 'carry on', resumeNotice = undefined, { causes = null, keepRestartBudget = false } = {}) {
   let finishInput;
   try {
-    finishInput = restartLatch?.beginInput();
+    finishInput = restartInputs.begin();
     let target = session && session.alive ? session : findSessionByClaudeSessionId(convoId);
     if (!target || !target.alive) target = journalResumeConvo(convoId, resumeNotice);
     if (!target) {
@@ -11179,7 +11373,7 @@ async function carryOnConvo(convoId, session, _sendReply, text = 'carry on', res
 // after this is kicked off (lib/timer-command.js fireRepeating) — the notice
 // says so, so the user knows it will come back.
 async function fireTimer(record) {
-  const finishInput = restartLatch?.beginInput();
+  const finishInput = restartInputs.begin();
   try {
     // A reminder that falls due while the account is locked is kept (on disk)
     // and delivered after the journal clears the lock.
@@ -11605,7 +11799,7 @@ function contextWindowForSession(session) {
 }
 
 async function fireAutoResume(roomId, convoId, slot) {
-  const finishInput = restartLatch?.beginInput();
+  const finishInput = restartInputs.begin();
   try {
     let session = sessions.get(roomId);
     if (!session || !session.alive) session = convoId ? journalResumeConvo(convoId, '⏳ The usage limit has reset — resuming this session to carry on.') : null;
@@ -11678,10 +11872,44 @@ function startAutoResumeSweep() {
   return timer;
 }
 
-// Watch the running checkout and submit settled updates to the planned gate.
-// Only an explicit force interval uses the legacy gracefulShutdown path;
-// interrupted turns then receive their carry-on handling at boot.
-let codeUpdateWatcher;
+// The live sessions that hold a restart back right now: mid-turn, a live
+// background work child, or a running subagent. Background work and subagents
+// use the idle reaper's age cap, a running turn never does. One process-table
+// read per call, shared by every live session. `unreadable` reports a failed
+// `ps`: the verdict then rests on in-memory signals alone.
+function sessionsHoldingRestart() {
+  const live = [...sessions.values()].filter(s => s.alive);
+  if (!live.length) return { holders: [], unreadable: false };
+  const table = readProcessTable();
+  const now = Date.now();
+  const holders = [];
+  for (const s of live) {
+    const last = handoffIdleSince(s);
+    // A quiet tool call can outlast the age cap without ending its turn.
+    // Subagent tracking is in memory, so it survives a failed ps read.
+    const hold = s.busy
+      ? { reason: 'turn in progress' }
+      : table.unreadable
+        ? workHold({ subagentCount: s.subagentConvos?.runningCount() ?? 0, idleSince: last, now })
+        : sessionWorkHold(s, last, now, table);
+    if (hold) {
+      holders.push({ session: s, reason: hold.reason });
+      debug(`[code-update] ${s.roomId} holds the update: ${hold.reason}`);
+    }
+  }
+  return { holders, unreadable: !!table.unreadable };
+}
+
+// Restart onto new code by itself — lib/code-update-restart.js has the
+// policy and the why. A rollout that found a live session here left the
+// new code on disk and the old process running; this is the "next natural
+// restart" it was deferred to. The checkout is the directory index.js runs
+// from. "Mid-turn" is session.busy, the same flag the loopback /sessions
+// list reports and restart_session parks on. A restart is the ordinary
+// SIGTERM path (gracefulShutdown: every session killed, the journal outbox
+// flushed) with a non-zero exit so every supervisor relaunches the bridge;
+// an idle session resumes with its history on its next turn, an
+// interrupted one gets a carry-on card at boot (publishRestartCarryOnCards).
 function startCodeUpdateWatcher() {
   if (!CODE_UPDATE_RESTART) {
     console.log('[code-update] self-restart onto new code: OFF (MATRON_CODE_UPDATE_RESTART)');
@@ -11693,30 +11921,22 @@ function startCodeUpdateWatcher() {
     console.log(`[code-update] self-restart onto new code: OFF (no HEAD reflog under ${__dirname})`);
     return null;
   }
-  const watcher = createCodeUpdateWatcher({
+  const watcher = codeUpdateWatcher = createCodeUpdateWatcher({
     readHead: () => readHeadReflog(gitDir),
-    busySessions: () => {
-      const result = evaluateQuiet({
-        sessions,
-        bootAt: BRIDGE_BOOT_AT,
-        readProcessTable: readProcessTableStrict,
-        listRunningSubagents: () => {
-          const result = subagentRunningStore.listStrict();
-          if (result.ok !== true) throw new Error('subagents unavailable');
-          return result.records;
-        },
-        mcpSignatures: MCP_SERVER_SIGNATURES,
-      });
-      return result.holders.length + (result.probe_error ? 1 : 0);
-    },
-    addRequest: request => plannedRestartAvailable ? plannedRestartState.addRequest(request, undefined, {
-      supersede: supersedesWatcherRequests(request),
-    }) : null,
-    preflight: () => defaultPreflight(__dirname),
-    // Optional advisory hook; unset = no gate. Never consulted for a forced
-    // restart, and never by restart_session or the other operator restarts,
-    // which do not go through this watcher.
-    gate: createCommandGate(process.env.MATRON_RESTART_GATE_CMD),
+    // Share the idle reaper's age cap for background work, while a running
+    // turn always holds the update unless forcing is explicitly enabled.
+    busySessions: () => sessionsHoldingRestart().holders.length + restartInputs.count,
+    // Upstream's check, then the checkout's own config (lib/restart-preflight.js).
+    preflight: createRestartPreflight(__dirname, { bootDotenvKeys: BOOT_DOTENV_KEYS }),
+    // Our pins, notice and input holds, then the optional operator hook
+    // (the gate command setting). Never consulted for a forced restart, and
+    // never by restart_session or the other operator restarts, which do not
+    // go through this watcher.
+    gate: restartGuard.gate,
+    // A restart waits for quiet and is never pushed through: the fork does
+    // not let a gate hold expire (upstream lets one lapse after its work-hold
+    // cap, which would restart onto sessions the gate still holds).
+    gateMaxMs: Infinity,
     restart: (info) => {
       if (shuttingDown) return;
       console.log(`[code-update] exiting ${CODE_UPDATE_EXIT_CODE} for the supervisor to relaunch onto ${info.sha.slice(0, 7)}${info.forced ? ` (${info.busy} session(s) mid-turn)` : ''}`);
@@ -11739,7 +11959,6 @@ function startCodeUpdateWatcher() {
     warnEveryMs: CODE_UPDATE_WARN_EVERY_MS,
     forceAfterMs: CODE_UPDATE_FORCE_AFTER_MS,
   });
-  codeUpdateWatcher = watcher;
   console.log(`[code-update] self-restart onto new code: ON (running ${boot.sha.slice(0, 7)}; poll ${CODE_UPDATE_POLL_MS}ms, settle ${CODE_UPDATE_SETTLE_MS}ms, ${CODE_UPDATE_FORCE_AFTER_MS > 0 ? `forced after ${CODE_UPDATE_FORCE_AFTER_MS}ms` : 'never mid-turn'})`);
   const timer = setInterval(() => {
     watcher.tick().catch(e => { try { console.warn(`[code-update] tick failed: ${e?.message ?? e}`); } catch { /* logging must never throw */ } });
@@ -11876,7 +12095,7 @@ function persistControlState(session) {
 }
 
 async function journalControlSession(rawParams, { fromDeviceId } = {}) {
-  const finishInput = restartLatch?.beginInput();
+  const finishInput = restartInputs.begin();
   try {
     const v = validateControlParams(rawParams);
     if (!v.ok) return { ok: false, error: { code: v.code, ...(v.detail ? { detail: v.detail } : {}) } };
@@ -11944,7 +12163,7 @@ async function journalControlSession(rawParams, { fromDeviceId } = {}) {
 // a Coordinator-attributed turn (sendTextToSession). Replies these paths
 // make land in the session chat via its command context.
 async function applyControlSteps(session, steps) {
-  const finishInput = restartLatch?.beginInput();
+  const finishInput = restartInputs.begin();
   try {
     let current = session;
     const ctx = journalSessionCommandCtx(current);
@@ -12009,7 +12228,7 @@ async function applyControlSteps(session, steps) {
 // session has no TUI, so it restarts on --effort (history kept), the way a
 // print-mode /model switch does.
 async function applyControlEffort(session, level, ctx) {
-  const finishInput = restartLatch?.beginInput();
+  const finishInput = restartInputs.begin();
   try {
     const refused = (detail) => ({ ok: false, error: { code: 'unsupported', detail } });
     let message = '';
@@ -12033,8 +12252,8 @@ async function applyControlEffort(session, level, ctx) {
   } finally { finishInput?.(); }
 }
 
-const restartNotices = plannedRestartAvailable ? createRestartNotices({
-  stateStore: plannedRestartState,
+const restartNotices = createRestartNotices({
+  stateStore: restartGuard,
   persist: session => {
     persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId,
       { _deferredControls: session._deferredControls });
@@ -12046,7 +12265,7 @@ const restartNotices = plannedRestartAvailable ? createRestartNotices({
     try { return sendTextToSession(session, text, { skipJournalMirror: true }); }
     catch { return reportSessionSendFailure(session, 'Restart notice could not be delivered.', { restoreJournalState: true }); }
   },
-}) : null;
+});
 
 function enqueueRestartNotice(session, { deferDrain = false } = {}) {
   try {
@@ -12109,11 +12328,7 @@ function drainDeferredControls(session) {
         // Once a slot has started a turn the rest wait for the next seam.
         if (startedTurn) continue;
         if (kind === 'restart_notice') {
-          if (!restartNotices || !plannedRestartState) {
-            settle(current, kind);
-            continue;
-          }
-          const state = plannedRestartState.getState();
+          const state = restartGuard.getState();
           const startsTurn = state.state === 'pending' && state.id === slots[kind].id
             && !Object.hasOwn(state.notified, journalConvoIdFor(current));
           if (restartNotices.apply(current, slots[kind])) {
@@ -12458,7 +12673,7 @@ function reconcilePendingGuestOnFrame(room, frame) {
 // `[room …]` line and hands it to roomDelivery against room.sessionRoomId
 // (callers substitute the guest binding in for the fan-out above).
 function deliverRoomFrameTo(room, frame) {
-  const finishInput = restartLatch?.beginInput();
+  const finishInput = restartInputs.begin();
   let deferred = false;
   try {
     const sender = frame.sender || '';
@@ -13007,7 +13222,7 @@ const JOIN_BACKLOG_LIMIT = 20;
 
 async function deliverAutoJoinedRequest(session, frame, room, { addressed }) {
   // Fork: count the join as in-flight input so a planned restart waits for it.
-  const finishInput = restartLatch?.beginInput();
+  const finishInput = restartInputs.begin();
   // The other side may write as soon as the accept lands; hold the room's
   // live frames until the join turn below has been handed over.
   roomJoinHold.hold(frame.room_id);
@@ -13154,7 +13369,7 @@ const journalInputConsumer = createJournalInputConsumer({
     const session = findSessionByClaudeSessionId(convoId);
     if (!session || !session.alive) return;
     // Fork: count the delivery as in-flight input so a planned restart waits for it.
-    const finishInput = restartLatch?.beginInput();
+    const finishInput = restartInputs.begin();
     try {
       roomDelivery.deliver(session, session.roomId, { roomId: 'memory', roomTitle: 'memory', from: 'bridge', body: text, at: Date.now(), cause: null });
     } finally { finishInput?.(); }
@@ -13510,6 +13725,18 @@ function resumePersistedSession(roomId, prev, { skipJournalMirror = false } = {}
   const activeAgent = resolveAgent({ persisted: prev.agent, fallback: ENV_DEFAULT_AGENT });
   const activeState = getPersistedAgentState(prev, activeAgent, history.length);
   const resumeSessionId = activeState.sessionId;
+  // Checked even without a native session ID: a fresh session has a stable
+  // conversation ID before its first native thread exists.
+  const removedWorktree = worktreeRemovedForResume(prev.workdir || DEFAULT_WORKDIR, activeAgent, resumeSessionId);
+  if (removedWorktree) {
+    // Said in the conversation itself; the idle session stays idle. The
+    // session was already dropped, so sendToRoom has nowhere to deliver on the
+    // journal path: publish straight to the conversation as well.
+    const msg = new WorktreeRemovedError(removedWorktree).message;
+    journalPublishNotice(prev.journalConvoId || prev.sessionId || roomId, msg);
+    Promise.resolve(sendToRoom(roomId, msg)).catch(() => {});
+    return null;
+  }
   const newSession = createSession(roomId, prev.workdir || DEFAULT_WORKDIR, resumeSessionId, {
     agent: activeAgent,
     model: activeState.model,
@@ -13707,7 +13934,7 @@ function makeWakeHandler(convoId, text) {
     publishNotice: (message, session) => journalPublishNotice(
       session ? journalConvoIdFor(session) : convoId, message),
     isPending: (session) => !!(session.busy || session.queuedMessages?.length || session._resumeOutbox?.length),
-    unavailable: () => shuttingDown || plannedRestartRuntime.stamped === true,
+    unavailable: () => shuttingDown,
   });
 }
 const wakeHandlers = new Map([['', makeWakeHandler(process.env.MATRON_WAKE_CONVO_ID, process.env.MATRON_WAKE_TEXT)]]);
@@ -14082,8 +14309,7 @@ const reminderHandlers = createReminderHandlers({
   journalConvoIdFor,
   timerStore,
   announce: announceAgentReminder,
-  restartState: plannedRestartAvailable ? plannedRestartState : undefined,
-  restartNotes: createRestartNotes(),
+  restartNotes,
 });
 
 // Parent-side agent-spawn handlers (lib/agent-spawn.js), backing the
@@ -14230,84 +14456,24 @@ async function respondAgentChatRoute(res, data, handler, describe) {
   res.end(JSON.stringify(resBody));
 }
 
-const plannedRestart = plannedRestartAvailable ? createPlannedRestart({
-  repoDir: __dirname,
-  stateStore: plannedRestartState,
-  landedRef: process.env.MATRON_RESTART_LANDED_REF || null,
-  collectMs: RESTART_COLLECT_MS,
-  sessions: () => sessions,
-  quietOptions: () => ({
-    sessions, bootAt: BRIDGE_BOOT_AT, readProcessTable: readProcessTableStrict,
-    hasQueuedInput: session => roomDelivery.pendingCount(session.roomId) > 0
-      || effortFlowHoldsInput(session),
-    listRunningSubagents: () => {
-      const result = subagentRunningStore.listStrict();
-      if (result.ok !== true) throw new Error('subagents unavailable');
-      return result.records;
-    },
-    mcpSignatures: MCP_SERVER_SIGNATURES,
-  }),
-  preflight: repoDir => defaultPreflight(repoDir, { mode: 'gate', bootDotenvKeys: BOOT_DOTENV_KEYS }),
-  warn: message => console.warn(message),
-  onReady: verdict => restartLatch.onReady(verdict),
-}) : null;
-if (plannedRestartAvailable) {
-  restartLatch = createRestartLatch({
-    stateStore: plannedRestartState, runtime: plannedRestartRuntime, bootId: BRIDGE_BOOT_ID,
-    available: () => plannedRestartAvailable,
-    quiet: () => plannedRestart.recheckQuiet(),
-    readCode: (requests, bootSha) => plannedRestart.readCode(requests, bootSha),
-    cacheKey: sha => plannedRestart.cacheKey(sha),
-    getPreflight: () => plannedRestart.getPreflight(),
-    listHeld: id => createRestartNotes().listHeld(id),
-    listMarkers: () => {
-      try {
-        const markers = JSON.parse(fs.readFileSync(INFLIGHT_FILE, 'utf8'));
-        if (!markers || typeof markers !== 'object' || Array.isArray(markers)) throw new Error('Invalid markers');
-        return Object.fromEntries(Object.entries(markers).filter(([id, marker]) => {
-          if (marker.kind !== 'background') return true;
-          const session = findSessionByClaudeSessionId(id);
-          return !!session && sessionHasBackgroundWork(session);
-        }));
-      } catch (error) {
-        if (error.code === 'ENOENT') return {};
-        throw error;
-      }
-    },
-    writeStamp: stamp => writeSelfRestartStamp(SELF_RESTART_STAMP_FILE, stamp),
-    deleteStamp: () => {
-      try { fs.unlinkSync(SELF_RESTART_STAMP_FILE); }
-      catch (error) { if (error.code !== 'ENOENT') throw error; }
-    },
-    publishRestartStatus, gracefulShutdown,
-    log: message => console.log(`[restart] ${message}`),
-  });
-  plannedRestart.retryCleanup = restartLatch.retryCleanup;
-}
-if (plannedRestartAvailable) {
-  let previousState;
+// While a restart is requested: tell sessions that arrive late to leave a
+// resume note, and keep the journal's `restart` block current.
+{
   let evaluatedAt = -Infinity;
+  let wasPending = false;
   const timer = setInterval(() => {
-    if (!plannedRestartAvailable) return;
     try {
-      plannedRestart.retryCleanup?.();
-      const state = plannedRestartState.getState().state;
-      if (state === 'back' && previousState !== 'back') {
-        codeUpdateWatcher?.onBack().catch(() => console.warn('[code-update] back request failed'));
-      }
-      if (state === 'cancelling') retryRestartCancellation();
-      const changed = state !== previousState;
-      previousState = state;
-      if (state === 'pending') {
+      const pendingNow = restartGuard.pending();
+      if (pendingNow) {
         queueRestartNotices();
-        if (changed || Date.now() - evaluatedAt >= 5000) {
+        if (!wasPending || Date.now() - evaluatedAt >= 5000) {
           evaluatedAt = Date.now();
-          plannedRestartRuntime.gateVerdict = plannedRestart.tick();
+          restartGuard.evaluate();
           publishRestartStatus('gate');
         }
-      }
-      if (changed) publishRestartStatus(state);
-    } catch { console.warn('[restart] tick failed'); }
+      } else if (wasPending) publishRestartStatus('cleared');
+      wasPending = pendingNow;
+    } catch { console.warn('[restart] status tick failed'); }
   }, 1000);
   timer.unref();
 }
@@ -14329,62 +14495,6 @@ function roomForClaudeSessionId(id) {
 
 const apiServer = createServer(async (req, res) => {
   const url = new URL(req.url, `http://localhost:${API_PORT}`);
-  if (req.method === 'POST' && ['/restart', '/restart/dry-run', '/restart/cancel'].includes(url.pathname)) {
-    const reply = (status, body) => {
-      res.writeHead(status, { 'Content-Type': 'application/json' });
-      res.end(JSON.stringify(body));
-    };
-    if (!PLANNED_RESTART_ENABLED) { reply(404, { error: 'disabled' }); return; }
-    if (!plannedRestartAvailable) { reply(503, { error: 'restart state unavailable' }); return; }
-    const token = req.headers['x-matron-restart-token'];
-    if (typeof token !== 'string' || !/^[a-f0-9]{64}$/.test(token)
-      || !timingSafeEqual(Buffer.from(token), Buffer.from(RESTART_TOKEN))) {
-      reply(401, { error: 'unauthorized' });
-      return;
-    }
-    let raw = '';
-    let bytes = 0;
-    try { for await (const chunk of req) {
-      bytes += chunk.length;
-      if (bytes > 64 * 1024) { reply(413, { error: 'request too large' }); return; }
-      raw += chunk;
-    } }
-    catch { reply(400, { error: 'unreadable request' }); return; }
-    let data;
-    try {
-      data = JSON.parse(raw || '{}');
-      if (!data || typeof data !== 'object' || Array.isArray(data)) throw new Error('invalid');
-    } catch { reply(400, { error: 'Invalid JSON' }); return; }
-    if (url.pathname === '/restart/dry-run') {
-      reply(200, plannedRestart.evaluate({ dryRun: true, request: data }));
-      return;
-    }
-    try {
-      const current = plannedRestartState.getState();
-      if (restartLatch.beforeRequest() || (current.state === 'cancelling' && url.pathname !== '/restart/cancel')) {
-        if (url.pathname === '/restart/cancel') reply(409, { error: 'restarting' });
-        else reply(503, { error: 'restarting', id: current.id });
-        return;
-      }
-      if (url.pathname === '/restart/cancel') {
-        const state = await cancelPlannedRestart();
-        reply(200, { id: state.id, state: state.state });
-        return;
-      }
-      if (typeof data.reason !== 'string' || !data.reason.trim()
-        || (data.sha !== undefined && (typeof data.sha !== 'string' || !data.sha || data.sha.startsWith('-')))
-        || (data.request_key !== undefined && (typeof data.request_key !== 'string' || !data.request_key))) {
-        reply(400, { error: 'Invalid restart request' });
-        return;
-      }
-      const result = plannedRestartState.addRequest({ reason: data.reason,
-        ...(data.sha === undefined ? {} : { sha: data.sha }), request_key: data.request_key ?? randomUUID() });
-      if (result.busy) reply(503, { error: 'restarting', id: result.id });
-      else reply(200, result);
-    } catch { reply(503, { error: 'restart state unavailable' }); }
-    return;
-  }
-
   // Browsers have no business here (lib/loopback-guard.js).
   const refusal = loopbackRefusal(req.headers);
   if (refusal) {
@@ -14522,6 +14632,48 @@ const apiServer = createServer(async (req, res) => {
     }
     res.writeHead(result.status, { 'Content-Type': 'application/json' });
     res.end(JSON.stringify(result.body));
+    return;
+  }
+
+  // /restart (GET dry run, POST ask, DELETE cancel): a bridge restart on
+  // demand, operator token only (isOperatorRoute). No body to speak of, so
+  // it is read here rather than after the generic POST-only check.
+  if (url.pathname === '/restart') {
+    // Fork: the per-boot restart token (~/.matron-bridge-restart.env, read by
+    // scripts/planned-restart.sh) opens this route beside the operator token.
+    // A token that is sent but wrong is refused outright.
+    const restartToken = req.headers['x-matron-restart-token'];
+    const restartTokenGiven = restartToken !== undefined;
+    const restartTokenOk = typeof restartToken === 'string' && /^[a-f0-9]{64}$/.test(restartToken)
+      && timingSafeEqual(Buffer.from(restartToken), Buffer.from(RESTART_TOKEN));
+    if (restartTokenGiven && !restartTokenOk) {
+      req.resume();
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'unauthorized' }));
+      return;
+    }
+    if (!restartTokenOk && refuseApiCall(null)) { req.resume(); return; }
+    // Operator or restart token only, even with MATRON_BRIDGE_API_AUTH=off:
+    // that setting must not let any local process restart the bridge.
+    if (!restartTokenOk && apiCaller?.kind !== 'operator') {
+      req.resume();
+      res.writeHead(403, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'Only the operator token or the restart token can ask for a bridge restart' }));
+      return;
+    }
+    let raw = '';
+    req.on('data', chunk => { if (raw.length < 4096) raw += chunk; });
+    req.on('end', async () => {
+      let data = null;
+      try { data = raw.trim() ? JSON.parse(raw) : null; } catch { /* no reason given */ }
+      // Pins, request_key and the notice ride on top of upstream's response
+      // (lib/restart-guard.js).
+      const r = await restartGuard.handle({ method: req.method, body: data, by: restartTokenOk ? 'restart client' : 'operator' });
+      res.writeHead(r.status, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(r.body));
+      // Do not wait for the next poll when nothing holds the restart.
+      if (req.method === 'POST' && r.status === 202) codeUpdateWatcher?.tick().catch(() => {});
+    });
     return;
   }
 
@@ -15474,28 +15626,11 @@ const apiServer = createServer(async (req, res) => {
 });
 
 apiServer.listen(API_PORT, '127.0.0.1', () => {
-  if (plannedRestartAvailable) {
-    try {
-      atomicWriteFileSync(RESTART_ENV_FILE, `MATRON_RESTART_TOKEN=${RESTART_TOKEN}\nMATRON_BRIDGE_API_PORT=${API_PORT}\n`, { mode: 0o600 });
-      restartTokenWritten = true;
-    } catch {
-      plannedRestartAvailable = false;
-      // Boot reconciliation may be suppressing carry-on cards for chats it
-      // expected to resume itself; with planned restart down nothing will,
-      // so hand those cards back and report the failure loudly.
-      restartBoot = null;
-      console.error('[restart] token initialization failed; planned restart unavailable');
-      publishRestartCarryOnCards();
-    }
-  }
-  if (plannedRestartAvailable) {
-    try { restartBoot?.listenerReady(); }
-    catch {
-      plannedRestartAvailable = false;
-      restartBoot = null;
-      console.warn('[restart] recovery initialization failed; planned restart unavailable');
-      publishRestartCarryOnCards();
-    }
+  try {
+    atomicWriteFileSync(RESTART_ENV_FILE, `MATRON_RESTART_TOKEN=${RESTART_TOKEN}\nMATRON_BRIDGE_API_PORT=${API_PORT}\n`, { mode: 0o600 });
+    restartTokenWritten = true;
+  } catch {
+    console.error('[restart] token file could not be written; scripts/planned-restart.sh cannot reach this bridge (the operator token still works)');
   }
   console.log(`Local API listening on 127.0.0.1:${API_PORT}`);
   publishOperatorToken();
@@ -15555,6 +15690,12 @@ async function switchAgentSession(roomId, targetAgent, { sendReply }) {
       );
       return null;
     }
+  }
+
+  const removedWorktree = worktreeService.removedFor(existing.workdir);
+  if (removedWorktree) {
+    await sendReply(new WorktreeRemovedError(removedWorktree).message);
+    return null;
   }
 
   const stableConvoId = journalConvoIdFor(existing) || persisted.journalConvoId || randomUUID();
@@ -15768,7 +15909,6 @@ function scheduleEffortFlowReturn(session, delayMs, attempt = 0) {
 // through here (the !effort command and the effort: picker button) — see
 // lib/effort-tracker.js for what turns a pending write into a published one.
 function switchEffortAndTrack(session, arg, send) {
-  restartLatch?.onInput();
   if (session.agent === AGENT_CODEX) {
     const level = String(arg || '').toLowerCase();
     const options = codexSessionOptions(session);
@@ -15841,7 +15981,6 @@ function scheduleEffortSettle(session) {
 // offer:true (a person's !model or picker tap) follows an applied switch
 // with the "use it for new chats too?" card (offerDefault).
 function applyModelSwitch(roomId, session, arg, { sendReply, sendHtml, explicit = true, offer = false }) {
-  restartLatch?.onInput();
   if (session.agent === AGENT_CODEX) {
     if (session.busy) {
       sendReply('Finish or interrupt the current Codex turn before switching models.');
@@ -16024,6 +16163,12 @@ function recreateSession(roomId, overrides, { sendReply, sendHtml }) {
   // Recheck at teardown, including attachments arriving during a reply await.
   if (mediaGateActive(existing)) {
     sendReply(INFLIGHT_MEDIA_REPLACE_REFUSAL);
+    return null;
+  }
+  // Refuse before anything is killed: the old session stays as it is.
+  const removedWorktree = worktreeRemovedFor(existing.workdir);
+  if (removedWorktree) {
+    sendReply(worktreeRemovedMessage(removedWorktree));
     return null;
   }
   const sessionId = existing.claudeSessionId;
@@ -16373,7 +16518,7 @@ function sessionWorkHold(session, last, now, table) {
 // the awaits. It stays only once the handoff has decided: it did its work,
 // or there was nothing to do.
 async function runPreReapHandoff(session, now, idleSince) {
-  const finishInput = restartLatch?.beginInput();
+  const finishInput = restartInputs.begin();
   try {
     const { roomId } = session;
     session._preReapHandoff = { idleSince, at: now, compactPending: false };
@@ -16567,37 +16712,8 @@ function startIdleReaper() {
 // live session). Markers inside the window get a card; the rest are dropped
 // silently. takeStale clears ALL previous-boot markers either way, so a given
 // interruption is offered exactly once and can never resurface on a later boot.
-let restartCancellation;
-function retryRestartCancellation() {
-  if (!plannedRestartAvailable) return;
-  try {
-    if (plannedRestartState.getState().state === 'cancelling') {
-      cancelPlannedRestart().catch(() => console.warn('Planned restart cancellation remains pending'));
-    }
-  } catch { console.warn('Planned restart cancellation remains pending'); }
-}
-
-function cancelPlannedRestart() {
-  restartCancellation ||= createRestartCancellation({ stateStore: plannedRestartState,
-    notesStore: createRestartNotes(), publishText: (...args) => journalPublisher.publishText(...args) });
-  return restartCancellation();
-}
-
-async function deliverRestartNote(entry) {
-  const finishInput = restartLatch?.beginInput();
-  try {
-    let session = findSessionByClaudeSessionId(entry.convoId);
-    if (!session || !session.alive) session = journalResumeConvo(entry.convoId);
-    if (!session || !session.alive) return false;
-    if (sessionOccupied(session) || session._awaitingInputReady
-      || effortFlowHoldsInput(session) || signInDialogHoldsInput(session)) return { deferred: true };
-    return sendToSession(session, [{ type: 'text', text: entry.text }], { plainTurn: true }) === true;
-  } finally { finishInput?.(); }
-}
-
-function publishRestartCarryOnCards(boot = null) {
+function publishRestartCarryOnCards() {
   if (!JOURNAL_ENABLED) return;
-  if (!boot) publishNoteOnlyRecoveryCards();
   let stale;
   try {
     // takeStale clears and PERSISTS before this returns, i.e. before a single
@@ -16607,8 +16723,7 @@ function publishRestartCarryOnCards(boot = null) {
     // the fire-once guarantee (see lib/inflight-marker.js takeStale). Do not
     // "fix" it by deferring the clear until after publishing; that reintroduces
     // duplicate cards, which is the louder failure.
-    stale = inflightMarker.takeStale(RESTART_CARRY_ON_MAX_AGE_MS)
-      .filter(rec => !boot?.suppressCard(rec.convoId, rec.bootId));
+    stale = inflightMarker.takeStale(RESTART_CARRY_ON_MAX_AGE_MS);
   } catch (e) {
     console.warn(`[inflight] boot reconciliation failed: ${e.message}`);
     return;
@@ -16616,12 +16731,30 @@ function publishRestartCarryOnCards(boot = null) {
   // The stamp is taken (read and removed) whether or not anything is stale,
   // so a stale stamp from an earlier boot can never claim a later crash's
   // interruptions.
-  const stamp = boot ? boot.stamp : takeSelfRestartStamp(SELF_RESTART_STAMP_FILE);
-  if (!stale.length) return;
+  const stamp = takeSelfRestartStamp(SELF_RESTART_STAMP_FILE);
   const persisted = loadPersistedSessions();
   const resumable = new Set(Object.values(persisted)
     .flatMap(rec => [rec?.journalConvoId, rec?.sessionId])
     .filter(Boolean));
+  // Resume notes first, before selectAutoCarryOn: a conversation with a note
+  // gets the note as its one bridge-made first turn, in place of both the
+  // automatic carry-on and the card. The notes are deleted before delivery.
+  const noteResult = takeNoteDeliveries({
+    store: restartNotes, stale, resumable, isResumeConvoId,
+    log: (m) => { try { console.log(m); } catch { /* logging must never throw */ } },
+  });
+  stale = noteResult.stale;
+  if (noteResult.deliveries.length) {
+    setTimeout(() => {
+      for (const note of noteResult.deliveries) {
+        void carryOnConvo(note.convoId, null, null,
+          restartNoteTurnText(note.text, note.ageMs, frameSafeBody, note.interrupted),
+          '🔄 The bridge restarted — resuming this chat with the note you left for it.',
+          { causes: [carryOnCause()] });
+      }
+    }, CODE_UPDATE_AUTO_CARRY_ON_DELAY_MS);
+  }
+  if (!stale.length) return;
   // The previous process's self-restart onto new code cut these turns off;
   // with the option on they carry on by themselves (lib/code-update-restart.js
   // AUTO_CARRY_ON_TEXT), after the journal socket has said hello and the
@@ -16670,7 +16803,7 @@ function publishRestartCarryOnCards(boot = null) {
       ? `⚠️ The bridge restarted during a turn ${peerField(rec.foreignPerson, PEER_NAME_MAX)} started in this chat — interrupted ${formatInterruptedAgo(rec.ageMs)}. Carry on runs as your own turn, with their request still in it.`
       : rec.kind === 'background'
         ? `⚠️ The bridge restarted while this chat had background work running — interrupted ${formatInterruptedAgo(rec.ageMs)}. The background work stopped where it was.`
-      : `⚠️ The bridge restarted while this chat was mid-turn — interrupted ${formatInterruptedAgo(rec.ageMs)}. The work stopped where it was.`;
+        : `⚠️ The bridge restarted while this chat was mid-turn — interrupted ${formatInterruptedAgo(rec.ageMs)}. The work stopped where it was.`;
     const published = journalPublishCardForConvo(rec.convoId, {
       question,
       options: [{ id: `resume-${rec.convoId}`, label: '▶️ Carry on', value: `resume:${rec.convoId}` }],
@@ -16687,49 +16820,7 @@ function publishRestartCarryOnCards(boot = null) {
   }
 }
 
-// Planned-restart recovery is down (no boot reconciler): nothing will deliver
-// the restart notes it left pending. Chats with an in-flight marker get the
-// ordinary carry-on card from publishRestartCarryOnCards; chats that only had
-// a note (no marker) get one here. Runs before that function takes the markers.
-function publishNoteOnlyRecoveryCards() {
-  if (!plannedRestartState) return;
-  try {
-    let markerIds = new Set();
-    try { markerIds = new Set(Object.keys(JSON.parse(fs.readFileSync(INFLIGHT_FILE, 'utf8')) || {})); } catch { /* none readable */ }
-    const persisted = loadPersistedSessions();
-    const resumable = new Set(Object.values(persisted)
-      .flatMap(rec => [rec?.journalConvoId, rec?.sessionId]).filter(Boolean));
-    for (const convoId of takeNoteOnlyRecoveries({ stateStore: plannedRestartState, notesStore: createRestartNotes(), markerIds,
-      isResumable: id => resumable.has(id) && isResumeConvoId(id) })) {
-      journalPublishCardForConvo(convoId, {
-        question: '⚠️ The bridge restarted and could not resume this chat by itself. Tap to carry on from where it left off.',
-        options: [{ id: `resume-${convoId}`, label: '▶️ Carry on', value: `resume:${convoId}` }],
-      });
-    }
-  } catch { console.warn('[restart] note-only recovery cards failed'); }
-}
-
 async function main() {
-  if (plannedRestartAvailable) {
-    restartBoot = createRestartBoot({
-      stateStore: plannedRestartState, notesStore: createRestartNotes(),
-      markerStore: { list: () => {
-        try {
-          const markers = JSON.parse(fs.readFileSync(INFLIGHT_FILE, 'utf8'));
-          return markers && typeof markers === 'object' && !Array.isArray(markers) ? markers : {};
-        } catch { return {}; }
-      } },
-      bootId: BRIDGE_BOOT_ID, bootSha: RESTART_BOOT_SHA, maxAgeMs: RESTART_CARRY_ON_MAX_AGE_MS,
-      takeStamp: () => takeSelfRestartStamp(SELF_RESTART_STAMP_FILE),
-      deliver: deliverRestartNote, resumeCancel: cancelPlannedRestart, log: text => console.warn(text),
-    });
-  }
-  try { restartBoot?.reconcile(); }
-  catch {
-    plannedRestartAvailable = false;
-    restartBoot = null;
-    console.warn('[restart] recovery initialization failed; planned restart unavailable');
-  }
   reconcileStrandedSubagents('startup', { beforeBootOnly: true });
   // Ensure secrets directory exists with restricted permissions
   try {
@@ -16800,7 +16891,7 @@ async function main() {
   // socket — the publisher is constructed (and connect()ed) at module load and
   // queues frames FIFO until hello_ok, exactly as the eager control-convo
   // upsert above relies on, so nothing is dropped by publishing here.
-  publishRestartCarryOnCards(restartBoot);
+  publishRestartCarryOnCards();
   // After the carry-on cards: a self-restart for new code must never land
   // before the previous process's interruptions have been surfaced.
   startCodeUpdateWatcher();

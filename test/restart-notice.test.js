@@ -3,30 +3,48 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import vm from 'node:vm';
-import { createRestartLatch } from '../lib/restart-latch.js';
-import { switchEffortInSession } from '../lib/effort-command.js';
-import { switchModelInSession } from '../lib/model-command.js';
-import { normalizeModelArg } from '../lib/model-aliases.js';
-import { markJournalOrigin, planQueueFlush } from '../lib/queue-flush.js';
 import { normalizeAgent } from '../lib/agent-backend.js';
 import { getPersistedAgentState, mergeAgentStates, resolveNativeSessionIdForPersistence, snapshotAgentState } from '../lib/agent-handoff.js';
 import { EventEmitter } from 'node:events';
 import { InteractiveSession } from '../lib/interactive-session.js';
-import { createRestartNotices, validateControlParams, authorizeControl, JOURNAL_DEVICE_ID, JOURNAL_ONLY_ACTIONS, CONTROL_KINDS, planSessionControl, controlNotice, TURN_STARTING_OPS } from '../lib/session-control.js';
-import { createPlannedRestartState } from '../lib/planned-restart-state.js';
-import { createPlannedRestart } from '../lib/planned-restart.js';
+import { createRestartNotices, CONTROL_KINDS, planSessionControl, controlNotice, TURN_STARTING_OPS } from '../lib/session-control.js';
 import * as turnCause from '../lib/turn-cause.js';
 
 const roots = [];
 afterEach(() => { vi.restoreAllMocks(); for (const root of roots.splice(0)) fs.rmSync(root, { recursive: true, force: true }); });
+// A stand-in for lib/restart-guard.js's store half: the same getState,
+// markNotified and markNoticeTurnEnded contract the notices read, with a
+// request that can be made and withdrawn.
+function createStore({ onPending } = {}) {
+  let count = 0;
+  let state = { id: null, state: null, requests: [], notified: {} };
+  const invalid = (id, convoId) => !id || !convoId || id !== state.id || state.state !== 'pending';
+  return {
+    getState: () => state,
+    pending: () => state.state === 'pending',
+    addRequest(request) {
+      state = { id: ++count === 1 ? 'restart-a' : `restart-${count}`, state: 'pending', requests: [request], notified: {} };
+      onPending?.(state);
+      return { id: state.id, state: state.state };
+    },
+    cancel() { state = { ...state, state: 'cancelled' }; },
+    markNotified(id, convoId) {
+      if (invalid(id, convoId)) return state;
+      if (!Object.hasOwn(state.notified, convoId)) state = { ...state, notified: { ...state.notified, [convoId]: { at: 100, turnEnded: false } } };
+      return state;
+    },
+    markNoticeTurnEnded(id, convoId) {
+      if (invalid(id, convoId) || !Object.hasOwn(state.notified, convoId)) return state;
+      state = { ...state, notified: { ...state.notified, [convoId]: { ...state.notified[convoId], turnEnded: true } } };
+      return state;
+    },
+  };
+}
 function setup(options = {}) {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'restart-notice-'));
   roots.push(root);
   let notices;
-  let count = 0;
-  const store = createPlannedRestartState({ file: path.join(root, 'state.json'),
-    historyFile: path.join(root, 'history.jsonl'), now: () => 100,
-    makeId: () => ++count === 1 ? 'restart-a' : `restart-${count}`, onPending: state => options.onPending?.(state) });
+  const store = createStore({ onPending: state => options.onPending?.(state) });
   const send = vi.fn(() => true);
   const persist = vi.fn(session => fs.writeFileSync(path.join(root, 'session.json'), JSON.stringify(session)));
   const drain = vi.fn(session => {
@@ -35,19 +53,20 @@ function setup(options = {}) {
     if (slot && notices.apply(session, slot)) delete session._deferredControls.restart_notice;
   });
   notices = createRestartNotices({ stateStore: store, send, persist, drain });
-  store.addRequest({ request_key: 'alice', reason: 'update' });
+  store.addRequest({ reason: 'update' });
   const session = { roomId: 'room-a', journalConvoId: 'alice', alive: true, busy: false,
     lastActivityAt: 100 - 5 * 60 * 60_000, ...options.session };
   return { root, store, notices, send, persist, drain, session };
 }
+// Alive sessions the notice has not reached yet, as the guard counts them.
 function unwarned(store, sessions) {
-  return createPlannedRestart({ stateStore: store, sessions: () => sessions,
-    git: () => { throw new Error('unavailable'); },
-    quietEvaluator: () => ({ quiet: true, holders: [], probe_error: null }) }).evaluate().waiting_on.unwarned;
+  const { notified } = store.getState();
+  return sessions.filter(s => s.alive && (s.journalConvoId || s.claudeSessionId) && !Object.hasOwn(notified, s.journalConvoId || s.claudeSessionId))
+    .map(s => s.journalConvoId || s.claudeSessionId);
 }
 
 // Run the production notice wiring and transport dispatch without spawning agents.
-function wiredSetup(backend, available = true) {
+function wiredSetup(backend) {
   const h = setup();
   const source = fs.readFileSync(new URL('../index.js', import.meta.url), 'utf8');
   const persisted = new Map();
@@ -62,8 +81,8 @@ function wiredSetup(backend, available = true) {
   let timerId = 0;
   const noop = () => {};
   const context = {
-    ...turnCause, inflightTurnOrigin: () => ({}), loadMatronMd: () => ({ block: '' }), apiHeaderFileFor: () => null, restartLatch: undefined, accountLock: { isLocked: () => false, hold: () => false }, boxLock: null, outsideWorkRefused: () => false, noticeAccountLocked: noop, CLAUDE_STEER_ENABLED: false, bumpTurnGeneration: noop, clearTurnClassification: noop, console: { warn: vi.fn() }, queueMicrotask, CONTROL_KINDS, TURN_STARTING_OPS, planSessionControl, controlNotice,
-    createRestartNotices, plannedRestartAvailable: available, plannedRestartState: available ? h.store : null,
+    ...turnCause, inflightTurnOrigin: () => ({}), loadMatronMd: () => ({ block: '' }), apiHeaderFileFor: () => null, restartInputs: { begin: () => () => {} }, accountLock: { isLocked: () => false, hold: () => false }, boxLock: null, outsideWorkRefused: () => false, noticeAccountLocked: noop, CLAUDE_STEER_ENABLED: false, bumpTurnGeneration: noop, clearTurnClassification: noop, console: { warn: vi.fn() }, queueMicrotask, CONTROL_KINDS, TURN_STARTING_OPS, planSessionControl, controlNotice,
+    createRestartNotices, restartGuard: h.store,
     sessions: new Map([['room-a', h.session]]),
     journalConvoIdFor: session => session.journalConvoId || session.claudeSessionId,
     persistSession: (roomId, id, cwd, origin, extra) => persisted.set(roomId,
@@ -96,6 +115,7 @@ function wiredSetup(backend, available = true) {
     journalFlushForSession: noop, journalSpawnStatus: noop,
     CodexExecSession: class extends EventEmitter { constructor() { super(); this.send = vi.fn(() => true); } },
     // Upstream notice/tracker-link helpers the extracted seams now call.
+    worktreeNoticeBlock: () => '', worktreeRemovedForResume: () => null, worktreeService: { info: () => null, removedFor: () => null },
     trackerLinksNow: text => text, noticeMeta: () => null, roomNoticeMeta: () => null, controlNoticeKind: () => null, journalRepoField: () => ({}),
   };
   vm.createContext(context);
@@ -110,7 +130,7 @@ function wiredSetup(backend, available = true) {
   load('function enterResumeHold(', '\nfunction formatQueueSummary(');
   load('function sessionOccupiedForRoomDelivery(', '\n// The one shared room-flush');
   load('async function applyControlSteps(', '\n// The Coordinator');
-  load('const restartNotices = plannedRestartAvailable ?', '\n// The room-delivery half');
+  load('const restartNotices = createRestartNotices({', '\n// The room-delivery half');
   load('function resumePersistedSession(', '\n// Open secure-input');
   load('function createCodexSessionForRoom(', '\nfunction codexToolIndicator(');
   const constructorStart = source.indexOf('function createInteractiveSessionForRoom(');
@@ -155,7 +175,6 @@ describe('restart notices', () => {
     expect(h.drain).toHaveBeenCalledOnce();
     expect(h.send.mock.calls[0][1]).toBe('The bridge will restart once nothing is running on it (update). Before ending this turn, write your resume note with `reminder_create restart_note: true`: what you are doing, what runs in the background and where, any in-process wait you rely on (ScheduleWakeup, CronCreate, Monitor) since those die with the process, and the next step. Your work will not be cut off; you will be carried on after the restart.');
     expect(h.store.getState().notified.alice).toEqual({ at: 100, turnEnded: false });
-    expect(h.store.getState().participants).toEqual([]);
     const bob = { ...h.session, journalConvoId: 'bob', _deferredControls: null };
     const mark = vi.spyOn(h.store, 'markNotified').mockImplementation(() => { throw new Error('storage unavailable'); });
     expect(() => h.notices.enqueue(bob)).toThrow('storage unavailable');
@@ -165,20 +184,15 @@ describe('restart notices', () => {
     h.notices.enqueue(bob);
     expect(h.store.getState().notified.bob.turnEnded).toBe(true);
     expect(h.send).toHaveBeenCalledTimes(2);
-    const rename = vi.spyOn(fs, 'renameSync').mockImplementation(() => { throw new Error('storage unavailable'); });
-    expect(() => h.store.markNotified('restart-a', 'box-a')).toThrow('storage unavailable');
-    expect(() => h.store.markNoticeTurnEnded('restart-a', 'alice')).toThrow('storage unavailable');
-    expect(h.store.getState().notified['box-a']).toBeUndefined();
     expect(h.store.getState().notified.alice.turnEnded).toBe(false);
-    rename.mockRestore();
   });
   it('deduplicates delivered notices and permits one for the next restart', () => {
     const h = setup();
     h.notices.enqueue(h.session);
     for (let i = 0; i < 100; i++) h.notices.enqueue(h.session);
     expect(h.send).toHaveBeenCalledOnce();
-    h.store.setState('cancelled');
-    h.store.addRequest({ request_key: 'bob', reason: 'config' });
+    h.store.cancel();
+    h.store.addRequest({ reason: 'config' });
     h.notices.enqueue(h.session);
     expect(h.send).toHaveBeenCalledTimes(2);
   });
@@ -204,7 +218,6 @@ describe('restart notices', () => {
     const resumed = { ...JSON.parse(fs.readFileSync(path.join(h.root, 'session.json'), 'utf8')), alive: true };
     h.notices.enqueue(resumed);
     expect(h.send).toHaveBeenCalledOnce();
-    expect(h.store.getState().participants).toEqual([]);
   });
   it('reports only alive unnotified sessions and clears them after delivery', () => {
     const h = setup();
@@ -275,13 +288,13 @@ describe('restart notices', () => {
     expect(h.store.getState().notified.alice !== undefined).toBe(accepted);
     expect(h.session._deferredControls?.restart_notice !== undefined).toBe(!accepted);
   });
-  it.each(['disabled', 'cancelled'])('drops an obsolete notice and delivers the following carry-on when %s', async mode => {
-    const h = wiredSetup('codex', mode !== 'disabled');
+  it('drops an obsolete notice and delivers the following carry-on once the request is cancelled', async () => {
+    const h = wiredSetup('codex');
     h.session._deferredControls = {
       restart_notice: { kind: 'restart_notice', id: h.store.getState().id, params: {} },
       carry_on: { kind: 'carry_on', params: { action: 'carry_on', message: 'Continue the work.' } },
     };
-    if (mode === 'cancelled') h.store.setState('cancelled');
+    h.store.cancel();
     h.context.maybeFlushRoomDelivery(h.session);
     await h.flush();
     expect(h.backendSend).toHaveBeenCalledOnce();
@@ -319,9 +332,9 @@ describe('restart notices', () => {
     if (mode === 'persist') {
       expect(h.session._deferredControls).toBeUndefined();
       const source = fs.readFileSync(new URL('../index.js', import.meta.url), 'utf8');
-      const start = source.indexOf('const restartNotices = plannedRestartAvailable ?');
+      const start = source.indexOf('const restartNotices = createRestartNotices({');
       const end = source.indexOf('\nfunction enqueueRestartNotice(', start);
-      const context = { plannedRestartAvailable: true, plannedRestartState: h.store, createRestartNotices,
+      const context = { restartGuard: h.store, createRestartNotices,
         persistSession: vi.fn(), getPersistedSession: () => null,
         maybeFlushRoomDelivery: vi.fn(), sendTextToSession: h.send };
       vm.createContext(context);
@@ -337,49 +350,13 @@ describe('restart notices', () => {
     const h = setup({ session: { busy: true } });
     h.notices.enqueue(h.session);
     expect(h.session._deferredControls?.restart_notice).toBeDefined();
-    h.store.setState('cancelled');
+    h.store.cancel();
     h.session.busy = false;
     h.drain(h.session);
     expect(h.send).not.toHaveBeenCalled();
     expect(h.session._deferredControls.restart_notice).toBeUndefined();
     h.notices.enqueue({ alive: true });
     expect(h.store.getState().notified).toEqual({});
-  });
-  it('fires the pending transition after committing state, including an unlatch', () => {
-    const onPending = vi.fn();
-    const h = setup({ onPending });
-    expect(onPending).toHaveBeenCalledOnce();
-    expect(onPending.mock.calls[0][0]).toEqual(h.store.getState());
-    h.store.addRequest({ request_key: 'bob', reason: 'config' });
-    expect(onPending).toHaveBeenCalledOnce();
-    h.store.setState('restarting');
-    h.store.setState('pending');
-    expect(onPending).toHaveBeenCalledTimes(2);
-  });
-  it('rejects stale notification writes and preserves the first notification record', () => {
-    const h = setup();
-    for (const method of ['markNotified', 'markNoticeTurnEnded']) {
-      for (const [id, convoId] of [['stale', 'alice'], [null, 'alice'], ['', 'alice'], ['restart-a', null], ['restart-a', '']]) {
-        expect(() => h.store[method](id, convoId)).toThrow('Invalid restart notice');
-      }
-      h.store[method]('restart-a', 'alice');
-    }
-    h.store.markNoticeTurnEnded('restart-a', 'bob');
-    h.store.markNoticeTurnEnded('restart-a', '__proto__');
-    expect(Object.keys(h.store.getState().notified)).toEqual(['alice']);
-    h.store.markNotified('restart-a', 'alice');
-    h.store.markNoticeTurnEnded('restart-a', 'alice');
-    h.store.markNotified('restart-a', 'alice');
-    expect(h.store.getState().notified.alice).toEqual({ at: 100, turnEnded: true });
-    h.store.setState('cancelled');
-    for (const method of ['markNotified', 'markNoticeTurnEnded']) {
-      expect(() => h.store[method]('restart-a', 'alice')).toThrow('Invalid restart notice');
-    }
-    fs.writeFileSync(path.join(h.root, 'state.json'), '{');
-    expect(() => h.notices.enqueue(h.session)).toThrow();
-    fs.unlinkSync(path.join(h.root, 'state.json'));
-    expect(h.notices.enqueue(h.session)).toBe(false);
-    expect(() => h.store.markNotified('restart-a', 'alice')).toThrow('Invalid restart notice');
   });
 });
 
@@ -432,7 +409,7 @@ it('retries failed notice turn completion on the idle sweep without resending', 
 
 it('persists and publishes a fresh Codex identity before native startup without a pending restart', async () => {
   const h = wiredSetup('codex');
-  h.store.setState('cancelled');
+  h.store.cancel();
   const sessionFile = path.join(h.root, 'sessions.json');
   Object.assign(h.context, {
     normalizeAgent, getPersistedAgentState, mergeAgentStates, resolveNativeSessionIdForPersistence, snapshotAgentState,
@@ -454,175 +431,3 @@ it('persists and publishes a fresh Codex identity before native startup without 
   expect(session.codex.send).not.toHaveBeenCalled();
 });
 
-function inputWiring() {
-  const h = wiredSetup('pty');
-  Object.assign(h.context, {
-    dispatchJournalBridgeCommand: async () => false, dispatchPlanBuild: async () => false,
-    dispatchJournalRescueKeystroke: async () => false, maybeResolveInteractivePrompt: () => false,
-    armOperatorCompact: () => {}, journalPublishNotice: () => {}, JOURNAL_RESUME_NOTICE: 'Continue.',
-    findSessionByClaudeSessionId: () => h.session, console: { warn() {}, log() {} },
-    contextWindowForSession: () => 100000, hasQueuedCompact: () => false, markJournalOrigin, planQueueFlush,
-    pendingMediaMirror: () => [], journalPublishUserItem: () => {}, journalMirrorUserMedia: () => {},
-    validateControlParams, authorizeControl, JOURNAL_DEVICE_ID, JOURNAL_ONLY_ACTIONS, boxLabelForControl: () => 'box-a',
-    controlOccupied: () => false, postControlNotice: () => {}, shouldCompactBefore: () => false,
-    journalPublisher: { flushCursor() {} },
-    switchModelInSession, switchEffortInSession, noteEffortWrite: () => {}, guardEffortDefault: () => {}, scheduleEffortSettle: () => {}, normalizeModelArg, bringAutoResumeForward: () => {},
-    explicitModelFlag: () => ({}), journalStatus: () => {},
-  });
-  for (const name of ['journalRouteTextToSession', 'fireTimer', 'carryOnConvo', 'fireAutoResume', 'applyControlEffort', 'journalControlSession', 'journalHandleControlCommand']) {
-    h.load(`async function ${name}(`, '\n}\n');
-  }
-  for (const name of ['journalResumeConvo', 'resumeSleepingSession', 'applyModelSwitch', 'switchEffortAndTrack', 'dispatchMergedFlush', 'flushQueue']) {
-    h.load(`function ${name}(`, '\n}\n');
-  }
-  const shutdown = vi.fn();
-  const key = { sha: 'head', env_hash: 'env', deps_stamp: 'deps' };
-  const deps = { stateStore: h.store, runtime: {}, bootId: 'box-a', now: () => 100,
-    quiet: () => ({ quiet: true, holders: [], probe_error: null }),
-    readCode: () => ({ sha: 'head', code: null }), cacheKey: () => key,
-    getPreflight: () => ({ status: 'ok', key, at: 100 }), listHeld: () => [], listMarkers: () => ({}),
-    writeStamp: () => {}, deleteStamp: () => {}, publishRestartStatus: () => {}, gracefulShutdown: shutdown,
-  };
-  const latch = createRestartLatch(deps);
-  h.context.restartLatch = latch;
-  h.context.journalInputConsumer = { queueRelease: { listLive: () => [], dropItem() {} } };
-  for (const name of ['snapshotQueuedReleaseBatch', 'queuedReleaseItemIds', 'liveQueuedReleaseEntries', 'restoreQueuedBatch', 'finalizeSentQueue']) {
-    h.load(`function ${name}(`, '\n}\n');
-  }
-  return { ...h, deps, latch, shutdown, ready: () => latch.onReady({ sha: 'head', state: h.store.getState() }) };
-}
-
-it.each(['journalRouteTextToSession', 'fireTimer', 'carryOnConvo', 'fireAutoResume', 'applyControlSteps', 'applyControlEffort', 'journalControlSession', 'journalHandleControlCommand', 'flushQueue'])(
-  'holds the latch while %s input is in flight and releases it after delivery', async name => {
-    const h = inputWiring();
-    let release;
-    let task;
-    const waiting = new Promise(resolve => { release = resolve; });
-    h.context.dispatchJournalBridgeCommand = () => waiting;
-    if (name === 'journalRouteTextToSession') task = h.context[name](h.session, 'Continue.');
-    if (name === 'fireTimer') task = h.context[name]({ convoId: 'alice', id: 'bob', text: 'Continue.' });
-    if (name === 'carryOnConvo') task = h.context[name]('alice', h.session, () => {}, 'Continue.');
-    if (name === 'fireAutoResume') task = h.context[name]('room-a', 'alice', { text: 'Continue.' });
-    if (name === 'applyControlSteps') task = h.context[name](h.session, [{ op: 'compact', command: 'Continue.' }]);
-    if (name === 'applyControlEffort') {
-      h.session._controlTypedAt = Date.now();
-      h.context.setTimeout = fn => { waiting.then(fn); };
-      h.context.switchEffortAndTrack = session => session.iv.sendText('/effort high');
-      h.context.armEffortAutoConfirm = () => {};
-      task = h.context[name](h.session, 'high', { sendReply() {} });
-    }
-    if (name === 'journalControlSession') {
-      h.context.coordinatorLookup = { snapshot: () => ({ known: false }), refresh: () => waiting };
-      task = h.context[name]({ action: 'alert', convo_id: 'alice', message: 'Continue.' }, { fromDeviceId: JOURNAL_DEVICE_ID });
-    }
-    if (name === 'journalHandleControlCommand') {
-      h.context.JOURNAL_CONTROL_CONVO_ID = 'bob';
-      h.context.ALLOWED_USER_IDS = ['alice'];
-      h.context.classifyJournalControlCommand = () => ({ cmd: 'status', normalizedText: 'Continue.' });
-      h.context.handleCommand = async () => {
-        await waiting;
-        return h.context.sendTextToSession(h.session, 'Continue.', { skipJournalMirror: true });
-      };
-      task = h.context[name]('Continue.');
-    }
-    if (name === 'flushQueue') {
-      h.session.agent = 'codex'; h.session.busy = true;
-      h.session.codex = { transport: 'app-server', steer: () => waiting };
-      expect(h.context.flushQueue(h.session, [[{ type: 'text', text: 'Continue.' }]], { convoId: 'alice', entries: [] })).toBe('deferred');
-      task = waiting;
-    }
-    expect(h.ready().latched).toBe(false);
-    expect(h.shutdown).not.toHaveBeenCalled();
-    release(name === 'flushQueue' ? true : name === 'journalControlSession' ? { known: true, convoId: 'alice' } : false);
-    await task;
-    await h.flush();
-    if (name === 'flushQueue') expect(h.context.commitDispatchedUserTurn).toHaveBeenCalledOnce();
-    else expect(h.backendSend).toHaveBeenCalledOnce();
-    expect(h.ready().latched).toBe(true);
-    expect(h.shutdown).toHaveBeenCalledOnce();
-  });
-
-it.each(['journalRouteTextToSession', 'fireTimer', 'carryOnConvo', 'fireAutoResume'])(
-  'delivers valid %s input entering after the stamp while suppressing shutdown', async name => {
-    const h = inputWiring();
-    let task;
-    h.deps.onStep = step => {
-      if (step !== 'stamp') return;
-      if (name === 'journalRouteTextToSession') task = h.context[name](h.session, 'Continue.');
-      if (name === 'fireTimer') task = h.context[name]({ convoId: 'alice', id: 'bob', text: 'Continue.' });
-      if (name === 'carryOnConvo') task = h.context[name]('alice', h.session, () => {}, 'Continue.');
-      if (name === 'fireAutoResume') task = h.context[name]('room-a', 'alice', { text: 'Continue.' });
-    };
-    h.context.restartLatch = createRestartLatch(h.deps);
-    expect(h.context.restartLatch.onReady({ sha: 'head', state: h.store.getState() }).latched).toBe(false);
-    await task;
-    expect(h.backendSend).toHaveBeenCalledWith('Continue.');
-    expect(h.store.getState().state).toBe('pending');
-    expect(h.shutdown).not.toHaveBeenCalled();
-  });
-
-it('resumes a persisted conversation after the stamp and delivers input when ready', async () => {
-  const h = inputWiring();
-  h.session.alive = false;
-  const prev = { sessionId: 'alice', journalConvoId: 'alice', workdir: '.', chatHistory: [] };
-  h.context.loadPersistedSessions = () => ({ 'room-a': prev });
-  h.context.createSession = (roomId, cwd, resumeSessionId) => {
-    h.session.alive = true;
-    return h.context.finishInteractiveConstruction(h.session, roomId, resumeSessionId, cwd, 'alice', false);
-  };
-  let resumed;
-  h.deps.onStep = step => { if (step === 'stamp') resumed = h.context.journalResumeConvo('alice'); };
-  h.context.restartLatch = createRestartLatch(h.deps);
-  expect(h.context.restartLatch.onReady({ sha: 'head', state: h.store.getState() }).latched).toBe(false);
-  expect(resumed).toBe(h.session);
-  expect(h.context.sendToSession(resumed, [{ type: 'text', text: 'Continue.' }], { skipJournalMirror: true })).toBe(true);
-  h.session.iv.emit('pty-data', 'ready');
-  h.releaseReady();
-  await h.flush();
-  expect(h.backendSend).toHaveBeenCalledWith('Continue.');
-  expect(h.shutdown).not.toHaveBeenCalled();
-});
-
-it('unlatches an interactive model control after the stamp and writes it to the PTY', () => {
-  const h = inputWiring();
-  h.deps.onStep = step => {
-    if (step === 'stamp') expect(h.context.applyModelSwitch('room-a', h.session, 'sonnet', { sendReply() {} })).toBe(true);
-  };
-  h.context.restartLatch = createRestartLatch(h.deps);
-  expect(h.context.restartLatch.onReady({ sha: 'head', state: h.store.getState() }).latched).toBe(false);
-  expect(h.backendSend).toHaveBeenCalledWith('/model sonnet');
-  expect(h.store.getState().state).toBe('pending');
-  expect(h.shutdown).not.toHaveBeenCalled();
-});
-
-it('unlatches an interactive effort control after the stamp and writes it to the PTY', () => {
-  const h = inputWiring();
-  h.deps.onStep = step => {
-    if (step === 'stamp') expect(h.context.switchEffortAndTrack(h.session, 'high', () => {})).toBe(true);
-  };
-  h.context.restartLatch = createRestartLatch(h.deps);
-  expect(h.context.restartLatch.onReady({ sha: 'head', state: h.store.getState() }).latched).toBe(false);
-  expect(h.backendSend).toHaveBeenCalledWith('/effort high');
-  expect(h.store.getState().state).toBe('pending');
-  expect(h.shutdown).not.toHaveBeenCalled();
-});
-
-it('reports a failed durable input unlatch without dispatching or rejecting carry-on', async () => {
-  const h = inputWiring();
-  const persist = h.store.setState.bind(h.store);
-  h.store.setState = (state, patch) => {
-    if (state === 'pending') throw new Error('storage unavailable');
-    return persist(state, patch);
-  };
-  h.context.journalPublishNotice = vi.fn();
-  let task;
-  h.deps.onStep = step => {
-    if (step === 'stamp') task = h.context.carryOnConvo('alice', h.session, () => {});
-  };
-  h.context.restartLatch = createRestartLatch(h.deps);
-  expect(h.context.restartLatch.onReady({ sha: 'head', state: h.store.getState() }).latched).toBe(false);
-  await expect(task).resolves.toBeUndefined();
-  expect(h.context.journalPublishNotice).toHaveBeenCalledWith('alice', '⚠️ Could not carry on: storage unavailable');
-  expect(h.backendSend).not.toHaveBeenCalled();
-  expect(h.shutdown).not.toHaveBeenCalled();
-});

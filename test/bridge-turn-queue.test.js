@@ -45,7 +45,7 @@ function setup({ busy = true } = {}) {
     console: { log() {}, warn() {}, error() {} },
     Date, JSON, Map, Set, Promise, Math, Number, String, Object, Array, Boolean, Error,
     setTimeout, clearTimeout,
-    restartLatch: undefined,
+    restartInputs: { begin: () => () => {} },
     shuttingDown: false,
     plannedRestartRuntime: { stamped: false },
     AGENT_CODEX: 'codex',

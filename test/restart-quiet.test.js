@@ -315,10 +315,8 @@ describe('boot subagent reconciliation', () => {
 
   it.each([true, false])('repairs only pre-boot children with parent live=%s', (live) => {
     const main = index.slice(index.indexOf('async function main()'));
-    const restart = main.indexOf('restartBoot?.reconcile();');
     const subagents = main.indexOf("reconcileStrandedSubagents('startup', { beforeBootOnly: true });");
-    expect(restart).toBeGreaterThan(-1);
-    expect(subagents).toBeGreaterThan(restart);
+    expect(subagents).toBeGreaterThan(-1);
     expect(main.indexOf('timerStore.init()')).toBeGreaterThan(subagents);
     expect(main.indexOf('await ')).toBeGreaterThan(subagents);
     const h = repair({ live, send: 'delivered' });

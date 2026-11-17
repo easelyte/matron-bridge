@@ -7,7 +7,7 @@ import { execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { afterEach, expect, it, vi } from 'vitest';
 import { preflightSupport } from '../lib/preflight-support.js';
-import { defaultPreflight } from '../lib/code-update-restart.js';
+import { createRestartPreflight } from '../lib/restart-preflight.js';
 
 vi.mock('node:child_process', async importOriginal => {
   const actual = await importOriginal();
@@ -90,35 +90,44 @@ it('fails closed for missing helper, commit, repository and invalid arguments', 
   expect(missing).toBe(1);
 });
 
-it('checks support before spawning gate mode and inherits config with checkout cwd', async () => {
+it('runs the gate preflight after the base check, only for a tree that supports it, with the checkout cwd', async () => {
   const { repo, sha } = fixture();
   const calls = [];
   const exec = (bin, args, options, callback) => { calls.push({ bin, args, options }); callback(null, '', ''); };
-  expect(await defaultPreflight(repo, { mode: 'gate', exec })).toEqual({ ok: true });
+  const base = vi.fn(async () => ({ ok: true }));
+  const env = { PATH: '/bin', BOOT_KEY: 'from-boot-dotenv', OTHER: 'kept' };
+  expect(await createRestartPreflight(repo, { base, exec, env, bootDotenvKeys: ['BOOT_KEY'] })()).toEqual({ ok: true });
+  expect(base).toHaveBeenCalledWith(repo);
   expect(calls).toHaveLength(1);
   expect(calls[0].args).toEqual(['index.js']);
   expect(calls[0].options.cwd).toBe(repo);
-  expect(calls[0].options.env).toEqual({ ...process.env, MATRON_BRIDGE_PREFLIGHT: 'gate' });
+  expect(calls[0].options.env).toEqual({ PATH: '/bin', OTHER: 'kept', MATRON_BRIDGE_PREFLIGHT: 'gate' });
   expect(preflightSupport(repo, sha)).toBe('gate/1');
-  const old = fixture(marker, false);
+  // The base check failing ends it before any child is spawned.
   calls.length = 0;
-  expect(await defaultPreflight(old.repo, { mode: 'gate', exec })).toEqual({ ok: false, error: 'mode unsupported at HEAD' });
+  const failing = vi.fn(async () => ({ ok: false, error: 'imports' }));
+  expect(await createRestartPreflight(repo, { base: failing, exec, env })()).toEqual({ ok: false, error: 'imports' });
+  expect(calls).toHaveLength(0);
+  // A tree without gate support gets the base check alone.
+  const old = fixture(marker, false);
+  expect(await createRestartPreflight(old.repo, { base, exec, env })()).toEqual({ ok: true });
   expect(calls).toHaveLength(0);
 });
 
-it('refuses gate child errors, timeouts and spawn exceptions', async () => {
+it('refuses gate child errors, timeouts and spawn exceptions with a fixed message', async () => {
   const { repo } = fixture();
-  for (const message of ['exit 1', 'timeout']) {
-    const result = await defaultPreflight(repo, { mode: 'gate', timeoutMs: 1,
+  const base = async () => ({ ok: true });
+  for (const message of ['exit 1', 'timeout config-secret']) {
+    const result = await createRestartPreflight(repo, { base, timeoutMs: 1,
       exec: (_bin, _args, options, callback) => {
         expect(options.timeout).toBe(1);
-        callback(new Error(message), '', '');
+        callback(new Error(message), '', 'stderr with config-secret');
       },
-    });
+    })();
     expect(result.ok).toBe(false);
-    expect(result.error).toContain(message);
+    expect(result.error).not.toContain('secret');
   }
-  expect((await defaultPreflight(repo, { mode: 'gate', exec: () => { throw new Error('spawn failed'); } })).ok).toBe(false);
+  expect((await createRestartPreflight(repo, { base, exec: () => { throw new Error('spawn failed'); } })()).ok).toBe(false);
 });
 
 it('recognizes the exact protocol line in an entry point larger than one megabyte', () => {

@@ -15,7 +15,7 @@ import { formatSearchAll } from './lib/search-format.js';
 import { missionIdemKey, itemIdemKey } from './lib/missions-idem.js';
 import { projectLine, formatProjectList, formatProjectDetail, formatProjectCreateAck, formatProjectStatusAck, formatProjectMergeAck, formatProjectBlocked, formatProjectJournalError } from './lib/projects-format.js';
 import { formatMemoryList, formatMemoryDetail, formatSaveAck, formatDeleteAck, formatRecall } from './lib/memory-format.js';
-import { formatReminderLine } from './lib/reminder-tools.js';
+import { formatReminderLine, REMINDER_ID_STRING } from './lib/reminder-tools.js';
 import { rosterLine } from './lib/roster-format.js';
 import { formatPendingList, formatDecideAck } from './lib/consent-tools.js';
 import {
@@ -1954,10 +1954,9 @@ async function callReminders(name, args, render) {
 
 server.tool(
   'reminder_create',
-  "Schedule a durable reminder to yourself: at the fire time `text` arrives in THIS conversation as a new turn (⏰ Reminder #N …), resuming the session if needed. Unlike CronCreate / ScheduleWakeup, which die at the idle reap (~1 h), a restart or the box sleeping, it survives all three; the box is woken for it. Use it for anything more than about an hour out. Pass exactly one of `in` or `at`. For standing check-ins pass `at` with `repeat: \"daily\"` and a `tz`: set it once, it keeps firing until reminder_cancel. A turn in progress or a background job you started already holds this session and this box awake, so needs no reminder. hold_awake: true ONLY when the work in between must not be interrupted across quiet gaps (a watch, a long download you do not own); it costs host resources every hour. For a planned restart handoff, pass `restart_note: true` without scheduling options: the note stays held until restart delivery.",
+  "Schedule a durable reminder to yourself: at the fire time `text` arrives in THIS conversation as a new turn (⏰ Reminder #N …), resuming the session if needed. Unlike CronCreate / ScheduleWakeup, which die at the idle reap (~1 h), a restart or the box sleeping, it survives all three; the box is woken for it. Use it for anything more than about an hour out. Pass exactly one of `in` or `at`. For standing check-ins pass `at` with `repeat: \"daily\"` and a `tz`: set it once, it keeps firing until reminder_cancel. A turn in progress or a background job you started already holds this session and this box awake, so needs no reminder. hold_awake: true ONLY when the work in between must not be interrupted across quiet gaps (a watch, a long download you do not own); it costs host resources every hour. restart_note: true instead of a time leaves `text` as a note to yourself, delivered as this conversation's first turn after the next bridge restart (once; one note per conversation, a newer one replaces it; dropped after about 24 h).",
   {
     text: z.string().min(1).max(2000).describe('What to tell yourself when it fires — write it for your future self, with enough context to act on'),
-    restart_note: z.boolean().optional().describe('Hold text for the pending planned restart. No in, at, repeat or hold_awake; replaces your prior note for this restart.'),
     in: z.string().optional().describe('Delay: 30s, 45m, 2h, 1d, 1h30m (5 s to 7 d)'),
     at: z.string().optional().describe("Clock time on this box (or in `tz`): 09:00, 14:30, 9pm, 12:10am — the next occurrence"),
     // Plain strings, not an enum: the bridge's own validation words the
@@ -1965,8 +1964,9 @@ server.tool(
     repeat: z.string().optional().describe('"daily" to fire at `at` every day until cancelled. Needs `at`; not with `in` or hold_awake.'),
     tz: z.string().optional().describe('IANA time zone for `at`, e.g. "Europe/London". Default: this box\'s own zone.'),
     hold_awake: z.boolean().optional().describe('Keep this box awake and this session un-reaped until it fires. Default false: the box may sleep and is woken for it. Not with repeat.'),
+    restart_note: z.boolean().optional().describe('true: hold `text` as a note delivered as the first turn after the next bridge restart. Not with in, at, repeat, tz or hold_awake.'),
   },
-  async (args) => callReminders('create', args, (d) => d.restart_note ? 'Restart note held for delivery after the planned restart.' : `Reminder set: ${formatReminderLine(d.reminder)}${d.reminder.hold_awake ? ' — the box stays awake until then.' : d.reminder.repeat ? ' — it repeats every day until reminder_cancel; the box may sleep and will be woken for each one.' : ' — the box may sleep and will be woken for it.'}`),
+  async (args) => callReminders('create', args, (d) => d.restart_note ? 'Restart note saved. It arrives as this conversation\'s first turn after the next bridge restart, once, if it is within about 24 hours.' : `Reminder set: ${formatReminderLine(d.reminder)}${d.reminder.hold_awake ? ' — the box stays awake until then.' : d.reminder.repeat ? ' — it repeats every day until reminder_cancel; the box may sleep and will be woken for each one.' : ' — the box may sleep and will be woken for it.'}`),
 );
 
 server.tool(
@@ -1979,6 +1979,8 @@ server.tool(
 server.tool(
   'reminder_cancel',
   "Cancel a pending reminder in this conversation by its number, or 'all' of them.",
-  { id: z.union([z.number().int(), z.literal('all')]).describe("Reminder number from reminder_list / the create result, or 'all'") },
+  // The string branch takes "261" / "#261" too: some MCP clients send the
+  // integer as a string, which a bare integer | 'all' union rejected.
+  { id: z.union([z.number().int(), z.literal('all'), z.string().regex(REMINDER_ID_STRING)]).describe("Reminder number from reminder_list / the create result, or 'all'") },
   async (args) => callReminders('cancel', args, (d) => `Cancelled ${d.cancelled.length === 1 ? 'reminder' : `${d.cancelled.length} reminders`}: ${d.cancelled.map(formatReminderLine).join('; ')}`),
 );

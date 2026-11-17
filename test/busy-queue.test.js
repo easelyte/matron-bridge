@@ -1737,7 +1737,7 @@ describe('index.js queued-send finalizer', () => {
     const flushQueue = runInNewContext(
       `(() => { ${src.slice(start, end)}; return flushQueue; })()`,
       {
-        restartLatch: undefined,
+        restartInputs: { begin: () => () => {} },
         AGENT_CODEX: 'codex', CLAUDE_STEER_ENABLED: false,
         console: { log: vi.fn() },
         runQueuedCleanup,

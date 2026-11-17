@@ -116,6 +116,18 @@ it('requires an executable /usr/bin/curl and refuses a bare script name', async 
   expect(result.stderr).toContain('by path');
   expect(f.requests).toHaveLength(0);
 });
+it('accepts 202 (requested) and 200 (request_key already seen) as success and prints the reply', async () => {
+  for (const status of ['202', '200']) {
+    const result = await (await fixture({ statuses: [status] })).run();
+    expect(result.status).toBe(0);
+    expect(result.stdout).toBe('{"state":"pending"}');
+  }
+});
+it('reports a refused pin (409) with the bridge reply and exit 2', async () => {
+  const result = await (await fixture({ statuses: ['409'] })).run();
+  expect(result.status).toBe(2);
+  expect(result.stderr).toContain('restart refused (HTTP 409)');
+});
 it('refuses an unexpected HTTP status', async () => {
   const result = await (await fixture({ statuses: ['500'] })).run();
   expect(result.status).toBe(2);

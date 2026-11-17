@@ -19,12 +19,19 @@
 # Usage:
 #   ./deploy.sh            pull, install, preflight, restart, record old PID
 #   ./deploy.sh --dry-run  pull, install, preflight — report readiness, NO restart
+#   ./deploy.sh --when-quiet  pull, install, preflight, then ask the running
+#                          bridge to restart itself once no session has work
+#                          in flight (POST /restart) instead of restarting now
 
 set -euo pipefail
 cd "$(dirname "$0")"
 
 DRY_RUN=0
-[ "${1:-}" = "--dry-run" ] && DRY_RUN=1
+WHEN_QUIET=0
+case "${1:-}" in
+  --dry-run) DRY_RUN=1 ;;
+  --when-quiet) WHEN_QUIET=1 ;;
+esac
 
 step() { printf '\n\033[1m==> %s\033[0m\n' "$1"; }
 fail() { printf '\033[31mFAIL: %s\033[0m\n' "$1" >&2; exit 1; }
@@ -142,6 +149,24 @@ echo "  preflight OK — the new code imports and boots"
 
 if [ "$DRY_RUN" = "1" ]; then
   step "--dry-run: readiness verified, bridge NOT restarted"
+  exit 0
+fi
+
+# 4a. --when-quiet: do not restart here. Ask the running bridge to restart
+#     itself when no session holds work (the same wait the code-update
+#     watcher does), using the operator token the bridge wrote at start.
+if [ "$WHEN_QUIET" = "1" ]; then
+  step "ask the bridge to restart when quiet (POST /restart)"
+  OPERATOR_HEADER="${XDG_STATE_HOME:-$HOME/.local/state}/matron-bridge/api-operator.header"
+  [ -r "$OPERATOR_HEADER" ] || fail "no operator token file at $OPERATOR_HEADER — is the bridge running?"
+  API="http://127.0.0.1:${MATRON_BRIDGE_API_PORT:-9802}/restart"
+  CODE=$(curl -sS -o "$NPMLS_OUT" -w '%{http_code}' -X POST -H @"$OPERATOR_HEADER" \
+    -H 'Content-Type: application/json' -d '{"reason":"deploy.sh --when-quiet"}' "$API") \
+    || fail "could not reach the bridge API at $API"
+  cat "$NPMLS_OUT"; echo
+  [ "$CODE" = "202" ] || fail "the bridge did not accept the restart request (HTTP $CODE)"
+  echo "Restart requested. The bridge restarts when no session has work in flight."
+  echo "Check: curl -s -H @\"$OPERATOR_HEADER\" $API   Cancel: add -X DELETE"
   exit 0
 fi
 

@@ -50,8 +50,8 @@ describe('--model wiring in the /start command family (source inspection)', () =
   // The extractor consumes `--model <alias>` as TWO tokens, so any positional
   // read from the pre-extraction list would pick up "--model" or the alias as
   // a workdir / session id.
-  it('!start reads its workdir positional from the extractor output', () => {
-    expect(BLOCKS['!start']()).toContain('const arg = startModelFlag.rest[0]');
+  it('!start reads its workdir positional from the last extractor\'s output (--worktree runs after --model)', () => {
+    expect(BLOCKS['!start']()).toContain('const arg = worktreeFlag.rest[0]');
   });
 
   it('!resume reads its session-id positional from the extractor output', () => {

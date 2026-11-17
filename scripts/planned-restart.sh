@@ -119,7 +119,12 @@ for attempt in 1 2; do
   status=${out##*$'\n'}
   body=${out%$'\n'*}
   case "$status" in
-    200) printf '%s' "$body"; exit 0 ;;
+    # 202: the restart is requested and waits for a quiet moment. 200: the
+    # request_key was already seen (a retry), so nothing new was requested.
+    200|202) printf '%s' "$body"; exit 0 ;;
+    # The bridge refused the pin (not a descendant of HEAD, or config-only
+    # after HEAD moved). The body says which; it holds no credentials.
+    409) echo "restart refused (HTTP 409): $body" >&2; exit 2 ;;
     401) if [[ "$attempt" == 1 ]]; then read_token; else echo 'token stale, bridge restarted; retry after back' >&2; exit 5; fi ;;
     503) echo 'retry after back' >&2; exit 6 ;;
     *) echo "restart request failed (HTTP $status)" >&2; exit 2 ;;
