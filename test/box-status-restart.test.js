@@ -100,3 +100,24 @@ describe('restart box status', () => {
   });
 
 });
+
+describe('restart box status: what the block carries after the resume-note merge', () => {
+  const state = { id: 'restart-a', state: 'back', requests: [{ sha: 'abc', reason: 'update', request_key: 'k' }], pending_since: 100, expected_sha: 'def',
+    results: { code_mismatch: false, resumed: ['c1'], failed: ['c2'], possibly_delivered: [], verdicts: { c1: { outcome: 'resumed', at: 5 }, c2: { outcome: 'failed', at: 6 } } },
+    participants: ['c1'], notified: { c1: {} }, verdicts: {}, boot_sha: 'x', previous_sha: 'y' };
+
+  it('publishes the gate\'s reason, the outcomes of the notes, and nothing else of the state file', () => {
+    const block = buildRestartStatus(state, { waiting_on: { quiet: { holders: [], probe_error: null }, code: null, preflight: null, gate: 'settling: waiting for a second quiet reading', collect: null, unwarned: [] } });
+    expect(Object.keys(block).sort()).toEqual(['expected_sha', 'id', 'pending_since', 'requests', 'results', 'state', 'waiting_on']);
+    expect(block.waiting_on).toEqual({ quiet: { holders: [], probe_error: null }, code: null, preflight: null, gate: 'settling: waiting for a second quiet reading', collect: null, unwarned: [] });
+    expect(block.results).toEqual(state.results);
+    expect(block.requests).toEqual([{ sha: 'abc', reason: 'update' }]);
+  });
+
+  it('keeps collect null and unwarned empty for older readers, and leaves the gate out when it is not holding', () => {
+    const block = buildRestartStatus(state, { waiting_on: { quiet: { holders: [{ convoId: 'c1', why: 'busy' }], probe_error: null }, code: 'dirty tree', preflight: { error: 'x' }, collect: null, unwarned: [] } });
+    expect(block.waiting_on.collect).toBeNull();
+    expect(block.waiting_on.unwarned).toEqual([]);
+    expect(block.waiting_on).not.toHaveProperty('gate');
+  });
+});

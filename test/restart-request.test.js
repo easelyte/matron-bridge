@@ -260,14 +260,20 @@ describe('state file for the crash rollback', () => {
     const b = build({ head: NEW, bootSha: NEW });
     b.world.now = T0 + 5000;
     const state = readState();
-    expect(state).toMatchObject({ state: 'back', boot_sha: NEW, expected_sha: NEW, restarting_at: restartedAt, results: { code_mismatch: false } });
+    expect(state).toMatchObject({ state: 'back', boot_sha: NEW, expected_sha: NEW, restarting_at: restartedAt, results: { code_mismatch: false }, history_appended: false });
     expect(state.booted_at).toEqual(expect.any(Number));
-    // A second boot reconciliation of the same restart adds no second line.
-    b.layer.reconcileBoot();
-    build({ head: NEW, bootSha: NEW });
+    // The history line waits for the resume notes; it carries what became of them.
+    expect(fs.existsSync(path.join(dir, 'history.jsonl'))).toBe(false);
+    b.layer.settleNotes({ c1: { outcome: 'resumed', at: 5 }, c2: { outcome: 'failed', at: 6 }, c3: { outcome: 'possibly_delivered', at: 7 } });
+    // Settling twice adds no second line.
+    b.layer.settleNotes({});
     const lines = fs.readFileSync(path.join(dir, 'history.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
     expect(lines).toHaveLength(1);
-    expect(lines[0]).toMatchObject({ id: state.id, state: 'back', abandoned: false, requests: [{ request_key: 'k1' }], results: { code_mismatch: false } });
+    expect(lines[0]).toMatchObject({
+      id: state.id, state: 'back', abandoned: false, requests: [{ request_key: 'k1' }],
+      results: { code_mismatch: false, resumed: ['c1'], failed: ['c2'], possibly_delivered: ['c3'], verdicts: { c2: { outcome: 'failed' } } },
+    });
+    expect(readState()).toMatchObject({ history_appended: true, results: { failed: ['c2'] } });
   });
 
   it('reports a code mismatch when the boot is not the expected sha', async () => {
@@ -542,5 +548,19 @@ describe('observed work starts the quiet count again', () => {
     expect(reader.count().quiet).toBe(false);
     world.now += 10_000;
     expect(reader.count().quiet).toBe(true);
+  });
+});
+
+describe('history for a restart whose notes never settled', () => {
+  it('is archived, once, when the record is replaced by a new request', async () => {
+    const a = build({ head: NEW });
+    await post(a.layer, { reason: 'deploy', sha: NEW, request_key: 'k1' });
+    a.layer.commitRestart({ sha: NEW });
+    const b = build({ head: NEW, bootSha: NEW });
+    // The process ended before settleNotes ran. The next request archives it.
+    expect((await post(b.layer, { reason: 'next', sha: NEW, request_key: 'k2' })).status).toBe(202);
+    const lines = fs.readFileSync(path.join(dir, 'history.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toMatchObject({ state: 'back', requests: [{ request_key: 'k1' }] });
   });
 });
