@@ -2,7 +2,8 @@ import { describe, it, expect, vi } from 'vitest';
 import { readFileSync } from 'node:fs';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
-import { COORDINATOR_ONLY, shouldRegister } from '../lib/tool-roles.js';
+import { COORDINATOR_ONLY, shouldRegister, toolRoleFor } from '../lib/tool-roles.js';
+import { codexMcpConfig } from '../lib/codex-mcp.js';
 import { buildClaudeSpawnEnv } from '../lib/spawn-env.js';
 
 describe('tool roles', () => {
@@ -27,16 +28,20 @@ describe('tool roles', () => {
 describe('Claude spawn tool role', () => {
   const build = (options = {}, baseEnv = {}) => buildClaudeSpawnEnv({ baseEnv, ...options });
 
-  it.each([undefined, '', '0', 'true'])('requires the exact filter opt-in, got %s', (flag) => {
+  it('BRIDGE_TOOL_FILTER=0 turns the filter off: no role, and an inherited one is dropped', () => {
     for (const coordinator of [true, false]) {
       expect(build({ coordinator, roleKnown: true }, {
-        BRIDGE_TOOL_FILTER: flag, BRIDGE_TOOL_ROLE: 'worker',
+        BRIDGE_TOOL_FILTER: '0', BRIDGE_TOOL_ROLE: 'worker',
       })).not.toHaveProperty('BRIDGE_TOOL_ROLE');
     }
   });
 
+  it.each([undefined, '', '1', 'true'])('filters by default (BRIDGE_TOOL_FILTER=%s)', (flag) => {
+    expect(build({ coordinator: false, roleKnown: true }, flag === undefined ? {} : { BRIDGE_TOOL_FILTER: flag }).BRIDGE_TOOL_ROLE).toBe('worker');
+  });
+
   it('sets per-session roles without mutating the bridge environment', () => {
-    const base = Object.freeze({ BRIDGE_TOOL_FILTER: '1', BRIDGE_TOOL_ROLE: 'worker' });
+    const base = Object.freeze({ BRIDGE_TOOL_ROLE: 'worker' });
     expect(build({ coordinator: true }, base).BRIDGE_TOOL_ROLE).toBe('coordinator');
     expect(build({ coordinator: false, roleKnown: true }, base).BRIDGE_TOOL_ROLE).toBe('worker');
     for (const options of [{}, { coordinator: false }, { coordinator: false, roleKnown: false }]) {
@@ -98,5 +103,25 @@ describe('ask-user MCP tool list', () => {
 
   it.each(['coordinator', 'full', 'unknown'])('role %s matches the default tool list', async (role) => {
     expect(await listTools(role)).toEqual(await listTools());
+  });
+});
+
+describe('Codex sessions get the same role', () => {
+  const baseConfig = { mcpServers: { 'ask-user': { command: 'node', args: ['./ask-user.js'] }, other: { command: 'x', args: [] } } };
+  it('toolRoleFor: worker only when the role is known and not the Coordinator; null when turned off', () => {
+    expect(toolRoleFor({ baseEnv: {}, coordinator: false, roleKnown: true })).toBe('worker');
+    expect(toolRoleFor({ baseEnv: {}, coordinator: true, roleKnown: true })).toBe('coordinator');
+    expect(toolRoleFor({ baseEnv: {}, coordinator: false, roleKnown: false })).toBe('full');
+    expect(toolRoleFor({ baseEnv: { BRIDGE_TOOL_FILTER: '0' }, coordinator: false, roleKnown: true })).toBeNull();
+  });
+  it('the ask-user server env carries the role, and only that server', () => {
+    const r = codexMcpConfig({ baseConfig, bridgeDir: '/bridge', roomId: 'room', apiPort: 9802, toolRole: 'worker' });
+    expect(r.mcp_servers['ask-user'].env.BRIDGE_TOOL_ROLE).toBe('worker');
+    expect(r.mcp_servers.other.env).not.toHaveProperty('BRIDGE_TOOL_ROLE');
+    expect(codexMcpConfig({ baseConfig, bridgeDir: '/bridge', roomId: 'room', apiPort: 9802 }).mcp_servers['ask-user'].env).not.toHaveProperty('BRIDGE_TOOL_ROLE');
+  });
+  it('index.js passes the session role to the Codex MCP config (source inspection)', () => {
+    const src = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
+    expect(src).toContain('toolRole: toolRoleFor({ coordinator: options.coordinator === true, roleKnown: options.roleKnown === true }) }) : {},');
   });
 });

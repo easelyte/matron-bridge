@@ -64,4 +64,18 @@ describe('createMemoryClient', () => {
     expect((await c.list()).status).toBe(0);
     expect(fetchImpl).not.toHaveBeenCalled();
   });
+
+  it('recall POSTs /memories/recall; a per-call timeout aborts a slow journal sooner', async () => {
+    const { fetchImpl, calls } = fakeFetch(() => ({ status: 200, body: { memories: [] } }));
+    const c = createMemoryClient({ baseUrl: 'https://j', token: 't', fetchImpl });
+    expect(await c.recall({ text: 'x', mode: 'auto' })).toEqual({ status: 200, data: { memories: [] } });
+    expect(calls[0].url).toBe('https://j/memories/recall');
+    expect(calls[0].init.method).toBe('POST');
+    expect(JSON.parse(calls[0].init.body)).toEqual({ text: 'x', mode: 'auto' });
+    const slow = vi.fn((url, init) => new Promise((resolve, reject) => { init.signal.addEventListener('abort', () => reject(new Error('aborted'))); }));
+    const c2 = createMemoryClient({ baseUrl: 'https://j', token: 't', fetchImpl: slow });
+    const started = Date.now();
+    expect((await c2.recall({ text: 'x' }, { timeoutMs: 50 })).status).toBe(0);
+    expect(Date.now() - started).toBeLessThan(5000);
+  });
 });

@@ -14,7 +14,7 @@ import { formatStartAck, formatCreateAck, formatMilestoneAck, formatMissionDetai
 import { formatSearchAll } from './lib/search-format.js';
 import { missionIdemKey, itemIdemKey } from './lib/missions-idem.js';
 import { projectLine, formatProjectList, formatProjectDetail, formatProjectCreateAck, formatProjectStatusAck, formatProjectMergeAck, formatProjectBlocked, formatProjectJournalError } from './lib/projects-format.js';
-import { formatMemoryList, formatMemoryDetail, formatSaveAck, formatDeleteAck } from './lib/memory-format.js';
+import { formatMemoryList, formatMemoryDetail, formatSaveAck, formatDeleteAck, formatRecall } from './lib/memory-format.js';
 import { formatReminderLine } from './lib/reminder-tools.js';
 import { rosterLine } from './lib/roster-format.js';
 import { formatPendingList, formatDecideAck } from './lib/consent-tools.js';
@@ -259,7 +259,7 @@ server.tool(
 
 server.tool(
   'send_attachment',
-  'Send a file from disk into the Matron chat as a real attachment: images (png/jpg/gif/webp/heic) render inline; PDFs, logs, and other files appear as tappable file attachments. Use this for screenshots, plots, generated documents, and build artifacts instead of describing them or pasting their contents. Do NOT use for secrets or credential files — use share_sensitive_data for those. The file must be inside the session working directory or be one the bridge downloaded for this conversation (a file the user sent here, or an item attachment), and attachments are capped at 50 MB. With chat_room_id the file goes to the other agents in that room instead: each room file needs the user\'s approval on a card, may be up to 10 GB, and uploads in the background — the tool returns at once, you are told in the room when the approval card has been filed, and the outcome arrives there too. Keep it purposeful: send the artifact the user needs, not every intermediate file.',
+  'Send a file from disk into the Matron chat as a real attachment (images render inline; other files are tappable): screenshots, plots, documents and build artifacts, instead of describing or pasting them. Never secrets or credential files (share_sensitive_data is for those). The file must be in the working directory or one the bridge downloaded for this conversation; at most 50 MB. With chat_room_id it goes to the agents in that room instead: up to 10 GB, after the user approves it on a card; the tool returns at once and the outcome arrives in the room. Send what the user needs, not every intermediate file.',
   {
     path: z.string().describe('Path to the file — absolute, or relative to the session working directory'),
     caption: z.string().optional().describe('Optional caption rendered with the attachment, like a message body. For a room file it is shown on the approval card as your note: say what the file is and why you are sending it'),
@@ -392,7 +392,7 @@ server.tool(
 
 server.tool(
   'agent_sessions',
-  "List this user's agent sessions, including conversation id, title, state, agent kind, and is_self. Use the is_self row to find this session's own conversation id; use agent rooms to coordinate with other sessions.",
+  "List this user's 30 most recent agent sessions: conversation id, title, state, agent kind and is_self. Use the is_self row to find this session's own conversation id.",
   {},
   async () => {
     try {
@@ -405,7 +405,9 @@ server.tool(
       if (!postRes.ok) {
         return { content: [{ type: 'text', text: `agent_sessions failed: ${data.error || `HTTP ${postRes.status}`}` }] };
       }
-      return { content: [{ type: 'text', text: JSON.stringify(data.sessions || [], null, 2) }] };
+      const rows = data.sessions || [];
+      const more = Number.isInteger(data.total) && data.total > rows.length ? `\n(${rows.length} most recent of ${data.total} sessions)` : '';
+      return { content: [{ type: 'text', text: JSON.stringify(rows, null, 2) + more }] };
     } catch (err) {
       return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
     }
@@ -414,14 +416,14 @@ server.tool(
 
 server.tool(
   'agent_chat_start',
-  "Start a chat room with one of the user's other agent sessions: pick a target conversation from agent_roster, and the bridge invites its agent. Sessions on this same bridge are valid targets too (the invite is delivered locally). The user approves the invite on a consent card; once approved, the peer's bridge joins its agent to the room at once (there is no accept step on that side) and the agent reads your opening message as its next turn. A target whose box is asleep is fine: the journal wakes the box while the invite waits for the user's consent, so it just takes a few minutes longer. You and a given peer session share ONE room for the life of both conversations — it survives an idle reap, a restart and the box sleeping, and a peer's message wakes this conversation: calling this again at the same target returns that existing room (and posts your message into it) rather than opening a second one; a room with another person that is still waiting on a card instead returns its status (whose card it waits on) without posting — there is no way to close a room, so use agent_chat_mute if one goes wrong. If the result is pending or pending_busy, do NOT wait or poll: continue your own work — the answer and any replies arrive automatically as later turns. To talk with another PERSON's agent (\"can we talk to bob about X\"), pass `person` and `topic` instead of target_convo_id — exactly one of the two. Your user gets one card to send it (in the new room's own conversation and in their For you list, not in your session's chat), then that person gets one card that also makes you contacts and lets them choose where to talk; do not call contact_add or session_share first. Neither Coordinator can answer either card.",
+  "Start a chat room with another of the user's agent sessions (from agent_roster; this bridge's own sessions too, and a sleeping box is woken). The user approves on a card; then the peer is joined at once and reads your opening message as its next turn. You and a peer share ONE room for the life of both conversations: calling this again at the same target returns that existing room (and posts your message into it). Rooms stay open (there is no way to close a room), so agent_chat_mute one that goes wrong. If the result is pending, do NOT wait or poll: answers and replies arrive as later turns. To talk with another PERSON's agent, pass `person` and `topic` instead of target_convo_id (exactly one of the two): your user gets one card to send it, that person one card that also makes you contacts; do not call contact_add or session_share first. Neither Coordinator can answer either card.",
   {
     target_convo_id: z.string().optional().describe('Conversation id of the target session, from agent_roster. Omit when you pass person'),
     person: z.string().max(PERSON_MAX).optional().describe("Another person to talk with, by their name as contact_list shows it (they need not be a contact yet), or name@host for someone on another journal. Omit when you pass target_convo_id"),
     topic: z.string().optional().describe('Optional short topic for the room title'),
     justification: z.string().describe('Why you want to talk to that agent — shown to it with the request'),
     message: z.string().describe('The opening message posted into the room'),
-    mission: z.number().int().min(1).optional().describe("Only for a room with another person (person, or one of their sessions): one of your mission numbers, already shared with them, to attach to the room. Turns their side starts may then use the tracker on that mission."),
+    mission: z.number().int().min(1).optional().describe("Only for a room with another person: one of your missions already shared with them, to attach; their side's turns may then use its tracker."),
   },
   async ({ target_convo_id, person, topic, justification, message, mission }) => {
     try {
@@ -604,17 +606,17 @@ server.tool(
 
 server.tool(
   'agent_session_start',
-  "Ask the user's consent to start a new agent session on one of their boxes — this one included, when the work has to happen here — seeded with a task. If the user has not already said which box and directory the work should happen in, ask them before calling this — they usually have a preference, and the consent card can only be approved or declined, it cannot be corrected. The result is pending: do NOT wait or poll — the user's decision and the spawn outcome arrive automatically as later turns. On approval the new session runs detached by default: it does the task and does not report back — a clean break, which is what a spawn normally is. Pass link: true only when you need its results in a chat room; the room is then created on approval and the child is told to report there. Pass mission: N to put the new session on mission #N from its first turn (the consent card says so) — the way to assign a mission made with mission_create.",
+  "Ask the user's consent to start a new agent session, seeded with a task, on one of their boxes (this one included). If the user has not said which box and directory, ask first: the card can only be approved or declined, not corrected. The result is pending: do NOT wait or poll; the decision and the outcome arrive as later turns. The new session is detached by default: it does the task and does not report back. Pass link: true only when you need its results in a chat room. Pass mission: N to put it on mission #N from its first turn.",
   {
     device_id: z.number().int().describe('Target box device id, from agent_boxes'),
     workdir: z.string().describe('Absolute working directory on the target box, from agent_boxes folders'),
     task: z.string().max(2000).describe('The task prompt. Shown VERBATIM on the user\'s consent card and executed verbatim as the new session\'s first turn — write it for both audiences.'),
     topic: z.string().max(200).optional().describe('Optional short room/session title'),
-    agent: z.enum(['claude', 'codex']).optional().describe('Optional coding agent for the new session. Omit to use the target box\'s own default agent (agent_boxes shows it as "default: …") — only set it if the user asked for one, or the task needs one the box does not default to. The consent card shows the agent that will run.'),
-    model: z.string().optional().describe('Optional model for the new session. For Claude: default, opus, opus[1m], sonnet, sonnet[1m], haiku, opusplan, fable (or a full claude-* model name). For Codex (needs agent: "codex"): a Codex model id. Omit to use the target box\'s own default (a box at its Fable weekly limit starts the session on Opus instead) — only set it if the user asked for a specific model. A Claude model sent with no agent to a box that defaults to Codex is dropped: the box runs Codex.'),
-    effort: z.enum(['minimal', 'low', 'medium', 'high', 'xhigh', 'max']).optional().describe('Optional reasoning effort for the new session (Claude: low…max; Codex: minimal…xhigh). Omit to use the target box\'s default — only set it if the user asked for one, or the task plainly needs less or more thinking than usual. The consent card shows it.'),
-    link: z.boolean().optional().describe('Open a chat room between this session and the new one, and have it report its outcome there. Default false: the spawned session is detached and simply does its task. Set true only when you need its results back here.'),
-    mission: z.number().int().min(1).optional().describe('Mission number the new session joins before its first turn — e.g. one you made with mission_create. The consent card shows it.'),
+    agent: z.enum(['claude', 'codex']).optional().describe('Omit for the box\'s default agent (agent_boxes: "default: …"). Set it only if the user asked, or the task needs the other one.'),
+    model: z.string().optional().describe('Omit for the box\'s default; set it only if the user asked. Claude: default, opus, opus[1m], sonnet, sonnet[1m], haiku, opusplan, fable or a claude-* name. Codex (needs agent: "codex"): a Codex model id. A Claude model sent to a Codex-default box with no agent is dropped.'),
+    effort: z.enum(['minimal', 'low', 'medium', 'high', 'xhigh', 'max']).optional().describe('Claude: low…max; Codex: minimal…xhigh. Omit for the box\'s default unless the user asked, or the task plainly needs more or less thinking.'),
+    link: z.boolean().optional().describe('true = a chat room with the new session, which reports its outcome there. Only when you need its results back here.'),
+    mission: z.number().int().min(1).optional().describe('Mission the new session joins before its first turn, e.g. one from mission_create'),
   },
   async ({ device_id, workdir, task, topic, agent, model, effort, link, mission }) => {
     try {
@@ -1007,7 +1009,7 @@ async function sessionControlCall(route, body, name) {
 
 server.tool(
   'restart_session',
-  "Restart THIS session's own agent process — the way to get browser tools (chrome-devtools MCP) mid-conversation, or to move onto a different model, without asking the user to do it. The conversation, workdir and history are kept; only the underlying process is respawned. continue_with is a message the bridge sends back into the restarted session as its first turn, so the work carries on unattended — write it as an instruction to your future self, including whatever context the restart is about to cost you. The restart does NOT happen instantly: it is parked until your current turn ends, so finish up and stop working rather than starting anything new after calling this. There is a small budget of consecutive self-restarts; once it runs out you must ask the user. Never call this in a loop. browser and model are Claude-only: a Codex session gets a refusal for either, and takes both from its own config.",
+  "Restart THIS session's own agent process (the conversation, workdir and history are kept) to get browser tools (chrome-devtools MCP) or move onto another model, without asking the user. continue_with is sent back as the restarted session's first turn: write it for your future self, with the context the restart will cost you. It is parked until your current turn ends, so finish up and start nothing new after calling it. A small budget of consecutive self-restarts applies; after that, ask the user. Never call it in a loop. browser and model are Claude-only.",
   {
     continue_with: z.string().max(2000).describe('The message to send into the restarted session as its first turn. Written for your future self: what you were doing, what to do next.'),
     browser: z.boolean().optional().describe('Restart with browser tools (chrome-devtools MCP) enabled. Omit to keep the session\'s current MCP servers.'),
@@ -1360,22 +1362,27 @@ async function callItems(name, args, render) {
   }
 }
 
+// Shared parameter wording for the item tools.
+const ATTACHMENTS_WHAT = 'Local paths in the working directory, or files the bridge downloaded for this conversation (≤20). `![caption](path)` in the body shows one in place; the rest go at the end';
+const STEP_UP_WHAT = "true = the user confirms the tap with Face ID or Touch ID (signed by their device's key). For anything destructive or hard to undo; a typed reply never counts.";
+const SUBJECT_WHAT = 'With step_up: exactly what is approved, a flat object of ≤12 short strings, e.g. {"op":"drop_table","table":"orders"}. Shown to the user and signed.';
+
 server.tool(
   'item_create',
-  "File an item in the user's task & decision tracker — a panel beside the chat, so it survives this session and the user can answer in their own time. Use kind 'question' for EACH decision you need from the user instead of listing questions in prose: the user answers in that item's own thread and their reply reaches you as a 📌 turn, so do not block waiting for it. Use 'decision' to record a choice you made yourself (what and why, in body) and 'task' for work to do later. Use 'notice' for something the user needs to read but not decide (a blocker, key result, warning, 'needs you in a browser') — it awaits the user with a built-in Seen button that closes it; don't pass actions. Markdown body; attach screenshots or files by local path. To show an image in place, put `![what it shows](./file.png)` right after the paragraph it illustrates and list the file in `attachments`; unreferenced attachments show at the end. When the question has an obvious one-tap answer — a go-ahead, or a choice between 2–3 options — pass `actions` so the user can tap instead of typing (they can still reply in words).",
+  "File an item in the user's tracker, beside the chat: it outlives this session and the user answers in its own thread, in their own time; the reply reaches you as a 📌 turn, so never block on it. kind 'question' for EACH decision you need from the user (never a list of questions in prose), 'decision' for a choice you made (what and why), 'task' for later work, 'notice' for something to read but not decide. A question with an obvious one-tap answer (a go-ahead, or 2–3 options) gets `actions`. Put an image where it belongs with `![what it shows](./file.png)` after its paragraph and list the file in `attachments`.",
   {
-    kind: z.enum(['task', 'question', 'decision', 'notice']).describe("notice: something the user needs to read but not decide (a blocker, key result, warning, 'needs you in a browser') — awaits the user with a built-in Seen button that closes it; don't pass actions"),
+    kind: z.enum(['task', 'question', 'decision', 'notice']).describe("notice: a blocker, key result or warning the user needs to read; it has a built-in Seen button, so pass no actions"),
     title: z.string().describe('One line, ≤200 chars'),
     body: z.string().optional().describe('Markdown. For a question: the options and your recommendation. For a decision: what and why.'),
-    attachments: z.array(z.string()).optional().describe('Local file paths inside the working directory, or files the bridge downloaded for this conversation (at most 20). A body image `![caption](path)` naming one of them shows it in place; the rest show at the end'),
+    attachments: z.array(z.string()).optional().describe(ATTACHMENTS_WHAT),
     labels: z.array(z.string()).optional(),
     links: z.array(z.object({ url: z.string(), title: z.string().optional() })).optional().describe('e.g. a GitHub issue or PR'),
     awaiting: z.enum(['user', 'agent']).nullable().optional().describe('Who acts next. Defaults: question→user, notice→user, task→agent, decision→nobody'),
     position: z.enum(['top', 'bottom']).optional().describe('Where a task lands in the ordered task list'),
     supersedes: z.string().optional().describe('Item id of a decision this one replaces'),
-    actions: z.array(z.string()).max(4).optional().describe('Up to 4 short one-tap reply labels (≤40 chars each, unique), e.g. ["Go"] or ["Option A","Option B"]. Tapping one behaves exactly like the user typing that label as a reply.'),
-    step_up: z.boolean().optional().describe("true = the user must confirm the tap with Face ID or Touch ID (a signature from their device's approval key). Use for anything destructive or hard to undo. A typed reply never satisfies it. Cannot be un-set once filed: close the item and file a new one."),
-    subject: z.record(z.string(), z.string()).optional().describe('With step_up: what exactly is being approved, as a flat object of short strings (at most 12 keys), e.g. {"op":"drop_table","table":"orders","box":"box-a"}. Shown to the user verbatim and signed.'),
+    actions: z.array(z.string()).max(4).optional().describe('Up to 4 one-tap reply labels (≤40 chars, unique), e.g. ["Go"] or ["Option A","Option B"]; a tap reads as that reply.'),
+    step_up: z.boolean().optional().describe(`${STEP_UP_WHAT} Cannot be removed once filed.`),
+    subject: z.record(z.string(), z.string()).optional().describe(SUBJECT_WHAT),
     shared_by: z.string().max(PERSON_MAX).optional().describe("Another person's mission you may contribute to: their user name (name@host for someone on another journal), with mission = THEIR number (mission_list shared: true lists them). Needs a contribute share; no attachments or buttons."),
     mission: z.number().int().min(1).optional().describe('With shared_by: THEIR mission number to file the item on'),
   },
@@ -1408,15 +1415,15 @@ server.tool(
 
 server.tool(
   'item_comment',
-  "Add a comment to an item (text and/or attachments by local path) — progress, findings, or a follow-up question in the same thread. The item is the full record of that piece of work: put follow-up screenshots, images and files in `attachments` here, not in the chat with a note that they are in the conversation. Show an image in place with `![what it shows](./file.png)` right after the paragraph it illustrates. A follow-up question belongs on the item it is about, not in a new item: pass `actions` (up to 4 one-tap reply labels) and the user gets buttons under this comment, the item is handed to them, and their tap reaches you as a 📌 turn. Optionally set `awaiting` to hand the item to the user ('user'), take it back ('agent'), or clear it (null). Prefer `item_close` when the item is actually resolved.",
+  "Add a comment to an item: progress, findings, or a follow-up question. The item is the record of the work, so its screenshots and files go in `attachments` here, not in the chat. A follow-up question goes on the item it is about, not a new one: pass `actions` and the user gets buttons under this comment, the item is handed to them, and the tap reaches you as a 📌 turn. `awaiting` hands the item to the user ('user'), takes it back ('agent') or clears it (null). Use item_close when it is resolved.",
   {
     id: z.string().describe("Item id ('it_…') or '#12'"),
     body: z.string().optional().describe('Markdown'),
-    attachments: z.array(z.string()).optional().describe('Local file paths inside the working directory, or files the bridge downloaded for this conversation (at most 20). A body image `![caption](path)` naming one of them shows it in place; the rest show at the end'),
+    attachments: z.array(z.string()).optional().describe(ATTACHMENTS_WHAT),
     awaiting: z.enum(['user', 'agent']).nullable().optional().describe('Who acts next after this comment; omit to leave it unchanged'),
-    actions: z.array(z.string()).max(4).optional().describe('Up to 4 short one-tap reply labels (≤40 chars each, unique) shown under this comment, e.g. ["Merge"] or ["Option A","Option B"]. Sets awaiting to the user. The item must be open (item_reopen a closed one first).'),
-    step_up: z.boolean().optional().describe("true = the user must confirm the tap with Face ID or Touch ID (a signature from their device's approval key). Use for anything destructive or hard to undo. A typed reply never satisfies it. Needs actions."),
-    subject: z.record(z.string(), z.string()).optional().describe('With step_up: what exactly is being approved, as a flat object of short strings (at most 12 keys), e.g. {"op":"drop_table","table":"orders","box":"box-a"}. Shown to the user verbatim and signed.'),
+    actions: z.array(z.string()).max(4).optional().describe('Up to 4 one-tap reply labels (≤40 chars, unique) under this comment, e.g. ["Merge"]. Sets awaiting to the user. The item must be open (item_reopen it first).'),
+    step_up: z.boolean().optional().describe(`${STEP_UP_WHAT} Needs actions.`),
+    subject: z.record(z.string(), z.string()).optional().describe(SUBJECT_WHAT),
     add_labels: z.array(z.string()).max(10).optional().describe('Labels to add to the item, keeping the ones it has (e.g. ["dispatched"] on a spare-allowance backlog task you started)'),
     shared_by: z.string().max(PERSON_MAX).optional().describe("An item on another person's mission you may contribute to: their user name (name@host for someone on another journal); id is then the item's id or THEIR number ('#12'). Needs a contribute share; no attachments or buttons."),
   },
@@ -1877,7 +1884,7 @@ async function callMemory(name, args, render) {
   }
 }
 
-const MEMORY_WHAT = "The user's memories are their standing rules and facts about how they want their agents to work (which boxes to avoid, which model to use, how to report), saved in the journal, shared by every session on every box, and listed under \"Your memories\" in every session's instructions at spawn. Each has a scope: 'global' (every session), 'coordinator' (the user's Coordinator only) or 'repo:<name>' (sessions working in that repo); a session is given the global memories, its repo's, and all of them when it is the Coordinator.";
+const MEMORY_WHAT = "The user's memories are their standing rules and facts about how they want their agents to work (which boxes to avoid, which model to use, how to report), saved in the journal, shared by every session on every box, and listed under \"Your memories\" in every session's instructions at spawn. Each has a scope: 'global' (every session), 'coordinator' (the user's Coordinator only) or 'repo:<name>' (sessions working in that repo); a session is given the global memories, its repo's, and all of them when it is the Coordinator. Each also has a tier: 'always' memories are listed in full, 'on_demand' ones are named under their topic and read with memory_get or found with memory_recall when the work touches that topic.";
 
 server.tool(
   'memory_save',
@@ -1888,6 +1895,8 @@ server.tool(
     body: z.string().optional().describe('Markdown, ≤8 KB: **Why:** and **How to apply:**. Omitted on an update clears the stored body — send it back.'),
     type: z.enum(['user', 'feedback', 'project', 'reference']).optional().describe("Defaults to 'feedback' (how the user wants work done). 'user' = who they are; 'project' = ongoing work or constraints; 'reference' = a pointer (URL, dashboard, ticket)."),
     scope: z.string().optional().describe("Who the memory is for: 'global' (every session; the default on create), 'coordinator' (a rule only the Coordinator acts on: sweeps, compaction, usage limits, box capacity) or 'repo:<name>' (a rule about one repo's workflow, e.g. 'repo:my-app' — the bare repo name). Omitted on an update keeps the stored scope."),
+    tier: z.enum(['always', 'on_demand']).optional().describe("'always' (listed in full in every session of its scope: safety rules, consent and desk boundaries, merge and deploy gates, how to talk to the user) or 'on_demand' (named under its topic, read when the work touches it: anything that only matters for one kind of task). Omitted on an update keeps the stored tier."),
+    topic: z.string().optional().describe("A short label, ≤40 chars, naming the situation the rule is for, e.g. 'booking courier collections'. Sessions see on-demand memories grouped by it, and recall matches on it. '' clears it; omitted on an update keeps it."),
   },
   async (args) => callMemory('save', args, formatSaveAck),
 );
@@ -1904,6 +1913,16 @@ server.tool(
   'Read one memory in full, body included (the why and the how behind the one-line description).',
   { name: z.string().describe('The memory name') },
   async (args) => callMemory('get', args, formatMemoryDetail),
+);
+
+server.tool(
+  'memory_recall',
+  "Find the user's memories that bear on what you are about to do, in your own words (\"booking a courier collection\", \"cleaning up disk space on a Mac\"), and read them whole. Use it when your work touches a topic in the on-demand list of your memories, or whenever you suspect a standing rule might apply and you don't know its name. Searches the memories in this session's scopes (every scope for the Coordinator).",
+  {
+    query: z.string().max(1000).describe('What you are doing or about to do, in your own words'),
+    limit: z.number().int().min(1).max(10).optional().describe('Default 5'),
+  },
+  async (args) => callMemory('recall', args, formatRecall),
 );
 
 server.tool(
@@ -1935,7 +1954,7 @@ async function callReminders(name, args, render) {
 
 server.tool(
   'reminder_create',
-  "Schedule a durable reminder to yourself: at the fire time the bridge delivers `text` into THIS conversation as a new turn (⏰ Reminder #N …), resuming the session if it was reaped. Unlike CronCreate / ScheduleWakeup, which live in this process and die at the bridge's idle reap (~1 h), on a restart, and when this dev box idle-stops, a reminder is persisted by the bridge, re-armed after a restart, and known to the host: the box may go to sleep meanwhile and is started again a few minutes before the reminder fires. Use this for anything further out than about an hour. The user sees a card with Send-now / Cancel buttons. For a planned restart handoff, pass `restart_note: true` without scheduling options: the note stays held until restart delivery. Otherwise pass exactly one of `in` or `at`. For standing check-ins (a morning and an evening sweep, say) pass `at` with `repeat: \"daily\"` and a `tz` such as \"Europe/London\": it fires at that wall-clock time every day, 08:00 staying 08:00 across the clock changes, and keeps its number until reminder_cancel ends it — set it once, never re-create it after each fire. A turn in progress or a background job you started that is still running already holds this session and this box awake (up to 8 hours from your last output), so a reminder is not needed for that. Set hold_awake: true ONLY when the work between now and then must not be interrupted across quiet gaps between turns (a watch, a long download you are not a parent of): it keeps this box from idle-stopping and this session from being reaped until the reminder fires, which costs resources on its host for every hour of it.",
+  "Schedule a durable reminder to yourself: at the fire time `text` arrives in THIS conversation as a new turn (⏰ Reminder #N …), resuming the session if needed. Unlike CronCreate / ScheduleWakeup, which die at the idle reap (~1 h), a restart or the box sleeping, it survives all three; the box is woken for it. Use it for anything more than about an hour out. Pass exactly one of `in` or `at`. For standing check-ins pass `at` with `repeat: \"daily\"` and a `tz`: set it once, it keeps firing until reminder_cancel. A turn in progress or a background job you started already holds this session and this box awake, so needs no reminder. hold_awake: true ONLY when the work in between must not be interrupted across quiet gaps (a watch, a long download you do not own); it costs host resources every hour. For a planned restart handoff, pass `restart_note: true` without scheduling options: the note stays held until restart delivery.",
   {
     text: z.string().min(1).max(2000).describe('What to tell yourself when it fires — write it for your future self, with enough context to act on'),
     restart_note: z.boolean().optional().describe('Hold text for the pending planned restart. No in, at, repeat or hold_awake; replaces your prior note for this restart.'),

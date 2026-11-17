@@ -1,12 +1,12 @@
 import { describe, it, expect } from 'vitest';
-import { memoryLine, formatMemoryList, formatMemoryDetail, formatSaveAck, formatDeleteAck, formatProposalOutcome } from '../lib/memory-format.js';
+import { memoryLine, formatMemoryList, formatMemoryDetail, formatSaveAck, formatDeleteAck, formatProposalOutcome, formatRecall, formatRecallContext } from '../lib/memory-format.js';
 
 const m = { id: 'me_1', name: 'avoid-box-a', type: 'feedback', description: 'Never use box-a.', body: '**Why:** reserved.', created_by: 'agent', updated_by: 'user', created_at: 1000, updated_at: 2000, origin_convo_id: 'c1' };
 
 describe('memory renderers', () => {
   it('memoryLine: name, type, description, updated time and who', () => {
-    expect(memoryLine(m)).toBe('`avoid-box-a` (feedback, global): Never use box-a. — updated 1970-01-01T00:00:02.000Z by user');
-    expect(memoryLine({ ...m, scope: 'repo:acme-app' })).toContain('(feedback, repo:acme-app)');
+    expect(memoryLine(m)).toBe('`avoid-box-a` (feedback, global, always): Never use box-a. — updated 1970-01-01T00:00:02.000Z by user');
+    expect(memoryLine({ ...m, scope: 'repo:acme-app' })).toContain('(feedback, repo:acme-app, always)');
   });
   it('formatMemoryList: one line per memory, or a placeholder', () => {
     expect(formatMemoryList({ memories: [m, { ...m, name: 'b' }] }).split('\n')).toHaveLength(2);
@@ -32,8 +32,8 @@ describe('memory renderers', () => {
     expect(formatMemoryDetail({ memory: { ...m, body: '', origin_convo_id: null } })).toContain('(no body)');
   });
   it('formatSaveAck says created or updated; formatDeleteAck names the memory', () => {
-    expect(formatSaveAck({ memory: m, created: true })).toBe('Saved memory `avoid-box-a` (created, scope global): Never use box-a.');
-    expect(formatSaveAck({ memory: { ...m, scope: 'repo:acme-app' }, created: false })).toBe('Saved memory `avoid-box-a` (updated, scope repo:acme-app): Never use box-a.');
+    expect(formatSaveAck({ memory: m, created: true })).toBe('Saved memory `avoid-box-a` (created, scope global, always): Never use box-a.');
+    expect(formatSaveAck({ memory: { ...m, scope: 'repo:acme-app' }, created: false })).toBe('Saved memory `avoid-box-a` (updated, scope repo:acme-app, always): Never use box-a.');
     expect(formatDeleteAck({ memory: m })).toBe('Deleted memory `avoid-box-a`');
   });
   it('a pending save or delete says plainly that nothing changed, names the item, and says not to retry', () => {
@@ -65,5 +65,26 @@ describe('memory renderers', () => {
     expect(formatMemoryDetail({})).toBe('(unknown memory)');
     expect(formatSaveAck({})).toBe('Saved memory');
     expect(formatDeleteAck(undefined)).toBe('Deleted memory `(unnamed)`');
+  });
+  it('tier and topic show in the line, the detail and the save ack', () => {
+    const od = { ...m, tier: 'on_demand', topic: 'couriers' };
+    expect(memoryLine(od)).toContain('(feedback, global, on demand, topic: couriers)');
+    expect(formatMemoryDetail({ memory: od })).toContain('\ntier: on demand, topic: couriers\n');
+    expect(formatMemoryDetail({ memory: m })).toContain('\ntier: always\n');
+    expect(formatSaveAck({ memory: od, created: true })).toContain('on demand, topic: couriers');
+  });
+  it('formatRecall: each memory whole, a long body cut with a pointer; nothing matched says so', () => {
+    const out = formatRecall({ memories: [{ ...m, tier: 'on_demand', topic: 'couriers' }, { ...m, name: 'long', body: 'y'.repeat(5000) }] });
+    expect(out).toContain('### `avoid-box-a` (global, on demand, topic: couriers)\nNever use box-a.\n\n**Why:** reserved.');
+    expect(out).toContain('… (cut; memory_get long for the rest)');
+    expect(formatRecall({ memories: [] })).toMatch(/^No memory matched/);
+  });
+  it('formatRecallContext: a labelled block for the turn, or nothing at all', () => {
+    expect(formatRecallContext({ memories: [] })).toBe('');
+    expect(formatRecallContext(null)).toBe('');
+    const out = formatRecallContext({ memories: [{ ...m, tier: 'on_demand', body: 'z'.repeat(2000) }] });
+    expect(out.startsWith('[Matron: memories that may bear on this message]\n')).toBe(true);
+    expect(out).toContain('### `avoid-box-a`');
+    expect(out).toContain('(cut; memory_get avoid-box-a for the rest)');
   });
 });

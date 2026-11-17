@@ -131,8 +131,32 @@ describe('createAgentChatHandlers', () => {
             { convo_id: 'convo-same-box', title: 'Same box peer', session_state: 'waiting', agent_kind: null, is_self: false },
             { convo_id: 'convo-cross-box', title: 'Cross box peer', session_state: 'done', agent_kind: 'codex', is_self: false },
           ],
+          total: 3,
         },
       });
+    });
+
+    it('flags nothing as self when the caller has no journal conversation yet', async () => {
+      const { handlers } = makeFixture({ session: { convoId: null } });
+      const res = await handlers.agentSessions({ roomId: '!sess' });
+      expect(res.body.sessions.some((s) => s.is_self)).toBe(false);
+    });
+
+    it('caps the list at 30 most recent, clips titles, and always keeps the caller\'s own row', async () => {
+      const conversations = Array.from({ length: 45 }, (_, i) => ({
+        id: `c${i}`, title: `T${i}\n${'x'.repeat(300)}`, session_state: 'done', agent_device_id: 7, last_ts: 1000 + i,
+      }));
+      // The caller's convo is the oldest, so it would fall outside the cap.
+      conversations.push({ id: 'convo-sess', title: 'mine', session_state: 'running', agent_device_id: 1, last_ts: 1 });
+      const { handlers } = makeFixture({ publisher: { fetchRoster: async () => ({ ...ROSTER, conversations }) } });
+
+      const res = await handlers.agentSessions({ roomId: '!sess' });
+
+      expect(res.body.sessions).toHaveLength(30);
+      expect(res.body.total).toBe(46);
+      expect(res.body.sessions[0]).toMatchObject({ convo_id: 'convo-sess', is_self: true });
+      expect(res.body.sessions[1].convo_id).toBe('c44');
+      expect(res.body.sessions.every((s) => s.title.length <= 120 && !s.title.includes('\n'))).toBe(true);
     });
 
     it('502s when the roster fetch fails', async () => {

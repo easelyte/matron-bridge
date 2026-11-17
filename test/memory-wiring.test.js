@@ -17,12 +17,13 @@ function body(startMarker, endMarker) {
   return index.slice(start, end);
 }
 
-const OPS = ['save', 'list', 'get', 'delete'];
+const OPS = ['save', 'list', 'get', 'delete', 'recall', 'recall-turn'];
 const TOOL_CALLS = {
   memory_save: "callMemory('save', args, formatSaveAck)",
   memory_list: "callMemory('list', args, formatMemoryList)",
   memory_get: "callMemory('get', args, formatMemoryDetail)",
   memory_delete: "callMemory('delete', args, formatDeleteAck)",
+  memory_recall: "callMemory('recall', args, formatRecall)",
 };
 
 describe('memory tools wiring (source inspection)', () => {
@@ -34,11 +35,11 @@ describe('memory tools wiring (source inspection)', () => {
     expect(index).toMatch(/const memoryHandlers = createMemoryHandlers\(\{\s*sessions,\s*journalConvoIdFor,\s*client: memoryClient,\s*isCoordinator: \(session, convoId\) => session\?\.coordinator === true \|\| \(!!convoId && coordinatorLookup\.snapshot\(\)\.convoId === convoId\),\s*repoFor: \(session\) => repoNames\.nameFor\(session\?\.workdir\),\s*\}\);/);
   });
 
-  it('mounts the four /memory routes through the shared handler map', () => {
-    const m = index.match(/url\.pathname\.match\(\/\^\\\/memory\\\/\(([a-z|]+)\)\$\/\)/);
+  it('mounts the /memory routes (tools and the recall hook) through the shared handler map', () => {
+    const m = index.match(/url\.pathname\.match\(\/\^\\\/memory\\\/\(([a-z|-]+)\)\$\/\)/);
     expect(m, 'the /memory route matcher is missing from index.js').toBeTruthy();
     expect(m[1].split('|').sort()).toEqual([...OPS].sort());
-    expect(index).toContain('memoryHandlers[name]');
+    expect(index).toContain("name === 'recall-turn' ? memoryHandlers.recallTurn : memoryHandlers[name]");
   });
 
   it('refreshes the memory cache at boot, on every hello_ok, behind every spawn and on every memory marker', () => {

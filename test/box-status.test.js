@@ -1,7 +1,7 @@
 import { describe, it, expect, vi } from 'vitest';
 import { buildLimits } from '../lib/spawn-capacity.js';
 import {
-  buildBoxVitals, createCodexLimitsRefresher, isWireLimitLine, BOX_LIMIT_LINES_MAX, BOX_STATUS_REPUBLISH_MS,
+  createCodexLimitsRefresher, isWireLimitLine, BOX_LIMIT_LINES_MAX, BOX_STATUS_REPUBLISH_MS,
 } from '../lib/box-status.js';
 
 const claude = (n) => Array.from({ length: n }, (_, i) => ({ id: `c${i}`, label: `Claude ${i}`, percent: i }));
@@ -69,24 +69,6 @@ describe('isWireLimitLine', () => {
     expect(isWireLimitLine({ id: 'a', label: 'a', percent: -1 })).toBe(false);
     expect(isWireLimitLine({ id: 'a', label: 'a', percent: 5, resets: 7 })).toBe(false);
     expect(isWireLimitLine([])).toBe(false);
-  });
-});
-
-describe('buildBoxVitals (contract §1 vitals block)', () => {
-  it('copies the three keys, rounding percentages to 1 dp', () => {
-    expect(buildBoxVitals({ cpu_pct: 12.345, ram_pct: 50, sampled_at_ms: 1_700_000_000_000, extra: 1 }))
-      .toEqual({ cpu_pct: 12.3, ram_pct: 50, sampled_at_ms: 1_700_000_000_000 });
-  });
-  it('omits the block (null) until both CPU and RAM have a sample', () => {
-    expect(buildBoxVitals(null)).toBeNull();
-    expect(buildBoxVitals({ cpu_pct: null, ram_pct: 40, sampled_at_ms: 1 })).toBeNull();
-  });
-  it('rejects out-of-range or non-finite values instead of sending something the journal drops', () => {
-    expect(buildBoxVitals({ cpu_pct: 101, ram_pct: 40, sampled_at_ms: 1 })).toBeNull();
-    expect(buildBoxVitals({ cpu_pct: NaN, ram_pct: 40, sampled_at_ms: 1 })).toBeNull();
-    expect(buildBoxVitals({ cpu_pct: 1, ram_pct: 40, sampled_at_ms: 0 })).toBeNull();
-    expect(buildBoxVitals({ cpu_pct: 1, ram_pct: 40, sampled_at_ms: 1.5 })).toBeNull();
-    expect(buildBoxVitals({ cpu_pct: 1, ram_pct: 40, sampled_at_ms: 9e15 })).toBeNull();
   });
 });
 

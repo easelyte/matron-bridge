@@ -13,6 +13,8 @@ import {
   resolveGitDir,
   readHeadReflog,
   defaultPreflight,
+  createCommandGate,
+  gateEnv,
   createCodeUpdateWatcher,
   AUTO_CARRY_ON_TEXT,
   autoCarryOnEnabled,
@@ -542,4 +544,209 @@ it.each([undefined, () => null])('uses the legacy idle path when planned request
   h.state.busy = 0;
   expect((await h.watcher.tick()).action).toBe('restart');
   expect(h.state.restarts[0].forced).toBe(false);
+});
+
+describe('restart gate', () => {
+  const landed = { sha: NEW, at: T0 - DEFAULT_SETTLE_MS };
+  const GATE_CAP = 60_000;
+  const gateOf = (state, verdict) => async () => { state.gateCalls = (state.gateCalls || 0) + 1; return typeof verdict === 'function' ? verdict() : verdict; };
+
+  it('unset: restarts at the first quiet poll as before', async () => {
+    const { watcher } = harness({ head: landed });
+    expect((await watcher.tick()).action).toBe('restart');
+  });
+
+  it('a hold delays the restart and a later safe verdict lets it through', async () => {
+    const state = {};
+    let verdict = { hold: true, reason: 'nightly backup running' };
+    const h = harness({ head: landed, gate: gateOf(state, () => verdict), gateMaxMs: GATE_CAP });
+    expect(await h.watcher.tick()).toMatchObject({ action: 'waiting', gate: 'nightly backup running' });
+    expect(h.state.restarts).toEqual([]);
+    h.state.now = T0 + 10_000;
+    verdict = { hold: false };
+    expect((await h.watcher.tick()).action).toBe('restart');
+  });
+
+  it('puts the gate reason in the 30-minute warning', async () => {
+    const state = {};
+    const h = harness({ head: landed, gate: gateOf(state, { hold: true, reason: 'nightly backup running' }), gateMaxMs: 3600_000 });
+    await h.watcher.tick();
+    expect(h.state.warn).toHaveLength(0);
+    h.state.now = T0 + DEFAULT_WARN_EVERY_MS;
+    await h.watcher.tick();
+    expect(h.state.warn.join('\n')).toMatch(/held by the restart gate for 30 min \(nightly backup running\)/);
+  });
+
+  it('expires at the cap, restarts and logs it', async () => {
+    const state = {};
+    const h = harness({ head: landed, gate: gateOf(state, { hold: true, reason: 'backup' }), gateMaxMs: GATE_CAP });
+    await h.watcher.tick();
+    h.state.now = T0 + GATE_CAP - 1;
+    expect((await h.watcher.tick()).action).toBe('waiting');
+    h.state.now = T0 + GATE_CAP;
+    expect((await h.watcher.tick()).action).toBe('restart');
+    expect(h.state.warn.join('\n')).toMatch(/past the 1 min cap, restarting anyway/);
+  });
+
+  it('counts a gate that throws or reports an error as safe, logged', async () => {
+    const state = {};
+    const h = harness({ head: landed, gate: gateOf(state, () => { throw new Error('boom'); }) });
+    expect((await h.watcher.tick()).action).toBe('restart');
+    expect(h.state.warn.join('\n')).toMatch(/restart gate failed \(boom\)/);
+    const h2 = harness({ head: landed, gate: gateOf(state, { hold: false, error: 'timed out after 5000ms' }) });
+    expect((await h2.watcher.tick()).action).toBe('restart');
+    expect(h2.state.warn.join('\n')).toMatch(/timed out after 5000ms/);
+  });
+
+  it('re-checks work after the gate answers: a turn that started meanwhile holds the restart', async () => {
+    const state = {};
+    let release;
+    const slow = () => new Promise(r => { release = () => r({ hold: false }); });
+    const h = harness({ head: landed, gate: gateOf(state, slow) });
+    const p = h.watcher.tick();
+    await Promise.resolve();
+    h.state.busy = 1;
+    release();
+    expect((await p).action).toBe('waiting');
+    expect(h.state.restarts).toEqual([]);
+  });
+
+  it('re-validates HEAD after the gate answers: a newer revision goes back through settle and preflight', async () => {
+    const state = {};
+    let release;
+    const slow = () => new Promise(r => { release = () => r({ hold: false }); });
+    const h = harness({ head: landed, gate: gateOf(state, slow) });
+    const p = h.watcher.tick();
+    await Promise.resolve();
+    h.state.head = { sha: 'c'.repeat(40), at: T0 };
+    release();
+    expect((await p).action).toBe('settling');
+    expect(h.state.restarts).toEqual([]);
+  });
+
+  it('never asks the gate for a forced restart', async () => {
+    const state = {};
+    const h = harness({ head: { sha: NEW, at: T0 - 10_000 }, busy: 1, settleMs: 10_000, forceAfterMs: 20_000, gate: gateOf(state, { hold: true, reason: 'x' }) });
+    await h.watcher.tick();
+    h.state.now = T0 + 20_000;
+    expect((await h.watcher.tick()).forced).toBe(true);
+    expect(state.gateCalls).toBeUndefined();
+  });
+});
+
+describe('createCommandGate', () => {
+  const fake = (err, stdout = '') => vi.fn((file, args, opts, cb) => cb(err, stdout, ''));
+
+  it('settles on its own deadline and kills the child when the callback never arrives', async () => {
+    vi.useFakeTimers();
+    try {
+      const kill = vi.fn();
+      const exec = vi.fn(() => ({ kill }));
+      const p = createCommandGate('hook', { exec, timeoutMs: 1000 })();
+      await vi.advanceTimersByTimeAsync(1300);
+      expect(await p).toEqual({ hold: false, error: 'timed out after 1000ms' });
+      expect(kill).toHaveBeenCalledWith('SIGKILL');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('is off for an unset or blank command', () => {
+    expect(createCommandGate(undefined)).toBeNull();
+    expect(createCommandGate('   ')).toBeNull();
+  });
+
+  it('runs the argv with a timeout and treats exit 0 as safe', async () => {
+    const exec = fake(null);
+    expect(await createCommandGate('/usr/bin/check --quiet', { exec, timeoutMs: 1234 })()).toEqual({ hold: false });
+    expect(exec).toHaveBeenCalledWith('/usr/bin/check', ['--quiet'], expect.objectContaining({ timeout: 1234 }), expect.any(Function));
+  });
+
+  it('exit 1 holds, with the first stdout line as the reason', async () => {
+    const exec = fake(Object.assign(new Error('x'), { code: 1 }), 'deploy in progress\nmore\n');
+    expect(await createCommandGate('check', { exec })()).toEqual({ hold: true, reason: 'deploy in progress' });
+    const bare = fake(Object.assign(new Error('x'), { code: 1 }), '');
+    expect((await createCommandGate('check', { exec: bare })()).reason).toBe('no reason given');
+  });
+
+  it('other exits, a timeout and a spawn failure count as safe with an error', async () => {
+    const r = (err) => createCommandGate('check', { exec: fake(err), timeoutMs: 50 })();
+    expect(await r(Object.assign(new Error('x'), { code: 2 }))).toEqual({ hold: false, error: 'exit 2' });
+    expect(await r(Object.assign(new Error('x'), { code: null, killed: true, signal: 'SIGTERM' }))).toEqual({ hold: false, error: 'timed out after 50ms' });
+    expect(await r(Object.assign(new Error('spawn check ENOENT'), { code: 'ENOENT' }))).toEqual({ hold: false, error: 'exit ENOENT' });
+    const thrower = vi.fn(() => { throw new Error('bad'); });
+    expect(await createCommandGate('check', { exec: thrower })()).toEqual({ hold: false, error: 'bad' });
+  });
+});
+
+describe('gateEnv', () => {
+  it('keeps PATH, HOME and MATRON_RESTART_GATE_* and drops everything else', () => {
+    expect(gateEnv({
+      PATH: '/bin', HOME: '/home/x', MATRON_RESTART_GATE_FOO: '1', MATRON_RESTART_GATE_CMD: 'check',
+      MATRON_API_TOKEN: 'secret', SECRET: 's', MATRON_BRIDGE_PLUGINS: '/p.mjs',
+    })).toEqual({ PATH: '/bin', HOME: '/home/x', MATRON_RESTART_GATE_FOO: '1', MATRON_RESTART_GATE_CMD: 'check' });
+  });
+
+  it('passes the minimal env and a detached spawn to the exec', async () => {
+    const exec = vi.fn((file, args, opts, cb) => cb(null, '', ''));
+    await createCommandGate('check', { exec, env: { PATH: '/bin', HOME: '/h', TOKEN: 'secret' } })();
+    const opts = exec.mock.calls[0][2];
+    expect(opts.env).toEqual({ PATH: '/bin', HOME: '/h' });
+    expect(opts.detached).toBe(process.platform !== 'win32');
+  });
+});
+
+describe('createCommandGate with a real child', () => {
+  it.skipIf(process.platform === 'win32')('runs the hook without the bridge secrets', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gate-'));
+    const script = path.join(dir, 'hook.js');
+    fs.writeFileSync(script, "process.stdout.write(Object.keys(process.env).includes('GATE_TEST_SECRET') ? 'leaked' : 'clean'); process.exit(1);");
+    process.env.GATE_TEST_SECRET = 'x';
+    try {
+      expect(await createCommandGate(`${process.execPath} ${script}`)()).toEqual({ hold: true, reason: 'clean' });
+    } finally {
+      delete process.env.GATE_TEST_SECRET;
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it.skipIf(process.platform === 'win32')("kills the hook's own children on timeout", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gate-'));
+    const script = path.join(dir, 'hook.js');
+    const pidFile = path.join(dir, 'child.pid');
+    fs.writeFileSync(script, `
+const { spawn } = require('node:child_process');
+const c = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], { stdio: 'ignore' });
+require('node:fs').writeFileSync(${JSON.stringify(pidFile)}, String(c.pid));
+setInterval(() => {}, 1000);
+`);
+    let grandchild;
+    try {
+      const gate = createCommandGate(`${process.execPath} ${script}`, { timeoutMs: 600 });
+      expect(await gate()).toEqual({ hold: false, error: 'timed out after 600ms' });
+      grandchild = Number(fs.readFileSync(pidFile, 'utf8'));
+      let alive = true;
+      for (let i = 0; i < 40 && alive; i++) {
+        try { process.kill(grandchild, 0); await new Promise(r => setTimeout(r, 50)); } catch { alive = false; }
+      }
+      expect(alive).toBe(false);
+    } finally {
+      try { if (grandchild) process.kill(grandchild, 'SIGKILL'); } catch { /* gone */ }
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it('settles on its own deadline when the hook ignores SIGTERM', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'gate-'));
+    const script = path.join(dir, 'hook.js');
+    fs.writeFileSync(script, "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000);");
+    try {
+      const gate = createCommandGate(`${process.execPath} ${script}`, { timeoutMs: 200 });
+      const started = Date.now();
+      expect(await gate()).toEqual({ hold: false, error: 'timed out after 200ms' });
+      expect(Date.now() - started).toBeLessThan(3000);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
 });
