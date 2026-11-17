@@ -260,14 +260,20 @@ describe('state file for the crash rollback', () => {
     const b = build({ head: NEW, bootSha: NEW });
     b.world.now = T0 + 5000;
     const state = readState();
-    expect(state).toMatchObject({ state: 'back', boot_sha: NEW, expected_sha: NEW, restarting_at: restartedAt, results: { code_mismatch: false } });
+    expect(state).toMatchObject({ state: 'back', boot_sha: NEW, expected_sha: NEW, restarting_at: restartedAt, results: { code_mismatch: false }, history_appended: false });
     expect(state.booted_at).toEqual(expect.any(Number));
-    // A second boot reconciliation of the same restart adds no second line.
-    b.layer.reconcileBoot();
-    build({ head: NEW, bootSha: NEW });
+    // The history line waits for the resume notes; it carries what became of them.
+    expect(fs.existsSync(path.join(dir, 'history.jsonl'))).toBe(false);
+    expect(b.layer.settleNotes({ c1: { outcome: 'resumed', at: 5 }, c2: { outcome: 'failed', at: 6 }, c3: { outcome: 'possibly_delivered', at: 7 } })).toBe(true);
+    // Settling twice adds no second line.
+    expect(b.layer.settleNotes({})).toBe(true);
     const lines = fs.readFileSync(path.join(dir, 'history.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
     expect(lines).toHaveLength(1);
-    expect(lines[0]).toMatchObject({ id: state.id, state: 'back', abandoned: false, requests: [{ request_key: 'k1' }], results: { code_mismatch: false } });
+    expect(lines[0]).toMatchObject({
+      id: state.id, state: 'back', abandoned: false, requests: [{ request_key: 'k1' }],
+      results: { code_mismatch: false, resumed: ['c1'], failed: ['c2'], possibly_delivered: ['c3'], verdicts: { c2: { outcome: 'failed' } } },
+    });
+    expect(readState()).toMatchObject({ history_appended: true, results: { failed: ['c2'] } });
   });
 
   it('reports a code mismatch when the boot is not the expected sha', async () => {
@@ -542,5 +548,73 @@ describe('observed work starts the quiet count again', () => {
     expect(reader.count().quiet).toBe(false);
     world.now += 10_000;
     expect(reader.count().quiet).toBe(true);
+  });
+});
+
+describe('history for a restart whose notes never settled', () => {
+  it('is archived, once, when the record is replaced by a new request', async () => {
+    const a = build({ head: NEW });
+    await post(a.layer, { reason: 'deploy', sha: NEW, request_key: 'k1' });
+    a.layer.commitRestart({ sha: NEW });
+    const b = build({ head: NEW, bootSha: NEW });
+    // The process ended before settleNotes ran. The next request archives it.
+    expect((await post(b.layer, { reason: 'next', sha: NEW, request_key: 'k2' })).status).toBe(202);
+    const lines = fs.readFileSync(path.join(dir, 'history.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+    expect(lines).toHaveLength(1);
+    expect(lines[0]).toMatchObject({ state: 'back', requests: [{ request_key: 'k1' }] });
+  });
+});
+
+describe('settleNotes answers whether the record was closed', () => {
+  it('is false while the restart has not been reconciled or the history cannot be written, and true once closed or when there is nothing to close', async () => {
+    const a = build({ head: NEW });
+    expect(a.layer.settleNotes({})).toBe(true);
+    await post(a.layer, { reason: 'deploy', sha: NEW });
+    a.layer.commitRestart({ sha: NEW });
+    expect(a.layer.settleNotes({})).toBe(false);
+    const b = build({ head: NEW, bootSha: NEW });
+    fs.rmSync(path.join(dir, 'history.jsonl'), { force: true });
+    fs.mkdirSync(path.join(dir, 'history.jsonl'));
+    expect(b.layer.settleNotes({ c1: { outcome: 'failed', at: 1 } })).toBe(false);
+    expect(readState().results.failed).toEqual(['c1']);
+    fs.rmdirSync(path.join(dir, 'history.jsonl'));
+    expect(b.layer.settleNotes({ c1: { outcome: 'failed', at: 1 } })).toBe(true);
+    expect(readState().history_appended).toBe(true);
+  });
+});
+
+describe('settleNotes: ownership and a state write that fails separately', () => {
+  it('outcomes for a record that has been replaced are dropped, not added to the new one', async () => {
+    const a = build({ head: NEW });
+    const first = await post(a.layer, { reason: 'deploy', sha: NEW, request_key: 'k1' });
+    a.layer.commitRestart({ sha: NEW });
+    const b = build({ head: NEW, bootSha: NEW });
+    await post(b.layer, { reason: 'next', sha: NEW, request_key: 'k2' });
+    expect(b.layer.settleNotes({ c1: { outcome: 'failed', at: 1 } }, first.body.id)).toBe(true);
+    expect(readState().state).toBe('pending');
+    expect(readState().results).toBeUndefined();
+  });
+
+  it('a state write that fails after the history line is retried without a second line', () => {
+    const a = build({ head: NEW });
+    const run = async () => {
+      await post(a.layer, { reason: 'deploy', sha: NEW });
+      a.layer.commitRestart({ sha: NEW });
+      return build({ head: NEW, bootSha: NEW });
+    };
+    return run().then((b) => {
+      const id = readState().id;
+      const statePath = path.join(dir, 'state.json');
+      const original = fs.readFileSync(statePath, 'utf8');
+      fs.rmSync(statePath);
+      fs.mkdirSync(statePath);
+      expect(b.layer.settleNotes({ c1: { outcome: 'failed', at: 1 } }, id)).toBe(false);
+      fs.rmdirSync(statePath);
+      fs.writeFileSync(statePath, original);
+      expect(b.layer.settleNotes({ c1: { outcome: 'failed', at: 1 } }, id)).toBe(true);
+      const lines = fs.readFileSync(path.join(dir, 'history.jsonl'), 'utf8').trim().split('\n');
+      expect(lines).toHaveLength(1);
+      expect(readState()).toMatchObject({ history_appended: true, results: { failed: ['c1'] } });
+    });
   });
 });

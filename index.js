@@ -25,6 +25,7 @@ if (PREFLIGHT_MODE === 'gate') {
 }
 import { createRestartRequests, PINNED_WATCHER_OPTIONS } from './lib/restart-request.js';
 import { createRestartPreflight, restartPreflightKey } from './lib/restart-preflight.js';
+import { createNoteDelivery } from './lib/restart-note-delivery.js';
 import { buildRestartStatus } from './lib/box-status-restart.js';
 import { BRIDGE_BOOT_AT } from './lib/boot-time.js';
 import { spawn, execFileSync, execFile } from 'child_process';
@@ -166,7 +167,7 @@ import { hookEntry } from './lib/hook-command.js';
 import { liveLogDir, liveLogPath as liveLogPathFor, openOwnLiveLog } from './lib/live-log-dir.js';
 import { killProcessTree } from './lib/process-kill.js';
 import { processTableCommand, readProcessTableStrict } from './lib/process-table.js';
-import { createQuietReader, createInputCounter, currentBootSubagents, sessionBackgroundWork } from './lib/restart-quiet.js';
+import { createQuietReader, createInputCounter, currentBootSubagents, sessionBackgroundWork, sessionOccupied } from './lib/restart-quiet.js';
 import { installShutdownToken, decideShutdown } from './lib/shutdown-endpoint.js';
 import { createWakeHandler, wakeTokenOk, WAKE_TOKEN_HEADER, wakeTargetsFromEnv, wakeRouteName } from './lib/wake-route.js';
 import {
@@ -14415,6 +14416,17 @@ const restartRequests = createRestartRequests({
   warn: message => console.warn(message),
   log: message => console.log(message),
 });
+// Resume notes after a restart (lib/restart-note-delivery.js): upstream's notes
+// plus the fork's retry and backoff and the recovery card. Its outcomes close
+// the restart's record (results in the state file, its history line).
+const restartNoteDelivery = createNoteDelivery({
+  deliver: entry => deliverRestartNote(entry),
+  recover: entry => { publishRecoveryCard(entry.convoId); },
+  // Notes taken now belong to the restart record that was just closed by the boot.
+  owner: () => { const record = restartRequests.getState(); return record.state === 'back' ? record.id : null; },
+  onSettled: (outcomes, ownerId) => restartRequests.settleNotes(outcomes, ownerId),
+  log: message => console.warn(message),
+});
 // While a restart is requested, keep the journal's `restart` block current.
 {
   let evaluatedAt = -Infinity;
@@ -16673,8 +16685,42 @@ function startIdleReaper() {
 // live session). Markers inside the window get a card; the rest are dropped
 // silently. takeStale clears ALL previous-boot markers either way, so a given
 // interruption is offered exactly once and can never resurface on a later boot.
+// A resume note is handed to its chat as the first turn after the restart
+// (the same carry-on cause upstream uses). A chat that is not ready for input
+// yet (a resumed PTY loading, a sign-in dialog, an effort picker, a turn in
+// progress) is deferred, which costs no attempt; a chat that cannot be
+// resumed at all is a failure. lib/restart-note-delivery.js retries.
+async function deliverRestartNote(entry) {
+  const finishInput = restartInputs.begin();
+  try {
+    let session = findSessionByClaudeSessionId(entry.convoId);
+    if (!session || !session.alive) session = journalResumeConvo(entry.convoId, '🔄 The bridge restarted — resuming this chat with the note you left for it.');
+    if (!session || !session.alive) return false;
+    // Holds that sendToSession would refuse (and report to the chat) are
+    // waited out instead: the account lock and a Codex sign-in in progress.
+    if (accountLock.isLocked()
+      || (session.codex?.transport === 'app-server' && (session._codexAccountCommandPending || session._codexLoginId))) return { deferred: true };
+    if (sessionOccupied(session) || session._awaitingInputReady
+      || effortFlowHoldsInput(session) || signInDialogHoldsInput(session)) return { deferred: true };
+    const turn = restartNoteTurnText(entry.text, Math.max(0, Date.now() - entry.writtenAt), frameSafeBody, entry.interrupted);
+    return sendToSession(session, [{ type: 'text', text: turn }], { plainTurn: true, causes: [carryOnCause()] }) === true;
+  } finally { finishInput?.(); }
+}
+
+// The note replaced the card its chat would have had; when it cannot be
+// delivered the chat gets one after all (only where a tap can resume it).
+function publishRecoveryCard(convoId) {
+  if (!JOURNAL_ENABLED) return false;
+  const resumable = Object.values(loadPersistedSessions()).some(rec => rec?.journalConvoId === convoId || rec?.sessionId === convoId);
+  if (!resumable || !isResumeConvoId(convoId)) return false;
+  return journalPublishCardForConvo(convoId, {
+    question: '⚠️ The bridge restarted and could not resume this chat by itself. Tap to carry on from where it left off.',
+    options: [{ id: `resume-${convoId}`, label: '▶️ Carry on', value: `resume:${convoId}` }],
+  });
+}
+
 function publishRestartCarryOnCards() {
-  if (!JOURNAL_ENABLED) return;
+  if (!JOURNAL_ENABLED) { restartNoteDelivery.intakeComplete(); return; }
   let stale;
   try {
     // takeStale clears and PERSISTS before this returns, i.e. before a single
@@ -16699,22 +16745,32 @@ function publishRestartCarryOnCards() {
     .filter(Boolean));
   // Resume notes first, before selectAutoCarryOn: a conversation with a note
   // gets the note as its one bridge-made first turn, in place of both the
-  // automatic carry-on and the card. The notes are deleted before delivery.
+  // automatic carry-on and the card. Fork: the notes are read here, written
+  // to the delivery's pending file, and only then removed from upstream's
+  // file, so a crash in between delivers them once (a note is identified by
+  // its conversation and write time) instead of losing them.
+  let taken = [];
   const noteResult = takeNoteDeliveries({
-    store: restartNotes, stale, resumable, isResumeConvoId,
+    store: { take: () => { taken = restartNotes.peek(); return taken; } }, stale, resumable, isResumeConvoId,
     log: (m) => { try { console.log(m); } catch { /* logging must never throw */ } },
   });
   stale = noteResult.stale;
   if (noteResult.deliveries.length) {
-    setTimeout(() => {
-      for (const note of noteResult.deliveries) {
-        void carryOnConvo(note.convoId, null, null,
-          restartNoteTurnText(note.text, note.ageMs, frameSafeBody, note.interrupted),
-          '🔄 The bridge restarted — resuming this chat with the note you left for it.',
-          { causes: [carryOnCause()] });
-      }
-    }, CODE_UPDATE_AUTO_CARRY_ON_DELAY_MS);
+    const writtenAt = new Map(taken.map(n => [n.convoId, n.writtenAt]));
+    const deliveries = noteResult.deliveries.map(d => ({ ...d, writtenAt: writtenAt.get(d.convoId) }));
+    try { restartNoteDelivery.start(deliveries); }
+    catch (e) {
+      // The notes could not be made durable: every one of these chats gets its
+      // card instead, and the restart's record says they were not delivered.
+      try { console.warn(`[restart-note] could not queue ${deliveries.length} note(s): ${e?.message ?? e}`); } catch { /* logging must never throw */ }
+      for (const note of deliveries) publishRecoveryCard(note.convoId);
+      restartNoteDelivery.failIntake(deliveries);
+    }
   }
+  try { restartNotes.discard(); } catch (e) {
+    try { console.warn(`[restart-note] could not remove the taken notes: ${e?.message ?? e}`); } catch { /* logging must never throw */ }
+  }
+  restartNoteDelivery.intakeComplete();
   if (!stale.length) return;
   // The previous process's self-restart onto new code cut these turns off;
   // with the option on they carry on by themselves (lib/code-update-restart.js
@@ -16858,6 +16914,12 @@ async function main() {
   // queues frames FIFO until hello_ok, exactly as the eager control-convo
   // upsert above relies on, so nothing is dropped by publishing here.
   publishRestartCarryOnCards();
+  // Notes an earlier process left pending are delivered too; once everything
+  // has settled the restart's record is closed (also when there is nothing).
+  // (Not settled when they cannot be read: the record stays open and the next
+  // boot tries again.)
+  try { restartNoteDelivery.resume(); }
+  catch (e) { console.warn(`[restart-note] could not resume pending notes: ${e?.message ?? e}`); }
   // After the carry-on cards: a self-restart for new code must never land
   // before the previous process's interruptions have been surfaced.
   startCodeUpdateWatcher();

@@ -352,6 +352,20 @@ curl -s -H @"$H" -X DELETE http://127.0.0.1:9802/restart   # cancel
 `./deploy.sh --when-quiet` does the pull, install and preflight, then sends
 that POST instead of restarting at once.
 
+**Resume notes.** A session leaves itself a note with `reminder_create
+restart_note: true`; it is delivered as that chat's first turn after the next
+restart (one note per chat, dropped after about 24 hours). This fork delivers
+them with retry and backoff: the notes are written to
+`~/.matron-bridge-restart-pending.json` before anything is delivered; a chat
+that is busy, not ready for input or holding a sign-in dialog is tried again
+after a minute at no cost; a failed delivery is tried again after a minute,
+three times in all, and then the chat gets a "Carry on" card instead. A note
+is marked as delivering before it is handed over, so a crash in between is
+recorded as "possibly delivered" and never answered with a second delivery.
+What became of every note (`resumed`, `failed`, `possibly_delivered`, `stale`)
+is recorded in the restart's `results` (state file, history line and the
+`restart` block of `box_status`).
+
 ## Config (.env)
 
 | Variable | Description | Default |

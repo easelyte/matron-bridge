@@ -69,8 +69,8 @@ it('request-only bridge: a pinned request waits for its commit, restarts once, r
     await wait(() => state().state === 'back');
     expect(state()).toMatchObject({ boot_sha: next, results: { code_mismatch: false } });
     expect(state().booted_at).toEqual(expect.any(Number));
-    expect(history()).toHaveLength(1);
-    expect(history()[0]).toMatchObject({ id: asked.body.id, state: 'back', requests: [{ request_key: 'rehearsal-1' }] });
+    await wait(() => history().length === 1);
+    expect(history()[0]).toMatchObject({ id: asked.body.id, state: 'back', requests: [{ request_key: 'rehearsal-1' }], results: { resumed: [], failed: [] } });
     await wait(async () => (await call(bridge, 'POST', { reason: 'late retry', sha: next, request_key: 'rehearsal-1' }).catch(() => null))?.status === 200);
     expect((await call(bridge, 'POST', { reason: 'late retry', sha: next, request_key: 'rehearsal-1' })).body).toMatchObject({ idempotent: true, id: asked.body.id, state: 'back' });
 
@@ -83,3 +83,37 @@ it('request-only bridge: a pinned request waits for its commit, restarts once, r
     await bridge.close();
   }
 }, 150000);
+
+it('a resume note survives the restart, is delivered to its chat after it, and its outcome closes the record', async () => {
+  const note = 'Continue checking the saved report.';
+  const bridge = await startBridge({
+    confine: false, planned: true,
+    env: { MATRON_CODE_UPDATE_RESTART: '1', MATRON_CODE_UPDATE_AUTO: '0', MATRON_CODE_UPDATE_POLL_MS: '300', MATRON_CODE_UPDATE_SETTLE_MS: '100' },
+  });
+  const file = (name) => path.join(bridge.home, `.matron-bridge-${name}`);
+  const state = () => JSON.parse(fs.readFileSync(file('restart-state.json'), 'utf8'));
+  const users = (id) => bridge.transcript(id).filter(row => row.type === 'user').map(row => row.message.content);
+  try {
+    const alice = await bridge.startSession();
+    const saved = await bridge.post('/reminders/create', { roomId: alice.roomId, restart_note: true, text: note });
+    expect(saved.restart_note.text).toBe(note);
+    // A config-only request while HEAD is where the process booted.
+    const asked = await call(bridge, 'POST', { reason: 'rehearsal: reload config', request_key: 'note-1' });
+    expect(asked.status).toBe(202);
+    await wait(() => bridge.supervisor.exits.length === 1, 90000);
+    expect(bridge.supervisor.exits).toEqual([{ code: 75, signal: null }]);
+    await wait(() => bridge.supervisor.launches === 2);
+    await wait(() => state().state === 'back');
+    // The note reaches its chat once, and then the record is closed with what became of it.
+    await wait(() => users(alice.claudeSessionId).some(content => content.some(part => part.text?.includes(note))), 120000);
+    await wait(() => state().history_appended === true, 60000);
+    expect(state().results).toMatchObject({ code_mismatch: false, resumed: [alice.claudeSessionId], failed: [], possibly_delivered: [] });
+    expect(users(alice.claudeSessionId).filter(content => content.some(part => part.text?.includes(note)))).toHaveLength(1);
+    const lines = fs.readFileSync(file('restart-history.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+    expect(lines).toHaveLength(1);
+    expect(lines[0].results.verdicts[alice.claudeSessionId].outcome).toBe('resumed');
+    expect(fs.existsSync(file('restart-pending.json')) ? JSON.parse(fs.readFileSync(file('restart-pending.json'), 'utf8')) : []).toEqual([]);
+  } finally {
+    await bridge.close();
+  }
+}, 240000);

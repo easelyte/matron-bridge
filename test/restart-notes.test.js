@@ -170,3 +170,18 @@ describe('restartNoteTurnText', () => {
     expect(restartNoteTurnText('line', 10 * MIN, undefined, true)).toContain('It cut your turn off mid-way');
   });
 });
+
+describe('peek and discard (fork: the two halves of take)', () => {
+  it('peek reads without removing; discard removes, and is quiet when the file is already gone', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'notes-peek-'));
+    try {
+      const store = createRestartNotes({ file: path.join(dir, 'notes.json') });
+      store.put('c1', 'first');
+      expect(store.peek()).toMatchObject([{ convoId: 'c1', text: 'first' }]);
+      expect(store.peek()).toHaveLength(1);
+      store.discard();
+      expect(store.peek()).toEqual([]);
+      expect(() => store.discard()).not.toThrow();
+    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  });
+});
