@@ -5,6 +5,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import {
   SHORT_CODE_LENGTH,
+  SHORT_LINK_MAX_LIFETIME_MS,
   createShortLinkReader,
   createShortLinkWriter,
   generateShortCode,
@@ -293,6 +294,41 @@ describe('writer and reader', () => {
     const first = w.add({ route: 'page', token: 'a.s', exp: expIn(60) });
     const second = w.add({ route: 'page', token: 'b.s', exp: expIn(60) });
     expect(first).not.toBe(second);
+  });
+});
+
+describe('bounded lifetimes', () => {
+  it('no code may outlive the longest link (a 30-day page)', () => {
+    const w = createShortLinkWriter({ file, now });
+    expect(SHORT_LINK_MAX_LIFETIME_MS).toBe(30 * 86400 * 1000);
+    expect(isShortCode(w.add({ route: 'page', token: 'ok.s', exp: expIn(30 * 86400) }))).toBe(true);
+    expect(() => w.add({ route: 'page', token: 'long.s', exp: expIn(30 * 86400 + 1) })).toThrow(/lifetime/);
+  });
+
+  it('deletes a set-aside corrupt store only once every token in it must have expired', () => {
+    writeFileSync(file, '{not json');
+    const w = createShortLinkWriter({ file, now });
+    w.add({ route: 'page', token: 't.s', exp: expIn(60) });
+    const [aside] = readdirSync(dir).filter((n) => n.includes('.corrupt-'));
+    expect(aside).toBe(`short-links.json.corrupt-${clock}`);
+    writeFileSync(path.join(dir, 'short-links.json.corrupt-notanumber'), 'x');
+    writeFileSync(path.join(dir, 'other.json.corrupt-1'), 'x');
+
+    clock += SHORT_LINK_MAX_LIFETIME_MS;
+    expect(w.pruneCorrupt()).toBe(0);
+    expect(existsSync(path.join(dir, aside))).toBe(true);
+
+    clock += 1;
+    expect(w.pruneCorrupt()).toBe(1);
+    expect(existsSync(path.join(dir, aside))).toBe(false);
+    // Only this store's own, well-named copies are touched; the live store stays.
+    expect(existsSync(path.join(dir, 'short-links.json.corrupt-notanumber'))).toBe(true);
+    expect(existsSync(path.join(dir, 'other.json.corrupt-1'))).toBe(true);
+    expect(existsSync(file)).toBe(true);
+  });
+
+  it('pruneCorrupt is a no-op when the directory is missing', () => {
+    expect(createShortLinkWriter({ file: path.join(dir, 'nope', 'x.json'), now }).pruneCorrupt()).toBe(0);
   });
 });
 
