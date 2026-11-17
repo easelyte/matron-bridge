@@ -199,11 +199,36 @@ describe('writer and reader', () => {
     for (const c of [c1, c2, c3]) expect(r.resolve(c)).not.toBeNull();
   });
 
+  it('never breaks an old lock whose owner is still alive', () => {
+    writeFileSync(`${file}.lock`, `${process.pid} other-nonce`);
+    const old = new Date(Date.now() - 60_000);
+    utimesSync(`${file}.lock`, old, old);
+    expect(() => createShortLinkWriter({ file, now }).add({ route: 'page', token: 'z.s', exp: expIn(60) })).toThrow(/locked/);
+    // And it left the other owner's lock in place.
+    expect(readFileSync(`${file}.lock`, 'utf8')).toBe(`${process.pid} other-nonce`);
+  });
+
   it('breaks a stale lock left by a crashed process', () => {
-    writeFileSync(`${file}.lock`, '');
+    writeFileSync(`${file}.lock`, '999999999 dead-nonce');
     const old = new Date(Date.now() - 60_000);
     utimesSync(`${file}.lock`, old, old);
     expect(isShortCode(createShortLinkWriter({ file, now }).add({ route: 'page', token: 'z.s', exp: expIn(60) }))).toBe(true);
+  });
+
+  it('a failed read does not stick: the reader retries and recovers without the file changing', () => {
+    const code = createShortLinkWriter({ file, now }).add({ route: 'page', token: 't.s', exp: expIn(60) });
+    let fail = true;
+    const flaky = {
+      ...fs,
+      readFileSync: (...args) => {
+        if (fail) { const e = new Error('EIO'); e.code = 'EIO'; throw e; }
+        return fs.readFileSync(...args);
+      },
+    };
+    const r = createShortLinkReader({ file, now, fs: flaky });
+    expect(r.resolve(code)).toBeNull();
+    fail = false;
+    expect(r.resolve(code)).toEqual({ route: 'page', token: 't.s' });
   });
 
   it('ignores entries for routes it does not know', () => {
