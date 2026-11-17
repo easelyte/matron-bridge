@@ -36,6 +36,7 @@ import { extractVideoFrames, videoFramesMessage } from './lib/video-frames.js';
 import { prepareInlineImage, appendInlineImageBlocks } from './lib/inline-image.js';
 import { createSendAttachmentHandler, checkLocalUpload, resolveAndUploadLocalFile } from './lib/send-attachment.js';
 import { createPageLinkHandler } from './lib/page-link.js';
+import { createShortLinkWriter, shortenViewerUrl, shortLinksEnabled, shortLinksFile } from './lib/short-links.js';
 import { createItemsClient } from './lib/items-client.js';
 import { readApprovalConfig } from './lib/approval-config.js';
 import { createApprovalGate } from './lib/approval-gate.js';
@@ -662,6 +663,14 @@ const SERVER_LABEL = process.env.SERVER_LABEL || (() => {
 const HMAC_SECRET = process.env.HMAC_SECRET || '';
 const VIEWER_BASE_URL = process.env.VIEWER_BASE_URL || '';
 const LINK_EXPIRY_MS = parseInt(process.env.LINK_EXPIRY_MS || String(15 * 60 * 1000), 10);
+// Short share links (lib/short-links.js): the links handed to people (pages,
+// sensitive data, secret requests) go out as <viewer>/l/<code> unless
+// MATRON_SHORT_LINKS=off. A store write failure falls back to the long link.
+// File links in diff cards stay long: they are minted on every edit and read
+// by the apps, never typed or pasted.
+const shortLinkWriter = shortLinksEnabled() ? createShortLinkWriter({ file: shortLinksFile() }) : null;
+const shortenLink = (url) => (url ? shortenViewerUrl(shortLinkWriter, url) : url);
+try { shortLinkWriter?.prune(); } catch (err) { console.warn(`[short-links] could not prune the store: ${err.message}`); }
 const SHOW_FILE_MAX_BYTES = 50 * 1024 * 1024;
 const SHOW_FILE_MAX_IN_FLIGHT = 2;
 const SHOW_FILE_MAX_IN_FLIGHT_PER_SESSION = 1;
@@ -1654,7 +1663,7 @@ function generateSecretLink(secretId, label, roomId, { ttlMs = LINK_EXPIRY_MS, m
   if (multiline) payloadObj.multiline = true;
   const payload = Buffer.from(JSON.stringify(payloadObj)).toString('base64url');
   const sig = createHmac('sha256', HMAC_SECRET).update(payload).digest('base64url');
-  return `${VIEWER_BASE_URL}/secret?token=${payload}.${sig}`;
+  return shortenLink(`${VIEWER_BASE_URL}/secret?token=${payload}.${sig}`);
 }
 
 function generateSensitiveLink(sensitiveId, label, ttl, { download = false, oneTime = true } = {}) {
@@ -1674,7 +1683,7 @@ function generateSensitiveLink(sensitiveId, label, ttl, { download = false, oneT
   const payload = Buffer.from(JSON.stringify(payloadObj)).toString('base64url');
   const sig = createHmac('sha256', HMAC_SECRET).update(payload).digest('base64url');
   const route = download ? 'sensitive-download' : 'sensitive';
-  return `${VIEWER_BASE_URL}/${route}?token=${payload}.${sig}`;
+  return shortenLink(`${VIEWER_BASE_URL}/${route}?token=${payload}.${sig}`);
 }
 
 
@@ -13909,6 +13918,7 @@ const handlePageLink = createPageLinkHandler({
   sessions,
   secret: HMAC_SECRET,
   baseUrl: process.env.VIEWER_PAGE_BASE_URL || VIEWER_BASE_URL,
+  shorten: shortenLink,
 });
 
 // The eight agent-chat room tools (lib/agent-chat.js), mounted below as thin
