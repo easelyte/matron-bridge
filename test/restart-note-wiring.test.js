@@ -15,12 +15,28 @@ const fn = (name) => {
 describe('resume note delivery wiring', () => {
   it('the boot cards queue the notes through the delivery, and fall back to cards when they cannot be queued', () => {
     const boot = fn('publishRestartCarryOnCards');
-    expect(boot).toContain('restartNoteDelivery.start(noteResult.deliveries)');
+    expect(boot).toContain('restartNoteDelivery.start(deliveries)');
     expect(boot).toMatch(/catch \(e\) \{[\s\S]*?publishRecoveryCard\(note\.convoId\)/);
     // Taken before the auto/card split, as upstream does.
     expect(boot.indexOf('takeNoteDeliveries(')).toBeLessThan(boot.indexOf('restartNoteDelivery.start('));
     expect(boot.indexOf('restartNoteDelivery.start(')).toBeLessThan(boot.indexOf('selectAutoCarryOn('));
     expect(boot).not.toContain('carryOnConvo(note.convoId');
+  });
+
+  it('a note leaves upstream\'s file only after it is in the delivery\'s: read, queue, then discard', () => {
+    const boot = fn('publishRestartCarryOnCards');
+    expect(boot).toContain('store: { take: () => { taken = restartNotes.peek(); return taken; } }');
+    expect(boot).not.toMatch(/store: restartNotes/);
+    expect(boot.indexOf('restartNoteDelivery.start(deliveries)')).toBeLessThan(boot.indexOf('restartNotes.discard()'));
+    expect(boot.indexOf('restartNotes.discard()')).toBeLessThan(boot.lastIndexOf('restartNoteDelivery.intakeComplete()'));
+    // Intake is only complete after the notes were taken: an early return before that leaves the record open.
+    expect(boot.indexOf('inflightMarker.takeStale(')).toBeLessThan(boot.lastIndexOf('restartNoteDelivery.intakeComplete()'));
+    expect(boot.slice(0, boot.indexOf('let stale;'))).toContain('restartNoteDelivery.intakeComplete(); return;');
+  });
+
+  it('notes that cannot be queued are recorded as failed in the restart record, not silently dropped', () => {
+    const boot = fn('publishRestartCarryOnCards');
+    expect(boot).toMatch(/restartRequests\.settleNotes\(Object\.fromEntries\(deliveries\.map\(d => \[d\.convoId, \{ outcome: 'failed'/);
   });
 
   it('main() resumes what an earlier process left after the cards, and settles the record even when that fails', () => {
@@ -30,7 +46,8 @@ describe('resume note delivery wiring', () => {
     expect(cards).toBeGreaterThan(-1);
     expect(resume).toBeGreaterThan(cards);
     expect(main.indexOf('startCodeUpdateWatcher();')).toBeGreaterThan(resume);
-    expect(main).toMatch(/catch \(e\) \{[\s\S]*?restartRequests\.settleNotes\(\{\}\)/);
+    // Not settled when the pending notes cannot be read: the record stays open.
+    expect(main.slice(resume, resume + 300)).not.toContain('settleNotes');
   });
 
   it('the delivery is built once, with its outcomes closing the restart record and its failures producing the card', () => {
@@ -46,6 +63,7 @@ describe('deliverRestartNote', () => {
   function load(over = {}) {
     const sendToSession = vi.fn(() => true);
     const context = {
+      accountLock: { isLocked: () => false },
       restartInputs: { begin: () => () => {} }, sessionOccupied: s => !!s.busy, effortFlowHoldsInput: () => false, signInDialogHoldsInput: () => false,
       findSessionByClaudeSessionId: () => ({ alive: true }), journalResumeConvo: vi.fn(() => null), sendToSession,
       restartNoteTurnText, frameSafeBody: s => s, carryOnCause: () => ({ kind: 'carry_on' }), Date: { now: () => 10_000 },
@@ -68,6 +86,9 @@ describe('deliverRestartNote', () => {
     ['a PTY that is not ready', { findSessionByClaudeSessionId: () => ({ alive: true, _awaitingInputReady: true }) }],
     ['an open sign-in dialog', { signInDialogHoldsInput: () => true }],
     ['an effort picker', { effortFlowHoldsInput: () => true }],
+    ['the account lock', { accountLock: { isLocked: () => true } }],
+    ['a Codex sign-in in progress', { findSessionByClaudeSessionId: () => ({ alive: true, codex: { transport: 'app-server' }, _codexLoginId: 'x' }) }],
+    ['a Codex account command in progress', { findSessionByClaudeSessionId: () => ({ alive: true, codex: { transport: 'app-server' }, _codexAccountCommandPending: true }) }],
   ])('defers on %s, without sending', async (_name, over) => {
     const { run, sendToSession } = load(over);
     expect(await run(entry)).toEqual({ deferred: true });

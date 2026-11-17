@@ -95,7 +95,6 @@ it('a resume note survives the restart, is delivered to its chat after it, and i
   const users = (id) => bridge.transcript(id).filter(row => row.type === 'user').map(row => row.message.content);
   try {
     const alice = await bridge.startSession();
-    await wait(() => !fs.existsSync(file('restart-pending.json')));
     const saved = await bridge.post('/reminders/create', { roomId: alice.roomId, restart_note: true, text: note });
     expect(saved.restart_note.text).toBe(note);
     // A config-only request while HEAD is where the process booted.

@@ -264,9 +264,9 @@ describe('state file for the crash rollback', () => {
     expect(state.booted_at).toEqual(expect.any(Number));
     // The history line waits for the resume notes; it carries what became of them.
     expect(fs.existsSync(path.join(dir, 'history.jsonl'))).toBe(false);
-    b.layer.settleNotes({ c1: { outcome: 'resumed', at: 5 }, c2: { outcome: 'failed', at: 6 }, c3: { outcome: 'possibly_delivered', at: 7 } });
+    expect(b.layer.settleNotes({ c1: { outcome: 'resumed', at: 5 }, c2: { outcome: 'failed', at: 6 }, c3: { outcome: 'possibly_delivered', at: 7 } })).toBe(true);
     // Settling twice adds no second line.
-    b.layer.settleNotes({});
+    expect(b.layer.settleNotes({})).toBe(true);
     const lines = fs.readFileSync(path.join(dir, 'history.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
     expect(lines).toHaveLength(1);
     expect(lines[0]).toMatchObject({
@@ -562,5 +562,23 @@ describe('history for a restart whose notes never settled', () => {
     const lines = fs.readFileSync(path.join(dir, 'history.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
     expect(lines).toHaveLength(1);
     expect(lines[0]).toMatchObject({ state: 'back', requests: [{ request_key: 'k1' }] });
+  });
+});
+
+describe('settleNotes answers whether the record was closed', () => {
+  it('is false while the restart has not been reconciled or the history cannot be written, and true once closed or when there is nothing to close', async () => {
+    const a = build({ head: NEW });
+    expect(a.layer.settleNotes({})).toBe(true);
+    await post(a.layer, { reason: 'deploy', sha: NEW });
+    a.layer.commitRestart({ sha: NEW });
+    expect(a.layer.settleNotes({})).toBe(false);
+    const b = build({ head: NEW, bootSha: NEW });
+    fs.rmSync(path.join(dir, 'history.jsonl'), { force: true });
+    fs.mkdirSync(path.join(dir, 'history.jsonl'));
+    expect(b.layer.settleNotes({ c1: { outcome: 'failed', at: 1 } })).toBe(false);
+    expect(readState().results.failed).toEqual(['c1']);
+    fs.rmdirSync(path.join(dir, 'history.jsonl'));
+    expect(b.layer.settleNotes({ c1: { outcome: 'failed', at: 1 } })).toBe(true);
+    expect(readState().history_appended).toBe(true);
   });
 });
