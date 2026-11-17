@@ -218,7 +218,6 @@ import { loadBridgePlugins } from './lib/bridge-plugins.js';
 import { createLocalMemories } from './lib/local-memories.js';
 import { buildActivity, buildLimits, buildDisk } from './lib/spawn-capacity.js';
 import { createCodexLimitsRefresher, BOX_STATUS_REPUBLISH_MS } from './lib/box-status.js';
-import { createOpsSnapshot, readHostSection } from './lib/ops-snapshot.js';
 import { createAgentSpawnHandlers } from './lib/agent-spawn.js';
 import { createSelfRestartHandler } from './lib/self-restart.js';
 import { createSelfCompactHandler } from './lib/self-compact.js';
@@ -1955,23 +1954,6 @@ function journalStartSessionForRpc({ workdir, mcpExtras, model = null, agent = n
   return session;
 }
 
-// ops_snapshot RPC backend (lib/ops-snapshot.js). `host`
-// is computed here from /proc; the other sections run MATRON_OPS_SNAPSHOT_CMD
-// (whitespace-split, no shell) + `--section <s>` in MATRON_OPS_SNAPSHOT_CWD or
-// the default workdir. Unset command -> those sections answer not_configured.
-const opsSnapshot = createOpsSnapshot({
-  command: process.env.MATRON_OPS_SNAPSHOT_CMD,
-  cwd: process.env.MATRON_OPS_SNAPSHOT_CWD
-    ? path.resolve(expandHome(process.env.MATRON_OPS_SNAPSHOT_CWD))
-    : DEFAULT_WORKDIR,
-  readHost: () => readHostSection({
-    getDisk: () => {
-      const disk = buildDisk({ path: DEFAULT_WORKDIR });
-      return disk ? { path: DEFAULT_WORKDIR, ...disk } : null;
-    },
-    getLiveSessions: () => buildActivity({ sessions, persisted: {} }).live_sessions,
-  }),
-});
 // Operator plugins (MATRON_BRIDGE_PLUGINS, off unless set; see docs/plugins.md).
 // Loaded before the journal connects, so no callback can run half-initialized. Never loaded from the default folder or a session folder.
 const bridgePlugins = await loadBridgePlugins({
@@ -2031,8 +2013,6 @@ const journalRpcHandler = createRpcRequestHandler({
   // Which account a new session here would burn quota against, so the chooser
   // can tell boxes on different logins apart. Same cache as the status frames.
   getAccountEmail: () => getAccountEmail(),
-  // Ops page: read-only host/ops sections.
-  opsSnapshot,
   // Spawn-room wiring (2026-08-09 agent-spawn spec). agentRooms is declared
   // later in this file (~:7223) — these arrows only dereference it at call
   // time, long after module evaluation finishes, same late-binding as

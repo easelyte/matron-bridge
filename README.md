@@ -651,7 +651,7 @@ matron-bridge/
 ├── BRIDGE_CODEX.md       # Extra instructions for bridge-spawned Codex turns
 ├── BRIDGE_NOTICES.md     # Notices block, appended while the user's notices setting is on
 ├── docs/codex.md         # Codex setup, switching, security, and troubleshooting
-├── docs/agent-rpc.md     # Agent RPC methods (recent_folders, start, ops_snapshot)
+├── docs/agent-rpc.md     # Agent RPC methods (recent_folders, start)
 ├── mcp-config.json       # MCP server config for Claude Code
 ├── viewer/               # HMAC-signed file viewer
 ├── setup/                # OS-dispatching installer, service, optional local whisper

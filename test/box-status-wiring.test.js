@@ -72,13 +72,6 @@ describe('box status wiring', () => {
     expect(shutdown).toMatch(/clearInterval\(_boxStatusRepublishHandle\)/);
   });
 
-  it('wires ops_snapshot with the env-configured command and cwd', () => {
-    expect(index).toMatch(/command: process\.env\.MATRON_OPS_SNAPSHOT_CMD,/);
-    expect(index).toMatch(/process\.env\.MATRON_OPS_SNAPSHOT_CWD\n?\s*\? path\.resolve\(expandHome\(process\.env\.MATRON_OPS_SNAPSHOT_CWD\)\)\n?\s*: DEFAULT_WORKDIR/);
-    const rpc = index.slice(index.indexOf('const journalRpcHandler = createRpcRequestHandler({'));
-    expect(rpc.slice(0, rpc.indexOf('\n});\n'))).toMatch(/\n\s*opsSnapshot,\n/);
-  });
-
   it('follows the CPU sampler with a vitals-only box_status, sent only when due', () => {
     const vitalsFn = index.slice(index.indexOf('function publishBoxVitals('), index.indexOf('function publishBoxVitals(') + 900);
     expect(vitalsFn).toMatch(/if \(!JOURNAL_ENABLED\) return false;/);
