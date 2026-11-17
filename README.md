@@ -370,8 +370,7 @@ three times in all, and then the chat gets a "Carry on" card instead. A note
 is marked as delivering before it is handed over, so a crash in between is
 recorded as "possibly delivered" and never answered with a second delivery.
 What became of every note (`resumed`, `failed`, `possibly_delivered`, `stale`)
-is recorded in the restart's `results` (state file, history line and the
-`restart` block of `box_status`).
+is recorded in the restart's `results` (state file and history line).
 
 ## Config (.env)
 
@@ -726,7 +725,6 @@ matron-bridge/
 ├── BRIDGE_CODEX.md       # Extra instructions for bridge-spawned Codex turns
 ├── BRIDGE_NOTICES.md     # Notices block, appended while the user's notices setting is on
 ├── docs/codex.md         # Codex setup, switching, security, and troubleshooting
-├── docs/agent-rpc.md     # Agent RPC methods (recent_folders, start)
 ├── mcp-config.json       # MCP server config for Claude Code
 ├── viewer/               # HMAC-signed file viewer
 ├── setup/                # OS-dispatching installer, service, optional local whisper

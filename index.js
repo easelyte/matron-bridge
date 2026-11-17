@@ -26,7 +26,6 @@ if (PREFLIGHT_MODE === 'gate') {
 import { createRestartRequests, PINNED_WATCHER_OPTIONS } from './lib/restart-request.js';
 import { createRestartPreflight, restartPreflightKey } from './lib/restart-preflight.js';
 import { createNoteDelivery } from './lib/restart-note-delivery.js';
-import { buildRestartStatus } from './lib/box-status-restart.js';
 import { BRIDGE_BOOT_AT } from './lib/boot-time.js';
 import { spawn, execFileSync, execFile } from 'child_process';
 import {
@@ -273,7 +272,7 @@ import { createTitleSummary } from './lib/title-summary.js';
 import { activityStateChanged, truncateActivityDetail, shouldResumeThinkingAfterTool } from './lib/journal-activity.js';
 import { streamRefFor, armReplyRef, settleReplyRef } from './lib/journal-stream.js';
 import { contextFullToNative, briefContextReport } from './lib/context-command.js';
-import { buildSessionStatus, contextTokensFromAssistantEvent, postCompactContextTokens, compactTriggerFrom, contextGaugeText, sessionContextWindow, emailFromClaudeConfig, isSidechainEvent, hostVitals, boxVitals, boxVitalsDue, startCpuSampler, stopCpuSampler, cpuPercent, ramPercent, cpuSampledAtMs, statusRepaintDue } from './lib/session-status.js';
+import { buildSessionStatus, contextTokensFromAssistantEvent, postCompactContextTokens, compactTriggerFrom, contextGaugeText, sessionContextWindow, emailFromClaudeConfig, isSidechainEvent, hostVitals, boxVitals, boxVitalsDue, startCpuSampler, stopCpuSampler, statusRepaintDue } from './lib/session-status.js';
 import { stallFromAssistantEvent, stallResetsAt } from './lib/stall-detector.js';
 import { spawnModelFallback, stallModelFallback, isFableModel } from './lib/fable-fallback.js';
 import { planSessionControl, validateControlParams, controlNotice, authorizeControl, mergeParkedSlot, JOURNAL_DEVICE_ID, JOURNAL_ONLY_ACTIONS, CONTROL_KINDS, TURN_STARTING_OPS, occupied as controlOccupied } from './lib/session-control.js';
@@ -455,11 +454,9 @@ const HOST_VITALS_SAMPLE_MS = Math.min(
 );
 const HOST_VITALS_DELTA_PCT = parseInt(process.env.HOST_VITALS_DELTA_PCT || '8', 10);
 let lastBoxVitalsSent = null; // { cpu_pct, ram_pct, at } of the last send that went out
-let _hostVitalsPushHandle = null;
 // box_status heartbeat: re-publish every
 // BOX_STATUS_REPUBLISH_MS so the journal's persisted vitals stay fresh.
 let _boxStatusRepublishHandle = null;
-let _lastVitalsPublished = null; // { cpu, ram, at } of the last host_vitals frame (pushHostVitals)
 // Pre-reap handoff (lib/pre-reap-handoff.js): shortly before the reap, while
 // the prompt cache is still warm, an idle session is asked to refresh its
 // mission status and is compacted when its context is large. Off when the
@@ -1462,12 +1459,10 @@ function publishBoxStatus(reason) {
       ? { agent, model: codexDefaultModelNow(), effort: codexDefaultEffortNow(), source }
       : { agent, model: defaultModelNow(), effort: defaultEffortNow(), source };
   } catch { /* best-effort */ }
-  let restart = null;
-  try { restart = buildRestartStatus(restartRequests.getState(), restartRequests.lastVerdict); } catch { /* best-effort */ }
   // Count and (cached) size of the worktrees this box made; omitted when none.
   let worktreeSummary = null;
   try { worktreeSummary = worktreeCleanup.summary(); } catch { /* best-effort */ }
-  if (!activity && !limits && !disk && !accountEmail && !vitals && !defaults && !restart) return false;
+  if (!activity && !limits && !disk && !accountEmail && !vitals && !defaults) return false;
   const sent = journalPublisher.sendRoomOp({
     op: 'box_status',
     ...(activity ? { activity } : {}),
@@ -1476,7 +1471,6 @@ function publishBoxStatus(reason) {
     ...(accountEmail ? { account: { email: accountEmail } } : {}),
     ...(vitals ? { vitals } : {}),
     ...(defaults ? { defaults } : {}),
-    ...(restart ? { restart } : {}),
     ...(worktreeSummary ? { worktrees: worktreeSummary } : {}),
     ...(boxLock ? { locked: boxLock.report() } : {}),
     ...pluginsReport(),
@@ -1484,11 +1478,6 @@ function publishBoxStatus(reason) {
   debug(`box_status (${reason}) ${sent ? 'sent' : 'not sent (journal not connected)'}`);
   if (sent && vitals) lastBoxVitalsSent = { cpu_pct: vitals.cpu_pct, ram_pct: vitals.ram_pct, at: Date.now() };
   return sent;
-}
-
-export function publishRestartStatus(reason) {
-  try { return publishBoxStatus(`restart ${reason}`); }
-  catch { return false; }
 }
 
 // A box_status carrying only `vitals`: the journal merges it into the box's
@@ -1503,6 +1492,12 @@ function publishBoxVitals() {
   if (sent) lastBoxVitalsSent = { cpu_pct: vitals.cpu_pct, ram_pct: vitals.ram_pct, at: now };
   return sent;
 }
+
+// Operator plugins (MATRON_BRIDGE_PLUGINS, off unless set; see docs/plugins.md).
+// Loaded before the journal connects, so no callback can run half-initialized. Never loaded from the default folder or a session folder.
+const bridgePlugins = await loadBridgePlugins({
+  forbiddenDirs: [DEFAULT_WORKDIR, ...Object.values(loadPersistedSessions()).map((r) => r?.workdir).filter(Boolean)],
+});
 
 const journalPublisher = createJournalPublisher({
   url: JOURNAL_WS_URL,
@@ -1701,26 +1696,15 @@ function loadPersistedSessions() {
   return {};
 }
 
-function savePersistedSessionsOrThrow(data) {
-  // Atomic replace (a follow-up to the original store): this file is rewritten on every
-  // message, and loadPersistedSessions treats a corrupt file as {} — so a
-  // truncating in-place write that dies mid-rewrite silently drops every
-  // persisted session, and the next persist overwrites the evidence.
-  atomicWriteFileSync(SESSIONS_FILE, JSON.stringify(data, null, 2));
-}
-
-// Returns whether the write actually landed. Still fail-OPEN (a full disk must
-// not take the bridge down mid-turn), but no longer fail-SILENT to its caller:
-// persistSession forwards this so a caller that is about to publish derived
-// state elsewhere can decline to let the remote copy get ahead of the durable
-// one.
 function savePersistedSessions(data) {
   try {
-    savePersistedSessionsOrThrow(data);
-    return true;
+    // Atomic replace (PR #151 follow-up): this file is rewritten on every
+    // message, and loadPersistedSessions treats a corrupt file as {} — so a
+    // truncating in-place write that dies mid-rewrite silently drops every
+    // persisted session, and the next persist overwrites the evidence.
+    atomicWriteFileSync(SESSIONS_FILE, JSON.stringify(data, null, 2));
   } catch (e) {
     console.error('Failed to save sessions file:', e.message);
-    return false;
   }
 }
 
@@ -1871,7 +1855,7 @@ function persistSession(roomId, sessionId, workdir, originRoomId, extra) {
     ...(activeAgent ? { agent: activeAgent } : {}),
     agentSessions,
   };
-  return savePersistedSessions(data);
+  savePersistedSessions(data);
 }
 
 function getPersistedSession(roomId) {
@@ -1979,12 +1963,6 @@ function journalStartSessionForRpc({ workdir, mcpExtras, model = null, agent = n
   }
   return session;
 }
-
-// Operator plugins (MATRON_BRIDGE_PLUGINS, off unless set; see docs/plugins.md).
-// Loaded before the journal connects, so no callback can run half-initialized. Never loaded from the default folder or a session folder.
-const bridgePlugins = await loadBridgePlugins({
-  forbiddenDirs: [DEFAULT_WORKDIR, ...Object.values(loadPersistedSessions()).map((r) => r?.workdir).filter(Boolean)],
-});
 
 const pluginsReport = () => (journalRpcHandler.plugins?.length ? { plugins: journalRpcHandler.plugins } : {});
 
@@ -12259,12 +12237,6 @@ function drainDeferredControls(session) {
         current = sessions.get(current.roomId) || current;
         // Once a slot has started a turn the rest wait for the next seam.
         if (startedTurn) continue;
-        // A notice parked by an earlier version (the pre-restart notice is gone):
-        // dropped, never applied.
-        if (kind === 'restart_notice') {
-          settle(current, kind);
-          continue;
-        }
         const { params } = slots[kind];
         const plan = planSessionControl({ params, session: current, canSwitch: canSwitchAgent });
         if (plan.kind === 'apply') {
@@ -13813,41 +13785,6 @@ const pendingPlanDecisions = new Map();
 
 // --- Local HTTP API ---
 
-function auditShowFile({ result, roomId, filePath, error, ...details }) {
-  const record = {
-    event: 'show_file',
-    ...(roomId ? { roomId } : {}),
-    ...(filePath ? { path: filePath } : {}),
-    result,
-    ...details,
-  };
-  if (error) {
-    record.error = {
-      name: typeof error.name === 'string' ? error.name : 'Error',
-      ...(typeof error.code === 'string' ? { code: error.code } : {}),
-    };
-  }
-  (result === 'ok' ? console.log : console.warn)(JSON.stringify(record));
-}
-
-function validateShowFileBody(data) {
-  if (data === null || typeof data !== 'object' || Array.isArray(data)
-      || (Object.getPrototypeOf(data) !== Object.prototype && Object.getPrototypeOf(data) !== null)) {
-    return { error: 'request body must be an object', reason: 'invalid-body' };
-  }
-  if (typeof data.path !== 'string' || data.path.trim() === '') {
-    return { error: 'path must be a non-empty string', reason: 'invalid-path' };
-  }
-  if (typeof data.token !== 'string' || data.token.trim() === '') {
-    return { error: 'token must be a non-empty string', reason: 'missing-token' };
-  }
-  if (data.caption !== undefined
-      && (typeof data.caption !== 'string' || data.caption.length > 4096)) {
-    return { error: 'caption must be a string of at most 4096 characters', reason: 'invalid-caption' };
-  }
-  return null;
-}
-
 // POST /wake (lib/wake-route.js): wake one configured conversation with one
 // configured text, the way a timer firing does — resuming a reaped session.
 // Off unless both env vars are set; the request can choose neither.
@@ -14032,7 +13969,7 @@ const itemsHandlers = createItemsHandlers({
   sessions,
   journalConvoIdFor,
   client: itemsClient,
-  uploadLocalFile: (session, reqPath, opts) => resolveAndUploadLocalFile({ session, reqPath, publisher: journalPublisher, ...opts }),
+  uploadLocalFile: (session, reqPath) => resolveAndUploadLocalFile({ session, reqPath, publisher: journalPublisher }),
   checkLocalFile: (session, reqPath) => checkLocalUpload({ session, reqPath }),
   saveAttachments: saveItemAttachments,
   // MATRON_STEP_UP_ALL=1: every question this box files needs a signed tap.
@@ -14385,6 +14322,41 @@ async function respondAgentChatRoute(res, data, handler, describe) {
   res.end(JSON.stringify(resBody));
 }
 
+function auditShowFile({ result, roomId, filePath, error, ...details }) {
+  const record = {
+    event: 'show_file',
+    ...(roomId ? { roomId } : {}),
+    ...(filePath ? { path: filePath } : {}),
+    result,
+    ...details,
+  };
+  if (error) {
+    record.error = {
+      name: typeof error.name === 'string' ? error.name : 'Error',
+      ...(typeof error.code === 'string' ? { code: error.code } : {}),
+    };
+  }
+  (result === 'ok' ? console.log : console.warn)(JSON.stringify(record));
+}
+
+function validateShowFileBody(data) {
+  if (data === null || typeof data !== 'object' || Array.isArray(data)
+      || (Object.getPrototypeOf(data) !== Object.prototype && Object.getPrototypeOf(data) !== null)) {
+    return { error: 'request body must be an object', reason: 'invalid-body' };
+  }
+  if (typeof data.path !== 'string' || data.path.trim() === '') {
+    return { error: 'path must be a non-empty string', reason: 'invalid-path' };
+  }
+  if (typeof data.token !== 'string' || data.token.trim() === '') {
+    return { error: 'token must be a non-empty string', reason: 'missing-token' };
+  }
+  if (data.caption !== undefined
+      && (typeof data.caption !== 'string' || data.caption.length > 4096)) {
+    return { error: 'caption must be a string of at most 4096 characters', reason: 'invalid-caption' };
+  }
+  return null;
+}
+
 // The fork's layer over upstream's restart request (lib/restart-request.js).
 // Everything it reads is looked up when it runs: the sessions, the watcher and
 // the helpers defined further down this file.
@@ -14413,7 +14385,6 @@ const restartRequests = createRestartRequests({
   preflight: () => createRestartPreflight(__dirname, { bootDotenvKeys: BOOT_DOTENV_KEYS })(),
   preflightKey: () => restartPreflightKey(__dirname),
   commandGate: createCommandGate(process.env.MATRON_RESTART_GATE_CMD),
-  onChange: () => publishRestartStatus('request'),
   warn: message => console.warn(message),
   log: message => console.log(message),
 });
@@ -14428,25 +14399,6 @@ const restartNoteDelivery = createNoteDelivery({
   onSettled: (outcomes, ownerId) => restartRequests.settleNotes(outcomes, ownerId),
   log: message => console.warn(message),
 });
-// While a restart is requested, keep the journal's `restart` block current.
-{
-  let evaluatedAt = -Infinity;
-  let wasPending = false;
-  const timer = setInterval(() => {
-    try {
-      const pendingNow = restartRequests.pending();
-      if (pendingNow) {
-        if (!wasPending || Date.now() - evaluatedAt >= 5000) {
-          evaluatedAt = Date.now();
-          restartRequests.evaluate();
-          publishRestartStatus('gate');
-        }
-      } else if (wasPending) publishRestartStatus('cleared');
-      wasPending = pendingNow;
-    } catch { console.warn('[restart] status tick failed'); }
-  }, 1000);
-  timer.unref();
-}
 
 // The session a loopback API request acts for (lib/api-auth.js).
 function apiNamedRoom(url, data) {
@@ -14459,12 +14411,13 @@ function apiNamedRoom(url, data) {
 
 function roomForClaudeSessionId(id) {
   if (typeof id !== 'string' || !id) return null;
-      for (const [roomId, s] of sessions) if (s.claudeSessionId === id) return roomId;
-      return null;
+  for (const [roomId, s] of sessions) if (s.claudeSessionId === id) return roomId;
+  return null;
 }
 
 const apiServer = createServer(async (req, res) => {
   const url = new URL(req.url, `http://localhost:${API_PORT}`);
+
   // Browsers have no business here (lib/loopback-guard.js).
   const refusal = loopbackRefusal(req.headers);
   if (refusal) {
@@ -16891,12 +16844,6 @@ async function main() {
   // process open. host_cpu appears once the first interval has a valid diff.
   // Sample at the fast vitals cadence so a published CPU value is always fresh.
   if (JOURNAL_ENABLED) startCpuSampler(HOST_VITALS_SAMPLE_MS, publishBoxVitals);
-  // Host-vitals gauge: a single convo-less frame, published ON CHANGE. The timer
-  // only EVALUATES every HOST_VITALS_SAMPLE_MS; pushHostVitals emits a frame only
-  // on a meaningful CPU/RAM delta or the heartbeat interval, so an idle bridge
-  // stays quiet. Ephemeral/fail-open. .unref()'d; cleared in shutdown handlers.
-  _hostVitalsPushHandle = setInterval(pushHostVitals, HOST_VITALS_SAMPLE_MS);
-  if (typeof _hostVitalsPushHandle.unref === 'function') _hostVitalsPushHandle.unref();
   // box_status heartbeat: publishBoxStatus is a no-op while disconnected
   // (sendRoomOp refuses), so this only reports while connected.
   _boxStatusRepublishHandle = setInterval(() => publishBoxStatus('heartbeat'), BOX_STATUS_REPUBLISH_MS);
@@ -16926,29 +16873,6 @@ async function main() {
   startCodeUpdateWatcher();
 }
 
-// Read cached CPU + instant RAM and emit one host_vitals frame (no convo_id).
-// cpu is omitted until the sampler has a first valid reading (matches the
-// host-vitals frame shape); ram is always present when the OS reports memory.
-function pushHostVitals() {
-  const cpu = cpuPercent();
-  const ram = ramPercent();
-  // Nothing to report until the sampler has at least one real reading.
-  if (cpu === null && ram === null) return;
-  const now = Date.now();
-  const last = _lastVitalsPublished;
-  const moved = !last
-    || (cpu !== null && (last.cpu === null || Math.abs(cpu - last.cpu) >= HOST_VITALS_DELTA_PCT))
-    || (ram !== null && (last.ram === null || Math.abs(ram - last.ram) >= HOST_VITALS_DELTA_PCT));
-  const heartbeatDue = !last || (now - last.at) >= HOST_VITALS_HEARTBEAT_MS;
-  // Steady load within the heartbeat window: stay quiet, cut idle traffic.
-  if (!moved && !heartbeatDue) return;
-  const vitals = { sampled_at_ms: cpu !== null ? cpuSampledAtMs() : now };
-  if (cpu !== null) vitals.cpu = cpu;
-  if (ram !== null) vitals.ram = ram;
-  journalPublisher.publishHostVitals(vitals);
-  _lastVitalsPublished = { cpu, ram, at: now };
-}
-
 main().catch(err => {
   console.error('Fatal error:', err);
   process.exit(1);
@@ -16967,7 +16891,6 @@ async function gracefulShutdown(signal, { exitCode = 0 } = {}) {
   if (shuttingDown) return;
   shuttingDown = true;
   if (signal === 'SIGINT') console.log('\nShutting down...');
-  if (_hostVitalsPushHandle) { clearInterval(_hostVitalsPushHandle); _hostVitalsPushHandle = null; }
   if (_boxStatusRepublishHandle) { clearInterval(_boxStatusRepublishHandle); _boxStatusRepublishHandle = null; }
   // Everything is inside try/finally so a throw from ANY step (sampler, session
   // kill, or the flush) still reaches process.exit(exitCode). Previously stopCpuSampler

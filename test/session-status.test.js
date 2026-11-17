@@ -465,18 +465,6 @@ describe('host vitals', () => {
     expect('resets_at' in v).toBe(false);
   });
 
-  it('hostVitals keys match the client wire contract exactly (cpu_pct/ram_pct/sampled_at_ms)', () => {
-    // Load-bearing across three repos: matron-web's buildUsageMeters
-    // destructures { cpu_pct, ram_pct, sampled_at_ms } off status.vitals, and
-    // matron-apple's WireModels reads status["vitals"]["cpu_pct"|"ram_pct"].
-    // A rename here silently renders NOTHING on both (Number.isFinite guards
-    // on web, optional decode on iOS) — so the key set is pinned, not sampled.
-    stopCpuSampler();
-    sampleCpuOnce(BASE);
-    sampleCpuOnce(VALID);
-    expect(Object.keys(hostVitals()).sort()).toEqual(['cpu_pct', 'ram_pct', 'sampled_at_ms']);
-  });
-
   it('hostVitals carries a numeric sampled_at_ms so clients can expire stale replays', () => {
     // The publisher replays the last status frame to new viewers, so an idle
     // convo would show an arbitrarily old reading as current without an age
@@ -571,16 +559,10 @@ describe('index.js wiring', () => {
     const start = src.indexOf('function journalStatus(');
     const end = src.indexOf('\nfunction ', start + 1);
     const body = src.slice(start, end);
-    // vitals ride at top level via the buildSessionStatus vitals param — the
-    // surface matron-web (buildUsageMeters reads status.vitals) and
-    // matron-apple (WireModels decodes status["vitals"].cpu_pct/ram_pct)
-    // actually render from.
+    // vitals ride at top level via the buildSessionStatus vitals param.
     expect(body).toContain('hostVitals()');
     expect(body).toMatch(/vitals[,\n]/);
-    // Each provider supplies its own account limits, never host vitals. A
-    // synthetic host_cpu/host_ram entry here double-renders CPU/RAM on any
-    // upstream-built client (they already synthesise both from status.vitals)
-    // and displaces a real quota bar on iOS's limits.prefix(3).
+    // Each provider supplies its own account limits, never host vitals.
     expect(body).not.toContain('hostVitalLimits');
     expect(body).toContain('limits: isCodex ? (session._codexMetadata?.limits || []) : (usageLimitsCache.lines || [])');
   });
@@ -813,9 +795,7 @@ describe('index.js header-liveness wiring', () => {
     const pubSrc = readFileSync(fileURLToPath(new URL('../lib/journal-publisher.js', import.meta.url)), 'utf-8');
     expect(pubSrc).toContain('publishStatus() { return false; }'); // noop publisher
     const start = pubSrc.indexOf('publishStatus(convoId, status)');
-    // Our fork inserts publishHostVitals between publishStatus and respondRpc,
-    // so bound the slice at it to read publishStatus's body alone.
-    const bodyEnd = pubSrc.indexOf('publishHostVitals(', start);
+    const bodyEnd = pubSrc.indexOf('respondRpc(', start);
     const pubBody = pubSrc.slice(start, bodyEnd);
     expect(pubBody).toContain('return true;');
     expect(pubBody).toContain('return false;');

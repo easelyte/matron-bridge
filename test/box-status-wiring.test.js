@@ -22,7 +22,7 @@ describe('box status wiring', () => {
     // no valid block, and a null block would be "malformed", not "absent".
     expect(fn).toMatch(/\.\.\.\(activity \? \{ activity \} : \{\}\)/);
     expect(fn).toMatch(/\.\.\.\(accountEmail \? \{ account: \{ email: accountEmail \} \} : \{\}\)/);
-    expect(fn).toMatch(/if \(!activity && !limits && !disk && !accountEmail && !vitals && !defaults && !restart\) return false;/);
+    expect(fn).toMatch(/if \(!activity && !limits && !disk && !accountEmail && !vitals && !defaults\) return false;/);
     // Host CPU/RAM ride the same report (omitted until both readings exist).
     expect(fn).toMatch(/vitals = boxVitals\(\)/);
     expect(fn).toMatch(/\.\.\.\(vitals \? \{ vitals \} : \{\}\)/);
@@ -30,7 +30,6 @@ describe('box status wiring', () => {
     // spawn consent card), from the same resolvers a start uses.
     expect(fn).toMatch(/const \{ agent, source \} = defaultAgentInfo\(\);/);
     expect(fn).toMatch(/\.\.\.\(defaults \? \{ defaults \} : \{\}\)/);
-    expect(fn).toContain('...(restart ? { restart } : {}),');
   });
 
   it('reports on every hello_ok, after a successful usage-limits refresh, and first thing at shutdown', () => {

@@ -125,9 +125,7 @@ describe('journal-rpc: start effort and the New Chat picker', () => {
     });
     return { handler, responses, calls };
   }
-  // Distinct request ids: the start RPC dedups on request_id (fork).
-  let reqSeq = 0;
-  const REQ = (method, params) => ({ request_id: `r${++reqSeq}`, from_device_id: 7, method, params });
+  const REQ = (method, params) => ({ request_id: 'r1', from_device_id: 7, method, params });
 
   it('a valid level reaches startSession normalized; none leaves the key off', () => {
     const { handler, responses, calls } = harness();

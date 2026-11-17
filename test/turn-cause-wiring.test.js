@@ -47,7 +47,7 @@ describe('turn causes reach sendToSession from every turn source', () => {
   });
 
   it('a spawned session\'s opening turn is sent with the causes the start handler names', () => {
-    expect(index).toContain("injectTurn: (session, text, meta) => sendTextToSession(session, text, { skipJournalMirror: true, causes: meta?.causes ?? null }),");
+    expect(index).toContain('injectTurn: (session, text, meta) => sendTextToSession(session, text, { skipJournalMirror: true, causes: meta?.causes ?? null }),');
     const rpc = readFileSync(new URL('../lib/journal-rpc.js', import.meta.url), 'utf8');
     expect(rpc).toContain('injectTurn(session, opening, { causes: [spawnedCause(params.spawn_id)] })');
   });

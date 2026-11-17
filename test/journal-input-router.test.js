@@ -2367,26 +2367,6 @@ describe('index.js agent-chat room wiring (source inspection)', () => {
     // below is unchanged.
     expect(args).toMatch(/onOpError: \(e\) => \{ warnRejectedConvoUpsert\(e\); if \(sessionControlHandlers\?\.onOpError\?\.\(e\)\) return; if \(agentSpawnHandlers\?\.onOpError\?\.\(e\)\) return; agentInvites\?\.onOpError\(e\); \}/);
   });
-
-  // persistSession is fail-open. It must still REPORT, so the
-  // summary publish can decline to get ahead of the durable copy.
-  describe('persistSession reports durability', () => {
-    const fn = src.slice(
-      src.indexOf('function savePersistedSessions('),
-      src.indexOf('\n}', src.indexOf('function savePersistedSessions(')),
-    );
-
-    it('returns true on a successful write and false on a caught failure', () => {
-      expect(fn).toMatch(/savePersistedSessionsOrThrow\(data\);\n\s*return true;/);
-      expect(fn).toMatch(/return false;/);
-    });
-
-    it('persistSession forwards the fail-open write result', () => {
-      const start = src.indexOf('function persistSession(');
-      const persist = src.slice(start, src.indexOf('\nfunction getPersistedSession(', start));
-      expect(persist).toMatch(/return savePersistedSessions\(data\);/);
-    });
-  });
 });
 
 describe('isResumePickerTap', () => {
