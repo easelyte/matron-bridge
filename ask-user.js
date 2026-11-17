@@ -469,21 +469,22 @@ server.tool(
 
 server.tool(
   'foreign_notice_review',
-  "Only in the review turn the bridge starts after you filed a foreign_notice: file your review of that notice for your own user, once. Say what the other side is asking, what your user already has on it, and 1 to 4 things your user might do. The bridge posts it under the notice with one button per action; nothing is done until your user taps one, which reaches you as their own turn.",
+  "Only in the review turn the bridge starts after you filed a foreign_notice: file your review of that notice for your own user, once. Say what the other side is asking, what your user already has on it, and 1 to 4 things your user might do. The bridge posts it under the notice with one button per action; nothing is done until your user taps one, which reaches you as their own turn. If an OPEN item of your user's, private or on no mission, already covers the notice (the same message can reach you twice, as a comment and in a room), pass only duplicate_of with that item: the bridge copies the notice onto that item, closes the notice and posts no buttons. Only for the same ask, not a related one; an item on a mission is refused (post the review with buttons instead).",
   {
-    asking: z.string().max(1000).describe('What is being asked, in a sentence or two, in your own words'),
+    asking: z.string().max(1000).optional().describe('What is being asked, in a sentence or two, in your own words. Required unless duplicate_of is set'),
+    duplicate_of: z.union([z.string().min(1).max(100), z.number().int().min(1)]).optional().describe("Id (it_...) or number of your own user's open item that already covers this notice. The bridge closes the notice and points to that item; leave asking, related and actions out"),
     related: z.string().max(2000).optional().describe("Related work of your user's that you found: missions, items, earlier exchanges with this person. Leave out when there is none"),
     actions: z.array(z.object({
       label: z.string().max(40).describe('Button label, e.g. "Reply: yes" or "Ask for more detail"'),
       does: z.string().max(300).describe('One sentence: what you will do if your user taps it'),
-    })).min(1).max(4).describe('1 to 4 things your user might do, most likely first'),
+    })).min(1).max(4).optional().describe('1 to 4 things your user might do, most likely first. Required unless duplicate_of is set'),
   },
-  async ({ asking, related, actions }) => {
+  async ({ asking, related, actions, duplicate_of }) => {
     try {
       const postRes = await bridgeFetch(`${BRIDGE_API}/foreign-notice-review`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ roomId: ROOM_ID, asking, related, actions }),
+        body: JSON.stringify({ roomId: ROOM_ID, asking, related, actions, duplicate_of }),
       });
       const data = await postRes.json().catch(() => ({}));
       if (!postRes.ok) return { content: [{ type: 'text', text: `foreign_notice_review failed: ${data.error || `HTTP ${postRes.status}`}` }] };

@@ -3,7 +3,7 @@ import { readFileSync } from 'node:fs';
 import { createForeignSessions, REVIEW_PARKED_MAX } from '../lib/foreign-session.js';
 import {
   decideForeignCall, foreignRouteAllowed, noticeItem, reviewTurnFor, reviewTurnText, validateReview, reviewComment,
-  REVIEW_PENDING_LINE, REVIEW_MISSING_COMMENT,
+  REVIEW_PENDING_LINE, REVIEW_MISSING_COMMENT, reviewDuplicateComment,
 } from '../lib/foreign-turn.js';
 
 // After a notice from another person's side is filed, the same session gets
@@ -355,5 +355,195 @@ describe('wiring', () => {
     expect(gate).toBeGreaterThan(-1);
     expect(route).toBeGreaterThan(gate);
     expect(index.slice(route, route + 400)).toContain('foreignSessions.postReview(frSession, data)');
+  });
+});
+
+describe('duplicate_of', () => {
+  const open = (extra = {}) => ({ status: 200, data: { item: { id: 'it_open', num: 42, title: 'Review backlog', state: 'open', kind: 'task', awaiting: 'agent', private: true, mission_id: 'mi_1', ...extra } } });
+  const state = { close: 200, comment: 201, hold: null };
+  async function setup(getTarget) {
+    state.close = 200; state.comment = 201; state.hold = null;
+    const closed = [];
+    const comments = [];
+    const updates = [];
+    const created = [];
+    const order = [];
+    const fs = createForeignSessions({
+      sharing: { personRoom: async () => ({ status: 404, data: {} }) },
+      items: {
+        // The notice is read back as the bridge filed it; anything else is the target.
+        get: async (id) => (id === 'it_1' ? { status: 200, data: { item: { ...created[0], id: 'it_1', num: 201 } } } : getTarget(id)),
+        create: async (body) => { created.push(body); return { status: 201, data: { item: { id: 'it_1', num: 201 } } }; },
+        close: async (id, body) => { order.push('close'); closed.push({ id, ...body }); return { status: state.close, data: {} }; },
+        comment: async (id, body, opts) => {
+          order.push(`comment:${id}`); comments.push({ id, ...body, key: opts?.idemKey });
+          // state.comment is the target's answer; the notice's own comments always land.
+          if (id === 'it_open' && state.hold) await state.hold;
+          return { status: id === 'it_open' ? state.comment : 201, data: {} };
+        },
+        update: async (id, body) => { updates.push([id, body]); return { status: 200, data: {} }; },
+      },
+      journalConvoIdFor: (s) => `convo-${s.roomId}`,
+      trackerBase: () => 'https://chat.example/u/bob',
+      sendText: () => true,
+      publishNotice: () => {},
+      isOccupied: () => false,
+      flag: { set: () => {}, clear: () => {} },
+      store: { load: () => ({}), save: () => {} },
+      reviewStore: { load: () => ({}), save: () => {} },
+      log: { warn: () => {} },
+    });
+    const s = { roomId: 'sess-a', alive: true, foreignTurn: null };
+    fs.begin(s, roomTurn);
+    await fs.raiseNotice(s, { title: 'PRs to review', text: 'Sixty of them.\nBy Friday ![x](https://example.com/t.png) <b>now</b>' });
+    fs.end(s);
+    fs.drainParked(s);
+    return { fs, s, closed, comments, updates, order };
+  }
+
+  it('is checked: an item id, a number or #number', () => {
+    expect(validateReview({ duplicate_of: 'it_abc' })).toEqual({ ok: true, value: { duplicateOf: 'it_abc' } });
+    expect(validateReview({ duplicate_of: 12 }).value.duplicateOf).toBe(12);
+    expect(validateReview({ duplicate_of: '#12' }).value.duplicateOf).toBe(12);
+    expect(validateReview({ duplicate_of: 'soon' }).ok).toBe(false);
+    expect(validateReview({ duplicate_of: 0 }).ok).toBe(false);
+  });
+  it('needs no asking or actions', () => {
+    expect(validateReview({ duplicate_of: 42 }).ok).toBe(true);
+    expect(validateReview({}).ok).toBe(false);
+  });
+  it('copies the notice onto the target, then closes it with a comment the user can check; no buttons', async () => {
+    const { fs, s, closed, comments, order } = await setup(async () => open());
+    const out = await fs.postReview(s, { duplicate_of: 42 });
+    expect(out.status).toBe(200);
+    expect(order).toEqual(['comment:it_open', 'close']);
+    expect(comments).toHaveLength(1);
+    expect(comments[0]).toMatchObject({ id: 'it_open', key: 'foreign-dup-it_1', as_convo_id: 'convo-sess-a' });
+    expect(comments[0].actions).toBeUndefined();
+    expect(comments[0].body).toContain("**Moved here from the notice [#201 From alice's agent: PRs to review](https://chat.example/u/bob/201), closed as the same as this item.**");
+    expect(comments[0].body).toContain('> Sixty of them.');
+    expect(comments[0].body).toContain('> By Friday [x](https://example.com/t.png) ‹b>now‹/b>');
+    expect(comments[0].body).not.toMatch(/!\[|<b>/);
+    expect(closed).toHaveLength(1);
+    expect(closed[0]).toMatchObject({ id: 'it_1', resolution: 'cancelled', as_convo_id: 'convo-sess-a' });
+    expect(closed[0].comment).toBe("Your agent judged this the same as [#42 Review backlog](https://chat.example/u/bob/42) and moved it there; reopen this if it isn't.");
+    expect((await fs.postReview(s, { duplicate_of: 42 })).status).toBe(409);
+    fs.end(s);
+    await tick();
+    expect(comments).toHaveLength(1);
+  });
+  it('folds into a private item, or one on no mission, and into nothing else', async () => {
+    for (const extra of [{ private: true, mission_id: 'mi_1' }, { private: false, mission_id: null }, { private: undefined, mission_id: null }]) {
+      const r = await setup(async () => open(extra));
+      expect((await r.fs.postReview(r.s, { duplicate_of: 42 })).status, JSON.stringify(extra)).toBe(200);
+      expect(r.closed).toHaveLength(1);
+    }
+  });
+  it('refuses a target on a mission that is not private, or one whose privacy and mission are unknown; the notice stays open and the review can still be sent', async () => {
+    for (const extra of [{ private: false, mission_id: 'mi_shared' }, { private: undefined, mission_id: 'mi_1' }, { private: undefined, mission_id: undefined }, { private: 'yes', mission_id: 'mi_1' }]) {
+      const r = await setup(async () => open(extra));
+      const out = await r.fs.postReview(r.s, { duplicate_of: 42 });
+      expect(out.status, JSON.stringify(extra)).toBe(409);
+      expect(out.body.error).toMatch(/private item or one on no mission.*buttons instead.*notice stays open/);
+      expect(r.comments).toEqual([]);
+      expect(r.closed).toEqual([]);
+      expect((await r.fs.postReview(r.s, good)).status).toBe(200);
+      expect(r.comments).toHaveLength(1);
+      expect(r.comments[0].id).toBe('it_1');
+    }
+  });
+  it('hands the target to the user only when it is a question not already waiting on them', async () => {
+    let r = await setup(async () => open());
+    await r.fs.postReview(r.s, { duplicate_of: 42 });
+    expect(r.updates).toEqual([]);
+    r = await setup(async () => open({ kind: 'question', awaiting: 'agent' }));
+    await r.fs.postReview(r.s, { duplicate_of: 42 });
+    expect(r.updates).toEqual([['it_open', { awaiting: 'user' }]]);
+    r = await setup(async () => open({ kind: 'question', awaiting: 'user' }));
+    await r.fs.postReview(r.s, { duplicate_of: 42 });
+    expect(r.updates).toEqual([]);
+  });
+  it('if the target comment fails the notice stays open, and the agent is told', async () => {
+    const { fs, s, closed, comments, order } = await setup(async () => open());
+    state.comment = 500;
+    const out = await fs.postReview(s, { duplicate_of: 42 });
+    expect(out.status).toBe(502);
+    expect(out.body.error).toMatch(/notice stays open/);
+    expect(closed).toEqual([]);
+    expect(order).toEqual(['comment:it_open']);
+    state.comment = 201;
+    expect((await fs.postReview(s, good)).status).toBe(200);
+    expect(comments.at(-1)).toMatchObject({ id: 'it_1', actions: ['Reply: yes', 'Ask for more detail'] });
+  });
+  it('refuses the notice itself, a closed item, another person\'s item and a missing one, writing nothing; the review may then be sent normally', async () => {
+    let reply = { status: 200, data: { item: { id: 'it_1', num: 201, state: 'open' } } };
+    const { fs, s, closed, comments } = await setup(async () => reply);
+    expect((await fs.postReview(s, { duplicate_of: 201 })).status).toBe(400);
+    reply = open({ state: 'closed' });
+    expect((await fs.postReview(s, { duplicate_of: 42 })).status).toBe(409);
+    reply = open({ owner: { username: 'bob' } });
+    expect((await fs.postReview(s, { duplicate_of: 42 })).status).toBe(400);
+    reply = { status: 404, data: {} };
+    expect((await fs.postReview(s, { duplicate_of: 99 })).status).toBe(404);
+    expect(closed).toEqual([]);
+    expect(comments).toEqual([]);
+    expect((await fs.postReview(s, good)).status).toBe(200);
+    expect(comments).toHaveLength(1);
+  });
+  it('a turn that ends while the target lookup is out says under the notice that no review came', async () => {
+    let release;
+    const gate = new Promise((res) => { release = res; });
+    const { fs, s, closed, comments } = await setup(async () => { await gate; return { status: 404, data: {} }; });
+    const dup = fs.postReview(s, { duplicate_of: 42 });
+    fs.end(s);
+    release();
+    expect((await dup).status).toBe(409);
+    await tick();
+    expect(closed).toEqual([]);
+    expect(comments).toEqual([expect.objectContaining({ id: 'it_1', body: REVIEW_MISSING_COMMENT })]);
+  });
+  it('a turn that ends while the copy onto the target is out, and fails, says under the notice that no review came', async () => {
+    const { fs, s, closed, comments } = await setup(async () => open());
+    let release;
+    state.hold = new Promise((res) => { release = res; });
+    state.comment = 500;
+    const dup = fs.postReview(s, { duplicate_of: 42 });
+    await tick();
+    fs.end(s);
+    release();
+    expect((await dup).status).toBe(502);
+    await tick();
+    expect(closed).toEqual([]);
+    expect(comments.map((c) => c.id)).toEqual(['it_open', 'it_1']);
+    expect(comments[1].body).toBe(REVIEW_MISSING_COMMENT);
+  });
+  it('claims the review before the lookup: a parallel review with buttons is refused', async () => {
+    let release;
+    const gate = new Promise((res) => { release = res; });
+    const { fs, s, closed, comments } = await setup(async () => { await gate; return open(); });
+    const dup = fs.postReview(s, { duplicate_of: 42 });
+    expect((await fs.postReview(s, good)).status).toBe(409);
+    release();
+    expect((await dup).status).toBe(200);
+    expect(comments).toHaveLength(1);
+    expect(comments[0].id).toBe('it_open');
+    expect(closed).toHaveLength(1);
+  });
+  it('a notice the user already marked seen is not closed twice, and a journal failure may be retried', async () => {
+    const { fs, s, closed } = await setup(async () => open());
+    state.close = 500;
+    expect((await fs.postReview(s, { duplicate_of: 42 })).status).toBe(502);
+    state.close = 409;
+    expect((await fs.postReview(s, { duplicate_of: 42 })).status).toBe(409);
+    expect(closed).toHaveLength(2);
+  });
+  it('links the item in the journal\'s own form when it is known, plain text without a number', () => {
+    expect(reviewDuplicateComment({ num: 42, title: 'A [b] (c)' }, 'https://chat.example/u/bob')).toContain('[#42 A b c](https://chat.example/u/bob/42)');
+    expect(reviewDuplicateComment({ id: 'it_x' })).toContain('same as it_x and');
+  });
+  it('the review turn and the tool tell the agent about it', () => {
+    expect(reviewTurnText(review)).toContain('duplicate_of');
+    expect(readFileSync(new URL('../ask-user.js', import.meta.url), 'utf8')).toContain('duplicate_of');
+    expect(readFileSync(new URL('../BRIDGE_CLAUDE.md', import.meta.url), 'utf8')).toContain('duplicate_of');
   });
 });
