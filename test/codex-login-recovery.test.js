@@ -49,7 +49,7 @@ describe('Codex authentication recovery in the bridge', () => {
         flushResponse: vi.fn(), journalStreamClear: vi.fn(), journalSessionState: vi.fn(),
         journalActivity: vi.fn(), maybeSummarizeAtTurnEnd: vi.fn(), journalStatus: vi.fn(),
         inflightMarker: { noteTurnEnd: vi.fn() }, journalConvoIdFor: vi.fn(),
-        dispatchDeferredCommand: vi.fn(() => false), maybeFlushRoomDelivery: vi.fn(), endRestartNoticeTurn: vi.fn(), sessionHasBackgroundWork: vi.fn(() => false),
+        dispatchDeferredCommand: vi.fn(() => false), maybeFlushRoomDelivery: vi.fn(), sessionHasBackgroundWork: vi.fn(() => false),
       });
       const finishStart = source.indexOf('function finishCodexTurn(');
       vm.runInContext(source.slice(finishStart, source.indexOf('\n}\n', finishStart) + 2), context);

@@ -2262,7 +2262,6 @@ describe('local (same-bridge) rooms', () => {
       expect((await f.handlers.chatRead({ roomId: '!guest', room_id: id })).status).toBe(404);
     });
   });
-
 });
 
 // Reuse-first chatStart (2026-08-19). agent_chat_leave used to be the way out

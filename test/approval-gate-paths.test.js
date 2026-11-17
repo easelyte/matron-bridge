@@ -72,11 +72,9 @@ function rpc(approvals, overrides = {}) {
 
 const TASK = 'Run the test suite and report.';
 const spawnSubject = (o = {}) => ({ op: 'spawn', ask: 'sp_1', box: 'box-a', workdir: '/srv/project', task_sha256: sha256Hex(TASK), decision: 'approve', ...o });
-// The fork dedups a start on its request_id, so each request here gets its own.
-let reqSeq = 0;
-const spawnReq = (params = {}) => ({ request_id: `r1-${++reqSeq}`, from_device_id: 0, method: 'start', params: { workdir: '/srv/project', prompt: TASK, spawn_id: 'sp_1', ...params } });
+const spawnReq = (params = {}) => ({ request_id: 'r1', from_device_id: 0, method: 'start', params: { workdir: '/srv/project', prompt: TASK, spawn_id: 'sp_1', ...params } });
 const startSubject = (o = {}) => ({ op: 'start', box: 'box-a', workdir: '/srv/project', prompt_sha256: sha256Hex(''), ...o });
-const clientReq = (params = {}) => ({ request_id: `r2-${++reqSeq}`, from_device_id: 4, approval_key_id: null, method: 'start', params: { workdir: '/srv/project', ...params } });
+const clientReq = (params = {}) => ({ request_id: 'r2', from_device_id: 4, approval_key_id: null, method: 'start', params: { workdir: '/srv/project', ...params } });
 const refused = (responses, detail) => {
   expect(responses).toHaveLength(1);
   expect(responses[0].ok).toBe(false);

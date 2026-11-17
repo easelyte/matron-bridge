@@ -319,7 +319,7 @@ describe('background marker behaviour in the bridge', () => {
       isSidechainEvent: () => false, modelFromEvent: () => null, eventConfirmsSession: () => false,
       postCompactContextTokens: () => null, contextGaugeText: () => null,
       compactTriggerFrom: event => event.compact_metadata?.trigger,
-      routeWorkflowStreamEvent: noop, endRestartNoticeTurn: noop, clearTurnClassification: noop, bumpTurnGeneration: noop,
+      routeWorkflowStreamEvent: noop, clearTurnClassification: noop, bumpTurnGeneration: noop,
       decideSteerHold: () => false,
     };
     context.sessionChildPid = runFunction('sessionChildPid', {});
