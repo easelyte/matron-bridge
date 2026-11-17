@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { mkdtempSync, rmSync, readFileSync, writeFileSync, statSync } from 'node:fs';
+import fs, { mkdtempSync, rmSync, readFileSync, writeFileSync, statSync, readdirSync, existsSync, utimesSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
@@ -155,12 +155,55 @@ describe('writer and reader', () => {
     expect(r.resolve(b)).toEqual({ route: 'page', token: 'b.s' });
   });
 
-  it('ignores a corrupt store (no throw, no resolution) and the writer starts it over', () => {
+  it('ignores a corrupt store (no throw, no resolution); the writer moves it aside and starts over', () => {
     writeFileSync(file, '{not json');
     const r = createShortLinkReader({ file, now });
     expect(r.resolve('AAAAAAAAAAAA')).toBeNull();
     const code = createShortLinkWriter({ file, now }).add({ route: 'page', token: 't.s', exp: expIn(60) });
     expect(r.resolve(code)).not.toBeNull();
+    expect(readdirSync(dir).filter((n) => n.includes('.corrupt-'))).toHaveLength(1);
+  });
+
+  it('never overwrites the store after a read error other than a missing file', () => {
+    const w = createShortLinkWriter({ file, now });
+    const keep = w.add({ route: 'page', token: 'keep.s', exp: expIn(600) });
+    const failing = {
+      ...fs,
+      readFileSync: () => { const e = new Error('EIO'); e.code = 'EIO'; throw e; },
+    };
+    const broken = createShortLinkWriter({ file, now, fs: failing });
+    expect(() => broken.add({ route: 'page', token: 'new.s', exp: expIn(600) })).toThrow(/EIO/);
+    expect(() => broken.prune()).toThrow(/EIO/);
+    expect(createShortLinkReader({ file, now }).resolve(keep)).toEqual({ route: 'page', token: 'keep.s' });
+    expect(Object.keys(JSON.parse(readFileSync(file, 'utf8')).links)).toEqual([keep]);
+    expect(existsSync(`${file}.lock`)).toBe(false);
+  });
+
+  it('serialises writers: a held lock makes add() wait, then fail to the long link, without touching the store', () => {
+    const w = createShortLinkWriter({ file, now });
+    const keep = w.add({ route: 'page', token: 'keep.s', exp: expIn(600) });
+    writeFileSync(`${file}.lock`, '');
+    expect(() => w.add({ route: 'page', token: 'x.s', exp: expIn(600) })).toThrow(/locked/);
+    expect(Object.keys(JSON.parse(readFileSync(file, 'utf8')).links)).toEqual([keep]);
+    rmSync(`${file}.lock`);
+    expect(isShortCode(w.add({ route: 'page', token: 'y.s', exp: expIn(600) }))).toBe(true);
+  });
+
+  it('a writer that re-reads under the lock keeps a code another process added meanwhile', () => {
+    const a = createShortLinkWriter({ file, now });
+    const b = createShortLinkWriter({ file, now });
+    const c1 = a.add({ route: 'page', token: 'a.s', exp: expIn(600) });
+    const c2 = b.add({ route: 'page', token: 'b.s', exp: expIn(600) });
+    const c3 = a.add({ route: 'page', token: 'c.s', exp: expIn(600) });
+    const r = createShortLinkReader({ file, now });
+    for (const c of [c1, c2, c3]) expect(r.resolve(c)).not.toBeNull();
+  });
+
+  it('breaks a stale lock left by a crashed process', () => {
+    writeFileSync(`${file}.lock`, '');
+    const old = new Date(Date.now() - 60_000);
+    utimesSync(`${file}.lock`, old, old);
+    expect(isShortCode(createShortLinkWriter({ file, now }).add({ route: 'page', token: 'z.s', exp: expIn(60) }))).toBe(true);
   });
 
   it('ignores entries for routes it does not know', () => {
@@ -175,15 +218,24 @@ describe('writer and reader', () => {
     expect(() => w.add({ route: 'page', token: 't.s' })).toThrow();
   });
 
-  it('caps the store, dropping the soonest-expiring codes but never the new one', () => {
-    const w = createShortLinkWriter({ file, now, maxEntries: 3 });
+  it('at capacity refuses a new code rather than evicting a live one', () => {
+    const w = createShortLinkWriter({ file, now, maxEntries: 2 });
     const r = createShortLinkReader({ file, now });
     const a = w.add({ route: 'page', token: 'a.s', exp: expIn(100) });
     const b = w.add({ route: 'page', token: 'b.s', exp: expIn(300) });
-    const c = w.add({ route: 'page', token: 'c.s', exp: expIn(400) });
-    const d = w.add({ route: 'page', token: 'd.s', exp: expIn(50) });
-    expect(r.resolve(a)).toBeNull();
-    for (const code of [b, c, d]) expect(r.resolve(code)).not.toBeNull();
+    expect(() => w.add({ route: 'page', token: 'c.s', exp: expIn(400) })).toThrow(/full/);
+    for (const code of [a, b]) expect(r.resolve(code)).not.toBeNull();
+    // Once one expires there is room again.
+    clock = (expIn(100) + 1) * 1000;
+    expect(isShortCode(w.add({ route: 'page', token: 'd.s', exp: expIn(400) }))).toBe(true);
+    expect(r.resolve(b)).not.toBeNull();
+  });
+
+  it('shortenViewerUrl falls back to the long link when the store is full', () => {
+    const w = createShortLinkWriter({ file, now, maxEntries: 1 });
+    w.add({ route: 'page', token: 'a.s', exp: expIn(100) });
+    const long = `https://viewer.example/page?token=${signed({ page: true, p: 'x', exp: expIn(300) })}`;
+    expect(shortenViewerUrl(w, long, { log: { warn: () => {} } })).toBe(long);
   });
 
   it('draws again on a collision', () => {
