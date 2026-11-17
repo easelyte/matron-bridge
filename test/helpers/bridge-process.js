@@ -66,7 +66,7 @@ async function randomPort() {
 // Run the actual entry point from a disposable source copy: startup writes
 // generated MCP config beside index.js. Where available, bwrap adds a read-only
 // filesystem view, private /tmp and PID namespace. Otherwise own a process group.
-export async function startBridge({ confine = true, interactive = true, planned = false, collectMs = 100, backgroundChild = false, crashBeforeHistory = false, beforeRelaunch } = {}) {
+export async function startBridge({ confine = true, interactive = true, planned = false, backgroundChild = false, env: extraEnv = {}, beforeRelaunch } = {}) {
   const confined = confine && bwrapAvailable;
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'bridge-process-'));
   const checkout = path.join(home, 'bridge');
@@ -126,21 +126,14 @@ catch (error) {
       'coordinator', 'BRIDGE_CLAUDE.md', 'BRIDGE_CODEX.md', 'BRIDGE_COORDINATOR.md', 'BRIDGE_NOTICES.md']) {
       fs.cpSync(path.join(repo, name), path.join(checkout, name), { recursive: true });
     }
-    if (crashBeforeHistory) {
-      const file = path.join(checkout, 'lib/restart-boot.js');
-      const source = fs.readFileSync(file, 'utf8');
-      // Let the accepted PTY submission finish, while keeping history unwritten.
-      const seam = "    onStep('back');";
-      if (!source.includes(seam)) throw new Error('Cannot locate history crash seam');
-      fs.writeFileSync(file, source.replace(seam, seam + "\n    if (process.env.HARNESS_CRASH_BEFORE_HISTORY === '1') { setTimeout(() => process.kill(process.pid, 'SIGKILL'), 1000); return; }"));
-    }
     const gitEnv = { HOME: home, PATH: process.env.PATH, GIT_CONFIG_NOSYSTEM: '1' };
     for (const args of [['init'], ['add', '.'], ['-c', 'user.name=alice', '-c', 'user.email=alice',
       '-c', 'commit.gpgsign=false', 'commit', '-m', 'Disposable checkout']]) {
       const result = spawnSync('git', args, { cwd: checkout, env: gitEnv, encoding: 'utf8', timeout: 5000 });
       if (result.status !== 0) throw new Error('Cannot initialize disposable checkout');
     }
-    if (planned) fs.writeFileSync(path.join(checkout, '.env'), `MATRON_RESTART_COLLECT_MS=${collectMs}\n`);
+    // The gate preflight loads the checkout's own .env.
+    if (planned) fs.writeFileSync(path.join(checkout, '.env'), '# harness\n');
     // repairSpawnHelperOnce only adds spawn-helper exec bits, as npm ci's postinstall already does.
     fs.symlinkSync(path.join(repo, 'node_modules'), path.join(checkout, 'node_modules'), 'dir');
     fs.copyFileSync(path.join(repo, 'test/stub-claude.mjs'), path.join(home, 'stub-claude.mjs'));
@@ -252,11 +245,10 @@ fs.watchFile(process.env.TRANSCRIPT_PATH, { interval: 25 }, async stat => {
       MATRON_INTERACTIVE_MODE: interactive ? '1' : '0', MATRON_CODE_UPDATE_RESTART: '0',
       SESSION_IDLE_TIMEOUT_MS: '0', MATRON_KEEP_AWAKE: 'off', MATRON_CRASH_RECOVERY_PROMPT: '0',
       MATRON_LIVE_OUTPUT_TTL: '3153600000', // Keep startup's literal /tmp sweep inert in both modes.
+      ...extraEnv,
     };
     supervisor = supervise(() => {
-      env.HARNESS_CRASH_BEFORE_HISTORY = crashBeforeHistory && supervisor?.launches === 1 ? '1' : '0';
-      // Keep the namespace init wrapper when testing a self-inflicted crash.
-      const child = confined ? childProcess.spawn('bwrap', ['--die-with-parent', '--unshare-pid', ...(crashBeforeHistory ? [] : ['--as-pid-1']), '--info-fd', '3',
+      const child = confined ? childProcess.spawn('bwrap', ['--die-with-parent', '--unshare-pid', '--as-pid-1', '--info-fd', '3',
         '--ro-bind', '/', '/', '--dev', '/dev', '--proc', '/proc',
         '--tmpfs', '/tmp', '--bind', home, home, '--ro-bind', readonly, '/tmp/harness-readonly',
         '--chdir', checkout, process.execPath, '--import', path.join(home, 'probe.mjs'), 'index.js'],

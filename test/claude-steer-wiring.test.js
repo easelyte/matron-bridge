@@ -60,7 +60,7 @@ function setup({ session: overrides = {}, steerEnabled = true } = {}) {
     pendingMediaMirror: () => [],
     contextFullToNative: () => null,
     AGENT_CLAUDE: 'claude',
-    restartLatch: undefined,
+    restartInputs: { begin: () => () => {} },
     inflightMarker: { touch: vi.fn(), noteTurnStart: vi.fn(), noteTurnEnd: vi.fn() },
     foreignSessions: { end: vi.fn() },
     accountLock: { isLocked: () => false },

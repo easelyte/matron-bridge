@@ -437,6 +437,16 @@ describe('notifyQueuedMessage', () => {
         { id: 'interrupt', label: '⚡ Send now', value: 'interrupt' },
       ],
       'pick_one', '📨 Queued (2): second', '📨 Queued (2): second',
+      {
+        question: '📨 Queued (2): second',
+        options: [
+          { id: 'cancel', label: '✕ Cancel', value: 'cancel:1' },
+          { id: 'send_one', label: '⚡ Send just this', value: 'sendone:1' },
+          { id: 'interrupt', label: '⚡ Send now', value: 'interrupt' },
+        ],
+        mode: 'pick_one',
+        silent: true,
+      },
     );
     expect(session.queueNotifications).toEqual([
       { eventId: '$ev1', plain: '📨 Queued (1): first' },
@@ -509,6 +519,29 @@ describe('notifyQueuedMessage', () => {
         { id: 'cancel', intent: 'neutral' },
       ],
     });
+  });
+
+  // A queued message goes out by itself when the turn ends, so its card is
+  // an offer, not a question: the journal must not push it to the user's
+  // phone, count it as unread or list it as unseen. `silent: true` is the
+  // journal's flag for exactly that, on every card shape.
+  it('marks every queued card silent so the journal never pushes it', async () => {
+    async function payloadFor(opts, sessionOver = {}) {
+      const sendButtonMessage = vi.fn(async () => '$tile');
+      const session = makeSession({ sendButtonMessage, queueNotifications: [], ...sessionOver });
+      await notifyQueuedMessage(session, 'p', { sendReply: vi.fn(), fullText: 'f', ...opts });
+      const args = sendButtonMessage.mock.calls[0];
+      return args[args.length - 1];
+    }
+    const structured = { queueRelease: { noteQueued: vi.fn() }, convoId: 'convo-1' };
+    expect((await payloadFor(structured)).silent).toBe(true);
+    expect((await payloadFor({ ...structured, allowSendOne: true })).silent).toBe(true);
+    expect((await payloadFor({ ...structured, compactJump: true })).silent).toBe(true);
+    expect((await payloadFor({ ...structured, editMode: 'replace' })).silent).toBe(true);
+    expect((await payloadFor({ ...structured, source: { item_id: 'it_1' } })).silent).toBe(true);
+    expect((await payloadFor(structured, { queuedMessages: [[{ type: 'text', text: 'x' }]] })).silent).toBe(true);
+    // No registry: the classic prompt shape, still silent.
+    expect(await payloadFor({})).toMatchObject({ mode: 'pick_one', silent: true });
   });
 
   // Spec 2026-10-01 (item thread queued replies): a queued tracker reply's
@@ -1737,7 +1770,7 @@ describe('index.js queued-send finalizer', () => {
     const flushQueue = runInNewContext(
       `(() => { ${src.slice(start, end)}; return flushQueue; })()`,
       {
-        restartLatch: undefined,
+        restartInputs: { begin: () => () => {} },
         AGENT_CODEX: 'codex', CLAUDE_STEER_ENABLED: false,
         console: { log: vi.fn() },
         runQueuedCleanup,

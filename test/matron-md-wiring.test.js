@@ -16,16 +16,16 @@ function body(startMarker, endMarker) {
 }
 
 const SPAWNS = [
-  ['print', 'function createSession(', 'const printCoord = claudeCoordinatorArgs('],
-  ['codex', 'function createCodexSessionForRoom(', 'const codexCoord = codexCoordinatorOptions('],
-  ['interactive', 'function createInteractiveSessionForRoom(', 'const ivCoord = claudeCoordinatorArgs('],
+  ['print', 'function createSession(', 'const printCoord = claudeCoordinatorArgs(', 'const matronMd = loadMatronMd(cwd);'],
+  ['codex', 'function createCodexSessionForRoom(', 'const codexCoord = codexCoordinatorOptions(', "const matronMd = loadMatronMd(cwd, { agent: 'codex' });"],
+  ['interactive', 'function createInteractiveSessionForRoom(', 'const ivCoord = claudeCoordinatorArgs(', 'const matronMd = loadMatronMd(cwd);'],
 ];
 
 describe('MATRON.md wiring (source inspection)', () => {
-  for (const [label, start, builder] of SPAWNS) {
+  for (const [label, start, builder, readCall] of SPAWNS) {
     it(`the ${label} spawn reads MATRON.md for its own workdir afresh and passes the block to the prompt builder`, () => {
       const fn = body(start, '\nfunction ');
-      const read = fn.indexOf('const matronMd = loadMatronMd(cwd);');
+      const read = fn.indexOf(readCall);
       expect(read, 'loadMatronMd(cwd) missing').toBeGreaterThan(-1);
       const build = fn.indexOf(builder);
       expect(build).toBeGreaterThan(read);
