@@ -15,7 +15,7 @@ const OTHER = 'b'.repeat(40);
 function fakeGit(state) {
   return args => {
     if (args[0] === 'rev-parse') return `${state.head}\n`;
-    if (args[0] === 'merge-base') return state.ancestors.has(args[2]);
+    if (args[0] === 'merge-base') return args[3] === 'origin/master' ? state.landed !== false : state.ancestors.has(args[2]);
     if (args[0] === 'status') return state.dirty ? ' M index.js\n' : '';
     throw new Error(`unexpected git ${args.join(' ')}`);
   };
@@ -38,7 +38,7 @@ function setup(options = {}) {
     getWatcher: () => watcher, repoDir: root, bootSha: options.bootSha === undefined ? SHA : options.bootSha,
     holds: () => options.holds?.() ?? { holders: [], unreadable: false },
     liveConvoIds: () => options.live ?? [], occupied: () => options.occupied?.() ?? [],
-    commandGate: options.commandGate ?? null, keys, git: fakeGit(git), now: () => 1000, onChange,
+    commandGate: options.commandGate ?? null, landedRef: options.landedRef ?? null, keys, git: fakeGit(git), now: () => 1000, onChange,
   });
   return { guard, git, watcher, keys, onChange, root };
 }
@@ -188,6 +188,36 @@ describe('cancel and dry run', () => {
     expect(r.body.waiting_on).toMatchObject({ code: null, collect: null, unwarned: ['alice'] });
     expect(r.body.waiting_on.quiet.holders).toEqual([{ convoId: '!r:x', why: 'turn in progress' }]);
     expect(h.guard.lastVerdict).toEqual({ waiting_on: r.body.waiting_on });
+  });
+});
+
+describe('landed ref', () => {
+  it('refuses a request while HEAD has not landed, and accepts it once it has', async () => {
+    const h = setup({ landedRef: 'origin/master', git: { landed: false } });
+    const r = await post(h.guard, { reason: 'deploy', sha: SHA });
+    expect(r.status).toBe(409);
+    expect(r.body.code).toBe('head not landed');
+    expect(h.watcher.request).not.toHaveBeenCalled();
+    h.git.landed = true;
+    expect((await post(h.guard, { reason: 'deploy', sha: SHA })).status).toBe(202);
+  });
+
+  it('holds the gate on an unlanded HEAD even with no request behind it (an automatic update)', async () => {
+    const h = setup({ landedRef: 'origin/master', git: { landed: false } });
+    expect(await h.guard.gate()).toEqual({ hold: true, reason: 'head not landed' });
+    h.git.landed = true;
+    expect(await h.guard.gate()).toEqual({ hold: false });
+  });
+
+  it('does not look at landing when no ref is configured', async () => {
+    const h = setup({ git: { landed: false } });
+    expect(await h.guard.gate()).toEqual({ hold: false });
+  });
+
+  it('fails closed on a ref that looks like a git option, without running git on it', async () => {
+    const h = setup({ landedRef: '--upload-pack=x' });
+    expect((await post(h.guard, { reason: 'deploy', sha: SHA })).body.code).toBe('head not landed');
+    expect(await h.guard.gate()).toEqual({ hold: true, reason: 'head not landed' });
   });
 });
 

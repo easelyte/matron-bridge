@@ -37,6 +37,12 @@ describe('code-update self-restart wiring', () => {
     expect(index).toMatch(/const CODE_UPDATE_RESTART = codeUpdateRestartEnabled\(process\.env\.MATRON_CODE_UPDATE_RESTART\)/);
   });
 
+  it('request-only mode (MATRON_CODE_UPDATE_AUTO=0) hides a HEAD move from the watcher until a restart is requested', () => {
+    expect(index).toMatch(/const CODE_UPDATE_AUTO = codeUpdateRestartEnabled\(process\.env\.MATRON_CODE_UPDATE_AUTO\)/);
+    expect(fn).toContain('readHead: () => (CODE_UPDATE_AUTO || restartGuard.pending() ? readHeadReflog(gitDir) : boot),');
+    expect(index).toMatch(/landedRef: process\.env\.MATRON_RESTART_LANDED_REF \|\| null,/);
+  });
+
   it('never forces a mid-turn restart unless the box opts in (ship-1, 2026-10-03)', () => {
     // 0 = never; the env is the only way to turn forcing on.
     expect(index).toMatch(/const CODE_UPDATE_FORCE_AFTER_MS = parseCodeUpdateMsOrOff\(process\.env\.MATRON_CODE_UPDATE_FORCE_AFTER_MS, CODE_UPDATE_FORCE_AFTER_DEFAULT_MS\)/);

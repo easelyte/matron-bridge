@@ -378,6 +378,8 @@ that POST instead of restarting at once.
 | `MATRON_PRE_REAP_HANDOFF_IDLE_MS` | How long a session must have been idle before the handoff runs. Must be shorter than `SESSION_IDLE_TIMEOUT_MS`, or the handoff is off. | `3000000` (50 minutes) |
 | `MATRON_PRE_REAP_COMPACT_PCT` | Context gauge (percent of the model's window) at or above which the handoff compacts the session. `0` or `off` keeps the status turn but never compacts. | `20` |
 | `MATRON_CODE_UPDATE_RESTART` | Restart the bridge by itself once newer code is on disk in its checkout (see "Self-restart onto new code" above). `0`/`false`/`off` disables it. | on |
+| `MATRON_CODE_UPDATE_AUTO` | Fork: `0`/`false`/`off` keeps the code-update watcher for explicit `/restart` requests only; a HEAD move alone then restarts nothing. Needs `MATRON_CODE_UPDATE_RESTART` on. | `1` |
+| `MATRON_RESTART_LANDED_REF` | Fork: a ref (for example `origin/master`) the checkout's HEAD must descend from before the bridge restarts onto it; otherwise the restart holds (`head not landed`) and a request is refused. | _(unset: no check)_ |
 | `MATRON_CODE_UPDATE_POLL_MS` | How often the checkout's HEAD reflog is read for new code | `60000` (1 minute) |
 | `MATRON_CODE_UPDATE_SETTLE_MS` | How old a HEAD move must be before the new tree is preflighted and trusted (the deploy's `npm install` runs after the pull) | `300000` (5 minutes) |
 | `MATRON_CODE_UPDATE_WARN_EVERY_MS` | How often the bridge logs that it is still waiting for a running turn before it can restart onto new code | `1800000` (30 minutes) |

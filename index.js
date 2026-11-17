@@ -348,7 +348,7 @@ if (PREFLIGHT_MODE === 'gate') {
     for (const name of ['MATRON_CODE_UPDATE_POLL_MS', 'MATRON_CODE_UPDATE_SETTLE_MS', 'MATRON_CODE_UPDATE_WARN_EVERY_MS', 'MATRON_CODE_UPDATE_FORCE_AFTER_MS']) {
       valid(name, value => /^\d+$/.test(value) && Number.isSafeInteger(Number(value)) && Number(value) >= (name === 'MATRON_CODE_UPDATE_FORCE_AFTER_MS' ? 0 : 1));
     }
-    for (const name of ['MATRON_CODE_UPDATE_RESTART', 'MATRON_CODE_UPDATE_AUTO_CARRY_ON']) {
+    for (const name of ['MATRON_CODE_UPDATE_RESTART', 'MATRON_CODE_UPDATE_AUTO', 'MATRON_CODE_UPDATE_AUTO_CARRY_ON']) {
       valid(name, value => /^(0|1|false|true|off|on|no|yes)$/i.test(value.trim()));
     }
   } catch (error) {
@@ -481,6 +481,9 @@ const RESTART_CARRY_ON_MAX_AGE_MS = parseInt(process.env.MATRON_RESTART_CARRY_ON
 // cap), unless MATRON_CODE_UPDATE_FORCE_AFTER_MS opts a box in.
 // MATRON_CODE_UPDATE_RESTART=0 switches it off.
 const CODE_UPDATE_RESTART = codeUpdateRestartEnabled(process.env.MATRON_CODE_UPDATE_RESTART);
+// Fork: 0 keeps the watcher for explicit /restart requests only; a HEAD move alone
+// then restarts nothing. On (the default) is upstream's behaviour.
+const CODE_UPDATE_AUTO = codeUpdateRestartEnabled(process.env.MATRON_CODE_UPDATE_AUTO);
 const CODE_UPDATE_POLL_MS = parseCodeUpdateMs(process.env.MATRON_CODE_UPDATE_POLL_MS, CODE_UPDATE_POLL_DEFAULT_MS);
 const CODE_UPDATE_SETTLE_MS = parseCodeUpdateMs(process.env.MATRON_CODE_UPDATE_SETTLE_MS, CODE_UPDATE_SETTLE_DEFAULT_MS);
 const CODE_UPDATE_WARN_EVERY_MS = parseCodeUpdateMs(process.env.MATRON_CODE_UPDATE_WARN_EVERY_MS, CODE_UPDATE_WARN_EVERY_DEFAULT_MS);
@@ -857,6 +860,7 @@ const restartGuard = createRestartGuard({
     if (!out.length && !quiet.quiet) out.push({ convoId: null, why: 'settling' });
     return out;
   },
+  landedRef: process.env.MATRON_RESTART_LANDED_REF || null,
   commandGate: createCommandGate(process.env.MATRON_RESTART_GATE_CMD),
   onChange: () => { queueRestartNotices(); publishRestartStatus('request'); },
   warn: message => console.warn(message),
@@ -11922,7 +11926,9 @@ function startCodeUpdateWatcher() {
     return null;
   }
   const watcher = codeUpdateWatcher = createCodeUpdateWatcher({
-    readHead: () => readHeadReflog(gitDir),
+    // Request-only mode (MATRON_CODE_UPDATE_AUTO=0) shows the watcher the boot
+    // commit until a restart is requested, so a HEAD move alone is not an update.
+    readHead: () => (CODE_UPDATE_AUTO || restartGuard.pending() ? readHeadReflog(gitDir) : boot),
     // Share the idle reaper's age cap for background work, while a running
     // turn always holds the update unless forcing is explicitly enabled.
     busySessions: () => sessionsHoldingRestart().holders.length + restartInputs.count,
