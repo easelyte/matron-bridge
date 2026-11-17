@@ -670,7 +670,6 @@ const LINK_EXPIRY_MS = parseInt(process.env.LINK_EXPIRY_MS || String(15 * 60 * 1
 // by the apps, never typed or pasted.
 const shortLinkWriter = shortLinksEnabled() ? createShortLinkWriter({ file: shortLinksFile() }) : null;
 const shortenLink = (url) => (url ? shortenViewerUrl(shortLinkWriter, url) : url);
-try { shortLinkWriter?.prune(); } catch (err) { console.warn(`[short-links] could not prune the store: ${err.message}`); }
 const SHOW_FILE_MAX_BYTES = 50 * 1024 * 1024;
 const SHOW_FILE_MAX_IN_FLIGHT = 2;
 const SHOW_FILE_MAX_IN_FLIGHT_PER_SESSION = 1;
@@ -16865,6 +16864,9 @@ async function main() {
     const pruned = pruneStaleCodexSinks();
     if (pruned > 0) console.log(`Pruned ${pruned} stale codex-viz sink dir(s)`);
   }
+  // Short links: drop codes that expired while the bridge was down (each
+  // new link prunes too; this covers a store nobody writes to for a while).
+  try { shortLinkWriter?.prune(); } catch (err) { console.warn(`[short-links] could not prune the store: ${err.message}`); }
   // Last: turn any marker left behind by the previous process into a "Carry on"
   // card. After timerStore.init() so a re-armed timer's own resume can't race
   // the reconciliation for the same convo, and safe with respect to the journal
