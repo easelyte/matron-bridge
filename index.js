@@ -24,7 +24,7 @@ if (PREFLIGHT_MODE === 'gate') {
   }
 }
 import { createRestartGuard, createInputCounter } from './lib/restart-guard.js';
-import { createRestartPreflight } from './lib/restart-preflight.js';
+import { createRestartPreflight, restartPreflightKey } from './lib/restart-preflight.js';
 import { buildRestartStatus } from './lib/box-status-restart.js';
 import { BRIDGE_BOOT_AT } from './lib/boot-time.js';
 import { spawn, execFileSync, execFile } from 'child_process';
@@ -327,6 +327,14 @@ const FALLBACK_CODEX_BRIDGE_PROMPT = 'You are running through Matron chat. Work 
 
 // --- Config ---
 
+// Requests close together become one restart: it waits this long after the
+// last request (never more than 30 minutes after the first).
+const RESTART_COLLECT_MS = process.env.MATRON_RESTART_COLLECT_MS === undefined
+  ? 300_000 : Number(process.env.MATRON_RESTART_COLLECT_MS);
+if (!Number.isSafeInteger(RESTART_COLLECT_MS) || RESTART_COLLECT_MS < 0
+  || !/^[0-9]+$/.test(process.env.MATRON_RESTART_COLLECT_MS ?? '300000')) {
+  throw new Error('Invalid restart collect duration');
+}
 const API_PORT = parseInt(process.env.MATRON_BRIDGE_API_PORT || '9802', 10);
 
 // Gate mode rejects values that normal startup would warn about and replace.
@@ -841,10 +849,13 @@ const restartGuard = createRestartGuard({
   // answers awaited, queued input, Codex exec worker groups, an unreadable
   // process table or subagent list (fail closed), and two quiet observations
   // in a row. See lib/restart-quiet.js.
-  occupied: () => {
+  occupied: ({ gate = false } = {}) => {
     const out = [];
     if (restartInputs.count > 0) out.push({ convoId: null, why: 'input_in_flight' });
     const quiet = evaluateQuiet({
+      // Only the gate's own evaluation counts a quiet reading and keeps the
+      // inventory it rebuilt; every other read leaves no trace.
+      readOnly: !gate,
       sessions, bootAt: BRIDGE_BOOT_AT, readProcessTable: readProcessTableStrict, prev: priorQuiet,
       hasQueuedInput: session => roomDelivery.pendingCount(session.roomId) > 0 || effortFlowHoldsInput(session),
       listRunningSubagents: () => {
@@ -854,13 +865,16 @@ const restartGuard = createRestartGuard({
       },
       mcpSignatures: MCP_SERVER_SIGNATURES,
     });
-    priorQuiet = quiet;
+    if (gate) priorQuiet = quiet;
     for (const holder of quiet.holders) out.push({ convoId: holder.convoId, why: holder.why });
     if (quiet.probe_error) out.push({ convoId: null, why: `probe_${quiet.probe_error}` });
-    if (!out.length && !quiet.quiet) out.push({ convoId: null, why: 'settling' });
+    if (gate && !out.length && !quiet.quiet) out.push({ convoId: null, why: 'settling' });
     return out;
   },
   landedRef: process.env.MATRON_RESTART_LANDED_REF || null,
+  collectMs: RESTART_COLLECT_MS,
+  preflight: () => createRestartPreflight(__dirname, { bootDotenvKeys: BOOT_DOTENV_KEYS })(),
+  preflightKey: () => restartPreflightKey(__dirname),
   commandGate: createCommandGate(process.env.MATRON_RESTART_GATE_CMD),
   onChange: () => { queueRestartNotices(); publishRestartStatus('request'); },
   warn: message => console.warn(message),
@@ -11931,7 +11945,10 @@ function startCodeUpdateWatcher() {
     readHead: () => (CODE_UPDATE_AUTO || restartGuard.pending() ? readHeadReflog(gitDir) : boot),
     // Share the idle reaper's age cap for background work, while a running
     // turn always holds the update unless forcing is explicitly enabled.
-    busySessions: () => sessionsHoldingRestart().holders.length + restartInputs.count,
+    // Upstream's holds, plus the in-memory ones (input in flight, answers
+    // awaited, queued input, Codex workers) read without side effects, so the
+    // re-check after the gate command sees what the gate saw.
+    busySessions: () => sessionsHoldingRestart().holders.length + restartGuard.occupiedNow().length,
     // Upstream's check, then the checkout's own config (lib/restart-preflight.js).
     preflight: createRestartPreflight(__dirname, { bootDotenvKeys: BOOT_DOTENV_KEYS }),
     // Our pins, notice and input holds, then the optional operator hook
@@ -11963,9 +11980,12 @@ function startCodeUpdateWatcher() {
     bootSha: boot.sha,
     settleMs: CODE_UPDATE_SETTLE_MS,
     warnEveryMs: CODE_UPDATE_WARN_EVERY_MS,
-    forceAfterMs: CODE_UPDATE_FORCE_AFTER_MS,
+    // Pinned to 0: a restart is never forced here, whatever
+    // MATRON_CODE_UPDATE_FORCE_AFTER_MS says (see the guard and the gate).
+    forceAfterMs: 0,
   });
-  console.log(`[code-update] self-restart onto new code: ON (running ${boot.sha.slice(0, 7)}; poll ${CODE_UPDATE_POLL_MS}ms, settle ${CODE_UPDATE_SETTLE_MS}ms, ${CODE_UPDATE_FORCE_AFTER_MS > 0 ? `forced after ${CODE_UPDATE_FORCE_AFTER_MS}ms` : 'never mid-turn'})`);
+  console.log(`[code-update] self-restart onto new code: ON (running ${boot.sha.slice(0, 7)}; poll ${CODE_UPDATE_POLL_MS}ms, settle ${CODE_UPDATE_SETTLE_MS}ms, never mid-turn)`);
+  if (CODE_UPDATE_FORCE_AFTER_MS > 0) console.warn('[code-update] MATRON_CODE_UPDATE_FORCE_AFTER_MS is ignored in this fork: a restart waits for quiet and is never forced');
   const timer = setInterval(() => {
     watcher.tick().catch(e => { try { console.warn(`[code-update] tick failed: ${e?.message ?? e}`); } catch { /* logging must never throw */ } });
   }, CODE_UPDATE_POLL_MS);

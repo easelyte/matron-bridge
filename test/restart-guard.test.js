@@ -30,6 +30,7 @@ function setup(options = {}) {
     get requested() { return requested ? { ...requested } : null; },
     gateHoldReason: null,
     request: vi.fn(({ reason, by }) => { requested = { reason, by, at: 1, error: null }; return { ok: true, requested }; }),
+    restarting: false,
     cancelRequest: vi.fn(() => { const had = !!requested; requested = null; return had; }),
   };
   const onChange = vi.fn();
@@ -37,8 +38,8 @@ function setup(options = {}) {
   const guard = createRestartGuard({
     getWatcher: () => watcher, repoDir: root, bootSha: options.bootSha === undefined ? SHA : options.bootSha,
     holds: () => options.holds?.() ?? { holders: [], unreadable: false },
-    liveConvoIds: () => options.live ?? [], occupied: () => options.occupied?.() ?? [],
-    commandGate: options.commandGate ?? null, landedRef: options.landedRef ?? null, keys, git: fakeGit(git), now: () => 1000, onChange,
+    liveConvoIds: () => options.live ?? [], occupied: o => options.occupied?.(o) ?? [], collectMs: options.collectMs ?? 0, preflight: options.preflight, preflightKey: options.preflightKey,
+    commandGate: options.commandGate ?? null, landedRef: options.landedRef ?? null, keys, git: fakeGit(git), now: options.clock ?? (() => 1000), onChange,
   });
   return { guard, git, watcher, keys, onChange, root };
 }
@@ -156,10 +157,10 @@ describe('request admission', () => {
     expect(r.body.requests).toEqual([{ reason: 'one', sha: SHA }, { reason: 'two' }]);
   });
 
-  it('answers 409 when the watcher is off, without recording anything', async () => {
+  it('answers 503 (retry after back) when the watcher is off, without recording anything', async () => {
     const h = setup({ noWatcher: true });
     const r = await post(h.guard, { reason: 'deploy', sha: SHA, request_key: 'k3' });
-    expect(r.status).toBe(409);
+    expect(r.status).toBe(503);
     expect(h.keys.has('k3')).toBe(false);
   });
 });

@@ -326,6 +326,16 @@ On top of that request, the fork checks and remembers three things:
   (`reminder_create` with `restart_note: true`), and the restart waits until
   they have been told.
 
+After the last request the bridge waits for `MATRON_RESTART_COLLECT_MS`
+(default 5 minutes) so requests close together cause one restart, and runs the
+preflight again right before it restarts (a result is reused for 5 minutes
+while the commit, `.env` and installed dependencies are unchanged).
+`MATRON_CODE_UPDATE_FORCE_AFTER_MS` is ignored here: nothing forces a restart.
+`DELETE /restart` forgets the cancelled request's `request_key`, and answers 409
+once the process is already exiting. 503 means the watcher is off or the
+bridge is restarting (the client exits 6, "retry after back"); 409 means the
+pin or landed ref was refused.
+
 The client exits 0 on 202 (requested) and 200 (key already seen), 2 on 409
 with the bridge's reply on stderr. `GET /restart` with the same token is the
 dry run and `DELETE /restart` the cancel. A hold from `MATRON_RESTART_GATE_CMD`
@@ -379,6 +389,7 @@ that POST instead of restarting at once.
 | `MATRON_PRE_REAP_COMPACT_PCT` | Context gauge (percent of the model's window) at or above which the handoff compacts the session. `0` or `off` keeps the status turn but never compacts. | `20` |
 | `MATRON_CODE_UPDATE_RESTART` | Restart the bridge by itself once newer code is on disk in its checkout (see "Self-restart onto new code" above). `0`/`false`/`off` disables it. | on |
 | `MATRON_CODE_UPDATE_AUTO` | Fork: `0`/`false`/`off` keeps the code-update watcher for explicit `/restart` requests only; a HEAD move alone then restarts nothing. Needs `MATRON_CODE_UPDATE_RESTART` on. | `1` |
+| `MATRON_RESTART_COLLECT_MS` | Fork: after a `/restart` request the bridge waits this long for more requests (each one extends it, up to 30 minutes after the first), so requests close together cause one restart. `0` restarts as soon as it is quiet. | `300000` |
 | `MATRON_RESTART_LANDED_REF` | Fork: a ref (for example `origin/master`) the checkout's HEAD must descend from before the bridge restarts onto it; otherwise the restart holds (`head not landed`) and a request is refused. | _(unset: no check)_ |
 | `MATRON_CODE_UPDATE_POLL_MS` | How often the checkout's HEAD reflog is read for new code | `60000` (1 minute) |
 | `MATRON_CODE_UPDATE_SETTLE_MS` | How old a HEAD move must be before the new tree is preflighted and trusted (the deploy's `npm install` runs after the pull) | `300000` (5 minutes) |

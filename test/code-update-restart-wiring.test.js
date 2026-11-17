@@ -46,13 +46,14 @@ describe('code-update self-restart wiring', () => {
   it('never forces a mid-turn restart unless the box opts in (ship-1, 2026-10-03)', () => {
     // 0 = never; the env is the only way to turn forcing on.
     expect(index).toMatch(/const CODE_UPDATE_FORCE_AFTER_MS = parseCodeUpdateMsOrOff\(process\.env\.MATRON_CODE_UPDATE_FORCE_AFTER_MS, CODE_UPDATE_FORCE_AFTER_DEFAULT_MS\)/);
-    expect(fn).toMatch(/forceAfterMs: CODE_UPDATE_FORCE_AFTER_MS,/);
+    expect(fn).toMatch(/forceAfterMs: 0,/);
+    expect(fn).not.toMatch(/forceAfterMs: CODE_UPDATE_FORCE_AFTER_MS/);
     expect(fn).toMatch(/warnEveryMs: CODE_UPDATE_WARN_EVERY_MS,/);
     expect(index).not.toMatch(/MAX_DEFER/);
   });
 
   it('counts a live session as holding when it is busy (the flag /sessions reports and restart_session parks on), has a background work child, or has a running subagent', () => {
-    expect(fn).toContain('busySessions: () => sessionsHoldingRestart().holders.length + restartInputs.count,');
+    expect(fn).toContain('busySessions: () => sessionsHoldingRestart().holders.length + restartGuard.occupiedNow().length,');
     const holdStart = index.indexOf('function sessionsHoldingRestart() {');
     const holdFn = index.slice(holdStart, index.indexOf('\n}\n', holdStart) + 3);
     expect(holdFn).toMatch(/filter\(s => s\.alive\)/);
