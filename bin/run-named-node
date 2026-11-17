@@ -131,6 +131,45 @@ if [ "$fresh" = 0 ]; then
   fi
 fi
 
+# Homebrew builds node against its own shared libnode, which the binary finds
+# through @rpath: next to itself, or in ../lib. A copy in another directory
+# cannot find it and dies at load time ("Library not loaded:
+# @rpath/libnode.NNN.dylib"). So every libnode*.dylib beside node or in its
+# ../lib is symlinked next to the copy, where @rpath looks first. Links left
+# behind by an older node point nowhere and are removed afterwards; the
+# current node's links are in place by then, so a launcher running at the
+# same time never sees one of its own links removed.
+realdir=${real%/*}
+for libdir in "$realdir/../lib" "$realdir"; do
+  libdir=$(cd "$libdir" 2>/dev/null && pwd -P) || continue
+  for lib in "$libdir"/libnode*.dylib; do
+    [ -f "$lib" ] || continue
+    link=$dir/${lib##*/}
+    # The copy directory may be node's own (or an alias of it): never
+    # replace a library with a link to itself.
+    if [ "$lib" -ef "$link" ] && [ ! -L "$link" ]; then
+      continue
+    fi
+    if [ -L "$link" ] && [ "$(readlink "$link")" = "$lib" ]; then
+      continue
+    fi
+    tmp=$dir/.${lib##*/}.tmp.$$
+    rm -f "$tmp" 2>/dev/null
+    if ln -s "$lib" "$tmp" 2>/dev/null && mv -f "$tmp" "$link" 2>/dev/null; then
+      :
+    else
+      rm -f "$tmp" 2>/dev/null
+      warn "could not link $lib next to $copy; running node without a Matron name"
+      exec "$node" "$@"
+    fi
+  done
+done
+for link in "$dir"/libnode*.dylib; do
+  if [ -L "$link" ] && [ ! -e "$link" ]; then
+    rm -f "$link" 2>/dev/null
+  fi
+done
+
 MATRON_REAL_NODE=$real
 export MATRON_REAL_NODE
 exec "$copy" "$@"

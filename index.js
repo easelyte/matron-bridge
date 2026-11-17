@@ -12401,6 +12401,7 @@ const foreignSessions = createForeignSessions({
   // Code's managed settings keep the bridge's own hooks from running and no
   // managed gate stands in, the turn is not taken (as for Codex).
   gateBlocked: (session) => (session?.codex ? null : foreignGateBlocked(session)),
+  trackerBase: () => trackerUrlBaseNow(),
   store: {
     load: () => { try { return JSON.parse(fs.readFileSync(FOREIGN_ACTIONS_FILE, 'utf-8')); } catch { return {}; } },
     save: (obj) => atomicWriteFileSync(FOREIGN_ACTIONS_FILE, JSON.stringify(obj), { mode: 0o600 }),
