@@ -465,16 +465,67 @@ describe('review follow-ups', () => {
     expect((await watcher.tick()).action).toBe('restart');
   });
 
-  it('refuses to record a restart without a verified boot sha, and adopts the watcher\'s reading once', async () => {
+  it('refuses to record a restart without a verified boot sha', async () => {
     const { layer, watcher, world } = build({ head: NEW, bootSha: null });
     await post(layer, { reason: 'deploy', sha: NEW });
     expect((await watcher.tick()).action).toBe('waiting');
     expect(world.restarts).toHaveLength(0);
-    layer.adoptBootSha(OLD);
-    layer.adoptBootSha(NEW);
-    expect((await watcher.tick()).action).toBe('restart');
-    expect(readState()).toMatchObject({ previous_sha: OLD, expected_sha: NEW });
   });
+
+  it('a finished restart is archived before the record is replaced, or the replacement is refused', async () => {
+    const a = build({ head: NEW });
+    await post(a.layer, { reason: 'deploy', sha: NEW, request_key: 'k1' });
+    a.layer.commitRestart({ sha: NEW });
+    const b = build({ head: NEW, bootSha: NEW });
+    // The history cannot be written: a new request is refused rather than losing k1.
+    fs.mkdirSync(path.join(dir, 'history.jsonl.d'));
+    const blocked = createRestartRequests({
+      getWatcher: () => b.watcher, holds: () => ({ holders: [], unreadable: false }), repoDir: dir, bootSha: NEW,
+      stateFile: path.join(dir, 'state.json'), historyFile: path.join(dir, 'history.jsonl.d'),
+      git: fakeGit(b.world), now: () => b.world.now,
+    });
+    blocked.reconcileBoot = undefined;
+    expect(readState().state).toBe('back');
+    expect((await blocked.handle({ method: 'POST', body: { reason: 'next', sha: NEW, request_key: 'k2' } })).status).toBe(503);
+    expect(readState().requests[0].request_key).toBe('k1');
+  });
+
+  it('an unreconciled restart record is not replaced', async () => {
+    const a = build({ head: NEW });
+    await post(a.layer, { reason: 'deploy', sha: NEW, request_key: 'k1' });
+    a.layer.commitRestart({ sha: NEW });
+    expect(readState().state).toBe('restarting');
+    expect((await post(a.layer, { reason: 'again', sha: NEW, request_key: 'k2' })).status).toBe(503);
+  });
+
+  it('a cancelled record does not hold its key', async () => {
+    const { layer } = build({ head: NEW });
+    const first = await post(layer, { reason: 'deploy', sha: NEW, request_key: 'k1' });
+    const state = readState();
+    fs.writeFileSync(path.join(dir, 'state.json'), JSON.stringify({ ...state, state: 'cancelled' }));
+    const fresh = build({ head: NEW });
+    const again = await post(fresh.layer, { reason: 'deploy', sha: NEW, request_key: 'k1' });
+    expect(again.status).toBe(202);
+    expect(again.body.id).not.toBe(first.body.id);
+  });
+
+  it('work seen while the command gate runs voids the approval', async () => {
+    const world = { now: T0, work: false };
+    const reader = createQuietReader(() => ({
+      sessions: new Map([['r1', { alive: true, busy: world.work }]]), bootAt: 0,
+      readProcessTable: () => ({ ok: true, table: [] }), listRunningSubagents: () => [],
+    }), { now: () => world.now, minGapMs: 5000 });
+    let layerRef;
+    const { layer } = build({ head: NEW, quiet: reader, commandGate: async () => {
+      world.work = true; layerRef.occupiedNow(); world.work = false; return { hold: false };
+    } });
+    layerRef = layer;
+    await post(layer, { reason: 'deploy', sha: NEW });
+    world.now += 10_000; await layer.gate();
+    world.now += 10_000;
+    expect(await layer.gate()).toMatchObject({ hold: true, reason: 'work seen while the gate ran' });
+  });
+
 });
 
 describe('observed work starts the quiet count again', () => {

@@ -11925,7 +11925,6 @@ function startCodeUpdateWatcher() {
     ...PINNED_WATCHER_OPTIONS,
   });
   console.log(`[code-update] self-restart onto new code: ON (running ${boot.sha.slice(0, 7)}; poll ${CODE_UPDATE_POLL_MS}ms, settle ${CODE_UPDATE_SETTLE_MS}ms, never mid-turn; ${CODE_UPDATE_AUTO ? 'restarts on a HEAD move and on request' : 'request-only (MATRON_CODE_UPDATE_AUTO=0): restarts only on POST /restart'})`);
-  restartRequests.adoptBootSha(boot.sha);
   // A request that was pending when the previous process went away is asked for again.
   try { restartRequests.restore(); } catch (e) { console.warn(`[restart] could not restore the pending request: ${e?.message ?? e}`); }
   const timer = setInterval(() => {
