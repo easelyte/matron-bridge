@@ -146,6 +146,27 @@ describe('codes that do not resolve', () => {
     expect(sub.status).toBe(403);
     expect(secretSubmits).toHaveLength(0);
   });
+
+  it('the posted-back credential must have been stored for that route, even when its token would pass', async () => {
+    // Tokens that would pass each POST's own checks, stored under a route the
+    // POST does not accept: only the route restriction can refuse them.
+    sensitive.set('s-route', { content: 'value-route', oneTime: true });
+    const exp = Math.floor(Date.now() / 1000) + 300;
+    const sensitiveAsPage = writer.add({ route: 'page', token: signed({ sensitiveId: 's-route', label: 'k' }), exp });
+    const res = await fetch(`${base}/sensitive/reveal`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ token: sensitiveAsPage }),
+    });
+    expect(res.status).toBe(403);
+    expect(sensitive.get('s-route').viewed).toBeUndefined();
+
+    const secretAsSensitive = writer.add({ route: 'sensitive', token: signed({ secretId: 'sec-route', label: 'k' }), exp });
+    const sub = await fetch(`${base}/secret`, {
+      method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: new URLSearchParams({ token: secretAsSensitive, value: 'v' }).toString(),
+    });
+    expect(sub.status).toBe(403);
+    expect(secretSubmits).toHaveLength(0);
+  });
 });
 
 describe('GET /l/<code> for sensitive data', () => {
