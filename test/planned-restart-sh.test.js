@@ -38,12 +38,12 @@ async function fixture({ token = 'a'.repeat(64), statuses = ['200'], rotate = fa
   servers.push(server);
   const port = server.address().port;
   return { file, root, port, requests,
-    run(args = ['config "quoted"\nnext', '--sha', 'c'.repeat(40), '--request-key', 'alice'], { env = {}, viaBash = false } = {}) {
-      const command = viaBash ? '/bin/bash' : script;
+    run(args = ['config "quoted"\nnext', '--sha', 'c'.repeat(40), '--request-key', 'alice'], { env = {}, viaBash = false, scriptPath = script } = {}) {
+      const command = viaBash ? '/bin/bash' : scriptPath;
       const bare = viaBash === 'bare';
-      const argv = bare ? [path.basename(script), ...args] : viaBash === 'p' ? ['-p', script, ...args] : viaBash ? [script, ...args] : args;
+      const argv = bare ? [path.basename(scriptPath), ...args] : viaBash === 'p' ? ['-p', scriptPath, ...args] : viaBash ? [scriptPath, ...args] : args;
       return new Promise(resolve => {
-        const child = spawn(command, argv, { cwd: bare ? path.dirname(script) : undefined, env: { HOME: root, MATRON_RESTART_ENV_FILE: file, MATRON_BRIDGE_API_PORT: String(port), ...env } });
+        const child = spawn(command, argv, { cwd: bare ? path.dirname(scriptPath) : undefined, env: { HOME: root, MATRON_RESTART_ENV_FILE: file, MATRON_BRIDGE_API_PORT: String(port), ...env } });
         let stdout = ''; let stderr = '';
         child.stdout.on('data', chunk => { stdout += chunk; });
         child.stderr.on('data', chunk => { stderr += chunk; });
@@ -130,19 +130,22 @@ it.each(['9802@example.com', '0', '65536', '99999', '080', '-1', '1e3'])('refuse
 it('retains the legacy default port without connecting to it', () => {
   const source = fs.readFileSync(script, 'utf8');
   expect(source).toContain('port=9802');
+  expect(source).not.toContain('configured_port');
   expect(source).toContain('http://127.0.0.1:${port}/restart');
 });
-it.each([false, true])('uses the file port with an explicit token path (%s)', async explicit => {
+it.each([false, true])('uses the file port with or without an explicit token path (%s)', async explicit => {
   const f = await fixture();
   fs.writeFileSync(f.file, `MATRON_RESTART_TOKEN=${'a'.repeat(64)}\nMATRON_BRIDGE_API_PORT=${f.port}\n`);
-  const result = await f.run(undefined, { env: {
-    MATRON_RESTART_ENV_FILE: explicit ? f.file : '',
-    // Without an explicit file, even an invalid ambient override is ignored.
-    MATRON_BRIDGE_API_PORT: explicit ? '' : 'invalid',
-  } });
+  const result = await f.run(undefined, { env: { MATRON_RESTART_ENV_FILE: explicit ? f.file : '', MATRON_BRIDGE_API_PORT: '' } });
   expect(result.status).toBe(0);
   expect(f.requests).toHaveLength(1);
   expect(f.requests[0].headers['x-matron-restart-token']).toBe('a'.repeat(64));
+});
+it('an invalid configured port is refused even without an explicit token path', async () => {
+  const f = await fixture();
+  const result = await f.run(undefined, { env: { MATRON_RESTART_ENV_FILE: '', MATRON_BRIDGE_API_PORT: 'invalid' } });
+  expect(result.status).toBe(2);
+  expect(f.requests).toHaveLength(0);
 });
 it('lets an explicit override take precedence over the file port', async () => {
   const target = await fixture();
@@ -289,4 +292,52 @@ it('a canary forged in both argv and env is the caller own choice: re-exec is sk
 });
 it('guards the re-exec with an exit 2 when env or bash is missing', () => {
   expect(fs.readFileSync(script, 'utf8')).toContain("[[ -x /usr/bin/env && -x /bin/bash ]] || { echo 'missing /usr/bin/env or /bin/bash' >&2; exit 2; }");
+});
+
+const tokenOnly = (f) => fs.writeFileSync(f.file, `MATRON_RESTART_TOKEN=${'a'.repeat(64)}\n`);
+
+it('the configured port wins even without an explicit token path (a bare call)', async () => {
+  const f = await fixture();
+  const decoy = await fixture();
+  fs.writeFileSync(f.file, `MATRON_RESTART_TOKEN=${'a'.repeat(64)}\nMATRON_BRIDGE_API_PORT=${decoy.port}\n`);
+  const result = await f.run(undefined, { env: { MATRON_RESTART_ENV_FILE: '', MATRON_BRIDGE_API_PORT: String(f.port) } });
+  expect(result.status).toBe(0);
+  expect(f.requests).toHaveLength(1);
+  expect(decoy.requests).toHaveLength(0);
+});
+it('with only a port-less token file the port is 9802, never the checkout .env (nothing in the test answers there)', async () => {
+  const f = await fixture();
+  tokenOnly(f);
+  // A .env beside the script, naming the fixture's port, is not consulted.
+  const checkout = path.join(f.root, 'bridge');
+  fs.mkdirSync(path.join(checkout, 'scripts'), { recursive: true });
+  const copy = path.join(checkout, 'scripts', 'planned-restart.sh');
+  fs.copyFileSync(script, copy);
+  fs.chmodSync(copy, 0o755);
+  fs.writeFileSync(path.join(checkout, '.env'), `MATRON_BRIDGE_API_PORT=${f.port}\n`);
+  const result = await f.run(undefined, { scriptPath: copy, env: { MATRON_RESTART_ENV_FILE: '', MATRON_BRIDGE_API_PORT: '' } });
+  expect(f.requests).toHaveLength(0);
+  expect([2, 4]).toContain(result.status);
+  if (result.status === 4) expect(result.stderr).toContain('port 9802');
+});
+it('treats 202 (a request accepted) and 200 (a key already seen) as success', async () => {
+  for (const status of ['202', '200']) {
+    const f = await fixture({ statuses: [status] });
+    expect((await f.run()).status).toBe(0);
+  }
+});
+it('reports a refused request with its reason and does not retry it', async () => {
+  for (const status of ['409', '400']) {
+    const f = await fixture({ statuses: [status] });
+    const result = await f.run();
+    expect(result.status).toBe(2);
+    expect(result.stderr).toContain(`restart refused (HTTP ${status})`);
+    expect(f.requests).toHaveLength(1);
+  }
+});
+it('tells a caller whose connection dropped that repeating the same key is safe', async () => {
+  const f = await fixture({ transport: true });
+  const result = await f.run();
+  expect(result.status).toBe(4);
+  expect(result.stderr).toContain('the same --request-key is safe to repeat');
 });

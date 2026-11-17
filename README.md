@@ -298,15 +298,21 @@ Run as the bridge's service user so the client finds
 `$HOME/.matron-bridge-restart.env`. After binding its local API, the bridge
 writes that private file with `MATRON_RESTART_TOKEN=<64 lowercase hex digits>`
 on line 1 and `MATRON_BRIDGE_API_PORT=<port>` on line 2. The client reads it
-as data; do not source it. Older files containing only the token still work,
-using port `9802`. Malformed files exit with code 2.
+as data; do not source it. Malformed files exit with code 2.
 
-To select another bridge explicitly, set `MATRON_RESTART_ENV_FILE` to its token
-file. A `MATRON_BRIDGE_API_PORT` environment override takes precedence over
-the file's port only when that explicit file is also set; otherwise ambient
-port overrides are ignored. Connection refusal exits with code 4 and reports
-the port tried. Execute the script directly or use `bash -p` as above to
-avoid loading ambient shell startup files and exported functions.
+The port is, highest first: `MATRON_BRIDGE_API_PORT` in the environment (the
+configured port, always honoured, with or without an explicit token file); the
+port line of the token file (the bridge writes it when it binds its API, so it
+is the port the running bridge listens on); `9802`, the bridge's own default and
+the one `deploy.sh` uses. Nothing else is read to find a port. To select another
+bridge explicitly, set `MATRON_RESTART_ENV_FILE` to its token file. Exit codes: 0
+accepted (202) or already known (200 for a key seen before); 2 refused (the
+reason is printed: 400 bad request, 409 config-only request after HEAD moved or
+the watcher is off), or a malformed token file or port; 4 the bridge is down or
+restarting, with the port tried (repeating the same `--request-key` is safe);
+5 the token is stale (the bridge restarted; retry after back); 6 the bridge is
+already restarting (503). Execute the script directly or use `bash -p` as above
+to avoid loading ambient shell startup files and exported functions.
 
 The file viewer follows the same rule: it watches the same checkout and,
 once new code has settled and the viewer module loads from it, exits with
@@ -346,7 +352,8 @@ body and to what the bridge remembers:
 H=${XDG_STATE_HOME:-$HOME/.local/state}/matron-bridge/api-operator.header
 curl -s -H @"$H" http://127.0.0.1:9802/restart            # dry run: who holds it, and why
 curl -s -H @"$H" -X POST -d '{"reason":"new .env"}' http://127.0.0.1:9802/restart
-curl -s -H @"$H" -X DELETE http://127.0.0.1:9802/restart   # cancel
+curl -s -H @"$H" -X POST -d '{"reason":"deploy","sha":"<commit>","request_key":"<key>"}' http://127.0.0.1:9802/restart
+curl -s -H @"$H" -X DELETE http://127.0.0.1:9802/restart   # cancel (200 {cancelled, id, state}; 409 once committed)
 ```
 
 `./deploy.sh --when-quiet` does the pull, install and preflight, then sends
