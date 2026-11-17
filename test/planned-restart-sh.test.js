@@ -317,7 +317,7 @@ it('the configured port wins even without an explicit token path (a bare call)',
 it.each([
   ['a plain line', 'OTHER=1\nMATRON_BRIDGE_API_PORT=@@\n'],
   ['export, quotes and a comment', 'export MATRON_BRIDGE_API_PORT="@@" # the bridge port\n'],
-  ['the last valid line', 'MATRON_BRIDGE_API_PORT=9\nMATRON_BRIDGE_API_PORT=@@\nMATRON_BRIDGE_API_PORT=junk\n'],
+  ['the last assignment', 'MATRON_BRIDGE_API_PORT=9\nMATRON_BRIDGE_API_PORT=@@\n'],
   ['no final newline', 'MATRON_BRIDGE_API_PORT=@@'],
 ])('with only a port-less token file, the checkout .env port is used (%s)', async (_name, dotenv) => {
   const f = await fixture();
@@ -338,15 +338,63 @@ it('the token file port beats the checkout .env, and the .env is never evaluated
   expect(other.requests).toHaveLength(0);
   expect(fs.existsSync(path.join(f.root, 'marker'))).toBe(false);
 });
-it('ignores invalid .env ports and falls back to 9802 (never connected to here)', async () => {
+it.each([
+  ['a zero', 'MATRON_BRIDGE_API_PORT=0\n'],
+  ['too large', 'MATRON_BRIDGE_API_PORT=65536\n'],
+  ['a command substitution', 'MATRON_BRIDGE_API_PORT=$(touch MARK)\n'],
+  ['internal whitespace', 'MATRON_BRIDGE_API_PORT=12 345\n'],
+  ['a later invalid line after a valid one', 'MATRON_BRIDGE_API_PORT=@@\nMATRON_BRIDGE_API_PORT=junk\n'],
+  ['an empty value', 'MATRON_BRIDGE_API_PORT=\n'],
+])('an invalid .env port is refused with exit 2 and nothing is connected to (%s)', async (_name, dotenv) => {
   const f = await fixture();
   tokenOnly(f);
-  const copy = checkoutWith(f, 'MATRON_BRIDGE_API_PORT=0\nMATRON_BRIDGE_API_PORT=99999\nMATRON_BRIDGE_API_PORT=$(id)\n');
+  const copy = checkoutWith(f, dotenv.replaceAll('@@', String(f.port)).replaceAll('MARK', path.join(f.root, 'marker')));
   const result = await f.run(undefined, { scriptPath: copy, env: { MATRON_RESTART_ENV_FILE: '', MATRON_BRIDGE_API_PORT: '' } });
-  // Whatever answers on 9802 (nothing in the test environment), it was not the fixture.
+  expect(result.status).toBe(2);
+  expect(result.stderr).toContain('invalid MATRON_BRIDGE_API_PORT in the bridge checkout .env');
   expect(f.requests).toHaveLength(0);
-  expect([2, 4]).toContain(result.status);
-  if (result.status === 4) expect(result.stderr).toContain('port 9802');
+  expect(fs.existsSync(path.join(f.root, 'marker'))).toBe(false);
+});
+it('a port that only looks like a setting inside another variable\'s multi-line value is not one', async () => {
+  const f = await fixture();
+  const hostile = await fixture();
+  tokenOnly(f);
+  const copy = checkoutWith(f, `MATRON_BRIDGE_API_PORT=${f.port}\nOTHER="first\nMATRON_BRIDGE_API_PORT=${hostile.port}\nlast"\n`);
+  const result = await f.run(undefined, { scriptPath: copy, env: { MATRON_RESTART_ENV_FILE: '', MATRON_BRIDGE_API_PORT: '' } });
+  expect(result.status, result.stderr).toBe(0);
+  expect(f.requests).toHaveLength(1);
+  expect(hostile.requests).toHaveLength(0);
+});
+it('a NUL byte in the .env refuses it, and CRLF line ends and single quotes are accepted', async () => {
+  const f = await fixture();
+  tokenOnly(f);
+  const nul = checkoutWith(f, `MATRON_BRIDGE_API_PORT=${f.port}\n`);
+  fs.writeFileSync(path.join(path.dirname(nul), '..', '.env'), Buffer.concat([Buffer.from('MATRON_BRIDGE_API_PORT=12'), Buffer.from([0]), Buffer.from('345\n')]));
+  const refused = await f.run(undefined, { scriptPath: nul, env: { MATRON_RESTART_ENV_FILE: '', MATRON_BRIDGE_API_PORT: '' } });
+  expect(refused.status).toBe(2);
+  expect(f.requests).toHaveLength(0);
+  fs.writeFileSync(path.join(path.dirname(nul), '..', '.env'), `X=1\r\nMATRON_BRIDGE_API_PORT='${f.port}'\r\n`);
+  const ok = await f.run(undefined, { scriptPath: nul, env: { MATRON_RESTART_ENV_FILE: '', MATRON_BRIDGE_API_PORT: '' } });
+  expect(ok.status, ok.stderr).toBe(0);
+  expect(f.requests).toHaveLength(1);
+});
+it('a script run through a symlink, or a symlinked .env, does not name a checkout', async () => {
+  const f = await fixture();
+  tokenOnly(f);
+  const real = checkoutWith(f, `MATRON_BRIDGE_API_PORT=${f.port}\n`);
+  const alias = path.join(f.root, 'alias');
+  fs.mkdirSync(path.join(alias, 'scripts'), { recursive: true });
+  fs.symlinkSync(real, path.join(alias, 'scripts', 'planned-restart.sh'));
+  fs.writeFileSync(path.join(alias, '.env'), `MATRON_BRIDGE_API_PORT=${f.port}\n`);
+  const viaLink = await f.run(undefined, { scriptPath: path.join(alias, 'scripts', 'planned-restart.sh'), env: { MATRON_RESTART_ENV_FILE: '', MATRON_BRIDGE_API_PORT: '' } });
+  // The .env beside the link is not consulted: 9802, which nothing in the test answers.
+  expect(f.requests).toHaveLength(0);
+  expect([2, 4]).toContain(viaLink.status);
+  fs.rmSync(path.join(f.root, 'bridge', '.env'));
+  fs.symlinkSync(path.join(alias, '.env'), path.join(f.root, 'bridge', '.env'));
+  const linkedEnv = await f.run(undefined, { scriptPath: real, env: { MATRON_RESTART_ENV_FILE: '', MATRON_BRIDGE_API_PORT: '' } });
+  expect(f.requests).toHaveLength(0);
+  expect([2, 4]).toContain(linkedEnv.status);
 });
 it('treats 202 (a request accepted) and 200 (a key already seen) as success', async () => {
   for (const status of ['202', '200']) {
