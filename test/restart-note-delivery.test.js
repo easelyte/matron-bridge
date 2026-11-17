@@ -14,7 +14,7 @@ const tick = () => new Promise(resolve => setImmediate(resolve));
 
 // A delivery whose timers the test fires by hand, in order of their due time.
 function harness({ answers = {}, settleAnswers = [true], ...options } = {}) {
-  const world = { now: T0, timers: [], delivered: [], recovered: [], settled: [], log: [] };
+  const world = { now: T0, timers: [], delivered: [], recovered: [], settled: [], owners: [], log: [] };
   const queues = Object.fromEntries(Object.entries(answers).map(([id, list]) => [id, [...list]]));
   const settleQueue = [...settleAnswers];
   const delivery = createNoteDelivery({
@@ -27,7 +27,7 @@ function harness({ answers = {}, settleAnswers = [true], ...options } = {}) {
       return next;
     },
     recover: (entry) => world.recovered.push(entry.convoId),
-    onSettled: (outcomes) => { world.settled.push(outcomes); return settleQueue.length > 1 ? settleQueue.shift() : settleQueue[0]; },
+    onSettled: (outcomes, owner) => { world.settled.push(outcomes); world.owners.push(owner); return settleQueue.length > 1 ? settleQueue.shift() : settleQueue[0]; },
     log: (m) => world.log.push(m),
     ...options,
   });
@@ -228,5 +228,57 @@ describe('review follow-ups: nothing lost, nothing settled early', () => {
     await run();
     expect(world.settled).toHaveLength(2);
     expect(world.settled[1].a.outcome).toBe('resumed');
+  });
+});
+
+describe('review follow-ups, round two', () => {
+  it('a newer note for a chat does not erase an outcome that was never acknowledged', async () => {
+    fs.writeFileSync(file, JSON.stringify([{ convoId: 'a', text: 'old', writtenAt: T0 - 9000, status: 'done', outcome: 'failed', outcome_at: T0 - 100, card: 'done', attempts: 3, owner: 'R1' }]));
+    const { world, delivery, run } = harness({ owner: () => 'R2' });
+    delivery.start([note('a', { text: 'new', ageMs: 10 })]);
+    await run();
+    // One report per record: R1 keeps its failure, R2 its resumed note.
+    expect(world.owners.sort()).toEqual(['R1', 'R2']);
+    const byOwner = Object.fromEntries(world.settled.map((outcomes, i) => [world.owners[i], outcomes]));
+    expect(byOwner.R1.a.outcome).toBe('failed');
+    expect(byOwner.R2.a.outcome).toBe('resumed');
+  });
+
+  it('notes that could not be queued are reported failed with everything else, in one report', async () => {
+    fs.writeFileSync(file, JSON.stringify([{ convoId: 'a', text: 't', writtenAt: T0 - 1000, status: 'pending', attempts: 0 }]));
+    const { world, delivery, run } = harness();
+    delivery.failIntake([note('c')]);
+    delivery.intakeComplete();
+    delivery.resume();
+    expect(world.settled).toEqual([]);
+    await run();
+    expect(world.settled).toHaveLength(1);
+    expect(world.settled[0]).toMatchObject({ a: { outcome: 'resumed' }, c: { outcome: 'failed' } });
+  });
+
+  it('a start that cannot begin delivery does not throw after the notes were written', () => {
+    const { world, delivery } = harness({ schedule: () => { throw new Error('no timers'); } });
+    expect(() => delivery.start([note('a')])).not.toThrow();
+    expect(world.log.join('\n')).toMatch(/could not start delivery/);
+    expect(onDisk()).toHaveLength(1);
+  });
+
+  it('reports the worst outcome when a chat has more than one in the same report', () => {
+    fs.writeFileSync(file, JSON.stringify([
+      { convoId: 'a', text: 't', writtenAt: T0 - 2000, status: 'done', outcome: 'resumed', outcome_at: 1, owner: 'R' },
+      { convoId: 'a', text: 't', writtenAt: T0 - 1000, status: 'done', outcome: 'possibly_delivered', outcome_at: 2, owner: 'R' },
+    ]));
+    const { world, delivery } = harness();
+    delivery.intakeComplete();
+    delivery.resume();
+    expect(world.settled).toEqual([{ a: { outcome: 'possibly_delivered', at: 2 } }]);
+    expect(world.owners).toEqual(['R']);
+  });
+
+  it('reports once, even when more timers fire afterwards', async () => {
+    const { world, delivery, run } = harness();
+    delivery.start([note('a'), note('b')]);
+    await run();
+    expect(world.settled).toHaveLength(1);
   });
 });

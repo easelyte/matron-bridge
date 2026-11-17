@@ -36,7 +36,8 @@ describe('resume note delivery wiring', () => {
 
   it('notes that cannot be queued are recorded as failed in the restart record, not silently dropped', () => {
     const boot = fn('publishRestartCarryOnCards');
-    expect(boot).toMatch(/restartRequests\.settleNotes\(Object\.fromEntries\(deliveries\.map\(d => \[d\.convoId, \{ outcome: 'failed'/);
+    expect(boot).toContain('restartNoteDelivery.failIntake(deliveries);');
+    expect(boot).not.toContain('settleNotes(');
   });
 
   it('main() resumes what an earlier process left after the cards, and settles the record even when that fails', () => {
@@ -55,7 +56,8 @@ describe('resume note delivery wiring', () => {
     const block = index.slice(index.indexOf('const restartNoteDelivery = createNoteDelivery({'), index.indexOf('// While a restart is requested, keep the journal'));
     expect(block).toContain('deliver: entry => deliverRestartNote(entry),');
     expect(block).toContain('recover: entry => { publishRecoveryCard(entry.convoId); },');
-    expect(block).toContain('onSettled: outcomes => restartRequests.settleNotes(outcomes),');
+    expect(block).toContain('onSettled: (outcomes, ownerId) => restartRequests.settleNotes(outcomes, ownerId),');
+    expect(block).toMatch(/owner: \(\) => \{ const record = restartRequests\.getState\(\); return record\.state === 'back' \? record\.id : null; \},/);
   });
 });
 

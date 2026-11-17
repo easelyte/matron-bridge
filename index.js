@@ -14422,7 +14422,9 @@ const restartRequests = createRestartRequests({
 const restartNoteDelivery = createNoteDelivery({
   deliver: entry => deliverRestartNote(entry),
   recover: entry => { publishRecoveryCard(entry.convoId); },
-  onSettled: outcomes => restartRequests.settleNotes(outcomes),
+  // Notes taken now belong to the restart record that was just closed by the boot.
+  owner: () => { const record = restartRequests.getState(); return record.state === 'back' ? record.id : null; },
+  onSettled: (outcomes, ownerId) => restartRequests.settleNotes(outcomes, ownerId),
   log: message => console.warn(message),
 });
 // While a restart is requested, keep the journal's `restart` block current.
@@ -16762,7 +16764,7 @@ function publishRestartCarryOnCards() {
       // card instead, and the restart's record says they were not delivered.
       try { console.warn(`[restart-note] could not queue ${deliveries.length} note(s): ${e?.message ?? e}`); } catch { /* logging must never throw */ }
       for (const note of deliveries) publishRecoveryCard(note.convoId);
-      restartRequests.settleNotes(Object.fromEntries(deliveries.map(d => [d.convoId, { outcome: 'failed', at: Date.now() }])));
+      restartNoteDelivery.failIntake(deliveries);
     }
   }
   try { restartNotes.discard(); } catch (e) {

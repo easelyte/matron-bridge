@@ -582,3 +582,39 @@ describe('settleNotes answers whether the record was closed', () => {
     expect(readState().history_appended).toBe(true);
   });
 });
+
+describe('settleNotes: ownership and a state write that fails separately', () => {
+  it('outcomes for a record that has been replaced are dropped, not added to the new one', async () => {
+    const a = build({ head: NEW });
+    const first = await post(a.layer, { reason: 'deploy', sha: NEW, request_key: 'k1' });
+    a.layer.commitRestart({ sha: NEW });
+    const b = build({ head: NEW, bootSha: NEW });
+    await post(b.layer, { reason: 'next', sha: NEW, request_key: 'k2' });
+    expect(b.layer.settleNotes({ c1: { outcome: 'failed', at: 1 } }, first.body.id)).toBe(true);
+    expect(readState().state).toBe('pending');
+    expect(readState().results).toBeUndefined();
+  });
+
+  it('a state write that fails after the history line is retried without a second line', () => {
+    const a = build({ head: NEW });
+    const run = async () => {
+      await post(a.layer, { reason: 'deploy', sha: NEW });
+      a.layer.commitRestart({ sha: NEW });
+      return build({ head: NEW, bootSha: NEW });
+    };
+    return run().then((b) => {
+      const id = readState().id;
+      const statePath = path.join(dir, 'state.json');
+      const original = fs.readFileSync(statePath, 'utf8');
+      fs.rmSync(statePath);
+      fs.mkdirSync(statePath);
+      expect(b.layer.settleNotes({ c1: { outcome: 'failed', at: 1 } }, id)).toBe(false);
+      fs.rmdirSync(statePath);
+      fs.writeFileSync(statePath, original);
+      expect(b.layer.settleNotes({ c1: { outcome: 'failed', at: 1 } }, id)).toBe(true);
+      const lines = fs.readFileSync(path.join(dir, 'history.jsonl'), 'utf8').trim().split('\n');
+      expect(lines).toHaveLength(1);
+      expect(readState()).toMatchObject({ history_appended: true, results: { failed: ['c1'] } });
+    });
+  });
+});
