@@ -4,7 +4,7 @@ import path from 'node:path';
 import { runInNewContext } from 'node:vm';
 import { describe, expect, it, vi } from 'vitest';
 import { createPlannedRestartState, supersedesWatcherRequests } from '../lib/planned-restart-state.js';
-import { createCodeUpdateWatcher } from '../lib/code-update-restart.js';
+import { createCodeUpdateWatcher, createCommandGate } from '../lib/code-update-restart.js';
 import { evaluateQuiet } from '../lib/restart-quiet.js';
 import { readProcessTableStrict } from '../lib/process-table.js';
 import { createSubagentRunningStore } from '../lib/subagent-running-store.js';
@@ -36,7 +36,7 @@ describe('code-update self-restart wiring', () => {
     const context = {
       CODE_UPDATE_RESTART: true, BRIDGE_BOOT_AT: 1000, __dirname: '.',
       plannedRestartAvailable: true, plannedRestartState: plannedStore || { addRequest }, codeUpdateWatcher: undefined,
-      plannedRestart: { tick: vi.fn() }, supersedesWatcherRequests,
+      plannedRestart: { tick: vi.fn() }, supersedesWatcherRequests, createCommandGate, process: { env: {} },
       resolveGitDir: () => '.', readHeadReflog: () => ({ sha: 'a'.repeat(40), at: 0 }),
       sessions: new Map([['alice', { alive: true, busy: false, journalConvoId: 'alice', proc: { pid: 100 }, ...session }]]),
       evaluateQuiet, readProcessTableStrict: () => readProcessTableStrict({ exec }),
@@ -121,6 +121,11 @@ describe('code-update self-restart wiring', () => {
   it('starts the watcher at the end of main(), after the carry-on cards', () => {
     const main = index.slice(index.indexOf('async function main()'), index.indexOf('main().catch'));
     expect(main).toMatch(/publishRestartCarryOnCards\(restartBoot\);[\s\S]*startCodeUpdateWatcher\(\);/);
+  });
+
+  it('reads the restart gate from MATRON_RESTART_GATE_CMD and only inside the watcher', () => {
+    expect(fn).toMatch(/gate: createCommandGate\(process\.env\.MATRON_RESTART_GATE_CMD\)/);
+    expect(index.match(/MATRON_RESTART_GATE_CMD/g)).toHaveLength(1);
   });
 
   it('watches the checkout index.js runs from, and is off without a reflog or when disabled', () => {

@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { createApiAuth, apiAuthRefusal, viewerApiKey, isViewerRoute, namedSessionRoom, NAMES_CONFLICT, operatorHeaderPath } from '../lib/api-auth.js';
+import { createApiAuth, apiAuthRefusal, viewerApiKey, isViewerRoute, isOperatorRoute, namedSessionRoom, NAMES_CONFLICT, operatorHeaderPath, SESSION_TOKEN_HEADER, OPERATOR_TOKEN_HEADER } from '../lib/api-auth.js';
 import { readApiHeaderFile } from '../lib/api-header-file.js';
 
 const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'api-auth-'));
@@ -45,7 +45,7 @@ describe('apiAuthRefusal', () => {
   });
   it('lets a session act for itself, or on a route that names no session', () => {
     expect(apiAuthRefusal({ caller: a, method: 'POST', pathname: '/send', namedRoomId: 'room-a' })).toBe(null);
-    expect(apiAuthRefusal({ caller: a, method: 'POST', pathname: '/sessions', namedRoomId: null })).toBe(null);
+    expect(apiAuthRefusal({ caller: a, method: 'POST', pathname: '/agent-roster', namedRoomId: null })).toBe(null);
   });
   it('refuses a session acting as another', () => {
     expect(apiAuthRefusal({ caller: a, method: 'POST', pathname: '/consent/decide', namedRoomId: 'room-coord' }).status).toBe(403);
@@ -144,4 +144,45 @@ describe('operator token file ownership', () => {
       expect(fs.existsSync(file)).toBe(false);
     } finally { fs.rmSync(base, { recursive: true, force: true }); }
   });
+});
+
+// Every operator route, as isOperatorRoute lists them. Add a route here when
+// isOperatorRoute gains one, so it gets the same checks.
+const OPERATOR_ROUTES = [
+  ['POST', '/sessions'],
+];
+
+describe('operator routes refuse session tokens', () => {
+  it('lists every operator route', () => {
+    for (const [method, pathname] of OPERATOR_ROUTES) expect(isOperatorRoute(method, pathname)).toBe(true);
+  });
+
+  for (const [method, pathname] of OPERATOR_ROUTES) {
+    it(`${method} ${pathname}: a session token is refused whether or not it names a session; the operator token passes`, () => {
+      const auth = createApiAuth();
+      auth.ensure('room-a');
+      const session = auth.caller({ [SESSION_TOKEN_HEADER]: auth.tokenFor('room-a') });
+      expect(session).toEqual({ kind: 'session', roomId: 'room-a' });
+      // Names no session.
+      expect(apiAuthRefusal({ caller: session, method, pathname, namedRoomId: null })).toMatchObject({ status: 403 });
+      // Names its own session.
+      expect(apiAuthRefusal({ caller: session, method, pathname, namedRoomId: 'room-a' })).toMatchObject({ status: 403 });
+      // Names another session.
+      expect(apiAuthRefusal({ caller: session, method, pathname, namedRoomId: 'room-b' })).toMatchObject({ status: 403 });
+
+      const base = tmp();
+      try {
+        const file = operatorHeaderPath({ XDG_STATE_HOME: base }, '/nowhere');
+        auth.writeOperatorFile(file);
+        const h = readApiHeaderFile(file);
+        const op = auth.caller(Object.fromEntries(Object.entries(h).map(([k, v]) => [k.toLowerCase(), v])));
+        expect(op).toEqual({ kind: 'operator' });
+        expect(apiAuthRefusal({ caller: op, method, pathname })).toBe(null);
+        // A request carrying both tokens is judged as the session (caller()
+        // checks the session token first), so it is refused too.
+        const both = auth.caller({ [SESSION_TOKEN_HEADER]: auth.tokenFor('room-a'), [OPERATOR_TOKEN_HEADER]: h[Object.keys(h)[0]] });
+        expect(apiAuthRefusal({ caller: both, method, pathname })).toMatchObject({ status: 403 });
+      } finally { fs.rmSync(base, { recursive: true, force: true }); }
+    });
+  }
 });

@@ -363,6 +363,28 @@ describe('renderMemoryBlock', () => {
     expect(out).not.toContain('left out');
     expect(out.endsWith('\n- app-rule (project, repo:acme-app): Train.\n- c-rule (feedback, coordinator): Compact.\n- g-rule (feedback, global): Rule g-rule.')).toBe(true);
   });
+  it('on-demand memories are named under their topic, after the always ones; the rest keep the full line', () => {
+    const od = (name, topic, scope) => ({ ...m(name, `Detail of ${name}.`, 'feedback', scope), tier: 'on_demand', ...(topic ? { topic } : {}) });
+    const memories = [m('a-always'), { ...m('b-always'), tier: 'always' }, od('ship-labels', 'shipping'), od('ship-courier', 'shipping'), od('lone'), od('apex-links', 'links'), od('elsewhere', 'shipping', 'repo:other')];
+    const out = renderMemoryBlock({ known: true, memories }, { repo: 'acme-app' });
+    expect(out).toContain('\n- a-always (feedback, global): Rule a-always.\n- b-always (feedback, global): Rule b-always.\n\n### On demand: named only\n\n');
+    expect(out).toContain('read the memory with memory_get before you act, or ask memory_recall');
+    expect(out.endsWith('\n- links: apex-links\n- shipping: ship-courier, ship-labels\n- other: lone')).toBe(true);
+    expect(out).not.toContain('Detail of');
+    expect(out).not.toContain('elsewhere');
+  });
+  it('no on-demand memories, no on-demand section', () => {
+    expect(renderMemoryBlock({ known: true, memories: [m('a'), { ...m('b'), tier: 'always' }] })).not.toContain('On demand');
+  });
+  it('the on-demand index stays inside the cap with many always memories', () => {
+    const memories = [];
+    for (let i = 0; i < 2000; i += 1) memories.push(m(`rule-${String(i).padStart(4, '0')}`, 'x'.repeat(150)));
+    for (let i = 0; i < 50; i += 1) memories.push({ ...m(`od-${i}`), tier: 'on_demand', topic: `topic ${i % 7}` });
+    const out = renderMemoryBlock({ known: true, memories });
+    expect(Buffer.byteLength(out, 'utf8')).toBeLessThanOrEqual(MEMORY_BLOCK_MAX_BYTES);
+    expect(out).toContain('### On demand: named only');
+    expect(out).toContain('- topic 0: ');
+  });
   it('known and empty says there are none; unknown says to call memory_list and never claims none', () => {
     expect(renderMemoryBlock({ known: true, memories: [] })).toMatch(/You have no memories yet\.$/);
     const unknown = renderMemoryBlock({ known: false, memories: [] });

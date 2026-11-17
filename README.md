@@ -276,7 +276,15 @@ the bridge logs a warning every 30 minutes. A box that would rather force
 the restart after a while sets
 `MATRON_CODE_UPDATE_FORCE_AFTER_MS`; the interrupted chats then carry on by
 themselves (`MATRON_CODE_UPDATE_AUTO_CARRY_ON=0` gives them the "Carry on"
-card instead). Sessions between turns resume with their history on their next turn,
+card instead). `MATRON_RESTART_GATE_CMD` adds an advisory hook for the
+quiet moment: a command (argv split on whitespace, no shell) run with a
+5 s timeout at each poll once no session holds work. Exit 0 means restart,
+exit 1 means hold, with the first line of stdout as the reason, which the
+30-minute waiting warning repeats. Any other exit code, a spawn failure or a
+timeout counts as safe (logged). A hold expires after the work-hold age cap
+(eight hours) and the restart then goes ahead, logged; a forced restart
+(`MATRON_CODE_UPDATE_FORCE_AFTER_MS`) never asks the gate. Unset, nothing
+changes. Sessions between turns resume with their history on their next turn,
 as with any restart. The exit code is 75, non-zero on purpose: launchd only
 relaunches after a non-zero exit.
 
@@ -353,17 +361,19 @@ the viewer's environment turns it off.
 | `MATRON_STEP_UP_ALL` | `1` marks every question this box files, and every comment with buttons, as step-up: the tap needs the user's device signature | off |
 | `MATRON_LOCKED` | `1` puts the box in locked mode: outside input is taken only during a signed unlock window. Needs `MATRON_APPROVAL_KEYS_FILE`; the bridge refuses to start without it | off |
 | `MATRON_UNLOCK_MAX_MINUTES` | The longest unlock window a locked box grants | `120` |
+| `MATRON_BRIDGE_PLUGINS` | Comma-separated absolute paths of ES modules that add RPC methods (see `docs/plugins.md`). **A plugin runs with full bridge privileges.** Files must be owned by the bridge's user, not group- or world-writable, with no writable or foreign-owned parent directory, and outside the default and session folders. Read at startup only | _(empty: off)_ |
 | `MATRON_BRIDGE_API_PORT` | Internal API port (hooks, MCP, viewer) | `9802` |
-| `MATRON_BRIDGE_API_AUTH` | `off` stops checking the per-session tokens on the internal API (they are still issued). Leave it unset. Scripts run outside a session can list sessions (`POST /sessions`) with `curl -H @"${XDG_STATE_HOME:-$HOME/.local/state}/matron-bridge/api-operator.header"`, an owner-only file the bridge rewrites at each start | on |
+| `MATRON_BRIDGE_API_AUTH` | `off` stops checking the per-session tokens on the internal API (they are still issued). Leave it unset. Scripts run outside a session can list sessions (`POST /sessions`) with `curl -H @"${XDG_STATE_HOME:-$HOME/.local/state}/matron-bridge/api-operator.header"`, an owner-only file the bridge rewrites at each start. A session token never opens `POST /sessions`, whether or not the request names a session | on |
 | `MATRON_VIEWER_PORT` | Local file viewer port | `9803` |
 | `MATRON_WAKE_CONVO_ID` | Conversation that `POST /wake` on the internal API wakes. Lets a scheduled job on the same machine wake one conversation with a fixed text, resuming its session if it was idle-stopped; the request can choose neither the conversation nor the text. Off unless both this and `MATRON_WAKE_TEXT` are set | — |
 | `MATRON_WAKE_TEXT` | The exact text `POST /wake` delivers to `MATRON_WAKE_CONVO_ID` | — |
 | `MATRON_WAKE_TARGETS` | Optional. Comma-separated names of further wake targets, for a box that runs more than one conversation needing a wake. `POST /wake/<name>` wakes target `<name>` (lowercase letters, digits and single dashes, up to 32 characters) with the conversation in `MATRON_WAKE_CONVO_ID_<NAME>` and the text in `MATRON_WAKE_TEXT_<NAME>`, where `<NAME>` is the name upper-cased with dashes as underscores (`chat-2` reads `MATRON_WAKE_CONVO_ID_CHAT_2`). Each target coalesces on its own, and `MATRON_WAKE_TOKEN` guards them all. A listed target missing either variable is off (404) and logged at startup | — |
 | `MATRON_WAKE_TOKEN` | Optional. When set, `POST /wake` is refused (403) unless the request carries it in an `X-Matron-Wake-Token` header — the internal API port is reachable by every local user, and a wake resumes a session | — |
+| `MATRON_RESTART_GATE_CMD` | Advisory hook for the self-restart onto new code (see above): a command, split on whitespace, run with a 5 s timeout once no session holds work, in its own process group (a timeout kills the whole group) and with a minimal environment: `PATH`, `HOME` and any `MATRON_RESTART_GATE_*` variables, not the bridge's tokens. Exit 0 = restart, exit 1 = hold (first stdout line is the reason shown in the waiting warning); anything else, or a timeout, counts as safe. A hold expires after eight hours. Never consulted for a forced restart | _(unset: no gate)_ |
 | `MCP_DEFAULT_EXTRAS` | Comma-separated MCP extras loaded for every session on this machine (e.g. `circleci`). Names must match `mcpExtras` keys in `mcp-config.json`/`mcp-config.local.json`. | _(none)_ |
 | `BRIDGE_PLUGIN_CACHE_DIR` | Dir plugin MCP servers (context7, serena, …) load from. Unset = an empty bridge-owned dir (no plugin MCPs, lean). Set to `~/.claude/plugins` or a curated dir to re-enable. | _(empty dir)_ |
-| `BRIDGE_TOOL_FILTER` | Set to `1` to hide Coordinator-only `ask-user` MCP tools from confirmed Claude worker sessions, in print and interactive modes. Unknown roles keep the full list. | off |
-| `BRIDGE_TOOL_ROLE` | Set per Claude session by the bridge when filtering is enabled: `worker`, `coordinator`, or `full`. Only `worker` hides tools; unset or unknown values keep every tool. | unset |
+| `BRIDGE_TOOL_FILTER` | Coordinator-only `ask-user` MCP tools are hidden from every session that is known not to be the Coordinator (Claude print and interactive, and Codex app-server sessions), which keeps each session's tool definitions about a quarter smaller. Set to `0` to give every session every tool. A session whose role is not known yet keeps the full list. | on |
+| `BRIDGE_TOOL_ROLE` | Set per session by the bridge unless filtering is off: `worker`, `coordinator`, or `full`. Only `worker` hides tools; unset or unknown values keep every tool. | unset |
 | `DOWNLOAD_RATE_LIMIT` | Viewer requests per minute for file downloads and sensitive-link shell pages | `30` |
 | `PAGE_RATE_LIMIT` | Viewer requests per minute for rendered HTML pages (`/page`) | `60` |
 | `VIEWER_PAGE_BASE_URL` | Optional separate public URL (pointed at the same viewer) for `share_html_page` links | `VIEWER_BASE_URL` |
@@ -479,6 +489,7 @@ Bridge sessions on the same journal server can chat with each other. An agent ro
 Every session gets these MCP tools via `ask-user.js`:
 
 - `agent_roster` — list the user's other agent sessions (titles, states, rolling summaries)
+- `agent_sessions` — list the user's sessions with state and an `is_self` flag
 - `agent_chat_start` — pick a target from the roster and invite its agent to a room (a second call at the same target returns the room the pair already has)
 - `agent_chat_accept` / `agent_chat_refuse` — answer an inbound request that still needs one (a same-bridge invite, or a join request into a room you own); an approved invite from another box has already joined the agent, so accept is a no-op there and refuse mutes the room
 - `agent_chat_join` — ask to join an existing room by id

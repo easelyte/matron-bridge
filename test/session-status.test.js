@@ -1,4 +1,4 @@
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
 import { readFileSync, readdirSync } from 'fs';
 import { join, basename } from 'path';
 import { fileURLToPath } from 'url';
@@ -23,6 +23,8 @@ import {
   cpuSampledAtMs,
   ramPercent,
   startCpuSampler,
+  boxVitals,
+  boxVitalsDue,
   stopCpuSampler,
 } from '../lib/session-status.js';
 
@@ -842,5 +844,52 @@ describe('index.js header-liveness wiring', () => {
     const at = src.indexOf('session.initData = event;');
     expect(at).toBeGreaterThan(-1);
     expect(src.slice(at, at + 600)).toContain('journalStatus(session);');
+  });
+});
+
+describe('box_status vitals', () => {
+  const BASE = { idle: 1000, total: 4000 };
+  const VALID = { idle: 1400, total: 4800 };
+  const OPTS = { deltaPct: 8, heartbeatMs: 45_000 };
+  const last = { cpu_pct: 40, ram_pct: 60, at: 1_000_000 };
+  const cur = (cpu_pct, ram_pct) => ({ cpu_pct, ram_pct, sampled_at_ms: 1 });
+
+  it('boxVitals is null until both readings exist, then the full block', () => {
+    stopCpuSampler();
+    expect(boxVitals()).toBeNull(); // no CPU sample yet: a partial block would be dropped
+    sampleCpuOnce(BASE);
+    sampleCpuOnce(VALID);
+    const v = boxVitals();
+    expect(v.cpu_pct).toBe(50);
+    expect(Number.isInteger(v.ram_pct)).toBe(true);
+    expect(Number.isInteger(v.sampled_at_ms)).toBe(true);
+    stopCpuSampler();
+  });
+
+  it('boxVitalsDue: first reading, small moves, 8-point moves and the heartbeat', () => {
+    expect(boxVitalsDue(null, cur(10, 10), 5, OPTS)).toBe(true);
+    expect(boxVitalsDue(last, null, last.at + 60_000, OPTS)).toBe(false);
+    expect(boxVitalsDue(last, cur(47, 67), last.at + 10_000, OPTS)).toBe(false);
+    expect(boxVitalsDue(last, cur(48, 60), last.at + 10_000, OPTS)).toBe(true);
+    expect(boxVitalsDue(last, cur(40, 52), last.at + 10_000, OPTS)).toBe(true);
+    expect(boxVitalsDue(last, cur(40, 60), last.at + 44_999, OPTS)).toBe(false);
+    expect(boxVitalsDue(last, cur(40, 60), last.at + 45_000, OPTS)).toBe(true);
+  });
+
+  it('startCpuSampler runs onSample after each scheduled sample, not after the priming one', () => {
+    vi.useFakeTimers();
+    try {
+      stopCpuSampler();
+      const onSample = vi.fn();
+      startCpuSampler(10_000, onSample);
+      expect(onSample).not.toHaveBeenCalled();
+      vi.advanceTimersByTime(10_000);
+      expect(onSample).toHaveBeenCalledTimes(1);
+      vi.advanceTimersByTime(20_000);
+      expect(onSample).toHaveBeenCalledTimes(3);
+    } finally {
+      stopCpuSampler();
+      vi.useRealTimers();
+    }
   });
 });

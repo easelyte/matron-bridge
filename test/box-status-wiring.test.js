@@ -23,6 +23,9 @@ describe('box status wiring', () => {
     expect(fn).toMatch(/\.\.\.\(activity \? \{ activity \} : \{\}\)/);
     expect(fn).toMatch(/\.\.\.\(accountEmail \? \{ account: \{ email: accountEmail \} \} : \{\}\)/);
     expect(fn).toMatch(/if \(!activity && !limits && !disk && !accountEmail && !vitals && !defaults && !restart\) return false;/);
+    // Host CPU/RAM ride the same report (omitted until both readings exist).
+    expect(fn).toMatch(/vitals = boxVitals\(\)/);
+    expect(fn).toMatch(/\.\.\.\(vitals \? \{ vitals \} : \{\}\)/);
     // This box's effective defaults for new sessions (agent_boxes, the
     // spawn consent card), from the same resolvers a start uses.
     expect(fn).toMatch(/const \{ agent, source \} = defaultAgentInfo\(\);/);
@@ -43,11 +46,6 @@ describe('box status wiring', () => {
     // confirmed (lib/journal-publisher.js sendRoomOp/flush) still runs after
     // it, before process.exit — otherwise the report races the exit.
     expect(shutdown).toMatch(/publishBoxStatus\('shutdown'\);[\s\S]*?await journalPublisher\.flush\(\{ timeoutMs: FLUSH_TIMEOUT_MS \}\);[\s\S]*?process\.exit\(exitCode\);/);
-  });
-
-  it('adds the vitals block from the shared host sampler (contract §1)', () => {
-    expect(fn).toMatch(/vitals = buildBoxVitals\(hostVitals\(\)\)/);
-    expect(fn).toMatch(/\.\.\.\(vitals \? \{ vitals \} : \{\}\)/);
   });
 
   it('feeds Codex lines from the account reader, only where Codex runs, on the Claude throttle', () => {
@@ -79,5 +77,17 @@ describe('box status wiring', () => {
     expect(index).toMatch(/process\.env\.MATRON_OPS_SNAPSHOT_CWD\n?\s*\? path\.resolve\(expandHome\(process\.env\.MATRON_OPS_SNAPSHOT_CWD\)\)\n?\s*: DEFAULT_WORKDIR/);
     const rpc = index.slice(index.indexOf('const journalRpcHandler = createRpcRequestHandler({'));
     expect(rpc.slice(0, rpc.indexOf('\n});\n'))).toMatch(/\n\s*opsSnapshot,\n/);
+  });
+
+  it('follows the CPU sampler with a vitals-only box_status, sent only when due', () => {
+    const vitalsFn = index.slice(index.indexOf('function publishBoxVitals('), index.indexOf('function publishBoxVitals(') + 900);
+    expect(vitalsFn).toMatch(/if \(!JOURNAL_ENABLED\) return false;/);
+    expect(vitalsFn).toMatch(/boxVitalsDue\(lastBoxVitalsSent, vitals, now,/);
+    expect(vitalsFn).toMatch(/sendRoomOp\(\{ op: 'box_status', vitals \}\)/);
+    // Remembered only once the frame went out, so a dropped one is retried.
+    expect(vitalsFn).toMatch(/if \(sent\) lastBoxVitalsSent = /);
+    expect(index).toMatch(/startCpuSampler\(HOST_VITALS_SAMPLE_MS, publishBoxVitals\)/);
+    expect(index).toMatch(/HOST_VITALS_DELTA_PCT \|\| '8'/);
+    expect(index).toMatch(/HOST_VITALS_HEARTBEAT_MS \|\| '45000'/);
   });
 });

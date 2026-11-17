@@ -75,6 +75,7 @@ import { createTimelineClient } from './lib/timeline-client.js';
 import { createTimelineHandlers } from './lib/timeline-tools.js';
 import { createMemoryClient } from './lib/memory-client.js';
 import { createMemoryHandlers } from './lib/memory-tools.js';
+import { memoryRecallEntry } from './lib/memory-recall-hook.js';
 import { createMemoryLookup } from './lib/memory-lookup.js';
 import { formatProposalOutcome } from './lib/memory-format.js';
 import { createUserDefaultsLookup, defaultDeclinedText, defaultOfferFor, defaultSavedText, effectiveDefaultEffort, effectiveDefaultModel } from './lib/user-defaults.js';
@@ -164,7 +165,7 @@ import { evaluateQuiet, currentBootSubagents, sessionBackgroundWork, sessionOccu
 import { installShutdownToken, decideShutdown } from './lib/shutdown-endpoint.js';
 import { createWakeHandler, wakeTokenOk, WAKE_TOKEN_HEADER, wakeTargetsFromEnv, wakeRouteName } from './lib/wake-route.js';
 import {
-  createCodeUpdateWatcher, resolveGitDir, readHeadReflog, defaultPreflight,
+  createCodeUpdateWatcher, createCommandGate, resolveGitDir, readHeadReflog, defaultPreflight,
   restartEnabled as codeUpdateRestartEnabled, parseMs as parseCodeUpdateMs,
   autoCarryOnEnabled as codeUpdateAutoCarryOnEnabled, writeSelfRestartStamp, takeSelfRestartStamp, selectAutoCarryOn,
   AUTO_CARRY_ON_TEXT as CODE_UPDATE_AUTO_CARRY_ON_TEXT, AUTO_CARRY_ON_DELAY_MS as CODE_UPDATE_AUTO_CARRY_ON_DELAY_MS,
@@ -213,9 +214,10 @@ import { createMediaDedupLedger } from './lib/media-dedup-ledger.js';
 import { createJournalPublisher, FLUSH_TIMEOUT_MS, deriveMediaHttpBaseUrl } from './lib/journal-publisher.js';
 import { createSessionStateLatch } from './lib/journal-session-state.js';
 import { createRpcRequestHandler } from './lib/journal-rpc.js';
+import { loadBridgePlugins } from './lib/bridge-plugins.js';
 import { createLocalMemories } from './lib/local-memories.js';
 import { buildActivity, buildLimits, buildDisk } from './lib/spawn-capacity.js';
-import { buildBoxVitals, createCodexLimitsRefresher, BOX_STATUS_REPUBLISH_MS } from './lib/box-status.js';
+import { createCodexLimitsRefresher, BOX_STATUS_REPUBLISH_MS } from './lib/box-status.js';
 import { createOpsSnapshot, readHostSection } from './lib/ops-snapshot.js';
 import { createAgentSpawnHandlers } from './lib/agent-spawn.js';
 import { createSelfRestartHandler } from './lib/self-restart.js';
@@ -266,7 +268,7 @@ import { createTitleSummary } from './lib/title-summary.js';
 import { activityStateChanged, truncateActivityDetail, shouldResumeThinkingAfterTool } from './lib/journal-activity.js';
 import { streamRefFor, armReplyRef, settleReplyRef } from './lib/journal-stream.js';
 import { contextFullToNative, briefContextReport } from './lib/context-command.js';
-import { buildSessionStatus, contextTokensFromAssistantEvent, postCompactContextTokens, compactTriggerFrom, contextGaugeText, sessionContextWindow, emailFromClaudeConfig, isSidechainEvent, hostVitals, startCpuSampler, stopCpuSampler, cpuPercent, ramPercent, cpuSampledAtMs, statusRepaintDue } from './lib/session-status.js';
+import { buildSessionStatus, contextTokensFromAssistantEvent, postCompactContextTokens, compactTriggerFrom, contextGaugeText, sessionContextWindow, emailFromClaudeConfig, isSidechainEvent, hostVitals, boxVitals, boxVitalsDue, startCpuSampler, stopCpuSampler, cpuPercent, ramPercent, cpuSampledAtMs, statusRepaintDue } from './lib/session-status.js';
 import { stallFromAssistantEvent, stallResetsAt } from './lib/stall-detector.js';
 import { spawnModelFallback, stallModelFallback, isFableModel } from './lib/fable-fallback.js';
 import { createRestartNotices, planSessionControl, validateControlParams, controlNotice, authorizeControl, mergeParkedSlot, JOURNAL_DEVICE_ID, JOURNAL_ONLY_ACTIONS, CONTROL_KINDS, TURN_STARTING_OPS, occupied as controlOccupied } from './lib/session-control.js';
@@ -306,6 +308,7 @@ import { createRunDir, headerRunRoot, healHeaderFile, writeHeaderFile } from './
 import { launchWithClaudePromptFile } from './lib/claude-prompt-file.js';
 import { trimChatHistory } from './lib/chat-history-cap.js';
 import { codexMcpConfig } from './lib/codex-mcp.js';
+import { toolRoleFor } from './lib/tool-roles.js';
 import { handleCodexControl, isCodexAuthError, offerCodexBuild, listCodexThreads, mergeCodexThreads } from './lib/codex-controls.js';
 import { createCodexAccountReader, codexSessionOptions } from './lib/codex-account.js';
 import { CodexTelemetryReader, codexUsageFor } from './lib/codex-telemetry.js';
@@ -440,19 +443,24 @@ if (isRootOutsideSandbox()) {
 // behaviour, or 0 to disable the reaper entirely).
 const SESSION_IDLE_TIMEOUT_MS = parseInt(process.env.SESSION_IDLE_TIMEOUT_MS || '3600000', 10);
 const SESSION_IDLE_CHECK_MS = parseInt(process.env.SESSION_IDLE_CHECK_MS || '300000', 10);
-// Cadence of the host-wide vitals push (CPU/RAM) — a single convo-less gauge
-// evaluated on a fast timer but published ON CHANGE: emit a frame only when CPU
-// or RAM moves past a threshold (idle jitter is filtered), plus a slow heartbeat
-// so the gauge stays fresh under steady load. Idle bridge -> ~no traffic; active
-// work shows the full rise and fall. All env-overridable.
-const HOST_VITALS_SAMPLE_MS = parseInt(process.env.HOST_VITALS_SAMPLE_MS || '2000', 10);
-const HOST_VITALS_DELTA_PCT = parseInt(process.env.HOST_VITALS_DELTA_PCT || '4', 10);
-const HOST_VITALS_HEARTBEAT_MS = parseInt(process.env.HOST_VITALS_HEARTBEAT_MS || '30000', 10);
+// Host CPU/RAM on box_status: sampled every HOST_VITALS_SAMPLE_MS (CPU is the
+// busy share over that whole interval), sent when either reading has moved by
+// HOST_VITALS_DELTA_PCT points since the last send, and at least every
+// HOST_VITALS_HEARTBEAT_MS (the web client greys out a reading older than 60 s,
+// see HOST_VITALS_STALE_MS in matron-web). The heartbeat is only checked after
+// a sample, so the sample interval is capped at the heartbeat.
+const HOST_VITALS_HEARTBEAT_MS = Math.max(5000, parseInt(process.env.HOST_VITALS_HEARTBEAT_MS || '45000', 10) || 45000);
+const HOST_VITALS_SAMPLE_MS = Math.min(
+  HOST_VITALS_HEARTBEAT_MS,
+  Math.max(5000, parseInt(process.env.HOST_VITALS_SAMPLE_MS || '10000', 10) || 10000),
+);
+const HOST_VITALS_DELTA_PCT = parseInt(process.env.HOST_VITALS_DELTA_PCT || '8', 10);
+let lastBoxVitalsSent = null; // { cpu_pct, ram_pct, at } of the last send that went out
 let _hostVitalsPushHandle = null;
 // box_status heartbeat: re-publish every
 // BOX_STATUS_REPUBLISH_MS so the journal's persisted vitals stay fresh.
 let _boxStatusRepublishHandle = null;
-let _lastVitalsPublished = null; // { cpu, ram, at } of the last emitted frame
+let _lastVitalsPublished = null; // { cpu, ram, at } of the last host_vitals frame (pushHostVitals)
 // Pre-reap handoff (lib/pre-reap-handoff.js): shortly before the reap, while
 // the prompt cache is still warm, an idle session is asked to refresh its
 // mission status and is compacted when its context is large. Off when the
@@ -1445,9 +1453,7 @@ function publishBoxStatus(reason) {
   try { limits = buildLimits(usageLimitsCache, codexLimits.cache); } catch { /* best-effort */ }
   try { disk = buildDisk({ path: DEFAULT_WORKDIR }); } catch { /* best-effort */ }
   try { accountEmail = getAccountEmail(); } catch { /* best-effort */ }
-  // Host CPU/RAM (lib/box-status.js buildBoxVitals over the same sampler
-  // hostVitals() reads for status frames); omitted until both have a sample.
-  try { vitals = buildBoxVitals(hostVitals()); } catch { /* best-effort */ }
+  try { vitals = boxVitals(); } catch { /* best-effort */ }
   // What a start with no explicit choice runs as here, so agent_boxes and
   // the spawn consent card can say so (null model/effort: the agent's own
   // default).
@@ -1471,8 +1477,10 @@ function publishBoxStatus(reason) {
     ...(defaults ? { defaults } : {}),
     ...(restart ? { restart } : {}),
     ...(boxLock ? { locked: boxLock.report() } : {}),
+    ...pluginsReport(),
   });
   debug(`box_status (${reason}) ${sent ? 'sent' : 'not sent (journal not connected)'}`);
+  if (sent && vitals) lastBoxVitalsSent = { cpu_pct: vitals.cpu_pct, ram_pct: vitals.ram_pct, at: Date.now() };
   return sent;
 }
 
@@ -1493,6 +1501,18 @@ if (plannedRestartAvailable) {
     };
   }
 }
+// A box_status carrying only `vitals`: the journal merges it into the box's
+// stored report, so this small frame never replaces the usage and activity
+// blocks. Called after each CPU sample; sends only when boxVitalsDue.
+function publishBoxVitals() {
+  if (!JOURNAL_ENABLED) return false;
+  const vitals = boxVitals();
+  const now = Date.now();
+  if (!boxVitalsDue(lastBoxVitalsSent, vitals, now, { deltaPct: HOST_VITALS_DELTA_PCT, heartbeatMs: HOST_VITALS_HEARTBEAT_MS })) return false;
+  const sent = journalPublisher.sendRoomOp({ op: 'box_status', vitals });
+  if (sent) lastBoxVitalsSent = { cpu_pct: vitals.cpu_pct, ram_pct: vitals.ram_pct, at: now };
+  return sent;
+}
 
 const journalPublisher = createJournalPublisher({
   url: JOURNAL_WS_URL,
@@ -1510,7 +1530,7 @@ const journalPublisher = createJournalPublisher({
   onPanic: (panic, { hello }) => (hello ? accountLock.onHello(panic) : accountLock.onFrame(panic)),
   // The box's lock, said on every hello: a hello without it reads as "not
   // locked". A box without approval keys sends nothing.
-  helloExtras: () => (boxLock ? { locked: boxLock.report() } : null),
+  helloExtras: () => ({ ...(boxLock ? { locked: boxLock.report() } : {}), ...pluginsReport() }),
   // The user's settings: hello_ok's (or GET /settings when it carries none)
   // and every pushed change.
   onSettings: (settings, { hello }) => { if (hello) userSettings.onHello(settings); else userSettings.apply(settings); },
@@ -1952,8 +1972,17 @@ const opsSnapshot = createOpsSnapshot({
     getLiveSessions: () => buildActivity({ sessions, persisted: {} }).live_sessions,
   }),
 });
+// Operator plugins (MATRON_BRIDGE_PLUGINS, off unless set; see docs/plugins.md).
+// Loaded before the journal connects, so no callback can run half-initialized. Never loaded from the default folder or a session folder.
+const bridgePlugins = await loadBridgePlugins({
+  forbiddenDirs: [DEFAULT_WORKDIR, ...Object.values(loadPersistedSessions()).map((r) => r?.workdir).filter(Boolean)],
+});
+
+const pluginsReport = () => (journalRpcHandler.plugins?.length ? { plugins: journalRpcHandler.plugins } : {});
+
 
 const journalRpcHandler = createRpcRequestHandler({
+  plugins: bridgePlugins,
   respondRpc: (args) => journalPublisher.respondRpc(args),
   startSession: journalStartSessionForRpc,
   // The !stop teardown for the unsupported_mode orphan: kill, drop from the
@@ -3406,7 +3435,8 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
       apiHeaderFile: apiHeaderFileFor(roomId),
     }),
     config: CODEX_APP_SERVER ? codexMcpConfig({ baseConfig: RAW_MCP_CONFIG, extras,
-      bridgeDir: __dirname, roomId, apiPort: API_PORT, showFileToken, apiHeaderFile: apiHeaderFileFor(roomId) }) : {},
+      bridgeDir: __dirname, roomId, apiPort: API_PORT, showFileToken, apiHeaderFile: apiHeaderFileFor(roomId),
+      toolRole: toolRoleFor({ coordinator: options.coordinator === true, roleKnown: options.roleKnown === true }) }) : {},
   });
   codex.planMode = CODEX_APP_SERVER && persisted?.codexPlanMode === true;
 
@@ -3896,6 +3926,9 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
         foreignGateEntry({ hooksDir: path.join(__dirname, 'hooks'), apiPort: API_PORT, roomId, foreignFlag: foreignFlagPath(roomId), apiHeaderFile: apiHeaderFileFor(roomId) }),
         { matcher: 'Bash', hooks: [ivHook('matron-bash-tee')] },
       ],
+      // The user's on-demand memories that bear on each message
+      // (lib/memory-recall-hook.js).
+      UserPromptSubmit: [memoryRecallEntry({ hooksDir: path.join(__dirname, 'hooks'), apiPort: API_PORT, roomId, apiHeaderFile: apiHeaderFileFor(roomId) })],
       Stop: [{
         hooks: [ivHook('stop-notify', { timeout: 10 })],
       }],
@@ -11700,6 +11733,10 @@ function startCodeUpdateWatcher() {
       supersede: supersedesWatcherRequests(request),
     }) : null,
     preflight: () => defaultPreflight(__dirname),
+    // Optional advisory hook; unset = no gate. Never consulted for a forced
+    // restart, and never by restart_session or the other operator restarts,
+    // which do not go through this watcher.
+    gate: createCommandGate(process.env.MATRON_RESTART_GATE_CMD),
     restart: (info) => {
       if (shuttingDown) return;
       console.log(`[code-update] exiting ${CODE_UPDATE_EXIT_CODE} for the supervisor to relaunch onto ${info.sha.slice(0, 7)}${info.forced ? ` (${info.busy} session(s) mid-turn)` : ''}`);
@@ -15058,11 +15095,12 @@ const apiServer = createServer(async (req, res) => {
         return;
       }
 
-      // The four memory_* tool routes; same one-matcher allowlist shape.
-      const memoryRoute = url.pathname.match(/^\/memory\/(save|list|get|delete)$/);
+      // The memory_* tool routes and the memory-recall hook's (recall-turn);
+      // same one-matcher allowlist shape.
+      const memoryRoute = url.pathname.match(/^\/memory\/(save|list|get|delete|recall|recall-turn)$/);
       if (memoryRoute) {
         const name = memoryRoute[1];
-        await respondAgentChatRoute(res, data, memoryHandlers[name],
+        await respondAgentChatRoute(res, data, name === 'recall-turn' ? memoryHandlers.recallTurn : memoryHandlers[name],
           (status, b) => debug(`memory/${name} ${status} ${b.error || (b.memory ? b.memory.name : `${(b.memories || []).length} memories`)}`));
         return;
       }
@@ -16758,7 +16796,7 @@ async function main() {
   // many-per-tick reads never corrupt it; .unref()'d so it doesn't hold the
   // process open. host_cpu appears once the first interval has a valid diff.
   // Sample at the fast vitals cadence so a published CPU value is always fresh.
-  if (JOURNAL_ENABLED) startCpuSampler(HOST_VITALS_SAMPLE_MS);
+  if (JOURNAL_ENABLED) startCpuSampler(HOST_VITALS_SAMPLE_MS, publishBoxVitals);
   // Host-vitals gauge: a single convo-less frame, published ON CHANGE. The timer
   // only EVALUATES every HOST_VITALS_SAMPLE_MS; pushHostVitals emits a frame only
   // on a meaningful CPU/RAM delta or the heartbeat interval, so an idle bridge
