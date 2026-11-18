@@ -377,16 +377,13 @@ that POST instead of restarting at once.
 
 **Resume notes.** A session leaves itself a note with `reminder_create
 restart_note: true`; it is delivered as that chat's first turn after the next
-restart (one note per chat, dropped after about 24 hours). This fork delivers
-them with retry and backoff: the notes are written to
-`~/.matron-bridge-restart-pending.json` before anything is delivered; a chat
-that is busy, not ready for input or holding a sign-in dialog is tried again
-after a minute at no cost; a failed delivery is tried again after a minute,
-three times in all, and then the chat gets a "Carry on" card instead. A note
-is marked as delivering before it is handed over, so a crash in between is
-recorded as "possibly delivered" and never answered with a second delivery.
-What became of every note (`resumed`, `failed`, `possibly_delivered`, `stale`)
-is recorded in the restart's `results` (state file and history line).
+restart (one note per chat, dropped after about 24 hours). A failed delivery
+is tried again after a minute, three times in all, and then the chat gets a
+"Carry on" card instead. Delivery is at-least-once: a note leaves the notes
+file only once it has been delivered or carded. What became of every note
+(`resumed`, `failed`, `stale`) is recorded in the restart's `results` (state
+file and history line); a note whose card could not be published is recorded
+as `failed` and delivered again at the next boot.
 
 ## Config (.env)
 
