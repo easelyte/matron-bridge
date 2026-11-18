@@ -15,8 +15,10 @@ describe('reconcileStrandedSubagents: a resumed child supersedes a pending done 
 
   it('removes the record on delivery only while it is still that record', () => {
     const delivered = body.slice(body.indexOf('onDelivered'));
-    expect(delivered).toContain('subagentRunningStore.list().find((entry) => entry.childConvoId === childConvoId)');
-    expect(delivered).toMatch(/if \(current && current\.addedAt === addedAt\) subagentRunningStore\.remove\(childConvoId\);/);
+    // The fork reads the store strictly: an unreadable store removes nothing.
+    expect(delivered).toContain('subagentRunningStore.listStrict()');
+    expect(delivered).toMatch(/result\.records\.some\(\(entry\) => entry\.childConvoId === childConvoId && entry\.addedAt === addedAt\)/);
+    expect(delivered).toContain('subagentRunningStore.remove(childConvoId)');
     // No unconditional remove left behind.
     expect(body).not.toContain('onDelivered: () => subagentRunningStore.remove(childConvoId)');
   });

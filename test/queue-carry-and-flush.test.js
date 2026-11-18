@@ -23,6 +23,7 @@ function flushHarness({ dispatchMergedFlush }) {
     journalConvoIdFor: () => 'convo',
     endTurn: vi.fn(),
     inflightMarker: { noteTurnEnd: vi.fn() },
+    restartInputs: { begin: () => () => {} },
     dispatchMergedFlush,
     console: { log: vi.fn() },
   });
