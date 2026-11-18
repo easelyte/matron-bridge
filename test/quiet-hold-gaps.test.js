@@ -122,6 +122,19 @@ describe('restart hold gaps: what upstream holds a restart for', () => {
     expect(holders.map((h) => h.reason)).toEqual(['1 subagent still running']);
   });
 
+  it('gap: Codex native subagent (app-server child thread, outside subagentConvos)', () => {
+    // Native children are recorded by lib/codex-app-wiring.js in its own map
+    // and running store; no hold path reads them, so an idle parent with a
+    // running native child is not a holder, with a readable or unreadable ps.
+    const wiring = readFileSync(new URL('../lib/codex-app-wiring.js', import.meta.url), 'utf8');
+    expect(wiring).toMatch(/runningStore\?\.add\(childId/);
+    const session = live({ codex: { transport: 'app-server', childThreads: new Map([['t1', { running: true }]]) } });
+    expect(holdersFor([session]).holders).toHaveLength(0);
+    expect(holdersFor([session], { unreadable: true }).holders).toHaveLength(0);
+    const body = sliceFunction('sessionsHoldingRestart') + sliceFunction('sessionWorkHold');
+    expect(body).not.toMatch(/childThreads|runningStore|codex-app/);
+  });
+
   it('gap: ps failure keeps subagents but loses background children', () => {
     const table = [{ pid: 500, ppid: 100, args: 'rake test' }];
     const noSub = holdersFor([live()], { table, unreadable: true });
