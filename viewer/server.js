@@ -24,10 +24,27 @@ export function resolveViewerPort(env = process.env, warn = console.warn) {
   return 9803;
 }
 
+// Express's `trust proxy`, from MATRON_VIEWER_TRUST_PROXY. Off by default: the
+// client address is then the socket's, and an X-Forwarded-For header cannot
+// change it. Behind a tunnel or reverse proxy that would make every visitor
+// the proxy's address and every rate limit one shared budget, so a proxied
+// deployment names the proxy it trusts: `loopback` for a tunnel daemon or
+// proxy on this host (cloudflared, nginx), a hop count, or a comma-separated
+// list of addresses or subnets. The rate limiters key on req.ip, which is
+// then the client address the trusted proxy forwarded.
+export function resolveTrustProxy(env = process.env) {
+  const raw = String(env.MATRON_VIEWER_TRUST_PROXY ?? '').trim();
+  if (['', 'off', 'false', 'no', '0'].includes(raw.toLowerCase())) return false;
+  if (/^\d+$/.test(raw)) return Number(raw);
+  if (['on', 'true', 'yes'].includes(raw.toLowerCase())) return true;
+  return raw;
+}
+
 const PORT = resolveViewerPort();
 const SECRET = process.env.HMAC_SECRET;
 
 const app = express();
+app.set('trust proxy', resolveTrustProxy());
 // App-wide urlencoded parsing keeps body-parser's 100 KB default — /sensitive
 // /reveal accepts urlencoded bodies too, and nothing about a secure-input form
 // should widen ITS ceiling. Only POST /secret gets the bigger parser, mounted

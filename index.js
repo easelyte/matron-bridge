@@ -16867,6 +16867,12 @@ async function main() {
   // Short links: drop codes that expired while the bridge was down (each
   // new link prunes too; this covers a store nobody writes to for a while).
   try { shortLinkWriter?.prune(); } catch (err) { console.warn(`[short-links] could not prune the store: ${err.message}`); }
+  // And delete set-aside corrupt copies once no token in them can be live,
+  // even with short links turned off since.
+  {
+    const deleted = createShortLinkWriter({ file: shortLinksFile() }).pruneCorrupt();
+    if (deleted > 0) console.log(`[short-links] deleted ${deleted} expired corrupt store cop${deleted === 1 ? 'y' : 'ies'}`);
+  }
   // Last: turn any marker left behind by the previous process into a "Carry on"
   // card. After timerStore.init() so a re-armed timer's own resume can't race
   // the reconciliation for the same convo, and safe with respect to the journal
