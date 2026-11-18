@@ -316,7 +316,7 @@ describe('request-only mode (MATRON_CODE_UPDATE_AUTO=0)', () => {
 
 describe('never forced, gate hold never lapses', () => {
   it('pins gateMaxMs to 0 (never lapses) and forceAfterMs to 0', () => {
-    expect(PINNED_WATCHER_OPTIONS).toEqual({ gateMaxMs: 0, forceAfterMs: 0 });
+    expect(PINNED_WATCHER_OPTIONS).toEqual({ gateMaxMs: 0, forceAfterMs: 0, forceHint: '' });
     expect(Object.isFrozen(PINNED_WATCHER_OPTIONS)).toBe(true);
   });
 
