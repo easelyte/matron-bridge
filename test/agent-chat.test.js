@@ -16,7 +16,7 @@ const ROSTER = {
     { device_id: 7, name: 'box-2' },
   ],
   conversations: [
-    { id: 'convo-remote', title: 'Remote work', session_state: 'running', summary: 'porting the app', agent_device_id: 7, last_ts: 111, status: { model: 'claude-opus-5-5', context: { tokens: 87000, window: 1000000, pct: 9 }, reported_at: 111 }, mission_num: 61, extra: 'dropped' },
+    { id: 'convo-remote', title: 'Remote work', session_state: 'running', summary: 'porting the app', agent_device_id: 7, last_ts: 111, agent_kind: 'codex', status: { model: 'claude-opus-5-5', context: { tokens: 87000, window: 1000000, pct: 9 }, reported_at: 111 }, mission_num: 61, extra: 'dropped' },
     { id: 'convo-self', title: 'Local work', session_state: 'running', summary: null, agent_device_id: 1, last_ts: 222, mission_num: 'not a number' },
     { id: 'convo-orphan', title: 'No agent', session_state: 'ended', summary: '', agent_device_id: null, last_ts: 333 },
   ],
@@ -109,10 +109,9 @@ describe('createAgentChatHandlers', () => {
   });
 
   describe('agentSessions', () => {
-    it('lists same-box and cross-box sessions with state, raw kind, and only the caller flagged as self', async () => {
+    it('lists same-box and cross-box sessions with state and kind, and flags only the caller as self', async () => {
       const conversations = [
-        // caller's own JOURNAL convo id is 'convo-sess' (journalConvoIdFor stub → s.convoId),
-        // NOT the roomId '!sess' — is_self must key on the journal convo id.
+        // The caller's journal convo id is 'convo-sess', not its session key '!sess'.
         { id: 'convo-sess', title: 'This session', session_state: 'running', agent_device_id: 1, agent_kind: 'claude' },
         { id: 'convo-same-box', title: 'Same box peer', session_state: 'waiting', agent_device_id: 1, agent_kind: null },
         { id: 'convo-cross-box', title: 'Cross box peer', session_state: 'done', agent_device_id: 7, agent_kind: 'codex' },
@@ -175,9 +174,7 @@ describe('createAgentChatHandlers', () => {
       expect(res.body.self).toEqual({ device_id: 1, name: 'mac' });
       expect(res.body.agents).toEqual([{ device_id: 7, name: 'box-2' }]);
       expect(res.body.conversations).toEqual([
-        // summary blanked by default (AGENT_ROSTER_SUMMARY_ENABLED is off); agent_kind
-        // is forwarded, null when the journal omits it.
-        { id: 'convo-remote', title: 'Remote work', session_state: 'running', summary: '', agent_device_id: 7, last_ts: 111, agent_kind: null, status: { model: 'claude-opus-5-5', context: { tokens: 87000, window: 1000000, pct: 9 }, reported_at: 111 }, mission_num: 61 },
+        { id: 'convo-remote', title: 'Remote work', session_state: 'running', summary: '', agent_device_id: 7, last_ts: 111, agent_kind: 'codex', status: { model: 'claude-opus-5-5', context: { tokens: 87000, window: 1000000, pct: 9 }, reported_at: 111 }, mission_num: 61 },
         { id: 'convo-self', title: 'Local work', session_state: 'running', summary: '', agent_device_id: 1, last_ts: 222, agent_kind: null },
         { id: 'convo-orphan', title: 'No agent', session_state: 'ended', summary: '', agent_device_id: null, last_ts: 333, agent_kind: null },
       ]);
@@ -1875,7 +1872,7 @@ describe('index.js routes + ask-user.js tools (source inspection)', () => {
     // local binding said 'joined' (answerAwait's contract in lib/agent-invites.js).
     const hand = body.indexOf('deliverAutoJoinedRequest(session, frame, room, { addressed })');
     expect(hand).toBeGreaterThan(-1);
-    // Fork delta: only an addressed request auto-joins; a guessed target keeps the ask.
+    // Only an addressed request auto-joins; a guessed target keeps the ask.
     expect(body).toMatch(/if \(!isJoin && !frame\.local && addressed\) \{[\s\S]{0,1200}deliverAutoJoinedRequest\(session, frame, room, \{ addressed \}\)/);
     expect(strip(body)).not.toMatch(/agentInvites\.answer\(\{ roomId: frame\.room_id, peerDeviceId: null, accept: true/);
     expect(strip(body)).not.toContain("setState(frame.room_id, 'joined')");

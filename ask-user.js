@@ -1339,13 +1339,12 @@ server.tool(
 // a sentence keeps the model working instead of retrying blindly.
 async function callItems(name, args, render) {
   const payload = { roomId: ROOM_ID, ...args };
-  // The two minting/appending item ops carry an idempotency key the model never
-  // sees or supplies: a harness-retried item_create/item_comment
-  // would otherwise duplicate the item/comment AND re-upload its attachment blob
-  // (permanently orphaning the first upload — retention.js never reaps it). The
-  // key is derived from the call (op, room, content, +id for comments) inside a
-  // ten-minute bucket, so a retry replays the existing row instead. See
-  // lib/missions-idem.js.
+  // item_create and item_comment carry an idempotency key the model never sees:
+  // a harness-retried call would otherwise duplicate the item/comment. The key
+  // is derived from the call (op, room, content, plus the item id for
+  // comments) inside a ten-minute bucket, so a retry replays the existing row.
+  // A retry still re-uploads its attachment (the bridge uploads before the
+  // journal call), which can leave an orphaned blob. See lib/missions-idem.js.
   if (name === 'create' || name === 'comment') {
     payload.idem_key = itemIdemKey({ op: `item_${name}`, roomId: ROOM_ID, args: args || {} });
   }

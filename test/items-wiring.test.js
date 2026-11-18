@@ -21,6 +21,12 @@ describe('items tracker wiring', () => {
     expect(index).toContain('itemsHandlers[name]');
   });
 
+  it('callItems attaches an idempotency key for create and comment', () => {
+    expect(askUser).toContain('itemIdemKey');
+    expect(askUser).toMatch(/name === 'create' \|\| name === 'comment'/);
+    expect(askUser).toMatch(/payload\.idem_key = itemIdemKey\(/);
+  });
+
   it('uploads item attachments through send-attachment\'s guarded resolver, not a bespoke read', () => {
     expect(index).toMatch(/uploadLocalFile: \(session, reqPath\) => resolveAndUploadLocalFile\(\{ session, reqPath, publisher: journalPublisher \}\)/);
   });

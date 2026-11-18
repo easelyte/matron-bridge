@@ -200,7 +200,7 @@ The viewer origin also serves the secret-request and sensitive-data pages, so pa
 
 ### Short links
 
-Page, sensitive-data and secret-request links go out short, as `<viewer>/l/<code>`, instead of carrying the whole signed token. The code is 12 random letters and digits (about 71 bits) and stands for exactly one token: the bridge stores the pair in `~/.matron-bridge-short-links.json` (owner-only, pruned as codes expire; no code may outlive the longest link, 30 days, and a store found corrupt is set aside and deleted once that long has passed), and the viewer looks the code up and serves the same response the long link would, in place rather than by redirect, so the long token never reaches the address bar, the browser history or a Referer. A code expires with its token, a one-time sensitive link is still consumed once, and an unknown, expired or malformed code gets the same answer as an expired token. Long links keep working. File links in diff cards stay long. Set `MATRON_SHORT_LINKS=off` to hand out long links only. The bridge and the viewer must run as the same user, or both be given the same `MATRON_SHORT_LINKS_FILE`.
+Page, sensitive-data and secret-request links go out short, as `<viewer>/l/<code>`, instead of carrying the whole signed token. The code is 12 random letters and digits (about 71 bits) and stands for exactly one token: the bridge stores the pair in `~/.matron-bridge-short-links.json` (owner-only, pruned as codes expire; no code may outlive the longest link, 30 days, and a store found corrupt is set aside and deleted once that long has passed), and the viewer looks the code up and serves the same response the long link would, in place rather than by redirect, so the long token never reaches the address bar, the browser history or a Referer. A code expires with its token, a one-time sensitive link is still consumed once, and an unknown, expired or malformed code gets the same answer as an expired token. Long links keep working. File links in diff cards stay long. Set `MATRON_SHORT_LINKS=off` to hand out long links only. The bridge and the viewer must run as the same user, since the bridge rewrites the store owner-only on every save. If their home directories differ, give both the same `MATRON_SHORT_LINKS_FILE`.
 
 ### Live command output rides the journal protocol
 
@@ -283,7 +283,17 @@ the quiet moment: a command (argv split on whitespace, no shell) run with a
 5 s timeout at each poll once no session holds work. Exit 0 means restart,
 exit 1 means hold, with the first line of stdout as the reason, which the
 30-minute waiting warning repeats. Any other exit code, a spawn failure or a
-timeout counts as safe (logged). Unset, nothing changes.
+timeout counts as safe (logged). A hold expires after the work-hold age cap
+(eight hours) and the restart then goes ahead, logged, unless
+`MATRON_RESTART_GATE_MAX_HOLD_MS=0` says it never lapses. With
+`MATRON_RESTART_GATE_ON_ERROR=hold` the other-exit-code, spawn-failure and
+timeout cases hold too, with the error as the reason, instead of counting as
+safe. With either setting on, nothing but the gate ends a hold, so a hold
+that goes on for 30 minutes (`MATRON_RESTART_GATE_NOTICE_AFTER_MS`, a gate
+that keeps failing included) is reported once as a notice in the bridge's own
+chat, along with how to get past it. A forced restart (`MATRON_CODE_UPDATE_FORCE_AFTER_MS`) never asks the
+gate, and neither does `POST /restart` with `{"force": true}` (sessions with
+work in flight still hold it). Unset, nothing changes. (Fork: a planned restart through `scripts/planned-restart.sh` never forces and its gate hold never lapses, whatever these settings say.)
 `MATRON_CODE_UPDATE_AUTO=0` makes the watcher request-only: a HEAD move alone
 restarts nothing, and only an explicit `POST /restart` does (everything else,
 the preflight, the holds and the gate, is the same). Sessions between turns resume with their history on their next turn,
@@ -332,7 +342,9 @@ A bridge restart can also be requested without any code change, for example
 to pick up a new `.env`. It goes through the same watcher, so it waits for
 the same holds, runs the same preflight, asks the same gate, warns every 30
 minutes and exits 75. The dry run's `gate` field is the gate's latest reason
-for holding a pending restart (null before it has been asked).
+for holding a pending restart (null before it has been asked). With a restart
+gate configured, `{"force": true}` in the POST body skips the gate for that
+request; sessions with work in flight still hold it.
 The routes take the operator token (or the per-boot token that
 `scripts/planned-restart.sh` reads) only, even with `MATRON_BRIDGE_API_AUTH=off`
 (a session token or the viewer key is refused), and answer 409 when the
@@ -428,7 +440,10 @@ is recorded in the restart's `results` (state file and history line).
 | `MATRON_WAKE_TEXT` | The exact text `POST /wake` delivers to `MATRON_WAKE_CONVO_ID` | — |
 | `MATRON_WAKE_TARGETS` | Optional. Comma-separated names of further wake targets, for a box that runs more than one conversation needing a wake. `POST /wake/<name>` wakes target `<name>` (lowercase letters, digits and single dashes, up to 32 characters) with the conversation in `MATRON_WAKE_CONVO_ID_<NAME>` and the text in `MATRON_WAKE_TEXT_<NAME>`, where `<NAME>` is the name upper-cased with dashes as underscores (`chat-2` reads `MATRON_WAKE_CONVO_ID_CHAT_2`). Each target coalesces on its own, and `MATRON_WAKE_TOKEN` guards them all. A listed target missing either variable is off (404) and logged at startup | — |
 | `MATRON_WAKE_TOKEN` | Optional. When set, `POST /wake` is refused (403) unless the request carries it in an `X-Matron-Wake-Token` header — the internal API port is reachable by every local user, and a wake resumes a session | — |
-| `MATRON_RESTART_GATE_CMD` | Advisory hook for the self-restart onto new code (see above): a command, split on whitespace, run with a 5 s timeout once no session holds work, in its own process group (a timeout kills the whole group) and with a minimal environment: `PATH`, `HOME` and any `MATRON_RESTART_GATE_*` variables, not the bridge's tokens. Exit 0 = restart, exit 1 = hold (first stdout line is the reason shown in the waiting warning); anything else, or a timeout, counts as safe. A hold expires after eight hours. Never consulted for a forced restart | _(unset: no gate)_ |
+| `MATRON_RESTART_GATE_CMD` | Advisory hook for the self-restart onto new code (see above): a command, split on whitespace, run with a 5 s timeout once no session holds work, in its own process group (a timeout kills the whole group) and with a minimal environment: `PATH`, `HOME` and any `MATRON_RESTART_GATE_*` variables, not the bridge's tokens. Exit 0 = restart, exit 1 = hold (first stdout line is the reason shown in the waiting warning). By default anything else, or a timeout, counts as safe and a hold expires after eight hours; see the two settings below. Never consulted for a forced restart or a `POST /restart` made with `{"force": true}` | _(unset: no gate)_ |
+| `MATRON_RESTART_GATE_MAX_HOLD_MS` | How long a gate hold lasts before the restart goes ahead anyway. `0` = a hold never lapses, so the gate is authoritative. Digits only; anything else (`0s`, `8h`, `0.5`) is ignored and the eight hours apply, as before | _(unset: 8 h)_ |
+| `MATRON_RESTART_GATE_NOTICE_AFTER_MS` | With the gate made authoritative (the two settings below), how long a hold lasts before one notice about it goes to the bridge's own chat, with how to get past it (`POST /restart` with `{"force": true}`). Digits only, at least 1 | _(unset: 30 min)_ |
+| `MATRON_RESTART_GATE_ON_ERROR` | `hold`: a gate that errors, times out or cannot start holds the restart (reason `gate error: ...`, warned once per distinct error) instead of counting as safe. Any other value: advisory, as before | _(unset: errors count as safe)_ |
 | `MCP_DEFAULT_EXTRAS` | Comma-separated MCP extras loaded for every session on this machine (e.g. `circleci`). Names must match `mcpExtras` keys in `mcp-config.json`/`mcp-config.local.json`. | _(none)_ |
 | `BRIDGE_PLUGIN_CACHE_DIR` | Dir plugin MCP servers (context7, serena, …) load from. Unset = an empty bridge-owned dir (no plugin MCPs, lean). Set to `~/.claude/plugins` or a curated dir to re-enable. | _(empty dir)_ |
 | `BRIDGE_TOOL_FILTER` | Coordinator-only `ask-user` MCP tools are hidden from every session that is known not to be the Coordinator (Claude print and interactive, and Codex app-server sessions), which keeps each session's tool definitions about a quarter smaller. Set to `0` to give every session every tool. A session whose role is not known yet keeps the full list. | on |
@@ -439,7 +454,7 @@ is recorded in the restart's `results` (state file and history line).
 | `MATRON_SHORT_LINKS` | Set to `off` to hand out long signed links instead of short `/l/<code>` ones (see "Short links") | on |
 | `MATRON_SHORT_LINKS_FILE` | The short-link store, written by the bridge and read by the viewer | `~/.matron-bridge-short-links.json` |
 | `SHORT_LINK_RATE_LIMIT` | Viewer requests per minute for `/l/<code>` lookups, before the route's own limit | `120` |
-| `MATRON_VIEWER_TRUST_PROXY` | Express `trust proxy` for the viewer, so its rate limits count per visitor instead of one shared budget behind a proxy. `loopback` for a tunnel daemon or reverse proxy on the same host (e.g. cloudflared); also a hop count or a comma-separated list of addresses/subnets. Leave unset when nothing sits in front of the viewer: X-Forwarded-For is then ignored and cannot be forged | off |
+| `MATRON_VIEWER_TRUST_PROXY` | Express `trust proxy` for the viewer, so its rate limits count per visitor instead of one shared budget behind a proxy. `loopback` for a tunnel daemon or reverse proxy on the same host (e.g. cloudflared); also a hop count or a comma-separated list of addresses/subnets. `true`/`on` are refused (they would trust a client-written X-Forwarded-For). Leave unset when nothing sits in front of the viewer: X-Forwarded-For is then ignored and cannot be forged | off |
 | `REVEAL_RATE_LIMIT` | Viewer requests per minute for `POST /sensitive/reveal`, counted separately so shell loads cannot exhaust it | `30` |
 | `WHISPER_MODEL_PATH` | whisper.cpp model for the optional local voice-note fallback. Used only when this file, and the `whisper-cli` built beside it, exist; the journal transcribes first, and the bridge never installs whisper itself | `~/.local/share/whisper-cpp/models/ggml-small.bin` |
 | `WHISPER_LANGUAGE` | Language for the local whisper fallback | `en` |

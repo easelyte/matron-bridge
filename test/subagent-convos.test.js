@@ -746,7 +746,7 @@ describe('createSubagentConvoTracker', () => {
       tracker.discover('agent-1', { label: 'A', agentType: null });
       expect(runningStore.calls.add).toHaveLength(1);
       expect(runningStore.calls.add[0].childConvoId).toBe('parent-uuid:sub:agent-1');
-      expect(runningStore.calls.add[0].meta).toMatchObject({ parentConvoId: 'parent-uuid', agentId: 'agent-1' });
+      expect(runningStore.calls.add[0].meta).toMatchObject({ parentConvoId: 'parent-uuid', agentId: 'agent-1', incarnation: true });
       expect(runningStore.list()).toHaveLength(1);
 
       tracker.noteTaskResult('toolu_1'); // sync-Task tool_result → finish

@@ -27,6 +27,16 @@ describe('code-update self-restart wiring', () => {
     expect(index.match(/process\.env\.MATRON_RESTART_GATE_CMD/g)).toHaveLength(1);
   });
 
+  it('reads the opt-in authoritative gate settings from the environment', () => {
+    // The hold itself never lapses: MATRON_RESTART_GATE_MAX_HOLD_MS is not read (pinned).
+    expect(fn).not.toMatch(/MATRON_RESTART_GATE_MAX_HOLD_MS/);
+    expect(fn).toMatch(/notify: \(text\) =>/);
+    expect(fn).toMatch(/gateNoticeAfterMs: \/\^\[1-9\]\\d\*\$\/\.test\(String\(process\.env\.MATRON_RESTART_GATE_NOTICE_AFTER_MS/);
+    expect(fn).not.toMatch(/never by restart_session or the other operator restarts, which do not go through this watcher/);
+    expect(fn).toMatch(/MATRON_RESTART_GATE_ON_ERROR/);
+    expect(fn).toMatch(/=== 'hold' \? 'hold' : 'safe'/);
+  });
+
   it('watches the checkout index.js runs from, and is off without a reflog or when disabled', () => {
     expect(fn).toMatch(/if \(!CODE_UPDATE_RESTART\) \{/);
     expect(fn).toMatch(/resolveGitDir\(__dirname\)/);

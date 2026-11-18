@@ -25,7 +25,7 @@ if (PREFLIGHT_MODE === 'gate') {
 }
 import { createRestartRequests, PINNED_WATCHER_OPTIONS } from './lib/restart-request.js';
 import { createRestartPreflight, restartPreflightKey } from './lib/restart-preflight.js';
-import { createNoteDelivery } from './lib/restart-note-delivery.js';
+import { createOutcomeNoteDelivery } from './lib/restart-note-outcomes.js';
 import { BRIDGE_BOOT_AT } from './lib/boot-time.js';
 import { spawn, execFileSync, execFile } from 'child_process';
 import {
@@ -167,7 +167,7 @@ import { hookEntry } from './lib/hook-command.js';
 import { liveLogDir, liveLogPath as liveLogPathFor, openOwnLiveLog } from './lib/live-log-dir.js';
 import { killProcessTree } from './lib/process-kill.js';
 import { processTableCommand, readProcessTableStrict } from './lib/process-table.js';
-import { createQuietReader, createInputCounter, currentBootSubagents, sessionBackgroundWork, sessionOccupied } from './lib/restart-quiet.js';
+import { createQuietReader, createInputCounter } from './lib/restart-quiet.js';
 import { installShutdownToken, decideShutdown } from './lib/shutdown-endpoint.js';
 import { createWakeHandler, wakeTokenOk, WAKE_TOKEN_HEADER, wakeTargetsFromEnv, wakeRouteName } from './lib/wake-route.js';
 import {
@@ -455,9 +455,6 @@ const HOST_VITALS_SAMPLE_MS = Math.min(
 );
 const HOST_VITALS_DELTA_PCT = parseInt(process.env.HOST_VITALS_DELTA_PCT || '8', 10);
 let lastBoxVitalsSent = null; // { cpu_pct, ram_pct, at } of the last send that went out
-// box_status heartbeat: re-publish every
-// BOX_STATUS_REPUBLISH_MS so the journal's persisted vitals stay fresh.
-let _boxStatusRepublishHandle = null;
 // Pre-reap handoff (lib/pre-reap-handoff.js): shortly before the reap, while
 // the prompt cache is still warm, an idle session is asked to refresh its
 // mission status and is compacted when its context is large. Off when the
@@ -2213,11 +2210,10 @@ function journalUpsertConvo(session, opts, options) {
     persistSession(session.roomId, session.claudeSessionId, session.workdir,
       session.originRoomId, { journalTitleHint: opts.title });
   }
-  // Stamp the backend kind on every session-scoped upsert so clients can mark
-  // codex vs claude on top-level conversation rows. session.agent
-  // ('claude' | 'codex') is set at session creation; a caller that already
-  // supplied agentKind wins. agent_kind is COALESCE-sticky server-side, so
-  // re-sending it on each state transition is idempotent.
+  // Stamp the backend kind ('claude' | 'codex') on every session-scoped upsert
+  // so clients can mark codex vs claude on top-level conversation rows. A
+  // caller that already supplied agentKind wins. The journal keeps the last
+  // non-null kind, so re-sending it on each state change is harmless.
   journalPublish(
     session,
     'upsertConvo',
@@ -2364,22 +2360,23 @@ function publishEditDiffToConvo(session, convoId, toolName, input) {
 // out to `claude -p "/usage"` — a local command that costs no API tokens but
 // does boot a claude process, hence the throttle: at most one fetch per
 // LIMITS_REFRESH_MS, refreshed only when turns are actually ending (nothing
-// runs overnight). A failed fetch stamps fetchedAt too, so an outage can't
+// runs overnight). A failed fetch stamps attemptedAt too, so an outage can't
 // turn every turn end into a spawn storm.
+let _boxStatusRepublishHandle = null;
 const LIMITS_REFRESH_MS = parseInt(process.env.LIMITS_REFRESH_MS || '300000', 10); // 5 min
-// fetchedAt = when the held lines were measured (box_status limits.as_of);
-// attemptedAt = last fetch attempt, success or failure (the throttle). Kept
-// apart so a failed refresh never re-stamps old quotas as fresh. okAt mirrors
-// fetchedAt: the last fetch that actually parsed, which freshness checks read.
+// okAt: the last fetch that actually parsed. fetchedAt also stamps failed
+// fetches (the refresh throttle), so freshness checks read okAt.
+// attemptedAt drives the refresh throttle (failed fetches stamp it too);
+// fetchedAt is when the held lines were actually measured, reported as as_of.
 const usageLimitsCache = { lines: null, fetchedAt: 0, attemptedAt: 0, okAt: 0, inflight: null };
 // A refresh that yields no limits is logged once per streak, not only under
 // DEBUG: a box whose /usage never prints them otherwise just shows no limits.
 const usageMissLog = createUsageMissLogger((m) => console.warn(m));
 const codexAccountReader = createCodexAccountReader();
-// Codex quota lines for box_status (wire contract 2026-09-26 §1): the
-// account-scoped `account/rateLimits/read` query via the shared reader, on the
-// Claude cache's LIMITS_REFRESH_MS throttle, only where Codex can run. A
-// failed read keeps the previous lines (lib/box-status.js).
+// Codex quota lines for box_status: the account-scoped `account/rateLimits/read`
+// query via the shared reader, on the Claude cache's LIMITS_REFRESH_MS throttle,
+// only where Codex can run. A failed read keeps the previous lines
+// (lib/box-status.js).
 const codexLimits = createCodexLimitsRefresher({
   read: () => codexAccountReader.read(DEFAULT_WORKDIR),
   available: () => detectCodexBinary(),
@@ -3598,6 +3595,9 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
       // killSession normally performs this synchronously so a replacement
       // session cannot inherit running/thinking state. Keep an exit-side
       // fallback for any future path that marks the session dead directly.
+      // A child that exits because the bridge is shutting down is not a
+      // failed turn: no error card, and the queue is not flushed into a
+      // process that is about to go away.
       finishCodexTurn(session, {
         usage: session._codexCompletedUsage,
         discardOutput: true,
@@ -3871,7 +3871,8 @@ function finishCodexTurn(session, {
   // carry-on card. Teardown leaves the marker standing; a genuine end clears
   // it. A deliberate !stop clears it explicitly at its own call site, before
   // killSession runs, so that case does not rely on this branch.
-  if (!discardOutput) inflightMarker.noteTurnEnd(journalConvoIdFor(session), { hasWork: sessionHasBackgroundWork(session) });
+  if (!discardOutput) inflightMarker.noteTurnEnd(journalConvoIdFor(session), { hasWork: true });
+  if (!discardOutput) dropBackgroundMarkerWhenNoWork(session);
   journalSessionState(session, 'waiting');
   journalActivity(session, 'idle');
   maybeSummarizeAtTurnEnd(session);
@@ -4379,7 +4380,8 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     session.turnCount++;
     session.busy = false;
     // Authoritative iv-mode turn-end seam.
-    inflightMarker.noteTurnEnd(journalConvoIdFor(session), { hasWork: sessionHasBackgroundWork(session) });
+    inflightMarker.noteTurnEnd(journalConvoIdFor(session), { hasWork: true });
+    dropBackgroundMarkerWhenNoWork(session);
     journalSessionState(session, 'waiting');
     journalActivity(session, 'idle');
     maybeSummarizeAtTurnEnd(session);
@@ -4730,7 +4732,7 @@ function handleInteractiveScreenUpdate(session, update) {
   // stale one still in the capture buffer (a retry's earlier link) must not
   // be sent in place of the fresh one just marked surfaced.
   const orderedUrls = [...newUrls, ...allUrls.filter(u => !newUrls.includes(u))];
-  const message = formatTuiCueMessage(unwrappedScreen, orderedUrls, { hasNewUrls: newUrls.length > 0 });
+  const message = formatTuiCueMessage(unwrappedScreen, orderedUrls, { hasNewUrls: newUrls.length > 0, newUrls });
   // Auto-Enter decision is independent of message formatting: an
   // acknowledgment screen the formatter can't summarise must STILL be
   // acknowledged, or claude sits blocked on a keystroke the user can't see.
@@ -5350,7 +5352,7 @@ function reconcileStrandedSubagents(reason = 'startup', { beforeBootOnly = false
   const repairFrames = strandedRepairFrames(entries, stranded);
   let published = 0;
   for (const { childConvoId, parentConvoId } of repairFrames) {
-    const addedAt = entries.find((entry) => entry.childConvoId === childConvoId).addedAt;
+    const addedAt = entries.find((entry) => entry.childConvoId === childConvoId)?.addedAt;
     try {
       // Publish `done` and drop the store record ONLY on confirmed delivery
       // a capacity-rejected best-effort send or a
@@ -5362,7 +5364,9 @@ function reconcileStrandedSubagents(reason = 'startup', { beforeBootOnly = false
         childConvoId,
         { sessionState: 'done', parentConvoId },
         { onDelivered: () => {
-          // A resumed incarnation must survive delivery of an older repair.
+          // A child resumed after this repair was queued has a newer record
+          // (add with incarnation: true); the older repair must not erase it.
+          // Strict read (fork): an unreadable store removes nothing.
           const result = subagentRunningStore.listStrict();
           if (result.ok === true && result.records.some((entry) => entry.childConvoId === childConvoId && entry.addedAt === addedAt)) {
             subagentRunningStore.remove(childConvoId);
@@ -6100,7 +6104,8 @@ function handleClaudeEvent(session, event) {
         foreignSessions.end(session);
         endTurn(session);
         // Authoritative print-mode turn-end seam.
-        inflightMarker.noteTurnEnd(journalConvoIdFor(session), { hasWork: sessionHasBackgroundWork(session) });
+        inflightMarker.noteTurnEnd(journalConvoIdFor(session), { hasWork: true });
+        dropBackgroundMarkerWhenNoWork(session);
         clearPendingInterrupt(session);
         // Print-mode's turn-end (this `case 'result':` block is its equivalent
         // of iv-mode's session.onTurnEnd above) — same 'waiting' transition.
@@ -6326,7 +6331,8 @@ function handleClaudeEvent(session, event) {
             // This branch IS the turn-end for a print-mode session at a manual
             // compact boundary (the iv branch above delegates to onTurnEnd,
             // which clears the marker there).
-            inflightMarker.noteTurnEnd(journalConvoIdFor(session), { hasWork: sessionHasBackgroundWork(session) });
+            inflightMarker.noteTurnEnd(journalConvoIdFor(session), { hasWork: true });
+            dropBackgroundMarkerWhenNoWork(session);
             endTurn(session);
             clearPendingInterrupt(session);
           }
@@ -6641,7 +6647,7 @@ function inflightTurnOrigin(session) {
 // again here as an agent-sourced echo would duplicate it. Every other caller
 // (text the bridge injects itself, which has no other route into the
 // journal) leaves this false.
-function sendToSession(session, contentBlocks, { skipJournalMirror = false, foreign = false, plainTurn = false, causes = null, queuedEntries = null } = {}) {
+function sendToSession(session, contentBlocks, { skipJournalMirror = false, foreign = false, causes = null, queuedEntries = null } = {}) {
   const finishInput = restartInputs.begin();
   try {
     if (!session.alive || session._autoStopped) return false;
@@ -6662,7 +6668,7 @@ function sendToSession(session, contentBlocks, { skipJournalMirror = false, fore
     if (session.codex?.transport === 'app-server' && (session._codexAccountCommandPending || session._codexLoginId)) {
       return reportSessionSendFailure(session, 'Complete Codex sign-in in your browser first. Enter the device code there, then send your message again after Matron confirms. Use /login cancel to cancel.');
     }
-    const nativeCompact = !plainTurn && session.codex?.transport === 'app-server' && contentBlocks.length === 1
+    const nativeCompact = session.codex?.transport === 'app-server' && contentBlocks.length === 1
       && contentBlocks[0]?.type === 'text' && isCompactCommand(contentBlocks[0].text);
     if (nativeCompact && contentBlocks[0].text.trim() !== '/compact') {
       return reportSessionSendFailure(session, 'Native Codex compaction does not accept custom instructions. Use /compact by itself.');
@@ -6763,7 +6769,7 @@ function sendToSession(session, contentBlocks, { skipJournalMirror = false, fore
     // Placed after the journal mirror above so the journal records what the user
     // actually typed. Plain /context needs no marking: flushResponse trims any
     // context report by default.
-    if (!plainTurn && contentBlocks.length === 1 && contentBlocks[0].type === 'text') {
+    if (contentBlocks.length === 1 && contentBlocks[0].type === 'text') {
       const nativeContext = contextFullToNative(contentBlocks[0].text);
       if (nativeContext) {
         session._contextFullOnce = true;
@@ -7088,7 +7094,8 @@ function releaseStaleSteerHold(session, why = 'steered message never started a t
   session.busy = false;
   foreignSessions.end(session);
   endTurn(session);
-  inflightMarker.noteTurnEnd(journalConvoIdFor(session), { hasWork: sessionHasBackgroundWork(session) });
+  inflightMarker.noteTurnEnd(journalConvoIdFor(session), { hasWork: true });
+  dropBackgroundMarkerWhenNoWork(session);
   clearPendingInterrupt(session);
   journalSessionState(session, 'waiting');
   journalActivity(session, 'idle');
@@ -7361,9 +7368,15 @@ function dispatchMergedFlush(session, queued) {
   if (blocks.length === 0) return false;
   // One turn for the whole batch: it was started by everything in it.
   if (!sendToSession(session, blocks, { skipJournalMirror: true, causes: queueCauses(queued), queuedEntries: queued })) return false;
-  if (mirrorText) journalPublishUserItem(session, 'publishText', { body: mirrorText, from: 'user' });
-  for (const entry of queued) {
-    for (const payload of pendingMediaMirror(entry)) journalMirrorUserMedia(session, payload);
+  // The text is already with the agent. A throw from the journal mirror must not
+  // read as a failed send, or flushQueue would restore the batch and send it twice.
+  try {
+    if (mirrorText) journalPublishUserItem(session, 'publishText', { body: mirrorText, from: 'user' });
+    for (const entry of queued) {
+      for (const payload of pendingMediaMirror(entry)) journalMirrorUserMedia(session, payload);
+    }
+  } catch (e) {
+    console.log(`[QUEUE] journal mirror of a delivered batch failed (room ${session.roomId}): ${e?.message ?? String(e)}`);
   }
   return true;
 }
@@ -7579,10 +7592,20 @@ function flushQueue(session, queued, releaseSnapshot = null) {
     return false;
   }
   let delivered;
+  const wasBusy = session.busy;
   try {
     delivered = dispatchMergedFlush(session, queued);
   } catch (e) {
+    // The batch was detached from the queue before the send; if the send
+    // throws it would be lost, so put it back for a later flush.
     restore();
+    // The send began a turn that no agent output will ever end: close it, or
+    // the restored batch waits on a turn end that never comes.
+    if (!wasBusy && session.busy) {
+      session.busy = false;
+      if (session.currentTurn) endTurn(session);
+      inflightMarker.noteTurnEnd(journalConvoIdFor(session));
+    }
     console.log(`[QUEUE] dispatch threw; kept ${queued.length} queued message(s) for retry (room ${session.roomId}): ${e?.message ?? String(e)}`);
     return false;
   }
@@ -9988,7 +10011,8 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
 // `silent` marks a line that is only a record (see timerCardPayload): the
 // journal and the apps show it and tell nobody.
 function journalPublishNotice(convoId, body, notice = null, { silent = false } = {}) {
-  if (!JOURNAL_ENABLED || !convoId) return;
+  // An empty body is no notice (a retried resume note's later attempts ask for none).
+  if (!JOURNAL_ENABLED || !convoId || !body) return;
   try {
     journalPublisher.publishText(convoId, { body, from: 'assistant', ...(notice ? { notice } : {}), ...(silent ? { silent: true } : {}) });
   } catch (e) {
@@ -11881,13 +11905,21 @@ function startCodeUpdateWatcher() {
     // out) plus the fork's, which never age out and see what upstream cannot.
     busySessions: () => sessionsHoldingRestart().holders.length + restartRequests.occupiedNow().length,
     preflight: () => defaultPreflight(__dirname),
-    // Sha pin, fork quiet rule, MATRON_RESTART_GATE_CMD and the .env preflight.
-    // Never consulted for restart_session or the other operator restarts, which
-    // do not go through this watcher.
+    // Sha pin, fork quiet rule, MATRON_RESTART_GATE_CMD and the .env preflight
+    // (restartRequests.gate wraps createCommandGate). Never consulted for
+    // restart_session or the other operator restarts, which do not go through
+    // this watcher.
     gate: restartRequests.gate,
     // The record the crash rollback reads is written before the exit; a restart
     // that cannot be recorded does not go ahead.
     beforeRestart: restartRequests.commitRestart,
+    // Upstream's opt-in settings kept: a gate that fails closed and a notice after a
+    // long hold. The hold itself never lapses (PINNED_WATCHER_OPTIONS below).
+    gateNoticeAfterMs: /^[1-9]\d*$/.test(String(process.env.MATRON_RESTART_GATE_NOTICE_AFTER_MS ?? '').trim())
+      ? Number(String(process.env.MATRON_RESTART_GATE_NOTICE_AFTER_MS).trim())
+      : undefined,
+    notify: (text) => { try { journalPublishNotice(JOURNAL_CONTROL_CONVO_ID, `⚠️ ${text}`); } catch { /* a notice must never break the watcher */ } },
+    gateOnError: String(process.env.MATRON_RESTART_GATE_ON_ERROR || '').trim().toLowerCase() === 'hold' ? 'hold' : 'safe',
     restart: (info) => {
       if (shuttingDown) return;
       console.log(`[code-update] exiting ${CODE_UPDATE_EXIT_CODE} for the supervisor to relaunch onto ${info.sha.slice(0, 7)}${info.forced ? ` (${info.busy} session(s) mid-turn)` : ''}`);
@@ -12644,6 +12676,9 @@ function deliverRoomFrameTo(room, frame) {
     // the 💬 line for the message that arrived after it.
     if (live) {
       maybeFlushRoomDelivery(session);
+      // The flush can run a parked command that replaces or ends the session.
+      // Re-read it so the rest of this delivery targets the session that exists
+      // now, not the one that was just retired.
       session = sessions.get(room.sessionRoomId);
       live = !!(session && session.alive);
     }
@@ -13040,11 +13075,11 @@ function journalInjectInviteRequest(frame) {
   // otherwise the room stays pending and the agent gets the accept/refuse
   // ask below, whose agent_chat_accept retries the answer properly.
   //
-  // fork delta: only an ADDRESSED request auto-joins. An unaddressed
-  // one (a peer bridge that predates target_convo_id) was routed here by a
-  // guess among live sessions (lib/invite-target.js); auto-joining would bind
-  // a room into a conversation it was never meant for with the user's notice
-  // suppressed, so the guessed session keeps the explicit accept/refuse ask.
+  // Only an ADDRESSED request auto-joins. An unaddressed one (a peer bridge
+  // that predates target_convo_id) was routed here by a guess among live
+  // sessions (lib/invite-target.js); auto-joining would bind a room into a
+  // conversation it was never meant for with the user's notice suppressed, so
+  // the guessed session keeps the explicit accept/refuse ask.
   if (!isJoin && !frame.local && addressed) {
     deliverAutoJoinedRequest(session, frame, room, { addressed })
       .catch((e) => { try { console.warn(`[agent-invites] joined-room delivery for ${frame.room_id} failed: ${e?.message ?? e}`); } catch { /* logging must never throw */ } });
@@ -14397,16 +14432,21 @@ const restartRequests = createRestartRequests({
   warn: message => console.warn(message),
   log: message => console.log(message),
 });
-// Resume notes after a restart (lib/restart-note-delivery.js): upstream's notes
-// plus the fork's retry and backoff and the recovery card. Its outcomes close
-// the restart's record (results in the state file, its history line).
-const restartNoteDelivery = createNoteDelivery({
-  deliver: entry => deliverRestartNote(entry),
-  recover: entry => { publishRecoveryCard(entry.convoId); },
+// Resume notes after a restart: upstream's delivery (lib/restart-note-delivery.js,
+// retry and "Carry on" card) wrapped so each note's outcome closes the restart's
+// record (lib/restart-note-outcomes.js; results in the state file, its history line).
+const restartNoteDelivery = createOutcomeNoteDelivery({
+  deliver: deliverRestartNote,
+  recover: (note) => publishNoteRecoveryCard(note.convoId),
+  discard: (entries) => restartNotes.discard(entries),
+  log: (m) => { try { console.warn(m); } catch { /* logging must never throw */ } },
+  firstDelayMs: CODE_UPDATE_AUTO_CARRY_ON_DELAY_MS,
+  // Going down: no retry may start, card or remove anything; the notes that
+  // were not dealt with stay on disk for the next boot.
+  halted: () => shuttingDown,
   // Notes taken now belong to the restart record that was just closed by the boot.
   owner: () => { const record = restartRequests.getState(); return record.state === 'back' ? record.id : null; },
   onSettled: (outcomes, ownerId) => restartRequests.settleNotes(outcomes, ownerId),
-  log: message => console.warn(message),
 });
 
 // The session a loopback API request acts for (lib/api-auth.js).
@@ -16402,23 +16442,6 @@ function readProcessTable() {
   }
 }
 
-// A failed observation must not erase evidence of background work.
-function sessionHasBackgroundWork(session, observed = readProcessTableStrict) {
-  try {
-    const result = observed();
-    if (result?.ok !== true || !Array.isArray(result.table)) return true;
-    const running = subagentRunningStore.listStrict();
-    if (running.ok !== true) return true;
-    const subagents = currentBootSubagents(running.records, BRIDGE_BOOT_AT);
-    // The completion hook is still running while its turn-end request is handled.
-    const signatures = [...MCP_SERVER_SIGNATURES, ['stop-notify.sh'], ['stop-notify.mjs']];
-    const work = sessionBackgroundWork(session, result.table, subagents, signatures, journalConvoIdFor(session));
-    return work.children || work.subagents;
-  } catch {
-    return true;
-  }
-}
-
 // {reason} when this session has work in flight (a turn running, or a live
 // descendant of its claude process that is not one of its configured MCP
 // servers — a tool call, a background task — or a running subagent),
@@ -16432,6 +16455,93 @@ function sessionWorkHold(session, last, now, table) {
     now,
     subagentCount: session.subagentConvos?.runningCount() ?? 0,
   });
+}
+
+// `ps` without blocking the event loop: the turn-end seams and the sweep below
+// run on the hot path, and a synchronous read (up to 5 s) would stall every
+// session. Same command and parse as readProcessTable; a failure resolves to
+// the same unreadable empty table, never rejects.
+function readProcessTableAsync() {
+  return new Promise((resolve) => {
+    try {
+      const { file, args: ptArgs } = processTableCommand();
+      const timeout = process.platform === 'win32' ? 15000 : 5000;
+      execFile(file, ptArgs, { encoding: 'utf8', timeout, maxBuffer: 16 * 1024 * 1024, env: stripJournalCreds(), windowsHide: true }, (err, stdout) => {
+        if (err) {
+          debug(`readProcessTableAsync failed: ${err.message}`);
+          resolve(Object.assign([], { unreadable: true }));
+          return;
+        }
+        try { resolve(parseProcessTable(stdout)); } catch { resolve(Object.assign([], { unreadable: true })); }
+      });
+    } catch (e) {
+      debug(`readProcessTableAsync failed: ${e.message}`);
+      resolve(Object.assign([], { unreadable: true }));
+    }
+  });
+}
+
+// Whether work outlives the turn that just ended: a live background child or a
+// running subagent, by the same rule that holds a restart or the idle reaper
+// (sessionWorkHold, with the turn itself left out: it is the thing that just
+// ended). An unreadable process table falls back to the in-memory subagent
+// count, as sessionsHoldingRestart does.
+// `idleSince` is the session's last activity (default: now, at a turn end), so
+// the sweep applies the same eight-hour cap as the reaper and the update restart.
+function sessionHasBackgroundWork(session, table, idleSince = Date.now()) {
+  try {
+    const now = Date.now();
+    const hold = table.unreadable
+      ? workHold({ subagentCount: session.subagentConvos?.runningCount() ?? 0, idleSince, now })
+      : sessionWorkHold(Object.create(session, { busy: { value: false } }), idleSince, now, table);
+    return !!hold;
+  } catch {
+    // A failed observation must not erase the evidence that work was running.
+    return true;
+  }
+}
+
+// The second half of a turn end. The marker was just kept as a background
+// marker (inflightMarker.noteTurnEnd with hasWork: true, so nothing is lost if
+// the check is slow); this checks without blocking whether anything outlives
+// the turn and drops the marker when nothing does. clearBackground only touches
+// a background marker, so a turn that has already started again is left alone.
+function dropBackgroundMarkerWhenNoWork(session) {
+  const convoId = journalConvoIdFor(session);
+  void readProcessTableAsync().then((table) => {
+    if (shuttingDown) return;
+    if (!sessionHasBackgroundWork(session, table)) inflightMarker.clearBackground(convoId);
+  });
+}
+
+// Keeps background markers honest while no turn runs. A marker is refreshed
+// while its work is still there (so a job longer than the carry-on window
+// still gets its card) and dropped once the work is gone, and also when the
+// conversation has no live session any more: reaped, killed, archived or
+// exited, the work it stood for is gone with it, and a card after a later
+// restart would be for something the restart never touched. The process table
+// is read (asynchronously) once per tick, and only when a background marker
+// exists. Not while shutting down: the sessions the SIGTERM path kills are
+// exactly the ones whose cards the restart must keep.
+function startBackgroundMarkerMaintenance() {
+  setInterval(async () => {
+    if (shuttingDown) return;
+    const ids = inflightMarker.backgroundIds();
+    if (!ids.length) return;
+    const live = new Map();
+    for (const session of sessions.values()) {
+      if (session.alive && !session._autoStopped) live.set(journalConvoIdFor(session), session);
+    }
+    const table = await readProcessTableAsync();
+    if (shuttingDown) return;
+    for (const convoId of ids) {
+      const session = live.get(convoId);
+      if (!session) { inflightMarker.clearBackground(convoId); continue; }
+      if (session.busy) continue;
+      if (sessionHasBackgroundWork(session, table, handoffIdleSince(session))) inflightMarker.refreshBackground(convoId);
+      else inflightMarker.clearBackground(convoId);
+    }
+  }, SESSION_IDLE_CHECK_MS).unref();
 }
 
 // --- Pre-reap handoff (lib/pre-reap-handoff.js) ---
@@ -16548,21 +16658,6 @@ function rearmPreReapHandoff(session) {
   if (session && session._preReapHandoff) session._preReapHandoff = null;
 }
 
-function startBackgroundMarkerMaintenance() {
-  setInterval(() => {
-    let table;
-    const observed = () => (table ??= readProcessTableStrict());
-    for (const session of sessions.values()) {
-      if (!session.alive || session._autoStopped) continue;
-      const hasWork = sessionHasBackgroundWork(session, observed);
-      if (session.busy) continue;
-      const convoId = journalConvoIdFor(session);
-      if (hasWork) inflightMarker.refreshBackground(convoId);
-      else inflightMarker.clearBackground(convoId);
-    }
-  }, SESSION_IDLE_CHECK_MS).unref();
-}
-
 function startIdleReaper() {
   setInterval(() => {
     const now = Date.now();
@@ -16616,6 +16711,8 @@ function startIdleReaper() {
       const idleHours = Math.round((now - last) / 3600000);
       debug(`Reaping idle session in ${roomId} (idle ${idleHours}h)`);
       session._autoStopped = true;
+      // The child dies with the session: no background-work card for it.
+      inflightMarker.clearBackground(journalConvoIdFor(session));
       killSession(session, 'SIGTERM');
       // Claude's persistent child close handler performs this cleanup. An
       // idle Codex logical session normally has no child between turns, so
@@ -16642,48 +16739,47 @@ function startIdleReaper() {
 
 // --- Startup ---
 
+// Hand a resume note to its chat as the first turn after the restart (the same
+// carry-on cause as the other bridge-made turns). Unlike carryOnConvo this
+// reports whether it worked, so lib/restart-note-delivery.js can retry: false
+// when the chat cannot be resumed or the session refused the text.
+async function deliverRestartNote(note) {
+  // Never start or resume a session while the bridge is going down.
+  if (shuttingDown) return false;
+  try {
+    let target = findSessionByClaudeSessionId(note.convoId);
+    // The "resuming" notice only on the first attempt: a retry that has to
+    // resume the chat again must not post it a second and third time.
+    if (!target || !target.alive) target = journalResumeConvo(note.convoId, note.attempt > 1 ? '' : '🔄 The bridge restarted — resuming this chat with the note you left for it.');
+    if (!target) return false;
+    const result = await journalRouteTextToSession(target,
+      restartNoteTurnText(note.text, note.ageMs, frameSafeBody, note.interrupted),
+      { bridgeOrigin: true, causes: [carryOnCause()] });
+    return result !== false;
+  } catch (e) {
+    try { console.warn(`[restart-note] delivery to convo=${note.convoId} failed: ${e?.message ?? e}`); } catch { /* logging must never throw */ }
+    return false;
+  }
+}
+
+// The note replaced the card its chat would have had; when it cannot be
+// delivered the chat gets one after all.
+function publishNoteRecoveryCard(convoId) {
+  if (!JOURNAL_ENABLED) return false;
+  return journalPublishCardForConvo(convoId, {
+    question: '⚠️ The bridge restarted and could not resume this chat with the note you left for it. Tap to carry on from where it left off.',
+    options: [{ id: `resume-${convoId}`, label: '▶️ Carry on', value: `resume:${convoId}` }],
+  });
+}
+
 // Boot reconciliation for restart carry-on. Every marker still on disk from a
 // previous bridge process is, by construction, a turn that never reached a
 // turn-end seam — the restart killed it (index.js SIGTERM handler kills every
 // live session). Markers inside the window get a card; the rest are dropped
 // silently. takeStale clears ALL previous-boot markers either way, so a given
 // interruption is offered exactly once and can never resurface on a later boot.
-// A resume note is handed to its chat as the first turn after the restart
-// (the same carry-on cause upstream uses). A chat that is not ready for input
-// yet (a resumed PTY loading, a sign-in dialog, an effort picker, a turn in
-// progress) is deferred, which costs no attempt; a chat that cannot be
-// resumed at all is a failure. lib/restart-note-delivery.js retries.
-async function deliverRestartNote(entry) {
-  const finishInput = restartInputs.begin();
-  try {
-    let session = findSessionByClaudeSessionId(entry.convoId);
-    if (!session || !session.alive) session = journalResumeConvo(entry.convoId, '🔄 The bridge restarted — resuming this chat with the note you left for it.');
-    if (!session || !session.alive) return false;
-    // Holds that sendToSession would refuse (and report to the chat) are
-    // waited out instead: the account lock and a Codex sign-in in progress.
-    if (accountLock.isLocked()
-      || (session.codex?.transport === 'app-server' && (session._codexAccountCommandPending || session._codexLoginId))) return { deferred: true };
-    if (sessionOccupied(session) || session._awaitingInputReady
-      || effortFlowHoldsInput(session) || signInDialogHoldsInput(session)) return { deferred: true };
-    const turn = restartNoteTurnText(entry.text, Math.max(0, Date.now() - entry.writtenAt), frameSafeBody, entry.interrupted);
-    return sendToSession(session, [{ type: 'text', text: turn }], { plainTurn: true, causes: [carryOnCause()] }) === true;
-  } finally { finishInput?.(); }
-}
-
-// The note replaced the card its chat would have had; when it cannot be
-// delivered the chat gets one after all (only where a tap can resume it).
-function publishRecoveryCard(convoId) {
-  if (!JOURNAL_ENABLED) return false;
-  const resumable = Object.values(loadPersistedSessions()).some(rec => rec?.journalConvoId === convoId || rec?.sessionId === convoId);
-  if (!resumable || !isResumeConvoId(convoId)) return false;
-  return journalPublishCardForConvo(convoId, {
-    question: '⚠️ The bridge restarted and could not resume this chat by itself. Tap to carry on from where it left off.',
-    options: [{ id: `resume-${convoId}`, label: '▶️ Carry on', value: `resume:${convoId}` }],
-  });
-}
-
 function publishRestartCarryOnCards() {
-  if (!JOURNAL_ENABLED) { restartNoteDelivery.intakeComplete(); return; }
+  if (!JOURNAL_ENABLED) return;
   let stale;
   try {
     // takeStale clears and PERSISTS before this returns, i.e. before a single
@@ -16708,32 +16804,16 @@ function publishRestartCarryOnCards() {
     .filter(Boolean));
   // Resume notes first, before selectAutoCarryOn: a conversation with a note
   // gets the note as its one bridge-made first turn, in place of both the
-  // automatic carry-on and the card. Fork: the notes are read here, written
-  // to the delivery's pending file, and only then removed from upstream's
-  // file, so a crash in between delivers them once (a note is identified by
-  // its conversation and write time) instead of losing them.
+  // automatic carry-on and the card. The notes stay in their file until each
+  // has been delivered (retried) or given a "Carry on" card instead
+  // (lib/restart-note-delivery.js).
   let taken = [];
   const noteResult = takeNoteDeliveries({
     store: { take: () => { taken = restartNotes.peek(); return taken; } }, stale, resumable, isResumeConvoId,
     log: (m) => { try { console.log(m); } catch { /* logging must never throw */ } },
   });
   stale = noteResult.stale;
-  if (noteResult.deliveries.length) {
-    const writtenAt = new Map(taken.map(n => [n.convoId, n.writtenAt]));
-    const deliveries = noteResult.deliveries.map(d => ({ ...d, writtenAt: writtenAt.get(d.convoId) }));
-    try { restartNoteDelivery.start(deliveries); }
-    catch (e) {
-      // The notes could not be made durable: every one of these chats gets its
-      // card instead, and the restart's record says they were not delivered.
-      try { console.warn(`[restart-note] could not queue ${deliveries.length} note(s): ${e?.message ?? e}`); } catch { /* logging must never throw */ }
-      for (const note of deliveries) publishRecoveryCard(note.convoId);
-      restartNoteDelivery.failIntake(deliveries);
-    }
-  }
-  try { restartNotes.discard(); } catch (e) {
-    try { console.warn(`[restart-note] could not remove the taken notes: ${e?.message ?? e}`); } catch { /* logging must never throw */ }
-  }
-  restartNoteDelivery.intakeComplete();
+  restartNoteDelivery.start(noteResult.deliveries, taken);
   if (!stale.length) return;
   // The previous process's self-restart onto new code cut these turns off;
   // with the option on they carry on by themselves (lib/code-update-restart.js
@@ -16745,6 +16825,7 @@ function publishRestartCarryOnCards() {
   // as the user's own turn with that person's request still in it. It gets
   // the card below, which says whose turn it was.
   const autoResumable = auto.filter(rec => !rec.foreignPerson && resumable.has(rec.convoId) && isResumeConvoId(rec.convoId))
+    // Background work is not a turn to carry on: it gets the card.
     .filter(rec => rec.kind !== 'background');
   if (autoResumable.length) {
     try { console.log(`[code-update] ${autoResumable.length} chat(s) cut off by the self-restart onto ${String(stamp.sha || '').slice(0, 7)} carry on by themselves in ${CODE_UPDATE_AUTO_CARRY_ON_DELAY_MS}ms`); } catch { /* logging must never throw */ }
@@ -16782,8 +16863,8 @@ function publishRestartCarryOnCards() {
     const question = rec.foreignPerson
       ? `⚠️ The bridge restarted during a turn ${peerField(rec.foreignPerson, PEER_NAME_MAX)} started in this chat — interrupted ${formatInterruptedAgo(rec.ageMs)}. Carry on runs as your own turn, with their request still in it.`
       : rec.kind === 'background'
-        ? `⚠️ The bridge restarted while this chat had background work running — interrupted ${formatInterruptedAgo(rec.ageMs)}. The background work stopped where it was.`
-      : `⚠️ The bridge restarted while this chat was mid-turn — interrupted ${formatInterruptedAgo(rec.ageMs)}. The work stopped where it was.`;
+        ? `⚠️ The bridge restarted while this chat had background work running — interrupted ${formatInterruptedAgo(rec.ageMs)}. The background work stopped where it was.${rec.note ? ` Your note for this chat: "${String(rec.note).replace(/\s+/g, ' ').trim().slice(0, 400)}"` : ''}`
+        : `⚠️ The bridge restarted while this chat was mid-turn — interrupted ${formatInterruptedAgo(rec.ageMs)}. The work stopped where it was.`;
     const published = journalPublishCardForConvo(rec.convoId, {
       question,
       options: [{ id: `resume-${rec.convoId}`, label: '▶️ Carry on', value: `resume:${rec.convoId}` }],
@@ -16819,6 +16900,7 @@ async function main() {
 
   console.log(`Allowed users: ${ALLOWED_USER_IDS.length ? ALLOWED_USER_IDS.join(', ') : 'any'}`);
   console.log(`Default workdir: ${DEFAULT_WORKDIR}`);
+  // Independent of the idle reaper: background markers must stay fresh either way.
   startBackgroundMarkerMaintenance();
   if (SESSION_IDLE_TIMEOUT_MS > 0) {
     console.log(`Session idle timeout: ${SESSION_IDLE_TIMEOUT_MS}ms (check every ${SESSION_IDLE_CHECK_MS}ms)`);
@@ -16853,9 +16935,18 @@ async function main() {
   // process open. host_cpu appears once the first interval has a valid diff.
   // Sample at the fast vitals cadence so a published CPU value is always fresh.
   if (JOURNAL_ENABLED) startCpuSampler(HOST_VITALS_SAMPLE_MS, publishBoxVitals);
-  // box_status heartbeat: publishBoxStatus is a no-op while disconnected
+  // box_status heartbeat, Codex boxes only: it exists so the Codex quota lines
+  // (account-scoped, no session to trigger them) do not go stale on an idle
+  // box. A Claude-only box has no Codex lines to refresh and keeps its
+  // turn-driven publishes. publishBoxStatus is a no-op while disconnected
   // (sendRoomOp refuses), so this only reports while connected.
-  _boxStatusRepublishHandle = setInterval(() => publishBoxStatus('heartbeat'), BOX_STATUS_REPUBLISH_MS);
+  _boxStatusRepublishHandle = setInterval(() => {
+    if (!codexSpawnable()) return;
+    // Throttled, and republishes on its own when new lines land; the publish
+    // below carries whatever is cached so the heartbeat itself stays cheap.
+    refreshCodexLimits();
+    publishBoxStatus('heartbeat');
+  }, BOX_STATUS_REPUBLISH_MS);
   if (typeof _boxStatusRepublishHandle.unref === 'function') _boxStatusRepublishHandle.unref();
   // Retention: the relocated codex-viz sink tree lives outside Claude Code's
   // pruned project dirs, so its unredacted JSONL would accumulate forever.
@@ -16880,12 +16971,9 @@ async function main() {
   // queues frames FIFO until hello_ok, exactly as the eager control-convo
   // upsert above relies on, so nothing is dropped by publishing here.
   publishRestartCarryOnCards();
-  // Notes an earlier process left pending are delivered too; once everything
-  // has settled the restart's record is closed (also when there is nothing).
-  // (Not settled when they cannot be read: the record stays open and the next
-  // boot tries again.)
-  try { restartNoteDelivery.resume(); }
-  catch (e) { console.warn(`[restart-note] could not resume pending notes: ${e?.message ?? e}`); }
+  // Intake is complete: once every note taken above has an outcome, the
+  // restart's record is closed (also when there is nothing).
+  restartNoteDelivery.intakeComplete();
   // After the carry-on cards: a self-restart for new code must never land
   // before the previous process's interruptions have been surfaced.
   startCodeUpdateWatcher();

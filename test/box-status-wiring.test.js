@@ -64,8 +64,8 @@ describe('box status wiring', () => {
     expect(index).toMatch(/getLimits: \(\) => \{ refreshUsageLimits\(DEFAULT_WORKDIR\); return buildLimits\(usageLimitsCache, codexLimits\.cache\); \}/);
   });
 
-  it('re-publishes on an unref\'d 5-minute heartbeat that shutdown clears', () => {
-    expect(index).toMatch(/_boxStatusRepublishHandle = setInterval\(\(\) => publishBoxStatus\('heartbeat'\), BOX_STATUS_REPUBLISH_MS\);\n\s*if \(typeof _boxStatusRepublishHandle\.unref === 'function'\) _boxStatusRepublishHandle\.unref\(\);/);
+  it('re-publishes on an unref\'d 5-minute heartbeat, Codex boxes only, that shutdown clears', () => {
+    expect(index).toMatch(/_boxStatusRepublishHandle = setInterval\(\(\) => \{\n\s*if \(!codexSpawnable\(\)\) return;\n(?:\s*\/\/.*\n)*\s*refreshCodexLimits\(\);\n\s*publishBoxStatus\('heartbeat'\);\n\s*\}, BOX_STATUS_REPUBLISH_MS\);\n\s*if \(typeof _boxStatusRepublishHandle\.unref === 'function'\) _boxStatusRepublishHandle\.unref\(\);/);
     const shutdownStart = index.indexOf('async function gracefulShutdown(');
     const shutdown = index.slice(shutdownStart, index.indexOf('\n}\n', shutdownStart) + 2);
     expect(shutdown).toMatch(/clearInterval\(_boxStatusRepublishHandle\)/);

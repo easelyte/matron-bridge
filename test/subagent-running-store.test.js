@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest';
 import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
@@ -116,5 +116,27 @@ describe('subagent-running-store', () => {
     } finally {
       fs.rmSync(file, { recursive: true, force: true });
     }
+  });
+
+  it('add() with incarnation re-stamps an existing record with a strictly later addedAt', () => {
+    store.add('p1:sub:a1', { parentConvoId: 'p1', agentId: 'a1' });
+    const first = store.list()[0].addedAt;
+    // Same millisecond on purpose: the new stamp must still be strictly later,
+    // or a pending repair for the old record could not tell it was superseded.
+    const now = vi.spyOn(Date, 'now').mockReturnValue(first);
+    try {
+      expect(store.add('p1:sub:a1', { parentConvoId: 'p1', agentId: 'a1', incarnation: true })).toBe(true);
+    } finally {
+      now.mockRestore();
+    }
+    const list = store.list();
+    expect(list).toHaveLength(1);
+    expect(list[0].addedAt).toBeGreaterThan(first);
+    expect(list[0]).toMatchObject({ parentConvoId: 'p1', agentId: 'a1' });
+  });
+
+  it('add() with incarnation on a new child behaves like a plain add', () => {
+    store.add('p1:sub:a1', { parentConvoId: 'p1', agentId: 'a1', incarnation: true });
+    expect(store.list()).toHaveLength(1);
   });
 });
