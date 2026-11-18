@@ -47,7 +47,7 @@ describe('pre-reap handoff wiring', () => {
     expect(resolve).toBeGreaterThan(mark);
     expect(body).toContain('await missionsClient.get(m.id)');
     expect(body).toContain('status_updated_at');
-    // Re-checks after the awaits: still the live session, mark still ours.
+    // Re-checks after the awaits: not shutting down, still the live session, mark still ours.
     const recheck = body.indexOf('if (shuttingDown || sessions.get(roomId) !== session || !session.alive || session._autoStopped || !session._preReapHandoff) return;');
     expect(recheck).toBeGreaterThan(resolve);
     // A failed lookup or a session that turned busy drops the mark, so the

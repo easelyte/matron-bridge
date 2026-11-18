@@ -266,8 +266,22 @@ describe('designLoginEndsPhantomTurn', async () => {
 describe('sign-in card needs an OAuth URL', async () => {
   const { formatTuiCueMessage } = await import('../lib/tui-cue-message.js');
   it('a repainted old sign-in screen next to a PR link is not a sign-in', () => {
-    const screen = 'Paste code here if prompted >\nDesign login cancelled.\nMerged as https://github.com/acme/repo/pull/17';
-    expect(formatTuiCueMessage(screen, ['https://github.com/acme/repo/pull/17'])).toBe(null);
+    const screen = 'Paste code here if prompted >\nDesign login cancelled.\nMerged as https://example.test/pr/17';
+    expect(formatTuiCueMessage(screen, ['https://example.test/pr/17'])).toBe(null);
+  });
+  it('a repaint with no new URLs says nothing', () => {
+    const oauth = 'https://claude.com/cai/oauth/authorize?code=true&state=a';
+    const screen = `Paste code here if prompted >\n${oauth}`;
+    expect(formatTuiCueMessage(screen, [oauth], { hasNewUrls: false })).toBe(null);
+  });
+  it('an old OAuth URL repainted beside a new unrelated link is not a new sign-in', () => {
+    const oauth = 'https://claude.com/cai/oauth/authorize?code=true&state=a';
+    const pr = 'https://example.test/pr/17';
+    const screen = `Paste code here if prompted >\n${oauth}\nMerged as ${pr}`;
+    expect(formatTuiCueMessage(screen, [pr, oauth], { hasNewUrls: true, newUrls: [pr] })).toBe(null);
+    // The same screen with the OAuth URL itself new still gets the card.
+    const msg = formatTuiCueMessage(screen, [oauth, pr], { hasNewUrls: true, newUrls: [oauth, pr] });
+    expect(msg.parts.map(p => p.plain)).toContain(oauth);
   });
   it('a live sign-in screen still gets the card with its OAuth URL', () => {
     const oauth = 'https://claude.com/cai/oauth/authorize?code=true&state=a';

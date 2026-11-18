@@ -277,3 +277,15 @@ describe('/restart route wiring', () => {
     expect(route.indexOf("apiCaller?.kind !== 'operator'")).toBeLessThan(route.indexOf('restartRequests.handle('));
   });
 });
+
+describe('POST with force (the way past a stuck gate)', () => {
+  it('passes force: true only when the body says so', async () => {
+    const calls = [];
+    const watcher = { request: (r) => { calls.push(r); return { ok: true }; }, requested: null };
+    const holds = () => ({ holders: [], unreadable: false });
+    await bridgeRestartResponse({ method: 'POST', body: { reason: 'x', force: true }, watcher, holds });
+    await bridgeRestartResponse({ method: 'POST', body: { reason: 'x', force: 'yes' }, watcher, holds });
+    await bridgeRestartResponse({ method: 'POST', body: { reason: 'x' }, watcher, holds });
+    expect(calls.map(c => c.force)).toEqual([true, false, false]);
+  });
+});

@@ -1131,7 +1131,7 @@ describe('PromptDetector', () => {
             for (const v of [...surfaced]) if (isCutOf(v, u)) surfaced.delete(v);
             surfaced.add(u);
           }
-          const message = formatTuiCueMessage(unwrapped, [...fresh, ...all.filter(u => !fresh.includes(u))], { hasNewUrls: fresh.length > 0 });
+          const message = formatTuiCueMessage(unwrapped, [...fresh, ...all.filter(u => !fresh.includes(u))], { hasNewUrls: fresh.length > 0, newUrls: fresh });
           for (const part of message?.parts || []) sent.push(part.plain);
         },
       };

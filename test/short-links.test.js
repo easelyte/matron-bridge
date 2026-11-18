@@ -190,6 +190,23 @@ describe('writer and reader', () => {
     expect(isShortCode(w.add({ route: 'page', token: 'y.s', exp: expIn(600) }))).toBe(true);
   });
 
+  it('a lock it could not finish writing is removed, so the next add() does not wait on it', () => {
+    let fail = true;
+    const flaky = {
+      ...fs,
+      writeFileSync(target, ...args) {
+        if (typeof target === 'number' && fail) { fail = false; throw new Error('disk full'); }
+        return fs.writeFileSync(target, ...args);
+      },
+    };
+    const w = createShortLinkWriter({ file, now, fs: flaky });
+    expect(() => w.add({ route: 'page', token: 'x.s', exp: expIn(600) })).toThrow(/disk full/);
+    expect(existsSync(`${file}.lock`)).toBe(false);
+    const started = Date.now();
+    expect(isShortCode(w.add({ route: 'page', token: 'y.s', exp: expIn(600) }))).toBe(true);
+    expect(Date.now() - started).toBeLessThan(1000);
+  });
+
   it('a writer that re-reads under the lock keeps a code another process added meanwhile', () => {
     const a = createShortLinkWriter({ file, now });
     const b = createShortLinkWriter({ file, now });

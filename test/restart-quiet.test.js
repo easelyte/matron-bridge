@@ -264,8 +264,10 @@ describe('boot subagent reconciliation', () => {
 
   it.each(['discover', 'revive'])('holds a resumed incarnation after %s and fences an old repair delivery', (method) => {
     const file = path.join(dir, 'running.json');
-    writeFileSync(file, JSON.stringify({ [old.childConvoId]: old }));
-    const store = createSubagentRunningStore({ file, bootAt: 1000, log: { warn() {} } });
+    // Upstream's resume stamp is strictly later than the record it replaces, so
+    // the old record sits one tick before the revive at 999 to stay pre-boot.
+    writeFileSync(file, JSON.stringify({ [old.childConvoId]: { ...old, addedAt: 998 } }));
+    const store = createSubagentRunningStore({ file, log: { warn() {} } });
     const tracker = createSubagentConvoTracker({
       runningStore: store, getParentConvoId: () => 'alice',
       publisher: { upsertConvo() {}, publishStatus() {} },

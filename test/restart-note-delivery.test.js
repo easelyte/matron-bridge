@@ -1,284 +1,370 @@
+import { describe, it, expect } from 'vitest';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { createNoteDelivery, NOTE_RETRY_MS, NOTE_FIRST_DELAY_MS, NOTE_MAX_AGE_MS } from '../lib/restart-note-delivery.js';
+import {
+  createNoteDelivery, NOTE_FIRST_DELAY_MS, NOTE_RETRY_MS, NOTE_MAX_ATTEMPTS,
+} from '../lib/restart-note-delivery.js';
+import { createRestartNotes, takeNoteDeliveries } from '../lib/restart-notes.js';
 
-const T0 = Date.parse('2026-11-17T12:00:00Z');
-let dir;
-let file;
-beforeEach(() => { dir = fs.mkdtempSync(path.join(os.tmpdir(), 'note-delivery-')); file = path.join(dir, 'pending.json'); });
-afterEach(() => { fs.rmSync(dir, { recursive: true, force: true }); });
-const onDisk = () => (fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, 'utf8')) : []);
-const tick = () => new Promise(resolve => setImmediate(resolve));
+const NOW = 1_800_000_000_000;
 
-// A delivery whose timers the test fires by hand, in order of their due time.
-function harness({ answers = {}, settleAnswers = [true], ...options } = {}) {
-  const world = { now: T0, timers: [], delivered: [], recovered: [], settled: [], owners: [], log: [] };
-  const queues = Object.fromEntries(Object.entries(answers).map(([id, list]) => [id, [...list]]));
-  const settleQueue = [...settleAnswers];
-  const delivery = createNoteDelivery({
-    file, now: () => world.now,
-    schedule: (fn, ms) => world.timers.push({ fn, at: world.now + ms }),
-    deliver: async (entry) => {
-      world.delivered.push({ convoId: entry.convoId, status: onDisk().find(e => e.convoId === entry.convoId)?.status, at: world.now });
-      const next = queues[entry.convoId]?.length ? queues[entry.convoId].shift() : true;
-      if (next instanceof Error) throw next;
-      return next;
-    },
-    recover: (entry) => world.recovered.push(entry.convoId),
-    onSettled: (outcomes, owner) => { world.settled.push(outcomes); world.owners.push(owner); return settleQueue.length > 1 ? settleQueue.shift() : settleQueue[0]; },
-    log: (m) => world.log.push(m),
-    ...options,
-  });
-  async function run() {
-    for (let guard = 0; guard < 60 && world.timers.length; guard++) {
-      world.timers.sort((a, b) => a.at - b.at);
-      const t = world.timers.shift();
-      world.now = Math.max(world.now, t.at);
-      t.fn();
-      await tick();
+// A manual scheduler: timers run when the test says so, in due order.
+function clock() {
+  const state = { t: 0, timers: [] };
+  const schedule = (fn, ms) => { const timer = { at: state.t + ms, fn }; state.timers.push(timer); return timer; };
+  const cancelTimer = (timer) => { state.timers = state.timers.filter(x => x !== timer); };
+  const advance = async (ms) => {
+    const end = state.t + ms;
+    for (;;) {
+      state.timers.sort((a, b) => a.at - b.at);
+      const next = state.timers[0];
+      if (!next || next.at > end) break;
+      state.timers.shift();
+      state.t = next.at;
+      next.fn();
+      // Let the async attempt settle before the next timer.
+      for (let i = 0; i < 5; i++) await Promise.resolve();
     }
-  }
-  return { world, delivery, run };
+    state.t = end;
+  };
+  return { state, schedule, cancelTimer, advance, now: () => NOW + state.t };
 }
-const note = (convoId, extra = {}) => ({ convoId, text: `note for ${convoId}`, ageMs: 5 * 60_000, interrupted: false, ...extra });
+
+const note = (convoId, extra = {}) => ({ convoId, text: `note for ${convoId}`, writtenAt: 1, ageMs: 0, interrupted: false, ...extra });
+const key = (n) => ({ convoId: n.convoId, writtenAt: n.writtenAt });
+
+// results: per-convo list of outcomes for deliver, in order.
+function setup(results, opts = {}) {
+  const c = clock();
+  const calls = [];
+  const cards = [];
+  const discards = [];
+  const logs = [];
+  const queue = Object.fromEntries(Object.entries(results).map(([k, v]) => [k, [...v]]));
+  const delivery = createNoteDelivery({
+    deliver: async (n) => { calls.push({ ...n, at: c.state.t }); const r = queue[n.convoId].shift(); if (r instanceof Error) throw r; return r; },
+    recover: (n) => { cards.push(n.convoId); if (opts.recoverThrows) throw new Error('card failed'); return opts.cardPublished === false ? false : true; },
+    discard: (entries) => { discards.push(entries); if (opts.discardThrows) throw new Error('EACCES'); },
+    schedule: c.schedule, cancelTimer: c.cancelTimer, now: c.now, log: (m) => logs.push(m),
+  });
+  return { c, calls, cards, discards, logs, delivery };
+}
 
 describe('resume note delivery', () => {
-  it('writes the notes before delivering anything, then delivers after the first delay', async () => {
-    const { world, delivery, run } = harness();
-    delivery.start([note('a')]);
-    expect(onDisk()).toMatchObject([{ convoId: 'a', text: 'note for a', status: 'pending', attempts: 0, writtenAt: T0 - 5 * 60_000 }]);
-    expect(world.delivered).toEqual([]);
-    await run();
-    expect(world.delivered).toEqual([{ convoId: 'a', status: 'delivering', at: T0 + NOTE_FIRST_DELAY_MS }]);
-    expect(world.settled).toEqual([{ a: { outcome: 'resumed', at: T0 + NOTE_FIRST_DELAY_MS } }]);
-    expect(onDisk()).toEqual([]);
+  it('delivers once after the first delay and then removes that note', async () => {
+    const t = setup({ a: [true] });
+    const a = note('a');
+    t.delivery.start([a], [key(a)]);
+    expect(t.calls).toHaveLength(0);
+    await t.c.advance(NOTE_FIRST_DELAY_MS);
+    expect(t.calls).toHaveLength(1);
+    expect(t.cards).toEqual([]);
+    expect(t.discards).toEqual([[a]]);
+    await t.c.advance(10 * NOTE_RETRY_MS);
+    expect(t.calls).toHaveLength(1);
   });
 
-  it('marks a note delivering before the hand-over (so a crash there is never answered with a second delivery)', async () => {
-    const { world, delivery, run } = harness();
-    delivery.start([note('a')]);
-    await run();
-    expect(world.delivered[0].status).toBe('delivering');
+  it('retries a failed delivery after the backoff and keeps the note until it works', async () => {
+    const t = setup({ a: [false, true] });
+    t.delivery.start([note('a')], [key(note('a'))]);
+    await t.c.advance(NOTE_FIRST_DELAY_MS);
+    expect(t.calls).toHaveLength(1);
+    expect(t.discards).toEqual([]);
+    await t.c.advance(NOTE_RETRY_MS - 1);
+    expect(t.calls).toHaveLength(1);
+    await t.c.advance(1);
+    expect(t.calls).toHaveLength(2);
+    expect(t.discards).toHaveLength(1);
+    expect(t.cards).toEqual([]);
   });
 
-  it('a deferred delivery is tried again after a minute and costs no attempt', async () => {
-    const { world, delivery, run } = harness({ answers: { a: [{ deferred: true }, { deferred: true }, { deferred: true }, { deferred: true }, true] } });
-    delivery.start([note('a')]);
-    await run();
-    expect(world.delivered.map(d => d.at)).toEqual([0, 1, 2, 3, 4].map(i => T0 + NOTE_FIRST_DELAY_MS + i * NOTE_RETRY_MS));
-    expect(world.recovered).toEqual([]);
-    expect(world.settled[0].a.outcome).toBe('resumed');
+  it('counts a throw and a non-true result as failures, and numbers the attempts', async () => {
+    const t = setup({ a: [new Error('boom'), undefined, true] });
+    t.delivery.start([note('a')], []);
+    await t.c.advance(NOTE_FIRST_DELAY_MS + 2 * NOTE_RETRY_MS);
+    expect(t.calls.map(c => c.attempt)).toEqual([1, 2, 3]);
+    expect(t.cards).toEqual([]);
+    expect(t.discards).toHaveLength(1);
   });
 
-  it('a failed delivery is retried after a minute, three times in all, then the chat gets its card', async () => {
-    const { world, delivery, run } = harness({ answers: { a: [false, new Error('no session'), false] } });
-    delivery.start([note('a')]);
-    await run();
-    expect(world.delivered.map(d => d.at)).toEqual([0, 1, 2].map(i => T0 + NOTE_FIRST_DELAY_MS + i * NOTE_RETRY_MS));
-    expect(world.recovered).toEqual(['a']);
-    expect(world.settled).toEqual([{ a: { outcome: 'failed', at: T0 + NOTE_FIRST_DELAY_MS + 2 * NOTE_RETRY_MS } }]);
+  it('publishes the Carry on card after the last attempt and then removes the note', async () => {
+    const t = setup({ a: [false, false, false] });
+    t.delivery.start([note('a')], [key(note('a'))]);
+    await t.c.advance(NOTE_FIRST_DELAY_MS + (NOTE_MAX_ATTEMPTS - 1) * NOTE_RETRY_MS);
+    expect(t.calls).toHaveLength(NOTE_MAX_ATTEMPTS);
+    expect(t.cards).toEqual(['a']);
+    expect(t.discards).toEqual([[note('a')]]);
+    await t.c.advance(10 * NOTE_RETRY_MS);
+    expect(t.calls).toHaveLength(NOTE_MAX_ATTEMPTS);
   });
 
-  it('a recovery card that throws does not stop the other notes or the settle', async () => {
-    const { world, delivery, run } = harness({ answers: { a: [false, false, false] }, recover: () => { throw new Error('journal down'); } });
-    delivery.start([note('a'), note('b')]);
-    await run();
-    expect(world.settled).toHaveLength(1);
-    expect(world.settled[0]).toMatchObject({ a: { outcome: 'failed' }, b: { outcome: 'resumed' } });
-    expect(world.log.join('\n')).toMatch(/recovery card failed for a/);
+  it('keeps the note when the card was not published (false) or threw', async () => {
+    for (const opts of [{ cardPublished: false }, { recoverThrows: true }]) {
+      const t = setup({ a: [false, false, false] }, opts);
+      t.delivery.start([note('a')], []);
+      await t.c.advance(NOTE_FIRST_DELAY_MS + 2 * NOTE_RETRY_MS);
+      expect(t.cards).toEqual(['a']);
+      expect(t.discards).toEqual([]);
+      expect(t.logs.join('\n')).toMatch(/keeping the note for the next boot/);
+    }
   });
 
-  it('a note a crash left delivering is possibly delivered, never delivered again', async () => {
-    fs.writeFileSync(file, JSON.stringify([{ id: 'old', convoId: 'a', text: 't', writtenAt: T0 - 1000, status: 'delivering', attempts: 1 }]));
-    const { world, delivery, run } = harness();
-    delivery.intakeComplete();
-    delivery.resume();
-    await run();
-    expect(world.delivered).toEqual([]);
-    expect(world.settled).toEqual([{ a: { outcome: 'possibly_delivered', at: T0 } }]);
+  it('removes each note as soon as it is dealt with, not when the others settle', async () => {
+    const t = setup({ a: [true], b: [false, false, false] });
+    const a = note('a');
+    const b = note('b', { writtenAt: 2 });
+    t.delivery.start([a, b], [key(a), key(b)]);
+    await t.c.advance(NOTE_FIRST_DELAY_MS);
+    expect(t.calls.map(c => c.convoId)).toEqual(['a', 'b']);
+    // A is gone from disk while B is still failing: a restart now cannot redeliver A.
+    expect(t.discards).toEqual([[a]]);
+    await t.c.advance(2 * NOTE_RETRY_MS);
+    expect(t.discards).toEqual([[a], [b]]);
   });
 
-  it('after a crash, pending notes carry on with their attempts and wait out their backoff', async () => {
-    fs.writeFileSync(file, JSON.stringify([{ convoId: 'a', text: 't', writtenAt: T0 - 1000, status: 'pending', attempts: 2, retry_at: T0 + 40_000 }]));
-    const { world, delivery, run } = harness({ answers: { a: [false] } });
-    delivery.intakeComplete();
-    delivery.resume();
-    await run();
-    expect(world.delivered.map(d => d.at)).toEqual([T0 + 40_000]);
-    expect(world.recovered).toEqual(['a']);
+  it('measures the note age at the time of each attempt', async () => {
+    const t = setup({ a: [false, true] });
+    t.delivery.start([note('a', { ageMs: 5_000 })], []);
+    await t.c.advance(NOTE_FIRST_DELAY_MS + NOTE_RETRY_MS);
+    expect(t.calls[0].ageMs).toBe(5_000 + NOTE_FIRST_DELAY_MS);
+    expect(t.calls[1].ageMs).toBe(5_000 + NOTE_FIRST_DELAY_MS + NOTE_RETRY_MS);
   });
 
-  it('drops a note older than a day, without a card', async () => {
-    const { world, delivery, run } = harness();
-    delivery.start([note('a', { ageMs: NOTE_MAX_AGE_MS + 1 })]);
-    await run();
-    expect(world.delivered).toEqual([]);
-    expect(world.recovered).toEqual([]);
-    expect(world.settled[0].a.outcome).toBe('stale');
+  it('removes the notes it was not asked to deliver (dropped ones) straight away', () => {
+    const t = setup({});
+    const gone = { convoId: 'gone', writtenAt: 1 };
+    t.delivery.start([], [gone]);
+    expect(t.discards).toEqual([[gone]]);
   });
 
-  it('delivers the notes of many chats staggered, two at a time past ten', async () => {
-    const { world, delivery, run } = harness();
-    delivery.start(Array.from({ length: 12 }, (_, i) => note(`c${i}`)));
-    await run();
-    expect(world.delivered.slice(0, 4).map(d => d.at - T0)).toEqual([15000, 15000, 25000, 25000]);
-    expect(world.delivered).toHaveLength(12);
+  it('a failed removal is logged, not thrown', async () => {
+    const t = setup({ a: [true] }, { discardThrows: true });
+    t.delivery.start([note('a')], []);
+    await t.c.advance(NOTE_FIRST_DELAY_MS);
+    expect(t.logs.join('\n')).toMatch(/could not remove the delivered note for convo=a: EACCES/);
   });
 
-  it('one note per conversation: a newer note replaces a pending one', () => {
-    const { delivery } = harness();
-    fs.writeFileSync(file, JSON.stringify([{ convoId: 'a', text: 'old', writtenAt: T0 - 9999, status: 'pending', attempts: 1 }]));
-    delivery.start([note('a', { text: 'new', ageMs: 10 })]);
-    expect(onDisk()).toMatchObject([{ convoId: 'a', text: 'new', attempts: 0 }]);
+  it('stop() cancels the pending retries: nothing is delivered, carded or removed afterwards', async () => {
+    const t = setup({ a: [false, true] });
+    t.delivery.start([note('a')], [key(note('a'))]);
+    await t.c.advance(NOTE_FIRST_DELAY_MS);
+    expect(t.calls).toHaveLength(1);
+    t.delivery.stop();
+    await t.c.advance(10 * NOTE_RETRY_MS);
+    expect(t.calls).toHaveLength(1);
+    expect(t.cards).toEqual([]);
+    expect(t.discards).toEqual([]);
   });
 
-  it('reads the earlier version\'s pending file (restart id on each note)', async () => {
-    fs.writeFileSync(file, JSON.stringify([{ id: 'restart-1', convoId: 'a', text: 'carry on with X', writtenAt: T0 - 60_000 }]));
-    const { world, delivery, run } = harness();
-    delivery.intakeComplete();
-    delivery.resume();
-    await run();
-    expect(world.delivered).toHaveLength(1);
-    expect(world.settled[0].a.outcome).toBe('resumed');
+  it('halted() cancels the pending retries and ignores an attempt in flight, without stop()', async () => {
+    let down = false;
+    const t = setup({ a: [false, true] });
+    const c = clock();
+    const calls = [];
+    const cards = [];
+    const discards = [];
+    const delivery = createNoteDelivery({
+      deliver: async (n) => { calls.push(n.attempt); return false; },
+      recover: (n) => { cards.push(n.convoId); return true; },
+      discard: (e) => discards.push(e),
+      schedule: c.schedule, cancelTimer: c.cancelTimer, halted: () => down, now: c.now,
+    });
+    delivery.start([note('a')], []);
+    await c.advance(NOTE_FIRST_DELAY_MS);
+    expect(calls).toEqual([1]);
+    down = true;
+    await c.advance(10 * NOTE_RETRY_MS);
+    expect(calls).toEqual([1]);
+    expect(cards).toEqual([]);
+    expect(discards).toEqual([]);
+    expect(t.calls).toEqual([]);
   });
 
-  it('moves a corrupt pending file aside, keeps going, and drops invalid entries with a log line', () => {
-    fs.writeFileSync(file, '{not json');
-    const a = harness();
-    a.delivery.intakeComplete();
-    a.delivery.resume();
-    expect(a.world.settled).toEqual([{}]);
-    expect(fs.readdirSync(dir).some(n => n.startsWith('pending.json.corrupt-'))).toBe(true);
-    fs.writeFileSync(file, JSON.stringify([{ convoId: 'a', text: '', writtenAt: 1 }, { convoId: 'b', text: 'ok', writtenAt: T0 }]));
-    const b = harness();
-    expect(b.delivery.pendingCount()).toBe(1);
-    expect(b.world.log.join('\n')).toMatch(/dropped 1 invalid/);
-  });
-
-  it('throws when the notes cannot be made durable, before anything was delivered', () => {
-    const { world, delivery } = harness({ file: path.join(dir, 'missing', 'pending.json') });
-    expect(() => delivery.start([note('a')])).toThrow();
-    expect(world.delivered).toEqual([]);
-  });
-});
-
-describe('review follow-ups: nothing lost, nothing settled early', () => {
-  it('does not settle until the boot code says intake is complete, even with an empty queue', () => {
-    const { world, delivery } = harness();
-    delivery.resume();
-    expect(world.settled).toEqual([]);
-    delivery.intakeComplete();
-    expect(world.settled).toEqual([{}]);
-  });
-
-  it('a note taken twice (written here, then the source survived a crash) is delivered once', async () => {
-    const a = harness();
-    const taken = { ...note('a'), writtenAt: T0 - 120_000 };
-    a.delivery.start([taken]);
-    await a.run();
-    expect(a.world.delivered).toHaveLength(1);
-    // The process died before the restart record was closed: entries are still on disk.
-    fs.writeFileSync(file, JSON.stringify([{ convoId: 'a', text: 'note for a', writtenAt: T0 - 120_000, status: 'done', outcome: 'resumed', outcome_at: T0 }]));
-    const b = harness();
-    b.delivery.start([taken]);
-    await b.run();
-    expect(b.world.delivered).toEqual([]);
-    expect(b.world.settled).toEqual([{ a: { outcome: 'resumed', at: T0 } }]);
-  });
-
-  it('outcomes survive a crash before the record is closed: a failure is not forgotten', async () => {
-    const a = harness({ answers: { a: [false, false, false] }, settleAnswers: [false] });
-    a.delivery.start([note('a'), note('b')]);
-    await a.run();
-    // Closing the record failed every time: everything is still on disk.
-    expect(onDisk().map(e => [e.convoId, e.status, e.outcome])).toEqual(expect.arrayContaining([['a', 'done', 'failed'], ['b', 'done', 'resumed']]));
-    const b = harness();
-    b.delivery.intakeComplete();
-    b.delivery.resume();
-    expect(b.world.settled[0]).toMatchObject({ a: { outcome: 'failed' }, b: { outcome: 'resumed' } });
-    expect(onDisk()).toEqual([]);
-  });
-
-  it('a record that could not be closed is tried again after a minute, with the same outcomes', async () => {
-    const { world, delivery, run } = harness({ settleAnswers: [false, false, true] });
-    delivery.start([note('a')]);
-    await run();
-    expect(world.settled).toHaveLength(3);
-    expect(world.settled[2]).toEqual(world.settled[0]);
-    expect(onDisk()).toEqual([]);
-  });
-
-  it('a recovery card that was due when the process died is published at the next boot', () => {
-    fs.writeFileSync(file, JSON.stringify([{ convoId: 'a', text: 't', writtenAt: T0 - 1000, status: 'done', outcome: 'failed', outcome_at: T0, card: 'due', attempts: 3 }]));
-    const { world, delivery } = harness();
-    delivery.intakeComplete();
-    delivery.resume();
-    expect(world.recovered).toEqual(['a']);
-    expect(world.settled[0].a.outcome).toBe('failed');
-  });
-
-  it('a note started after an earlier settle is reported too', async () => {
-    const { world, delivery, run } = harness();
-    delivery.resume();
-    delivery.intakeComplete();
-    expect(world.settled).toHaveLength(1);
-    delivery.start([note('a')]);
-    await run();
-    expect(world.settled).toHaveLength(2);
-    expect(world.settled[1].a.outcome).toBe('resumed');
+  it('stop() during a delivery in flight: its result is ignored (no card, no removal)', async () => {
+    const c = clock();
+    const cards = [];
+    const discards = [];
+    let release;
+    const delivery = createNoteDelivery({
+      deliver: () => new Promise((resolve) => { release = resolve; }),
+      recover: (n) => { cards.push(n.convoId); return true; },
+      discard: (e) => discards.push(e),
+      schedule: c.schedule, cancelTimer: c.cancelTimer, now: c.now, maxAttempts: 1,
+    });
+    delivery.start([note('a')], []);
+    await c.advance(NOTE_FIRST_DELAY_MS);
+    delivery.stop();
+    release(false);
+    for (let i = 0; i < 5; i++) await Promise.resolve();
+    expect(cards).toEqual([]);
+    expect(discards).toEqual([]);
   });
 });
 
-describe('review follow-ups, round two', () => {
-  it('a newer note for a chat does not erase an outcome that was never acknowledged', async () => {
-    fs.writeFileSync(file, JSON.stringify([{ convoId: 'a', text: 'old', writtenAt: T0 - 9000, status: 'done', outcome: 'failed', outcome_at: T0 - 100, card: 'done', attempts: 3, owner: 'R1' }]));
-    const { world, delivery, run } = harness({ owner: () => 'R2' });
-    delivery.start([note('a', { text: 'new', ageMs: 10 })]);
-    await run();
-    // One report per record: R1 keeps its failure, R2 its resumed note.
-    expect(world.owners.sort()).toEqual(['R1', 'R2']);
-    const byOwner = Object.fromEntries(world.settled.map((outcomes, i) => [world.owners[i], outcomes]));
-    expect(byOwner.R1.a.outcome).toBe('failed');
-    expect(byOwner.R2.a.outcome).toBe('resumed');
+describe('resume note delivery at shutdown', () => {
+  it('a send in flight that succeeds after halted() still removes its note', async () => {
+    let down = false;
+    const c = clock();
+    const discards = [];
+    let release;
+    const delivery = createNoteDelivery({
+      deliver: () => new Promise((resolve) => { release = resolve; }),
+      discard: (e) => discards.push(e),
+      schedule: c.schedule, cancelTimer: c.cancelTimer, halted: () => down, now: c.now,
+    });
+    delivery.start([note('a')], []);
+    await c.advance(NOTE_FIRST_DELAY_MS);
+    down = true;
+    release(true);
+    for (let i = 0; i < 5; i++) await Promise.resolve();
+    expect(discards).toHaveLength(1);
+    expect(discards[0][0].convoId).toBe('a');
   });
 
-  it('notes that could not be queued are reported failed with everything else, in one report', async () => {
-    fs.writeFileSync(file, JSON.stringify([{ convoId: 'a', text: 't', writtenAt: T0 - 1000, status: 'pending', attempts: 0 }]));
-    const { world, delivery, run } = harness();
-    delivery.failIntake([note('c')]);
-    delivery.intakeComplete();
-    delivery.resume();
-    expect(world.settled).toEqual([]);
-    await run();
-    expect(world.settled).toHaveLength(1);
-    expect(world.settled[0]).toMatchObject({ a: { outcome: 'resumed' }, c: { outcome: 'failed' } });
+  it('a send in flight that succeeds after stop() still removes its note', async () => {
+    const c = clock();
+    const discards = [];
+    let release;
+    const delivery = createNoteDelivery({
+      deliver: () => new Promise((resolve) => { release = resolve; }),
+      discard: (e) => discards.push(e),
+      schedule: c.schedule, cancelTimer: c.cancelTimer, now: c.now,
+    });
+    delivery.start([note('a')], []);
+    await c.advance(NOTE_FIRST_DELAY_MS);
+    delivery.stop();
+    release(true);
+    for (let i = 0; i < 5; i++) await Promise.resolve();
+    expect(discards).toHaveLength(1);
+  });
+});
+
+describe('resume note delivery against the real note store', () => {
+  function tmpStore() {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'note-delivery-'));
+    const file = path.join(dir, 'notes.json');
+    return { file, store: createRestartNotes({ file, now: () => NOW }) };
+  }
+
+  // One boot: peek the notes, choose deliveries, deliver with `results`.
+  async function boot(store, results, { crashBeforeRemoval = false } = {}) {
+    const c = clock();
+    let taken = [];
+    const { deliveries } = takeNoteDeliveries({
+      store: { take: () => { taken = store.peek(); return taken; } },
+      stale: [], resumable: new Set(['c1', 'c2']), now: () => NOW,
+    });
+    const delivered = [];
+    const cards = [];
+    const delivery = createNoteDelivery({
+      deliver: async (n) => { delivered.push(n.convoId); return results.shift(); },
+      recover: (n) => { cards.push(n.convoId); return true; },
+      discard: crashBeforeRemoval ? () => { throw new Error('crashed before the note was removed'); } : (entries) => store.discard(entries),
+      schedule: c.schedule, cancelTimer: c.cancelTimer, now: c.now,
+    });
+    delivery.start(deliveries, taken);
+    await c.advance(NOTE_FIRST_DELAY_MS + NOTE_MAX_ATTEMPTS * NOTE_RETRY_MS);
+    return { delivered, cards };
+  }
+
+  it('a crash before delivery delivers the note exactly once at the next boot', async () => {
+    const { store } = tmpStore();
+    store.put('c1', 'carry on with the migration');
+    // First boot dies before any timer fires: nothing was delivered or removed.
+    takeNoteDeliveries({ store: { take: () => store.peek() }, stale: [], resumable: new Set(['c1']), now: () => NOW });
+    const second = await boot(store, [true]);
+    expect(second.delivered).toEqual(['c1']);
+    const third = await boot(store, [true]);
+    expect(third.delivered).toEqual([]);
   });
 
-  it('a start that cannot begin delivery does not throw after the notes were written', () => {
-    const { world, delivery } = harness({ schedule: () => { throw new Error('no timers'); } });
-    expect(() => delivery.start([note('a')])).not.toThrow();
-    expect(world.log.join('\n')).toMatch(/could not start delivery/);
-    expect(onDisk()).toHaveLength(1);
+  it('a crash after a successful delivery but before the removal delivers it once more (at-least-once)', async () => {
+    const { store } = tmpStore();
+    store.put('c1', 'carry on with the migration');
+    const first = await boot(store, [true], { crashBeforeRemoval: true });
+    expect(first.delivered).toEqual(['c1']);
+    const second = await boot(store, [true]);
+    expect(second.delivered).toEqual(['c1']);
+    const third = await boot(store, [true]);
+    expect(third.delivered).toEqual([]);
   });
 
-  it('reports the worst outcome when a chat has more than one in the same report', () => {
-    fs.writeFileSync(file, JSON.stringify([
-      { convoId: 'a', text: 't', writtenAt: T0 - 2000, status: 'done', outcome: 'resumed', outcome_at: 1, owner: 'R' },
-      { convoId: 'a', text: 't', writtenAt: T0 - 1000, status: 'done', outcome: 'possibly_delivered', outcome_at: 2, owner: 'R' },
-    ]));
-    const { world, delivery } = harness();
-    delivery.intakeComplete();
-    delivery.resume();
-    expect(world.settled).toEqual([{ a: { outcome: 'possibly_delivered', at: 2 } }]);
-    expect(world.owners).toEqual(['R']);
+  it('a note delivered early is already gone when a later note is still failing', async () => {
+    const { store } = tmpStore();
+    store.put('c1', 'first');
+    store.put('c2', 'second');
+    const c = clock();
+    let taken = [];
+    const { deliveries } = takeNoteDeliveries({
+      store: { take: () => { taken = store.peek(); return taken; } }, stale: [], resumable: new Set(['c1', 'c2']), now: () => NOW,
+    });
+    const delivery = createNoteDelivery({
+      deliver: async (n) => n.convoId === 'c1',
+      recover: () => true, discard: (e) => store.discard(e), schedule: c.schedule, cancelTimer: c.cancelTimer, now: c.now,
+    });
+    delivery.start(deliveries, taken);
+    await c.advance(NOTE_FIRST_DELAY_MS);
+    expect(store.peek().map(n => n.convoId)).toEqual(['c2']);
   });
 
-  it('reports once, even when more timers fire afterwards', async () => {
-    const { world, delivery, run } = harness();
-    delivery.start([note('a'), note('b')]);
-    await run();
-    expect(world.settled).toHaveLength(1);
+  it('a note written for the next restart while retrying survives the removal', async () => {
+    const { store } = tmpStore();
+    store.put('c1', 'old');
+    const c = clock();
+    let taken = [];
+    const { deliveries } = takeNoteDeliveries({
+      store: { take: () => { taken = store.peek(); return taken; } }, stale: [], resumable: new Set(['c1', 'c2']), now: () => NOW,
+    });
+    const delivery = createNoteDelivery({ deliver: async () => true, discard: (e) => store.discard(e), schedule: c.schedule, cancelTimer: c.cancelTimer, now: c.now });
+    delivery.start(deliveries, taken);
+    store.put('c2', 'for the next restart');
+    await c.advance(NOTE_FIRST_DELAY_MS);
+    expect(store.peek().map(n => n.convoId)).toEqual(['c2']);
+  });
+
+  it('notes the choice step dropped are removed with the first delivery step', async () => {
+    const { store } = tmpStore();
+    store.put('not-resumable', 'x');
+    store.put('c1', 'y');
+    const c = clock();
+    let taken = [];
+    const { deliveries } = takeNoteDeliveries({
+      store: { take: () => { taken = store.peek(); return taken; } }, stale: [], resumable: new Set(['c1']), now: () => NOW,
+    });
+    createNoteDelivery({ deliver: async () => true, discard: (e) => store.discard(e), schedule: c.schedule, cancelTimer: c.cancelTimer, now: c.now }).start(deliveries, taken);
+    expect(store.peek().map(n => n.convoId)).toEqual(['c1']);
+  });
+});
+
+describe('resume note delivery wiring', () => {
+  const index = fs.readFileSync(new URL('../index.js', import.meta.url), 'utf8');
+  it('reads the notes with peek and removes them only through the delivery', () => {
+    expect(index).toMatch(/store: \{ take: \(\) => \{ taken = restartNotes\.peek\(\)/);
+    expect(index).toMatch(/discard: \(entries\) => restartNotes\.discard\(entries\)/);
+    expect(index).not.toMatch(/restartNotes\.take\(/);
+  });
+  it('delivers through a function that reports failure, with the carry-on cause', () => {
+    const fn = index.slice(index.indexOf('async function deliverRestartNote'), index.indexOf('function publishNoteRecoveryCard'));
+    expect(fn).toMatch(/journalRouteTextToSession\(target,/);
+    expect(fn).toMatch(/causes: \[carryOnCause\(\)\]/);
+    expect(fn).toMatch(/return false;/);
+  });
+  it('refuses to deliver while shutting down, and the delivery is told the bridge is going down', () => {
+    const fn = index.slice(index.indexOf('async function deliverRestartNote'), index.indexOf('function publishNoteRecoveryCard'));
+    expect(fn).toMatch(/if \(shuttingDown\) return false;/);
+    const shutdown = index.slice(index.indexOf('async function gracefulShutdown'));
+    expect(index).toMatch(/halted: \(\) => shuttingDown,/);
+    expect(shutdown).not.toMatch(/restartNoteDelivery/);
+  });
+  it('posts the resuming notice on the first attempt only', () => {
+    const fn = index.slice(index.indexOf('async function deliverRestartNote'), index.indexOf('function publishNoteRecoveryCard'));
+    expect(fn).toMatch(/note\.attempt > 1 \? ''/);
+    expect(index).toMatch(/if \(!JOURNAL_ENABLED \|\| !convoId \|\| !body\) return;/);
+  });
+  it('reports whether the recovery card was published', () => {
+    const fn = index.slice(index.indexOf('function publishNoteRecoveryCard'), index.indexOf('function publishNoteRecoveryCard') + 700);
+    expect(fn).toMatch(/if \(!JOURNAL_ENABLED\) return false;/);
+    expect(fn).toMatch(/return journalPublishCardForConvo\(/);
   });
 });

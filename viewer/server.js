@@ -31,12 +31,19 @@ export function resolveViewerPort(env = process.env, warn = console.warn) {
 // deployment names the proxy it trusts: `loopback` for a tunnel daemon or
 // proxy on this host (cloudflared, nginx), a hop count, or a comma-separated
 // list of addresses or subnets. The rate limiters key on req.ip, which is
-// then the client address the trusted proxy forwarded.
-export function resolveTrustProxy(env = process.env) {
+// then the client address the trusted proxy forwarded. There is deliberately
+// no "trust everything" value: Express's `true` takes the left-most
+// X-Forwarded-For entry, which the client writes, so anyone could pick their
+// own address and step round the limits. `on`/`true`/`yes` therefore leave
+// trust proxy off and say so.
+export function resolveTrustProxy(env = process.env, warn = console.warn) {
   const raw = String(env.MATRON_VIEWER_TRUST_PROXY ?? '').trim();
   if (['', 'off', 'false', 'no', '0'].includes(raw.toLowerCase())) return false;
   if (/^\d+$/.test(raw)) return Number(raw);
-  if (['on', 'true', 'yes'].includes(raw.toLowerCase())) return true;
+  if (['on', 'true', 'yes'].includes(raw.toLowerCase())) {
+    warn(`[viewer] MATRON_VIEWER_TRUST_PROXY=${raw} would trust any client's X-Forwarded-For; ignoring it. Use loopback, a hop count or the proxy's addresses.`);
+    return false;
+  }
   return raw;
 }
 

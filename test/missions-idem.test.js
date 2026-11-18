@@ -77,6 +77,15 @@ describe('itemIdemKey', () => {
     expect(itemIdemKey(comment)).toBe(itemIdemKey({ ...comment }));
   });
 
+  it('step_up, subject and add_labels are part of a comment key', () => {
+    const withActions = { ...comment, args: { ...comment.args, actions: ['Merge'] } };
+    const key = itemIdemKey(withActions);
+    expect(itemIdemKey({ ...withActions, args: { ...withActions.args, step_up: true } })).not.toBe(key);
+    const stepped = { ...withActions, args: { ...withActions.args, step_up: true } };
+    expect(itemIdemKey({ ...stepped, args: { ...stepped.args, subject: { op: 'merge' } } })).not.toBe(itemIdemKey(stepped));
+    expect(itemIdemKey({ ...comment, args: { ...comment.args, add_labels: ['dispatched'] } })).not.toBe(itemIdemKey(comment));
+  });
+
   it('differs across a bucket boundary', () => {
     expect(itemIdemKey(create)).not.toBe(itemIdemKey({ ...create, now: NOW + 600_000 }));
   });

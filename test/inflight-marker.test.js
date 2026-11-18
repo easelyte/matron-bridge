@@ -296,3 +296,17 @@ describe('background work markers', () => {
     expect(marker.takeStale(maxAge).map(rec => rec.kind)).toEqual(['background']);
   });
 });
+
+describe('backgroundIds', () => {
+  it('lists only usable background markers', () => {
+    const { marker } = harness();
+    expect(marker.backgroundIds()).toEqual([]);
+    marker.noteTurnStart('alice', 'room-a');
+    marker.noteTurnStart('bob', 'room-b');
+    expect(marker.backgroundIds()).toEqual([]);
+    marker.noteTurnEnd('alice', { hasWork: true });
+    expect(marker.backgroundIds()).toEqual(['alice']);
+    marker.clearBackground('alice');
+    expect(marker.backgroundIds()).toEqual([]);
+  });
+});

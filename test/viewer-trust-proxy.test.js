@@ -53,7 +53,16 @@ describe('resolveTrustProxy', () => {
     }
     expect(resolveTrustProxy({ MATRON_VIEWER_TRUST_PROXY: 'loopback' })).toBe('loopback');
     expect(resolveTrustProxy({ MATRON_VIEWER_TRUST_PROXY: '1' })).toBe(1);
-    expect(resolveTrustProxy({ MATRON_VIEWER_TRUST_PROXY: 'true' })).toBe(true);
     expect(resolveTrustProxy({ MATRON_VIEWER_TRUST_PROXY: 'loopback, 10.0.0.0/8' })).toBe('loopback, 10.0.0.0/8');
+  });
+
+  it('refuses the trust-everything values, which would let a client forge its address', async () => {
+    const { resolveTrustProxy } = await import('../viewer/server.js');
+    for (const v of ['on', 'true', 'TRUE', 'yes']) {
+      const warnings = [];
+      expect(resolveTrustProxy({ MATRON_VIEWER_TRUST_PROXY: v }, (m) => warnings.push(m))).toBe(false);
+      expect(warnings).toHaveLength(1);
+      expect(warnings[0]).toContain('ignoring it');
+    }
   });
 });

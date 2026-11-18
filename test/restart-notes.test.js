@@ -93,7 +93,7 @@ describe('takeNoteDeliveries', () => {
     const stamp = { bootId: 'b1' };
     const stale = [{ convoId: 'c1', bootId: 'b1', ageMs: 5 }, { convoId: 'c2', bootId: 'b1', ageMs: 5 }];
     const r = takeNoteDeliveries({ store, stale, resumable, now: () => NOW });
-    expect(r.deliveries).toEqual([{ convoId: 'c1', text: 'finish the deploy check', ageMs: 10 * MIN, interrupted: true }]);
+    expect(r.deliveries).toEqual([{ convoId: 'c1', text: 'finish the deploy check', writtenAt: NOW - 10 * MIN, ageMs: 10 * MIN, interrupted: true }]);
     const { auto, card } = selectAutoCarryOn(r.stale, stamp, { enabled: true });
     const firstTurns = [...r.deliveries.map(d => d.convoId), ...auto.map(a => a.convoId), ...card.map(c => c.convoId)];
     expect(firstTurns.filter(id => id === 'c1')).toHaveLength(1);
@@ -106,6 +106,16 @@ describe('takeNoteDeliveries', () => {
     const r = takeNoteDeliveries({ store, stale, resumable, now: () => NOW });
     expect(r.deliveries).toEqual([]);
     expect(r.stale).toEqual(stale);
+  });
+
+  it('background work a restart cut off is never carried on through the note: its card wins and carries the note', () => {
+    const store = setup([['c1', 'finish the deploy check'], ['c2', 'other']]);
+    const stale = [{ convoId: 'c1', kind: 'background', bootId: 'b1', ageMs: 5 }, { convoId: 'c2', kind: 'turn', bootId: 'b1', ageMs: 5 }];
+    const r = takeNoteDeliveries({ store, stale, resumable, now: () => NOW });
+    expect(r.deliveries.map(d => [d.convoId, d.interrupted])).toEqual([['c2', true]]);
+    expect(r.stale).toEqual([{ convoId: 'c1', kind: 'background', bootId: 'b1', ageMs: 5, note: 'finish the deploy check' }]);
+    const { auto, card } = selectAutoCarryOn(r.stale, { bootId: 'b1' }, { enabled: true });
+    expect(auto.concat(card).map(x => x.convoId)).toEqual(['c1']);
   });
 
   it('delivers a note even when no turn was interrupted', () => {
@@ -171,17 +181,56 @@ describe('restartNoteTurnText', () => {
   });
 });
 
-describe('peek and discard (fork: the two halves of take)', () => {
-  it('peek reads without removing; discard removes, and is quiet when the file is already gone', () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'notes-peek-'));
-    try {
-      const store = createRestartNotes({ file: path.join(dir, 'notes.json') });
-      store.put('c1', 'first');
-      expect(store.peek()).toMatchObject([{ convoId: 'c1', text: 'first' }]);
-      expect(store.peek()).toHaveLength(1);
-      store.discard();
-      expect(store.peek()).toEqual([]);
-      expect(() => store.discard()).not.toThrow();
-    } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+describe('restart note store: peek and discard', () => {
+  it('peek() reads without removing', () => {
+    const { file } = tmpFile();
+    const store = createRestartNotes({ file, now: () => NOW });
+    store.put('c1', 'hello');
+    expect(store.peek().map(n => n.text)).toEqual(['hello']);
+    expect(store.peek().map(n => n.text)).toEqual(['hello']);
+    expect(fs.existsSync(file)).toBe(true);
+  });
+
+  it('discard() removes only the entries given, so a newer note for another chat stays', () => {
+    const { file } = tmpFile();
+    const store = createRestartNotes({ file, now: () => NOW });
+    store.put('c1', 'one');
+    const taken = store.peek();
+    store.put('c2', 'two');
+    store.discard(taken);
+    expect(store.peek().map(n => n.convoId)).toEqual(['c2']);
+  });
+
+  it('discard() keeps a note that replaced the taken one (different write time)', () => {
+    const { file } = tmpFile();
+    let t = NOW;
+    const store = createRestartNotes({ file, now: () => t });
+    store.put('c1', 'old');
+    const taken = store.peek();
+    t += 1000;
+    store.put('c1', 'new');
+    store.discard(taken);
+    expect(store.peek().map(n => n.text)).toEqual(['new']);
+  });
+
+  it('discard() deletes the file when nothing is left, and is quiet when it is already gone', () => {
+    const { file } = tmpFile();
+    const store = createRestartNotes({ file, now: () => NOW });
+    store.put('c1', 'one');
+    const taken = store.peek();
+    store.discard(taken);
+    expect(fs.existsSync(file)).toBe(false);
+    expect(() => store.discard(taken)).not.toThrow();
+    expect(() => store.discard([])).not.toThrow();
+  });
+
+  it('discard() throws when the file cannot be rewritten', () => {
+    const { file } = tmpFile();
+    createRestartNotes({ file, now: () => NOW }).put('c1', 'one');
+    createRestartNotes({ file, now: () => NOW }).put('c2', 'two');
+    const failing = fsWith({ renameSync: () => { throw new Error('ENOSPC'); } });
+    const store = createRestartNotes({ file, fs: failing, now: () => NOW });
+    expect(() => store.discard([{ convoId: 'c1', writtenAt: NOW }])).toThrow(/ENOSPC/);
+    expect(createRestartNotes({ file }).peek()).toHaveLength(2);
   });
 });

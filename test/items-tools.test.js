@@ -448,12 +448,39 @@ describe('items handlers', () => {
   });
 
   it('comment: actions on a closed item (journal 409) says to reopen first', async () => {
-    const { h, client } = fixture();
+    const { h, client } = fixture({ get: vi.fn(async () => ({ status: 200, data: { item: { id: 'it_1', state: 'closed' }, comments: [] } })) });
     client.comment.mockResolvedValueOnce({ status: 409, data: { error: 'conflict' } });
     const r = await h.comment({ roomId: '!r:s', id: 'it_1', body: 'q', actions: ['Go'] });
     expect(r.status).toBe(409);
     expect(r.body.error).toMatch(/item_reopen/);
     expect(client.update).not.toHaveBeenCalled();
+  });
+
+  it('comment: actions on a closed item still get the reopen hint when a retry key was sent', async () => {
+    // ask-user.js sends an idem_key on every comment, so the hint cannot depend on its absence.
+    const closed = () => ({ status: 200, data: { item: { id: 'it_1', state: 'closed' }, comments: [] } });
+    const { h, client } = fixture({ get: vi.fn(async () => closed()) });
+    client.comment.mockResolvedValueOnce({ status: 409, data: { error: 'conflict' } });
+    const r = await h.comment({ roomId: '!r:s', id: 'it_1', body: 'q', actions: ['Go'], idem_key: 'k' });
+    expect(r.status).toBe(409);
+    expect(r.body.error).toMatch(/item_reopen/);
+    // A named journal code is taken as given, without a lookup.
+    const named = fixture();
+    named.client.comment.mockResolvedValueOnce({ status: 409, data: { error: 'item_closed' } });
+    expect((await named.h.comment({ roomId: '!r:s', id: 'it_1', body: 'q', actions: ['Go'], idem_key: 'k' })).body.error).toMatch(/item_reopen/);
+    expect(named.client.get).not.toHaveBeenCalled();
+  });
+
+  it('comment: an idem-key conflict on an open item keeps the journal error, not the closed hint', async () => {
+    const { h, client } = fixture();
+    client.comment.mockResolvedValueOnce({ status: 409, data: { error: 'idem_key_conflict' } });
+    const r = await h.comment({ roomId: '!r:s', id: 'it_1', body: 'q', actions: ['Go'], idem_key: 'k' });
+    expect(r.status).toBe(409);
+    expect(r.body.error).toBe('idem_key_conflict');
+    // An unnamed 409 on an item that is open is not the closed hint either.
+    const open = fixture();
+    open.client.comment.mockResolvedValueOnce({ status: 409, data: { error: 'conflict' } });
+    expect((await open.h.comment({ roomId: '!r:s', id: 'it_1', body: 'q', actions: ['Go'], idem_key: 'k' })).body.error).toBe('conflict');
   });
 
   it('comment: a journal that drops the buttons is reported, and the item is still handed to the user', async () => {
