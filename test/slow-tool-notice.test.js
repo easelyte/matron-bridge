@@ -44,7 +44,7 @@ function makeHarness({ thresholdMs = 1000, reminderMs = 3000, notify } = {}) {
 }
 
 describe('resolveSlowToolNoticeMs', () => {
-  it('defaults to 3 minutes, reminder to 10', () => {
+  it('defaults to 5 minutes, reminder to 10', () => {
     expect(DEFAULT_SLOW_TOOL_NOTICE_MS).toBe(300_000);
     expect(DEFAULT_SLOW_TOOL_REMINDER_MS).toBe(600_000);
     expect(resolveSlowToolReminderMs(undefined)).toBe(DEFAULT_SLOW_TOOL_REMINDER_MS);

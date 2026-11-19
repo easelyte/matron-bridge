@@ -117,7 +117,7 @@ describe('locked mode and gate wiring beyond the event router', () => {
   });
 
   it('a box with approval keys does not start a session from a typed command', () => {
-    const head = body('async function handleCommand(roomId, text, sendReply, sendHtml, sender) {', 'switch (cmd) {');
+    const head = body('async function handleCommand(roomId, text, sendReply) {', 'switch (cmd) {');
     expect(head).toMatch(/approvalGate\.enabled && \(cmd === '!start' \|\| cmd === '!workdir'\)/);
     expect(head).toMatch(/return;/);
   });

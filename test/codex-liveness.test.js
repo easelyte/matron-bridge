@@ -9,14 +9,15 @@ function currentStartTicks() {
 }
 
 describe('isWrapperAlive', () => {
-  it('returns true when the pid is alive and its start ticks match', () => {
+  // The start-tick cases read /proc via currentStartTicks(), Linux only.
+  it.skipIf(process.platform !== 'linux')('returns true when the pid is alive and its start ticks match', () => {
     expect(isWrapperAlive({
       wrapperPid: process.pid,
       wrapperStartTicks: currentStartTicks(),
     })).toBe(true);
   });
 
-  it('returns false when an alive pid has been reused', () => {
+  it.skipIf(process.platform !== 'linux')('returns false when an alive pid has been reused', () => {
     const staleStartTicks = (BigInt(currentStartTicks()) + 1n).toString();
 
     expect(isWrapperAlive({

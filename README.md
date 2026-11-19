@@ -20,6 +20,8 @@ This project is licensed under AGPLv3. For alternative licensing, contact [licen
 - Claude Code CLI and/or Codex CLI installed and authenticated
 - A [matron-journal](https://github.com/Matronhq/matron-journal) server, plus the Matron app signed in to it (to pair the bridge by QR code) or an agent token minted on the journal server with `matron-admin agent add <user> <device-name>`
 
+**Linux and macOS:** the session hooks are shell scripts that need `jq` and `curl` on the `PATH` (`apt-get install jq curl`, `brew install jq`). Without `jq`, interactive sessions never report the end of a turn.
+
 **Linux (Ubuntu/Debian):** `apt-get install nodejs npm` (or use nvm), and `apt-get install ffmpeg` for the key frames of videos sent in chat. Voice notes are transcribed by the journal, so whisper is optional: `setup/install-whisper.sh` installs it (and ffmpeg) as a local fallback.
 
 **macOS:** [Homebrew](https://brew.sh), Xcode Command Line Tools (`xcode-select --install`), and `brew install node@22`, plus `brew install ffmpeg` for the key frames of videos sent in chat. Voice notes are transcribed by the journal, so whisper is optional: `setup/install-whisper.sh` runs `brew install whisper-cpp ffmpeg` for a local fallback.
@@ -66,7 +68,7 @@ Prefer to configure by hand (or provisioning non-interactively)?
 
 ```bash
 cp .env.example .env
-# Edit .env — set JOURNAL_WS_URL + JOURNAL_TOKEN_FILE (or JOURNAL_TOKEN), ALLOWED_USER_IDS, and HMAC_SECRET (openssl rand -hex 32) for file/secret links
+# Edit .env — set JOURNAL_WS_URL + JOURNAL_TOKEN_FILE (or JOURNAL_TOKEN), and HMAC_SECRET (openssl rand -hex 32) for file/secret links
 ```
 
 ### Enable Codex
@@ -178,13 +180,19 @@ setup\service.ps1       # registers two Scheduled Tasks at logon and starts them
 The tasks (`\Matron\matron-bridge` and `\Matron\matron-bridge-viewer`) run in
 your **desktop session**, so a Claude session on that box can drive GUI
 applications; the flip side is that the bridge only runs while you are logged
-on. For an unattended machine, configure auto-logon. `index.js` loads `.env`
-itself, so after editing `.env` just run `.\restart.ps1`.
+on. For an unattended machine, configure auto-logon. After editing `.env`, run
+`.\restart.ps1` for the bridge. It does not restart the viewer task, so restart
+that too:
 
-Print mode (the default) is the supported session mode on Windows. `/iv`
-(interactive TUI mode) runs through ConPTY, which re-renders Claude Code's
-terminal output, and is best effort: if prompts are not detected, switch back
-with `/iv off`.
+```powershell
+Stop-ScheduledTask -TaskPath '\Matron\' -TaskName matron-bridge-viewer
+Start-ScheduledTask -TaskPath '\Matron\' -TaskName matron-bridge-viewer
+```
+
+Print mode (the default) is the supported session mode on Windows.
+`/mode interactive` (interactive TUI mode) runs through ConPTY, which
+re-renders Claude Code's terminal output, and is best effort: if prompts are
+not detected, switch back with `/mode print`.
 
 ## Publishing the viewer
 
@@ -270,16 +278,19 @@ minutes (so `npm install` has finished), proves the tree boots with the same
 preflight the deploy scripts run, and then exits for the supervisor to
 relaunch it at the first poll where no session has work in flight: a turn
 running, a background job (shell, monitor) still alive under the session's
-agent process, or a subagent running. A running turn always holds the
-update. Background jobs and subagents share the idle reaper's eight-hour
-cap from the session's last activity, so a stuck background job cannot
-defer updates forever. If the process table cannot be read, running turns
-and subagents still hold the update, with the cap applying only to
-subagents. While waiting,
+agent process, a subagent running, or a session waiting for a person's answer.
+A running turn always holds the update. Input queued for delivery (queued
+messages, the resume outbox, or waiting for input readiness) also holds the
+restart. Background jobs, subagents, pending answers and queued input share the
+idle reaper's eight-hour cap from the session's last activity, so a stuck
+background job cannot defer updates forever. If the process table cannot be
+read, running turns, subagents, pending answers and queued input still hold the
+update, with the cap applying to subagents, pending answers and queued input.
+While waiting,
 the bridge logs a warning every 30 minutes. This fork never forces a restart
 mid-turn: `MATRON_CODE_UPDATE_FORCE_AFTER_MS` is ignored (logged at boot), and
-a gate hold never expires. `MATRON_RESTART_GATE_CMD` adds an advisory hook for
-the quiet moment: a command (argv split on whitespace, no shell) run with a
+a gate hold never expires. `MATRON_RESTART_GATE_CMD` adds an advisory hook for the
+quiet moment: a command (argv split on whitespace, no shell) run with a
 5 s timeout at each poll once no session holds work. Exit 0 means restart,
 exit 1 means hold, with the first line of stdout as the reason, which the
 30-minute waiting warning repeats. Any other exit code, a spawn failure or a
@@ -389,7 +400,7 @@ as `failed` and delivered again at the next boot.
 
 | Variable | Description | Default |
 |---|---|---|
-| `ALLOWED_USER_IDS` | Comma-separated allowlist of authorized user identities for this bridge (its sender label for journal-originated session commands) | `""` (any user) |
+| `ALLOWED_USER_IDS` | Informational: your user name on the journal, shown in the startup log. The bridge does not filter messages by it; the journal decides who can reach this bridge's conversations | `""` |
 | `DEFAULT_WORKDIR` | Default working directory for coding-agent sessions; `~` expands to the service user's home directory | `process.cwd()` if unset |
 | `MATRON_DEFAULT_AGENT` | Default coding agent (`claude` or `codex`) for new sessions; override per command with `--claude` / `--codex`. The box's own default set in the apps (Settings ▸ Devices, journal `PUT /devices/:id/defaults`, or the `box_defaults_set` tool) takes precedence | `claude` |
 | `MATRON_DEFAULT_MODEL` | Claude model for fresh starts when none is picked (New Chat picker, `/start` without `--model`); an alias such as `fable`, `opus`, `sonnet` or a full `claude-*` name. The `default` alias resolves to this too. Resumed rooms keep their own model. The box's own default model (Settings ▸ Devices, when Claude is its default agent) and then the user's own default model (Settings in the apps, journal `GET /defaults`) take precedence when this box can run them. Claude only; the effective default is reported to the picker as `default_model`. | `fable` |
@@ -414,8 +425,35 @@ as `failed` and delivered again at the next boot.
 | `BRIDGE_CLAUDE_MD_PATH` | Optional markdown file appended to bridge-spawned Claude sessions for bridge-specific guidance | `BRIDGE_CLAUDE.md` |
 | `BRIDGE_CODEX_MD_PATH` | Optional developer-instructions markdown injected into bridge-spawned Codex turns | `BRIDGE_CODEX.md` |
 | `BRIDGE_NOTICES_MD_PATH` | Markdown appended to every session's instructions while the user's "Send things I need to read to For you" setting is on (text after a `<!-- coordinator -->` line goes to the Coordinator only) | `BRIDGE_NOTICES.md` |
-| `CODEX_SANDBOX_MODE` | Sandbox for Codex programmatic turns: `read-only`, `workspace-write`, or `danger-full-access` | `workspace-write` |
+| `CODEX_SANDBOX_MODE` | Sandbox for Codex programmatic turns: `read-only`, `workspace-write`, or `danger-full-access`. A value that is none of these falls back to `workspace-write` | `danger-full-access` |
 | `CODEX_NETWORK_ACCESS` | Command network access in Codex workspace-write mode: `true` or `false`; empty inherits Codex configuration | unset |
+| `MATRON_PERMISSION_MODE` | Box-wide default permission mode for Claude print sessions: `bypass` or `auto` (see "Permissions") | `bypass` |
+| `PERMISSION_PROMPT_TIMEOUT_MS` | How long a permission card waits for an answer before it denies itself (at most one hour) | `300000` (5 minutes) |
+| `MATRON_SELF_RESTART_MAX` | How many consecutive `restart_session` calls a session may make before it has to ask the user | `3` |
+| `MATRON_SELF_COMPACT_COOLDOWN_MS` | Minimum gap between two `compact_self` calls in one session | `1800000` (30 minutes) |
+| `MATRON_RESTART_CARRY_ON_MAX_AGE_MS` | How recently a conversation must have been active for the next bridge start to offer a Carry on card for its interrupted turn | `21600000` (6 hours) |
+| `MATRON_SLOW_TOOL_NOTICE_MS` | How long a tool call may run before the chat gets a "still running" notice | `300000` (5 minutes) |
+| `MATRON_SLOW_TOOL_REMINDER_MS` | How often that notice repeats while the call is still running | `600000` (10 minutes) |
+| `MATRON_QUEUE_EDIT_HOLD_MS` | How long a queued message is held back while the user edits it | `600000` (10 minutes) |
+| `MATRON_TRANSFER_MAX_BYTES` | Largest file `send_attachment` may send into an agent room | `10737418240` (10 GB) |
+| `MATRON_FILES_DIR` | Where files the user sends from Matron to a print-mode session are saved (one folder per project, outside the working directory) | `~/matron-files` |
+| `MATRON_KEEP_AWAKE` | macOS only: `work` keeps the Mac awake while a session is live, `always` never lets it sleep, `off` leaves sleep to macOS | `work` |
+| `MATRON_SLEEP_COMMAND` | Command `/sleep` runs to put the box to sleep. Unset, `/sleep` is off | — |
+| `MATRON_SLEEP_WAKE_HINT` | How the `/sleep` card says the box will wake again | `something starts it again` |
+| `SHOW_FILE_DEFAULT_ON` | `1` loads the `share` MCP extra (`show_file`) in every session | off |
+| `SHOW_FILE_ARTIFACT_ROOTS` | Colon-separated absolute directories, outside the working directory, that `show_file` may also send from | — |
+| `SHOW_FILE_UPLOAD_TIMEOUT_MS` | How long one `show_file` upload may take (at most 5 minutes) | `30000` |
+| `BRIDGE_COORDINATOR_MD_PATH` | Markdown appended to the Coordinator session's instructions | `BRIDGE_COORDINATOR.md` |
+| `BRIDGE_COORDINATOR_DIR` | Directory of the Coordinator's procedures and routines | `coordinator/` |
+| `SECRET_RATE_LIMIT` | Viewer requests per minute for secret-request forms | `30` |
+| `MATRON_REDACT_OVERSIZE_POLICY` | What the Codex output redactor does with text too large to scan: `truncate`, `drop` or `skip` | `truncate` |
+| `LIMITS_REFRESH_MS` | Shortest gap between two refreshes of the account usage meters | `300000` (5 minutes) |
+| `HOST_VITALS_SAMPLE_MS` | How often the box's CPU, memory and disk are sampled (at least 5 s) | `10000` |
+| `HOST_VITALS_DELTA_PCT` | Change, in percentage points, that sends a new host-vitals report straight away | `8` |
+| `HOST_VITALS_HEARTBEAT_MS` | Longest gap between two host-vitals reports (at least 5 s) | `45000` |
+| `RESUME_READY_QUIET_MS` | How long a resumed interactive session's screen must stay quiet before the first message is typed | `800` |
+| `RESUME_READY_HARDCAP_MS` | Longest wait for that quiet before typing anyway | `120000` |
+| `MATRON_LIVE_OUTPUT_TTL` | Seconds a live command-output log is kept | `86400` (1 day) |
 | `DEBUG` | Set to `1` to log verbose bridge and coding-agent events | `0` |
 | `MATRON_INTERACTIVE_MODE` | Set to `1` to spawn Claude Code as a real PTY (instead of `--print` stream mode) so interactive flows like `/login` work | `0` |
 | `MATRON_DUMP_PTY` | When `MATRON_INTERACTIVE_MODE=1`, set to `1` to dump raw PTY bytes for each session to a private per-session temp dir, e.g. `/tmp/iv-pty-XXXXXX/<roomId>.log` (exact path is printed to the bridge log at session start), for debugging stuck-prompt issues | `0` |
@@ -556,7 +594,7 @@ Get the agent token by pairing with the Matron app (`npm run pair`, or the first
 
 The journal also exposes an HTTP **search API** (`GET /search?q=` on the https base derived from `JOURNAL_WS_URL`, authenticated with the same agent token) that full-text searches every one of the user's conversations across all their devices, plus an `around_seq` context mode on `GET /convo/:id/messages` for reading prose around a hit. Bridge sessions are told how to use it in `BRIDGE_CLAUDE.md` / `BRIDGE_CODEX.md`; the full spec lives in matron-journal's [`docs/protocol.md`](https://github.com/Matronhq/matron-journal/blob/master/docs/protocol.md) ("Journal search").
 
-The `item_*` MCP tools and the `/items` HTTP routes they wrap (the task & decision tracker, described for sessions in `BRIDGE_CLAUDE.md` / `BRIDGE_CODEX.md`) need a matron-journal deployment with the items routes (journal PR #73). Deploy that journal update before this bridge in production — against an older journal, the tools answer `journal unreachable` or the routes answer `HTTP 404`.
+The `item_*` MCP tools and the `/items` HTTP routes they wrap (the task & decision tracker, described for sessions in `BRIDGE_CLAUDE.md` / `BRIDGE_CODEX.md`) need a matron-journal with the items routes. Against an older journal, the tools answer `journal unreachable` or the routes answer `HTTP 404`.
 
 ## Agent-to-agent chat
 

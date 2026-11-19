@@ -43,10 +43,10 @@ describe('buildPrintSessionSettings', () => {
     // gate off (verified against the real CLI below).
     expect(settings.disableAllHooks).toBe(false);
     expect(settings.permissions.allow).toEqual(['mcp__ask-user', 'mcp__show-file']);
-    expect(settings.hooks.PreCompact[0].hooks[0].command).toBe(path.posix.join(HOOKS_DIR, 'compact-notify.sh'));
+    expect(settings.hooks.PreCompact[0].hooks[0].command).toBe(`'${path.posix.join(HOOKS_DIR, 'compact-notify.sh')}'`);
     expect(settings.hooks.PreToolUse[0]).toEqual({
       matcher: 'Bash',
-      hooks: [{ type: 'command', command: path.posix.join(HOOKS_DIR, 'matron-bash-tee.sh') }],
+      hooks: [{ type: 'command', command: `'${path.posix.join(HOOKS_DIR, 'matron-bash-tee.sh')}'` }],
     });
     const gate = gateCommand(settings);
     expect(gate.type).toBe('command');

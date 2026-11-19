@@ -63,9 +63,7 @@ function makeRouter(overrides = {}) {
     injectText: vi.fn(() => true),
     injectBlocks: vi.fn(() => true),
     queueMedia: vi.fn(async () => {}),
-    echoToRoom: vi.fn(),
     publishNotice: vi.fn(),
-    escapeHtml: (s) => String(s),
     log: silentLog,
     ...overrides,
   };

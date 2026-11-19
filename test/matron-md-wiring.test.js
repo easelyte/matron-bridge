@@ -42,6 +42,5 @@ describe('MATRON.md wiring (source inspection)', () => {
     expect(index).toContain('Workdir: ${session.workdir}${matronMdNote(session)}${resumeModelLine}');
     expect(index).toContain('Workdir: ${resolved}${matronMdNote(session)}${workdirModelLine}');
     expect(index).toContain('Session active\\nAgent: ${agentLabel(session.agent)}\\nWorkdir: ${session.workdir}${matronMdNote(session)}');
-    expect(index).toContain('<tr><td>MATRON.md</td><td>${escapeHtml(matronMdFileList(session.matronMd))}</td></tr>');
   });
 });

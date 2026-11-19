@@ -58,7 +58,7 @@ function setup({ busy = true } = {}) {
     requeuedSteerAt: new WeakMap(),
     journalInputConsumer: { queueRelease },
     journalConvoIdFor: () => 'convo',
-    journalSessionCommandCtx: () => ({ sendReply, sendHtml: vi.fn(), sender: 'user' }),
+    journalSessionCommandCtx: () => ({ sendReply, sender: 'user' }),
     findSessionByClaudeSessionId: (id) => (id === 'convo' ? session : null),
     journalResumeConvo: () => null,
     accountLock: { hold: () => false },
@@ -83,7 +83,7 @@ function setup({ busy = true } = {}) {
     AUTO_RESUME_TEXT: 'carry on',
     BAD_MODEL_RECOVERY_TEXT: 'recover',
     CLAUDE_STEER_ENABLED: false,
-    escapeHtml: (t) => t, formatQueueSummary: vi.fn(), clearQueueNotifications: vi.fn(), emitRelease: vi.fn(), pendingFlushBatch: () => [], queueReleaseForBatch: () => null,
+    formatQueueSummary: vi.fn(), clearQueueNotifications: vi.fn(), emitRelease: vi.fn(), pendingFlushBatch: () => [], queueReleaseForBatch: () => null,
     QUEUE_EDIT_HOLD_MS: 60000,
     debug: () => {},
   };
@@ -120,7 +120,7 @@ describe('user-typed text still raises the card', () => {
     await h.context.journalRouteTextToSession(h.session, 'please also check the logs');
     expect(texts(h.session)).toEqual(['please also check the logs']);
     expect(h.session.sendButtonMessage).toHaveBeenCalledTimes(1);
-    const payload = h.session.sendButtonMessage.mock.calls[0][5];
+    const payload = h.session.sendButtonMessage.mock.calls[0][3];
     expect(payload.kind).toBe('queued_release');
     expect(payload.question).toBe('Send this queued message now, or cancel it?');
     expectLockstep(h, 1);
@@ -131,7 +131,7 @@ describe('user-typed text still raises the card', () => {
     await h.context.journalRouteTextToSession(h.session, 'carry on', { bridgeOrigin: true });
     await h.context.journalRouteTextToSession(h.session, 'typed by a person');
     expect(h.session.sendButtonMessage).toHaveBeenCalledTimes(1);
-    expect(h.session.sendButtonMessage.mock.calls[0][5].body).toContain('typed by a person');
+    expect(h.session.sendButtonMessage.mock.calls[0][3].body).toContain('typed by a person');
     expectLockstep(h, 2);
   });
 });
@@ -283,7 +283,7 @@ describe('user-authored queue callers keep the card', () => {
     const h = setup();
     await h.context.journalQueueMedia(h.session, { blocks: media, mirrorToJournal: true, preview: 'voice note', fullText: 'voice note' });
     expect(h.session.sendButtonMessage).toHaveBeenCalledTimes(1);
-    expect(h.session.sendButtonMessage.mock.calls[0][5].kind).toBe('queued_release');
+    expect(h.session.sendButtonMessage.mock.calls[0][3].kind).toBe('queued_release');
     expectLockstep(h, 1);
   });
 
@@ -294,7 +294,7 @@ describe('user-authored queue callers keep the card', () => {
       source: { item_id: 'it_1', comment_id: 'c_1' },
     });
     expect(h.session.sendButtonMessage).toHaveBeenCalledTimes(1);
-    expect(h.session.sendButtonMessage.mock.calls[0][5].edit.mode).toBe('resend');
+    expect(h.session.sendButtonMessage.mock.calls[0][3].edit.mode).toBe('resend');
     expectLockstep(h, 1);
   });
 });

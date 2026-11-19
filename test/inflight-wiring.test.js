@@ -123,11 +123,11 @@ describe('restart carry-on turn-boundary wiring', () => {
 
     expect(
       starts,
-      'index.js should have exactly 3 `session.busy = true;` turn-start sites (submitAnswer\'s '
-      + 'tool_result write, sendToSession, and the plan-approval tool_result). If this changed, a '
+      'index.js should have exactly 2 `session.busy = true;` turn-start sites (sendToSession and '
+      + 'the plan-approval tool_result). If this changed, a '
       + 'turn start was added or removed — pair it with an inflightMarker.noteTurnStart call, or a '
       + 'restart during that turn produces NO carry-on card.',
-    ).toBe(3);
+    ).toBe(2);
 
     expect(
       notes,

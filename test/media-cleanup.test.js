@@ -12,7 +12,7 @@ function harness(overrides = {}) {
     fetchMedia: vi.fn(async () => ({ buffer: Buffer.from('bytes') })),
     buildSavedBlocks: vi.fn(async () => ({ blocks, cleanup: vi.fn() })),
     injectBlocks: vi.fn(() => true), injectText: vi.fn(() => true),
-    queueMedia: vi.fn(async () => {}), echoToRoom: vi.fn(), publishNotice: vi.fn(),
+    queueMedia: vi.fn(async () => {}), publishNotice: vi.fn(),
     log: { warn: vi.fn() }, ...overrides,
   };
   return { session, deps, route: createJournalMediaRouter(deps) };
@@ -123,11 +123,11 @@ describe('queued attachment cancellation', () => {
   it.each(['magic', 'tap', 'item'])('cleans the file on %s cancellation', async kind => {
     const cleanup = vi.fn();
     const session = { queuedMessages: [attachQueuedCleanup([...blocks], cleanup)], queueNotifications: [{ id: 'card::0' }] };
-    const deps = { sendReply: vi.fn(), sendHtml: vi.fn(), htmlEscape: s => s,
+    const deps = { sendReply: vi.fn(),
       queueRelease: { listLive: () => [{ itemId: 'card::0', promptId: 'card' }], dropItem: vi.fn() },
       convoId: 'conversation', emitRelease: (_convo, _entry, { mutate } = {}) => { mutate?.(); return true; } };
     if (kind === 'magic') await handleBusyQueueMagicWord(session, 'cancel', deps);
-    if (kind === 'tap') resolveQueueReleaseTap('cancel:0', session, deps);
+    if (kind === 'tap') resolveQueueReleaseTap('cancel', session, { ...deps, entry: { prompt_id: 'card', itemIds: ['card::0'] } });
     if (kind === 'item') cancelQueuedItem(session, { itemId: 'card::0', promptId: 'card', ...deps });
     expect(cleanup).toHaveBeenCalledTimes(1);
   });

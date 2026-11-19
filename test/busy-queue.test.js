@@ -15,17 +15,11 @@ import { createQueuedReleaseRetry } from '../lib/queued-release-retry.js';
 // Busy-queue magic words, notifications and queue-release taps
 // (lib/busy-queue.js). queuedMessages and queueNotifications must move in
 // lockstep on every path, or later indexed cancels remove the WRONG message.
-// The "full" deps add the sendHtml sink; the journal caller omits it,
-// because journal feedback stays plain text.
 
-// The real formatQueueSummary lives in index.js (it leans on escapeHtml);
-// tests inject a recognizable stand-in so assertions can prove it was fed
-// the flushed queue.
+// The real formatQueueSummary lives in index.js; tests inject a recognizable
+// stand-in so assertions can prove it was fed the flushed queue.
 function fakeSummary(queued) {
-  return {
-    plain: `  1. [${queued.length} entries]`,
-    html: `<ol><li>[${queued.length} entries]</li></ol>`,
-  };
+  return { plain: `  1. [${queued.length} entries]` };
 }
 
 function makeSession(overrides = {}) {
@@ -44,7 +38,6 @@ function makeSession(overrides = {}) {
 function fullDeps(overrides = {}) {
   return {
     sendReply: vi.fn(async () => {}),
-    sendHtml: vi.fn(async () => {}),
     formatQueueSummary: vi.fn(fakeSummary),
     flushQueue: vi.fn(() => true),
     stripQueueNotificationLinks: vi.fn(),
@@ -62,8 +55,7 @@ function realisticStrip() {
 
 function journalDeps(overrides = {}) {
   // What journalRouteTextToSession passes: a plain reply sink, the shared
-  // queue primitives and the notification-clearing seam. Only sendHtml is
-  // omitted (journal feedback stays plain text).
+  // queue primitives and the notification-clearing seam.
   const deps = {
     sendReply: vi.fn(async () => {}),
     formatQueueSummary: vi.fn(fakeSummary),
@@ -107,7 +99,7 @@ describe('handleBusyQueueMagicWord — send/interrupt (full seams)', () => {
     const queuedRef = session.queuedMessages;
     const order = [];
     const deps = fullDeps({
-      sendHtml: vi.fn(async () => order.push('summary')),
+      sendReply: vi.fn(async () => order.push('summary')),
       flushQueue: vi.fn(() => {
         order.push('flush');
         return true;
@@ -126,22 +118,19 @@ describe('handleBusyQueueMagicWord — send/interrupt (full seams)', () => {
     expect(deps.stripQueueNotificationLinks).toHaveBeenCalledWith(session);
   });
 
-  it('sends the exact Matrix summary text (html sink present)', async () => {
+  it('sends the exact summary text', async () => {
     const session = makeSession();
     const deps = fullDeps();
     await handleBusyQueueMagicWord(session, 'send', deps);
-    expect(deps.sendHtml).toHaveBeenCalledWith(
-      '⚡ Sending 2 queued messages now:\n  1. [2 entries]',
-      '<b>⚡ Sending 2 queued messages now:</b><ol><li>[2 entries]</li></ol>',
-    );
-    expect(deps.sendReply).not.toHaveBeenCalled();
+    expect(deps.sendReply).toHaveBeenCalledTimes(1);
+    expect(deps.sendReply).toHaveBeenCalledWith('⚡ Sending 2 queued messages now:\n  1. [2 entries]');
   });
 
   it('uses the singular form for one queued message', async () => {
     const session = makeSession({ queuedMessages: [[{ type: 'text', text: 'only' }]] });
     const deps = fullDeps();
     await handleBusyQueueMagicWord(session, 'send', deps);
-    expect(deps.sendHtml.mock.calls[0][0]).toMatch(/^⚡ Sending 1 queued message now:/);
+    expect(deps.sendReply.mock.calls[0][0]).toMatch(/^⚡ Sending 1 queued message now:/);
   });
 
   it('replies "no queued messages" when the queue is empty, and never flushes', async () => {
@@ -191,13 +180,11 @@ describe('handleBusyQueueMagicWord — send/interrupt (journal seams)', () => {
   });
 
   it('Bugbot scenario invariant: after a Matron send-flush, a re-queued message is index-aligned with its tile', async () => {
-    // The indexed cancel:<idx> button handler lives in index.js's Matrix
-    // button_response path and is not importable in this harness (top-level
-    // Matrix/express side effects — see showbashoutput.test.js). What
-    // protects it is the invariant asserted here: a Matron send-flush leaves
-    // BOTH arrays empty, so post-flush queueing rebuilds them in lockstep
-    // from index 0 — cancel:0 then splices queue[0] and notifs[0] for the
-    // SAME message. Pre-fix, notifs kept the two stale entries, so
+    // A positional cancel (index.js's /cancel-queued endpoint) is not
+    // importable in this harness. What protects it is the invariant asserted
+    // here: a Matron send-flush leaves BOTH arrays empty, so post-flush
+    // queueing rebuilds them in lockstep from index 0 — a cancel at 0 then
+    // splices queue[0] and notifs[0] for the SAME message. Pre-fix, notifs kept the two stale entries, so
     // notifs[0] was tileA while queue[0] was the new message C.
     const session = makeSession();
     const deps = journalDeps();
@@ -422,44 +409,25 @@ describe('handleBusyQueueMagicWord — cancel (journal seams)', () => {
 // notifyQueuedMessage posts the tile, resolveQueueReleaseTap runs the taps.
 
 describe('notifyQueuedMessage', () => {
-  it('button channel: posts the tile with indexed cancel + interrupt values and records the notif', async () => {
-    const sendButtonMessage = vi.fn(async () => '$tile2');
+  it('without the registry there is no card: plain text, even with a button channel, and the notif is recorded', async () => {
+    const sendButtonMessage = vi.fn(async () => '$card');
+    const sendReply = vi.fn(async () => '$tile2');
     const session = makeSession({
       sendButtonMessage,
       queueNotifications: [{ eventId: '$ev1', plain: '📨 Queued (1): first' }],
     });
-    await notifyQueuedMessage(session, 'second', { sendReply: vi.fn(), htmlEscape: (s) => s, allowSendOne: true });
-    expect(sendButtonMessage).toHaveBeenCalledWith(
-      '📨 Queued (2): second',
-      [
-        { id: 'cancel', label: '✕ Cancel', value: 'cancel:1' },
-        { id: 'send_one', label: '⚡ Send just this', value: 'sendone:1' },
-        { id: 'interrupt', label: '⚡ Send now', value: 'interrupt' },
-      ],
-      'pick_one', '📨 Queued (2): second', '📨 Queued (2): second',
-      {
-        question: '📨 Queued (2): second',
-        options: [
-          { id: 'cancel', label: '✕ Cancel', value: 'cancel:1' },
-          { id: 'send_one', label: '⚡ Send just this', value: 'sendone:1' },
-          { id: 'interrupt', label: '⚡ Send now', value: 'interrupt' },
-        ],
-        mode: 'pick_one',
-        silent: true,
-      },
-    );
+    await notifyQueuedMessage(session, 'second', { sendReply, allowSendOne: true });
+    expect(sendButtonMessage).not.toHaveBeenCalled();
+    expect(sendReply).toHaveBeenCalledWith('📨 Queued (2): second');
     expect(session.queueNotifications).toEqual([
       { eventId: '$ev1', plain: '📨 Queued (1): first' },
       { eventId: '$tile2', plain: '📨 Queued (2): second' },
     ]);
   });
 
-  it('button send that returns no event id records nothing (no dangling notif entry)', async () => {
-    const session = makeSession({
-      sendButtonMessage: vi.fn(async () => null),
-      queueNotifications: [],
-    });
-    await notifyQueuedMessage(session, 'second', { sendReply: vi.fn() });
+  it('a send that returns no event id records nothing (no dangling notif entry)', async () => {
+    const session = makeSession({ queueNotifications: [] });
+    await notifyQueuedMessage(session, 'second', { sendReply: vi.fn(async () => null) });
     expect(session.queueNotifications).toEqual([]);
   });
 
@@ -487,7 +455,6 @@ describe('notifyQueuedMessage', () => {
     const session = makeSession({ sendButtonMessage, queueNotifications: [] });
     await notifyQueuedMessage(session, 'trunc…', {
       sendReply: vi.fn(),
-      htmlEscape: (s) => s,
       queueRelease: { noteQueued },
       convoId: 'convo-1',
       fullText: 'the full untruncated queued message body',
@@ -540,8 +507,6 @@ describe('notifyQueuedMessage', () => {
     expect((await payloadFor({ ...structured, editMode: 'replace' })).silent).toBe(true);
     expect((await payloadFor({ ...structured, source: { item_id: 'it_1' } })).silent).toBe(true);
     expect((await payloadFor(structured, { queuedMessages: [[{ type: 'text', text: 'x' }]] })).silent).toBe(true);
-    // No registry: the classic prompt shape, still silent.
-    expect(await payloadFor({})).toMatchObject({ mode: 'pick_one', silent: true });
   });
 
   // Spec 2026-10-01 (item thread queued replies): a queued tracker reply's
@@ -693,8 +658,7 @@ describe('notifyQueuedMessage', () => {
 
     expect(payload.actions.map(a => a.id)).toEqual(['send', 'cancel']);
     expect(payload.options.map(o => o.id)).toEqual(['send', 'cancel']);
-    // The Matrix tile loses it too — same capability, same card.
-    expect(buttonArgs[1].map(b => b.id)).toEqual(['cancel', 'interrupt']);
+    expect(buttonArgs[1]).toEqual(payload.options);
     // The question must not advertise an action that isn't there.
     expect(payload.question).toBe('Send all 2 queued messages now, or cancel this one?');
   });
@@ -720,7 +684,7 @@ describe('notifyQueuedMessage', () => {
 
     expect(payload.actions.map(a => a.id)).toEqual(['send', 'cancel']);
     expect(payload.options.map(o => o.id)).toEqual(['send', 'cancel']);
-    expect(buttonArgs[1].map(b => b.id)).toEqual(['cancel', 'interrupt']);
+    expect(buttonArgs[1]).toEqual(payload.options);
     expect(payload.question).toBe('Send all 2 queued messages now, or cancel this one?');
   });
 
@@ -743,17 +707,6 @@ describe('notifyQueuedMessage', () => {
     );
   });
 
-  // Matrix parity: the legacy button tile carries the same third affordance,
-  // positionally addressed (`sendone:<n>`) like its `cancel:<n>` sibling.
-  it('button channel: the Matrix tile gains sendone:<n> only on a multi-queued card', async () => {
-    const solo = vi.fn(async () => '$tile');
-    await notifyQueuedMessage(
-      makeSession({ sendButtonMessage: solo, queueNotifications: [], queuedMessages: [[{ type: 'text', text: 'only' }]] }),
-      'only',
-      { sendReply: vi.fn(), htmlEscape: (s) => s },
-    );
-    expect(solo.mock.calls[0][1].map(b => b.id)).toEqual(['cancel', 'interrupt']);
-  });
 });
 
 
@@ -853,62 +806,17 @@ describe('cancelQueuedItem', () => {
 });
 
 describe('resolveQueueReleaseTap', () => {
-  it('interrupt: detaches + strips + flushes without a post-action text line, returns true', () => {
+  // A tap is resolved against the live registry entry the router matched to
+  // its card. Without one there is nothing to resolve, whatever the value.
+  it('without an entry nothing is handled, even for a queue action', () => {
     const session = makeSession();
     const deps = fullDeps();
-    const handled = resolveQueueReleaseTap('interrupt', session, deps);
-    expect(handled).toBe(true);
-    expect(session.queuedMessages).toBeNull();
-    expect(deps.stripQueueNotificationLinks).toHaveBeenCalledWith(session);
-    expect(deps.sendHtml).not.toHaveBeenCalled();
-    expect(deps.sendReply).not.toHaveBeenCalled();
-    expect(deps.flushQueue).toHaveBeenCalledTimes(1);
-    expect(deps.flushQueue.mock.calls[0][1]).toHaveLength(2);
-  });
-
-  it('interrupt via journal seams: no post-action text line, same flush', () => {
-    const session = makeSession();
-    const deps = fullDeps({ sendHtml: null });
-    const handled = resolveQueueReleaseTap('interrupt', session, deps);
-    expect(handled).toBe(true);
-    expect(deps.sendReply).not.toHaveBeenCalled();
-    expect(deps.flushQueue).toHaveBeenCalledTimes(1);
-  });
-
-  it('interrupt on an empty queue is a SILENT no-op (stale-tile tap), still handled', () => {
-    const session = makeSession({ queuedMessages: null });
-    const deps = fullDeps();
-    expect(resolveQueueReleaseTap('interrupt', session, deps)).toBe(true);
-    expect(deps.sendHtml).not.toHaveBeenCalled();
-    expect(deps.sendReply).not.toHaveBeenCalled();
-    expect(deps.flushQueue).not.toHaveBeenCalled();
-  });
-
-  it('cancel:<n> splices exactly the indexed message AND its tile without a post-action text line', () => {
-    const session = makeSession();
-    const deps = fullDeps();
-    expect(resolveQueueReleaseTap('cancel:0', session, deps)).toBe(true);
-    expect(session.queuedMessages).toEqual([[{ type: 'text', text: 'second' }]]);
-    expect(session.queueNotifications).toEqual([{ eventId: '$ev2', plain: '📨 Queued (2): second' }]);
-    expect(deps.sendReply).not.toHaveBeenCalled();
-  });
-
-  it('cancel of the last remaining message nulls the queue without a post-action text line', () => {
-    const session = makeSession({
-      queuedMessages: [[{ type: 'text', text: 'solo' }]],
-      queueNotifications: [{ eventId: '$ev1', plain: '📨 Queued (1): solo' }],
-    });
-    const deps = fullDeps();
-    resolveQueueReleaseTap('cancel:0', session, deps);
-    expect(session.queuedMessages).toBeNull();
-    expect(deps.sendReply).not.toHaveBeenCalled();
-  });
-
-  it('cancel with an out-of-range index is a SILENT no-op (stale tile), still handled', () => {
-    const session = makeSession();
-    const deps = fullDeps();
-    expect(resolveQueueReleaseTap('cancel:9', session, deps)).toBe(true);
+    for (const value of ['send', 'send_one', 'cancel', 'edit', 'interrupt', 'cancel:0', 'sendone:0']) {
+      expect(resolveQueueReleaseTap(value, session, deps)).toBe(false);
+    }
     expect(session.queuedMessages).toHaveLength(2);
+    expect(session.queueNotifications).toHaveLength(2);
+    expect(deps.flushQueue).not.toHaveBeenCalled();
     expect(deps.sendReply).not.toHaveBeenCalled();
   });
 
@@ -922,9 +830,8 @@ describe('resolveQueueReleaseTap', () => {
   });
 });
 
-// Coverage gap (a): the STRUCTURED entry path (entry != null), reached in
-// production from the router's stable-id classification. Only the legacy
-// entry==null branches were exercised above.
+// The entry path, reached in production from the router's stable-id
+// classification.
 describe('resolveQueueReleaseTap — structured entry path (stable-id)', () => {
   function entrySession(overrides = {}) {
     return {
@@ -1023,7 +930,6 @@ describe('resolveQueueReleaseTap — structured entry path (stable-id)', () => {
       notify,
       formatQueueSummary: (queued) => ({
         plain: queued.map((e, i) => `  ${i + 1}. ${e.map(b => b.text).join('\n')}`).join('\n'),
-        html: '',
       }),
     });
     expect(notify).toHaveBeenCalledTimes(1);
@@ -1041,7 +947,7 @@ describe('resolveQueueReleaseTap — structured entry path (stable-id)', () => {
       queueRelease: { listLive: vi.fn(() => []), dropItem: vi.fn() },
       emitRelease: vi.fn(),
       notify,
-      formatQueueSummary: () => ({ plain: 'x', html: '' }),
+      formatQueueSummary: () => ({ plain: 'x' }),
     });
     expect(notify).not.toHaveBeenCalled();
   });
@@ -1379,7 +1285,6 @@ describe('resolveQueueReleaseTap — send_one (structured, stable-id)', () => {
       notify,
       formatQueueSummary: (queued) => ({
         plain: queued.map((e, i) => `  ${i + 1}. ${e.map(b => b.text).join('\n')}`).join('\n'),
-        html: '',
       }),
     });
     expect(notify).toHaveBeenCalledTimes(1);
@@ -1392,7 +1297,7 @@ describe('resolveQueueReleaseTap — send_one (structured, stable-id)', () => {
     tapSendOne(threeSession(), {
       flushQueue: fakeFlushQueue(false),
       notify,
-      formatQueueSummary: () => ({ plain: 'x', html: '' }),
+      formatQueueSummary: () => ({ plain: 'x' }),
     });
     expect(notify).not.toHaveBeenCalled();
   });
@@ -1406,82 +1311,6 @@ describe('resolveQueueReleaseTap — send_one (structured, stable-id)', () => {
   });
 });
 
-// Matrix-shaped compatibility values. These have had no production caller since
-// the router stopped classifying queue taps by value shape (issue #165), but the
-// branch is still the contract for any pre-deploy tile still on screen, so the
-// third affordance exists here too and obeys the same stale-tap silence.
-describe('resolveQueueReleaseTap — legacy sendone:<n>', () => {
-  it('splices exactly the indexed message + tile and flushes only it', () => {
-    const session = makeSession();
-    const deps = fullDeps({ flushQueue: vi.fn(() => true) });
-    expect(resolveQueueReleaseTap('sendone:0', session, deps)).toBe(true);
-
-    expect(deps.flushQueue).toHaveBeenCalledTimes(1);
-    expect(deps.flushQueue.mock.calls[0][1]).toEqual([[{ type: 'text', text: 'first' }]]);
-    expect(session.queuedMessages).toEqual([[{ type: 'text', text: 'second' }]]);
-    expect(session.queueNotifications).toEqual([{ eventId: '$ev2', plain: '📨 Queued (2): second' }]);
-    expect(deps.sendReply).not.toHaveBeenCalled();
-  });
-
-  it('nulls the queue when the indexed message was the last one', () => {
-    const session = makeSession({
-      queuedMessages: [[{ type: 'text', text: 'solo' }]],
-      queueNotifications: [{ eventId: '$ev1', plain: '📨 Queued (1): solo' }],
-    });
-    resolveQueueReleaseTap('sendone:0', session, fullDeps({ flushQueue: vi.fn(() => true) }));
-    expect(session.queuedMessages).toBeNull();
-  });
-
-  it('an out-of-range index is a SILENT no-op (stale tile), still handled', () => {
-    const session = makeSession();
-    const deps = fullDeps();
-    expect(resolveQueueReleaseTap('sendone:9', session, deps)).toBe(true);
-    expect(deps.flushQueue).not.toHaveBeenCalled();
-    expect(session.queuedMessages).toHaveLength(2);
-  });
-
-  // Taps index 1, not 0: at index 0 a restore-to-front and a restore-to-origin
-  // are indistinguishable, so the test would pass against the bug.
-  it('a retained flush puts the message and its tile back at their ORIGINAL index, and edits nothing', () => {
-    const session = makeSession({
-      queuedMessages: [
-        [{ type: 'text', text: '/compact' }],
-        [{ type: 'text', text: 'first' }],
-        [{ type: 'text', text: 'second' }],
-      ],
-      queueNotifications: [
-        { eventId: '$evC', plain: '📨 Queued: /compact' },
-        { eventId: '$ev1', plain: '📨 Queued (2): first' },
-        { eventId: '$ev2', plain: '📨 Queued (3): second' },
-      ],
-    });
-    const deps = fullDeps({
-      // Faithful restoreQueuedBatch: it PREPENDS, which is what makes putting
-      // the entry back at its own index this branch's job.
-      flushQueue: vi.fn((s, queued) => {
-        s.queuedMessages = [...queued, ...(s.queuedMessages || [])];
-        return false;
-      }),
-    });
-    expect(resolveQueueReleaseTap('sendone:1', session, deps)).toBe(true);
-    expect(session.queuedMessages).toEqual([
-      [{ type: 'text', text: '/compact' }],
-      [{ type: 'text', text: 'first' }],
-      [{ type: 'text', text: 'second' }],
-    ]);
-    expect(session.queueNotifications.map(n => n.plain)).toEqual([
-      '📨 Queued: /compact', '📨 Queued (2): first', '📨 Queued (3): second',
-    ]);
-    // The compact is still isolated by the next flush, not merged mid-body.
-    expect(compactBatchSize(session.queuedMessages)).toBe(1);
-  });
-});
-
-// A queued /compact is flushed ALONE and ahead of everything else
-// (lib/compact-priority.js). Merging it into the one-message batch the queue
-// normally becomes makes Claude read the following messages as *compaction
-// instructions*, so the split has to hold on every flush path — including the
-// ones where the user explicitly asked for the whole queue.
 describe('compact-first batch split', () => {
   function compactSession() {
     return makeSession({
@@ -1667,7 +1496,7 @@ describe('notifyQueuedMessage — compact jump tile', () => {
       compactJump: true,
     });
 
-    const payload = session.sendButtonMessage.mock.calls[0][5];
+    const payload = session.sendButtonMessage.mock.calls[0][3];
     expect(payload.actions.map(a => a.label)).toEqual(['⚡ Send now', '✕ Cancel']);
     // Ids and values are untouched, so shipped clients route the card exactly
     // as they always have.
@@ -1697,7 +1526,7 @@ describe('queued-release publisher wiring', () => {
       // Write-ahead persisted a `pending` record keyed (promptId, itemId, action)
       // BEFORE the publish.
       expect(put).toHaveBeenCalledTimes(1);
-      expect(put).toHaveBeenCalledWith('pr_123 pr_123::0 cancel', expect.objectContaining({
+      expect(put).toHaveBeenCalledWith('pr_123\u0000pr_123::0\u0000cancel', expect.objectContaining({
         convoId: 'convo-1',
         promptId: 'pr_123',
         itemId: 'pr_123::0',
@@ -1711,7 +1540,7 @@ describe('queued-release publisher wiring', () => {
         action: 'cancel',
         released: ['pr_123::0'],
         at: 1_722_000_000_000,
-      }, { idemKey: 'qr pr_123 pr_123::0 cancel' });
+      }, { idemKey: 'qr\u0000pr_123\u0000pr_123::0\u0000cancel' });
     } finally {
       now.mockRestore();
     }
@@ -2104,11 +1933,10 @@ describe('#165 index.js prompt-reply handler — value-shape classification reti
     const body = src.slice(start, end);
     // Only a 'live' queued-release seq is intercepted as a queue action; every
     // other reply — including one whose label is literally `interrupt` /
-    // `cancel:2` — flows through to journalRoutePromptReply and the "answered:"
-    // echo. No value-shape early-return sits between classify and route.
+    // `cancel:2` — flows through to journalRoutePromptReply. No value-shape
+    // early-return sits between classify and route.
     expect(body).toMatch(/queuedRelease\.state === 'live'/);
     expect(body).toMatch(/journalRoutePromptReply\(session, answer, \{ causes \}\)/);
-    expect(body).toMatch(/answered: /);
     expect(body).not.toMatch(/isQueueReleaseTap/);
   });
 });

@@ -21,7 +21,7 @@ function harness(overrides = {}) {
     fetchMedia: vi.fn(async () => ({ buffer: Buffer.from('bytes') })),
     buildSavedBlocks: vi.fn(async () => blocks),
     injectBlocks: vi.fn(() => true), injectText: vi.fn(() => true),
-    queueMedia: vi.fn(async () => {}), echoToRoom: vi.fn(), publishNotice: vi.fn(),
+    queueMedia: vi.fn(async () => {}), publishNotice: vi.fn(),
     log: { warn: vi.fn() }, ...overrides,
   };
   return { session, deps, route: createJournalMediaRouter(deps) };
@@ -75,7 +75,6 @@ describe('attachment preparation and delivery', () => {
     expect(h.deps.injectText).not.toHaveBeenCalled();
     expect(h.deps.injectBlocks).not.toHaveBeenCalled();
     expect(h.deps.queueMedia).not.toHaveBeenCalled();
-    expect(h.deps.echoToRoom).toHaveBeenCalledTimes(1);
   });
 
   it('does not deliver blocks prepared for a session that ended meanwhile', async () => {
@@ -144,7 +143,7 @@ describe('session replacement', () => {
     const done = deferred();
     const context = vm.createContext({
       sessions: new Map([['room', session]]),
-      journalSessionCommandCtx: () => ({ sendReply: () => {}, sendHtml: () => {}, sender: 's' }),
+      journalSessionCommandCtx: () => ({ sendReply: () => {}, sender: 's' }),
       handleCommand: () => { seen = session._replayingDeferred; return done.promise; },
     });
     vm.runInContext(src, context);

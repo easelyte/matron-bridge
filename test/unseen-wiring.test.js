@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { readFileSync, readdirSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { loadCoordinatorBlock } from '../lib/coordinator.js';
 
 // index.js cannot be imported in-process (top-level side effects), so the
@@ -11,8 +12,8 @@ const askUser = readFileSync(new URL('../ask-user.js', import.meta.url), 'utf8')
 // (spec 2026-10-01 coordinator routines), assembled as index.js does.
 const coord = loadCoordinatorBlock({
   readFile: (p) => readFileSync(p, 'utf8'),
-  path: new URL('../BRIDGE_COORDINATOR.md', import.meta.url).pathname,
-  dir: new URL('../coordinator', import.meta.url).pathname,
+  path: fileURLToPath(new URL('../BRIDGE_COORDINATOR.md', import.meta.url)),
+  dir: fileURLToPath(new URL('../coordinator', import.meta.url)),
   readDir: (d) => readdirSync(d),
 });
 const claude = readFileSync(new URL('../BRIDGE_CLAUDE.md', import.meta.url), 'utf8');

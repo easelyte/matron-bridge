@@ -3,7 +3,7 @@ import { EventEmitter } from 'node:events';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
-import { resolveSpawnCwd, attachSpawnErrorHandler } from '../lib/spawn-guard.js';
+import { resolveSpawnCwd, attachSpawnErrorHandler, attachStdinErrorHandler } from '../lib/spawn-guard.js';
 
 describe('resolveSpawnCwd', () => {
   const exists = (p) => p === '/exists' || p === '/fallback';
@@ -82,5 +82,50 @@ describe('attachSpawnErrorHandler', () => {
     proc.on('error', () => events.push('error'));
     await new Promise((resolve) => proc.on('close', () => { events.push('close'); resolve(); }));
     expect(events).toEqual(['error', 'close']);
+  });
+});
+
+describe('attachStdinErrorHandler', () => {
+  it('logs a stdin error instead of letting it throw', () => {
+    const stdin = new EventEmitter();
+    const log = vi.fn();
+    attachStdinErrorHandler({ stdin }, { log });
+    expect(() => stdin.emit('error', new Error('write EPIPE'))).not.toThrow();
+    expect(log).toHaveBeenCalledWith('claude stdin error: write EPIPE');
+  });
+
+  it('adds one listener only, and tolerates a process with no stdin', () => {
+    const stdin = new EventEmitter();
+    attachStdinErrorHandler({ stdin }, { log: () => {} });
+    attachStdinErrorHandler({ stdin }, { log: () => {} });
+    expect(stdin.listenerCount('error')).toBe(1);
+    expect(() => attachStdinErrorHandler({ stdin: null }, { log: () => {} })).not.toThrow();
+  });
+
+  it('survives a logger that throws', () => {
+    const stdin = new EventEmitter();
+    attachStdinErrorHandler({ stdin }, { log: () => { throw new Error('log failed'); } });
+    expect(() => stdin.emit('error', new Error('boom'))).not.toThrow();
+  });
+
+  // The real case: the reading end of the pipe has gone but the bridge has
+  // not seen the child exit yet, and it writes one more message. Unguarded,
+  // this write ends the process with "Unhandled 'error' event". POSIX only:
+  // a Windows pipe does not report the closed reader as EPIPE on this write.
+  it.skipIf(process.platform === 'win32')('absorbs the error from a write into a pipe the child has closed', async () => {
+    const { spawn } = await import('node:child_process');
+    const child = 'require("fs").closeSync(0); console.log("closed"); setTimeout(() => {}, 10000)';
+    const proc = spawn(process.execPath, ['-e', child], { stdio: ['pipe', 'pipe', 'ignore'] });
+    try {
+      const log = vi.fn();
+      attachStdinErrorHandler(proc, { log });
+      await new Promise((resolve) => proc.stdout.once('data', resolve));
+      const writeError = await new Promise((resolve) => proc.stdin.write('{"type":"user"}\n', resolve));
+      await new Promise((resolve) => setImmediate(resolve));
+      expect(writeError?.code).toBe('EPIPE');
+      expect(log).toHaveBeenCalledWith('claude stdin error: write EPIPE');
+    } finally {
+      proc.kill();
+    }
   });
 });

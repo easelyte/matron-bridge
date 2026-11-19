@@ -82,3 +82,10 @@ describe('wizard readline setup', () => {
     expect(src).toMatch(/createInterface\(\{[^}]*terminal: true[^}]*\}\)/);
   });
 });
+
+describe('parseEnv line endings', () => {
+  it('reads a .env saved with Windows line endings', () => {
+    const env = parseEnv('JOURNAL_WS_URL=wss://journal.example.com/ws\r\nHMAC_SECRET=abc\r\nEMPTY=\r\n');
+    expect(env).toEqual({ JOURNAL_WS_URL: 'wss://journal.example.com/ws', HMAC_SECRET: 'abc', EMPTY: '' });
+  });
+});

@@ -241,7 +241,7 @@ describe('Codex bridge wiring', () => {
     const reportStart = src.indexOf('function reportSessionSendFailure(');
     const reportEnd = src.indexOf('\nfunction flushResponse(', reportStart);
     const reporter = src.slice(reportStart, reportEnd);
-    expect(reporter).toMatch(/session\.sendHtml[\s\S]*session\.sendCallback/);
+    expect(reporter).toMatch(/if \(session\.sendCallback\) session\.sendCallback\(message\);/);
     expect(reporter).toContain('return false');
     expect(reporter).not.toContain('_sendFailureReported');
   });

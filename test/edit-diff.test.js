@@ -138,4 +138,38 @@ describe('computeEditDiff', () => {
     expect(await computeEditDiff('Write', { file_path: '/tmp/x' }, '/tmp')).toBeNull();
     expect(await computeEditDiff('MultiEdit', { file_path: '/tmp/x', edits: [] }, '/tmp')).toBeNull();
   });
+
+  it('Edit: a rewrite past the edit-length bound -> null, without a long block', () => {
+    const oldLines = Array.from({ length: 3000 }, (_, i) => `old ${i}`).join('\n');
+    const newLines = Array.from({ length: 3000 }, (_, i) => `new ${i}`).join('\n');
+    const t0 = Date.now();
+    const r = computeEditDiff('Edit', {
+      file_path: '/tmp/x', old_string: oldLines, new_string: newLines,
+    }, '/tmp');
+    expect(r).toBeNull();
+    // Unbounded, this diff takes seconds; the bound gives up early.
+    expect(Date.now() - t0).toBeLessThan(1500);
+  });
+
+  it('MultiEdit: one edit past the bound -> null (no partial card)', () => {
+    const big = (p) => Array.from({ length: 3000 }, (_, i) => `${p} ${i}`).join('\n');
+    const r = computeEditDiff('MultiEdit', {
+      file_path: '/tmp/x',
+      edits: [
+        { old_string: 'foo', new_string: 'bar' },
+        { old_string: big('old'), new_string: big('new') },
+      ],
+    }, '/tmp');
+    expect(r).toBeNull();
+  });
+
+  it('Write: a large new file is not edit-length bounded and keeps its card', async () => {
+    const dir = await mkTmp();
+    const f = path.join(dir, 'fresh.txt');
+    const content = Array.from({ length: 5000 }, (_, i) => `line ${i}`).join('\n');
+    const r = computeEditDiff('Write', { file_path: f, content }, dir);
+    expect(r.newFile).toBe(true);
+    expect(r.added).toBe(5000);
+    expect(r.truncated).toBe(true);
+  });
 });

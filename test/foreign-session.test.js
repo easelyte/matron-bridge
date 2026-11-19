@@ -4,7 +4,7 @@ import { actionHash, ACTION_INPUT_MAX, ACTION_PENDING_MAX } from '../lib/foreign
 
 // The stateful half of foreign turns: arming the gate, one-shot approvals,
 // the "Allow once" asks and the taps that answer them.
-function rig({ busy = false, setThrows = false, stored = {} } = {}) {
+function rig({ busy = false, setThrows = false, stored = {}, roomTitle = undefined } = {}) {
   const sent = [];
   const notices = [];
   const flags = new Set();
@@ -27,6 +27,7 @@ function rig({ busy = false, setThrows = false, stored = {} } = {}) {
     isOccupied: () => occupied.v,
     flag: { set: (k) => { if (setThrows) throw new Error('ro'); flags.add(k); }, clear: (k) => flags.delete(k) },
     store: { load: () => saved, save: (o) => { saved = o; } },
+    roomTitle,
   });
   return { fs, sent, notices, flags, created, closed, occupied, saved: () => saved };
 }
@@ -126,6 +127,39 @@ describe('Allow once', () => {
     expect((await r.fs.check(s, { tool_name: 'mcp__ask-user__memory_get', tool_input: { name: 'x' } })).decision).toBe('allow');
     expect(r.fs.routeAllowed(s, '/memory/get', {})).toBe(true);
     expect(r.fs.routeAllowed(s, '/memory/get', {})).toBe(false);
+  });
+
+  it('names the room by its title, and a lookup that throws falls back to the id', async () => {
+    const r = rig({ roomTitle: (id) => (id === 'room-2' ? 'Release planning' : null) });
+    const s = session();
+    r.fs.begin(s, { roomId: 'room-1', person: 'tim', role: 'owner', mission: null });
+    await r.fs.requestAction(s, { tool_name: 'mcp__ask-user__agent_chat_send', tool_input: { room_id: 'room-2', message: 'hi' }, why: 'w' });
+    expect(r.created[0].title).toMatch(/^Allow once: Send a message in “Release planning”/);
+    const t = rig({ roomTitle: () => { throw new Error('boom'); } });
+    t.fs.begin(s, { roomId: 'room-1', person: 'tim', role: 'owner', mission: null });
+    expect((await t.fs.requestAction(s, { tool_name: 'mcp__ask-user__agent_chat_send', tool_input: { room_id: 'room-2', message: 'hi' }, why: 'w' })).status).toBe(200);
+    expect(t.created[0].body).toContain('a room the bridge does not know (`room-2`)');
+  });
+
+  it('refuses an input with bidirectional controls, which the card could not show faithfully', async () => {
+    const r = rig();
+    const s = session();
+    r.fs.begin(s, { roomId: 'room-1', person: 'tim', role: 'owner', mission: null });
+    const out = await r.fs.requestAction(s, { tool_name: 'Bash', tool_input: { command: 'echo \u202Etxt.hs' }, why: 'w' });
+    expect(out.status).toBe(400);
+    expect(out.body.error).toMatch(/bidirectional/);
+    expect(r.created).toEqual([]);
+  });
+
+  it('refuses an input whose card would be over the body cap even without the readable copy', async () => {
+    const r = rig();
+    const s = session();
+    r.fs.begin(s, { roomId: 'room-1', person: 'tim', role: 'owner', mission: null });
+    const out = await r.fs.requestAction(s, { tool_name: 'Bash', tool_input: { command: `${'`'.repeat(8000)}${'~'.repeat(8000)}` }, why: 'w' });
+    expect(out.status).toBe(400);
+    expect(out.body.error).toMatch(/too large/);
+    expect(r.created).toEqual([]);
+    expect(r.fs.pendingCount()).toBe(0);
   });
 
   it('refuses an input the card could not show in full, rather than cutting it', async () => {

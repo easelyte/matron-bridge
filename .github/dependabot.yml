@@ -14,12 +14,6 @@ updates:
         dependency-type: production
       npm-development:
         dependency-type: development
-    ignore:
-      # matrix-bot-sdk still depends on deprecated request/request-promise.
-      # Keep Dependabot active, but expect this family to need upstream work.
-      - dependency-name: request
-      - dependency-name: request-promise
-      - dependency-name: uuid
 
   - package-ecosystem: github-actions
     directory: /

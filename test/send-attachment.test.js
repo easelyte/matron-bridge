@@ -47,6 +47,11 @@ describe('classifyContentType', () => {
     expect(classifyContentType('photo.heic')).toEqual({ contentType: 'image/heic', isImage: true });
   });
 
+  it('does not send an SVG as an inline image: it goes as a file to download', () => {
+    expect(classifyContentType('diagram.svg')).toEqual({ contentType: 'application/octet-stream', isImage: false });
+    expect(classifyContentType('DIAGRAM.SVG').isImage).toBe(false);
+  });
+
   it('classifies documents and text as non-image files', () => {
     expect(classifyContentType('report.pdf')).toEqual({ contentType: 'application/pdf', isImage: false });
     expect(classifyContentType('build.log')).toEqual({ contentType: 'text/plain', isImage: false });

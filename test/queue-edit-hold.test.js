@@ -423,7 +423,7 @@ describe('flush notices for a hold split', () => {
   it('echoes what went and says the rest wait for an edit, not a compaction', () => {
     const n = queueFlushNotice('turnEnd', {
       queued: 1, deferred: 2, deferredBy: batchDeferralReason([text('a')]),
-      summary: { plain: '  1. a', html: '<ol><li>a</li></ol>' },
+      summary: { plain: '  1. a' },
     });
     expect(n.plain).toBe('📬 Sending 1 queued message:\n  1. a\n— the other 2 queued messages wait while a queued message is being edited.');
     expect(n.plain).not.toMatch(/compact/);
@@ -439,7 +439,7 @@ describe('flush notices for a hold split', () => {
     const session = cardSession();
     const registry = fakeRegistry();
     await queueAll(session, ['a', 'b'], registry);
-    const deps = tapDeps(session, registry, { formatQueueSummary: (q) => ({ plain: `[${q.length}]`, html: '' }) });
+    const deps = tapDeps(session, registry, { formatQueueSummary: (q) => ({ plain: `[${q.length}]` }) });
     resolveQueueReleaseTap('edit', session, { ...deps, entry: entryFor(session, 1) });
     resolveQueueReleaseTap('send', session, { ...deps, entry: entryFor(session, 0) });
     expect(deps.notify).toHaveBeenCalledWith(expect.stringMatching(/being edited/));
@@ -458,7 +458,7 @@ describe('handleBusyQueueMagicWord — send with a held message', () => {
     const sendReply = vi.fn(async () => {});
     const flushQueue = vi.fn(() => true);
     await handleBusyQueueMagicWord(session, 'send', {
-      sendReply, flushQueue, formatQueueSummary: () => ({ plain: '', html: '' }),
+      sendReply, flushQueue, formatQueueSummary: () => ({ plain: '' }),
     });
     expect(flushQueue).not.toHaveBeenCalled();
     expect(sendReply).toHaveBeenCalledWith(QUEUE_EDIT_HELD_REPLY);

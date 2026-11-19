@@ -1,5 +1,6 @@
 import { describe, it, expect, vi } from 'vitest';
 import { readFileSync, readdirSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import {
   createCoordinatorLookup,
   loadCoordinatorBlock,
@@ -251,8 +252,8 @@ describe('loadCoordinatorBlock', () => {
   it('the real files load into one block that starts with the preamble and ends with the last routine', () => {
     const block = loadCoordinatorBlock({
       readFile: (p) => readFileSync(p, 'utf8'),
-      path: new URL('../BRIDGE_COORDINATOR.md', import.meta.url).pathname,
-      dir: new URL('../coordinator', import.meta.url).pathname,
+      path: fileURLToPath(new URL('../BRIDGE_COORDINATOR.md', import.meta.url)),
+      dir: fileURLToPath(new URL('../coordinator', import.meta.url)),
       readDir: (d) => readdirSync(d),
     });
     expect(block).toMatch(/^# You are this user's Coordinator/);

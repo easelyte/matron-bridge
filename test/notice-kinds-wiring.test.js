@@ -12,14 +12,14 @@ describe('extra notice kinds are set where the events already happen', () => {
     expect(start).toBeGreaterThan(-1);
     const body = index.slice(start, index.indexOf('\n}\n', start));
     expect(body).toMatch(/if \(!meta \|\| !session\?\.roomId\) return false;/);
-    expect(body).toMatch(/sendToRoom\(session\.roomId, plain, html, \{ notice: meta \}\)/);
+    expect(body).toMatch(/sendToRoom\(session\.roomId, plain, \{ notice: meta \}\)/);
     expect(body).toMatch(/\.catch\(/);
     expect(body).toMatch(/return true;/);
     expect(body).toMatch(/return false;/);
   });
 
   it('keeps both crash-restart notices untagged (print mode and interactive mode)', () => {
-    const sites = index.match(/const n = notice\('warning',\s*\n\s*`\[Session crashed[\s\S]*?restarted\.sendHtml\(n\.plain, n\.html\);/g);
+    const sites = index.match(/if \(restarted\.sendCallback\) \{\s*\n\s*restarted\.sendCallback\(\s*`\[Session crashed[\s\S]*?\);/g);
     expect(sites).toHaveLength(2);
     for (const site of sites) {
       expect(site).not.toMatch(/sendKindNotice|noticeMeta/);
@@ -29,11 +29,11 @@ describe('extra notice kinds are set where the events already happen', () => {
 
   it('tags the slow-tool notice and falls back to the plain callback', () => {
     expect(index).toMatch(/noticeMeta\('slow_tool', text, \{ summary: slowToolNoticeSummary\(\{ toolName, elapsedMs, reminder \}\) \}\)/);
-    expect(index).toMatch(/if \(!sendKindNotice\(session, 'slow_tool', text, markdownToHtml\(text\), meta\)\) session\.sendCallback\(text\);/);
+    expect(index).toMatch(/if \(!sendKindNotice\(session, 'slow_tool', text, meta\)\) session\.sendCallback\(text\);/);
   });
 
   it('tags the !restart result line', () => {
-    expect(index).toMatch(/sendKindNotice\(restarted, 'restart', restartedLine, markdownToHtml\(restartedLine\)\)\) await sendReply\(restartedLine\)/);
+    expect(index).toMatch(/sendKindNotice\(restarted, 'restart', restartedLine\)\) await sendReply\(restartedLine\)/);
   });
 
   it('keeps delivery failures untagged: dropped queued messages, a failed room flush, stranded room messages, a lost timer', () => {

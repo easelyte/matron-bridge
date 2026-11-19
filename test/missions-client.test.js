@@ -40,10 +40,10 @@ describe('createMissionsClient', () => {
     const c = createMissionsClient({ baseUrl: 'https://j', token: 't', fetchImpl });
     await c.get('#61'); await c.update('ms_1', { title: 'x' }); await c.join('ms_1', { convo_id: 'c2' });
     await c.close('ms_1', { summary: 's' }); await c.postMilestone({ convo_id: 'c1', kind: 'progress', title: 't' }, {});
-    await c.listMilestones('c1'); await c.list({ state: 'open' });
+    await c.list({ state: 'open' });
     expect(calls.map((x) => `${x.init.method} ${x.url}`)).toEqual([
       'GET https://j/missions/%2361', 'PATCH https://j/missions/ms_1', 'POST https://j/missions/ms_1/join',
-      'POST https://j/missions/ms_1/close', 'POST https://j/milestones', 'GET https://j/milestones?convo=c1', 'GET https://j/missions?state=open',
+      'POST https://j/missions/ms_1/close', 'POST https://j/milestones', 'GET https://j/missions?state=open',
     ]);
   });
 

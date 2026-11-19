@@ -86,6 +86,38 @@ describe('publish-side Codex redaction', () => {
     expect(redact('AUTH=hidden\nGOOGLE_TOKEN=hidden')).not.toContain('=hidden');
   });
 
+  it('keeps JSON valid and redacts a quoted secret value once', () => {
+    const redact = createPublishRedactor({});
+    const secret = 'hunter2-fixture-value';
+    const out = redact(JSON.stringify({ password: secret, x: 1, nested: { api_key: secret } }));
+
+    expect(out).not.toContain(secret);
+    const parsed = JSON.parse(out);
+    expect(parsed.x).toBe(1);
+    expect(parsed.password).toMatch(/^\[REDACTED:secret-key:[0-9a-f]{8}\]$/);
+    expect(out.match(/\[REDACTED:/g)).toHaveLength(2);
+    // The same secret gets the same marker, quoted or bare.
+    expect(parsed.nested.api_key).toBe(parsed.password);
+    expect(redact(`password=${secret}`)).toBe(`password=${parsed.password}`);
+
+    expect(redact(`password: '${secret}'`)).toMatch(/^password: '\[REDACTED:secret-key:[0-9a-f]{8}\]'$/);
+  });
+
+  it('still redacts everything after a quoted secret value on the same line', () => {
+    const redact = createPublishRedactor({});
+    const out = redact('password: "first-fixture" second-fixture');
+    expect(out).not.toContain('first-fixture');
+    expect(out).not.toContain('second-fixture');
+  });
+
+  it('redacts a secret value that is itself written like a redaction marker', () => {
+    const redact = createPublishRedactor({});
+    const lookalike = '[REDACTED:secret-key:0badc0de]';
+    expect(redact(`password: "${lookalike}"`)).not.toContain('0badc0de');
+    expect(redact(`password: ${lookalike}`)).not.toContain('0badc0de');
+    expect(redact(`password=x\ntoken: "${lookalike}" trailing-fixture`)).not.toContain('trailing-fixture');
+  });
+
   it('applies the built-in baseline when no policy is configured', () => {
     // With no policy file the redactor still runs the built-in secret-key /
     // private-key-PEM / env-dump belt. It never reads from disk in this mode.

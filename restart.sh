@@ -6,10 +6,11 @@ cd "$(dirname "$0")"
 
 PORT=9802
 
-# This script is the non-systemd bounce (launchd/manual installs). Under systemd
-# it is actively harmful: it kills the unit's process, systemd respawns it at
-# RestartSec=5, and the nohup instance started below grabs the port first — so
-# the surviving bridge is unsupervised and systemd's respawn fails to bind.
+# This script is the bounce for manual installs and for launchd, where it hands
+# the restart to launchd (see below). Under systemd it is actively harmful: it
+# kills the unit's process, systemd respawns it at RestartSec=5, and the nohup
+# instance started below grabs the port first — so the surviving bridge is
+# unsupervised and systemd's respawn fails to bind.
 #
 # Refuse whenever systemd owns the unit's lifecycle, not just while it is
 # `active`: during the RestartSec hold-off after a crash the state is
@@ -39,6 +40,44 @@ if command -v systemctl >/dev/null 2>&1; then
     echo "  sudo systemd-run --on-active=20 --unit=bridge-restart systemctl restart matron-bridge" >&2
     exit 1
   fi
+fi
+
+# Under launchd (setup/service-macos.sh), restart through launchd. Stopping the
+# service's process here and starting a copy with nohup would take the bridge
+# out of launchd: the bridge exits 0 on SIGTERM, the plist only relaunches after
+# a failed exit, and the nohup copy then runs unsupervised, outside the plist's
+# environment and log file, holding the port against the service's next start.
+#
+# Same lookup as deploy.sh: ask launchd which of the two labels in the wild it
+# has. `command -v launchctl` keeps this a no-op on Linux, and a Mac with no
+# service installed falls through to the manual start below.
+if command -v launchctl >/dev/null 2>&1; then
+  LAUNCHD_DOMAIN="gui/$(id -u)"
+  for candidate in chat.matron.matron-bridge chat.matron.claude-matrix-bridge; do
+    LAUNCHD_TARGET="$LAUNCHD_DOMAIN/$candidate"
+    if launchctl print "$LAUNCHD_TARGET" >/dev/null 2>&1; then
+      # A copy started outside launchd (by an older version of this script, or
+      # by hand) may still hold the port; the restarted service could not bind
+      # while it does. Stop whatever holds the port other than the service.
+      SERVICE_PID=$(launchctl print "$LAUNCHD_TARGET" 2>/dev/null | awk -F'= ' '/^[[:space:]]*pid = /{print $2; exit}')
+      for pid in $(lsof -ti :$PORT 2>/dev/null); do
+        if [ "$pid" != "$SERVICE_PID" ]; then
+          echo "Stopping a bridge copy outside launchd on port $PORT (PID: $pid)"
+          kill "$pid" 2>/dev/null || true
+        fi
+      done
+      echo "Restarting launchd service $LAUNCHD_TARGET..."
+      # kickstart -k stops the running instance and starts the service again.
+      if ! launchctl kickstart -k "$LAUNCHD_TARGET"; then
+        echo "ERROR: launchctl kickstart -k $LAUNCHD_TARGET failed." >&2
+        echo "Not starting a separate copy: it would run outside launchd." >&2
+        exit 1
+      fi
+      echo "Bridge restarted by launchd."
+      echo "Verify: launchctl print $LAUNCHD_TARGET | grep 'pid ='"
+      exit 0
+    fi
+  done
 fi
 
 echo "Stopping existing bridge processes..."

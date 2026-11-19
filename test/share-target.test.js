@@ -12,7 +12,7 @@ describe('resolveShareTarget', () => {
     _journalTitleHint: 'ABC:3a Template cleanup',
     claudeSessionId: '3a000000-1111-4222-8333-444444444444',
     workdir: '/Users/developer/Dev/acme-infra',
-    sendHtml: () => {},
+    sendCallback: () => {},
     ...over,
   });
 
@@ -56,26 +56,21 @@ describe('resolveShareTarget', () => {
     expect(out.description).toContain('acme-infra');
   });
 
-  // Sessions are constructed with sendCallback/sendHtml null and get them
+  // Sessions are constructed with sendCallback null and get it
   // attached afterwards, so "alive" alone did not mean "can be told". The
   // caller reported `notified: <that room>` regardless, and the MCP tool
   // passed that on to the agent — which then believed the user had the link.
   it('rejects a live session that has no send channel attached yet', () => {
-    const sessions = new Map([['room-1', session({ sendHtml: null, sendCallback: null })]]);
+    const sessions = new Map([['room-1', session({ sendCallback: null })]]);
     const out = resolveShareTarget(sessions, 'room-1');
     expect(out.ok).toBe(false);
     expect(out.error).toMatch(/no send channel/i);
   });
 
-  it('accepts a session reachable only through the plain-text callback', () => {
-    const sessions = new Map([['room-1', session({ sendHtml: null, sendCallback: () => {} })]]);
-    expect(resolveShareTarget(sessions, 'room-1').ok).toBe(true);
-  });
-
   it('omits unreachable sessions from the list of alternatives it suggests', () => {
     const sessions = new Map([
       ['aaaa1111-0000-0000-0000-000000000000', session()],
-      ['bbbb2222-0000-0000-0000-000000000000', session({ _journalTitleHint: 'not wired up', sendHtml: null, sendCallback: null })],
+      ['bbbb2222-0000-0000-0000-000000000000', session({ _journalTitleHint: 'not wired up', sendCallback: null })],
     ]);
     const out = resolveShareTarget(sessions, 'cccc3333-0000-0000-0000-000000000000');
     expect(out.ok).toBe(false);

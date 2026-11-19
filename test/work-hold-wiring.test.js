@@ -36,7 +36,27 @@ describe('work in flight holds the session and the box', () => {
   it('reads the process table at most once per tick, only when a session has passed the idle timeout', () => {
     const body = fnBody('startIdleReaper');
     expect(body).toMatch(/let table = null;/);
-    expect(body).toMatch(/const processTable = \(\) => \(table \?\?= readProcessTable\(\)\);/);
+    expect(body).toMatch(/if \(\[\.\.\.sessions\.values\(\)\]\.some\(\(s\) => pastIdleTimeout\(s, now\)\)\) table = await readProcessTableAsync\(\);/);
+    expect(body).toMatch(/const processTable = \(\) => table;/);
+    // Never the blocking read: the reaper ticks while sessions are held.
+    expect(body).not.toMatch(/readProcessTable\(\)|execFileSync/);
+    // The walk itself stays synchronous after the one read, so its checks and
+    // its decision see the same session state.
+    const walk = body.slice(body.indexOf('for (const [roomId, session] of sessions)'), body.indexOf('}, SESSION_IDLE_CHECK_MS)'));
+    expect(walk.length).toBeGreaterThan(0);
+    expect(walk).not.toMatch(/\bawait\b/);
+    expect(walk.indexOf('if (!table) continue;')).toBeLessThan(walk.indexOf('sessionWorkHold('));
+  });
+
+  it('prefetches the table on exactly the sessions the walk would consider reaping', () => {
+    const body = fnBody('pastIdleTimeout');
+    expect(body).toMatch(/session\.alive && !session\._autoStopped\s*&& now - handoffIdleSince\(session\) >= SESSION_IDLE_TIMEOUT_MS/);
+    const reaper = fnBody('startIdleReaper');
+    // The walk's own skips, in the same terms.
+    expect(reaper).toContain('if (!session.alive) continue;');
+    expect(reaper).toContain('if (session._autoStopped) continue;');
+    expect(reaper).toContain('const last = handoffIdleSince(session);');
+    expect(reaper).toContain('if (now - last < SESSION_IDLE_TIMEOUT_MS) {');
   });
 
   it('finds the claude child pid for every session shape', () => {
@@ -48,7 +68,7 @@ describe('work in flight holds the session and the box', () => {
 
   it('decides with the pure helper on the session\'s busy flag and live work children', () => {
     const body = fnBody('sessionWorkHold');
-    expect(body).toMatch(/workHold\(\{\s*busy: !!session\.busy,\s*children: liveWorkChildren\(sessionChildPid\(session\), table, MCP_SERVER_SIGNATURES\),\s*idleSince: last,\s*now,\s*subagentCount: session\.subagentConvos\?\.runningCount\(\) \?\? 0,\s*\}\)/);
+    expect(body).toMatch(/workHold\(\{\s*busy: !!session\.busy,\s*children: liveWorkChildren\(sessionChildPid\(session\), table, MCP_SERVER_SIGNATURES\),\s*idleSince: last,\s*now,\s*subagentCount: session\.subagentConvos\?\.runningCount\(\) \?\? 0,\s*awaitingAnswer,\s*queuedInput,\s*\}\)/);
   });
 
   it('knows the MCP servers by the merged config claude is spawned with — every extras group, local overlay included', () => {

@@ -65,24 +65,35 @@ describe('bridge wiring', () => {
     expect(index).toContain('generateSecretLink(secretId, label, roomId, { ttlMs, multiline, context, convoId })');
   });
 
+  // Just the createSecretRequests({...}) call: a slice to the end of the file
+  // would let any later `sendToSession(` or `journalPublishNotice(` stand in
+  // for a seam that had been removed from the call.
+  const secretRequestsCall = () => {
+    const start = index.indexOf('const secretRequests = createSecretRequests(');
+    expect(start).toBeGreaterThan(-1);
+    const end = index.indexOf('\n});', start);
+    expect(end).toBeGreaterThan(start);
+    return index.slice(start, end);
+  };
+
   // The delivery BEHAVIOUR (idle / busy / reaped / resume-failed) is unit-
   // tested in test/secret-requests.test.js now that the branches live in the
   // module. All that is left to assert here is that index.js hands the module
   // the real seams rather than reimplementing any of them.
   it('hands the store the real session seams, including the auto-resume', () => {
-    const wiring = index.slice(index.indexOf('const secretRequests = createSecretRequests('));
+    const wiring = secretRequestsCall();
     // Live sessions only — a dead-but-mapped session must fall through to the
     // resume, not dead-end in the undeliverable notice.
     expect(wiring).toMatch(/getSession: \(roomId\) => \{[\s\S]*?s && s\.alive \? s : null;/);
     expect(wiring).toMatch(/resumeSession: \(roomId, notice\) => journalResumeRoom\(roomId, notice\)/);
-    expect(wiring).toContain('sendToSession(');
+    expect(wiring).toMatch(/inject: \(session, text\) => sendToSession\(session, /);
     expect(wiring).toContain('queue: queueSecretTurn');
     expect(index).toMatch(/function queueSecretTurn[\s\S]*?journalQueueMedia\(session, \{[\s\S]*?bridgeOrigin: true/);
-    expect(wiring).toContain('journalPublishNotice(');
+    expect(wiring).toContain('publishNotice: journalPublishNotice,');
   });
 
   it('lets the store see a submission turn still held on the queue or in a resume outbox', () => {
-    const wiring = index.slice(index.indexOf('const secretRequests = createSecretRequests('));
+    const wiring = secretRequestsCall();
     const probe = wiring.slice(wiring.indexOf('awaitingDelivery:'), wiring.indexOf('fileTtlMs:'));
     expect(probe).toContain('queuedMessages');
     expect(probe).toContain('_resumeOutbox');
@@ -91,12 +102,12 @@ describe('bridge wiring', () => {
   });
 
   it('persists the request store with owner-only permissions', () => {
-    const wiring = index.slice(index.indexOf('const secretRequests = createSecretRequests('));
+    const wiring = secretRequestsCall();
     expect(wiring).toMatch(/mode: 0o600/);
   });
 
   it('sweeps orphaned secret files through the store rather than a bespoke scan', () => {
-    const wiring = index.slice(index.indexOf('const secretRequests = createSecretRequests('));
+    const wiring = secretRequestsCall();
     expect(wiring).toContain('listSecretFiles:');
     expect(wiring).toContain('SECRETS_DIR');
     // Only files this process names are ever listed for the sweep.

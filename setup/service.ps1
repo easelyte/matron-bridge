@@ -43,6 +43,16 @@ if ($consoleUser -and ($consoleUser -notmatch ('\\' + [regex]::Escape($env:USERN
   Write-Warning "This shell runs as $env:USERDOMAIN\$env:USERNAME but the desktop is logged on as $consoleUser; the bridge will only run while $env:USERNAME is logged on at the desktop."
 }
 
+# Refuse an elevated prompt (see the description above): tasks registered from
+# one would run with the elevated token, not as the desktop user. Uninstall
+# works from either.
+if (-not $Uninstall) {
+  $principal = New-Object Security.Principal.WindowsPrincipal([Security.Principal.WindowsIdentity]::GetCurrent())
+  if ($principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    Fail 'run setup\service.ps1 from a normal (not elevated) PowerShell, as the user who will run the bridge'
+  }
+}
+
 $tasks = @(
   @{ Name = 'matron-bridge';        Args = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$Start`"";         Desc = 'Matron Bridge (Claude Code sessions for Matron)' },
   @{ Name = 'matron-bridge-viewer'; Args = "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$Start`" -Viewer"; Desc = 'Matron Bridge file viewer (signed URL file server)' }

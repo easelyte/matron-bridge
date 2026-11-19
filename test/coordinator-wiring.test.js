@@ -119,7 +119,7 @@ describe('explicit model picks are persisted as such (source inspection)', () =>
 
   it('applyModelSwitch takes an explicit option; implicit switches persist modelExplicit:false and park with --implicit', () => {
     const fn = body('function applyModelSwitch(', '\nfunction ');
-    expect(fn).toContain('function applyModelSwitch(roomId, session, arg, { sendReply, sendHtml, explicit = true, offer = false }) {');
+    expect(fn).toContain('function applyModelSwitch(roomId, session, arg, { sendReply, explicit = true, offer = false }) {');
     expect(fn).toContain("session._deferredCommandText = `!model ${decision.normalized}${explicit ? '' : ' --implicit'}${explicit && !offer ? ' --no-offer' : ''}`;");
     expect(fn.match(/explicit \? explicitModelFlag\([^)]*\) : \{ modelExplicit: false \}/g)).toHaveLength(3);
   });
@@ -128,7 +128,7 @@ describe('explicit model picks are persisted as such (source inspection)', () =>
     const block = body("case '!model': {", "case '!mode': {");
     expect(block).toContain("const implicit = parts.slice(2).includes('--implicit');");
     expect(block).toContain("const offer = !implicit && !parts.slice(2).includes('--no-offer');");
-    expect(block).toContain('applyModelSwitch(roomId, session, arg, { sendReply, sendHtml, explicit: !implicit, offer });');
+    expect(block).toContain('applyModelSwitch(roomId, session, arg, { sendReply, explicit: !implicit, offer });');
   });
 });
 

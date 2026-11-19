@@ -36,6 +36,7 @@ import { extractVideoFrames, videoFramesMessage } from './lib/video-frames.js';
 import { prepareInlineImage, appendInlineImageBlocks } from './lib/inline-image.js';
 import { createSendAttachmentHandler, checkLocalUpload, resolveAndUploadLocalFile } from './lib/send-attachment.js';
 import { createPageLinkHandler } from './lib/page-link.js';
+import { utf8ChunkDecoder } from './lib/utf8-chunks.js';
 import { createShortLinkWriter, shortenViewerUrl, shortLinksEnabled, shortLinksFile } from './lib/short-links.js';
 import { createItemsClient } from './lib/items-client.js';
 import { readApprovalConfig } from './lib/approval-config.js';
@@ -85,7 +86,7 @@ import { trackerUrlBase, renderTrackerLinks } from './lib/tracker-links.js';
 import { createTrackerLinkChecker, withTrackerLinkCheck, LINK_CHECK_FIELDS } from './lib/tracker-link-check.js';
 import { createRepoNameLookup } from './lib/repo-name.js';
 import { createCoordinatorLookup, coordinatorNeedsAssigning, loadCoordinatorBlock, loadNoticesBlock, renderNoticesBlock, claudeCoordinatorArgs, codexCoordinatorOptions, explicitModelFlag, explicitModelFlagForResume, coordinatorTurnText, planCoordinatorTransition, decideCoordinatorEvent, withCoordinatorModel, recreateSpawnModel, renderMemoryBlock } from './lib/coordinator.js';
-import { loadMatronMd, matronMdFileList, matronMdStatusLine } from './lib/matron-md.js';
+import { loadMatronMd, matronMdStatusLine } from './lib/matron-md.js';
 import { createWorktreeLedger } from './lib/worktree-ledger.js';
 import { createConsentStore } from './lib/worktree-setup.js';
 import { createSetupFlow } from './lib/worktree-setup-flow.js';
@@ -120,7 +121,7 @@ import {
   parseDefaultExtras,
   resolveDefaultExtras,
 } from './lib/mcp-config.js';
-import { aliasLabel, extractModelFlag, isValidModelArg, modelFromEvent, modelOptions, normalizeModelArg, VALID_ALIAS_HINT } from './lib/model-aliases.js';
+import { aliasLabel, crashRestartModel, extractModelFlag, isValidModelArg, modelFromEvent, modelOptions, normalizeModelArg, VALID_ALIAS_HINT } from './lib/model-aliases.js';
 import { switchModelInSession, modelButtons, planPrintModelSwitch } from './lib/model-command.js';
 import { writeSavedMediaFile, makeIdentityAwareCleanup } from './lib/saved-media-file.js';
 import { INFLIGHT_MEDIA_REPLACE_REFUSAL } from './lib/session-replace-guard.js';
@@ -156,6 +157,7 @@ import { parseTimerCommand, formatDuration as formatTimerDuration, createTimerSt
 import { formatRepeat } from './lib/daily-repeat.js';
 import { sleepConfig, sleepButtons, sleepCardText, performSleep, runSleepCommand, SLEEP_NOT_CONFIGURED } from './lib/sleep-command.js';
 import { promptButtons, promptResponseForButton } from './lib/prompt-buttons.js';
+import { promptCardQuestion, codexModelCardQuestion, codexEffortCardQuestion } from './lib/button-card-text.js';
 import { parseOptionReply } from './lib/prompt-reply.js';
 import { sendDelayedPromptAnswer, writePromptAnswer } from './lib/prompt-answer-delivery.js';
 import { SubagentWatcher, routeWorkflowStreamEvent } from './lib/subagent-watcher.js';
@@ -191,7 +193,8 @@ import { formatSubagentToolBody, subagentToolStep } from './lib/subagent-tool-fo
 import { ivUploadDir, ivUploadAnnotation, ivUploadsRoot } from './lib/iv-uploads.js';
 import { matronFilesDir, matronFilesRoot, sessionDownloadDir } from './lib/matron-files.js';
 import { parseUsageLimits, formatLimits, createUsageMissLogger, usageFetchTimeoutMs } from './lib/usage-limits.js';
-import { resolveSpawnCwd, attachSpawnErrorHandler, failedSpawnProcess } from './lib/spawn-guard.js';
+import { resolveSpawnCwd, attachSpawnErrorHandler, attachStdinErrorHandler, failedSpawnProcess } from './lib/spawn-guard.js';
+import { respondApiError, guardApiListener, installUnhandledRejectionLogger } from './lib/api-guard.js';
 import { readSessionSummary, listSessionSummaries, listSessionIdsByMtime, pathExists } from './lib/session-summary.js';
 import {
   extractForceFlag,
@@ -203,6 +206,7 @@ import {
   JOURNAL_CONTROL_HELP,
   JOURNAL_CONTROL_HELP_NOTE,
 } from './lib/command-dispatch.js';
+import { stopSessionAndConfirm } from './lib/stop-command.js';
 import { sendPrintInterrupt, applyInterruptAck } from './lib/print-interrupt.js';
 import {
   checkFileLink,
@@ -231,12 +235,12 @@ import { createRecentFolders } from './lib/recent-folders.js';
 import { atomicWriteFileSync } from './lib/atomic-write.js';
 import { shouldAnnounceOnline, recordOnlineAnnounced } from './lib/announce-once.js';
 import { createInflightMarker } from './lib/inflight-marker.js';
-import { cancelQueuedItem, countUserQueued, dispatchBusyQueueMagicWord, notifyQueuedMessage, resolveQueueReleaseTap } from './lib/busy-queue.js';
+import { cancelQueuedItem, countUserQueued, dispatchBusyQueueMagicWord, notifyQueuedMessage, resolveQueueReleaseTap, scopedQueueRelease } from './lib/busy-queue.js';
 import { DEFAULT_EDIT_HOLD_MS } from './lib/queue-edit-hold.js';
 import { handlePickerValue, isResumeConvoId } from './lib/picker-dispatch.js';
 import { createPermissionRegistry, renderPermissionCard, permissionInputRefusal, permissionButtons, permissionSpawnArgs, resolveBypassMode, resolvePermissionTimeoutMs, isRootOutsideSandbox, guardRootBypass, ROOT_BYPASS_WARNING, resolvePermissionRequest, resolvePermissionCheck, buildPrintSessionSettings, foreignGateEntry, listSessionGrants, revokeSessionGrant } from './lib/permission-prompt.js';
 import { createPlanApprovalItems } from './lib/plan-approval-items.js';
-import { buildPermissionSnapshot } from './lib/permission-eval.js';
+import { sessionPermissionSnapshot } from './lib/permission-eval.js';
 import { createSlowToolNotices, renderSlowToolNotice, slowToolNoticeSummary, resolveSlowToolNoticeMs, resolveSlowToolReminderMs } from './lib/slow-tool-notice.js';
 import { createJournalInputConsumer, resolvePromptChoice, resolvePromptChoices } from './lib/journal-input-router.js';
 import { createAgentRooms, INVITE_TTL_MS } from './lib/agent-rooms.js';
@@ -279,7 +283,7 @@ import { spawnModelFallback, stallModelFallback, isFableModel } from './lib/fabl
 import { planSessionControl, validateControlParams, controlNotice, authorizeControl, mergeParkedSlot, JOURNAL_DEVICE_ID, JOURNAL_ONLY_ACTIONS, CONTROL_KINDS, TURN_STARTING_OPS, occupied as controlOccupied } from './lib/session-control.js';
 import { noticeMeta, consentNoticeMeta, unseenNoticeMeta, roomNoticeMeta, controlNoticeKind } from './lib/system-notice.js';
 import { createSessionControlHandlers } from './lib/session-control-client.js';
-import { armFromStall, dueResumes, autoResumeDue, shouldCompactBefore, AUTO_RESUME_TEXT, BAD_MODEL_RECOVERY_TEXT, FABLE_SWITCH_TEXT } from './lib/auto-resume.js';
+import { armFromStall, dueResumes, dropResumeSlot, autoResumeDue, shouldCompactBefore, AUTO_RESUME_TEXT, BAD_MODEL_RECOVERY_TEXT, FABLE_SWITCH_TEXT } from './lib/auto-resume.js';
 import { handoffConfig, handoffIdleSince, handoffDue, planHandoff, handoffTurnText, handoffNotice, preReapCompactCommand, noteTurnStart as notePreReapTurnStart } from './lib/pre-reap-handoff.js';
 import {
   AGENT_CLAUDE,
@@ -1118,10 +1122,6 @@ const matronMdNote = (session) => {
   const line = matronMdStatusLine(session?.matronMd);
   return line ? `\n${line}` : '';
 };
-const matronMdNoteHtml = (session) => {
-  const line = matronMdStatusLine(session?.matronMd);
-  return line ? `<br/>${escapeHtml(line)}` : '';
-};
 const noticesBlockNow = ({ coordinator, coordinatorOnly = false }) => trackerLinksNow(renderNoticesBlock(NOTICES_BLOCKS, { enabled: userSettings.notices(), coordinator: coordinator === true, coordinatorOnly }));
 
 // Tracker links in what agents write (lib/tracker-links.js): the journal's
@@ -1931,10 +1931,9 @@ const subagentRunningStore = createSubagentRunningStore({ log: console });
 // convo id — NOT the room key, which is bridge-internal).
 function journalStartSessionForRpc({ workdir, mcpExtras, model = null, agent = null, effort = null }) {
   const sessionRoomId = newSessionConvoId();
-  const sessionSendReply = (reply) => sendToRoom(sessionRoomId, reply, markdownToHtml(reply));
-  const sessionSendHtml = (plainText, html) => sendToRoom(sessionRoomId, plainText, html);
-  const sessionSendButtons = (prompt, buttons, mode, plainText, html, payload) =>
-    sendButtonMessage(sessionRoomId, prompt, buttons, mode, plainText, html, payload);
+  const sessionSendReply = (reply) => sendToRoom(sessionRoomId, reply);
+  const sessionSendButtons = (prompt, buttons, mode, payload) =>
+    sendButtonMessage(sessionRoomId, prompt, buttons, mode, payload);
   // `agent` is the New Chat switch's pick (validated by the RPC handler);
   // absent means createSession's resolveAgent falls to the box default,
   // exactly as before the switch existed. persistSession's live snapshot
@@ -1949,7 +1948,6 @@ function journalStartSessionForRpc({ workdir, mcpExtras, model = null, agent = n
   });
   session.originRoomId = null;
   session.sendCallback = sessionSendReply;
-  session.sendHtml = sessionSendHtml;
   session.sendButtonMessage = sessionSendButtons;
   // Codex has a stable conversation id even before its native thread starts.
   const mintedConvoId = session.agent === AGENT_CODEX && !session.claudeSessionId;
@@ -2665,8 +2663,7 @@ function reportPromptAnswerDeliveryFailure(session, error) {
   const detail = error?.message || String(error || 'unknown error');
   const message = `Could not deliver the prompt answer to Claude: ${detail}`;
   debug(message);
-  if (session.sendHtml) session.sendHtml(message, escapeHtml(message));
-  else if (session.sendCallback) session.sendCallback(message);
+  if (session.sendCallback) session.sendCallback(message);
 }
 
 // Mirror a media upload the user just sent into the journal, once it has been
@@ -2722,8 +2719,7 @@ function journalFlushForSession(session) {
 // mirrors into the journal via sessions.get(roomId) and drops the notice for
 // a room with no live entry.
 function postRootBypassWarning(roomId) {
-  const rw = notice('warning', ROOT_BYPASS_WARNING, escapeHtml(ROOT_BYPASS_WARNING));
-  Promise.resolve(sendToRoom(roomId, rw.plain, rw.html)).catch(() => {});
+  Promise.resolve(sendToRoom(roomId, ROOT_BYPASS_WARNING)).catch(() => {});
 }
 
 // Coordinator role for one spawn (spec 2026-09-23 §2a). createSession is
@@ -2855,9 +2851,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   const guarded = resolveSpawnCwd(expandHome(workdir || DEFAULT_WORKDIR), [DEFAULT_WORKDIR, os.homedir()]);
   if (guarded.fellBack) {
     console.warn(`[spawn-guard] workdir ${guarded.missing} no longer exists for ${roomId}; using ${guarded.cwd}`);
-    const wg = notice('warning', `Workdir ${guarded.missing} no longer exists — using ${guarded.cwd} instead. Use !workdir to move the session.`,
-      `Workdir <code>${escapeHtml(String(guarded.missing))}</code> no longer exists — using <code>${escapeHtml(guarded.cwd)}</code> instead. Use <code>!workdir</code> to move the session.`);
-    Promise.resolve(sendToRoom(roomId, wg.plain, wg.html)).catch(() => {});
+    Promise.resolve(sendToRoom(roomId, `Workdir ${guarded.missing} no longer exists — using ${guarded.cwd} instead. Use !workdir to move the session.`)).catch(() => {});
   }
   workdir = guarded.cwd;
   const persistedMode = getPersistedSession(roomId);
@@ -2867,9 +2861,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     // to Claude visibly rather than throw: createSession's callers are not
     // wrapped, and a silent switch would be the worse surprise.
     console.warn(`[agent] ${roomId}: the Codex backend is not available on Windows; starting a Claude session instead`);
-    const cw = notice('warning', 'The Codex backend is not available on Windows — starting a Claude session instead.',
-      'The Codex backend is not available on Windows — starting a Claude session instead.');
-    Promise.resolve(sendToRoom(roomId, cw.plain, cw.html)).catch(() => {});
+    Promise.resolve(sendToRoom(roomId, 'The Codex backend is not available on Windows — starting a Claude session instead.')).catch(() => {});
     agent = AGENT_CLAUDE;
     options = { ...options, agent: AGENT_CLAUDE };
   }
@@ -2910,9 +2902,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
       }
       if (usable && found.workdir !== workdir) {
         console.warn(`[transcript-relocate] ${roomId}: session ${shortId}… transcript lives under ${found.workdir}, not persisted workdir ${workdir}; resuming there`);
-        const tr = notice('info', `Resuming in ${found.workdir} — the session had moved there.`,
-          `Resuming in <code>${escapeHtml(found.workdir)}</code> — the session had moved there.`);
-        Promise.resolve(sendToRoom(roomId, tr.plain, tr.html)).catch(() => {});
+        Promise.resolve(sendToRoom(roomId, `Resuming in ${found.workdir} — the session had moved there.`)).catch(() => {});
         workdir = found.workdir;
       }
     } else if (found) {
@@ -2956,11 +2946,14 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     }
   }
   const cwd = expandHome(workdir || DEFAULT_WORKDIR);
-  // Per-room live-bash-output gate. Defaults on; toggled via !show_bash.
+  // Per-room live-bash-output gate. Defaults on; Codex sessions toggle it
+  // with /show_bash (lib/codex-controls.js).
   // showBashOutput is persisted via persistSession on toggle and re-read here at
   // spawn so the hook env stays in sync with the room's setting across restarts.
   // Unset (undefined) means "never toggled" → use the default (on).
-  const persistedForRoom = getPersistedSession(roomId);
+  // The entry read at the top of createSession: nothing on the way here
+  // writes the sessions file, so it is still current.
+  const persistedForRoom = persistedMode;
   const showBashOutputAtSpawn = persistedForRoom?.showBashOutput !== false;
   // mcpExtras: explicit caller-supplied value wins (used by /start, /resume,
   // /workdir handlers that parsed user flags); otherwise fall back to whatever
@@ -3029,10 +3022,8 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   // Auto mode needs Opus 4.6+/Sonnet 4.6+/Fable-class models; Haiku-class
   // sessions fall back to `default` permission mode and prompt for far more.
   if (!bypassMode && printModel && /haiku/i.test(printModel)) {
-    const hw = notice('warning',
-      `Model ${printModel} doesn't support auto permission mode — the session may fall back to default mode and prompt frequently. Use --bypass to run without permission gating instead.`,
-      `Model <code>${escapeHtml(printModel)}</code> doesn't support auto permission mode — the session may fall back to default mode and prompt frequently. Use <code>--bypass</code> to run without permission gating instead.`);
-    Promise.resolve(sendToRoom(roomId, hw.plain, hw.html)).catch(() => {});
+    Promise.resolve(sendToRoom(roomId,
+      `Model ${printModel} doesn't support auto permission mode — the session may fall back to default mode and prompt frequently. Use --bypass to run without permission gating instead.`)).catch(() => {});
   }
   args.push(...identity.cliArgs);
 
@@ -3100,17 +3091,17 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     // Spawn-time MCP permission snapshot ({mcpAllow,mcpDeny,mcpAsk} from the
     // session's layered .claude settings), built ONCE here and immutable for the
     // session's life — the POST /permission-request classifier reads it to
-    // decide allow-silent / deny-visible / ask-card. Built for every session
-    // (cheap, fail-closed): only auto-mode sessions ever route MCP calls through
-    // the permission_request tool, but a bypass session simply never consults it.
-    permissionSnapshot: buildPermissionSnapshot({ workdir: cwd }),
+    // decide allow-silent / deny-visible / ask-card. Only gated sessions route
+    // MCP calls through the gate hook and permission_request tool, so a bypass
+    // spawn (effective mode, after the root downgrade) skips the build and
+    // keeps null, which the classifier reads as default-gated.
+    permissionSnapshot: sessionPermissionSnapshot({ bypass: bypassMode, workdir: cwd }),
     responseBuffer: '',
     sendCallback: null,
     pendingPlan: null,
-    pendingPlanDenialId: resumeSessionId ? (getPersistedSession(roomId)?.pendingPlanDenialId || null) : null,
-    planItemId: resumeSessionId ? (getPersistedSession(roomId)?.planItemId || null) : null,
-    planToolUseId: resumeSessionId ? (getPersistedSession(roomId)?.planToolUseId || null) : null,
-    sendHtml: null,
+    pendingPlanDenialId: resumeSessionId ? (persistedForRoom?.pendingPlanDenialId || null) : null,
+    planItemId: resumeSessionId ? (persistedForRoom?.planItemId || null) : null,
+    planToolUseId: resumeSessionId ? (persistedForRoom?.planToolUseId || null) : null,
     showWorking: false,
     showBashOutput: showBashOutputAtSpawn,
     alive: true,
@@ -3174,13 +3165,14 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   // A write into a dead pipe (EPIPE) surfaces as an 'error' on stdin; with no
   // listener that is fatal to the bridge. Log it; the write's own callback
   // and proc.on('close') handle what was in flight.
-  if (CLAUDE_STEER_ENABLED && proc.stdin && proc.stdin.listenerCount('error') === 0) {
-    proc.stdin.on('error', (err) => console.warn(`[spawn-guard] claude stdin error: ${err?.message || err} (room ${roomId})`));
-  }
+  attachStdinErrorHandler(proc, {
+    log: (msg) => console.warn(`[spawn-guard] ${msg} (room ${roomId})`),
+  });
 
   // Parse newline-delimited JSON from stdout
+  const decodeStdout = utf8ChunkDecoder();
   proc.stdout.on('data', (chunk) => {
-    session.lineBuf += chunk.toString();
+    session.lineBuf += decodeStdout(chunk);
     const lines = session.lineBuf.split('\n');
     // Keep the last (possibly incomplete) line in the buffer
     session.lineBuf = lines.pop();
@@ -3219,7 +3211,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
       if (!session.alive || typeof session.sendCallback !== 'function') return;
       const text = renderSlowToolNotice({ toolName, elapsedMs, reminder });
       const meta = noticeMeta('slow_tool', text, { summary: slowToolNoticeSummary({ toolName, elapsedMs, reminder }) });
-      if (!sendKindNotice(session, 'slow_tool', text, markdownToHtml(text), meta)) session.sendCallback(text);
+      if (!sendKindNotice(session, 'slow_tool', text, meta)) session.sendCallback(text);
     },
     log: debug,
   });
@@ -3311,7 +3303,6 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
         );
         restarted.restartCount = session.restartCount + 1;
         restarted.sendCallback = session.sendCallback;
-        restarted.sendHtml = session.sendHtml;
         restarted.sendButtonMessage = session.sendButtonMessage;
         restarted.originRoomId = session.originRoomId;
         restarted.firstMessageCaptured = session.firstMessageCaptured;
@@ -3353,22 +3344,16 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
         restarted._journalConvoEstablished = session._journalConvoEstablished;
         sessions.set(roomId, restarted);
         onCrashRestart(session, restarted, exitCode, proc.signalCode);
-        if (restarted.sendHtml) {
-          const n = notice('warning',
-            `[Session crashed (exit ${exitCode}), restarted automatically — attempt ${restarted.restartCount}/3]`,
-            `Session crashed (exit ${exitCode}), restarted automatically — attempt <b>${restarted.restartCount}/3</b>`);
-          restarted.sendHtml(n.plain, n.html);
-        } else if (restarted.sendCallback) {
-          restarted.sendCallback(`[Session crashed (exit ${exitCode}), restarted automatically — attempt ${restarted.restartCount}/3]`);
+        if (restarted.sendCallback) {
+          restarted.sendCallback(
+            `[Session crashed (exit ${exitCode}), restarted automatically — attempt ${restarted.restartCount}/3]`
+          );
         }
       } else {
         // Notice BEFORE teardown: sendToRoom's journal mirror looks the
         // session up in the map, so a notice sent after sessions.delete()
         // is silently dropped (same fix as the iv-mode close handler).
-        if (session.sendHtml) {
-          const n = notice('error', `[Session ended (exit ${exitCode})]`, `Session ended (exit <code>${exitCode}</code>)`);
-          session.sendHtml(n.plain, n.html);
-        } else if (session.sendCallback) {
+        if (session.sendCallback) {
           session.sendCallback(`[Session ended (exit ${exitCode})]`);
         }
         sessions.delete(roomId);
@@ -3379,7 +3364,6 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     }
   });
 
-  session.resetTimeout = () => {}; // no-op, kept for call-site compatibility
 
   // Subagent activity is surfaced on demand: notifyTaskStarted() runs when
   // the parent's stream emits a Task tool_use. The watcher object is cheap
@@ -3415,10 +3399,8 @@ function reportInteractiveFallback(session, error, persisted) {
     persistSession(session.roomId, session.claudeSessionId, session.workdir,
       session.originRoomId || persisted.originRoomId || null, { interactiveMode: false });
   }
-  const n = notice('warning',
-    `Couldn't start interactive mode on this bridge (${reason}). The chat carries on in print mode; anything that needed interactive mode, such as /effort or /login, was not applied.`,
-    `Couldn't start interactive mode on this bridge (<code>${escapeHtml(reason)}</code>). The chat carries on in print mode; anything that needed interactive mode, such as <code>/effort</code> or <code>/login</code>, was not applied.`);
-  Promise.resolve(sendToRoom(session.roomId, n.plain, n.html)).catch(() => {});
+  Promise.resolve(sendToRoom(session.roomId,
+    `Couldn't start interactive mode on this bridge (${reason}). The chat carries on in print mode; anything that needed interactive mode, such as /effort or /login, was not applied.`)).catch(() => {});
 }
 
 // --- Codex programmatic sessions ---
@@ -3501,7 +3483,6 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
     pendingPlanDenialId: null,
     planItemId: null,
     planToolUseId: null,
-    sendHtml: null,
     sendButtonMessage: null,
     showWorking: false,
     showBashOutput: CODEX_APP_SERVER && persisted?.showBashOutput !== false,
@@ -3543,8 +3524,7 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
     publisher: journalPublisher, convoIdFor: journalConvoIdFor, runningStore: subagentRunningStore,
     stream: journalStream, activity: journalActivity, status: journalStatus,
     notice: (s, message) => journalPublishNotice(journalConvoIdFor(s), message),
-    publishPrompt: (s, payload) => s.sendButtonMessage?.(payload.question, payload.options, payload.mode,
-      payload.question, escapeHtml(payload.question), payload) ?? false,
+    publishPrompt: (s, payload) => s.sendButtonMessage?.(payload.question, payload.options, payload.mode, payload) ?? false,
     submitAsyncAnswer: submitCodexAsyncAnswer,
     onLoginComplete: s => {
       void refreshCodexMetadata(s, { force: true });
@@ -3627,7 +3607,6 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
     if (CODEX_APP_SERVER) void offerCodexBuild(session);
   });
 
-  session.resetTimeout = () => {};
   sessions.set(roomId, session);
   if (!resumeSessionId && !options.journalConvoId && !persisted?.journalConvoId) {
     persistSession(roomId, session.claudeSessionId, cwd, null);
@@ -3773,9 +3752,7 @@ function flushPendingSessionQueue(session) {
     deferredBy: batchDeferralReason(queued),
     summary: formatQueueSummary(queued),
   });
-  if (session.sendHtml) {
-    session.sendHtml(notice.plain, notice.html);
-  } else if (session.sendCallback) {
+  if (session.sendCallback) {
     session.sendCallback(notice.plain);
   }
   const sent = flushQueue(session, queued, releaseSnapshot);
@@ -3817,7 +3794,7 @@ function dispatchDeferredCommand(session) {
   if (!session.alive || sessions.get(session.roomId) !== session) return false;
   const ctx = journalSessionCommandCtx(session);
   session._replayingDeferred = true;
-  handleCommand(session.roomId, text, ctx.sendReply, ctx.sendHtml, ctx.sender).finally(() => {
+  handleCommand(session.roomId, text, ctx.sendReply).finally(() => {
     session._replayingDeferred = false;
   }).catch((err) => {
     // The command failed, so nothing is pending any more. For a self-restart
@@ -3879,8 +3856,7 @@ function finishCodexTurn(session, {
   journalStatus(session);
   if (!discardOutput && error && session.alive) {
     const message = `⚠️ ${error}`;
-    if (session.sendHtml) session.sendHtml(message, escapeHtml(message));
-    else if (session.sendCallback) session.sendCallback(message);
+    if (session.sendCallback) session.sendCallback(message);
   }
 
   if (!preserveQueue && !session._codexSteerPending && !session._codexUncertainSteer) {
@@ -3964,7 +3940,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
       // confirmation prompt ("Yes / Yes, manually / Refine / Tell Claude
       // what to change") is caught by lib/prompt-detector.js and routed
       // to the user as a numbered question — that's the single approval
-      // round. The hook+/plan-decision flow remains in print-mode only.
+      // round.
       PreToolUse: [
         // The foreign-turn gate (lib/foreign-turn.js), first and on every tool.
         foreignGateEntry({ hooksDir: path.join(__dirname, 'hooks'), apiPort: API_PORT, roomId, foreignFlag: foreignFlagPath(roomId), apiHeaderFile: apiHeaderFileFor(roomId) }),
@@ -4071,10 +4047,9 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     responseBuffer: '',
     sendCallback: null,
     pendingPlan: null,
-    pendingPlanDenialId: resumeSessionId ? (getPersistedSession(roomId)?.pendingPlanDenialId || null) : null,
-    planItemId: resumeSessionId ? (getPersistedSession(roomId)?.planItemId || null) : null,
-    planToolUseId: resumeSessionId ? (getPersistedSession(roomId)?.planToolUseId || null) : null,
-    sendHtml: null,
+    pendingPlanDenialId: resumeSessionId ? (persistedForRoom?.pendingPlanDenialId || null) : null,
+    planItemId: resumeSessionId ? (persistedForRoom?.planItemId || null) : null,
+    planToolUseId: resumeSessionId ? (persistedForRoom?.planToolUseId || null) : null,
     sendButtonMessage: null,
     showWorking: false,
     showBashOutput: showBashOutputAtSpawn,
@@ -4229,7 +4204,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
         // die).
         const restarted = createSession(roomId, cwd, session.claudeSessionId, {
           agent: session.agent,
-          model: session.currentModel || undefined,
+          model: crashRestartModel(session),
           mcpExtras: session.mcpExtras,
           // Carry the live --bypass/--auto choice for the same reason as
           // mcpExtras: a session that dies before its first persist would
@@ -4242,7 +4217,6 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
         });
         restarted.restartCount = session.restartCount + 1;
         restarted.sendCallback = session.sendCallback;
-        restarted.sendHtml = session.sendHtml;
         restarted.sendButtonMessage = session.sendButtonMessage;
         // Account-flow state must survive the TUI's own exit: /logout makes
         // claude quit, this branch respawns it (resumed, now logged out), and
@@ -4311,12 +4285,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
         // and dropped (Bugbot, PR #162).
         enterResumeHold(restarted);
         onCrashRestart(session, restarted, exitCode);
-        if (restarted.sendHtml) {
-          const n = notice('warning',
-            `[Session crashed (exit ${exitCode}), restarted automatically — attempt ${restarted.restartCount}/3]`,
-            `Session crashed (exit ${exitCode}), restarted automatically — attempt <b>${restarted.restartCount}/3</b>`);
-          restarted.sendHtml(n.plain, n.html);
-        } else if (restarted.sendCallback) {
+        if (restarted.sendCallback) {
           restarted.sendCallback(`[Session crashed (exit ${exitCode}), restarted automatically — attempt ${restarted.restartCount}/3]`);
         }
       } else {
@@ -4336,12 +4305,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
           if (session._accountFlowReturnToPrint) {
             persistSession(roomId, session.claudeSessionId, session.workdir, session.originRoomId, { interactiveMode: false });
           }
-          const n = notice('info', '👋 Logged out. Send /login when you\'re ready to sign back in.', '👋 Logged out. Send <code>/login</code> when you\'re ready to sign back in.');
-          if (session.sendHtml) session.sendHtml(n.plain, n.html);
-          else if (session.sendCallback) session.sendCallback(n.plain);
-        } else if (session.sendHtml) {
-          const n = notice('error', `[Session ended (exit ${exitCode})]`, `Session ended (exit <code>${exitCode}</code>)`);
-          session.sendHtml(n.plain, n.html);
+          if (session.sendCallback) session.sendCallback('👋 Logged out. Send /login when you\'re ready to sign back in.');
         } else if (session.sendCallback) {
           session.sendCallback(`[Session ended (exit ${exitCode})]`);
         }
@@ -4353,7 +4317,6 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     }
   });
 
-  session.resetTimeout = () => {};
 
   // iv-mode turn-end handler. Print-mode does most of this work in
   // case 'result' inside handleClaudeEvent; the transcript file in iv-mode
@@ -4362,7 +4325,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     // A turn another person started ends here (iv-mode's turn-end seam).
     foreignSessions.end(session);
     endTurn(session);
-    debug(`[IV] onTurnEnd called, room=${session.roomId}, bufLen=${session.responseBuffer.length}, sendCallback=${!!session.sendCallback}, sendHtml=${!!session.sendHtml}`);
+    debug(`[IV] onTurnEnd called, room=${session.roomId}, bufLen=${session.responseBuffer.length}, sendCallback=${!!session.sendCallback}`);
     // Flush the accumulated assistant text to the chat.
     if (session.responseBuffer.trim() && !session.waitingForAnswer) {
       flushResponse(session);
@@ -4415,35 +4378,6 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     if (!queueDispatched) maybeFlushRoomDelivery(session);
   };
 
-  // /plan-decision HTTP handler calls this when claude's ExitPlanMode hook
-  // fires. We post the plan to the chat and stash the tool_use_id so that
-  // the "build" handler in the message loop can call
-  // pendingPlanDecisions.get(toolUseId).resolve(...) when the user replies.
-  session.requestPlanDecision = (toolUseId, planText) => {
-    session.ivPendingPlanToolUseId = toolUseId;
-    session.pendingPlan = planText || '';
-    const preview = (planText || '').length > 500
-      ? (planText || '').slice(0, 500) + '…'
-      : (planText || '');
-    const plainPlan = `--- Plan Ready ---\n\n${preview}\n\nReply "build" to execute, or send feedback.`;
-    if (session.sendHtml) {
-      const htmlPlan =
-        `<b>📋 Plan Ready</b><blockquote>${markdownToHtml(preview)}</blockquote>` +
-        `Reply <code>build</code> to execute, or send feedback.`;
-      session.sendHtml(plainPlan, htmlPlan);
-      // The card's mirror in the tracker (lib/plan-approval-items.js): a
-      // question the user can find and answer from the For you list.
-      void planItems.opened(session, planText || '', { toolUseId });
-    } else if (session.sendCallback) {
-      session.sendCallback(plainPlan);
-      void planItems.opened(session, planText || '', { toolUseId });
-    } else {
-      // No output channel yet — auto-deny so the hook unblocks.
-      const pending = pendingPlanDecisions.get(toolUseId);
-      if (pending) pending.resolve({ decision: 'deny', reason: 'no output channel for session' });
-    }
-  };
-
   sessions.set(roomId, session);
   if (restartRequests.pending()) enterResumeHold(session);
   // A plan item restored with this session may belong to a hook that died
@@ -4458,7 +4392,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
 
 // Surface a detected TUI prompt to the user as a multiple-choice question.
 async function handleInteractivePrompt(session, prompt) {
-  if (!session.sendHtml && !session.sendCallback) return;
+  if (!session.sendCallback) return;
   // Surface claude's explanatory prose (rendered above the menu) BEFORE the
   // question, so the user has the reasoning when choosing. In iv-mode that
   // prose only reaches the transcript after the answer, but it's on the live
@@ -4482,8 +4416,7 @@ async function handleInteractivePrompt(session, prompt) {
         // Self-clear so a stale capture can't suppress an unrelated later message.
         session.suppressPreambleTimer = setTimeout(() => { session._suppressPreambleText = null; }, 600_000);
         if (typeof session.suppressPreambleTimer.unref === 'function') session.suppressPreambleTimer.unref();
-        if (session.sendHtml) session.sendHtml(preamble, markdownToHtml(preamble));
-        else session.sendCallback(preamble);
+        session.sendCallback(preamble);
       }
     } catch (e) { debug('extractPreamble failed:', e?.message); }
   }
@@ -4495,24 +4428,6 @@ async function handleInteractivePrompt(session, prompt) {
   if (session.sendButtonMessage) {
     const b = promptButtons(prompt);
     if (b) {
-      const header = prompt.question || 'Claude is asking';
-      // Include each option's description (when the detector captured one, e.g.
-      // AskUserQuestion menus) so the user has the per-option detail before
-      // choosing — the buttons themselves only carry the short label.
-      const descOf = (i) => (prompt.options && prompt.options[i] && prompt.options[i].description) || '';
-      const plain = ['Claude is asking:', prompt.question || '', '',
-        ...b.buttons.map((bt, i) => {
-          const d = descOf(i);
-          return `${i + 1}. ${bt.label}${d ? `\n    ${d}` : ''}`;
-        })].filter(Boolean).join('\n');
-      const anyDesc = b.buttons.some((_, i) => descOf(i));
-      const htmlOpts = b.buttons.map((bt, i) => {
-        const d = descOf(i);
-        return `<b>${i + 1}. ${escapeHtml(bt.label)}</b>${d ? `<br/><i>${escapeHtml(d)}</i>` : ''}`;
-      }).join(anyDesc ? '<br/>' : ' · ');
-      const html = `<b>🟡 Claude is asking:</b>` +
-        (prompt.question ? `<br/><i>${escapeHtml(prompt.question)}</i>` : '') +
-        `<br/><br/>${htmlOpts}`;
       // If a newer prompt superseded this one while we were composing, bail —
       // don't post buttons for a stale prompt against the current TUI menu.
       if (session.pendingInteractivePrompt !== prompt) return;
@@ -4521,7 +4436,7 @@ async function handleInteractivePrompt(session, prompt) {
       // this room to publish to.
       // Fall through to the text rendering below in the null case so the
       // prompt is never silently dropped while the TUI waits for an answer.
-      const sent = await session.sendButtonMessage(header, b.buttons, b.mode, plain, html);
+      const sent = await session.sendButtonMessage(promptCardQuestion(prompt, b.buttons), b.buttons, b.mode);
       if (sent != null) return;
     }
   }
@@ -4550,25 +4465,7 @@ async function handleInteractivePrompt(session, prompt) {
     '',
     helpPlain,
   ].filter(Boolean).join('\n');
-  if (session.sendHtml) {
-    const htmlOptions = prompt.options.map((opt, i) =>
-      `<b>${i + 1}.</b> ${escapeHtml(opt.label)}${opt.selected ? ' <i>(current)</i>' : ''}` +
-      (opt.description ? `<br/>&nbsp;&nbsp;&nbsp;&nbsp;<i>${escapeHtml(opt.description)}</i>` : '')
-    ).join('<br/>');
-    const helpHtml =
-      `Reply with the option number (1–${prompt.options.length})` +
-      (prompt.kind === 'yes-no' ? ' or <code>y</code> / <code>n</code>' : '') +
-      (ftLabel ? `, or send any other text to <i>${escapeHtml(ftLabel)}</i>` : '') +
-      '.';
-    const html =
-      `<b>🟡 Claude is asking:</b><br/>` +
-      (prompt.question ? `<i>${escapeHtml(prompt.question)}</i><br/><br/>` : '') +
-      htmlOptions +
-      `<br/><br/>${helpHtml}`;
-    session.sendHtml(plain, html);
-  } else {
     session.sendCallback(plain);
-  }
 }
 
 // If the session has a pending TUI prompt and the user's message looks like
@@ -4585,9 +4482,7 @@ function maybeResolveInteractivePrompt(session, userText) {
   const ack = (label, { numberPrefix = '', note = '' } = {}) => {
     const tail = note ? ` ${note}` : '';
     const plain = `→ Sent "${numberPrefix}${label}" to Claude${tail}`;
-    const html = `<i>→ Sent <b>${escapeHtml(numberPrefix + label)}</b> to Claude${escapeHtml(tail)}</i>`;
-    if (session.sendHtml) session.sendHtml(plain, html);
-    else if (session.sendCallback) session.sendCallback(plain);
+    if (session.sendCallback) session.sendCallback(plain);
   };
 
   // Select the free-text slot ("Tell Claude what to change" / "Type something"),
@@ -4749,8 +4644,7 @@ function handleInteractiveScreenUpdate(session, update) {
     const parts = message.parts || [message];
     console.log(`[IV-DEBUG] Surfacing parsed free-text TUI cue in ${parts.length} message(s) (${newUrls.length} new URL(s), inputCue=${hasInputCue})`);
     for (const part of parts) {
-      if (session.sendHtml) session.sendHtml(part.plain, part.html);
-      else if (session.sendCallback) session.sendCallback(part.plain);
+      if (session.sendCallback) session.sendCallback(part.plain);
     }
   }
   // A free-text TUI cue means claude is waiting on the user just like a
@@ -4808,12 +4702,11 @@ function handleInteractiveScreenUpdate(session, update) {
         const current = sessions.get(roomId);
         if (!shouldRunAccountFlowReturn(current)) return;
         const sendReply = current.sendCallback || (() => {});
-        const sendHtml = current.sendHtml || ((plain) => sendReply(plain));
         // applyModeSwitch announces the outcome either way — the switch on
         // success, refusalAnnouncement on refusal — and returns the
         // replacement session only when the switch actually happened.
         const switched = applyModeSwitch(roomId, current, false, {
-          sendReply, sendHtml,
+          sendReply,
           announcement: '✅ Logged in successfully — back to normal mode.',
           refusalAnnouncement: 'Login finished, but I couldn\'t switch back to non-interactive mode automatically — type /mode print when ready.',
         });
@@ -4827,8 +4720,7 @@ function handleInteractiveScreenUpdate(session, update) {
       return;
     }
     const note = '↵ (auto-pressed Enter to continue)';
-    if (session.sendHtml) session.sendHtml(note, `<i>${escapeHtml(note)}</i>`);
-    else if (session.sendCallback) session.sendCallback(note);
+    if (session.sendCallback) session.sendCallback(note);
   }
 }
 
@@ -4839,7 +4731,7 @@ function handleInteractiveScreenUpdate(session, update) {
 // later bare number/letter reply is sent as raw keystrokes (see the message
 // handler) to drive the open menu. Detector-side dedup prevents repeats.
 function handleUnclassifiedPrompt(session, { screen }) {
-  if (!session.sendHtml && !session.sendCallback) return;
+  if (!session.sendCallback) return;
   // Clean the raw screen: drop blank lines, keep the tail (the menu sits at the
   // bottom), and cap length so we don't dump the whole terminal.
   const cleaned = String(screen || '')
@@ -4851,11 +4743,7 @@ function handleUnclassifiedPrompt(session, { screen }) {
     .slice(0, 1500);
   if (!cleaned) return;
   const plain = `⚠️ Claude is waiting for input I couldn't turn into buttons. Reply with the option number shown (or send !esc to cancel):\n\n${cleaned}`;
-  const html =
-    `<b>⚠️ Claude is waiting for input I couldn't parse into buttons.</b><br/>` +
-    `Reply with the option number shown (or send <code>!esc</code> to cancel):<br/><pre>${escapeHtml(cleaned)}</pre>`;
-  if (session.sendHtml) session.sendHtml(plain, html);
-  else session.sendCallback(plain);
+  session.sendCallback(plain);
   session.pendingUnclassifiedPrompt = true;
   // Unconditional (dedupes internally) — see the matching iv-prompt handler.
   journalSessionState(session, 'waiting');
@@ -4980,7 +4868,6 @@ function scheduleDesignLoginFinish(roomId, flow, outcome, delayMs, attempt = 0) 
     const current = sessions.get(roomId);
     if (!ownsDesignLoginFinish(current, flow)) return;
     const sendReply = current.sendCallback || (() => {});
-    const sendHtml = current.sendHtml || ((plain) => sendReply(plain));
     if (!shouldRunAccountFlowReturn(current)) {
       current._designLoginFlow = null;
       sendReply(designLoginOutcomeMessage(outcome, { returning: false }));
@@ -4992,7 +4879,7 @@ function scheduleDesignLoginFinish(roomId, flow, outcome, delayMs, attempt = 0) 
     }
     current._designLoginFlow = null;
     const switched = applyModeSwitch(roomId, current, false, {
-      sendReply, sendHtml,
+      sendReply,
       announcement: designLoginOutcomeMessage(outcome),
       refusalAnnouncement: `${designLoginOutcomeMessage(outcome, { returning: false })} I couldn't switch back to non-interactive mode automatically — type /mode print when ready.`,
     });
@@ -5061,40 +4948,6 @@ function formatQuestion(q, index, total) {
   return msg;
 }
 
-function formatQuestionHtml(q, index, total) {
-  // HTML rendering collapses raw "\n" to a single space, so options
-  // separated only by newlines render as a run-on wall. Use explicit <br>
-  // for line breaks and a blank line
-  // (double <br>) between options so A/B/C are visually separated. An option
-  // whose label is tagged "(Recommended)" gets a ⭐ marker.
-  let msg = '';
-  const prefix = total > 1 ? `❓ Question ${index + 1}/${total}` : '❓';
-
-  if (q.header) {
-    msg += `${prefix} — <b>${escapeHtml(q.header)}</b><br><br>`;
-  } else {
-    msg += `${prefix}<br><br>`;
-  }
-
-  msg += escapeHtml(q.question);
-
-  if (q.options && q.options.length > 0) {
-    q.options.forEach((opt, i) => {
-      const letter = String.fromCharCode(65 + i);
-      const label = typeof opt.label === 'string' ? opt.label : typeof opt === 'string' ? opt : String(opt.label ?? opt);
-      const desc = opt.description || '';
-      const marker = /\(recommended\)/i.test(label) ? '⭐ ' : '';
-      msg += `<br><br>${marker}<b>${letter}.</b> ${escapeHtml(label)}`;
-      if (desc) {
-        msg += `<br><i>${escapeHtml(desc)}</i>`;
-      }
-    });
-    msg += `<br><br>Reply with a letter (A, B, C…) or number (1, 2, 3…), or type a custom answer.`;
-  }
-
-  return msg;
-}
-
 function sendAllQuestions(session) {
   const questions = session.pendingQuestions;
   if (!questions || questions.length === 0) return;
@@ -5104,9 +4957,6 @@ function sendAllQuestions(session) {
 
   for (let i = 0; i < total; i++) {
     const q = questions[i];
-    const plainText = formatQuestion(q, i, total);
-    const html = formatQuestionHtml(q, i, total);
-
     if (q.options && q.options.length > 0 && session.sendButtonMessage) {
       // Build button array from options
       const buttons = q.options.map((opt, idx) => {
@@ -5129,13 +4979,11 @@ function sendAllQuestions(session) {
       const promptId = randomUUID();
       (session.questionPromptIds ||= []).push(promptId);
       (session.questionPromptCards ||= new Map()).set(promptId, { seq: null, superseded: false });
-      session.sendButtonMessage(prompt, buttons, mode, plainText, html, {
+      session.sendButtonMessage(prompt, buttons, mode, {
         question: prompt, options: buttons, mode, prompt_id: promptId,
       });
-    } else if (session.sendHtml) {
-      session.sendHtml(plainText, html);
     } else if (session.sendCallback) {
-      session.sendCallback(plainText);
+      session.sendCallback(formatQuestion(q, i, total));
     }
   }
 }
@@ -5145,7 +4993,6 @@ function sendAllQuestions(session) {
 // causes: what the answer is (the user's message, lib/turn-cause.js), for
 // the turn it starts or joins — the same as for any other send.
 function submitAnswer(session, answerText, { causes = null } = {}) {
-  const mode = session.waitingForAnswer;
   session.waitingForAnswer = null;
   session.pendingQuestions = null;
   session.currentQuestionIndex = 0;
@@ -5153,55 +5000,10 @@ function submitAnswer(session, answerText, { causes = null } = {}) {
   for (const promptId of session.questionPromptIds || []) session.questionPromptCards?.delete(promptId);
   session.questionPromptIds = [];
 
-  if (mode === 'text-reply') {
-    // AskUserQuestion was auto-rejected — send the answer as a regular user message
+  // AskUserQuestion is auto-rejected (print sessions disallow the tool), so
+  // the answer goes in as a regular user message. waitingForAnswer is only
+  // ever 'text-reply' or null.
     sendTextToSession(session, answerText, { skipJournalMirror: true, causes });
-  } else {
-    // Normal tool_result flow. This path only applies to print-mode stream-
-    // json input. In iv-mode, user questions are surfaced and answered via the
-    // PromptDetector → buttons/text path (handleInteractivePrompt +
-    // respondToPrompt), so this tool_result branch is unreachable there. Log if
-    // it ever fires under iv-mode so we notice an unexpected code path.
-    if (session.iv) {
-      debug('iv-mode: skipping legacy tool_result stdin.write (ask-user MCP should handle this).');
-      return;
-    }
-    // Not through sendToSession, so the turn seam is taken here: the answer
-    // begins the turn (ended by its result event) or joins the running one.
-    const beganTurn = beginOrJoinTurn(session, causes);
-    session.busy = true;
-    bumpTurnGeneration(session);
-    inflightMarker.noteTurnStart(journalConvoIdFor(session), session.roomId, inflightTurnOrigin(session));
-    journalSessionState(session, 'running');
-    journalActivity(session, 'thinking');
-    session._turnInitSeen = false;
-    const jsonMsg = JSON.stringify({
-      type: 'user',
-      message: {
-        role: 'user',
-        content: [{
-          tool_use_id: mode,
-          type: 'tool_result',
-          content: answerText,
-        }]
-      }
-    }) + '\n';
-    // The answer can be whatever the user typed, so only its size is logged.
-    debug('Sending answer to stdin:', jsonMsg.length, 'bytes');
-    writePromptAnswer(session, jsonMsg, {
-      // This answer goes in via a raw tool_result stdin write (not
-      // sendToSession), so record it only after stdin accepts the chunk.
-      onDelivered: () => {
-        recordUserAnswer(session, answerText);
-        if (session.resetTimeout) session.resetTimeout();
-      },
-      onError: (error) => reportSessionSendFailure(
-        session,
-        `Could not send the prompt answer to Claude: ${error.message}`,
-        { restoreJournalState: true, beganTurn },
-      ),
-    });
-  }
 }
 
 function resolveQuestionAnswer(session, text) {
@@ -5256,6 +5058,8 @@ function setupSubagentWatcher(session, workdir, sessionId) {
     getParentModel: () => session.currentModel || session.initData?.model,
     getParentWindow: () => contextWindowForSession(session),
     runningStore: subagentRunningStore,
+    // A finished child's transcript stops being polled after a grace period.
+    onChildFinished: agentId => session.subagentWatcher?.noteAgentFinished(agentId),
     log: console,
   });
   session.subagentWatcher = new SubagentWatcher({ workdir, sessionId });
@@ -5793,11 +5597,10 @@ function handleClaudeEvent(session, event) {
         } else {
           // Collect tool indicator
           let indicator = `🔧 ${toolName}`;
-          let indicatorHtml = null;
           let isKeyEvent = false;
           // Set when sendLiveOutputEvent has been invoked — the live-output
-          // message already carries the command in its body/formatted_body
-          // fallback, so we skip the duplicate `🔧 <cmd>` indicator below.
+          // activity already carries the command, so we skip the duplicate
+          // `🔧 <cmd>` indicator below.
           let liveOutputSent = false;
 
           if (toolName === 'Bash' && input.command) {
@@ -5817,7 +5620,6 @@ function handleClaudeEvent(session, event) {
               ? displayCommand.slice(0, 100) + '…'
               : displayCommand;
             indicator = `🔧 \`${cmd}\``;
-            indicatorHtml = `🔧 <code>${escapeHtml(cmd)}</code>`;
             isKeyEvent = true;
 
             if (session.showBashOutput) {
@@ -5870,15 +5672,12 @@ function handleClaudeEvent(session, event) {
               // fallback is effectively dead unless a future failure path is
               // added there, kept as the safety net it always was.
               const fallbackPlain = indicator;
-              const fallbackHtml = indicatorHtml;
               sendLiveOutputEvent(session, {
                 tool_use_id: liveToolUseId,
                 command: displayCommand,
               }).then(ok => {
                 if (ok) return;
-                if (session.sendHtml && fallbackHtml) {
-                  session.sendHtml(fallbackPlain, fallbackHtml);
-                } else if (session.sendCallback) {
+                if (session.sendCallback) {
                   session.sendCallback(fallbackPlain);
                 }
               });
@@ -5886,7 +5685,6 @@ function handleClaudeEvent(session, event) {
             }
           } else if (toolName === 'Read' && input.file_path) {
             indicator = `📖 ${input.file_path}`;
-            indicatorHtml = `📖 <code>${escapeHtml(input.file_path)}</code>`;
           } else if ((toolName === 'Write' || toolName === 'Edit' || toolName === 'MultiEdit')
                      && input.file_path) {
             // Journal-only: a structured `diff` event
@@ -5899,18 +5697,14 @@ function handleClaudeEvent(session, event) {
             publishEditDiff(session, toolName, input, null);
           } else if ((toolName === 'Glob' || toolName === 'Grep') && input.pattern) {
             indicator = `🔍 ${input.pattern}`;
-            indicatorHtml = `🔍 <code>${escapeHtml(input.pattern)}</code>`;
           } else if (toolName === 'WebSearch' && input.query) {
             indicator = `🌐 ${input.query}`;
-            indicatorHtml = `🌐 <i>${escapeHtml(input.query)}</i>`;
             isKeyEvent = true;
           } else if (toolName === 'WebFetch' && input.url) {
             indicator = `🌐 ${input.url}`;
-            indicatorHtml = `🌐 <a href="${escapeHtml(input.url)}">${escapeHtml(input.url)}</a>`;
           } else if (toolName === 'Task' || toolName === 'Agent') {
             const desc = (input.description || input.prompt || '').slice(0, 80);
             indicator = `🔀 Subtask: ${desc}`;
-            indicatorHtml = `🔀 Subtask: <i>${escapeHtml(desc)}</i>`;
             isKeyEvent = true;
             // Trigger the subagent watcher's discovery burst — the new
             // agent-<id>.jsonl file appears within ~100ms of this event — and
@@ -5926,11 +5720,6 @@ function handleClaudeEvent(session, event) {
               return `${icon} ${t.content || t.text || ''}`;
             }).join('\n');
             indicator = `📋 Todos:\n${todos}`;
-            const todosHtml = (input.todos || []).map(t => {
-              const icon = t.status === 'completed' ? '✅' : t.status === 'in_progress' ? '🔄' : '⬚';
-              return `<li>${icon} ${escapeHtml(t.content || t.text || '')}</li>`;
-            }).join('');
-            indicatorHtml = `📋 <b>Todos:</b><ul>${todosHtml}</ul>`;
             isKeyEvent = true;
           }
 
@@ -5939,9 +5728,7 @@ function handleClaudeEvent(session, event) {
           // `🔧 <command>` indicator.
           if (!liveOutputSent) {
             session.toolCalls.push(indicator);
-            if (isKeyEvent && session.sendHtml && indicatorHtml) {
-              session.sendHtml(indicator, indicatorHtml);
-            } else if (isKeyEvent && session.sendCallback) {
+            if (isKeyEvent && session.sendCallback) {
               session.sendCallback(indicator);
             }
           }
@@ -6131,14 +5918,7 @@ function handleClaudeEvent(session, event) {
           : planText;
 
         const plainPlan = `--- Plan Ready ---\n\n${planPreview}\n\nReply "build" to execute, or send feedback.`;
-        if (session.sendHtml) {
-          const htmlPlan =
-            `<b>📋 Plan Ready</b><blockquote>${markdownToHtml(planPreview)}</blockquote>` +
-            `Reply <code>build</code> to execute, or send feedback.`;
-          session.sendHtml(plainPlan, htmlPlan);
-        } else {
           session.sendCallback(plainPlan);
-        }
         // The card's mirror in the tracker (lib/plan-approval-items.js).
         void planItems.opened(session, planText, { toolUseId: planDenial.tool_use_id });
       }
@@ -6184,10 +5964,7 @@ function handleClaudeEvent(session, event) {
         const COMPACT_COOLDOWN_MS = 60_000;
         if (!session.lastCompactCompleteNotify || (now - session.lastCompactCompleteNotify) > COMPACT_COOLDOWN_MS) {
           session.lastCompactCompleteNotify = now;
-          if (session.sendHtml) {
-            const n = notice('info', '🗜️ Context compacted — conversation history was summarized to free up space');
-            session.sendHtml(n.plain, n.html);
-          } else if (session.sendCallback) {
+          if (session.sendCallback) {
             session.sendCallback('🗜️ Context compacted — conversation history was summarized to free up space');
           }
         } else {
@@ -6308,10 +6085,7 @@ function handleClaudeEvent(session, event) {
           const pendingNow = Date.now();
           session._lastManualCompactConfirm = pendingNow;
           session.lastCompactCompleteNotify = pendingNow;
-          if (session.sendHtml) {
-            const n = notice('success', doneText);
-            session.sendHtml(n.plain, n.html);
-          } else if (session.sendCallback) {
+          if (session.sendCallback) {
             session.sendCallback(doneText);
           }
           // onTurnEnd clears busy + typing and flushes any queued messages.
@@ -6358,10 +6132,7 @@ function handleClaudeEvent(session, event) {
           if (!session._lastManualCompactConfirm || (now - session._lastManualCompactConfirm) > DUP_BOUNDARY_MS) {
             session._lastManualCompactConfirm = now;
             session.lastCompactCompleteNotify = now;
-            if (session.sendHtml) {
-              const n = notice('success', doneText);
-              session.sendHtml(n.plain, n.html);
-            } else if (session.sendCallback) {
+            if (session.sendCallback) {
               session.sendCallback(doneText);
             }
           }
@@ -6390,7 +6161,7 @@ function handleClaudeEvent(session, event) {
             if (!session.iv) session.slowToolNotices?.toolEnded(block.tool_use_id);
             // A Task tool_result means the subagent it spawned has completed —
             // finish that child convo (no-op for every non-Task tool_result).
-            session.subagentConvos?.noteTaskResult(block.tool_use_id);
+            session.subagentConvos?.noteTaskResult(block.tool_use_id, { failed: block.is_error === true });
             const entry = liveOutputStore.get(block.tool_use_id);
             // Only pay for the blockText join + three regex scans below when
             // something will actually consume the result: either the
@@ -6575,8 +6346,7 @@ function reportSessionSendFailure(session, message, { restoreJournalState = fals
   // Callers use false to decide whether dispatch-dependent work (history,
   // media mirroring, naming) may run. Surface the specific failure here
   // because the journal-only input path has no transport-level fallback.
-  if (session.sendHtml) session.sendHtml(message, escapeHtml(message));
-  else if (session.sendCallback) session.sendCallback(message);
+  if (session.sendCallback) session.sendCallback(message);
   return false;
 }
 
@@ -6817,7 +6587,6 @@ function sendToSession(session, contentBlocks, { skipJournalMirror = false, fore
             { restoreJournalState: true, beganTurn });
         }
         commitDispatchedUserTurn(session, historyText, preparedHandoff.pending);
-        if (session.resetTimeout) session.resetTimeout();
         return true;
       }
       // Defensive fallback: validation above should make this unreachable, but
@@ -6861,7 +6630,6 @@ function sendToSession(session, contentBlocks, { skipJournalMirror = false, fore
     // The handoff went into stdin with this message; consume it now so another
     // write cannot prepend it again. User history still waits for CLI start.
     else if (preparedHandoff.pending) commitDispatchedUserTurn(session, '', preparedHandoff.pending);
-    if (session.resetTimeout) session.resetTimeout();
     return true;
   } finally { finishInput?.(); }
 }
@@ -6920,7 +6688,6 @@ function requeueSteeredMessages(session, entries) {
     // this still finds it.
     Promise.resolve(notifyQueuedMessage(session, preview, {
       sendReply: ctx.sendReply,
-      htmlEscape: escapeHtml,
       queueRelease: journalInputConsumer.queueRelease,
       convoId: journalConvoIdFor(session),
       fullText: text,
@@ -7343,10 +7110,7 @@ function formatQueueSummary(queued) {
     }
   }
   const plain = lines.map(l => `  ${l.index}. ${l.text}`).join('\n');
-  const html = lines.map(l =>
-    `<li>${escapeHtml(l.text)}</li>`
-  ).join('');
-  return { plain, html: `<ol>${html}</ol>` };
+  return { plain };
 }
 
 // Merge/grouping rules live in lib/queue-flush.js (pure, unit-tested):
@@ -7419,13 +7183,7 @@ function pendingFlushBatch(session) {
 }
 
 function queueReleaseForBatch(session, queued) {
-  const itemIds = queuedReleaseItemIds(session, queued);
-  return {
-    listLive: (convoId) => liveQueuedReleaseEntries(convoId, itemIds),
-    dropItem: (convoId, itemId) => {
-      journalInputConsumer.queueRelease.dropItem(convoId, itemId);
-    },
-  };
+  return scopedQueueRelease(journalInputConsumer.queueRelease, queuedReleaseItemIds(session, queued));
 }
 
 // action: 'send' for a batch that went out; 'expired' for one dropped
@@ -7673,18 +7431,6 @@ function splitMessage(text) {
   return chunks;
 }
 
-// --- Markdown to HTML ---
-
-function escapeHtml(text) {
-  // &quot; matters because escapeHtml output is interpolated into HTML
-  // attributes (href="...") as well as element content.
-  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
-}
-
-function color(text, hex) {
-  return `<font color="${hex}">${text}</font>`;
-}
-
 function formatDuration(ms) {
   const s = Math.floor(ms / 1000);
   if (s < 60) return `${s}s`;
@@ -7696,156 +7442,20 @@ function formatDuration(ms) {
   return rm ? `${h}h ${rm}m` : `${h}h`;
 }
 
-const NOTICE_COLORS = {
-  success: '#3fb950',
-  error: '#f85149',
-  warning: '#f0883e',
-  info: '#58a6ff',
-};
-
-function notice(type, plainText, htmlContent) {
-  const hex = NOTICE_COLORS[type] || NOTICE_COLORS.info;
-  return {
-    plain: plainText,
-    html: `${color('▌', hex)} ${htmlContent || escapeHtml(plainText)}`,
-  };
-}
-
 // A bridge line in the session's chat, tagged payload.notice = {kind, icon,
 // summary} (lib/system-notice.js) so a client can recognise it without
-// matching the wording. Same delivery as session.sendHtml (sendToRoom), plus
-// the tag. Returns false when the session has no room to send through, so
-// the caller keeps its existing untagged path.
-function sendKindNotice(session, kind, plain, html, meta = noticeMeta(kind, plain)) {
+// matching the wording. Same delivery as session.sendCallback (sendToRoom),
+// plus the tag. Returns false when the session has no room to send through,
+// so the caller keeps its existing untagged path.
+function sendKindNotice(session, kind, plain, meta = noticeMeta(kind, plain)) {
   if (!meta || !session?.roomId) return false;
   try {
-    Promise.resolve(sendToRoom(session.roomId, plain, html, { notice: meta }))
+    Promise.resolve(sendToRoom(session.roomId, plain, { notice: meta }))
       .catch((e) => { try { debug(`sendKindNotice(${kind}) failed: ${e?.message ?? e}`); } catch { /* logging must never throw */ } });
     return true;
   } catch {
     return false;
   }
-}
-
-function markdownToHtml(text) {
-  let processed = text.replace(/\*\*`([^`\n]+)`\*\*/g, '‹b›‹code›$1‹/code›‹/b›');
-
-  // Convert list markers to placeholders BEFORE backtick split so inline code in list items works
-  processed = processed.replace(/^([-*])\s+/gm, '‹li›');
-  processed = processed.replace(/^(\d+)\.\s+/gm, '‹li›');
-
-  const parts = processed.split(/(```[\s\S]*?```|`[^`\n]+`)/g);
-
-  // Phase 1: Process each part (inline formatting for text, code wrapping for code)
-  let html = parts.map((part, i) => {
-    if (i % 2 === 1) {
-      if (part.startsWith('```')) {
-        const inner = part.replace(/^```\w*\n?/, '').replace(/\n?```$/, '');
-        const lineCount = inner.split('\n').length;
-        if (lineCount > 15) {
-          return `<details><summary>Code (${lineCount} lines)</summary><pre><code>${escapeHtml(inner)}</code></pre></details>`;
-        }
-        return `<pre><code>${escapeHtml(inner)}</code></pre>`;
-      }
-      return `<code>${escapeHtml(part.slice(1, -1))}</code>`;
-    }
-
-    let html = escapeHtml(part);
-
-    html = html.replace(/^#{1,6}\s+(.+)$/gm, '<b>$1</b>');
-    html = html.replace(/\*\*(.+?)\*\*/g, '<b>$1</b>');
-    html = html.replace(/__(.+?)__/g, '<b>$1</b>');
-    html = html.replace(/(?<!\w)\*([^*\n]+?)\*(?!\w)/g, '<i>$1</i>');
-    html = html.replace(/(?<!\w)_([^_\n]+?)_(?!\w)/g, '<i>$1</i>');
-    html = html.replace(/~~(.+?)~~/g, '<s>$1</s>');
-
-    // Markdown links: [text](url)
-    html = html.replace(/\[([^\]]+)\]\((https?:\/\/[^)]+)\)/g, '<a href="$2">$1</a>');
-
-    // Linkify remaining bare URLs (not already inside tags). The text is
-    // already escapeHtml'd, so a quote right after a URL appears as
-    // &quot;/&#39; — stop the match at those entities or they get absorbed
-    // into the href. (&lt;/&gt; are deliberately NOT terminators: a literal
-    // > inside a URL has always been absorbed as &gt; and decodes back to >
-    // when the client parses the attribute, so stopping there would change
-    // currently-correct rendering.)
-    html = html.replace(/(?<!href="|">)(https?:\/\/(?:(?!&quot;|&#39;)[^\s<>"'])+)/g, '<a href="$1">$1</a>');
-
-    // Horizontal rules
-    html = html.replace(/^-{3,}$/gm, '<hr/>');
-
-    // Blockquotes: consecutive > lines
-    html = html.replace(/(^&gt;\s?.+(\n|$))+/gm, (match) => {
-      const inner = match.replace(/^&gt;\s?/gm, '').trim();
-      return `<blockquote>${inner}</blockquote>`;
-    });
-
-    return html;
-  }).join('');
-
-  // Phase 2: Block-level processing on joined HTML (so inline code within lists/tables works)
-  html = html.replace(/‹b›‹code›/g, '<b><code>');
-  html = html.replace(/‹\/code›‹\/b›/g, '</code></b>');
-
-  // List items (markers were converted to ‹li› before backtick split)
-  html = html.replace(/^‹li›(.+)$/gm, '<li>$1</li>');
-
-  // Tables: consecutive lines starting with | — render as <pre><code> for cross-client compatibility
-  html = html.replace(/(?:^|\n)((?:\|[^\n]+\|\n?)+)/g, (match, tableBlock) => {
-    return '<pre><code>' + padTable(tableBlock).replace(/\n/g, '&#10;') + '</code></pre>';
-  });
-
-  // Wrap consecutive <li> in <ul>
-  html = html.replace(/(<li>[\s\S]*?<\/li>)(\n<li>[\s\S]*?<\/li>)*/g, (match) => {
-    return `<ul>${match}</ul>`;
-  });
-
-  // Protect newlines inside <pre> blocks before converting to <br/>
-  html = html.replace(/<pre><code>([\s\S]*?)<\/code><\/pre>/g, (match, inner) => {
-    return '<pre><code>' + inner.replace(/\n/g, '&#10;') + '</code></pre>';
-  });
-  html = html.replace(/<pre>([\s\S]*?)<\/pre>/g, (match, inner) => {
-    return '<pre>' + inner.replace(/\n/g, '&#10;') + '</pre>';
-  });
-
-  // Convert newlines to <br/> (but not before/after block elements)
-  html = html.replace(/\n/g, '<br/>');
-
-  // Restore newlines in <pre> blocks
-  html = html.replace(/<pre><code>([\s\S]*?)<\/code><\/pre>/g, (match, inner) => {
-    return '<pre><code>' + inner.replace(/&#10;/g, '\n') + '</code></pre>';
-  });
-  html = html.replace(/<pre>([\s\S]*?)<\/pre>/g, (match, inner) => {
-    return '<pre>' + inner.replace(/&#10;/g, '\n') + '</pre>';
-  });
-
-  // Clean up excessive <br/> around block elements
-  html = html.replace(/<br\/>(<\/?(?:hr|li|pre|ol|ul|table|thead|tbody|tr|th|td|blockquote|details|summary)(?:\s[^>]*)?>)/g, '$1');
-  html = html.replace(/(<\/?(?:hr|li|pre|ol|ul|table|thead|tbody|tr|th|td|blockquote|details|summary)(?:\s[^>]*)?>)<br\/>/g, '$1');
-
-  return html;
-}
-
-// Pad pipe table columns to equal widths
-function padTable(tableText) {
-  const rows = tableText.trim().split('\n');
-  const parsed = rows.map(r => r.replace(/^\|/, '').replace(/\|$/, '').split('|').map(c => c.trim()));
-  const colCount = Math.max(...parsed.map(r => r.length));
-  const widths = Array(colCount).fill(0);
-  for (const row of parsed) {
-    // Skip separator rows for width calculation
-    if (/^[\s\-:]+$/.test(row.join(''))) continue;
-    for (let i = 0; i < row.length; i++) {
-      widths[i] = Math.max(widths[i], (row[i] || '').length);
-    }
-  }
-  return rows.map(r => {
-    const cells = r.replace(/^\|/, '').replace(/\|$/, '').split('|').map(c => c.trim());
-    if (/^[\s\-:]+$/.test(cells.join(''))) {
-      return '| ' + widths.map(w => '-'.repeat(w)).join(' | ') + ' |';
-    }
-    return '| ' + cells.map((c, i) => (c || '').padEnd(widths[i] || 0)).join(' | ') + ' |';
-  }).join('\n');
 }
 
 // Journal bodies are raw markdown: Matron clients render GFM themselves
@@ -7879,7 +7489,7 @@ function deduplicateFilename(dir, filename) {
 // exactly the re-publish loop the return path must avoid (the journal
 // already has the user's own row for that content), so with the flag set
 // sendToRoom publishes nothing.
-async function sendToRoom(roomId, text, html, { skipJournalMirror = false, notice = null } = {}) {
+async function sendToRoom(roomId, text, { skipJournalMirror = false, notice = null } = {}) {
   // Journal mirror: every session reply and bridge notice that flows through
   // here is fine to mirror as-is (v1 doesn't distinguish the two). Rooms with
   // no active session (control-room chatter) are silently skipped.
@@ -8065,12 +7675,9 @@ function sweepToolStreams(session) {
   }
 }
 
-// fallbackBody/fallbackHtml are retired plain/HTML fallback text.
-// Still accepted because ~11 call sites pass them positionally through the
-// session.sendButtonMessage closures; the journal publishes structured
-// prompts and ignores them. Retiring the whole fallback-text plumbing is a
-// tracked follow-up.
-async function sendButtonMessage(roomId, prompt, buttons, mode, _fallbackBody, _fallbackHtml, payload = null) {
+// Publishes a prompt card: `payload` when the caller built a structured one,
+// otherwise the classic { question, options, mode } shape.
+async function sendButtonMessage(roomId, prompt, buttons, mode, payload = null) {
   console.log(`[BUTTONS] Sending button message: mode=${mode}, buttons=${buttons.length}, prompt=${prompt.substring(0, 50)}`);
   const journalSession = sessions.get(roomId);
   if (journalSession) {
@@ -8353,7 +7960,7 @@ async function fileWorktreeConsentCard(session, started) {
   try { session.sendCallback?.('Could not file the approval card for the worktree setup script, so it did not run.'); } catch { /* best effort */ }
 }
 
-async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
+async function handleCommand(roomId, text, sendReply) {
   const nativeSession = sessions.get(roomId);
   if (nativeSession?.alive && await runCodexControl(nativeSession, text, sendReply)) return;
   const parts = text.split(/\s+/);
@@ -8369,11 +7976,6 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
 
   switch (cmd) {
     case '!start': {
-      if (!sender) {
-        await sendReply('Cannot determine sender. Please try again.');
-        return;
-      }
-
       const { bypass: startBypass, rest: afterBypass } = extractBypassFlag(parts.slice(1));
       const { extras: mcpExtras, rest: afterMcp } = extractMcpExtraFlags(afterBypass, KNOWN_MCP_EXTRAS);
       const agentFlags = extractAgentFlag(afterMcp);
@@ -8446,10 +8048,9 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       // Mint a fresh conversation id for this session
       const sessionRoomId = newSessionConvoId();
 
-      const sessionSendReply = (reply) => sendToRoom(sessionRoomId, reply, markdownToHtml(reply));
-      const sessionSendHtml = (plainText, html) => sendToRoom(sessionRoomId, plainText, html);
-      const sessionSendButtons = (prompt, buttons, mode, plainText, html, payload) =>
-        sendButtonMessage(sessionRoomId, prompt, buttons, mode, plainText, html, payload);
+      const sessionSendReply = (reply) => sendToRoom(sessionRoomId, reply);
+      const sessionSendButtons = (prompt, buttons, mode, payload) =>
+        sendButtonMessage(sessionRoomId, prompt, buttons, mode, payload);
 
       const session = createSession(sessionRoomId, workdir, undefined, {
         agent: selectedAgent, mcpExtras,
@@ -8458,7 +8059,6 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       });
       session.originRoomId = roomId;
       session.sendCallback = sessionSendReply;
-      session.sendHtml = sessionSendHtml;
       session.sendButtonMessage = sessionSendButtons;
       // The requested model IS this session's model from the first turn — the
       // spawn already carries --model, so say so rather than waiting for the
@@ -8512,12 +8112,17 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       // path has no busy = false for print/iv), so it is invisible to a
       // `session.busy = false` grep.
       inflightMarker.noteTurnEnd(journalConvoIdFor(session));
-      killSession(session);
-      sessions.delete(roomId);
+      await stopSessionAndConfirm({
+        sessions,
+        roomId,
+        kill: () => killSession(session),
+        settle: () => {
       journalSessionState(session, 'done');
       journalActivity(session, 'idle');
       journalEvictConvoInput(session);
-      await sendReply('Session stopped.');
+        },
+        sendReply,
+      });
       break;
     }
 
@@ -8600,7 +8205,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         // being forced into auto mode by the coercion.
         bypass: restartBypass != null ? restartBypass
           : (typeof existing.bypassMode === 'boolean' ? existing.bypassMode : undefined),
-      }, { sendReply, sendHtml });
+      }, { sendReply });
       // Refused at teardown (an attachment arrived during the reply await):
       // recreateSession already said so; don't announce a restart.
       if (!restarted) return;
@@ -8620,16 +8225,11 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const restartedLine = `${agentLabel(existing.agent)} session restarted.\nSession: ${restartSessionId ? restartSessionId.slice(0, 8) + '...' : '(new)'}\nWorkdir: ${restartWorkdir}${matronMdNote(restarted)}${extrasLine}${restartModelLine}${restartPermNote}`;
       // Tagged for the apps (the summary is its first line); a restart with
       // no live replacement session keeps the plain reply.
-      if (!restarted || !sendKindNotice(restarted, 'restart', restartedLine, markdownToHtml(restartedLine))) await sendReply(restartedLine);
+      if (!restarted || !sendKindNotice(restarted, 'restart', restartedLine)) await sendReply(restartedLine);
       break;
     }
 
     case '!resume': {
-      if (!sender) {
-        await sendReply('Cannot determine sender. Please try again.');
-        return;
-      }
-
       const { bypass: resumeBypass, rest: resumeAfterBypass } = extractBypassFlag(parts.slice(1));
       const { extras: resumeExtras, rest: resumeAfterMcp } = extractMcpExtraFlags(resumeAfterBypass, KNOWN_MCP_EXTRAS);
       const resumeAgentFlags = extractAgentFlag(resumeAfterMcp);
@@ -8671,7 +8271,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         }
         // No arg — show sessions list inline
         const flag = resumeAgentFlags.agent ? ` --${resumeAgentFlags.agent}` : '';
-        await handleCommand(roomId, `!sessions${flag}`, sendReply, sendHtml, sender);
+        await handleCommand(roomId, `!sessions${flag}`, sendReply);
         return;
       }
 
@@ -8854,10 +8454,9 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
           : `Resumed ${shortId}`,
         titleMarkerFor({ _journalTitleHint: resumedHint }));
 
-      const sessionSendReply = (reply) => sendToRoom(sessionRoomId, reply, markdownToHtml(reply));
-      const sessionSendHtml = (plainText, html) => sendToRoom(sessionRoomId, plainText, html);
-      const sessionSendButtons = (prompt, buttons, mode, plainText, html, payload) =>
-        sendButtonMessage(sessionRoomId, prompt, buttons, mode, plainText, html, payload);
+      const sessionSendReply = (reply) => sendToRoom(sessionRoomId, reply);
+      const sessionSendButtons = (prompt, buttons, mode, payload) =>
+        sendButtonMessage(sessionRoomId, prompt, buttons, mode, payload);
 
       // Inherit the resumed session's previously persisted extras unless the
       // user is explicitly overriding via the command line; this lets a
@@ -8910,7 +8509,6 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       session._llmTitleEarned = resumedTitleEarned;
       session.lastRosterText = resumePersisted?.lastRosterText || '';
       session.sendCallback = sessionSendReply;
-      session.sendHtml = sessionSendHtml;
       session.sendButtonMessage = sessionSendButtons;
       session._agentSessions = inheritedAgentSessions;
       // The model this session just spawned with IS its current model — the
@@ -8961,22 +8559,11 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const resumeModelLine = resumeModelFlag.model ? `\nModel: ${aliasLabel(resumeModelFlag.model)}` : '';
       await sendReply(`Resuming ${agentLabel(selectedAgent)} session ${shortId}… in a new conversation${resumePermNote}.`);
       const resumePlain = `Resuming ${agentLabel(selectedAgent)} session ${shortId}…\nWorkdir: ${session.workdir}${matronMdNote(session)}${resumeModelLine}${resumePermNote}\n\nSend any message to continue.`;
-      const resumeHtml =
-        `<b>Resuming ${escapeHtml(agentLabel(selectedAgent))} session <code>${shortId}</code>…</b><br/>` +
-        `Workdir: <code>${escapeHtml(session.workdir)}</code>${matronMdNoteHtml(session)}` +
-        `${resumeModelFlag.model ? `<br/>Model: <code>${escapeHtml(aliasLabel(resumeModelFlag.model))}</code>` : ''}` +
-        `${escapeHtml(resumePermNote)}<br/><br/>` +
-        `<i>Send any message to continue.</i>`;
-      await sessionSendHtml(resumePlain, resumeHtml);
+      await sessionSendReply(resumePlain);
       break;
     }
 
     case '!workdir': {
-      if (!sender) {
-        await sendReply('Cannot determine sender. Please try again.');
-        return;
-      }
-
       const { bypass: workdirBypass, rest: workdirAfterBypass } = extractBypassFlag(parts.slice(1));
       const { extras: workdirExtras, rest: workdirAfterMcp } = extractMcpExtraFlags(workdirAfterBypass, KNOWN_MCP_EXTRAS);
       const workdirAgentFlags = extractAgentFlag(workdirAfterMcp);
@@ -9024,10 +8611,9 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       // Mint a fresh conversation id for this session
       const sessionRoomId = newSessionConvoId();
 
-      const sessionSendReply = (reply) => sendToRoom(sessionRoomId, reply, markdownToHtml(reply));
-      const sessionSendHtml = (plainText, html) => sendToRoom(sessionRoomId, plainText, html);
-      const sessionSendButtons = (prompt, buttons, mode, plainText, html, payload) =>
-        sendButtonMessage(sessionRoomId, prompt, buttons, mode, plainText, html, payload);
+      const sessionSendReply = (reply) => sendToRoom(sessionRoomId, reply);
+      const sessionSendButtons = (prompt, buttons, mode, payload) =>
+        sendButtonMessage(sessionRoomId, prompt, buttons, mode, payload);
 
       const session = createSession(sessionRoomId, resolved, undefined, {
         agent: selectedAgent, mcpExtras: workdirExtras,
@@ -9036,7 +8622,6 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       });
       session.originRoomId = roomId;
       session.sendCallback = sessionSendReply;
-      session.sendHtml = sessionSendHtml;
       session.sendButtonMessage = sessionSendButtons;
       // Same rule as !start: set currentModel before persisting (the live
       // snapshot reads it) and pass model through the explicit `extra`.
@@ -9050,13 +8635,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const workdirModelLine = workdirModel ? `\nModel: ${aliasLabel(workdirModel)}` : '';
       await sendReply(`${agentLabel(selectedAgent)} session started in a new conversation${workdirPermNote}.\nWorkdir: ${resolved}${workdirModelLine}`);
       const wdPlain = `${agentLabel(selectedAgent)} session started.\nWorkdir: ${resolved}${matronMdNote(session)}${workdirModelLine}${workdirPermNote}\n\nSend any message to interact with ${agentLabel(selectedAgent)}.`;
-      const wdHtml =
-        `<b>${escapeHtml(agentLabel(selectedAgent))} session started</b><br/>` +
-        `Workdir: <code>${escapeHtml(resolved)}</code>${matronMdNoteHtml(session)}` +
-        `${workdirModel ? `<br/>Model: <code>${escapeHtml(aliasLabel(workdirModel))}</code>` : ''}` +
-        `${escapeHtml(workdirPermNote)}<br/><br/>` +
-        `<i>Send any message to interact with ${escapeHtml(agentLabel(selectedAgent))}.</i>`;
-      await sessionSendHtml(wdPlain, wdHtml);
+      await sessionSendReply(wdPlain);
       break;
     }
 
@@ -9085,24 +8664,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         `Session active\nAgent: ${agentLabel(session.agent)}\nWorkdir: ${session.workdir}${matronMdNote(session)}${session.worktree ? `\n${worktreeHeaderLine(session.worktree)}` : ''}\nSession ID: ${shortId}\n` +
         `Uptime: ${formatDuration(uptimeMs)}\nRestarts: ${session.restartCount}/3\nBusy: ${busyText}${codexDetails}`;
 
-      const busyHtml = session.busy
-        ? color('● busy', '#f0883e')
-        : color('● idle', '#3fb950');
-      const htmlStatus =
-        `<b>Session Status</b><table>` +
-        `<tr><td>State</td><td>${busyHtml}</td></tr>` +
-        `<tr><td>Agent</td><td>${escapeHtml(agentLabel(session.agent))}</td></tr>` +
-        `<tr><td>Workdir</td><td><code>${escapeHtml(session.workdir)}</code></td></tr>` +
-        (session.worktree ? `<tr><td>Worktree</td><td><code>${escapeHtml(session.worktree.branch)}</code></td></tr>` : '') +
-        (matronMdFileList(session.matronMd) ? `<tr><td>MATRON.md</td><td>${escapeHtml(matronMdFileList(session.matronMd))}</td></tr>` : '') +
-        `<tr><td>Session</td><td><code>${shortId}</code></td></tr>` +
-        `<tr><td>Uptime</td><td>${formatDuration(uptimeMs)}</td></tr>` +
-        `<tr><td>Restarts</td><td>${session.restartCount}/3</td></tr>` +
-        `<tr><td>Turns</td><td>${session.turnCount}</td></tr>` +
-        (session.agent === AGENT_CODEX ? '' : `<tr><td>Cost</td><td>$${session.totalUsage.cost_usd.toFixed(4)}</td></tr>`) +
-        `</table>` + escapeHtml(codexDetails).replace(/\n/g, '<br/>');
-
-      await sendHtml(plainStatus, htmlStatus);
+      await sendReply(plainStatus);
       break;
     }
 
@@ -9116,29 +8678,6 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       }
       session.showWorking = !session.showWorking;
       await sendReply(`Tool call visibility: ${session.showWorking ? 'ON — will show working' : 'OFF — hidden'}`);
-      break;
-    }
-
-    case '!show_bash':
-    case '!show_bash_output':
-    case '!bash_output': {
-      const session = sessions.get(roomId);
-      if (!session) {
-        await sendReply('No active session.');
-        break;
-      }
-      if (session.agent === AGENT_CODEX) {
-        await sendReply('Live Bash tee output is a Claude-hook feature and is not available in Codex programmatic mode.');
-        break;
-      }
-      session.showBashOutput = !session.showBashOutput;
-      // Persist so !restart re-reads the value at spawn. Gated like the
-      // pendingPlanDenialId persist at the ExitPlanMode handler — passing a
-      // null sessionId here would clobber an existing persisted sessionId.
-      if (session.claudeSessionId) {
-        persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { showBashOutput: session.showBashOutput });
-      }
-      await sendReply(`showBashOutput: ${session.showBashOutput ? 'ON' : 'OFF'} — run !restart to apply`);
       break;
     }
 
@@ -9187,7 +8726,6 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
 
       const activeId = currentSession?.claudeSessionId;
 
-      // Plain text fallback
       const plainList = items.map((s, i) => {
         const date = new Date(s.modified).toISOString().replace('T', ' ').slice(0, 16);
         const shortId = s.sessionId.slice(0, 8);
@@ -9196,22 +8734,9 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         return `${i + 1}. ${shortId} ${date}${active}${desc}`;
       }).join('\n');
 
-      // HTML formatted version
-      const htmlRows = items.map((s, _i) => {
-        const date = new Date(s.modified).toISOString().replace('T', ' ').slice(0, 16);
-        const shortId = s.sessionId.slice(0, 8);
-        const active = s.sessionId === activeId ? ' ⚡' : '';
-        const desc = s.summary
-          ? `<br/><span style="color:gray">${escapeHtml(s.summary)}</span>`
-          : '';
-        return `<li><b>${shortId}</b> <code>${date}</code>${active}${desc}</li>`;
-      }).join('\n');
-
       const agentFlag = `--${selectedAgent}`;
       const plainText = `${agentLabel(selectedAgent)} sessions for ${workdir}:\n\n${plainList}\n\nUse /resume ${agentFlag} <number> or /resume ${agentFlag} <id> to resume.`;
-      const html = `<b>${escapeHtml(agentLabel(selectedAgent))} sessions for ${escapeHtml(workdir)}:</b><ol>\n${htmlRows}\n</ol><i>Use <code>/resume ${agentFlag} &lt;number&gt;</code> or <code>/resume ${agentFlag} &lt;id&gt;</code> to resume.</i>`;
-
-      await sendHtml(plainText, html);
+      await sendReply(plainText);
       break;
     }
 
@@ -9257,56 +8782,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         `Send any other text to chat with the selected coding agent.\n` +
         `You can also send photos and documents (PDFs, images, text files).`;
 
-      const cmdGroup = (title, cmds) => {
-        const items = cmds.map(([c, d]) => `<li><code>${c}</code> — ${d}</li>`).join('');
-        return `<b>${title}</b><ul>${items}</ul>`;
-      };
-
-      const htmlHelp =
-        cmdGroup('Sessions', [
-          ['/start [--claude|--codex]', 'Start a new session (creates a new room)'],
-          ['/start [--claude|--codex] &lt;workdir&gt;', 'Start in a specific directory'],
-          ['/start --browser [workdir]', 'Also enable chrome-devtools MCP (off by default to save ~400M)'],
-          ['/start --worktree <name> [workdir]', 'Start in a fresh git worktree (branch wt/<name> from origin); never the default'],
-          ['/start --auto [workdir]', 'Run with auto permission mode + Matron permission cards instead of the default --dangerously-skip-permissions (--bypass switches back); also accepted by /restart, /resume, /workdir'],
-          ['/start --model &lt;alias&gt; [workdir]', `Start on a specific Claude model (${escapeHtml(VALID_ALIAS_HINT)}, or a full <code>claude-*</code> name); also accepted by /restart, /resume, /workdir. Claude only`],
-          ['/stop', 'Stop the current session'],
-          ['/restart', 'Restart the session once the current turn finishes; --force restarts immediately (--browser/--bypass/--auto also accepted)'],
-          ['/resume [--claude|--codex] &lt;n|id&gt;', 'Resume a session from that agent'],
-          ['/sessions [--claude|--codex]', 'List past sessions for an agent'],
-          ['/workdir [--claude|--codex] &lt;path&gt;', 'Start a session in a different directory'],
-        ]) +
-        cmdGroup('Info', [
-          ['/status', 'Show current session info'],
-          ['/agent', 'Show the current coding agent'],
-          ['/switch &lt;claude|codex&gt;', 'Hand this conversation to the other coding agent'],
-          ['/working', 'Toggle tool call visibility'],
-          ['/mcp', 'Show MCP server status'],
-          ['/model', 'Show current model'],
-          ['/effort [level]', 'Show or set effort level (low, medium, high, xhigh, max, auto, ultracode)'],
-          ['/mode [interactive|print]', 'Show or switch interactive vs non-interactive mode'],
-          ['/login', 'Log in to your Anthropic account (auto-switches to interactive mode)'],
-          ['/logout', 'Log out of your Anthropic account (auto-switches to interactive mode)'],
-          ['/design-login', 'Authorize Claude Design access (auto-switches to interactive mode)'],
-          ['/cost', 'Show session cost'],
-          ['/usage', 'Show token usage'],
-          ['/limits', 'Show subscription usage limits (session &amp; weekly)'],
-          ['/timer &lt;duration|time&gt; &lt;message&gt;', 'Send a message to this chat later (e.g. /timer 2h hey, /timer 30m /compact, /timer 09:00 standup, /timer 12:10am ping); /timer lists, /timer cancel &lt;id|all&gt; cancels'],
-          ['/tools', 'List available tools'],
-          ['/sleep', 'Stop this machine now, with a confirmation button (needs <code>MATRON_SLEEP_COMMAND</code>)'],
-          ['/permissions', 'List session-allowed tools; <code>/permissions revoke &lt;name&gt;</code> (or <code>all</code>) removes a grant'],
-          ['/help', 'Show this help message'],
-        ]) +
-        `<b>Tips</b><ul>` +
-        `<li>Each <code>/start</code>, <code>/resume</code>, and <code>/workdir</code> creates a new session</li>` +
-        `<li>Room names show <code>${SERVER_LABEL} · &lt;repo&gt; · &lt;topic&gt;</code></li>` +
-        `<li>Messages are queued automatically while the agent is working</li>` +
-        `<li>Send <code>interrupt</code> to force interrupt</li>` +
-        `<li><code>!esc</code> — cancel the current turn without killing the session</li>` +
-        `<li>You can send photos and documents (PDFs, images, text files)</li>` +
-        `</ul>`;
-
-      await sendHtml(plainHelp, htmlHelp);
+      await sendReply(plainHelp);
       break;
     }
 
@@ -9368,17 +8844,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
                        s.status === 'needs-auth' ? '🟡' : '⚪';
           return `${icon} ${s.name} — ${s.status}`;
         }).join('\n');
-        const statusDot = (st) => {
-          const clr = st === 'connected' ? '#3fb950' :
-                      st === 'failed' ? '#f85149' :
-                      st === 'needs-auth' ? '#f0883e' : '#8b949e';
-          return color('●', clr);
-        };
-        const htmlRows = servers.map(s =>
-          `<tr><td>${statusDot(s.status)}</td><td><code>${escapeHtml(s.name)}</code></td><td>${escapeHtml(s.status)}</td></tr>`
-        ).join('');
-        const htmlMcp = `<b>MCP Servers</b><table>${htmlRows}</table>`;
-        await sendHtml(`MCP Servers (live):\n\n${plainList}`, htmlMcp);
+        await sendReply(`MCP Servers (live):\n\n${plainList}`);
       } else {
         // No initData.mcp_servers. In iv-mode there is no system/init event, so
         // live server status is never exposed — fall back to the bridge's
@@ -9425,7 +8891,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         // `--no-offer`: a switch someone else asked for (the Coordinator's
         // session_set_model) parked mid-turn — no "for new chats too?" card.
         const offer = !implicit && !parts.slice(2).includes('--no-offer');
-        applyModelSwitch(roomId, session, arg, { sendReply, sendHtml, explicit: !implicit, offer });
+        applyModelSwitch(roomId, session, arg, { sendReply, explicit: !implicit, offer });
         break;
       }
       const current = session.currentModel || session.initData?.model || null;
@@ -9442,31 +8908,21 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
           options.modelOptions.map(o => `${o.label}: /model ${o.value}`).join('\n') +
           (metadata.modelsError ? `\n\n${metadata.modelsError}\nYou can still type /model <model-id>.` : '');
         if (session.sendButtonMessage) {
-          session.sendButtonMessage('Codex model', options.modelOptions.map((o, i) => ({
+          session.sendButtonMessage(codexModelCardQuestion(options, metadata), options.modelOptions.map((o, i) => ({
             id: `codex-model-${i}`, label: o.label, value: `model:${o.value}`,
-          })), 'pick_one', plain, escapeHtml(plain).replace(/\n/g, '<br/>'));
+          })), 'pick_one');
         } else await sendReply(plain);
       } else if (session.iv) {
         // A live TUI means switching works. Prefer buttons, but fall back to a
         // typed-command hint when no button channel is wired (e.g. some
         // auto-started sessions) — never claim "needs interactive mode" here.
         if (session.sendButtonMessage) {
-          const buttons = modelButtons();
-          const plain = `${currentLine}${extra}\n\nTap a model to switch, or type /model <name>.`;
-          const htmlButtons = buttons.map(b => `<b>${escapeHtml(b.label)}</b>`).join(' · ');
-          const html = `<b>🧠 ${escapeHtml(currentLine)}</b>${extra ? '<br/>' + escapeHtml(extra.trim()).replace(/\n/g, '<br/>') : ''}` +
-            `<br/><br/>Tap a model to switch, or type <code>/model &lt;name&gt;</code>.<br/>${htmlButtons}`;
-          session.sendButtonMessage(currentLine, buttons, 'pick_one', plain, html);
+          session.sendButtonMessage(`${currentLine}${extra}`, modelButtons(), 'pick_one');
         } else {
           await sendReply(`${currentLine}${extra}\n\nType /model <name> to switch (e.g. /model sonnet). Options: ${VALID_ALIAS_HINT}.`);
         }
       } else if (session.sendButtonMessage) {
-        const buttons = modelButtons();
-        const plain = `${currentLine}${extra}\n\nTap a model to switch (restarts to apply), or type /model <name>.`;
-        const htmlButtons = buttons.map(b => `<b>${escapeHtml(b.label)}</b>`).join(' · ');
-        const html = `<b>🧠 ${escapeHtml(currentLine)}</b>${extra ? '<br/>' + escapeHtml(extra.trim()).replace(/\n/g, '<br/>') : ''}` +
-          `<br/><br/>Tap a model to switch (restarts to apply), or type <code>/model &lt;name&gt;</code>.<br/>${htmlButtons}`;
-        session.sendButtonMessage(currentLine, buttons, 'pick_one', plain, html);
+        session.sendButtonMessage(`${currentLine}${extra}`, modelButtons(), 'pick_one');
       } else {
         await sendReply(`${currentLine}${extra}\n\nType /model <name> to switch (restarts to apply). Options: ${VALID_ALIAS_HINT}.`);
       }
@@ -9488,11 +8944,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       if (!arg) {
         const line = `Mode: ${modeLabel(currentInteractive)}`;
         if (session.sendButtonMessage) {
-          const buttons = modeButtons(currentInteractive);
-          const plain = `${line}\n\nTap to switch, or type /mode interactive | /mode print.`;
-          const htmlButtons = buttons.map(b => `<b>${escapeHtml(b.label)}</b>`).join(' · ');
-          const html = `<b>🔀 ${escapeHtml(line)}</b><br/><br/>Tap to switch, or type <code>/mode interactive</code> | <code>/mode print</code>.<br/>${htmlButtons}`;
-          session.sendButtonMessage(line, buttons, 'pick_one', plain, html);
+          session.sendButtonMessage(line, modeButtons(currentInteractive), 'pick_one');
         } else {
           await sendReply(`${line}\n\nType /mode interactive or /mode print to switch.`);
         }
@@ -9504,7 +8956,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         break;
       }
       const wantInteractive = target === 'interactive';
-      applyModeSwitch(roomId, session, wantInteractive, { sendReply, sendHtml });
+      applyModeSwitch(roomId, session, wantInteractive, { sendReply });
       break;
     }
 
@@ -9612,7 +9064,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       // applyModeSwitch sends planModeSwitch's own message instead and
       // nothing is parked.
       const next = applyModeSwitch(roomId, session, true, {
-        sendReply, sendHtml,
+        sendReply,
         announcement: isDesign
           ? 'Signing in to Claude Design — switching to interactive mode to complete…'
           : cmdWord === 'logout'
@@ -9650,9 +9102,9 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
           const plain = `Codex effort: ${options.effort || 'config default'}\n\n` +
             options.effortLevels.map(o => `/effort ${o.value}`).join('\n');
           if (session.sendButtonMessage) {
-            session.sendButtonMessage('Codex effort', options.effortLevels.map((o, i) => ({
+            session.sendButtonMessage(codexEffortCardQuestion(options), options.effortLevels.map((o, i) => ({
               id: `codex-effort-${i}`, label: o.label, value: `effort:${o.value}`,
-            })), 'pick_one', plain, escapeHtml(plain).replace(/\n/g, '<br/>'));
+            })), 'pick_one');
           } else await sendReply(plain);
         }
         break;
@@ -9661,7 +9113,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       if (arg) {
         // A person's /effort: once it commits, offer it for new chats too.
         noteEffortDefaultOffer(roomId, arg);
-        if (!session.iv) applyPrintEffortSwitch(roomId, session, arg, { sendReply, sendHtml });
+        if (!session.iv) applyPrintEffortSwitch(roomId, session, arg, { sendReply });
         else if (switchEffortAndTrack(session, arg, sendReply)
                  && session._effortFlowReturnToPrint === normalizeEffortArg(arg)) {
           // The re-parked half of an /effort-from-print flow, replayed after
@@ -9677,11 +9129,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       // `/effort <level>` inline — no picker).
       if (session.iv) {
         if (session.sendButtonMessage) {
-          const buttons = effortButtons();
-          const plain = `Effort level\n\nTap a level to set it, or type /effort <level>.`;
-          const htmlButtons = buttons.map(b => `<b>${escapeHtml(b.label)}</b>`).join(' · ');
-          const html = `<b>🎚️ Effort level</b><br/><br/>Tap a level to set it for this session, or type <code>/effort &lt;level&gt;</code>.<br/>${htmlButtons}`;
-          session.sendButtonMessage('Effort level', buttons, 'pick_one', plain, html);
+          session.sendButtonMessage('Effort level', effortButtons(), 'pick_one');
         } else {
           await sendReply(`Type /effort <level> to set the effort level. Options: ${VALID_EFFORT_HINT}.`);
         }
@@ -9702,14 +9150,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         break;
       }
       const cost = session.totalUsage.cost_usd;
-      const costClr = cost < 0.5 ? '#3fb950' : cost < 2 ? '#f0883e' : '#f85149';
-      const plainCost = `Session cost: $${cost.toFixed(4)}\nTurns: ${session.turnCount}`;
-      const htmlCost =
-        `<b>Session Cost</b><table>` +
-        `<tr><td>Cost</td><td>${color('$' + cost.toFixed(4), costClr)}</td></tr>` +
-        `<tr><td>Turns</td><td>${session.turnCount}</td></tr>` +
-        `</table>`;
-      await sendHtml(plainCost, htmlCost);
+      await sendReply(`Session cost: $${cost.toFixed(4)}\nTurns: ${session.turnCount}`);
       break;
     }
 
@@ -9731,11 +9172,10 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
           (u.reasoning_tokens != null ? `Reasoning: ${u.reasoning_tokens.toLocaleString()} (included in output)\n` : '') +
           `Total: ${(u.input_tokens + u.output_tokens).toLocaleString()}\n` +
           `Bridge turns: ${session.turnCount}${context}`;
-        await sendHtml(plain, escapeHtml(plain).replace(/\n/g, '<br/>'));
+        await sendReply(plain);
         break;
       }
       const u = session.totalUsage;
-      const uCostClr = u.cost_usd < 0.5 ? '#3fb950' : u.cost_usd < 2 ? '#f0883e' : '#f85149';
       const plainUsage =
         `Token usage (cumulative):\n\n` +
         `Input: ${u.input_tokens.toLocaleString()}\n` +
@@ -9744,16 +9184,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         (session.agent === AGENT_CODEX ? '' : `Cache create: ${u.cache_create.toLocaleString()}\n`) +
         `Turns: ${session.turnCount}` +
         (session.agent === AGENT_CODEX ? '' : `\nCost: $${u.cost_usd.toFixed(4)}`);
-      const htmlUsage =
-        `<b>Token Usage</b><table>` +
-        `<tr><td>Input</td><td>${u.input_tokens.toLocaleString()}</td></tr>` +
-        `<tr><td>Output</td><td>${u.output_tokens.toLocaleString()}</td></tr>` +
-        `<tr><td>Cache read</td><td>${u.cache_read.toLocaleString()}</td></tr>` +
-        (session.agent === AGENT_CODEX ? '' : `<tr><td>Cache create</td><td>${u.cache_create.toLocaleString()}</td></tr>`) +
-        `<tr><td>Turns</td><td>${session.turnCount}</td></tr>` +
-        (session.agent === AGENT_CODEX ? '' : `<tr><td>Cost</td><td>${color('$' + u.cost_usd.toFixed(4), uCostClr)}</td></tr>`) +
-        `</table>`;
-      await sendHtml(plainUsage, htmlUsage);
+      await sendReply(plainUsage);
       break;
     }
 
@@ -9769,15 +9200,15 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
             ? await refreshCodexMetadata(active, { force: true })
             : await codexAccountReader.read(DEFAULT_WORKDIR, { force: true });
           const fallback = metadata.limitsError || 'No Codex subscription limits were returned for this account. API-key accounts may not have subscription limits.';
-          const { plain, html } = formatLimits({ ok: metadata.limits.length > 0, lines: metadata.limits }, fallback);
-          await sendHtml(plain, html);
+          const { plain } = formatLimits({ ok: metadata.limits.length > 0, lines: metadata.limits }, fallback);
+          await sendReply(plain);
           break;
         }
         const cwd = active?.workdir || DEFAULT_WORKDIR;
         const raw = await fetchUsageLimitsText(cwd);
         const parsed = parseUsageLimits(raw);
-        const { plain, html } = formatLimits(parsed, raw);
-        await sendHtml(plain, html);
+        const { plain } = formatLimits(parsed, raw);
+        await sendReply(plain);
       } catch (e) {
         await sendReply(`Couldn't fetch usage limits: ${e.message}`);
       }
@@ -9828,7 +9259,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
           await session.sendButtonMessage(
             summary,
             [timerSendNowButton(record.id), timerCancelButton(record.id)],
-            'pick_one', summary, escapeHtml(summary), timerCardPayload(record, summary));
+            'pick_one', timerCardPayload(record, summary));
         } else {
           await sendReply(`${summary} /timer lists, /timer cancel ${record.id} cancels.`);
         }
@@ -9888,7 +9319,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       for (const [, s] of sessions) if (s.alive && s.busy) busyCount++;
       const card = sleepCardText({ wakeHint, busyCount });
       await session.sendButtonMessage(
-        card, sleepButtons(), 'pick_one', card, escapeHtml(card));
+        card, sleepButtons(), 'pick_one');
       break;
     }
 
@@ -9913,7 +9344,6 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const mcpTools = tools.filter(t => t.startsWith('mcp__'));
       const builtIn = tools.filter(t => !t.startsWith('mcp__'));
 
-      // Plain text
       let plainMsg = `Built-in tools (${builtIn.length}):\n${builtIn.join(', ')}\n\n`;
       const grouped = {};
       for (const t of mcpTools) {
@@ -9929,18 +9359,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
         }
       }
 
-      // HTML
-      let htmlMsg = `<b>Built-in tools (${builtIn.length})</b><br/>` +
-        builtIn.map(t => `<code>${escapeHtml(t)}</code>`).join(', ');
-      if (mcpTools.length > 0) {
-        for (const [server, serverTools] of Object.entries(grouped)) {
-          htmlMsg += `<details><summary><b>${escapeHtml(server)}</b> (${serverTools.length})</summary>` +
-            serverTools.map(t => `<code>${escapeHtml(t)}</code>`).join(', ') +
-            `</details>`;
-        }
-      }
-
-      await sendHtml(plainMsg, htmlMsg);
+      await sendReply(plainMsg);
       break;
     }
 
@@ -9980,10 +9399,7 @@ async function handleCommand(roomId, text, sendReply, sendHtml, sender) {
       const plain = `Session-allowed tools (${grants.length}) — cleared on restart:\n` +
         grants.map(t => `  ${t}`).join('\n') +
         `\n\nRevoke with /permissions revoke <name> (or /permissions revoke all).`;
-      const html = `<b>Session-allowed tools (${grants.length})</b> — cleared on restart<ul>` +
-        grants.map(t => `<li><code>${escapeHtml(t)}</code></li>`).join('') +
-        `</ul>Revoke with <code>/permissions revoke &lt;name&gt;</code> (or <code>/permissions revoke all</code>).`;
-      await sendHtml(plain, html);
+      await sendReply(plain);
       break;
     }
 
@@ -10062,30 +9478,12 @@ function formatInterruptedAgo(ageMs) {
   return hours === 1 ? 'about an hour ago' : `about ${hours} hours ago`;
 }
 
-// Echo something into a session's room WITHOUT re-mirroring it into the
-// journal (sendToRoom's default behavior publishes a from:'assistant'
-// text event for everything it sends — see its own comment — which for an
-// echo of content the journal already has would be exactly the re-publish
-// loop this return path exists to avoid). With the journal as the only
-// output this publishes nothing. Fire-and-forget: failures here must never
-// affect journal-side processing.
-function journalEchoToRoom(session, plain, html) {
-  if (!session || !session.roomId) return;
-  sendToRoom(session.roomId, plain, html, { skipJournalMirror: true }).catch(() => {});
-}
-
 // ctx for a session-scoped command dispatch (Deliverable 1/2, journal side):
 // replies go through the NORMAL sendToRoom for the session's room id,
-// which publishes them into the session's journal convo. `sender` is who
-// a command like !start/!resume/!workdir invites into any NEW room it
-// creates; the bridge is single-user, so ALLOWED_USER_IDS[0] is the only
-// sane choice — the same assumption journalHandleControlCommand's
-// control-convo dispatch makes below.
+// which publishes them into the session's journal convo.
 function journalSessionCommandCtx(session) {
   return {
-    sendReply: (reply) => sendToRoom(session.roomId, reply, markdownToHtml(reply)),
-    sendHtml: (plainText, html) => sendToRoom(session.roomId, plainText, html),
-    sender: ALLOWED_USER_IDS[0],
+    sendReply: (reply) => sendToRoom(session.roomId, reply),
   };
 }
 
@@ -10176,7 +9574,7 @@ async function journalRouteTextToSession(session, body, { keepRestartBudget = fa
       flushCursor: () => journalPublisher.flushCursor(),
       runBridgeCommand: (normalizedCommand) => {
         const ctx = journalSessionCommandCtx(session);
-        return handleCommand(session.roomId, normalizedCommand, ctx.sendReply, ctx.sendHtml, ctx.sender);
+      return handleCommand(session.roomId, normalizedCommand, ctx.sendReply);
       },
       // Safety net for JOURNAL_UNAVAILABLE_COMMANDS (currently empty — see
       // that constant's comment in lib/command-dispatch.js for the mapping):
@@ -10239,15 +9637,15 @@ async function journalRouteTextToSession(session, body, { keepRestartBudget = fa
   // checked after prompt/menu/question resolution, before rescue keystrokes
   // and busy-queueing. With no pending plan, `build` falls through and routes
   // to Claude as ordinary text. The "▶️ Building..."
-  // notice goes through the session ctx's sendHtml (sendToRoom), which
+  // notice goes through the session ctx's sendReply (sendToRoom), which
   // mirrors into the journal like every other bridge reply.
   const dispatchedBuild = await dispatchPlanBuild(
     trimmed,
-    !!(session.pendingPlan || session.pendingPlanDenialId || session.ivPendingPlanToolUseId),
+    !!(session.pendingPlan || session.pendingPlanDenialId),
     {
       approvePlan: () => {
         const ctx = journalSessionCommandCtx(session);
-        return approvePlanBuild(session, { sendHtml: ctx.sendHtml, causes });
+        return approvePlanBuild(session, { sendReply: ctx.sendReply, causes });
         },
       },
     );
@@ -10372,7 +9770,6 @@ async function journalRouteTextToSession(session, body, { keepRestartBudget = fa
     const preview = trimmed.length > 40 ? trimmed.slice(0, 37) + '…' : trimmed;
     await notifyQueuedMessage(session, preview, {
       sendReply: ctx.sendReply,
-      htmlEscape: escapeHtml,
       queueRelease: journalInputConsumer.queueRelease,
       convoId: journalConvoIdFor(session),
       fullText: trimmed,
@@ -10507,11 +9904,10 @@ function journalRoutePromptReply(session, { choice, text }, { causes = null } = 
 }
 
 // Adapts journalRouteTextToSession to the router's routeTextToSession(session,
-// body, {username}) interface: echoes the incoming message (a no-op publish,
-// see journalEchoToRoom), then routes it in.
-function journalOnText(session, body, { username, seq, convoId }) {
+// body, {seq, convoId}) interface and routes the message in. The journal
+// already holds the user's own row, so nothing is echoed back.
+function journalOnText(session, body, { seq, convoId }) {
   rearmPreReapHandoff(session);
-  journalEchoToRoom(session, `📱 ${username} (Matron): ${body}`, `📱 <b>${escapeHtml(username)} (Matron):</b> ${escapeHtml(body)}`);
   // journalRouteTextToSession is async (command dispatch awaits
   // handleCommand) — not awaited here, matching the router's fire-and-forget
   // contract for routeTextToSession, but errors must still be caught so a
@@ -10623,9 +10019,7 @@ const journalMediaRouter = createJournalMediaRouter({
   mirrorText: (session, text) => journalPublishUserItem(session, 'publishText', { body: text, from: 'user' }),
   queueMedia: (session, entry) => journalQueueMedia(session, entry),
   isCanonicalSession: (session) => !!session?.alive && sessions.get(session.roomId) === session,
-  echoToRoom: journalEchoToRoom,
   publishNotice: journalPublishNotice,
-  escapeHtml,
   log: console,
 });
 
@@ -10663,7 +10057,6 @@ async function journalQueueMedia(session, { blocks, mirrorToJournal, preview, fu
   try {
     await notifyQueuedMessage(session, preview, {
       sendReply: ctx.sendReply,
-      htmlEscape: escapeHtml,
       queueRelease: journalInputConsumer.queueRelease,
       convoId: journalConvoIdFor(session),
       fullText,
@@ -10788,13 +10181,13 @@ function journalOnItem(session, item, ctx) {
     });
     return;
   }
-  const hasPendingPlan = !!(session.pendingPlan || session.pendingPlanDenialId || session.ivPendingPlanToolUseId);
+  const hasPendingPlan = !!(session.pendingPlan || session.pendingPlanDenialId);
   if (hasPendingPlan && planItems.isBuildReply(session, item?.payload)) {
     const cmdCtx = journalSessionCommandCtx(session);
     // The build reply itself is what the approval's turn is for, exactly as
     // for any other reply on an item (lib/items-turn.js).
     const buildCause = itemCause(item?.payload);
-    approvePlanBuild(session, { sendHtml: cmdCtx.sendHtml, causes: buildCause ? [buildCause] : null }).catch((e) => {
+    approvePlanBuild(session, { sendReply: cmdCtx.sendReply, causes: buildCause ? [buildCause] : null }).catch((e) => {
       try { console.warn(`[plan-items] build from item reply failed: ${e?.message ?? e}`); } catch { /* logging must never throw */ }
     });
     return;
@@ -11013,7 +10406,6 @@ function postEditedQueueCard(session, { index, text }) {
   const preview = text.length > 40 ? text.slice(0, 37) + '…' : text;
   return notifyQueuedMessage(session, preview, {
     sendReply: ctx.sendReply,
-    htmlEscape: escapeHtml,
     queueRelease: journalInputConsumer.queueRelease,
     convoId: journalConvoIdFor(session),
     fullText: text,
@@ -11025,8 +10417,8 @@ function postEditedQueueCard(session, { index, text }) {
 }
 
 // Adapts journalRoutePromptReply to the router's routePromptReply(session,
-// {target_seq, choice, text}, {username}) interface.
-function journalOnPromptReply(session, answer, { username, seq, convoId: replyConvoId }) {
+// {target_seq, choice, text}, {seq, convoId}) interface.
+function journalOnPromptReply(session, answer, { seq, convoId: replyConvoId }) {
   rearmPreReapHandoff(session);
   // Command-replay guard: a prompt answer has side effects (keystrokes into
   // the TUI / a tool_result write), so an ungraceful crash inside the
@@ -11133,7 +10525,6 @@ function journalOnPromptReply(session, answer, { username, seq, convoId: replyCo
       confirmSleep: confirmSleepFromButton,
       cancelSleep: cancelSleepFromButton,
       sendReply: ctx.sendReply,
-      sendHtml: ctx.sendHtml,
     });
     return;
   }
@@ -11152,9 +10543,7 @@ function journalOnPromptReply(session, answer, { username, seq, convoId: replyCo
   if (label == null) {
     console.warn(`[journal-input] prompt_reply with no resolvable pending prompt for convo=${journalConvoIdFor(session)}`);
     journalPublishNotice(journalConvoIdFor(session), "Nothing to answer right now — there's no open prompt in this session.");
-    return;
   }
-  journalEchoToRoom(session, `📱 ${username} answered: ${label}`, `📱 <b>${escapeHtml(username)} answered:</b> ${escapeHtml(label)}`);
 }
 
 function journalIsControlConvo(convoId) {
@@ -11194,22 +10583,17 @@ async function journalHandleControlCommand(body) {
   }
 
   const { cmd, normalizedText } = decision;
-  const sender = ALLOWED_USER_IDS[0];
 
     if (cmd === 'help') {
-      // handleCommand's '!help' calls sendHtml(plain, html) — intercept so we
-      // can append the Matron-specific note to the SAME real help text
-      // instead of re-deriving/duplicating it.
-      await handleCommand(JOURNAL_CONTROL_CONVO_ID, normalizedText, reply,
-        (plainText) => reply(plainText + JOURNAL_CONTROL_HELP_NOTE), sender);
+    // handleCommand's '!help' sends the help text as its one reply —
+    // intercept it so we can append the Matron-specific note to the SAME
+    // real help text instead of re-deriving/duplicating it.
+    await handleCommand(JOURNAL_CONTROL_CONVO_ID, normalizedText,
+      (plainText) => reply(plainText + JOURNAL_CONTROL_HELP_NOTE));
       return;
     }
 
-    // Every other command: plain-text reply sink for both sendReply and
-    // sendHtml (the control convo has no HTML rendering — same choice
-    // journalPublishNotice/journalEchoToRoom's callers make elsewhere).
-    await handleCommand(JOURNAL_CONTROL_CONVO_ID, normalizedText, reply,
-      (plainText) => reply(plainText), sender);
+    await handleCommand(JOURNAL_CONTROL_CONVO_ID, normalizedText, reply);
   } finally { finishInput?.(); }
 }
 
@@ -11539,7 +10923,7 @@ async function announceAgentReminder(session, record) {
     await session.sendButtonMessage(
       summary,
       [timerSendNowButton(record.id), timerCancelButton(record.id)],
-      'pick_one', summary, escapeHtml(summary), timerCardPayload(record, summary));
+      'pick_one', timerCardPayload(record, summary));
   } else {
     journalPublishNotice(journalConvoIdFor(session), summary, null, { silent: true });
   }
@@ -11652,8 +11036,7 @@ function cancelSleepFromButton(session, sendReply) {
 // same flow a typed /login runs, replies included. Skips the picker alive
 // gate so the !login handler's own "no active session" reply speaks instead.
 function startLoginFromButton(session, sendReply) {
-  const ctx = journalSessionCommandCtx(session);
-  return handleCommand(session.roomId, '!login', sendReply, ctx.sendHtml, ctx.sender);
+  return handleCommand(session.roomId, '!login', sendReply);
 }
 
 // The " · ⚠️ permissions bypassed" / " · 🛡 auto permissions" suffix used by
@@ -11777,6 +11160,9 @@ async function fireAutoResume(roomId, convoId, slot) {
     if (!session || !session.alive) session = convoId ? journalResumeConvo(convoId, '⏳ The usage limit has reset — resuming this session to carry on.') : null;
     if (!session) {
       debug(`auto-resume: ${roomId} could not be resumed`);
+    // Not resumable: drop the slot, or every sweep repeats the notices.
+    const records = loadPersistedSessions();
+    if (dropResumeSlot(records, roomId, slot)) savePersistedSessions(records);
       return;
     }
     // A resume hold, a running turn or an open prompt: not now. The slot
@@ -11845,8 +11231,9 @@ function startAutoResumeSweep() {
 }
 
 // The live sessions that hold a restart back right now: mid-turn, a live
-// background work child, or a running subagent. Background work and subagents
-// use the idle reaper's age cap, a running turn never does. One process-table
+// background work child, a running subagent, a pending answer, or input queued
+// for delivery. Background work, subagents, pending answers and queued input
+// use the idle reaper's age cap; a running turn never does. One process-table
 // read per call, shared by every live session. `unreadable` reports a failed
 // `ps`: the verdict then rests on in-memory signals alone.
 function sessionsHoldingRestart() {
@@ -11857,13 +11244,15 @@ function sessionsHoldingRestart() {
   const holders = [];
   for (const s of live) {
     const last = handoffIdleSince(s);
+    const awaitingAnswer = !!(s.pendingInteractivePrompt || s.pendingUnclassifiedPrompt || s.waitingForAnswer);
+    const queuedInput = (s.queuedMessages?.length > 0) || (s._resumeOutbox?.length > 0) || !!s._awaitingInputReady;
     // A quiet tool call can outlast the age cap without ending its turn.
-    // Subagent tracking is in memory, so it survives a failed ps read.
+    // Subagent tracking and queued input survive a failed ps read.
     const hold = s.busy
       ? { reason: 'turn in progress' }
       : table.unreadable
-        ? workHold({ subagentCount: s.subagentConvos?.runningCount() ?? 0, idleSince: last, now })
-        : sessionWorkHold(s, last, now, table);
+        ? workHold({ subagentCount: s.subagentConvos?.runningCount() ?? 0, idleSince: last, now, awaitingAnswer, queuedInput })
+        : sessionWorkHold(s, last, now, table, { awaitingAnswer, queuedInput });
     if (hold) {
       holders.push({ session: s, reason: hold.reason });
       debug(`[code-update] ${s.roomId} holds the update: ${hold.reason}`);
@@ -11974,7 +11363,7 @@ function recoverBadModel(session) {
   }
   const ctx = journalSessionCommandCtx(session);
   const switched = !controlOccupied(session)
-    && applyModelSwitch(session.roomId, session, 'default', { sendReply: ctx.sendReply, sendHtml: ctx.sendHtml, explicit: false });
+    && applyModelSwitch(session.roomId, session, 'default', { sendReply: ctx.sendReply, explicit: false });
   if (!switched) {
     // Refused (a resume hold, a busy turn, a TUI not ready): the one
     // recovery is NOT spent. Retry through the sweep in a minute — the
@@ -12025,7 +11414,7 @@ function switchFableStall(session, { retry = 0, prior = undefined } = {}) {
   const when = fb.resetsAt ? ` (Fable resets ${new Date(fb.resetsAt).toUTCString().replace(/:\d\d GMT$/, ' UTC')})` : '';
   const ctx = journalSessionCommandCtx(session);
   const switched = !controlOccupied(session)
-    && applyModelSwitch(session.roomId, session, fb.model, { sendReply: ctx.sendReply, sendHtml: ctx.sendHtml, explicit: false });
+    && applyModelSwitch(session.roomId, session, fb.model, { sendReply: ctx.sendReply, explicit: false });
   if (!switched) {
     // Refused (a resume hold, a busy turn, a TUI not ready): try again in a
     // minute, a few times, then fall back to waiting for the reset.
@@ -12063,14 +11452,13 @@ function boxLabelForControl() {
 }
 
 function postControlNotice(session, text, kind = null) {
-  const n = notice('info', text);
-  // A tagged notice takes sendHtml's own path (sendToRoom), with the tag.
+  // A tagged notice takes sendCallback's own path (sendToRoom), with the tag.
   const meta = kind ? noticeMeta(kind, text) : null;
-  if (meta && session?.roomId && typeof session.sendHtml === 'function' && sessions.get(session.roomId) === session) {
-    try { sendToRoom(session.roomId, n.plain, n.html, { notice: meta }); return; } catch { /* fall through */ }
+  if (meta && session?.roomId && typeof session.sendCallback === 'function' && sessions.get(session.roomId) === session) {
+    try { sendToRoom(session.roomId, text, { notice: meta }); return; } catch { /* fall through */ }
   }
-  if (session && typeof session.sendHtml === 'function') {
-    try { session.sendHtml(n.plain, n.html); return; } catch { /* fall through */ }
+  if (session && typeof session.sendCallback === 'function') {
+    try { session.sendCallback(text); return; } catch { /* fall through */ }
   }
   journalPublishNotice(journalConvoIdFor(session), text, meta);
 }
@@ -12179,7 +11567,7 @@ async function applyControlSteps(session, steps) {
         if (!next) return { ok: false, error: { code: 'unsupported', detail: 'the agent switch was refused' } };
         current = next;
       } else if (step.op === 'set_model') {
-        if (!applyModelSwitch(current.roomId, current, step.model, { sendReply: ctx.sendReply, sendHtml: ctx.sendHtml, explicit: true })) {
+      if (!applyModelSwitch(current.roomId, current, step.model, { sendReply: ctx.sendReply, explicit: true })) {
           return { ok: false, error: { code: 'unsupported', detail: 'the model switch was refused' } };
         }
         if (current.iv) current._controlTypedAt = Date.now();
@@ -12231,7 +11619,7 @@ async function applyControlEffort(session, level, ctx) {
     }
     if (session.busy) return refused('the session is mid-turn');
     persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { claudeEffort: level });
-    const next = recreateSession(session.roomId, { effort: level }, { sendReply: ctx.sendReply, sendHtml: ctx.sendHtml });
+  const next = recreateSession(session.roomId, { effort: level }, { sendReply: ctx.sendReply });
     if (!next) return refused('the session could not restart');
     ctx.sendReply(`Restarted on effort ${level}.`);
     return { ok: true };
@@ -12414,6 +11802,7 @@ const foreignSessions = createForeignSessions({
   // managed gate stands in, the turn is not taken (as for Codex).
   gateBlocked: (session) => (session?.codex ? null : foreignGateBlocked(session)),
   trackerBase: () => trackerUrlBaseNow(),
+  roomTitle: (id) => { const r = agentRooms.get(id); return r?.title || r?.topic || null; },
   store: {
     load: () => { try { return JSON.parse(fs.readFileSync(FOREIGN_ACTIONS_FILE, 'utf-8')); } catch { return {}; } },
     save: (obj) => atomicWriteFileSync(FOREIGN_ACTIONS_FILE, JSON.stringify(obj), { mode: 0o600 }),
@@ -13537,22 +12926,21 @@ function journalEvictConvoInput(session) {
 
 // Plan approval for the `build` keyword, called from the journal
 // session-text route and a build reply on a plan item (decision gate:
-// dispatchPlanBuild, lib/command-dispatch.js). iv-mode resolves the pending
-// /plan-decision hook with allow; print-mode does the tool_result/denial
-// dance (or falls back to a plain approval message when the denial was
+// dispatchPlanBuild, lib/command-dispatch.js). iv-mode sends the approval
+// as text; print-mode does the tool_result/denial dance (or falls back to a plain approval message when the denial was
 // already answered).
-// `sendHtml` is the caller's reply sink for the final "▶️ Building..."
+// `sendReply` is the caller's reply sink for the final "▶️ Building..."
 // notice — the session ctx's sendToRoom sink, which publishes into the
 // journal.
 // `causes` is the approval itself (the user's message or item reply,
 // lib/turn-cause.js): every path below either starts a turn with it or adds
 // it to the one the plan is waiting in.
-async function approvePlanBuild(session, { sendHtml, causes = null }) {
+async function approvePlanBuild(session, { sendReply, causes = null }) {
   const toolUseId = session.pendingPlanDenialId;
   debug(`[PLAN-DEBUG] Build triggered! pendingPlan=${!!session.pendingPlan} denialId=${toolUseId}`);
   // The tracker mirror closes as decided, whichever mode settles the plan
   // below (lib/plan-approval-items.js); best-effort, never blocks the build.
-  void planItems.resolved(session, 'build', { toolUseId: session.ivPendingPlanToolUseId || toolUseId || null });
+  void planItems.resolved(session, 'build', { toolUseId: toolUseId || null });
 
   // Check if a tool_result already exists in the session history for this tool_use_id.
   // Claude CLI auto-generates a tool_result for permission denials, so sending another
@@ -13563,31 +12951,14 @@ async function approvePlanBuild(session, { sendHtml, causes = null }) {
   debug(`[PLAN-DEBUG] tool_result already in history: ${alreadyAnswered}`);
 
   if (session.iv) {
-    // iv-mode: the ExitPlanMode hook is blocking on /plan-decision; resolve
-    // it with allow so the hook returns and claude proceeds naturally.
-    // No stdin.write or follow-up text needed — the hook's allow decision
-    // unblocks the original tool call and claude continues its turn.
-    const pending = session.ivPendingPlanToolUseId
-      ? pendingPlanDecisions.get(session.ivPendingPlanToolUseId)
-      : null;
+    // iv-mode: Claude's own in-TUI plan confirmation was answered through
+    // the prompt detector, so the approval goes in as text.
     session.pendingPlan = null;
     session.pendingPlanDenialId = null;
-    session.ivPendingPlanToolUseId = null;
     if (session.claudeSessionId) {
       persistSession(session.roomId, session.claudeSessionId, session.workdir, session.originRoomId, { pendingPlanDenialId: null });
     }
-    if (pending) {
-      debug(`[PLAN-DEBUG] iv-mode: resolving pending plan decision with allow`);
-      // The hook unblocks the turn the plan was written in: the approval
-      // joins that turn, never replacing what started it. Only a turn still
-      // on the session: a decision left over from an interrupted turn must
-      // not leave a turn behind that nothing will end (joinHeldTurn).
-      joinHeldTurn(session, causes);
-      pending.resolve({ decision: 'allow', reason: 'approved by user' });
-    } else {
-      debug(`[PLAN-DEBUG] iv-mode: no pending plan decision found; sending build prompt as text`);
       sendTextToSession(session, 'The user has approved the plan. Go ahead and execute it now. Do not re-enter plan mode — just make the changes directly.', { causes });
-    }
   } else if (!toolUseId || alreadyAnswered) {
     // No denial ID, or tool_result already exists — send as plain text to avoid duplicate
     session.pendingPlan = null;
@@ -13629,14 +13000,11 @@ async function approvePlanBuild(session, { sendHtml, causes = null }) {
       }
     }) + '\n';
     debug(`[PLAN-DEBUG] Sending tool_result + text for ExitPlanMode: ${toolUseId}`);
-    // Same delivery as submitAnswer's tool_result: a write stdin refuses
+    // A write stdin refuses
     // (no stdin, a synchronous throw, or a failed write callback) clears
     // busy and the in-flight marker, and ends the turn when this approval
     // began it, so a later send cannot inherit the approval's causes.
     writePromptAnswer(session, jsonMsg, {
-      onDelivered: () => {
-        if (session.resetTimeout) session.resetTimeout();
-      },
       onError: (error) => reportSessionSendFailure(
         session,
         `Could not send the plan approval to Claude: ${error.message}`,
@@ -13644,8 +13012,7 @@ async function approvePlanBuild(session, { sendHtml, causes = null }) {
       ),
     });
   }
-  const buildNotice = notice('success', '▶️ Building...', '▶️ <b>Building…</b>');
-  await sendHtml(buildNotice.plain, buildNotice.html);
+  await sendReply('▶️ Building...');
 }
 
 // Respawn a persisted session into its room: recreate the process with
@@ -13657,12 +13024,11 @@ async function approvePlanBuild(session, { sendHtml, causes = null }) {
 // this directly.
 //
 // skipJournalMirror applies to that notice only (the session's own
-// sendCallback/sendHtml stay mirrored as usual): the journal resume path
+// sendCallback stays mirrored as usual): the journal resume path
 // posts its own richer "Session was idle" notice first, and without the
 // skip Matron users would see both.
 function resumePersistedSession(roomId, prev, { skipJournalMirror = false } = {}) {
-  const sendReply = (reply) => sendToRoom(roomId, reply, markdownToHtml(reply));
-  const sendHtmlFn = (plainText, html) => sendToRoom(roomId, plainText, html);
+  const sendReply = (reply) => sendToRoom(roomId, reply);
   const history = Array.isArray(prev.chatHistory) ? prev.chatHistory : [];
   // A legacy record with no agent ran as the env default; the live box
   // default is for new sessions only.
@@ -13699,15 +13065,13 @@ function resumePersistedSession(roomId, prev, { skipJournalMirror = false } = {}
   if (typeof prev.llmTitleEarned === 'boolean') newSession._llmTitleEarned = prev.llmTitleEarned;
   newSession.lastRosterText = prev.lastRosterText || '';
   newSession.sendCallback = sendReply;
-  newSession.sendHtml = sendHtmlFn;
-  newSession.sendButtonMessage = (prompt, buttons, mode, plainText, html, payload) =>
-    sendButtonMessage(roomId, prompt, buttons, mode, plainText, html, payload);
+  newSession.sendButtonMessage = (prompt, buttons, mode, payload) =>
+    sendButtonMessage(roomId, prompt, buttons, mode, payload);
   hydrateAgentState(newSession, prev);
 
   const shortId = resumeSessionId ? resumeSessionId.slice(0, 8) : 'new';
   const verb = resumeSessionId ? 'Auto-resuming' : 'Restoring';
-  const arNotice = notice('info', `${verb} ${agentLabel(newSession.agent)} session ${shortId}…`, `${verb} ${escapeHtml(agentLabel(newSession.agent))} session <code>${shortId}</code>…`);
-  Promise.resolve(sendToRoom(roomId, arNotice.plain, arNotice.html, { skipJournalMirror })).catch(() => {});
+  Promise.resolve(sendToRoom(roomId, `${verb} ${agentLabel(newSession.agent)} session ${shortId}…`, { skipJournalMirror })).catch(() => {});
   // Hold the triggering (and any further) message until the resumed TUI is
   // ready — claude --resume + auto-compaction can take seconds, far longer
   // than the paste→Enter window, so an immediate type-in is silently dropped.
@@ -13768,11 +13132,10 @@ const secretRequests = createSecretRequests({
   items: itemsClient,
   generateLink: (secretId, { label, context, convoId, roomId, multiline, ttlMs }) =>
     generateSecretLink(secretId, label, roomId, { ttlMs, multiline, context, convoId }),
-  notifyChat: (record, { plain, html }) => {
+  notifyChat: (record, { plain }) => {
     const session = record.roomId ? sessions.get(record.roomId) : null;
     if (!session) return;
-    if (html && session.sendHtml) session.sendHtml(plain, html);
-    else if (session.sendCallback) session.sendCallback(plain);
+    if (session.sendCallback) session.sendCallback(plain);
   },
   // LIVE sessions only. A killed-but-still-mapped session would take the
   // inject branch, fail it (sendToSession refuses on !alive) and dead-end in
@@ -13818,13 +13181,6 @@ const pendingSensitiveData = new Map(); // Map<sensitiveId, { label, content, vi
 const permissionRegistry = createPermissionRegistry({
   ttlMs: resolvePermissionTimeoutMs(process.env.PERMISSION_PROMPT_TIMEOUT_MS),
 });
-
-// Map<tool_use_id, { resolve(decision), plan }> — open ExitPlanMode hook
-// requests waiting for a user decision in interactive mode. The hook script
-// (hooks/exit-plan-decision.sh) holds an HTTP request open against
-// /plan-decision; the bridge resolves it once the user replies.
-// Phase 4 wires the session-side handler that actually surfaces the plan.
-const pendingPlanDecisions = new Map();
 
 // --- Local HTTP API ---
 
@@ -13982,7 +13338,6 @@ const agentChatHandlers = createAgentChatHandlers({
     from_device_id: journalPublisher.identity()?.deviceId ?? -1,
   }),
   routeLocalRoomMessage,
-  notifyRoomPeer: (roomId, sessionKey, text) => journalNotifyRoomEvent(roomId, text, { sessionKey }),
   // Mute seams (2026-08-19). agent_chat_mute is loud on purpose: a member
   // going quiet looks like a bug from the other side, so the other LOCAL
   // member's own chat is told in plain text…
@@ -14347,9 +13702,7 @@ const selfRestartHandler = createSelfRestartHandler({
     dispatchDeferredCommand(session);
   },
   notify: (session, text) => {
-    const n = notice('info', text);
-    if (session.sendHtml) session.sendHtml(n.plain, n.html);
-    else if (session.sendCallback) session.sendCallback(text);
+    if (session.sendCallback) session.sendCallback(text);
   },
 });
 
@@ -14637,8 +13990,9 @@ const apiServer = createServer(async (req, res) => {
       return;
     }
     let raw = '';
-    req.on('data', chunk => { if (raw.length < 4096) raw += chunk; });
-    req.on('end', async () => {
+    const decodeRaw = utf8ChunkDecoder();
+    req.on('data', chunk => { if (raw.length < 4096) raw += decodeRaw(chunk); });
+    req.on('end', guardApiListener(res, async () => {
       let data = null;
       try { data = raw.trim() ? JSON.parse(raw) : null; } catch { /* no reason given */ }
       // The sha pin, request key and durable record ride on top of upstream's
@@ -14648,7 +14002,7 @@ const apiServer = createServer(async (req, res) => {
       res.end(JSON.stringify(r.body));
       // Do not wait for the next poll when nothing holds the restart.
       if (req.method === 'POST' && r.status === 202) codeUpdateWatcher?.tick().catch(() => {});
-    });
+    }));
     return;
   }
 
@@ -14680,6 +14034,7 @@ const apiServer = createServer(async (req, res) => {
 
   let body = '';
   let bodyBytes = 0;
+  const decodeBody = utf8ChunkDecoder();
   let showFileBodyTooLarge = false;
   req.on('data', chunk => {
     if (showFileBodyTooLarge) return;
@@ -14699,9 +14054,9 @@ const apiServer = createServer(async (req, res) => {
       req.pause();
       return;
     }
-    body += chunk;
+    body += decodeBody(chunk);
   });
-  req.on('end', async () => {
+  req.on('end', guardApiListener(res, async () => {
     if (showFileBodyTooLarge) return;
 
     if (url.pathname === '/show-file') {
@@ -14734,9 +14089,16 @@ const apiServer = createServer(async (req, res) => {
       return;
     }
 
+    // Only a body that does not parse is "Invalid JSON"; a route that throws
+    // answers with its own error below.
+    let data;
+    try { data = JSON.parse(body); }
+    catch {
+      res.writeHead(400);
+      res.end(JSON.stringify({ error: 'Invalid JSON' }));
+      return;
+    }
     try {
-      const data = JSON.parse(body);
-
       if (refuseApiCall(apiNamedRoom(url, data))) return;
 
       // Foreign turns (lib/foreign-turn.js): the hook's question, answered
@@ -14927,7 +14289,7 @@ const apiServer = createServer(async (req, res) => {
         const card = renderPermissionCard({ toolName, input });
         const { buttons: permBtns, mode: permMode } = permissionButtons(permRequestId, toolName);
         try {
-          await sendButtonMessage(roomId, card.plain, permBtns, permMode, card.plain, card.html);
+          await sendButtonMessage(roomId, card.plain, permBtns, permMode);
         } catch (err) {
           // Card never reached the user — withdraw the request and answer
           // non-OK so the tool denies immediately instead of polling for five
@@ -15004,12 +14366,6 @@ const apiServer = createServer(async (req, res) => {
       if (url.pathname === '/agent-chat-invite') {
         await respondAgentChatRoute(res, data, agentChatHandlers.chatInvite,
           (status, b) => debug(`agent-chat-invite ${status} ${data?.room_id} ${b.status || b.error || ''}`));
-        return;
-      }
-
-      if (url.pathname === '/agent-chat-leave') {
-        await respondAgentChatRoute(res, data, agentChatHandlers.chatLeave,
-          (status, b) => debug(`agent-chat-leave ${status} ${data?.room_id} ${b.error || 'ok'}`));
         return;
       }
 
@@ -15282,13 +14638,8 @@ const apiServer = createServer(async (req, res) => {
         const activeSession = target.session;
 
         const verb = download === true ? 'Download' : 'View';
-        const linkKind = oneTime !== false ? 'one-time link' : 'link';
-        if (activeSession && activeSession.sendHtml) {
-          const plain = `🔐 Secure data: ${label} — ${verb}: ${link}`;
-          const html = `🔐 Secure data: <b>${escapeHtml(label)}</b> — <a href="${link}">${verb}</a> (${linkKind}, expires at ${new Date(expiresAt).toISOString()})`;
-          activeSession.sendHtml(plain, html);
-        } else if (activeSession && activeSession.sendCallback) {
-          activeSession.sendCallback(`🔐 Secure data: ${label} — ${link} (${linkKind}, expires at ${new Date(expiresAt).toISOString()})`);
+        if (activeSession && activeSession.sendCallback) {
+          activeSession.sendCallback(`🔐 Secure data: ${label} — ${verb}: ${link}`);
         }
 
         // Schedule cleanup after expiry
@@ -15305,15 +14656,6 @@ const apiServer = createServer(async (req, res) => {
           // should surface this so a wrong-but-live room is caught at once.
           notified: target.description,
         }));
-        return;
-      }
-
-      if (url.pathname === '/redact-message') {
-        // The journal has no message redaction, so this endpoint reports
-        // unsupported instead of acting. The ask-user redact_message MCP
-        // tool (ask-user.js) surfaces this text back to Claude.
-        res.writeHead(501, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify({ error: 'Message redaction is not supported: the bridge is journal-only and has no message-redaction capability.' }));
         return;
       }
 
@@ -15365,9 +14707,7 @@ const apiServer = createServer(async (req, res) => {
             deferredBy: batchDeferralReason(queued),
             summary: formatQueueSummary(queued),
           });
-          if (session.sendHtml) {
-            session.sendHtml(notice.plain, notice.html);
-          } else if (session.sendCallback) {
+          if (session.sendCallback) {
             session.sendCallback(notice.plain);
           }
           sent = flushQueue(session, queued, releaseSnapshot);
@@ -15452,7 +14792,7 @@ const apiServer = createServer(async (req, res) => {
           res.end(JSON.stringify({ error: 'roomId and text required' }));
           return;
         }
-        sendToRoom(roomId, text, markdownToHtml(text)).then(() => {
+        sendToRoom(roomId, text).then(() => {
           res.writeHead(200);
           res.end(JSON.stringify({ ok: true }));
         }).catch(err => {
@@ -15475,10 +14815,7 @@ const apiServer = createServer(async (req, res) => {
           const COMPACT_COOLDOWN_MS = 60_000;
           if (!target.lastCompactStartNotify || (now - target.lastCompactStartNotify) > COMPACT_COOLDOWN_MS) {
             target.lastCompactStartNotify = now;
-            if (target.sendHtml) {
-              const n = notice('info', '🗜️ Compacting context — summarizing conversation history…');
-              target.sendHtml(n.plain, n.html);
-            } else if (target.sendCallback) {
+            if (target.sendCallback) {
               target.sendCallback('🗜️ Compacting context — summarizing conversation history…');
             }
           } else {
@@ -15515,65 +14852,6 @@ const apiServer = createServer(async (req, res) => {
         res.writeHead(200);
         res.end(JSON.stringify({ ok: true }));
 
-      } else if (url.pathname === '/plan-decision') {
-        // PreToolUse hook (hooks/exit-plan-decision.sh) — fires when claude
-        // calls ExitPlanMode. Blocks until the user decides.
-        const { session_id, tool_use_id, plan } = data;
-        if (!tool_use_id) {
-          res.writeHead(400);
-          res.end(JSON.stringify({ decision: 'deny', reason: 'tool_use_id required' }));
-          return;
-        }
-        let target = null;
-        if (session_id) {
-          for (const [, s] of sessions) {
-            if (s.claudeSessionId === session_id && s.alive) { target = s; break; }
-          }
-        }
-        if (!target) {
-          res.writeHead(404);
-          res.end(JSON.stringify({ decision: 'deny', reason: 'unknown session' }));
-          return;
-        }
-        if (typeof target.requestPlanDecision !== 'function') {
-          // Session has no plan-decision handler — this is the print-mode path
-          // (Phase 4 adds the iv-mode handler). Deny so we never silently
-          // execute an unreviewed plan.
-          res.writeHead(503);
-          res.end(JSON.stringify({ decision: 'deny', reason: 'no plan-decision handler for session' }));
-          return;
-        }
-        // Hold the response. Timer caps the wait under curl's 1800s ceiling
-        // in exit-plan-decision.sh so we always reply before curl times out.
-        const PLAN_DECISION_TIMEOUT_MS = 1740 * 1000;
-        const timer = setTimeout(() => {
-          if (!pendingPlanDecisions.has(tool_use_id)) return;
-          pendingPlanDecisions.delete(tool_use_id);
-          res.writeHead(200, { 'Content-Type': 'application/json' });
-          res.end(JSON.stringify({ decision: 'deny', reason: 'timeout waiting for user' }));
-          // The plan is dead: its tracker mirror closes as cancelled
-          // (lib/plan-approval-items.js). The session may have been
-          // replaced meanwhile; whichever holds the room now owns the item.
-          const holder = sessions.get(target.roomId);
-          if (holder) void planItems.resolved(holder, 'timeout', { toolUseId: tool_use_id });
-        }, PLAN_DECISION_TIMEOUT_MS);
-        pendingPlanDecisions.set(tool_use_id, {
-          resolve: ({ decision, reason }) => {
-            clearTimeout(timer);
-            pendingPlanDecisions.delete(tool_use_id);
-            res.writeHead(200, { 'Content-Type': 'application/json' });
-            res.end(JSON.stringify({ decision: decision || 'deny', reason: reason || '' }));
-          },
-          plan,
-        });
-        try {
-          target.requestPlanDecision(tool_use_id, plan);
-        } catch (e) {
-          // If the handler throws, resolve with deny so the hook unblocks.
-          const pending = pendingPlanDecisions.get(tool_use_id);
-          if (pending) pending.resolve({ decision: 'deny', reason: `session handler threw: ${e?.message || e}` });
-        }
-
       } else if (url.pathname === '/sessions') {
         const list = [];
         for (const [roomId, session] of sessions) {
@@ -15593,11 +14871,10 @@ const apiServer = createServer(async (req, res) => {
         res.writeHead(404);
         res.end('Not found');
       }
-    } catch (_e) {
-      res.writeHead(400);
-      res.end(JSON.stringify({ error: 'Invalid JSON' }));
+    } catch (e) {
+      respondApiError(res, e);
     }
-  });
+  }));
 });
 
 apiServer.listen(API_PORT, '127.0.0.1', () => {
@@ -15705,7 +14982,6 @@ async function switchAgentSession(roomId, targetAgent, { sendReply }) {
   next.originRoomId = existing.originRoomId;
   next.firstMessageCaptured = true;
   next.sendCallback = existing.sendCallback;
-  next.sendHtml = existing.sendHtml;
   next.sendButtonMessage = existing.sendButtonMessage;
   next.showWorking = existing.showWorking;
   next.showBashOutput = existing.showBashOutput;
@@ -15855,10 +15131,9 @@ function scheduleEffortFlowReturn(session, delayMs, attempt = 0) {
       return;
     }
     const sendReply = current.sendCallback || (() => {});
-    const sendHtml = current.sendHtml || ((plain) => sendReply(plain));
     const applied = trackedEffort(current) === level;
     const switched = applyModeSwitch(roomId, current, false, {
-      sendReply, sendHtml,
+      sendReply,
       announcement: applied
         ? `✅ Effort set to ${effortLabel(level)} — back to normal mode.`
         : `Effort change to ${effortLabel(level)} didn't go through — back to normal mode, effort unchanged.`,
@@ -15956,7 +15231,7 @@ function scheduleEffortSettle(session) {
 // assignment may change it again.
 // offer:true (a person's !model or picker tap) follows an applied switch
 // with the "use it for new chats too?" card (offerDefault).
-function applyModelSwitch(roomId, session, arg, { sendReply, sendHtml, explicit = true, offer = false }) {
+function applyModelSwitch(roomId, session, arg, { sendReply, explicit = true, offer = false }) {
   if (session.agent === AGENT_CODEX) {
     if (session.busy) {
       sendReply('Finish or interrupt the current Codex turn before switching models.');
@@ -16048,7 +15323,7 @@ function applyModelSwitch(roomId, session, arg, { sendReply, sendHtml, explicit 
   bringAutoResumeForward(session);
   persistSession(roomId, session.claudeSessionId, session.workdir, session.originRoomId,
     { model: decision.normalized, ...(explicit ? explicitModelFlag(decision.normalized) : { modelExplicit: false }) });
-  const next = recreateSession(roomId, { model: decision.normalized }, { sendReply, sendHtml });
+  const next = recreateSession(roomId, { model: decision.normalized }, { sendReply });
   if (next) next.currentModel = decision.normalized;
   if (next && offer) offerDefault(roomId, 'model', decision.normalized);
   return true;
@@ -16061,7 +15336,7 @@ function applyModelSwitch(roomId, session, arg, { sendReply, sendHtml, explicit 
 // (scheduleEffortFlowReturn). Mid-turn it parks `!effort <level>` on the
 // deferred-command stash instead, replayed at turn end before the queue
 // flushes.
-function applyPrintEffortSwitch(roomId, session, arg, { sendReply, sendHtml }) {
+function applyPrintEffortSwitch(roomId, session, arg, { sendReply }) {
   const decision = planPrintEffortSwitch(session, arg);
   if (decision.defer) {
     const previousParked = session._deferredCommandText;
@@ -16077,7 +15352,7 @@ function applyPrintEffortSwitch(roomId, session, arg, { sendReply, sendHtml }) {
     sendReply(decision.message);
     return false;
   }
-  const next = applyModeSwitch(roomId, session, true, { sendReply, sendHtml, announcement: decision.message });
+  const next = applyModeSwitch(roomId, session, true, { sendReply, announcement: decision.message });
   if (!next) return false;
   next._postReadySlashCommand = `/effort ${decision.normalized}`;
   next._effortFlowReturnToPrint = decision.normalized;
@@ -16088,7 +15363,7 @@ function applyPrintEffortSwitch(roomId, session, arg, { sendReply, sendHtml }) {
 // planModeSwitch, then persist the choice and restart the session in the new
 // mode (same session id, history preserved). Used by the !mode command and the
 // mode: toggle button.
-function applyModeSwitch(roomId, session, wantInteractive, { sendReply, sendHtml, announcement, refusalAnnouncement }) {
+function applyModeSwitch(roomId, session, wantInteractive, { sendReply, announcement, refusalAnnouncement }) {
   if (session.agent === AGENT_CODEX) {
     sendReply('Interactive Codex mode is not part of this first integration.');
     return;
@@ -16118,7 +15393,7 @@ function applyModeSwitch(roomId, session, wantInteractive, { sendReply, sendHtml
   persistSession(roomId, session.claudeSessionId, session.workdir, session.originRoomId, { interactiveMode: wantInteractive });
   // Return the replacement session so callers can park follow-up work on it
   // (the /login-from-print flow tags _postReadySlashCommand).
-  const next = recreateSession(roomId, { interactive: wantInteractive }, { sendReply, sendHtml });
+  const next = recreateSession(roomId, { interactive: wantInteractive }, { sendReply });
   // The interactive spawn failed and createSession fell back to print (it has
   // already told the room why). Nothing may be parked on a print session: a
   // parked slash would never be typed, and an /effort return-to-print mark
@@ -16133,7 +15408,7 @@ function applyModeSwitch(roomId, session, wantInteractive, { sendReply, sendHtml
 // new createSession options. Carries user-visible state (queue, per-room
 // toggles, chat history) across the swap. Returns the new session, or null if
 // the room has no live session. Shared by /restart, /model (print) and /mode.
-function recreateSession(roomId, overrides, { sendReply, sendHtml }) {
+function recreateSession(roomId, overrides, { sendReply }) {
   const existing = sessions.get(roomId);
   if (!existing) return null;
   // Recheck at teardown, including attachments arriving during a reply await.
@@ -16208,9 +15483,8 @@ function recreateSession(roomId, overrides, { sendReply, sendHtml }) {
     ...overrides,
   });
   next.sendCallback = sendReply;
-  next.sendHtml = sendHtml;
-  next.sendButtonMessage = (prompt, buttons, mode, plainText, html, payload) =>
-    sendButtonMessage(roomId, prompt, buttons, mode, plainText, html, payload);
+  next.sendButtonMessage = (prompt, buttons, mode, payload) =>
+    sendButtonMessage(roomId, prompt, buttons, mode, payload);
   next.originRoomId = originRoomId;
   next.firstMessageCaptured = existing.firstMessageCaptured;
   next.queuedMessages = existing.queuedMessages;
@@ -16447,13 +15721,15 @@ function readProcessTable() {
 // servers — a tool call, a background task — or a running subagent),
 // null when the idle clock
 // should rule. See lib/work-hold.js.
-function sessionWorkHold(session, last, now, table) {
+function sessionWorkHold(session, last, now, table, { awaitingAnswer = false, queuedInput = false } = {}) {
   return workHold({
     busy: !!session.busy,
     children: liveWorkChildren(sessionChildPid(session), table, MCP_SERVER_SIGNATURES),
     idleSince: last,
     now,
     subagentCount: session.subagentConvos?.runningCount() ?? 0,
+    awaitingAnswer,
+    queuedInput,
   });
 }
 
@@ -16658,13 +15934,27 @@ function rearmPreReapHandoff(session) {
   if (session && session._preReapHandoff) session._preReapHandoff = null;
 }
 
+// A session the reaper would consider reaping at `now`: live, not already
+// stopped, and idle past the timeout. The walk in startIdleReaper applies
+// the same three checks in the same order.
+function pastIdleTimeout(session, now) {
+  return session.alive && !session._autoStopped
+    && now - handoffIdleSince(session) >= SESSION_IDLE_TIMEOUT_MS;
+}
+
 function startIdleReaper() {
-  setInterval(() => {
+  setInterval(async () => {
     const now = Date.now();
     // Read the process table at most once per tick, and only if some session
     // has actually passed the idle timeout — most ticks never get that far.
+    // Read it before the walk, without blocking the event loop (ps can take
+    // seconds); the walk below then runs synchronously, so no session changes
+    // between its checks and its decision. Two ticks never interleave a walk,
+    // so a slow ps overlapping the next tick is harmless. readProcessTableAsync
+    // never rejects.
     let table = null;
-    const processTable = () => (table ??= readProcessTable());
+    if ([...sessions.values()].some((s) => pastIdleTimeout(s, now))) table = await readProcessTableAsync();
+    const processTable = () => table;
     let held = 0;
     for (const [roomId, session] of sessions) {
       if (!session.alive) continue;
@@ -16688,6 +15978,10 @@ function startIdleReaper() {
       // or a background job the agent started — a colleague's hour-plus rake
       // test was cut off here at the 60-minute mark.
       // Bounded at WORK_HOLD_MAX_MS from the last activity inside workHold.
+      // No table: the session was not past the timeout when the tick began
+      // (nothing makes a session idler while ps runs, so this is a guard
+      // only). The next tick decides it.
+      if (!table) continue;
       const hold = sessionWorkHold(session, last, now, processTable());
       if (hold) {
         held += 1;
@@ -17021,6 +16315,9 @@ async function gracefulShutdown(signal, { exitCode = 0 } = {}) {
   }
 }
 
+// A rejected promise nobody handled would otherwise end the process, and
+// every session with it.
+installUnhandledRejectionLogger(process);
 process.on('SIGINT', () => { void gracefulShutdown('SIGINT'); });
 process.on('SIGTERM', () => { void gracefulShutdown('SIGTERM'); });
 // Windows: Ctrl+Break in a console run. SIGTERM can be listened for but is

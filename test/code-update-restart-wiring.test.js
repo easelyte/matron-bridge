@@ -94,9 +94,9 @@ describe('code-update self-restart wiring', () => {
     const holdFn = index.slice(holdStart, index.indexOf('\n}\n', holdStart) + 3);
     expect(holdFn).toMatch(/filter\(s => s\.alive\)/);
     expect(holdFn).toContain('const last = handoffIdleSince(s);');
-    expect(holdFn).toContain('sessionWorkHold(s, last, now, table)');
+    expect(holdFn).toContain('sessionWorkHold(s, last, now, table, { awaitingAnswer, queuedInput })');
     expect(holdFn).toContain("const hold = s.busy\n      ? { reason: 'turn in progress' }");
-    expect(holdFn).toContain('workHold({ subagentCount: s.subagentConvos?.runningCount() ?? 0, idleSince: last, now })');
+    expect(holdFn).toContain('workHold({ subagentCount: s.subagentConvos?.runningCount() ?? 0, idleSince: last, now, awaitingAnswer, queuedInput })');
     // One process-table read per poll, shared by all live sessions.
     expect(holdFn.match(/readProcessTable\(\)/g)).toHaveLength(1);
     expect(index).not.toMatch(/restartHold/);

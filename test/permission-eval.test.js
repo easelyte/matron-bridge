@@ -13,6 +13,7 @@ import {
   buildPermissionSnapshot,
   classifyPermission,
   PERMISSION_SOURCE_MAX_BYTES,
+  sessionPermissionSnapshot,
 } from '../lib/permission-eval.js';
 
 const WEBFLOW_SETTINGS_FIXTURE = path.resolve('test/fixtures/webflow-settings.local.json');
@@ -358,15 +359,36 @@ describe('permission snapshot', () => {
   });
 });
 
-describe('print-session snapshot wiring (source inspection)', () => {
-  const indexSource = readFileSync(path.resolve('index.js'), 'utf8');
-  const printSpawn = indexSource.slice(
-    indexSource.indexOf('function createSession('),
-    indexSource.indexOf('// --- Codex programmatic sessions ---'),
-  );
+describe('sessionPermissionSnapshot', () => {
+  function repoWithRules() {
+    const repo = path.join(fixtureDir, 'repo');
+    const homeDir = path.join(fixtureDir, 'home');
+    mkdirSync(path.join(repo, '.claude'), { recursive: true });
+    mkdirSync(homeDir, { recursive: true });
+    gitInit(repo);
+    writeFileSync(path.join(repo, '.claude', 'settings.local.json'), JSON.stringify({
+      permissions: { allow: ['mcp__root__local_tool'], deny: ['mcp__root__denied_tool'] },
+    }));
+    vi.stubEnv('HOME', homeDir);
+    return repo;
+  }
 
-  it('builds one immutable snapshot per print session (read by both the card hook and the classifier)', () => {
-    expect(printSpawn).toContain('permissionSnapshot: buildPermissionSnapshot({ workdir: cwd })');
-    expect((printSpawn.match(/permissionSnapshot[,:]/g) || [])).toHaveLength(1);
+  it('a gated session gets the same snapshot buildPermissionSnapshot builds', () => {
+    const workdir = repoWithRules();
+    const snapshot = sessionPermissionSnapshot({ bypass: false, workdir });
+    expect(snapshot).toEqual(buildPermissionSnapshot({ workdir }));
+    expect(Object.isFrozen(snapshot)).toBe(true);
+    expect(classifyPermission(snapshot, 'mcp__root__denied_tool')).toBe('deny');
+  });
+
+  it('a bypass session gets null without reading settings, and null classifies as default-gated', () => {
+    const workdir = repoWithRules();
+    // Unreadable settings would warn if they were read.
+    writeFileSync(path.join(workdir, '.claude', 'settings.json'), '{not json');
+    const warn = vi.spyOn(console, 'warn').mockImplementation(() => {});
+    const snapshot = sessionPermissionSnapshot({ bypass: true, workdir });
+    expect(snapshot).toBeNull();
+    expect(warn).not.toHaveBeenCalled();
+    expect(classifyPermission(snapshot, 'mcp__root__local_tool')).toBe('default-gated');
   });
 });

@@ -369,6 +369,8 @@ describe('buildSessionStatus', () => {
     });
   });
 
+  // The builder holds no state, so this null rides on every frame while the
+  // effort is unknown, not just the first: a client that missed one converges.
   it('publishes an EXPLICIT null while effort is unknown — clients merge stickily, so absent means "unchanged"', () => {
     const status = buildSessionStatus({ model: 'claude-fable-5', effort: null });
     expect('effort' in status).toBe(true);
@@ -382,14 +384,6 @@ describe('buildSessionStatus', () => {
     expect('effort' in buildSessionStatus({ model: 'gpt-5.6-codex', effort: undefined })).toBe(false);
   });
 
-  it('re-publishes null on EVERY frame while unknown, so a client that missed one clear still converges', () => {
-    // Not a one-shot clear: three consecutive frames of an untracked session
-    // all carry the null, so a dropped/throttled frame cannot strand a client
-    // on a stale level.
-    for (let i = 0; i < 3; i++) {
-      expect(buildSessionStatus({ model: 'claude-fable-5', effort: null }).effort).toBeNull();
-    }
-  });
 });
 
 describe('emailFromClaudeConfig', () => {
@@ -516,12 +510,22 @@ describe('host vitals', () => {
 
   it('startCpuSampler is idempotent and .unref()s its interval', () => {
     stopCpuSampler();
-    startCpuSampler(60000);
-    startCpuSampler(60000); // second call is a no-op (no duplicate interval)
-    // The interval is unref'd, so it does not keep the test process alive; the
-    // suite exiting cleanly is the observable proof. Just confirm teardown.
-    stopCpuSampler();
-    expect(cpuPercent()).toBeNull();
+    const setSpy = vi.spyOn(globalThis, 'setInterval');
+    const clearSpy = vi.spyOn(globalThis, 'clearInterval');
+    try {
+      startCpuSampler(60000);
+      startCpuSampler(60000); // second call is a no-op (no duplicate interval)
+      expect(setSpy).toHaveBeenCalledTimes(1);
+      const handle = setSpy.mock.results[0].value;
+      expect(handle.hasRef()).toBe(false);
+      stopCpuSampler();
+      expect(clearSpy).toHaveBeenCalledWith(handle);
+      expect(cpuPercent()).toBeNull();
+    } finally {
+      stopCpuSampler();
+      setSpy.mockRestore();
+      clearSpy.mockRestore();
+    }
   });
 });
 
@@ -563,7 +567,6 @@ describe('index.js wiring', () => {
     expect(body).toContain('hostVitals()');
     expect(body).toMatch(/vitals[,\n]/);
     // Each provider supplies its own account limits, never host vitals.
-    expect(body).not.toContain('hostVitalLimits');
     expect(body).toContain('limits: isCodex ? (session._codexMetadata?.limits || []) : (usageLimitsCache.lines || [])');
   });
 

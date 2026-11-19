@@ -2,10 +2,7 @@
   "mcpServers": {
     "ask-user": {
       "command": "node",
-      "args": ["./ask-user.js"],
-      "env": {
-        "BRIDGE_API_URL": "http://127.0.0.1:9802"
-      }
+      "args": ["./ask-user.js"]
     }
   },
   "mcpExtras": {

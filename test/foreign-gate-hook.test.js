@@ -110,7 +110,7 @@ describe('settings', () => {
       const s = buildPrintSessionSettings({ bypass, hooksDir: '/h', apiPort: 9802, roomId: 'r1', foreignFlag: '/tmp/f', platform: 'linux' });
       expect(s.disableAllHooks).toBe(false);
       expect(s.hooks.PreToolUse[0].matcher).toBe('.*');
-      expect(s.hooks.PreToolUse[0].hooks[0].command).toBe("/h/foreign-gate.sh '--port' '9802' '--room' 'r1' '--flag' '/tmp/f'");
+      expect(s.hooks.PreToolUse[0].hooks[0].command).toBe("'/h/foreign-gate.sh' '--port' '9802' '--room' 'r1' '--flag' '/tmp/f'");
     }
   });
   it('the Windows entry runs the Node port in exec form', () => {

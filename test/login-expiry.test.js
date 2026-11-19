@@ -205,7 +205,7 @@ describe('login-expiry wiring (source inspection)', () => {
   it('wires the tap to the same handler a typed /login runs', () => {
     expect(index).toContain('startLogin: startLoginFromButton,');
     const fn = slice('function startLoginFromButton(session, sendReply) {', '\n}');
-    expect(fn).toContain("handleCommand(session.roomId, '!login', sendReply, ctx.sendHtml, ctx.sender)");
+    expect(fn).toContain("handleCommand(session.roomId, '!login', sendReply)");
   });
 });
 

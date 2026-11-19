@@ -396,6 +396,22 @@ describe('createTimerStore', () => {
     expect(h.store.add({ convoId: 'c1', text: 'new', delayMs: 60_000 }).id).toBe(7);
   });
 
+  it('a new id is above every kept timer, whatever nextId the file gives', () => {
+    const kept = [
+      { id: 4, convoId: 'c1', fireAt: 1_500_000, text: 'four' },
+      { id: 9, convoId: 'c2', fireAt: 1_600_000, text: 'nine' },
+    ];
+    for (const nextId of [undefined, 'x', 1, 9, 0, -3]) {
+      const h = makeStore({ persisted: { nextId, timers: kept.map((t) => ({ ...t })) } });
+      h.store.init();
+      expect(h.store.add({ convoId: 'c1', text: 'new', delayMs: 60_000 }).id, String(nextId)).toBe(10);
+      expect(h.store.add({ convoId: 'c1', text: 'newer', delayMs: 60_000 }).id, String(nextId)).toBe(11);
+    }
+    // A counter already past the kept timers is left alone.
+    const h = makeStore({ persisted: { nextId: 20, timers: kept.map((t) => ({ ...t })) } });
+    expect(h.store.add({ convoId: 'c1', text: 'new', delayMs: 60_000 }).id).toBe(20);
+  });
+
   it('tolerates a corrupt/empty persisted file and malformed records', () => {
     const bad = { nextId: 'x', timers: [null, { id: 1 }, { id: 2, convoId: 'c1', fireAt: 1_500_000, text: 'ok' }] };
     const h = makeStore({ persisted: bad });

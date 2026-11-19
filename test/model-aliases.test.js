@@ -7,6 +7,7 @@ import {
   aliasLabel,
   modelFromEvent,
   modelOptions,
+  crashRestartModel,
 } from '../lib/model-aliases.js';
 
 describe('SWITCHABLE_ALIASES', () => {
@@ -95,5 +96,16 @@ describe('modelFromEvent', () => {
     // header's model label and the context percentage.
     expect(modelFromEvent({ parent_tool_use_id: 'tu_1', message: { model: 'claude-haiku-4-5' } })).toBe(null);
     expect(modelFromEvent({ isSidechain: true, message: { model: 'claude-haiku-4-5' } })).toBe(null);
+  });
+});
+
+describe('crashRestartModel', () => {
+  it('restarts on the alias the session was started with, not the transcript\'s plain id', () => {
+    expect(crashRestartModel({ _modelAlias: 'opus[1m]', currentModel: 'claude-opus-4-7' })).toBe('opus[1m]');
+  });
+  it('falls back to the model last seen, then to none', () => {
+    expect(crashRestartModel({ _modelAlias: null, currentModel: 'claude-opus-4-7' })).toBe('claude-opus-4-7');
+    expect(crashRestartModel({ _modelAlias: null, currentModel: null })).toBeUndefined();
+    expect(crashRestartModel(null)).toBeUndefined();
   });
 });
