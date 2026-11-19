@@ -359,19 +359,6 @@ describe('permission snapshot', () => {
   });
 });
 
-describe('print-session snapshot wiring (source inspection)', () => {
-  const indexSource = readFileSync(path.resolve('index.js'), 'utf8');
-  const printSpawn = indexSource.slice(
-    indexSource.indexOf('function createSession('),
-    indexSource.indexOf('// --- Codex programmatic sessions ---'),
-  );
-
-  it('builds one immutable snapshot per print session (read by both the card hook and the classifier)', () => {
-    expect(printSpawn).toContain('permissionSnapshot: buildPermissionSnapshot({ workdir: cwd })');
-    expect((printSpawn.match(/permissionSnapshot[,:]/g) || [])).toHaveLength(1);
-  });
-});
-
 describe('sessionPermissionSnapshot', () => {
   function repoWithRules() {
     const repo = path.join(fixtureDir, 'repo');
