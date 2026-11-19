@@ -33,10 +33,6 @@ What's contributing to your limits usage?
 Approximate, based on local sessions on this machine — does not include other devices or claude.ai.
 `;
 
-const GREEN = '#3fb950';
-const ORANGE = '#f0883e';
-const RED = '#f85149';
-
 describe('parseUsageLimits', () => {
   it('extracts the Current session / week headline lines', () => {
     const { ok, lines } = parseUsageLimits(SUBSCRIPTION_SAMPLE, new Date('2026-07-08T00:00:00Z'));
@@ -351,51 +347,12 @@ describe('formatLimits', () => {
     expect(plain).not.toContain('requests');
   });
 
-  it('color-codes percentages by threshold in HTML', () => {
-    const parsed = parseUsageLimits(SUBSCRIPTION_SAMPLE);
-    const { html } = formatLimits(parsed, SUBSCRIPTION_SAMPLE);
-    expect(html).toContain(`<font color="${GREEN}">39%</font>`);   // < 50
-    expect(html).toContain(`<font color="${ORANGE}">66%</font>`);  // < 80
-    expect(html).toContain(`<font color="${RED}">100%</font>`);    // >= 80
-  });
-
-  it('maps threshold boundaries to the right colors', () => {
-    const mk = (percent) => formatLimits(
-      { ok: true, lines: [{ label: 'Session', percent, resets: 'soon' }] },
-      '',
-    ).html;
-    expect(mk(49)).toContain(`<font color="${GREEN}">49%</font>`);
-    expect(mk(50)).toContain(`<font color="${ORANGE}">50%</font>`);
-    expect(mk(79)).toContain(`<font color="${ORANGE}">79%</font>`);
-    expect(mk(80)).toContain(`<font color="${RED}">80%</font>`);
-  });
-
   it('falls back to the raw text when parsing found nothing', () => {
     const raw = 'Login required. Run `claude` to authenticate.';
     const parsed = parseUsageLimits(raw);
-    const { plain, html } = formatLimits(parsed, raw);
-    expect(plain).toContain('Login required');
-    expect(html).toContain('Login required');
+    expect(formatLimits(parsed, raw)).toEqual({ plain: raw });
   });
 
-  it('escapes HTML-special characters in the fallback', () => {
-    const raw = 'error: <bad> & "stuff"';
-    const { html } = formatLimits(parseUsageLimits(raw), raw);
-    expect(html).toContain('&lt;bad&gt;');
-    expect(html).toContain('&amp;');
-    expect(html).toContain('&quot;stuff&quot;');
-    expect(html).not.toContain('<bad>');
-    expect(html).not.toContain('"stuff"');
-  });
-
-  it('escapes double quotes in parsed labels and reset times', () => {
-    const { html } = formatLimits(
-      { ok: true, lines: [{ label: 'week ("all" models)', percent: 10, resets: 'Jul 9, "noon"' }] },
-      '',
-    );
-    expect(html).toContain('week (&quot;all&quot; models)');
-    expect(html).toContain('Jul 9, &quot;noon&quot;');
-  });
 });
 
 // `claude -p /usage` scans the box's local session transcripts, so on a box

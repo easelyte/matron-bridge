@@ -128,7 +128,7 @@ describe('the route layer', () => {
     expect(foreignRouteAllowed(null, '/memory/get', {})).toBe(true);
   });
   it('keeps the harness routes open and the room routes to their room', () => {
-    for (const p of ['/permission-check', '/permission-request', '/compact-start', '/turn-end', '/plan-decision', '/foreign-check', '/foreign-action-request']) {
+    for (const p of ['/permission-check', '/permission-request', '/compact-start', '/turn-end', '/foreign-check', '/foreign-action-request']) {
       expect(foreignRouteAllowed(bare, p, {}), p).toBe(true);
     }
     expect(foreignRouteAllowed(bare, '/agent-chat-send', { room_id: 'room-1' })).toBe(true);
@@ -178,8 +178,9 @@ describe('turn text', () => {
     const it = actionRequestItem({ turn: bare, toolName: 'Bash', toolInput: { command: 'ls ```' }, why: 'list' });
     expect(it.actions).toEqual(['Allow once', 'Decline']);
     expect(it.kind).toBe('question');
-    expect(it.body).toContain(canonicalJson({ command: "ls '''" }));
-    expect(it.body.match(/```/g).length).toBe(2);
+    // Exact, never rewritten: the fence is longer than any backtick run.
+    const fence = '~'.repeat(3);
+    expect(it.body.endsWith(`\n${fence}json collapsed\n${canonicalJson({ command: 'ls ' + '`'.repeat(3) })}\n${fence}`)).toBe(true);
     expect(it.private).toBe(true);
   });
   it('the item shows a long input whole, never cut', () => {

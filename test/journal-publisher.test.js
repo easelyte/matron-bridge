@@ -1306,23 +1306,33 @@ describe('createJournalPublisher', () => {
   });
 
   it('fetchMedia: an over-cap blob (declared content-length beyond fetchMediaMaxBytes) is aborted and dropped, warns', async () => {
-    const big = Buffer.alloc(64, 0x41); // 64 bytes, cap set to 8 below
+    // Headers only: a declared 64 bytes against a cap of 8, and no body. Only
+    // the declared-length check can refuse this; the streamed-size check
+    // never sees a byte and would end at the deadline with a different warning.
+    const responses = new Set();
     const httpServer = await startFakeHttpServer((_entry, res) => {
-      res.writeHead(200, { 'content-type': 'application/octet-stream' });
-      res.end(big);
+      responses.add(res);
+      res.on('close', () => responses.delete(res));
+      res.writeHead(200, { 'content-type': 'application/octet-stream', 'content-length': 64 });
+      res.flushHeaders();
     });
     const wsUrl = `ws://127.0.0.1:${httpServer.port}/ws`;
     const warnings = [];
     const log = { warn: (...a) => warnings.push(a.join(' ')), error: () => {} };
-    const pub = createJournalPublisher({ url: wsUrl, token: 'tok', log, ...FAST_BACKOFF, fetchMediaMaxBytes: 8 });
+    const pub = createJournalPublisher({
+      url: wsUrl, token: 'tok', log, ...FAST_BACKOFF, fetchMediaMaxBytes: 8, fetchMediaTimeoutMs: 2000,
+    });
 
+    try {
     warnings.length = 0;
     const result = await pub.fetchMedia('big-blob');
     expect(result).toBeNull();
-    expect(warnings.some(w => /exceeds 8 cap|aborted/.test(w))).toBe(true);
-
+      expect(warnings.some(w => /fetchMedia aborted: blob 64 bytes exceeds 8 cap/.test(w))).toBe(true);
+    } finally {
     pub.close();
+      for (const res of responses) res.destroy();
     await httpServer.close();
+    }
   });
 
   it('fetchMedia: a body that never arrives is aborted at the deadline and resolves null', async () => {
@@ -1432,9 +1442,13 @@ describe('createJournalPublisher — onEvent + cursor persistence', () => {
     const pub = createJournalPublisher({ url: fake.url, token: 'tok', log: silentLog, ...FAST_BACKOFF });
 
     await waitFor(() => fake.connections.length >= 1);
-    // Must not throw even though nothing is listening for it.
-    expect(() => fake.connections[0].ws.send(JSON.stringify(journalFrame(1)))).not.toThrow();
+    fake.connections[0].ws.send(JSON.stringify(journalFrame(1)));
     await delay(50);
+    // The frame was dropped without breaking the socket: the publisher still
+    // sends on the same connection, and did not reconnect.
+    pub.streamAppend('c1', 'tu1', 0, 'after');
+    await waitFor(() => fake.received.some(f => f.op === 'stream_append'));
+    expect(fake.connections).toHaveLength(1);
 
     pub.close();
     await fake.close();
@@ -1758,6 +1772,7 @@ describe('tool-output streaming (streamAppend / stream_resync / finalizeToolOutp
 
   it('a throwing onStreamResync handler is contained — later frames still processed', async () => {
     const seen = [];
+    let resyncCalls = 0;
     const server = await startFakeServer({
       onFrame: (msg) => {
         if (msg.op === 'stream_append' && msg.offset === 999) {
@@ -1768,16 +1783,18 @@ describe('tool-output streaming (streamAppend / stream_resync / finalizeToolOutp
     });
     const pub = createJournalPublisher({
       url: server.url, token: 't', log: silentLog,
-      onStreamResync: () => { throw new Error('boom'); },
+      onStreamResync: () => { resyncCalls += 1; throw new Error('boom'); },
       onEvent: (msg) => seen.push(msg),
     });
     try {
       await waitFor(() => server.connections.length === 1);
       await delay(20);
       pub.streamAppend('c1', 'tu1', 999, 'gap');
-      await delay(50); // resync arrives, handler throws, must be swallowed
+      // The resync arrives and the handler throws; it must be swallowed.
+      await waitFor(() => resyncCalls === 1);
       server.connections[0].ws.send(JSON.stringify({ kind: 'journal', seq: 1, type: 'text', payload: {} }));
       await waitFor(() => seen.length === 1);
+      expect(server.connections).toHaveLength(1);
     } finally {
       pub.close();
       await server.close();
@@ -2092,11 +2109,19 @@ describe('createJournalPublisher — agent-chat room ops', () => {
 
   it('the absence of onSpawnFrame does not throw on an inbound spawn frame', async () => {
     const fake = await startFakeServer();
-    const pub = createJournalPublisher({ url: fake.url, token: 'tok', log: silentLog, ...FAST_BACKOFF });
+    const warnings = [];
+    const pub = createJournalPublisher({
+      url: fake.url, token: 'tok', log: { warn: (m) => warnings.push(m), error: () => {} }, ...FAST_BACKOFF,
+    });
     await waitFor(() => fake.connections.length === 1);
     await delay(50);
-    expect(() => fake.connections[0].ws.send(JSON.stringify({ kind: 'spawn', event: 'pending', request_id: 'r' }))).not.toThrow();
+    fake.connections[0].ws.send(JSON.stringify({ kind: 'spawn', event: 'pending', request_id: 'r' }));
     await delay(50);
+    // Ignored quietly, and the socket keeps working on the same connection.
+    pub.streamAppend('c1', 'tu1', 0, 'after');
+    await waitFor(() => fake.received.some(f => f.op === 'stream_append'));
+    expect(fake.connections).toHaveLength(1);
+    expect(warnings).toEqual([]);
     pub.close();
     await fake.close();
   });

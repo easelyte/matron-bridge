@@ -24,7 +24,8 @@ TEE_BIN="$HOOK_DIR/matron-tee"
 LOG_PATH="/tmp/matron-cmd-${TUID}.log"
 
 QUOTED_CMD=$(echo "$INPUT" | jq -r '.tool_input.command | @sh')
-NEW_CMD="$TEE_BIN $LOG_PATH -- bash -c $QUOTED_CMD"
+QUOTED_TEE=$(jq -rn --arg p "$TEE_BIN" '$p | @sh')
+NEW_CMD="$QUOTED_TEE $LOG_PATH -- bash -c $QUOTED_CMD"
 
 jq -n --arg c "$NEW_CMD" '{
   hookSpecificOutput: {

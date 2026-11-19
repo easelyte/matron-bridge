@@ -62,7 +62,6 @@ function makeFixture(overrides = {}) {
     : vi.fn((frame) => calls.push({ call: 'deliverLocalInvite', frame }));
   const localAnswer = vi.fn((roomId, args) => calls.push({ call: 'localAnswer', roomId, args }));
   const routeLocalRoomMessage = vi.fn((roomId, fromKey, body) => calls.push({ call: 'routeLocalRoomMessage', roomId, fromKey, body }));
-  const notifyRoomPeer = vi.fn((roomId, sessionKey, text) => calls.push({ call: 'notifyRoomPeer', roomId, sessionKey, text }));
   // Mute seams (2026-08-19): the loud announcement into the other member's
   // own chat, and the 🔊 Unmute card / its retirement.
   const publishSessionNotice = vi.fn((sessionKey, text) => calls.push({ call: 'publishSessionNotice', sessionKey, text }));
@@ -79,7 +78,7 @@ function makeFixture(overrides = {}) {
     clearPendingPeer: (roomId) => pendingJoin.delete(roomId),
     journalConvoIdFor: (s) => s.convoId || null,
     serverLabel: '2',
-    deliverLocalInvite, localAnswer, routeLocalRoomMessage, notifyRoomPeer,
+    deliverLocalInvite, localAnswer, routeLocalRoomMessage,
     publishSessionNotice, publishMuteCard, retireMuteCard, dropPendingRoomMessages,
     ...('personRoomState' in overrides ? { personRoomState: overrides.personRoomState } : {}),
     log,
@@ -87,14 +86,14 @@ function makeFixture(overrides = {}) {
     // AGENT_ROSTER_SUMMARY_ENABLED on the test box cannot flip these assertions.
     env: overrides.env ?? {},
   });
-  return { handlers, calls, publisher, rooms, invites, sessions, pendingJoin, log, deliverLocalInvite, localAnswer, routeLocalRoomMessage, notifyRoomPeer, publishSessionNotice, publishMuteCard, retireMuteCard, dropPendingRoomMessages };
+  return { handlers, calls, publisher, rooms, invites, sessions, pendingJoin, log, deliverLocalInvite, localAnswer, routeLocalRoomMessage, publishSessionNotice, publishMuteCard, retireMuteCard, dropPendingRoomMessages };
 }
 
 describe('createAgentChatHandlers', () => {
   describe('caller-session gate (all handlers)', () => {
     it('rejects a missing or non-string roomId with 400', async () => {
       const { handlers } = makeFixture();
-      for (const h of ['roster', 'agentSessions', 'chatStart', 'chatSend', 'chatAccept', 'chatRefuse', 'chatJoin', 'chatInvite', 'chatLeave', 'chatRead']) {
+      for (const h of ['roster', 'agentSessions', 'chatStart', 'chatSend', 'chatAccept', 'chatRefuse', 'chatJoin', 'chatInvite', 'chatLeaveDone', 'chatRead']) {
         expect((await handlers[h]({})).status).toBe(400);
         expect((await handlers[h]({ roomId: 42 })).status).toBe(400);
       }
@@ -787,8 +786,7 @@ describe('createAgentChatHandlers', () => {
 
     it('409s an owner who left the room — the owner exemption covers only pending', async () => {
       const f = makeFixture();
-      const id = joined(f, 'room-1', 'joined', 'owner');
-      await f.handlers.chatLeave({ roomId: '!sess', room_id: id });
+      const id = joined(f, 'room-1', 'left', 'owner');
       const res = await f.handlers.chatSend({ roomId: '!sess', room_id: id, message: 'x' });
       expect(res.status).toBe(409);
       expect(f.calls.filter((c) => c.call === 'publishText')).toEqual([]);
@@ -1137,15 +1135,6 @@ describe('createAgentChatHandlers', () => {
       expect(invites.answer).toHaveBeenCalledWith({ roomId: 'room-1', peerDeviceId: 9, accept: false, reason: undefined });
     });
 
-    it('chatLeave on an already-left room is a calm 200, not a re-surfaced journal conflict', async () => {
-      const { handlers, rooms, invites } = makeFixture();
-      rooms.record('room-1', { role: 'guest', state: 'left', sessionRoomId: '!sess' });
-      const res = await handlers.chatLeave({ roomId: '!sess', room_id: 'room-1' });
-      expect(res.status).toBe(200);
-      expect(res.body).toEqual({ ok: true, room_id: 'room-1', note: 'already left' });
-      expect(invites.leave).not.toHaveBeenCalled();
-    });
-
     it('409s an owner answer when no join request is pending (including its own outbound pending invite)', async () => {
       const { handlers, rooms, invites } = makeFixture();
       rooms.record('room-1', { role: 'owner', state: 'pending', sessionRoomId: '!sess', peerDeviceId: 7 });
@@ -1328,6 +1317,45 @@ describe('createAgentChatHandlers', () => {
       rooms.record('room-1', { role: 'guest', state: 'pending', sessionRoomId: '!sess' });
       await handlers.chatJoin({ roomId: '!sess', room_id: 'room-1', justification: 'retry' });
       expect(rooms.get('room-1')).toMatchObject({ role: 'guest', state: 'pending', sessionRoomId: '!sess' });
+    });
+
+    // Joining a room the caller is already in must change nothing: record()
+    // merges, so re-recording it as a pending guest would take the caller's
+    // own working binding away.
+    it.each([
+      ['the owner of a joined room', { role: 'owner', state: 'joined' }],
+      ['the owner of a room still waiting for its peer', { role: 'owner', state: 'pending' }],
+      ['a joined guest', { role: 'guest', state: 'joined' }],
+    ])('is a no-op that says so for %s, and leaves the binding alone', async (_who, binding) => {
+      const { handlers, rooms, invites, calls } = makeFixture();
+      rooms.record('room-1', { ...binding, sessionRoomId: '!sess', peerDeviceId: 7 });
+      const before = rooms.get('room-1');
+      calls.length = 0;
+      const res = await handlers.chatJoin({ roomId: '!sess', room_id: 'room-1', justification: 'j' });
+      expect(res.status).toBe(200);
+      expect(res.body).toMatchObject({ ok: true, room_id: 'room-1' });
+      expect(res.body.note).toMatch(/already in this room/);
+      expect(invites.join).not.toHaveBeenCalled();
+      expect(calls.filter((c) => c.call === 'record')).toEqual([]);
+      expect(rooms.get('room-1')).toEqual(before);
+    });
+
+    it('is a no-op for the joined second session of a same-bridge room', async () => {
+      const { handlers, rooms, invites } = makeFixture();
+      rooms.record('room-1', { role: 'owner', state: 'joined', sessionRoomId: '!other', guestSessionRoomId: '!sess', guestState: 'joined' });
+      const before = rooms.get('room-1');
+      const res = await handlers.chatJoin({ roomId: '!sess', room_id: 'room-1', justification: 'j' });
+      expect(res.status).toBe(200);
+      expect(res.body.note).toMatch(/already in this room/);
+      expect(invites.join).not.toHaveBeenCalled();
+      expect(rooms.get('room-1')).toEqual(before);
+    });
+
+    it('puts a prior binding back when the journal rejects the re-join outright', async () => {
+      const { handlers, rooms } = makeFixture({ joinOutcome: { kind: 'error', code: 'forbidden' } });
+      rooms.record('room-1', { role: 'owner', state: 'left', sessionRoomId: '!sess' });
+      await handlers.chatJoin({ roomId: '!sess', room_id: 'room-1', justification: 'retry' });
+      expect(rooms.get('room-1')).toMatchObject({ role: 'owner', state: 'left', sessionRoomId: '!sess' });
     });
   });
 
@@ -1517,57 +1545,6 @@ describe('createAgentChatHandlers', () => {
     });
   });
 
-  describe('chatLeave', () => {
-    it('404s a room this session is not in', async () => {
-      const { handlers } = makeFixture();
-      expect((await handlers.chatLeave({ roomId: '!sess', room_id: 'room-ghost' })).status).toBe(404);
-    });
-
-    it('sends the leave op and marks the room left, even from pending', async () => {
-      const { handlers, rooms, invites } = makeFixture();
-      rooms.record('room-1', { role: 'guest', state: 'pending', sessionRoomId: '!sess' });
-      const res = await handlers.chatLeave({ roomId: '!sess', room_id: 'room-1' });
-      expect(res.status).toBe(200);
-      expect(res.body).toEqual({ ok: true });
-      expect(invites.leave).toHaveBeenCalledWith({ roomId: 'room-1' });
-      expect(rooms.get('room-1').state).toBe('left');
-    });
-
-    it('502s when the leave frame never left the socket and keeps the state (peer was not told)', async () => {
-      const { handlers, rooms } = makeFixture({ leaveOutcome: { kind: 'error', code: 'journal_unreachable' } });
-      rooms.record('room-1', { role: 'guest', state: 'joined', sessionRoomId: '!sess' });
-      const res = await handlers.chatLeave({ roomId: '!sess', room_id: 'room-1' });
-      expect(res.status).toBe(502);
-      expect(res.body.error).toMatch(/peer was not told/i);
-      expect(rooms.get('room-1').state).toBe('joined');
-    });
-
-    it('REGRESSION (C2): the OWNER\'s leave surfaces the journal conflict — no local "left", peer state intact', async () => {
-      // journal participants.js leaveConvo only flips a convo_agents row in
-      // state 'joined'; the owner has no row at all, so the journal answers
-      // fail('conflict','not a joined participant') with ref agent_leave.
-      const { handlers, rooms } = makeFixture({ leaveOutcome: { kind: 'error', code: 'conflict', detail: 'not a joined participant' } });
-      rooms.record('room-1', { role: 'owner', state: 'joined', sessionRoomId: '!sess', peerDeviceId: 7 });
-      const res = await handlers.chatLeave({ roomId: '!sess', room_id: 'room-1' });
-      expect(res.status).toBe(409);
-      expect(res.body.error).toMatch(/not a joined participant/);
-      expect(res.body.error).toMatch(/peer was not told/i);
-      // NOT terminally marked left: the peer was never told and keeps
-      // publishing — the room must keep routing.
-      expect(rooms.get('room-1')).toMatchObject({ state: 'joined', peerDeviceId: 7 });
-      // …so a send still works.
-      expect((await handlers.chatSend({ roomId: '!sess', room_id: 'room-1', message: 'still in' })).status).toBe(200);
-    });
-
-    it('other journal leave rejections map to 502 and also keep the state', async () => {
-      const { handlers, rooms } = makeFixture({ leaveOutcome: { kind: 'error', code: 'not_found' } });
-      rooms.record('room-1', { role: 'guest', state: 'joined', sessionRoomId: '!sess' });
-      const res = await handlers.chatLeave({ roomId: '!sess', room_id: 'room-1' });
-      expect(res.status).toBe(502);
-      expect(rooms.get('room-1').state).toBe('joined');
-    });
-  });
-
   describe('chatRead', () => {
     it('404s a room this session is not in', async () => {
       const { handlers } = makeFixture();
@@ -1728,9 +1705,7 @@ describe('index.js routes + ask-user.js tools (source inspection)', () => {
     ['/agent-chat-refuse', 'chatRefuse'],
     ['/agent-chat-join', 'chatJoin'],
     ['/agent-chat-invite', 'chatInvite'],
-    // The leave ROUTE stays mounted even though the tool is gone: session
-    // eviction still closes a dead session's rooms through chatLeave.
-    ['/agent-chat-leave', 'chatLeave'],
+    ['/agent-chat-leave-done', 'chatLeaveDone'],
     ['/agent-chat-mute', 'chatMute'],
     ['/agent-chat-unmute', 'chatUnmute'],
     ['/agent-chat-read', 'chatRead'],
@@ -1980,17 +1955,26 @@ describe('index.js routes + ask-user.js tools (source inspection)', () => {
     expect(deliver).toMatch(/journalResumeRoom\(room\.sessionRoomId, ROOM_WAKE_NOTICE\)[\s\S]{0,400}orphanRoomBinding\(frame\.convo_id, room\.sessionRoomId\)/);
   });
 
+  it('mounts no bare /agent-chat-leave route and builds no chatLeave handler', () => {
+    // The unguarded leave was removed: nothing called it, and the one leave a
+    // session can ask for is the guarded /agent-chat-leave-done.
+    expect(indexSrc).not.toMatch(/url\.pathname === '\/agent-chat-leave'/);
+    expect(indexSrc).toMatch(/url\.pathname === '\/agent-chat-leave-done'/);
+    const { handlers } = makeFixture();
+    expect(handlers).not.toHaveProperty('chatLeave');
+    expect(typeof handlers.chatLeaveDone).toBe('function');
+  });
+
   it('declares every agent-chat MCP tool in ask-user.js', () => {
     for (const name of TOOLS) {
       expect(askUserSrc).toMatch(new RegExp(`server\\.tool\\(\\s*\\n\\s*'${name}',`));
     }
   });
 
-  it('agent_chat_leave is the GUARDED leave, never the bridge\'s own teardown route', () => {
+  it('agent_chat_leave is the GUARDED leave', () => {
     // Rooms of two live for the life of the two sessions (2026-08-19), so the
-    // tool must not reach the unguarded /agent-chat-leave route the bridge's
-    // teardown uses: it goes to /agent-chat-leave-done, whose handler refuses
-    // every leave that would end a room for someone else.
+    // tool goes to /agent-chat-leave-done, whose handler refuses every leave
+    // that would end a room for someone else.
     const start = askUserSrc.indexOf("'agent_chat_leave',");
     expect(start).toBeGreaterThan(-1);
     const block = askUserSrc.slice(start, askUserSrc.indexOf('server.tool(', start));
@@ -2190,58 +2174,6 @@ describe('local (same-bridge) rooms', () => {
       const res = await f.handlers.chatSend({ roomId: '!guest', room_id: id, message: 'too early' });
       expect(res.status).toBe(409);
       expect(res.body.error).toMatch(/pending/);
-    });
-  });
-
-  describe('leaving', () => {
-    it('flips both bindings, tells the other end, and skips the journal', async () => {
-      const f = makeFixture();
-      const id = localRoom(f);
-      const res = await f.handlers.chatLeave({ roomId: '!guest', room_id: id });
-      expect(res.status).toBe(200);
-      const r = f.rooms.get(id);
-      expect(r.state).toBe('left');
-      expect(r.guestState).toBe('left');
-      expect(f.notifyRoomPeer).toHaveBeenCalledWith(id, '!sess', 'left the room');
-      expect(f.invites.leave).not.toHaveBeenCalled();
-    });
-
-    it('owner leaving notifies the guest binding', async () => {
-      const f = makeFixture();
-      const id = localRoom(f);
-      await f.handlers.chatLeave({ roomId: '!sess', room_id: id });
-      expect(f.notifyRoomPeer).toHaveBeenCalledWith(id, '!guest', 'left the room');
-    });
-
-    it("reports 'already left' off the caller's own binding", async () => {
-      const f = makeFixture();
-      const id = localRoom(f, { guestState: 'left' });
-      const res = await f.handlers.chatLeave({ roomId: '!guest', room_id: id });
-      expect(res.body.note).toMatch(/already left/);
-      // The owner side was NOT flipped by the no-op.
-      expect(f.rooms.get(id).state).toBe('joined');
-    });
-
-    it('a guest leaving an unanswered invite refuses it instead of ghosting the owner', async () => {
-      const f = makeFixture();
-      const id = localRoom(f, { guestState: 'pending', state: 'pending' });
-      const res = await f.handlers.chatLeave({ roomId: '!guest', room_id: id });
-      expect(res.status).toBe(200);
-      expect(f.rooms.get(id).guestState).toBe('refused');
-      // The loopback refusal settles the owner's chatStart waiters (or
-      // surfaces as a late-answer turn) — that IS the peer notification,
-      // so no separate 'left the room' FYI on top of it.
-      expect(f.localAnswer).toHaveBeenCalledWith(id, { accept: false, reason: 'left the room without answering' });
-      expect(f.notifyRoomPeer).not.toHaveBeenCalled();
-    });
-
-    it("a binding that ended another way (refused) is a calm 200 and the peer is NOT told 'left'", async () => {
-      const f = makeFixture();
-      const id = localRoom(f, { guestState: 'refused', state: 'refused' });
-      const res = await f.handlers.chatLeave({ roomId: '!guest', room_id: id });
-      expect(res.status).toBe(200);
-      expect(res.body.note).toMatch(/already refused/);
-      expect(f.notifyRoomPeer).not.toHaveBeenCalled();
     });
   });
 

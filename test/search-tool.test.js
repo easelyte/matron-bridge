@@ -86,12 +86,13 @@ describe('formatSearchAll', () => {
   });
 
   it('never splits a surrogate pair when truncating', () => {
+    // The emoji's two UTF-16 units sit at indices 159 and 160, so a cut at
+    // 160 code units would keep only its high surrogate.
     const snippet = `${'a'.repeat(159)}😀 trailing text past the cut`;
     const out = formatSearchAll({ results: [{ kind: 'item', num: 1, title: 'Emoji', state: 'open', why: 'exact', snippet }], semantic: 'ready' });
     const shown = out.split(' — ')[1];
-    expect(shown.endsWith('…')).toBe(true);
-    expect(shown).not.toMatch(/�/);
-    expect(Array.from(shown.slice(0, -1)).length).toBe(160);
+    expect(shown).not.toMatch(/[\uD800-\uDBFF](?![\uDC00-\uDFFF])/);
+    expect(shown).toBe(`${'a'.repeat(159)}😀…`);
   });
 
   it('a short snippet is left exactly as is, with no ellipsis', () => {

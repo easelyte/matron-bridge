@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { armFromStall, autoResumeDue, shouldCompactBefore, dueResumes, AUTO_RESUME_TEXT, RESUME_GRACE_MS, RESUME_RETRY_MS, RESUME_MAX_RETRIES } from '../lib/auto-resume.js';
+import { armFromStall, autoResumeDue, shouldCompactBefore, dueResumes, dropResumeSlot, AUTO_RESUME_TEXT, RESUME_GRACE_MS, RESUME_RETRY_MS, RESUME_MAX_RETRIES } from '../lib/auto-resume.js';
 import { stallFromAssistantEvent } from '../lib/stall-detector.js';
 
 const AT = '2026-09-29T15:00:00.000Z';
@@ -54,6 +54,22 @@ describe('autoResumeDue / dueResumes', () => {
     expect(dueResumes(records, T + RESUME_GRACE_MS)).toEqual([{ roomId: '!a', convoId: 'ca', slot: { at: AT, kind: 'usage_limit', text: 't' } }]);
     expect(dueResumes(records, T)).toEqual([]);
     expect(dueResumes(undefined, T)).toEqual([]);
+  });
+  it('a slot whose session cannot be resumed is dropped, so the sweep does not fire it again', () => {
+    const slot = { at: AT, kind: 'usage_limit', text: 't' };
+    const records = {
+      '!a': { journalConvoId: 'ca', workdir: '/w', _autoResume: slot },
+      '!b': { journalConvoId: 'cb', _autoResume: { ...slot } },
+    };
+    expect(dropResumeSlot(records, '!a', slot)).toBe(true);
+    expect(records['!a']).toEqual({ journalConvoId: 'ca', workdir: '/w', _autoResume: null });
+    expect(dueResumes(records, T + RESUME_GRACE_MS).map((d) => d.roomId)).toEqual(['!b']);
+    // Nothing to write when there is no such slot, or a newer one was armed.
+    expect(dropResumeSlot(records, '!a', slot)).toBe(false);
+    expect(dropResumeSlot(records, '!missing', slot)).toBe(false);
+    expect(dropResumeSlot(records, '!b', { ...slot, at: '2026-09-30T00:00:00.000Z' })).toBe(false);
+    expect(records['!b']._autoResume).toEqual(slot);
+    expect(dropResumeSlot(undefined, '!a', slot)).toBe(false);
   });
 });
 

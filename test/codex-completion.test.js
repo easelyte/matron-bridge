@@ -183,7 +183,8 @@ describe('Codex completion state machine', () => {
     }));
   });
 
-  it('interrupts a reused pid whose process start ticks do not match', async () => {
+  // Real liveness compares /proc start ticks, which exist on Linux only.
+  it.skipIf(process.platform !== 'linux')('interrupts a reused pid whose process start ticks do not match', async () => {
     const harness = makeHarness({ realLiveness: true });
     await attach(harness);
     harness.meta.wrapperStartTicks = '0';

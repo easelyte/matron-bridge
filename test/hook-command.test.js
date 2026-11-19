@@ -1,4 +1,7 @@
 import { describe, it, expect } from 'vitest';
+import { execFileSync } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { hookEntry, nodeHookEntry, shellQuote } from '../lib/hook-command.js';
 
@@ -8,9 +11,23 @@ const WIN_HOOKS = 'C:\\bridge\\hooks';
 describe('hookEntry', () => {
   it('POSIX: the .sh script path as a shell-form command', () => {
     expect(hookEntry({ hooksDir: HOOKS, name: 'stop-notify', timeout: 10, platform: 'linux' }))
-      .toEqual({ type: 'command', command: path.posix.join(HOOKS, 'stop-notify.sh'), timeout: 10 });
+      .toEqual({ type: 'command', command: `'${path.posix.join(HOOKS, 'stop-notify.sh')}'`, timeout: 10 });
     expect(hookEntry({ hooksDir: HOOKS, name: 'matron-bash-tee', platform: 'darwin' }))
-      .toEqual({ type: 'command', command: path.posix.join(HOOKS, 'matron-bash-tee.sh') });
+      .toEqual({ type: 'command', command: `'${path.posix.join(HOOKS, 'matron-bash-tee.sh')}'` });
+  });
+
+  it('POSIX: an install path with a space or a quote still runs as one shell word', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "hook it's "));
+    try {
+      const script = path.join(dir, 'echo-args.sh');
+      fs.writeFileSync(script, '#!/bin/sh\nprintf "%s|" ran "$@"\n', { mode: 0o755 });
+      const bare = hookEntry({ hooksDir: dir, name: 'echo-args', platform: 'linux' });
+      expect(execFileSync('sh', ['-c', bare.command], { encoding: 'utf8' })).toBe('ran|');
+      const withArgs = hookEntry({ hooksDir: dir, name: 'echo-args', args: ['a b', 7], platform: 'linux' });
+      expect(execFileSync('sh', ['-c', withArgs.command], { encoding: 'utf8' })).toBe('ran|a b|7|');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
   });
 
   it('win32: exec form — node.exe plus the .mjs port and literal args, no shell', () => {

@@ -41,7 +41,7 @@ describe('stalled-session Fable switch (source inspection)', () => {
   it('switches with explicit:false and arms a model_recovery carry-on on the live session', () => {
     const fn = body('function switchFableStall(session, { retry = 0, prior = undefined } = {}) {', '\n}\n');
     expect(fn).toContain('stallModelFallback({ stall: session._stall,');
-    expect(fn).toContain('applyModelSwitch(session.roomId, session, fb.model, { sendReply: ctx.sendReply, sendHtml: ctx.sendHtml, explicit: false })');
+    expect(fn).toContain('applyModelSwitch(session.roomId, session, fb.model, { sendReply: ctx.sendReply, explicit: false })');
     expect(fn).toContain('const next = sessions.get(session.roomId) || session;');
     expect(fn).toContain("next._autoResume = { at: new Date().toISOString(), kind: 'model_recovery', text };");
     expect(fn).toContain("kind: 'fable_switch', retry: retry + 1,");

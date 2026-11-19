@@ -47,7 +47,7 @@ describe('session control wiring (source inspection)', () => {
   it('applies steps through the existing switch, model, compact and turn paths', () => {
     const fn = body('async function applyControlSteps(session, steps) {', '\nfunction drainDeferredControls(');
     expect(fn).toContain('await switchAgentSession(current.roomId, step.agent, { sendReply: ctx.sendReply });');
-    expect(fn).toContain('if (!applyModelSwitch(current.roomId, current, step.model, { sendReply: ctx.sendReply, sendHtml: ctx.sendHtml, explicit: true })) {');
+    expect(fn).toContain('if (!applyModelSwitch(current.roomId, current, step.model, { sendReply: ctx.sendReply, explicit: true })) {');
     // The model rides into an agent switch via agentSessions[target].model.
     expect(fn).toContain('agentSessions: mergeAgentStates(persisted.agentSessions, { [step.agent]: targetState }),');
     // So does the effort, and on its own it goes through applyControlEffort.
@@ -137,7 +137,7 @@ describe('automatic carry-on wiring (source inspection)', () => {
   it('recovers a bad model once with the default model, then carries on; a second failure is left for a person', () => {
     const fn = body('function recoverBadModel(session) {', '\n// --- Coordinator session control');
     expect(fn).toContain('if (session._badModelRecovered) {');
-    expect(fn).toContain("&& applyModelSwitch(session.roomId, session, 'default', { sendReply: ctx.sendReply, sendHtml: ctx.sendHtml, explicit: false });");
+    expect(fn).toContain("&& applyModelSwitch(session.roomId, session, 'default', { sendReply: ctx.sendReply, explicit: false });");
     // Delivery goes through the sweep: nothing is typed on the heels of /model.
     expect(fn).toContain("next._autoResume = { at: new Date().toISOString(), kind: 'model_recovery', text: BAD_MODEL_RECOVERY_TEXT };");
     expect(fn).not.toContain('journalRouteTextToSession(');

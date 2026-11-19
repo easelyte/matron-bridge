@@ -306,10 +306,10 @@ describe('MCP tool wiring (source inspection)', () => {
   });
   it('a person\'s /effort <level> on a print session takes the /login route instead of refusing', () => {
     const src = readFileSync(new URL('../index.js', import.meta.url), 'utf8');
-    expect(src).toContain('if (!session.iv) applyPrintEffortSwitch(roomId, session, arg, { sendReply, sendHtml });');
+    expect(src).toContain('if (!session.iv) applyPrintEffortSwitch(roomId, session, arg, { sendReply });');
     expect(src).toContain('session._deferredCommandText = `!effort ${decision.normalized}`;');
     // Borrow interactive mode and park the command, exactly as /login does.
-    expect(src).toContain('const next = applyModeSwitch(roomId, session, true, { sendReply, sendHtml, announcement: decision.message });');
+    expect(src).toContain('const next = applyModeSwitch(roomId, session, true, { sendReply, announcement: decision.message });');
     expect(src).toContain('next._postReadySlashCommand = `/effort ${decision.normalized}`;');
     expect(src).toContain('next._effortFlowReturnToPrint = decision.normalized;');
     // The watcher records the typed write and accepts its confirmation.

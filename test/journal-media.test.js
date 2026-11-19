@@ -23,9 +23,7 @@ function makeRouter(overrides = {}) {
     injectText: vi.fn(() => true),
     injectBlocks: vi.fn(() => true),
     queueMedia: vi.fn(async () => {}),
-    echoToRoom: vi.fn(),
     publishNotice: vi.fn(),
-    escapeHtml: (s) => String(s),
     log: silentLog,
     ...overrides,
   };
@@ -343,7 +341,6 @@ describe('createJournalMediaRouter — voice note sent with the typed draft (cap
       { type: 'text', text: '[Voice note transcription]: what do you think of this' },
     ]);
     expect(mirrorText).toHaveBeenCalledWith(session, '[Voice note transcription]: what do you think of this');
-    expect(deps.echoToRoom).toHaveBeenCalledTimes(2); // "sent a voice note" + the words
   });
 
   it('uses the journal transcript when it has one', async () => {
@@ -478,15 +475,6 @@ describe('createJournalMediaRouter — video (frame extraction)', () => {
     expect(deps.transcribe).not.toHaveBeenCalled();
   });
 
-  it('room echo says "a video", not "a file"', async () => {
-    const { route, deps } = makeRouter({
-      fetchMedia: videoFetch(),
-      buildVideoBlocks: vi.fn(async () => videoBlocks),
-    });
-    await route(session, { type: 'file', blobRef: 'v', contentType: 'video/quicktime', name: 'clip.mov' }, ctx);
-    expect(deps.echoToRoom.mock.calls[0][1]).toMatch(/sent a video/);
-  });
-
   it('detects video from the fetched content-type when the frame declared octet-stream', async () => {
     const { route, deps } = makeRouter({
       fetchMedia: videoFetch(),
@@ -567,7 +555,6 @@ describe('createJournalMediaRouter — transcript from the journal (transcribed 
     expect(deps.fetchMedia).not.toHaveBeenCalled();
     expect(deps.transcribe).not.toHaveBeenCalled();
     expect(deps.injectText).toHaveBeenCalledWith(session, '[Voice note transcription]: deploy the journal');
-    expect(deps.echoToRoom).toHaveBeenLastCalledWith(session, '🎤 alice (Matron): deploy the journal', expect.any(String));
   });
 
   it('a busy session queues the journal transcript exactly like a local one', async () => {
@@ -999,7 +986,6 @@ describe('createJournalMediaRouter — journal first, local whisper only when in
       buildSavedBlocks: vi.fn(() => []),
       injectText: vi.fn(() => true),
       injectBlocks: vi.fn(() => true),
-      echoToRoom: vi.fn(),
       publishNotice: vi.fn(),
       log: silentLog,
     };

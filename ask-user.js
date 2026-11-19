@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 
-// MCP server providing secure-input tools: request_secret, share_sensitive_data, redact_message.
+// MCP server providing secure-input tools (request_secret, share_sensitive_data) and the bridge's other agent tools.
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
@@ -31,10 +31,8 @@ import { formatTimelineReadAck, formatTimelineWriteAck } from './lib/timeline-to
 import { readApiHeaderFile, explainUnauthorized } from './lib/api-header-file.js';
 import { shouldRegister } from './lib/tool-roles.js';
 
-// Route to whichever bridge spawned us: explicit BRIDGE_API_URL wins, else the
-// per-session MATRON_BRIDGE_API_PORT exported by the bridge at spawn (journal=9812,
-// old Matrix bridge=9802), else the legacy default. Prevents the inbound-secret
-// flow from posting to the wrong bridge process after the journal cutover.
+// The session's environment carries the port the bridge really listens on
+// (MATRON_BRIDGE_API_PORT); an explicit BRIDGE_API_URL still wins.
 const BRIDGE_API = process.env.BRIDGE_API_URL
   || (process.env.MATRON_BRIDGE_API_PORT && `http://127.0.0.1:${process.env.MATRON_BRIDGE_API_PORT}`)
   || 'http://127.0.0.1:9802';
@@ -217,38 +215,6 @@ server.tool(
         content: [{
           type: 'text',
           text: `Secure link created for "${label}":\n${url}\n\nThis link expires at ${new Date(expiresAt).toISOString()} and ${usage}.${notice}`
-        }]
-      };
-    } catch (err) {
-      return { content: [{ type: 'text', text: `Error: ${err.message}` }] };
-    }
-  }
-);
-
-server.tool(
-  'redact_message',
-  'Redact (delete) a message that was sent by the bridge to the user in the Matron chat. Use this to remove sensitive information that was accidentally posted. Note: Only messages sent by the bridge bot can be redacted.',
-  {
-    eventId: z.string().describe('The event ID of the message to redact'),
-    reason: z.string().optional().describe('Optional reason for redacting the message'),
-  },
-  async ({ eventId, reason }) => {
-    try {
-      const postRes = await bridgeFetch(`${BRIDGE_API}/redact-message`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ roomId: ROOM_ID, eventId, reason }),
-      });
-
-      if (!postRes.ok) {
-        const err = await postRes.text();
-        return { content: [{ type: 'text', text: `Error redacting message: ${err}` }] };
-      }
-
-      return {
-        content: [{
-          type: 'text',
-          text: `Message ${eventId} has been redacted.${reason ? ` Reason: ${reason}` : ''}`
         }]
       };
     } catch (err) {
@@ -1223,9 +1189,8 @@ server.tool(
 // carry on, and a finished third member otherwise had only a mute to stop
 // being woken by their traffic, which then told every sender for days that
 // their messages no longer reached it. The bridge refuses every other case
-// (lib/agent-chat.js leaveRoom). The /agent-chat-leave route and chatLeave
-// internals are the bridge's own teardown, not this tool: since 2026-09-21 no
-// teardown calls them except the lazy cleanup of a conversation that can no
+// (lib/agent-chat.js leaveRoom). Session teardown never leaves a room; the
+// one bridge-side leave is the lazy cleanup of a conversation that can no
 // longer be resumed (index.js orphanRoomBinding).
 
 server.tool(

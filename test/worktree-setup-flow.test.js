@@ -7,7 +7,7 @@ import path from 'node:path';
 import { createWorktreeLedger } from '../lib/worktree-ledger.js';
 import { createWorktreeService } from '../lib/worktree-service.js';
 import { ALLOW_LABEL, DECLINE_LABEL, createSetupFlow } from '../lib/worktree-setup-flow.js';
-import { createConsentStore } from '../lib/worktree-setup.js';
+import { createConsentStore, setupSummary } from '../lib/worktree-setup.js';
 import { git, makeRepo, roomyStatfs } from './helpers/worktree-repo.js';
 
 const KEY = 'example.com/owner/repo';
@@ -238,5 +238,30 @@ describe('running', () => {
     expect(out.ok).toBe(true);
     expect(h.ledger.get(out.cwd)).toBeTruthy();
     expect((await out.background()).join(' ')).toMatch(/skipped: exploded/);
+  });
+});
+
+describe('a setup the previous process left running', () => {
+  it('is shown as interrupted after a restart, not as still running', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'matron-wtflow-'));
+    cleanups.push(() => fs.rmSync(home, { recursive: true, force: true }));
+    const file = path.join(home, 'worktrees.json');
+    const wt = (name) => `/repo/.claude/worktrees/${name}`;
+    const before = createWorktreeLedger({ file });
+    before.add(wt('a'), { name: 'a', branch: 'a', root: '/repo', setup: { state: 'running', itemId: 'it_a' } });
+    before.add(wt('b'), { name: 'b', branch: 'b', root: '/repo', setup: { state: 'pending', sha256: 'abc' } });
+    before.add(wt('c'), { name: 'c', branch: 'c', root: '/repo', setup: { state: 'ok' } });
+
+    // The restarted bridge: a new ledger on the same file, a new flow.
+    const ledger = createWorktreeLedger({ file });
+    createSetupFlow({ ledger, consent: createConsentStore({ file: path.join(home, 'consent.json') }), logDir: home, env: {} });
+    const setup = ledger.get(wt('a')).setup;
+    expect(setup).toEqual({ state: 'failed', interrupted: true, itemId: 'it_a' });
+    expect(setupSummary(setup)).toMatch(/interrupted/);
+    expect(setupSummary(setup)).not.toMatch(/exit \?/);
+    expect(ledger.get(wt('b')).setup).toEqual({ state: 'pending', sha256: 'abc' });
+    expect(ledger.get(wt('c')).setup).toEqual({ state: 'ok' });
+    // Written to the file as well, so the next start reads the same.
+    expect(createWorktreeLedger({ file }).get(wt('a')).setup.state).toBe('failed');
   });
 });

@@ -154,30 +154,13 @@ function makeHarness(opts = {}) {
 
 describe('formatSecretChatNotice', () => {
   it('names the label, links the form, and shows the item number and window', () => {
-    const { plain, html } = formatSecretChatNotice({
+    expect(formatSecretChatNotice({
       label: 'AWS access key',
       link: 'https://v/secret?token=abc',
       itemNum: 120,
+    })).toEqual({
+      plain: '🔐 Secret requested: AWS access key — [Enter secret](https://v/secret?token=abc) (#120, 24 h)',
     });
-    expect(plain).toBe('🔐 Secret requested: AWS access key — [Enter secret](https://v/secret?token=abc) (#120, 24 h)');
-    expect(html).toContain('<b>AWS access key</b>');
-    expect(html).toContain('<a href="https://v/secret?token=abc">Enter secret</a>');
-    expect(html).toContain('(#120, 24 h)');
-  });
-
-  it('escapes the label in the HTML variant', () => {
-    const { html } = formatSecretChatNotice({ label: '<img src=x>', link: 'https://v/s', itemNum: 1 });
-    expect(html).not.toContain('<img');
-    expect(html).toContain('&lt;img src=x&gt;');
-  });
-
-  it('escapes the link in the href, not only the label', () => {
-    // VIEWER_BASE_URL is operator config, but it lands in an attribute, so a
-    // quote in it must not be able to close the attribute and add another.
-    const { html } = formatSecretChatNotice({ label: 'k', link: 'https://v/s?a="x onmouseover=1', itemNum: 1 });
-    // The injected quote is neutralised, so the attribute still ends where
-    // the template says it does and `onmouseover` stays inside the href.
-    expect(html).toContain('href="https://v/s?a=&quot;x onmouseover=1">');
   });
 
   it('drops the item number when the item could not be filed', () => {
@@ -186,9 +169,8 @@ describe('formatSecretChatNotice', () => {
   });
 
   it('says so plainly when the viewer is not configured', () => {
-    const { plain, html } = formatSecretChatNotice({ label: 'token', link: null, itemNum: 7 });
-    expect(plain).toBe('🔐 Secret requested: token (viewer not configured)');
-    expect(html).toBe(null);
+    expect(formatSecretChatNotice({ label: 'token', link: null, itemNum: 7 }))
+      .toEqual({ plain: '🔐 Secret requested: token (viewer not configured)' });
   });
 });
 
@@ -238,9 +220,8 @@ describe('createSecretRequests.create', () => {
     expect(h.items.calls.create[0].body).toContain('> For \\[the release\\]\\(https://example.com/tasks/release\\).');
     expect(h.items.calls.create[0].body).toContain('[Open originating conversation](matron://convo/c)');
     expect(h.chat[0].info.plain).toContain('[Open originating conversation](matron://convo/c)');
-    expect(h.chat[0].info.html).toContain('<a href="matron://convo/c">Open originating conversation</a>');
-    expect(h.chat[0].info.html).toContain(context.replaceAll('\n', '<br>'));
-    expect(h.chat[0].info.html).not.toContain('href="https://example.com');
+    expect(h.chat[0].info.plain).toContain('> For \\[the release\\]\\(https://example.com/tasks/release\\).');
+    expect(h.chat[0].info.plain).not.toContain('](https://example.com');
     expect(linkOptions.context).toBe(context);
     expect(linkOptions.convoId).toBe('c');
     const restored = makeHarness({ initial: h.saved });
@@ -727,6 +708,22 @@ describe('orphaned secret files', () => {
     });
     h.store.init();
     expect(h.removed).toEqual(['/tmp/secrets/3f2504e0-4f89-11d3-9a0c-0305e82c3301.txt']);
+  });
+
+  it('sweeps its own files when the lister returns Windows paths', async () => {
+    const dir = 'C:\\Users\\alice\\.secrets\\';
+    const h = makeHarness({
+      startAt: 10_000_000,
+      fileTtlMs: 3600_000,
+      listSecretFiles: () => [
+        { path: `${dir}11111111-1111-4111-8111-111111111111.txt`, mtimeMs: 1 },
+        { path: `${dir}aws-prod.txt`, mtimeMs: 1 },
+        { path: `${dir}33333333-3333-4333-8333-333333333333.txt`, mtimeMs: 10_000_000 - 600_000 },
+      ],
+    });
+    h.store.init();
+    expect(h.removed).toEqual([`${dir}11111111-1111-4111-8111-111111111111.txt`]);
+    expect(h.scheduler.only().delay).toBe(3600_000 - 600_000);
   });
 
   it('isOwnSecretFileName accepts exactly <uuid>.txt', () => {

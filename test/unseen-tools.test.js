@@ -182,3 +182,22 @@ describe('unseen item links follow the tracker link form', () => {
     expect('tracker_url_base' in (await unknown.list({ roomId: '!r:s' })).body).toBe(false);
   });
 });
+
+describe('an unseen item with no number', () => {
+  it('is listed without a link, never as #undefined', () => {
+    const { item_num: _n, ...numberless } = item;
+    for (const base of [undefined, 'https://chat.example/u/alice']) {
+      for (const text of [
+        formatUnseenList({ entries: [numberless], tracker_url_base: base }, { now: NOW }),
+        formatUnseenMine({ entries: [numberless], tracker_url_base: base }, { now: NOW }),
+        formatUnseenNudge({ entries: [numberless] }, { now: NOW, trackerBase: base }),
+      ]) {
+        expect(text).not.toContain('undefined');
+        expect(text).not.toContain('link [');
+        expect(text).toContain('tracker an item (question)');
+        expect(text).toContain('"Which box?" · ref item:it_ab:1789');
+      }
+    }
+  });
+});
+

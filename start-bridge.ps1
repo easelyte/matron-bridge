@@ -13,8 +13,9 @@
   exit, after ending any session trees the bridge left behind (they would
   otherwise keep the task instance alive).
 
-  index.js loads .env itself (dotenv), so no environment inlining is needed:
-  edit .env, then .\restart.ps1.
+  index.js and viewer\start.js load .env themselves (dotenv), so no
+  environment inlining is needed: edit .env, then .\restart.ps1 (the bridge
+  only; the viewer reads .env when its own task next starts).
 
 .PARAMETER Viewer
   Run viewer\start.js instead of index.js.

@@ -71,11 +71,25 @@ describe('resolvePromptChoice', () => {
     expect(resolvePromptChoice(undefined, '1')).toBeNull();
   });
 
-  it('a numeric string prefers the numbered-position match over an id match, per option order', () => {
-    // id '1' would collide with the 1-based-number reading of choice '1' —
-    // number wins (documents the precedence, not just asserts it).
+  it('an option whose label is a number is matched by its label, not by position', () => {
+    // The shape of an AskUserQuestion card's buttons: value = label. A tap
+    // sends the value, so tapping "2" must answer "2", not the second option.
+    const numeric = ['2', '4', '8'].map((label, i) => ({ id: `opt_${'abc'[i]}`, label, value: label }));
+    expect(resolvePromptChoice(numeric, '2')).toEqual({ option: numeric[0], index: 0 });
+    expect(resolvePromptChoice(numeric, 2)).toEqual({ option: numeric[0], index: 0 });
+    const zeroBased = ['0', '1', '2', '3'].map((label, i) => ({ id: `opt_${'abcd'[i]}`, label, value: label }));
+    expect(resolvePromptChoice(zeroBased, '1')).toEqual({ option: zeroBased[1], index: 1 });
+    // A number that names no option is still the 1-based position.
+    expect(resolvePromptChoice(numeric, '3')).toEqual({ option: numeric[2], index: 2 });
+    // A label with no separate value is matched the same way.
+    const labelOnly = [{ id: 'opt_a', label: '2' }, { id: 'opt_b', label: '4' }];
+    expect(resolvePromptChoice(labelOnly, '2')).toEqual({ option: labelOnly[0], index: 0 });
+  });
+
+  it('a numeric string prefers an id match over the numbered position', () => {
     const numericIdOptions = [{ id: '5', label: 'Five' }, { id: '1', label: 'One' }];
-    expect(resolvePromptChoice(numericIdOptions, '1')).toEqual({ option: numericIdOptions[0], index: 0 });
+    expect(resolvePromptChoice(numericIdOptions, '1')).toEqual({ option: numericIdOptions[1], index: 1 });
+    expect(resolvePromptChoice(numericIdOptions, '2')).toEqual({ option: numericIdOptions[1], index: 1 });
   });
 });
 
@@ -1137,7 +1151,7 @@ describe('index.js journal input consumer — auto-resume wiring (source inspect
     expect(body).toMatch(/resumeSleepingSession\(roomId, prev, convoId, noticeText\)/);
 
     // …and the helper threads that flag into the sendToRoom carrying the
-    // notice (the session's own sendCallback/sendHtml stay mirrored). Bound
+    // notice (the session's own sendCallback stays mirrored). Bound
     // the slice at the next surviving section header (Local HTTP API, which
     // now immediately follows resumePersistedSession — the old anchor,
     // `// --- Matrix Message Handler ---`, was deleted in Task 4) so the
@@ -1149,12 +1163,13 @@ describe('index.js journal input consumer — auto-resume wiring (source inspect
     expect(hEnd).toBeGreaterThan(hStart);
     const hBody = src.slice(hStart, hEnd);
     expect(hBody).toMatch(/skipJournalMirror = false/);
-    expect(hBody).toMatch(/sendToRoom\(roomId, arNotice\.plain, arNotice\.html, \{ skipJournalMirror \}\)/);
+    expect(hBody).toMatch(/sendToRoom\(roomId, `\$\{verb\} [^`]*`, \{ skipJournalMirror \}\)/);
   });
 
   it('resumes the active provider with its provider-specific native session ID', () => {
     const start = src.indexOf('function resumePersistedSession(');
-    const end = src.indexOf('\n// --- Matrix Message Handler ---', start);
+    const end = src.indexOf('\n// --- Local HTTP API ---', start);
+    expect(end).toBeGreaterThan(start);
     const body = src.slice(start, end);
 
     expect(body).toContain('const resumeSessionId = activeState.sessionId;');

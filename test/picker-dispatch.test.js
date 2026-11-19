@@ -14,7 +14,6 @@ describe('handlePickerValue', () => {
       cancelSleep: vi.fn(),
       saveDefault: vi.fn(),
       sendReply: vi.fn(),
-      sendHtml: vi.fn(),
     };
   }
 
@@ -23,7 +22,7 @@ describe('handlePickerValue', () => {
     const session = { id: 'sess' };
     expect(handlePickerValue('model:sonnet', 'room-1', session, s)).toBe(true);
     expect(s.applyModelSwitch).toHaveBeenCalledWith('room-1', session, 'sonnet', {
-      sendReply: s.sendReply, sendHtml: s.sendHtml,
+      sendReply: s.sendReply,
     });
     expect(s.switchEffortInSession).not.toHaveBeenCalled();
     expect(s.applyModeSwitch).not.toHaveBeenCalled();
@@ -42,12 +41,12 @@ describe('handlePickerValue', () => {
     const session = { id: 'sess' };
     expect(handlePickerValue('mode:interactive', 'room-1', session, s)).toBe(true);
     expect(s.applyModeSwitch).toHaveBeenCalledWith('room-1', session, true, {
-      sendReply: s.sendReply, sendHtml: s.sendHtml,
+      sendReply: s.sendReply,
     });
     s.applyModeSwitch.mockClear();
     expect(handlePickerValue('mode:print', 'room-1', session, s)).toBe(true);
     expect(s.applyModeSwitch).toHaveBeenCalledWith('room-1', session, false, {
-      sendReply: s.sendReply, sendHtml: s.sendHtml,
+      sendReply: s.sendReply,
     });
   });
 

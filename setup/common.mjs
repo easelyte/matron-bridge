@@ -31,7 +31,9 @@ export function readIfExists(p) {
 
 export function parseEnv(text) {
   const out = {};
-  for (const line of text.split('\n')) {
+  // A .env saved with Windows line endings must read the same as one with
+  // Unix endings, or a re-run would see no values and mint new secrets.
+  for (const line of text.split(/\r?\n/)) {
     const m = /^([A-Z0-9_]+)=(.*)$/.exec(line);
     if (m) out[m[1]] = m[2];
   }

@@ -287,6 +287,53 @@ describe('createSubagentConvoTracker', () => {
     expect(b.status.task_ref).toBe('toolu_2');
   });
 
+  it('a Task that returns without ever starting a subagent does not shift later pairings', () => {
+    // A refused or invalid call: its tool_result arrives and no subagent
+    // transcript is ever written.
+    tracker.noteTaskStarted('toolu_refused');
+    tracker.noteTaskResult('toolu_refused', { failed: true });
+
+    tracker.noteTaskStarted('toolu_2');
+    const child = tracker.discover('agent-2', { label: 'B', agentType: null });
+    expect(child.taskRef).toBe('toolu_2');
+
+    // ...so its own tool_result is what finishes it.
+    publisher.calls.upsertConvo.length = 0;
+    tracker.noteTaskResult('toolu_2');
+    expect(publisher.calls.upsertConvo).toHaveLength(1);
+    expect(publisher.calls.upsertConvo[0].opts.sessionState).toBe(CHILD_STATE_FINISHED);
+  });
+
+  it('drops only the returned Task from the queue, keeping the order of the rest', () => {
+    tracker.noteTaskStarted('toolu_1');
+    tracker.noteTaskStarted('toolu_refused');
+    tracker.noteTaskStarted('toolu_3');
+    tracker.noteTaskResult('toolu_refused', { failed: true });
+
+    expect(tracker.discover('agent-a', { label: 'A', agentType: null }).taskRef).toBe('toolu_1');
+    expect(tracker.discover('agent-c', { label: 'C', agentType: null }).taskRef).toBe('toolu_3');
+  });
+
+  it('a result that is not an error keeps its Task queued for the subagent on its way', () => {
+    // A background spawn's launch result arrives before its subagent is
+    // discovered or its start is announced.
+    tracker.noteTaskStarted('toolu_bg');
+    tracker.noteTaskStarted('toolu_2');
+    tracker.noteTaskResult('toolu_bg');
+
+    expect(tracker.discover('agent-bg', { label: 'BG', agentType: null }).taskRef).toBe('toolu_bg');
+    expect(tracker.discover('agent-2', { label: 'B', agentType: null }).taskRef).toBe('toolu_2');
+  });
+
+  it('a Task tool_use seen twice is queued once', () => {
+    tracker.noteTaskStarted('toolu_1');
+    tracker.noteTaskStarted('toolu_1');
+    expect(tracker.discover('agent-a', { label: 'A', agentType: null }).taskRef).toBe('toolu_1');
+    // Seen again after it was paired: still not queued a second time.
+    tracker.noteTaskStarted('toolu_1');
+    expect(tracker.discover('agent-b', { label: 'B', agentType: null }).taskRef).toBeNull();
+  });
+
   it('marks the child done when the spawning Task tool_result is observed', () => {
     tracker.noteTaskStarted('toolu_1');
     tracker.discover('agent-1', { label: 'A', agentType: null });

@@ -43,7 +43,7 @@ function setup({ session: overrides = {}, steerEnabled = true } = {}) {
   };
   const replies = [];
   const frames = [];
-  const ctxObj = { sendReply: vi.fn(async (m) => { replies.push(m); }), sendHtml: vi.fn(), sender: 'user' };
+  const ctxObj = { sendReply: vi.fn(async (m) => { replies.push(m); }), sender: 'user' };
   const explicit = {
     console: { log() {}, warn() {}, error() {} },
     Date, JSON, Map, Set, Promise, Math, Number, String, Object, Array, Boolean, Error,
@@ -97,7 +97,7 @@ function setup({ session: overrides = {}, steerEnabled = true } = {}) {
     journalPublishUserItem: vi.fn(),
     // Passed by reference (not called) in the busy branch.
     formatQueueSummary: vi.fn(), clearQueueNotifications: vi.fn(),
-    emitRelease: vi.fn(), escapeHtml: (t) => t,
+    emitRelease: vi.fn(),
   };
   // Every other function the lifted code calls becomes an inert stub; they
   // are output/journal side effects these tests do not assert on.
@@ -319,9 +319,9 @@ describe('shared running-turn writer', () => {
     const h = setup({ session: { pendingQuestions: [{ question: 'Which?', options: [{ label: 'A' }] }], sendButtonMessage } });
     h.context.sendAllQuestions(h.session);
     expect(h.session.questionPromptIds).toEqual(['steer-uuid-1']);
-    expect(sendButtonMessage.mock.calls[0][5]).toMatchObject({ prompt_id: 'steer-uuid-1', mode: 'pick_one' });
+    expect(sendButtonMessage.mock.calls[0][3]).toMatchObject({ prompt_id: 'steer-uuid-1', mode: 'pick_one' });
     const echo = { type: 'prompt', sender: 'agent:bridge', convo_id: 'convo', seq: 42,
-      payload: sendButtonMessage.mock.calls[0][5] };
+      payload: sendButtonMessage.mock.calls[0][3] };
     if (!delayed) h.context.journalHandleInboundEvent(echo);
     h.session.waitingForAnswer = 'text-reply';
     h.context.supersedePromptsForSteerHold(h.session, {});
@@ -685,7 +685,6 @@ describe('review follow-ups', () => {
     vi.useFakeTimers();
     const h = setup();
     h.session.sendCallback = vi.fn();
-    h.session.sendHtml = vi.fn();
     h.session.claudeSessionId = 'sid';
     h.session.pendingPlanDenialId = 'plan-1';
     h.context.sendToSession(h.session, [{ type: 'text', text: 'actually, smaller scope' }]);
@@ -695,17 +694,17 @@ describe('review follow-ups', () => {
     expect(h.session.pendingPlan ?? null).toBeNull();
     expect(h.session.pendingPlanDenialId).toBeNull();
     expect(h.context.planItems.opened).not.toHaveBeenCalled();
-    expect(h.session.sendHtml).not.toHaveBeenCalled();
+    expect(h.session.sendCallback).not.toHaveBeenCalled();
     expect(h.context.journalPublishNotice).toHaveBeenCalledWith('convo', steer.STEER_PROMPT_SUPERSEDED_NOTICE);
   });
 
   it('the same plan result without a hold still posts the card', () => {
     const h = setup();
     h.session.sendCallback = vi.fn();
-    h.session.sendHtml = vi.fn();
     h.context.handleClaudeEvent(h.session, planResult());
     expect(h.session.busy).toBe(false);
     expect(h.session.pendingPlan).toBe('do it');
+    expect(h.session.sendCallback).toHaveBeenCalledWith('--- Plan Ready ---\n\ndo it\n\nReply "build" to execute, or send feedback.');
     expect(h.context.planItems.opened).toHaveBeenCalledTimes(1);
     expect(h.context.journalPublishNotice).not.toHaveBeenCalledWith('convo', steer.STEER_PROMPT_SUPERSEDED_NOTICE);
   });
@@ -1061,16 +1060,14 @@ describe('print interrupt acknowledgment wiring', () => {
     expect(h.session._turnInitSeen).toBe(false);
   });
 
-  it.each(['submitAnswer', 'approvePlanBuild'])('advances the generation before the direct %s write', async (name) => {
-    const h = setup({ session: { busy: false, turnGeneration: 1, waitingForAnswer: 'question-tool', pendingPlanDenialId: 'plan-tool' } });
-    h.context.notice = () => ({ plain: 'Building', html: 'Building' });
+  it('advances the generation before the direct approvePlanBuild write', async () => {
+    const h = setup({ session: { busy: false, turnGeneration: 1, pendingPlanDenialId: 'plan-tool' } });
     h.context.writePromptAnswer = vi.fn((session) => {
       expect(session.busy).toBe(true);
       expect(session.turnGeneration).toBe(2);
       expect(session._turnInitSeen).toBe(false);
     });
-    if (name === 'submitAnswer') h.context.submitAnswer(h.session, 'answer');
-    else await h.context.approvePlanBuild(h.session, { sendHtml: vi.fn() });
+    await h.context.approvePlanBuild(h.session, { sendReply: vi.fn() });
     expect(h.context.writePromptAnswer).toHaveBeenCalledTimes(1);
   });
 });

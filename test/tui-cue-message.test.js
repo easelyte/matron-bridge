@@ -26,14 +26,6 @@ describe('formatTuiCueMessage — OAuth sign-in cue', () => {
     expect(msg.parts[1].plain).toBe(OAUTH_URL);
   });
 
-  it('keeps the URL message tappable as a link', () => {
-    const msg = formatTuiCueMessage(oauthScreen(), [OAUTH_URL]);
-    // &amp;-escaped in the attribute, but the href is the same url.
-    expect(msg.parts[1].html).toBe(
-      `<a href="${OAUTH_URL.replace(/&/g, '&amp;')}">${OAUTH_URL.replace(/&/g, '&amp;')}</a>`,
-    );
-  });
-
   it('surfaces only the first url even when the screen carries several', () => {
     const msg = formatTuiCueMessage(oauthScreen(), [OAUTH_URL, 'https://claude.ai/other']);
     expect(msg.parts).toHaveLength(3);
@@ -80,7 +72,10 @@ describe('formatTuiCueMessage — press-Enter acknowledgment', () => {
 
 describe('urlCueParts', () => {
   it('omits the tail message when there is no trailing prose', () => {
-    expect(urlCueParts('lead', '<b>lead</b>', ['https://x.test/'])).toHaveLength(2);
+    expect(urlCueParts('lead', ['https://x.test/'])).toEqual([
+      { plain: 'lead' },
+      { plain: 'https://x.test/' },
+    ]);
   });
 });
 

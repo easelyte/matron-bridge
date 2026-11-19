@@ -7,6 +7,7 @@ import {
   parseMemoryFrontmatter,
   parseMemoryIndex,
   LOCAL_MEMORIES_RESULT_MAX_BYTES,
+  trimIndexToBudget,
 } from '../lib/local-memories.js';
 import { encodeProjectSegment } from '../lib/transcript-dir.js';
 
@@ -432,4 +433,83 @@ describe('get()', () => {
     expect(Buffer.byteLength(JSON.stringify(out.result), 'utf8')).toBeLessThanOrEqual(LOCAL_MEMORIES_RESULT_MAX_BYTES);
     expect(out.result.next_offset).not.toBe(null);
   });
+});
+
+// One drop of the frame trim as it was first written, which re-serialised
+// the whole reply before every drop. Returns false when nothing is left.
+function referenceDrop(result) {
+  const { projects, claude_md: claudeMd } = result;
+  let fullest = null;
+  for (const p of projects) {
+    if (p.memories.length > 0 && (!fullest || p.memories.length > fullest.memories.length)) fullest = p;
+  }
+  if (fullest) {
+    fullest.memories.pop();
+    fullest.more += 1;
+  } else if (projects.length > 0) {
+    (result.more_projects ??= []).push(projects.pop().dir);
+  } else if (claudeMd.length > 0) {
+    claudeMd.pop();
+    result.more_claude_md = (result.more_claude_md ?? 0) + 1;
+  } else {
+    return false;
+  }
+  return true;
+}
+
+describe('trimIndexToBudget', () => {
+  // Deterministic pseudo-random fixtures, with multi-byte text so byte and
+  // character counts differ, and enough rows that the counters cross digit
+  // boundaries (9 -> 10, 99 -> 100).
+  let seed = 7;
+  const rand = (n) => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed % n; };
+  const text = (n) => Array.from({ length: n }, (_, i) => (i % 7 === 0 ? 'é' : i % 11 === 0 ? '"' : 'x')).join('');
+  const reply = ({ projectCount, maxMemories, claudeMdCount, offsetPage }) => {
+    const result = {
+      home: '/home/alice',
+      claude_md: Array.from({ length: claudeMdCount }, (_, i) => ({
+        path: `/home/alice/p${i}/CLAUDE.md`, size: rand(5000), mtime: 1700000000000 + i, folder: `/home/alice/p${i}`,
+      })),
+      projects: Array.from({ length: projectCount }, (_, i) => ({
+        dir: `-home-alice-p${i}`,
+        path: i % 3 ? `/home/alice/p${i}` : null,
+        memory_dir: `/home/alice/.claude/projects/-home-alice-p${i}/memory`,
+        index: i % 4 ? { size: rand(900), mtime: 1700000000000 + i } : null,
+        offset: 0,
+        memories: Array.from({ length: rand(maxMemories + 1) }, (_, j) => ({
+          file: `m${j}.md`, name: `m${j}`, title: text(rand(40)), description: text(rand(200)),
+          type: 'project', hook: text(rand(30)), size: rand(4000), mtime: 1700000000000 + j,
+        })),
+        more: 0,
+      })),
+    };
+    if (offsetPage) result.claude_md_offset = 3;
+    return result;
+  };
+
+  it('makes the same drops as re-serialising before each one, at every budget boundary', () => {
+    for (const shape of [
+      { projectCount: 10, maxMemories: 30, claudeMdCount: 110, offsetPage: false },
+      { projectCount: 2, maxMemories: 150, claudeMdCount: 0, offsetPage: false },
+      { projectCount: 0, maxMemories: 0, claudeMdCount: 120, offsetPage: true },
+    ]) {
+      const base = reply(shape);
+      // Every state the old loop passes through, with its serialised size:
+      // for a budget b it stops at the first state no larger than b.
+      const states = [];
+      const walk = structuredClone(base);
+      do {
+        const json = JSON.stringify(walk);
+        states.push({ json, bytes: Buffer.byteLength(json, 'utf8') });
+      } while (referenceDrop(walk));
+      const budgets = new Set([0]);
+      for (const { bytes } of states) { budgets.add(bytes); budgets.add(bytes - 1); }
+      for (const budget of budgets) {
+        if (budget < 0) continue;
+        const expected = states.find((st) => st.bytes <= budget) ?? states[states.length - 1];
+        const actual = trimIndexToBudget(structuredClone(base), budget);
+        expect(JSON.stringify(actual)).toBe(expected.json);
+      }
+    }
+  }, 30_000);
 });

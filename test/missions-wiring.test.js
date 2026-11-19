@@ -1,4 +1,5 @@
 import { readFileSync, readdirSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { loadCoordinatorBlock } from '../lib/coordinator.js';
 import { describe, expect, it } from 'vitest';
 
@@ -6,8 +7,8 @@ import { describe, expect, it } from 'vitest';
 // (spec 2026-10-01 coordinator routines), assembled as index.js does.
 const coordinatorPlaybook = () => loadCoordinatorBlock({
   readFile: (p) => readFileSync(p, 'utf8'),
-  path: new URL('../BRIDGE_COORDINATOR.md', import.meta.url).pathname,
-  dir: new URL('../coordinator', import.meta.url).pathname,
+  path: fileURLToPath(new URL('../BRIDGE_COORDINATOR.md', import.meta.url)),
+  dir: fileURLToPath(new URL('../coordinator', import.meta.url)),
   readDir: (d) => readdirSync(d),
 });
 

@@ -34,7 +34,7 @@ describe('reminders wiring', () => {
   });
 
   it('the idle reaper leaves a session alone while it holds a hold-awake reminder', () => {
-    const reaper = index.slice(index.indexOf('function startIdleReaper'), index.indexOf('function startIdleReaper') + 2500);
+    const reaper = index.slice(index.indexOf('function startIdleReaper'), index.indexOf('}, SESSION_IDLE_CHECK_MS)', index.indexOf('function startIdleReaper')));
     // The not-yet-reaped branch is a block since the pre-reap handoff
     // (lib/pre-reap-handoff.js) runs inside it; it still ends in `continue`.
     expect(reaper).toMatch(/if \(now - last < SESSION_IDLE_TIMEOUT_MS\) \{\n[\s\S]*?\n {8}continue;\n {6}\}\n[\s\S]*?holdAwakeUntil\(journalConvoIdFor\(session\)\)[\s\S]*?continue;/);

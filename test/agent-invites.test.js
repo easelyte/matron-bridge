@@ -610,7 +610,7 @@ describe('createAgentInvites', () => {
       const { inv, rooms, notifyRoom } = makeInvites();
       rooms.record('r1', { role: 'owner', state: 'pending', sessionRoomId: '!sess' });
       rooms.setState('r1', 'joined');
-      rooms.record('r1', { role: 'owner', state: 'left', sessionRoomId: '!sess' }); // chatLeave stamped it
+      rooms.record('r1', { role: 'owner', state: 'left', sessionRoomId: '!sess' }); // a leave already stamped it
       inv.onInviteFrame({ kind: 'invite', event: 'answer', room_id: 'r1', accept: true, peer_device_id: 7, from_device_id: 7 });
       expect(rooms.get('r1').state).toBe('left');
       // Late-answer notify still fires; only the state transition is gated.

@@ -245,4 +245,55 @@ describe('TranscriptTail', () => {
 
     expect(result).toMatchObject({ ok: false, error: expect.any(Error) });
   });
+
+  describe('a listener that throws', () => {
+    let logged;
+    let realError;
+    beforeEach(() => {
+      logged = [];
+      realError = console.error;
+      console.error = (...args) => { logged.push(args); };
+    });
+    afterEach(() => { console.error = realError; });
+
+    it('is not reported as a parse error, and later lines are still emitted', () => {
+      const tail = new TranscriptTail(file);
+      const parseErrors = [];
+      const seen = [];
+      tail.on('parseError', e => parseErrors.push(e));
+      tail.on('event', (e) => {
+        seen.push(e.n);
+        if (e.n === 1) throw new Error('handler bug');
+      });
+      tail.lineBuf = '{"n":1}\nnot json\n{"n":2}\n';
+      tail._emitCompleteLines();
+
+      expect(seen).toEqual([1, 2]);
+      expect(parseErrors.map(e => e.line)).toEqual(['not json']);
+      expect(logged).toHaveLength(1);
+      expect(String(logged[0][0])).toContain('listener');
+      expect(logged[0][1]).toMatchObject({ message: 'handler bug' });
+    });
+
+    it('is logged, not swallowed, for a complete last line with no newline yet', () => {
+      const tail = new TranscriptTail(file);
+      tail.on('event', () => { throw new Error('handler bug'); });
+      tail.lineBuf = '{"n":1}';
+      tail._emitCompletePendingJson();
+
+      expect(tail.lineBuf).toBe('');
+      expect(logged).toHaveLength(1);
+      expect(logged[0][1]).toMatchObject({ message: 'handler bug' });
+    });
+
+    it('logs nothing for a partial last line, which stays buffered', () => {
+      const tail = new TranscriptTail(file);
+      tail.on('event', () => { throw new Error('handler bug'); });
+      tail.lineBuf = '{"n":';
+      tail._emitCompletePendingJson();
+
+      expect(tail.lineBuf).toBe('{"n":');
+      expect(logged).toEqual([]);
+    });
+  });
 });

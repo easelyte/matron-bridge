@@ -263,14 +263,28 @@ describe('buildMcpServers', () => {
   });
 
   it('unwraps xvfb-run on macOS so the browser MCP actually starts', () => {
+    // A Linux overlay that still carries the sandbox flag, so the strip is
+    // observable (BASE itself has none).
+    const browser = BASE.mcpExtras.browser['chrome-devtools'];
+    const withSandboxFlag = {
+      ...BASE,
+      mcpExtras: {
+        ...BASE.mcpExtras,
+        browser: { 'chrome-devtools': { ...browser, args: [...browser.args, '--chromeArg=--no-sandbox'] } },
+      },
+    };
+    const linux = buildMcpServers({ baseConfig: withSandboxFlag, extras: ['browser'], platform: 'linux' });
+    expect(linux.config.mcpServers['chrome-devtools'].args).toContain('--chromeArg=--no-sandbox');
+
     const { config } = buildMcpServers({
-      baseConfig: BASE,
+      baseConfig: withSandboxFlag,
       extras: ['browser'],
       platform: 'darwin',
       askUserBaseDir: '/opt/bridge',
     });
     // macifyMcpServers strips the xvfb wrapper + Linux sandbox flags.
     expect(config.mcpServers['chrome-devtools'].command).toBe('npx');
+    expect(config.mcpServers['chrome-devtools'].args[0]).toBe('-y');
     expect(config.mcpServers['chrome-devtools'].args).not.toContain('--chromeArg=--no-sandbox');
   });
 

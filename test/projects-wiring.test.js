@@ -1,4 +1,5 @@
 import { readFileSync, readdirSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { loadCoordinatorBlock } from '../lib/coordinator.js';
 import { describe, expect, it, vi } from 'vitest';
 import { createProjectsHandlers } from '../lib/projects-tools.js';
@@ -160,7 +161,20 @@ describe('projects wiring', () => {
   });
 
   it('schemas: close and merge say Coordinator; status is a string; no convo_id or idem_key parameter', () => {
-    const slice = (from, to) => askUser.slice(askUser.indexOf(`'${from}',`), to ? askUser.indexOf(`'${to}',`) : askUser.indexOf('// --- Memories'));
+    // Anchored on the server.tool( registration: a bare `'project_create',`
+    // first matches the idem-key call in callProjects, a slice that also
+    // spans the project_list registration.
+    const at = (name) => {
+      const i = askUser.indexOf(`server.tool(\n  '${name}',`);
+      expect(i, name).toBeGreaterThan(-1);
+      return i;
+    };
+    const slice = (from, to) => {
+      const start = at(from);
+      const end = to ? at(to) : askUser.indexOf('// --- Memories', start);
+      expect(end, `${from}..${to}`).toBeGreaterThan(start);
+      return askUser.slice(start, end);
+    };
     expect(slice('project_close', 'project_merge')).toMatch(/Coordinator only/);
     expect(slice('project_merge')).toMatch(/Coordinator only/);
     expect(slice('project_merge')).toMatch(/into: z\.number\(\)\.int\(\)\.min\(1\)/);
@@ -200,8 +214,8 @@ describe('projects wiring', () => {
     const codexMd = readFileSync(new URL('../BRIDGE_CODEX.md', import.meta.url), 'utf8');
     const coord = loadCoordinatorBlock({
       readFile: (p) => readFileSync(p, 'utf8'),
-      path: new URL('../BRIDGE_COORDINATOR.md', import.meta.url).pathname,
-      dir: new URL('../coordinator', import.meta.url).pathname,
+      path: fileURLToPath(new URL('../BRIDGE_COORDINATOR.md', import.meta.url)),
+      dir: fileURLToPath(new URL('../coordinator', import.meta.url)),
       readDir: (d) => readdirSync(d),
     });
     const DEFINITION = 'A Project is the user\'s tracker object that groups related missions — not a working directory, and nothing to do with `~/.claude/projects`.';

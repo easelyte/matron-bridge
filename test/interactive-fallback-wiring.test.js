@@ -25,7 +25,7 @@ describe('interactive spawn failure falls back to print mode', () => {
   it('marks the session, persists print mode for a known room, and tells the room why', () => {
     expect(report).toMatch(/session\._interactiveSpawnFailed = reason;/);
     expect(report).toMatch(/if \(persisted && session\.claudeSessionId\) \{\s*persistSession\([\s\S]*?\{ interactiveMode: false \}\);/);
-    expect(report).toMatch(/sendToRoom\(session\.roomId, n\.plain, n\.html\)/);
+    expect(report).toMatch(/sendToRoom\(session\.roomId,\s*`Couldn't start interactive mode/);
     expect(report).toMatch(/carries on in print mode/);
   });
 

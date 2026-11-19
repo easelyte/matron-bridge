@@ -212,8 +212,7 @@ describe('isIvSlashPassthrough (journal command classification pin: unknown-slas
 
 // Plan-mode `build` keyword (PR #101 follow-up). The journal path approves a
 // pending plan when the text is exactly "build" (case-insensitive, trimmed)
-// and the session has plan state (pendingPlan || pendingPlanDenialId ||
-// ivPendingPlanToolUseId) — originally Matrix's comparison, pinned here
+// and the session has plan state (pendingPlan || pendingPlanDenialId) — originally Matrix's comparison, pinned here
 // unchanged since Matrix's retirement in Task 4. The approval implementation
 // (approvePlanBuild, index.js) is reused AS-IS.
 describe('isPlanBuildText (journal command classification pin)', () => {

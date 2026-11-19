@@ -26,15 +26,21 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-DRY_RUN=0
-WHEN_QUIET=0
-case "${1:-}" in
-  --dry-run) DRY_RUN=1 ;;
-  --when-quiet) WHEN_QUIET=1 ;;
-esac
-
 step() { printf '\n\033[1m==> %s\033[0m\n' "$1"; }
 fail() { printf '\033[31mFAIL: %s\033[0m\n' "$1" >&2; exit 1; }
+
+# Parse arguments before anything else runs. An argument this script does not
+# know must stop it here: falling through to the default path would pull and
+# restart the live bridge on a typo such as --dryrun.
+DRY_RUN=0
+WHEN_QUIET=0
+[ "$#" -le 1 ] || fail "too many arguments (usage: ./deploy.sh [--dry-run | --when-quiet])"
+case "${1:-}" in
+  '') ;;
+  --dry-run) DRY_RUN=1 ;;
+  --when-quiet) WHEN_QUIET=1 ;;
+  *) fail "unknown argument: $1 (usage: ./deploy.sh [--dry-run | --when-quiet])" ;;
+esac
 
 # Which service manager owns the bridge on this host. Everything
 # manager-specific — the "does the service exist?" preflight, the old-PID
@@ -74,12 +80,16 @@ case "$(uname -s)" in
   Linux)
     # setup/service-linux.sh installs a system-level unit, so restarting needs
     # root. Non-interactive sudo only: this script is usually run from inside a
-    # bridge session, where a password prompt would hang forever.
+    # bridge session, where a password prompt would hang forever. Only the
+    # restart itself needs it, so --dry-run and --when-quiet work without it;
+    # the check runs before the pull when this run will restart.
     SUDO=""
     if [ "$(id -u)" -ne 0 ]; then
-      sudo -n true 2>/dev/null \
-        || fail "restarting matron-bridge needs passwordless sudo for systemctl (sudo -n failed)"
       SUDO="sudo -n"
+      if [ "$DRY_RUN" = "0" ] && [ "$WHEN_QUIET" = "0" ]; then
+        sudo -n true 2>/dev/null \
+          || fail "restarting matron-bridge needs passwordless sudo for systemctl (sudo -n failed)"
+      fi
     fi
     TARGET="matron-bridge"
 

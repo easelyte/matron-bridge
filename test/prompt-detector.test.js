@@ -651,12 +651,9 @@ describe('classifyScreen — first option glued onto heading line', () => {
       '2. Foo',
       '3. Bar',
     ].join('\n');
-    const r = classifyScreen(screen);
-    if (r) {
-      // If we still classify, options must reflect what was actually on
-      // screen; we should not synthesise a "1." from the heading.
-      expect(r.options.map(o => o.key)).not.toContain('1');
-    }
+    // A run that starts at 2 is not a numbered prompt at all; in particular
+    // no "1." is synthesised from the paragraph above it.
+    expect(classifyScreen(screen)).toBeNull();
   });
 });
 

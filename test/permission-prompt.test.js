@@ -56,36 +56,31 @@ describe('parsePermTap', () => {
 
 describe('renderPermissionCard', () => {
   it('shows the command (and description) for Bash', () => {
-    const { plain, html } = renderPermissionCard({
+    const { plain } = renderPermissionCard({
       toolName: 'Bash',
       input: { command: 'rm -rf build', description: 'Clean build dir' },
     });
     expect(plain).toContain('Bash');
     expect(plain).toContain('rm -rf build');
     expect(plain).toContain('Clean build dir');
-    expect(html).toContain('<code>');
   });
 
-  it('shows compact JSON for non-Bash tools and escapes html', () => {
-    const { plain, html } = renderPermissionCard({
+  it('shows compact JSON for non-Bash tools', () => {
+    const { plain } = renderPermissionCard({
       toolName: 'WebFetch',
       input: { url: 'https://x.test/<b>' },
     });
-    expect(plain).toContain('"url"');
-    expect(html).toContain('&lt;b&gt;');
-    expect(html).not.toContain('<b>"');
+    expect(plain).toContain('{"url":"https://x.test/<b>"}');
   });
 
   it('shows the whole input, including fields that come after long content', () => {
-    const { plain, html } = renderPermissionCard({
+    const { plain } = renderPermissionCard({
       toolName: 'Write',
       input: { content: 'A'.repeat(600), file_path: '/tmp/example/target.txt' },
     });
-    for (const out of [plain, html]) {
-      expect(out).toContain('A'.repeat(600));
-      expect(out).toContain('/tmp/example/target.txt');
-      expect(out).not.toContain('…');
-    }
+    expect(plain).toContain('A'.repeat(600));
+    expect(plain).toContain('/tmp/example/target.txt');
+    expect(plain).not.toContain('…');
   });
 
   it('shows a long Bash command in full', () => {
@@ -125,13 +120,11 @@ describe('renderPermissionCard', () => {
   });
 
   it('strips bidirectional control characters from tool name and preview', () => {
-    const { plain, html } = renderPermissionCard({
+    const { plain } = renderPermissionCard({
       toolName: 'Bash‮',
       input: { command: 'echo ‮gnp.tseb‬ safe', description: 'desc⁦iso⁩' },
     });
-    for (const out of [plain, html]) {
-      expect(out).not.toMatch(/[؜‎‏‪-‮⁦-⁩]/);
-    }
+    expect(plain).not.toMatch(/[؜‎‏‪-‮⁦-⁩]/);
     expect(plain).toContain('gnp.tseb safe');
   });
 });

@@ -136,6 +136,45 @@ describe('parseProcessTable', () => {
 });
 
 describe('workHold', () => {
+  it('holds while waiting for an answer, unless the age cap has passed', () => {
+    expect(workHold({ awaitingAnswer: true, idleSince: T0 - WORK_HOLD_MAX_MS + 1, now: T0 }))
+      .toEqual({ reason: 'waiting for an answer' });
+    for (const age of [WORK_HOLD_MAX_MS, WORK_HOLD_MAX_MS + 1]) {
+      expect(workHold({ awaitingAnswer: true, idleSince: T0 - age, now: T0 })).toBeNull();
+    }
+  });
+
+  it('reports a busy turn before a pending answer', () => {
+    expect(workHold({ busy: true, awaitingAnswer: true, idleSince: T0, now: T0 }))
+      .toEqual({ reason: 'turn in progress' });
+  });
+
+  it('does not hold for an answer unless the caller opts in', () => {
+    expect(workHold({ idleSince: T0, now: T0 })).toBeNull();
+    expect(workHold({ awaitingAnswer: false, idleSince: T0, now: T0 })).toBeNull();
+  });
+
+  it('holds queued input before subagents and children', () => {
+    expect(workHold({ queuedInput: true, subagentCount: 1, children: [{ pid: 1, args: 'sleep 60' }], idleSince: T0, now: T0 }))
+      .toEqual({ reason: 'input queued for delivery' });
+  });
+
+  it('releases queued input at the age cap', () => {
+    expect(workHold({ queuedInput: true, idleSince: T0 - WORK_HOLD_MAX_MS + 1, now: T0 }))
+      .toEqual({ reason: 'input queued for delivery' });
+    expect(workHold({ queuedInput: true, idleSince: T0 - WORK_HOLD_MAX_MS, now: T0 })).toBeNull();
+  });
+
+  it('reports a running turn ahead of queued input', () => {
+    expect(workHold({ busy: true, queuedInput: true, idleSince: T0, now: T0 }))
+      .toEqual({ reason: 'turn in progress' });
+  });
+
+  it('defaults to no queued input', () => {
+    expect(workHold({ idleSince: T0, now: T0 })).toBeNull();
+    expect(workHold({ queuedInput: false, idleSince: T0, now: T0 })).toBeNull();
+  });
+
   it('holds a session mid-turn', () => {
     expect(workHold({ busy: true, children: [], idleSince: T0 - 3600_000, now: T0 })).toEqual({ reason: 'turn in progress' });
   });

@@ -14,7 +14,6 @@ function fixture(clientOverrides = {}, handlerOptions = {}) {
     join: vi.fn(async () => ({ status: 200, data: { mission } })),
     close: vi.fn(async () => ({ status: 200, data: { mission: { ...mission, state: 'closed' } } })),
     postMilestone: vi.fn(async () => ({ status: 201, data: { milestone: { id: 'ml_1', num: 63 }, mission } })),
-    listMilestones: vi.fn(async () => ({ status: 200, data: { milestones: [] } })),
     // Default: a journal from before mission links (404), so every existing
     // cold-resolve test keeps exercising the old scan.
     conversationMissions: vi.fn(async () => ({ status: 404, data: { error: 'not_found' } })),

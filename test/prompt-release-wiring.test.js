@@ -27,10 +27,10 @@ describe('timer and reminder cards', () => {
     // counts as unread or unseen.
     expect(payload).toContain('silent: true,');
     expect(payload).toContain("mode: 'pick_one',");
-    const cards = index.match(/'pick_one', summary, escapeHtml\(summary\), timerCardPayload\(record, summary\)\);/g) || [];
+    const cards = index.match(/'pick_one', timerCardPayload\(record, summary\)\);/g) || [];
     // The typed /timer confirmation and the agent's reminder_create card.
     expect(cards).toHaveLength(2);
-    expect(index).not.toMatch(/\[timerSendNowButton\(record\.id\), timerCancelButton\(record\.id\)\],\s*'pick_one', summary, escapeHtml\(summary\)\);/);
+    expect(index).not.toMatch(/\[timerSendNowButton\(record\.id\), timerCancelButton\(record\.id\)\],\s*'pick_one'\);/);
   });
 
   // Today's apps render an unknown bridge prompt_reply as an "Answered"

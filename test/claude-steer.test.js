@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import {
   STEER_HOLD_BACKSTOP_MS, applySteerLifecycle, beginSteerHold, buildSteerLine, canSteerClaude,
-  claudeSteerEnabled, dropUnstartedSteers, endSteerHold, noteSteerWritten, resetClaudeSteer, steerOriginFromCauses, steerPendingTurn,
+  claudeSteerEnabled, endSteerHold, noteSteerWritten, takeUnstartedSteers, resetClaudeSteer, steerOriginFromCauses, steerPendingTurn,
 } from '../lib/claude-steer.js';
 
 function steerable(overrides = {}) {
@@ -186,12 +186,12 @@ describe('lifecycle bookkeeping', () => {
     expect(onBackstop).not.toHaveBeenCalled();
   });
 
-  it('dropUnstartedSteers keeps started entries', () => {
+  it('takeUnstartedSteers keeps started entries', () => {
     const s = {};
     noteSteerWritten(s, 'a');
     noteSteerWritten(s, 'b');
     s._steered.get('b').state = 'started';
-    dropUnstartedSteers(s);
+    takeUnstartedSteers(s);
     expect([...s._steered.keys()]).toEqual(['b']);
   });
 });

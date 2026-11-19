@@ -249,6 +249,43 @@ describe('createTrackerLinkChecker', () => {
     expect(lookup).toHaveBeenCalledTimes(1);
   });
 
+  it('looks a record up again before refusing a title that differs from a remembered one', async () => {
+    const rows2 = { 'alice/43': { kind: 'mission', title: 'Holiday rota' } };
+    const { lookup, search } = fakeJournal(rows2);
+    const check = createTrackerLinkChecker({ lookup, search, base: () => BASE });
+    expect(await check([link(43, '#43 Holiday rota')])).toEqual({ ok: true });
+    rows2['alice/43'] = { kind: 'mission', title: 'Quarterly budget review' };
+    expect(await check([link(43, '#43 Quarterly budget review')])).toEqual({ ok: true });
+    expect(lookup).toHaveBeenCalledTimes(2);
+    // The fresh answer replaces the remembered one.
+    expect(await check([link(43, '#43 Quarterly budget review')])).toEqual({ ok: true });
+    expect(lookup).toHaveBeenCalledTimes(2);
+  });
+
+  it('refuses a wrong title after one fresh lookup, quoting the current title', async () => {
+    const rows2 = { 'alice/43': { kind: 'mission', title: 'Holiday rota' } };
+    const { lookup, search } = fakeJournal(rows2);
+    const check = createTrackerLinkChecker({ lookup, search, base: () => BASE });
+    await check([link(43, '#43 Holiday rota')]);
+    rows2['alice/43'] = { kind: 'mission', title: 'Quarterly budget review' };
+    const r = await check([`${link(43, '#43 Office move')} ${link(43, '#43 Kitchen refit')}`]);
+    expect(r.ok).toBe(false);
+    expect(r.error).toContain('#43 is the mission "Quarterly budget review", not "Office move"');
+    expect(r.error).toContain('not "Kitchen refit"');
+    expect(lookup).toHaveBeenCalledTimes(2);
+  });
+
+  it('keeps the remembered title when the fresh lookup fails', async () => {
+    const rows2 = { 'alice/43': { kind: 'mission', title: 'Holiday rota' } };
+    const { lookup, search } = fakeJournal(rows2);
+    const check = createTrackerLinkChecker({ lookup, search, base: () => BASE });
+    await check([link(43, '#43 Holiday rota')]);
+    rows2['alice/43'] = 'down';
+    const r = await check([link(43, '#43 Office move')]);
+    expect(r.ok).toBe(false);
+    expect(r.error).toContain('#43 is the mission "Holiday rota"');
+  });
+
   it('asks again about a number it could not find: the record may have just been made', async () => {
     const rows2 = {};
     const { lookup, search } = fakeJournal(rows2);

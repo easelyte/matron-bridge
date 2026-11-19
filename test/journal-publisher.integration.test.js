@@ -22,12 +22,13 @@ async function waitFor(predicate, timeoutMs = 10000, intervalMs = 20) {
   }
 }
 
-// Optional end-to-end check against the real matron-journal server code (not
-// a fake). Only runs on boxes that have a matron-journal checkout next to
-// this repo (true on box-2 today); everywhere else — including regular CI —
-// this file is a no-op so the suite stays green without the sibling repo.
-const MATRON_DIR = '/home/developer/matron-journal';
-const HAS_MATRON = existsSync(MATRON_DIR);
+// Optional end-to-end check against the real journal server code (not a
+// fake). Skipped unless MATRON_JOURNAL_CHECKOUT names a local checkout of the
+// journal server, e.g.
+//   MATRON_JOURNAL_CHECKOUT="$HOME/src/journal" npx vitest run test/journal-publisher.integration.test.js
+// Everywhere else, including regular CI, this file is a no-op.
+const MATRON_DIR = process.env.MATRON_JOURNAL_CHECKOUT || '';
+const HAS_MATRON = MATRON_DIR !== '' && existsSync(MATRON_DIR);
 
 const describeIfMatron = HAS_MATRON ? describe : describe.skip;
 

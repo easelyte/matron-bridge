@@ -414,11 +414,11 @@ describe('Design login lifecycle', async () => {
     const start = source.indexOf("    case '!design-login':");
     const end = source.indexOf("    case '!effort':", start);
     // The production switch uses a canonical internal command key.
-    const run = runInNewContext(`(async function(roomId, sendReply, sendHtml) {
+    const run = runInNewContext(`(async function(roomId, sendReply) {
       const cmd = '!design-login';
       switch (cmd) { ${source.slice(start, end)} }
     })`, context);
-    return { session, context, run: () => run('room', vi.fn(), vi.fn()) };
+    return { session, context, run: () => run('room', vi.fn()) };
   }
 
   it('parks design login on the replacement print session using the account flow', async () => {

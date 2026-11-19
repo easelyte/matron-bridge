@@ -98,7 +98,7 @@ describe('/sleep wiring', () => {
   });
 
   it('lists /sleep in the command reference', () => {
-    expect(src).toMatch(/'\/sleep'/);
+    expect(src).toContain('`/sleep — Stop this machine now');
   });
 
   it('routes a verified sleep: tap whose session was reaped through the sessionless seam', () => {
