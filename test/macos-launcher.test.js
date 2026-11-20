@@ -164,3 +164,28 @@ describe.runIf(hasSwift)('matron-bridge-launcher process behaviour', () => {
     });
   });
 });
+
+describe.runIf(process.platform !== 'win32')('setup/service-macos.sh without node', () => {
+  it('says node was not found instead of exiting silently', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'mb-svc-nonode-'));
+    try {
+      fs.mkdirSync(path.join(dir, 'setup'));
+      fs.copyFileSync(path.join(root, 'setup/service-macos.sh'), path.join(dir, 'setup/service-macos.sh'));
+      fs.writeFileSync(path.join(dir, '.env'), 'EXAMPLE_SETTING=on\n');
+      // A PATH holding only dirname, the one external command the script runs
+      // before its node check, so node is missing wherever it is installed.
+      const bin = path.join(dir, 'bin');
+      fs.mkdirSync(bin);
+      fs.symlinkSync(spawnSync('bash', ['-c', 'command -v dirname'], { encoding: 'utf8' }).stdout.trim(), path.join(bin, 'dirname'));
+      const bash = spawnSync('bash', ['-c', 'command -v bash'], { encoding: 'utf8' }).stdout.trim();
+      const res = spawnSync(bash, [path.join(dir, 'setup/service-macos.sh')], {
+        encoding: 'utf8',
+        env: { PATH: bin, HOME: dir, MATRON_SERVICE_WRITE_ONLY: path.join(dir, 'out') },
+      });
+      expect(res.status).toBe(1);
+      expect(res.stderr).toMatch(/node not found/);
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
