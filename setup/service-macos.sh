@@ -4,7 +4,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_DIR="$(dirname "$SCRIPT_DIR")"
 SCOPE="${SCOPE:-user}"
-NODE_BIN="${NODE_BIN:-$(command -v node)}"
+NODE_BIN="${NODE_BIN:-$(command -v node || true)}"
 
 if [ -z "$NODE_BIN" ] || [ ! -x "$NODE_BIN" ]; then
   echo "ERROR: node not found. Install Node.js 22+ (e.g. 'brew install node@22')." >&2
