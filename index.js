@@ -36,6 +36,7 @@ import { extractVideoFrames, videoFramesMessage } from './lib/video-frames.js';
 import { prepareInlineImage, appendInlineImageBlocks } from './lib/inline-image.js';
 import { createSendAttachmentHandler, checkLocalUpload, resolveAndUploadLocalFile } from './lib/send-attachment.js';
 import { createPageLinkHandler } from './lib/page-link.js';
+import { pinSessionRoots } from './lib/session-roots.js';
 import { utf8ChunkDecoder } from './lib/utf8-chunks.js';
 import { createShortLinkWriter, shortenViewerUrl, shortLinksEnabled, shortLinksFile } from './lib/short-links.js';
 import { createItemsClient } from './lib/items-client.js';
@@ -2969,16 +2970,9 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   if (rootDowngraded) console.warn(`[permissions] ${roomId}: ${ROOT_BYPASS_WARNING}`);
   const effectiveMcpExtras = effectiveExtras(mcpExtras, DEFAULT_MCP_EXTRAS);
   const shareEnabled = effectiveMcpExtras.includes('share');
-  let showFileToken;
-  let showFilePinnedRoots = null;
-  if (shareEnabled) {
-    try {
-      showFilePinnedRoots = pinAllowedRootsSync([cwd, ...SHOW_FILE_ARTIFACT_ROOTS]);
-      showFileToken = randomUUID();
-    } catch (error) {
-      console.warn(`[show-file] disabled for ${roomId}: failed to pin allowed roots (${error.message})`);
-    }
-  }
+  const { pageLinkPinnedRoots, showFilePinnedRoots, showFileToken } = pinSessionRoots({
+    cwd, shareEnabled, artifactRoots: SHOW_FILE_ARTIFACT_ROOTS, roomId,
+  });
   // Pre-assign the session id for fresh spawns (same trick as iv-mode below):
   // claudeSessionId is then known synchronously, so RPC start can answer with
   // a convo_id immediately and journal publishes never buffer for the init
@@ -3084,6 +3078,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     codexSpawnEnv: spawnEnv,
     ...(showFileToken ? { showFileToken } : {}),
     showFilePinnedRoots,
+    pageLinkPinnedRoots,
     _showFileInFlight: 0,
     mcpExtras,
     bypassMode: requestedBypassMode,
@@ -3423,16 +3418,9 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
   const effort = pickedEffort || persistedCodexState.effort || (fresh && options.effort !== 'default' ? codexDefaultEffortNow() : null) || null;
   const mcpExtras = options.mcpExtras ?? persistedCodexState.mcpExtras ?? persisted?.mcpExtras ?? [];
   const extras = effectiveExtras(mcpExtras, DEFAULT_MCP_EXTRAS);
-  let showFileToken;
-  let showFilePinnedRoots = null;
-  if (CODEX_APP_SERVER && extras.includes('share')) {
-    try {
-      showFilePinnedRoots = pinAllowedRootsSync([cwd, ...SHOW_FILE_ARTIFACT_ROOTS]);
-      showFileToken = randomUUID();
-    } catch (error) {
-      console.warn(`[show-file] disabled for ${roomId}: failed to pin allowed roots (${error.message})`);
-    }
-  }
+  const { pageLinkPinnedRoots, showFilePinnedRoots, showFileToken } = pinSessionRoots({
+    cwd, shareEnabled: CODEX_APP_SERVER && extras.includes('share'), artifactRoots: SHOW_FILE_ARTIFACT_ROOTS, roomId,
+  });
   const matronMd = loadMatronMd(cwd, { agent: 'codex' });
   // A bridge-made worktree adds its notice ahead of the repository's MATRON.md.
   const worktreeInfo = worktreeService.info(cwd);
@@ -3477,6 +3465,7 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
     mcpExtras,
     ...(showFileToken ? { showFileToken } : {}),
     showFilePinnedRoots,
+    pageLinkPinnedRoots,
     responseBuffer: '',
     sendCallback: null,
     pendingPlan: null,
@@ -3894,16 +3883,9 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     : (Array.isArray(persistedForRoom?.mcpExtras) ? persistedForRoom.mcpExtras : []);
   const effectiveMcpExtras = effectiveExtras(mcpExtras, DEFAULT_MCP_EXTRAS);
   const shareEnabled = effectiveMcpExtras.includes('share');
-  let showFileToken;
-  let showFilePinnedRoots = null;
-  if (shareEnabled) {
-    try {
-      showFilePinnedRoots = pinAllowedRootsSync([cwd, ...SHOW_FILE_ARTIFACT_ROOTS]);
-      showFileToken = randomUUID();
-    } catch (error) {
-      console.warn(`[show-file] disabled for ${roomId}: failed to pin allowed roots (${error.message})`);
-    }
-  }
+  const { pageLinkPinnedRoots, showFilePinnedRoots, showFileToken } = pinSessionRoots({
+    cwd, shareEnabled, artifactRoots: SHOW_FILE_ARTIFACT_ROOTS, roomId,
+  });
   // transcriptExists demotes a resume whose transcript was never written to a
   // fresh --session-id spawn on the same id (see planSessionIdentity). This is
   // what breaks the /logout crash loop's second half: the iv auto-restart and
@@ -4042,6 +4024,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     codexSpawnEnv: interactiveEnv,
     ...(showFileToken ? { showFileToken } : {}),
     showFilePinnedRoots,
+    pageLinkPinnedRoots,
     _showFileInFlight: 0,
     mcpExtras,
     responseBuffer: '',
