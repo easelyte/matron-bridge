@@ -9,7 +9,7 @@ import { SECRET_CONTEXT_MAX_LENGTH } from './lib/secret-context.js';
 import { resolvePermissionTimeoutMs, classifyPermissionPostResponse, permissionInputRefusal } from './lib/permission-prompt.js';
 import { formatBox } from './lib/agent-boxes-format.js';
 import { formatUsageHistory } from './lib/usage-history-tool.js';
-import { itemLine, formatItemList, formatItemDetail, formatCommentAck, formatHandoverAck, withImageWarnings, withStepUpNote } from './lib/items-format.js';
+import { itemLine, formatItemList, formatItemDetail, formatCommentAck, formatHandoverAck, withImageWarnings, withStepUpNote, withMultiSelectNote } from './lib/items-format.js';
 import { formatStartAck, formatCreateAck, formatMilestoneAck, formatMissionDetail, missionLine, formatBlocked, formatJournalError, formatStatusAck, formatMissionList, formatJoinAck, formatLeaveAck, formatUpdateAck } from './lib/missions-format.js';
 import { formatSearchAll } from './lib/search-format.js';
 import { missionIdemKey, itemIdemKey } from './lib/missions-idem.js';
@@ -1330,6 +1330,7 @@ async function callItems(name, args, render) {
 // Shared parameter wording for the item tools.
 const ATTACHMENTS_WHAT = 'Local paths in the working directory, or files the bridge downloaded for this conversation (≤20). `![caption](path)` in the body shows one in place; the rest go at the end';
 const STEP_UP_WHAT = "true = the user confirms the tap with Face ID or Touch ID (signed by their device's key). For anything destructive or hard to undo; a typed reply never counts.";
+const MULTI_SELECT_WHAT = 'true = the user ticks any of the actions and taps Send, e.g. a list of missions to close; the 📌 turn lists every label picked (tapped "A", "C"). Needs actions; not with step_up or on a notice.';
 const SUBJECT_WHAT = 'With step_up: exactly what is approved, a flat object of ≤12 short strings, e.g. {"op":"drop_table","table":"orders"}. Shown to the user and signed.';
 
 server.tool(
@@ -1345,7 +1346,8 @@ server.tool(
     awaiting: z.enum(['user', 'agent']).nullable().optional().describe('Who acts next. Defaults: question→user, notice→user, task→agent, decision→nobody'),
     position: z.enum(['top', 'bottom']).optional().describe('Where a task lands in the ordered task list'),
     supersedes: z.string().optional().describe('Item id of a decision this one replaces'),
-    actions: z.array(z.string()).max(4).optional().describe('Up to 4 one-tap reply labels (≤40 chars, unique), e.g. ["Go"] or ["Option A","Option B"]; a tap reads as that reply.'),
+    actions: z.array(z.string()).max(12).optional().describe('Up to 4 one-tap reply labels (≤40 chars, unique), e.g. ["Go"] or ["Option A","Option B"]; a tap reads as that reply. With multi_select: up to 12 labels of ≤80 chars.'),
+    multi_select: z.boolean().optional().describe(MULTI_SELECT_WHAT),
     step_up: z.boolean().optional().describe(`${STEP_UP_WHAT} Cannot be removed once filed.`),
     subject: z.record(z.string(), z.string()).optional().describe(SUBJECT_WHAT),
     shared_by: z.string().max(PERSON_MAX).optional().describe("Another person's mission you may contribute to: their user name (name@host for someone on another journal), with mission = THEIR number (mission_list shared: true lists them). Needs a contribute share; no attachments or buttons."),
@@ -1353,7 +1355,7 @@ server.tool(
   },
   async (args) => (args.shared_by
     ? callSharing('shared_item_create', 'item_create', args, formatContribAck('Filed'))
-    : callItems('create', args, (d) => withStepUpNote(withImageWarnings(itemLine(d.item), d), d))),
+    : callItems('create', args, (d) => withStepUpNote(withImageWarnings(withMultiSelectNote(itemLine(d.item), d), d), d))),
 );
 
 server.tool(
@@ -1386,7 +1388,8 @@ server.tool(
     body: z.string().optional().describe('Markdown'),
     attachments: z.array(z.string()).optional().describe(ATTACHMENTS_WHAT),
     awaiting: z.enum(['user', 'agent']).nullable().optional().describe('Who acts next after this comment; omit to leave it unchanged'),
-    actions: z.array(z.string()).max(4).optional().describe('Up to 4 one-tap reply labels (≤40 chars, unique) under this comment, e.g. ["Merge"]. Sets awaiting to the user. The item must be open (item_reopen it first).'),
+    actions: z.array(z.string()).max(12).optional().describe('Up to 4 one-tap reply labels (≤40 chars, unique) under this comment, e.g. ["Merge"]. Sets awaiting to the user. The item must be open (item_reopen it first). With multi_select: up to 12 labels of ≤80 chars.'),
+    multi_select: z.boolean().optional().describe(MULTI_SELECT_WHAT),
     step_up: z.boolean().optional().describe(`${STEP_UP_WHAT} Needs actions.`),
     subject: z.record(z.string(), z.string()).optional().describe(SUBJECT_WHAT),
     add_labels: z.array(z.string()).max(10).optional().describe('Labels to add to the item, keeping the ones it has (e.g. ["dispatched"] on a spare-allowance backlog task you started)'),
