@@ -116,6 +116,28 @@ describe('native Codex session lifecycle', () => {
     }
   });
 
+  it('lets Codex read CLAUDE.md as a fallback, after any names the user configured', async () => {
+    const h = setup();
+    h.send(); await settle();
+    const params = h.clients[0].request.mock.calls.find(([method]) => method === 'thread/start')[1];
+    expect(params.config.project_doc_fallback_filenames).toEqual(['CLAUDE.md']);
+    h.session.kill();
+
+    let client;
+    const session = new CodexAppServerSession({ cwd: '/workspace', clientFactory: () => {
+      client = new FakeClient();
+      const base = client.request.getMockImplementation();
+      client.request.mockImplementation(async (method, p) => (method === 'config/read'
+        ? { config: { model: 'm', model_reasoning_effort: 'low', project_doc_fallback_filenames: ['TEAM.md'] } }
+        : base(method, p)));
+      return client;
+    } });
+    session.send([{ type: 'text', text: 'hi' }]); await settle();
+    const own = client.request.mock.calls.find(([method]) => method === 'thread/start')[1];
+    expect(own.config.project_doc_fallback_filenames).toEqual(['TEAM.md', 'CLAUDE.md']);
+    session.kill();
+  });
+
   it.each([null, undefined, '', 'invalid'])('inherits workspace networking when not explicitly configured (%s)', async networkAccess => {
     const h = setup({ networkAccess });
     h.send(); await settle();

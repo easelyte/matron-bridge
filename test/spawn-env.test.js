@@ -99,6 +99,17 @@ describe('buildClaudeSpawnEnv', () => {
     expect('SHOW_FILE_TOKEN' in claude({ showFileToken: undefined })).toBe(false);
   });
 
+  it('names the journal conversation in MATRON_CONVO_ID', () => {
+    expect(claude({ convoId: 'convo-1' }).MATRON_CONVO_ID).toBe('convo-1');
+  });
+
+  it('never inherits MATRON_CONVO_ID from the bridge env', () => {
+    const baseEnv = { ...BRIDGE_ENV, MATRON_CONVO_ID: 'other-convo' };
+    expect(claude({ baseEnv, convoId: 'convo-1' }).MATRON_CONVO_ID).toBe('convo-1');
+    expect('MATRON_CONVO_ID' in claude({ baseEnv })).toBe(false);
+    expect('MATRON_CONVO_ID' in claude({ baseEnv, convoId: '' })).toBe(false);
+  });
+
   it('rejects a non-object base env', () => {
     expect(() => claude({ baseEnv: null })).toThrow(TypeError);
     expect(() => claude({ baseEnv: 'nope' })).toThrow(TypeError);
@@ -153,6 +164,18 @@ describe('buildCodexSpawnEnv', () => {
     const base = { ...BRIDGE_ENV };
     codex({ baseEnv: base });
     expect(base).toEqual(BRIDGE_ENV);
+  });
+
+  it('names the journal conversation in MATRON_CONVO_ID on both transports', () => {
+    expect(codex({ appServer: true, convoId: 'convo-1' }).MATRON_CONVO_ID).toBe('convo-1');
+    expect(codex({ appServer: false, convoId: 'convo-1' }).MATRON_CONVO_ID).toBe('convo-1');
+  });
+
+  it('never inherits MATRON_CONVO_ID from the bridge env', () => {
+    const baseEnv = { ...BRIDGE_ENV, MATRON_CONVO_ID: 'other-convo' };
+    expect(codex({ baseEnv, convoId: 'convo-1' }).MATRON_CONVO_ID).toBe('convo-1');
+    expect('MATRON_CONVO_ID' in codex({ baseEnv, appServer: true })).toBe(false);
+    expect('MATRON_CONVO_ID' in codex({ baseEnv, appServer: false })).toBe(false);
   });
 
   it('rejects a non-object base env', () => {

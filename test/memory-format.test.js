@@ -42,6 +42,11 @@ describe('memory renderers', () => {
     expect(saved).toContain('outside a turn the user started themselves');
     expect(saved).toContain('reach you as a later turn');
     expect(saved).toContain('Do not retry');
+    expect(saved).toContain('If they reply on it instead of tapping, read the thread with item_get("#41") and answer there with item_comment');
+    expect(formatSaveAck({ pending: true, action: 'save', name: 'avoid-elm', item_num: null, item_id: 'it_abc' })).toContain('item_get("it_abc")');
+    const noRef = formatSaveAck({ pending: true, action: 'save', name: 'avoid-elm', item_num: null, item_id: null });
+    expect(noRef).not.toContain('item_get');
+    expect(noRef).toContain('save again under the same name');
     expect(saved).not.toMatch(/^Saved memory/);
     const deleted = formatDeleteAck({ pending: true, action: 'delete', name: 'avoid-elm', item_num: null });
     expect(deleted).toMatch(/^NOT deleted yet: memory `avoid-elm` is a proposal waiting for the user's approval on a tracker item\./);

@@ -63,7 +63,7 @@ describe('memory handlers', () => {
 
   it('save: journal 409 → the max-200 message; status 0 → 502; 404 → refused (routes or not writable)', async () => {
     expect(await fixture({ save: vi.fn(async () => ({ status: 409, data: { error: 'too_many' } })) }).h.save({ roomId: '!r:s', name: 'x', description: 'd' }))
-      .toEqual({ status: 409, body: { error: 'the journal holds the maximum of 200 memories — delete one first' } });
+      .toEqual({ status: 409, body: { error: 'the journal holds the maximum of 400 memories — delete one first' } });
     expect(await fixture({ save: vi.fn(async () => ({ status: 0, data: { error: 'journal unreachable' } })) }).h.save({ roomId: '!r:s', name: 'x', description: 'd' }))
       .toEqual({ status: 502, body: { error: 'journal unreachable' } });
     const refused = await fixture({ save: vi.fn(async () => ({ status: 404, data: { error: 'not_found' } })) }).h.save({ roomId: '!r:s', name: 'x', description: 'd' });
