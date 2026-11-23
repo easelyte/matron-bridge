@@ -42,6 +42,7 @@ import { createShortLinkWriter, shortenViewerUrl, shortLinksEnabled, shortLinksF
 import { createItemsClient } from './lib/items-client.js';
 import { readApprovalConfig } from './lib/approval-config.js';
 import { createApprovalGate } from './lib/approval-gate.js';
+import { createApprovalFiles, defaultApprovalFilesDir } from './lib/approval-files.js';
 import { createApprovalPaths } from './lib/approval-paths.js';
 import { createBoxLock } from './lib/box-lock.js';
 import { createAccountLock, ACCOUNT_LOCKED_LINE } from './lib/account-lock.js';
@@ -1263,6 +1264,7 @@ function outsideWorkRefused() {
 }
 // A signed tap on a tracker item, checked against the pinned keys so the
 // agent is told whether it verified on this box. null with the gate off.
+const approvalFiles = createApprovalFiles({ dir: process.env.MATRON_APPROVAL_FILES_DIR || defaultApprovalFilesDir(), log: console });
 const tapVerifier = createTapVerifier({ gate: approvalGate, getItem: (id) => itemsClient.getAsStored(id) });
 
 const trackerUrlBaseNow = () => trackerUrlBase({ httpBase: journalHttpBase, userName: journalIdentity.name() });
@@ -3027,10 +3029,14 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
   // Child env (lib/spawn-env.js): journal token and bridge-only secrets
   // stripped, read-proxy header file, node bin dir on PATH, per-session
   // SHOW_FILE_TOKEN.
+  // The journal conversation id, fixed for the life of this process: the
+  // session object below and MATRON_CONVO_ID in the child env share it.
+  const printJournalConvoId = options.journalConvoId || persistedMode?.journalConvoId || identity.sessionId;
   const spawnEnv = buildClaudeSpawnEnv({
     coordinator: options.coordinator === true,
     roleKnown: options.roleKnown === true,
     roomId,
+    convoId: printJournalConvoId,
     apiPort: API_PORT,
     journalProxyHeaderFile: JOURNAL_PROXY_HEADER_FILE,
     apiHeaderFile: apiHeaderFileFor(roomId),
@@ -3112,7 +3118,7 @@ function createSession(roomId, workdir, resumeSessionId, options = {}) {
     // session that crashes before its first event would wrongly restart via
     // --session-id on an already-persisted id (#136 / PR #151).
     _sessionConfirmed: identity.resumed,
-    journalConvoId: options.journalConvoId || persistedMode?.journalConvoId || identity.sessionId,
+    journalConvoId: printJournalConvoId,
     _agentSessions: mergeAgentStates({}, options.agentSessions || persistedMode?.agentSessions),
     _agentHistoryCursor: 0,
     busy: false,
@@ -3426,6 +3432,8 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
   const worktreeInfo = worktreeService.info(cwd);
   matronMd.block = [worktreeNoticeBlock(worktreeInfo), matronMd.block].filter(Boolean).join('\n\n');
   const codexCoord = codexCoordinatorOptions({ coordinator: !!options.coordinator, baseInstructions: trackerLinksNow(CODEX_BRIDGE_PROMPT), block: trackerLinksNow(COORDINATOR_BLOCK), baseSandbox: CODEX_SANDBOX_MODE, memoryBlock: memoryBlockNow({ coordinator: !!options.coordinator, workdir: cwd }), noticesBlock: noticesBlockNow({ coordinator: !!options.coordinator }), matronMdBlock: matronMd.block });
+  // Shared by the session object below and MATRON_CONVO_ID in the child env.
+  const codexJournalConvoId = options.journalConvoId || persisted?.journalConvoId || resumeSessionId || newSessionConvoId();
   const Adapter = CODEX_APP_SERVER ? CodexAppServerSession : CodexExecSession;
   const codex = new Adapter({
     cwd,
@@ -3439,6 +3447,7 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
     // HTTP fallback (see buildCodexSpawnEnv).
     env: buildCodexSpawnEnv({
       roomId,
+      convoId: codexJournalConvoId,
       apiPort: API_PORT,
       appServer: CODEX_APP_SERVER,
       journalProxyHeaderFile: JOURNAL_PROXY_HEADER_FILE,
@@ -3482,7 +3491,7 @@ function createCodexSessionForRoom(roomId, workdir, resumeSessionId, options = {
     // Kept under the historical property name for compatibility with the
     // journal protocol and existing persistence/routing code.
     claudeSessionId: resumeSessionId || null,
-    journalConvoId: options.journalConvoId || persisted?.journalConvoId || resumeSessionId || newSessionConvoId(),
+    journalConvoId: codexJournalConvoId,
     _agentSessions: mergeAgentStates({}, options.agentSessions || persisted?.agentSessions),
     _agentHistoryCursor: 0,
     busy: false,
@@ -3971,10 +3980,13 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
   if (ivEffort) claudeArgs.push('--effort', ivEffort);
 
   // Child env (lib/spawn-env.js): same shape as the print spawn.
+  // Shared by the session object below and MATRON_CONVO_ID in the child env.
+  const ivJournalConvoId = options.journalConvoId || persistedForRoom?.journalConvoId || sessionId;
   const interactiveEnv = buildClaudeSpawnEnv({
     coordinator: options.coordinator === true,
     roleKnown: options.roleKnown === true,
     roomId,
+    convoId: ivJournalConvoId,
     apiPort: API_PORT,
     journalProxyHeaderFile: JOURNAL_PROXY_HEADER_FILE,
     apiHeaderFile: apiHeaderFileFor(roomId),
@@ -4041,7 +4053,7 @@ function createInteractiveSessionForRoom(roomId, workdir, resumeSessionId, optio
     lastActivityAt: Date.now(),
     restartCount: 0,
     claudeSessionId: sessionId,
-    journalConvoId: options.journalConvoId || persistedForRoom?.journalConvoId || sessionId,
+    journalConvoId: ivJournalConvoId,
     _agentSessions: mergeAgentStates({}, options.agentSessions || persistedForRoom?.agentSessions),
     _agentHistoryCursor: 0,
     busy: false,
@@ -13357,6 +13369,8 @@ const itemsHandlers = createItemsHandlers({
   // MATRON_STEP_UP_ALL=1: every question this box files needs a signed tap.
   stepUpAll: APPROVAL_CONFIG.stepUpAll,
   verifyTap: tapVerifier ? (thread, comment) => tapVerifier.forThread(thread, comment) : null,
+  // Signed taps saved as files for the commands that check them.
+  saveApproval: (itemNum, comment) => approvalFiles.save(itemNum, comment),
 });
 
 const missionsHandlers = createMissionsHandlers({

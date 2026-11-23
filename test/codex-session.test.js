@@ -9,6 +9,7 @@ import {
   contentBlocksToCodexPrompt,
   normalizeCodexSandbox,
   normalizeCodexNetworkAccess,
+  codexDocFallbacks,
 } from '../lib/codex-session.js';
 
 function fakeChild() {
@@ -26,12 +27,14 @@ describe('Codex programmatic session', () => {
       'exec', '--json', '--skip-git-repo-check',
       '-c', 'approval_policy="never"',
       '-c', 'sandbox_mode="workspace-write"',
+      '-c', 'project_doc_fallback_filenames=["CLAUDE.md"]',
       '--model', 'gpt-test', '-',
     ]);
     expect(buildCodexExecArgs({ threadId: 'thread-1' })).toEqual([
       'exec', 'resume', '--json', '--skip-git-repo-check',
       '-c', 'approval_policy="never"',
       '-c', 'sandbox_mode="workspace-write"',
+      '-c', 'project_doc_fallback_filenames=["CLAUDE.md"]',
       'thread-1', '-',
     ]);
   });
@@ -319,6 +322,14 @@ describe('Codex bridge wiring', () => {
     expect(body).toContain('resolveNativeSessionIdForPersistence');
     expect(body).toContain('state = { ...state, sessionId: effectiveSessionId }');
     expect(body).toContain('sessionId: effectiveSessionId');
+  });
+
+  it('adds CLAUDE.md to the doc fallbacks, keeping names the user set', () => {
+    expect(codexDocFallbacks()).toEqual(['CLAUDE.md']);
+    expect(codexDocFallbacks(['TEAM.md'])).toEqual(['TEAM.md', 'CLAUDE.md']);
+    expect(codexDocFallbacks(['CLAUDE.md', 'TEAM.md'])).toEqual(['CLAUDE.md', 'TEAM.md']);
+    expect(codexDocFallbacks('CLAUDE.md')).toEqual(['CLAUDE.md']);
+    expect(codexDocFallbacks([null, '', 'X.md'])).toEqual(['X.md', 'CLAUDE.md']);
   });
 });
 

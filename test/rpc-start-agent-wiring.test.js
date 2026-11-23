@@ -32,7 +32,8 @@ describe('New Chat agent switch wiring (source inspection)', () => {
 
   it('assigns a stable conversation id at Codex construction and persists fresh starts', () => {
     const src = block('function createCodexSessionForRoom(', 'function codexToolIndicator(');
-    expect(src).toContain('journalConvoId: options.journalConvoId || persisted?.journalConvoId || resumeSessionId || newSessionConvoId()');
+    expect(src).toContain('const codexJournalConvoId = options.journalConvoId || persisted?.journalConvoId || resumeSessionId || newSessionConvoId();');
+    expect(src).toContain('journalConvoId: codexJournalConvoId,');
     expect(src).toMatch(/sessions\.set\(roomId, session\);[\s\S]*?if \(!resumeSessionId && !options\.journalConvoId && !persisted\?\.journalConvoId\) \{\s*persistSession\(roomId, session\.claudeSessionId, cwd, null\)/);
     const event = block('function handleCodexEvent(', 'function flushPendingSessionQueue(');
     expect(event).toContain('if (!session.journalConvoId) session.journalConvoId = event.thread_id;');
