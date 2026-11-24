@@ -445,6 +445,7 @@ as `failed` and delivered again at the next boot.
 | `SHOW_FILE_UPLOAD_TIMEOUT_MS` | How long one `show_file` upload may take (at most 5 minutes) | `30000` |
 | `BRIDGE_COORDINATOR_MD_PATH` | Markdown appended to the Coordinator session's instructions | `BRIDGE_COORDINATOR.md` |
 | `BRIDGE_COORDINATOR_DIR` | Directory of the Coordinator's procedures and routines | `coordinator/` |
+| `BRIDGE_COORDINATOR_OVERLAY_DIR` | Optional second directory with `procedures/` and `routines/`, outside the checkout. A file there replaces the built-in file of the same name; any other `.md` file is added. Use it to keep a few procedures of your own and still get updates to the rest | unset |
 | `SECRET_RATE_LIMIT` | Viewer requests per minute for secret-request forms | `30` |
 | `MATRON_REDACT_OVERSIZE_POLICY` | What the Codex output redactor does with text too large to scan: `truncate`, `drop` or `skip` | `truncate` |
 | `LIMITS_REFRESH_MS` | Shortest gap between two refreshes of the account usage meters | `300000` (5 minutes) |

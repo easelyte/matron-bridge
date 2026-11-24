@@ -249,6 +249,77 @@ describe('loadCoordinatorBlock', () => {
     expect(loadCoordinatorBlock({ readFile: fallbackRead, path: '/x', dir: '/d', readDir, log })).toBe(`${FALLBACK_COORDINATOR_BLOCK}\n\nA\n\nB\n\nR1`);
     expect(loadCoordinatorBlock({ readFile: () => { throw new Error('x'); }, path: '/x', log })).toBe(FALLBACK_COORDINATOR_BLOCK);
   });
+  describe('overlay directory', () => {
+    const base = {
+      '/x': '# brief',
+      '/d/procedures/10-a.md': 'A', '/d/procedures/20-b.md': 'B',
+      '/d/routines/daily-sweep.md': 'R1',
+    };
+    const baseDirs = { '/d/procedures': ['10-a.md', '20-b.md'], '/d/routines': ['daily-sweep.md'] };
+    const make = (files, dirs) => ({
+      readFile: (p) => { if (!(p in files)) throw new Error('ENOENT'); return files[p]; },
+      readDir: (d) => { if (!(d in dirs)) throw new Error('ENOENT'); return dirs[d]; },
+    });
+
+    it('a same-named overlay file replaces the built-in one, and extra overlay files are added in name order', () => {
+      const io = make(
+        { ...base, '/o/procedures/20-b.md': 'B-own', '/o/procedures/15-extra.md': 'X', '/o/routines/zz-own.md': 'R-own', '/o/routines/notes.txt': 'no' },
+        { ...baseDirs, '/o/procedures': ['20-b.md', '15-extra.md'], '/o/routines': ['zz-own.md', 'notes.txt'] },
+      );
+      const log = { warn: vi.fn(), info: vi.fn() };
+      expect(loadCoordinatorBlock({ ...io, path: '/x', dir: '/d', overlayDir: '/o', log }))
+        .toBe('# brief\n\nA\n\nX\n\nB-own\n\nR1\n\nR-own');
+      expect(log.warn).not.toHaveBeenCalled();
+      // One line names every file taken from the overlay, and none of their text.
+      expect(log.info).toHaveBeenCalledTimes(1);
+      const line = log.info.mock.calls[0][0];
+      expect(line).toContain('procedures/15-extra.md');
+      expect(line).toContain('procedures/20-b.md');
+      expect(line).toContain('routines/zz-own.md');
+      expect(line).not.toContain('B-own');
+    });
+
+    it('an overlay with only one of the two subdirectories leaves the other built-in one alone, without a warning', () => {
+      const io = make({ ...base, '/o/routines/daily-sweep.md': 'R-own' }, { ...baseDirs, '/o/routines': ['daily-sweep.md'] });
+      const log = { warn: vi.fn(), info: vi.fn() };
+      expect(loadCoordinatorBlock({ ...io, path: '/x', dir: '/d', overlayDir: '/o', log })).toBe('# brief\n\nA\n\nB\n\nR-own');
+      expect(log.warn).not.toHaveBeenCalled();
+    });
+
+    it('an unreadable or empty overlay file falls back to the built-in file of that name, with a warning', () => {
+      const io = make(
+        { ...base, '/o/procedures/10-a.md': '   ' },
+        { ...baseDirs, '/o/procedures': ['10-a.md', '20-b.md', '30-gone.md'] },
+      );
+      const log = { warn: vi.fn(), info: vi.fn() };
+      // 10-a is empty and 20-b unreadable: both fall back. 30-gone has no built-in twin: skipped.
+      expect(loadCoordinatorBlock({ ...io, path: '/x', dir: '/d', overlayDir: '/o', log })).toBe('# brief\n\nA\n\nB\n\nR1');
+      expect(log.warn).toHaveBeenCalledTimes(3);
+      expect(log.info).not.toHaveBeenCalled();
+    });
+
+    it('an overlay directory with neither subdirectory warns once and changes nothing', () => {
+      const io = make(base, baseDirs);
+      const log = { warn: vi.fn(), info: vi.fn() };
+      expect(loadCoordinatorBlock({ ...io, path: '/x', dir: '/d', overlayDir: '/nope', log })).toBe('# brief\n\nA\n\nB\n\nR1');
+      expect(log.warn).toHaveBeenCalledTimes(1);
+      expect(log.warn.mock.calls[0][0]).toContain('/nope');
+    });
+
+    it('no overlay directory reads nothing extra', () => {
+      const io = make(base, baseDirs);
+      const readDir = vi.fn(io.readDir);
+      loadCoordinatorBlock({ readFile: io.readFile, readDir, path: '/x', dir: '/d' });
+      expect(readDir.mock.calls.map((c) => c[0])).toEqual(['/d/procedures', '/d/routines']);
+    });
+
+    it('the overlay still applies when the built-in directory is missing', () => {
+      const io = make({ '/x': '# brief', '/o/procedures/10-a.md': 'own' }, { '/o/procedures': ['10-a.md'] });
+      const log = { warn: vi.fn(), info: vi.fn() };
+      expect(loadCoordinatorBlock({ ...io, path: '/x', dir: '/gone', overlayDir: '/o', log })).toBe('# brief\n\nown');
+    });
+  });
+
   it('the real files load into one block that starts with the preamble and ends with the last routine', () => {
     const block = loadCoordinatorBlock({
       readFile: (p) => readFileSync(p, 'utf8'),

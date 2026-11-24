@@ -719,6 +719,9 @@ const BRIDGE_COORDINATOR_MD_PATH = process.env.BRIDGE_COORDINATOR_MD_PATH || DEF
 // The playbook directory (spec 2026-10-01 coordinator routines): one file
 // per procedure and per routine, appended to BRIDGE_COORDINATOR.md at boot.
 const BRIDGE_COORDINATOR_DIR = process.env.BRIDGE_COORDINATOR_DIR || DEFAULT_BRIDGE_COORDINATOR_DIR;
+// Optional second playbook directory, outside this checkout: a file there
+// replaces the built-in file of the same name, and others are added.
+const BRIDGE_COORDINATOR_OVERLAY_DIR = process.env.BRIDGE_COORDINATOR_OVERLAY_DIR || null;
 // The notices block: how to file what the user needs to read as notices,
 // appended at spawn while the user's `notices` setting is on.
 const BRIDGE_NOTICES_MD_PATH = process.env.BRIDGE_NOTICES_MD_PATH || DEFAULT_BRIDGE_NOTICES_MD_PATH;
@@ -756,6 +759,7 @@ const COORDINATOR_BLOCK = loadCoordinatorBlock({
   readFile: (p) => fs.readFileSync(p, 'utf-8'),
   path: BRIDGE_COORDINATOR_MD_PATH,
   dir: BRIDGE_COORDINATOR_DIR,
+  overlayDir: BRIDGE_COORDINATOR_OVERLAY_DIR,
   readDir: (d) => fs.readdirSync(d),
   log: console,
 });
