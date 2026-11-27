@@ -56,6 +56,14 @@ describe('reminder handlers', () => {
     expect(r.body.reminder.in_ms).toBe(4.5 * HOUR);
   });
 
+  it('`in` reaches a year ahead', async () => {
+    const { h } = fixture();
+    for (const d of ['8d', '30d', '52w', '365d', '366d']) {
+      const r = await h.create({ roomId: '!r:s', text: d, in: d });
+      expect(r.status, d).toBe(201);
+    }
+  });
+
   it('hold_awake is persisted on the record so the keep-awake marker and the reaper see it', async () => {
     const { h, saves, store } = fixture();
     const r = await h.create({ roomId: '!r:s', text: 'deploy window', in: '3h', hold_awake: true });
@@ -102,7 +110,8 @@ describe('reminder handlers', () => {
     expect((await h.create({ roomId: '!r:s', text: 'x', in: 'soon' })).status).toBe(400);
     expect((await h.create({ roomId: '!r:s', text: 'x', at: '25:00' })).status).toBe(400);
     expect((await h.create({ roomId: '!r:s', text: 'x', in: '1s' })).body.error).toMatch(/too soon/);
-    expect((await h.create({ roomId: '!r:s', text: 'x', in: '8d' })).body.error).toMatch(/too far/);
+    expect((await h.create({ roomId: '!r:s', text: 'x', in: '367d' })).body.error).toMatch(/too far/);
+    expect((await h.create({ roomId: '!r:s', text: 'x', in: '8d', hold_awake: true })).body.error).toMatch(/^hold_awake is only for reminders up to 7d away/);
     expect((await h.create({ roomId: '!r:s', text: 'x', in: '1h', hold_awake: 'yes' })).status).toBe(400);
     expect(MIN_TIMER_MS).toBeLessThan(MAX_TIMER_MS);
   });
@@ -223,6 +232,40 @@ describe('daily repeating reminders (repeat + tz)', () => {
     expect(await err({ in: '2h', tz: 'Europe/London' })).toBe("tz only applies to 'at' — 'in' is a duration, the same in every zone");
     expect(await err({ at: '08:00', repeat: 'daily', hold_awake: true })).toBe('hold_awake cannot be combined with repeat — a daily reminder would keep the box awake for good; the box is woken for each check-in anyway');
     expect(await err({ at: '25:00', repeat: 'daily', tz: 'Europe/London' })).toMatch(/^'at' must be a clock time/);
+    expect(store.listForConvo('c1')).toEqual([]);
+  });
+
+  it('`at` takes a date and time, in tz or this box\'s zone, weeks ahead', async () => {
+    const { h } = daily();
+    // 24 Dec is GMT in London: 09:00 local is 09:00Z.
+    let r = await create(h, { at: '2026-12-24 09:00', tz: 'Europe/London' });
+    expect(r.status).toBe(201);
+    expect(r.body.reminder.fire_at).toBe('2026-12-24T09:00:00.000Z');
+    // ISO T form, a meridiem, and a summer date (BST, +1).
+    r = await create(h, { at: '2027-06-01T9am', tz: 'Europe/London' });
+    expect(r.body.reminder.fire_at).toBe('2027-06-01T08:00:00.000Z');
+    r = await create(h, { at: '2027-01-21 14:30', tz: 'America/New_York' });
+    expect(r.body.reminder.fire_at).toBe('2027-01-21T19:30:00.000Z');
+    // No tz: the box's own zone.
+    r = await create(h, { at: '2026-11-02 10:00' });
+    const zone = Intl.DateTimeFormat().resolvedOptions().timeZone;
+    expect(new Intl.DateTimeFormat('en-GB', { timeZone: zone, dateStyle: 'short', timeStyle: 'short' }).format(Date.parse(r.body.reminder.fire_at))).toBe('02/11/2026, 10:00');
+  });
+
+  it('rejects a dated `at` with no time, a past date, an unreal date, one past a year, and one with repeat', async () => {
+    const { h, store } = daily();
+    const err = async (extra) => {
+      const r = await create(h, extra);
+      expect(r.status, JSON.stringify(extra)).toBe(400);
+      return r.body.error;
+    };
+    expect(await err({ at: '2026-12-24' })).toMatch(/needs a time too/);
+    expect(await err({ at: '2026-12-24 25:00' })).toMatch(/needs a time too/);
+    expect(await err({ at: '2026-02-30 09:00' })).toMatch(/not a real date/);
+    expect(await err({ at: '2026-09-01 09:00', tz: 'Europe/London' })).toMatch(/has already passed/);
+    expect(await err({ at: '2028-01-01 09:00', tz: 'Europe/London' })).toMatch(/too far ahead/);
+    expect(await err({ at: '2026-12-24 08:00', repeat: 'daily' })).toMatch(/not a date/);
+    expect(await err({ at: '2026-12-24 08:00', hold_awake: true })).toMatch(/^hold_awake is only for/);
     expect(store.listForConvo('c1')).toEqual([]);
   });
 

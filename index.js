@@ -15992,7 +15992,7 @@ function startIdleReaper() {
       // A pending hold-awake reminder (reminder_create hold_awake: true) is
       // the agent saying the work in between must not be interrupted — the
       // box stays up for it (KEEPAWAKE_FILE), and so does the session.
-      // Bounded by MAX_TIMER_MS, and the store drops the record at fire
+      // Bounded by MAX_HOLD_AWAKE_MS, and the store drops the record at fire
       // time, so this can never pin a session for good.
       const holdUntil = timerStore.holdAwakeUntil(journalConvoIdFor(session));
       if (holdUntil && holdUntil > now) {
