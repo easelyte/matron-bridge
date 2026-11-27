@@ -2,6 +2,7 @@ import { describe, it, expect, vi } from 'vitest';
 import {
   parseDuration, parseClockTime, parseClockHourMinute, formatDuration, parseTimerCommand, createTimerStore,
   timerCancelButton, timerSendNowButton, timerPromptId, keepAwakeMarker, MIN_TIMER_MS, MAX_TIMER_MS, OVERDUE_GRACE_MS,
+  MAX_TIMER_CHUNK_MS,
 } from '../lib/timer-command.js';
 
 // Local-time epoch builder: clock parsing is defined in the HOST's local
@@ -18,12 +19,15 @@ describe('parseDuration', () => {
     expect(parseDuration('10m')).toBe(600_000);
     expect(parseDuration('2h')).toBe(7_200_000);
     expect(parseDuration('1d')).toBe(86_400_000);
+    expect(parseDuration('3w')).toBe(21 * 86_400_000);
   });
 
   it('parses descending combos', () => {
     expect(parseDuration('1h30m')).toBe(5_400_000);
     expect(parseDuration('1d2h')).toBe(93_600_000);
     expect(parseDuration('1d2h3m4s')).toBe(93_784_000);
+    expect(parseDuration('2w3d')).toBe(17 * 86_400_000);
+    expect(parseDuration('3d1w')).toBeNull();
   });
 
   it('is case/whitespace tolerant', () => {
@@ -153,7 +157,9 @@ describe('parseTimerCommand', () => {
   it('rejects bad duration, too short, too long, empty message', () => {
     expect(parseTimerCommand('soon hello').kind).toBe('error');
     expect(parseTimerCommand('1s hello').kind).toBe('error');
-    expect(parseTimerCommand('30d hello').kind).toBe('error');
+    expect(parseTimerCommand('367d hello').kind).toBe('error');
+    expect(parseTimerCommand('30d hello')).toMatchObject({ kind: 'set', delayMs: 30 * DAY });
+    expect(parseTimerCommand('366d hello').kind).toBe('set');
     expect(parseTimerCommand('2h').kind).toBe('error');
     expect(MIN_TIMER_MS).toBeLessThan(MAX_TIMER_MS);
   });
@@ -287,6 +293,71 @@ function makeStore({ persisted, onFire = () => {}, start = 1_000_000 } = {}) {
     },
   };
 }
+
+describe('createTimerStore: waits past the setTimeout ceiling', () => {
+  // Node fires a setTimeout over 2^31-1 ms (~24.8 days) at once, so a long
+  // wait is armed as a chain of links no longer than MAX_TIMER_CHUNK_MS.
+  const CEILING = 2 ** 31 - 1;
+
+  it('never hands setTimeout a delay over the ceiling, and fires once at the exact time', () => {
+    const fired = [];
+    const h = makeStore({ onFire: (r) => fired.push(r) });
+    h.store.add({ convoId: 'c1', text: 'Christmas eve check', delayMs: 90 * DAY });
+    const delays = [];
+    for (let elapsed = 0; elapsed < 90 * DAY;) {
+      const [t] = [...h.scheduled.values()];
+      expect(t.delay).toBeLessThanOrEqual(CEILING);
+      expect(t.delay).toBeLessThanOrEqual(MAX_TIMER_CHUNK_MS);
+      delays.push(t.delay);
+      elapsed += t.delay;
+      expect(fired).toHaveLength(0);
+      h.tick(t.delay);
+    }
+    expect(fired).toEqual([expect.objectContaining({ text: 'Christmas eve check' })]);
+    expect(delays.reduce((a, b) => a + b, 0)).toBe(90 * DAY);
+    expect(h.scheduled.size).toBe(0);
+    expect(h.store.listForConvo('c1')).toHaveLength(0);
+  });
+
+  it('a link waking does not touch the file; only the real fire removes the record', () => {
+    const h = makeStore();
+    h.store.add({ convoId: 'c1', text: 'x', delayMs: 60 * DAY });
+    const saves = h.saves.length;
+    h.tick(MAX_TIMER_CHUNK_MS);
+    expect(h.saves.length).toBe(saves);
+    expect(h.store.listForConvo('c1')).toHaveLength(1);
+  });
+
+  it('cancel stops a chain part-way, and Send now delivers at once', () => {
+    const fired = [];
+    const h = makeStore({ onFire: (r) => fired.push(r.text) });
+    h.store.add({ convoId: 'c1', text: 'cancelled', delayMs: 300 * DAY });
+    h.store.add({ convoId: 'c1', text: 'sent now', delayMs: 300 * DAY });
+    h.tick(MAX_TIMER_CHUNK_MS * 2);
+    expect(h.store.cancel('c1', 1)).toHaveLength(1);
+    expect(h.store.fireNow('c1', 2)).toBeTruthy();
+    expect(fired).toEqual(['sent now']);
+    h.tick(300 * DAY);
+    expect(fired).toEqual(['sent now']);
+    expect(h.scheduled.size).toBe(0);
+  });
+
+  it('init re-arms a far-off record from disk as a chain too', () => {
+    const fired = [];
+    const start = 1_000_000;
+    const h = makeStore({ start, onFire: (r) => fired.push(r.id), persisted: { nextId: 8, timers: [{ id: 7, convoId: 'c1', text: 'x', fireAt: start + 200 * DAY, createdAt: 1 }] } });
+    h.store.init();
+    expect([...h.scheduled.values()][0].delay).toBe(MAX_TIMER_CHUNK_MS);
+    let elapsed = 0;
+    while (h.scheduled.size) {
+      const [t] = [...h.scheduled.values()];
+      elapsed += t.delay;
+      h.tick(t.delay);
+    }
+    expect(elapsed).toBe(200 * DAY);
+    expect(fired).toEqual([7]);
+  });
+});
 
 describe('createTimerStore', () => {
   it('add persists, arms, and fires exactly once with the record', () => {
